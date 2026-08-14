@@ -45,10 +45,12 @@ Three normalisations, and the forge that forced each
 * **`supports_acknowledge` is a capability, not an assumption.** Bitbucket Cloud
   has no reactions on pull-request comments. A caller that assumed the 👀 would
   either crash there or silently skip it; a flag makes the absence legible.
-* **`self_login` strips a trailing `[bot]`.** GitHub's REST and GraphQL APIs
-  disagree about whether an App's login carries the suffix — `AGENTS.md` records
-  the same discrepancy for `kube-agents-bot`. Comparing an unnormalised login
-  against a comment author is how an agent ends up answering itself forever.
+* **`normalise_login` strips a trailing `[bot]`.** GitHub's REST and GraphQL
+  APIs disagree about whether an App's login carries the suffix — `AGENTS.md`
+  records the same discrepancy for `kube-agents-bot`. Comparing an unnormalised
+  login against a comment author is how an agent ends up answering itself
+  forever. Every login crossing this seam goes through it, including the one
+  `viewer_login` reads out of the credential store.
 
 On the repository parser
 ------------------------
@@ -83,14 +85,16 @@ GH_MISSING_RC = 127
 #: tick's per-job lock open indefinitely.
 GH_TIMEOUT_S = 60
 
-#: `gh` list commands take a limit, not a cursor, and silently truncate. A full
-#: page therefore means "there may be more", which callers have to notice.
-PR_PAGE_LIMIT = 100
+#: Page size for the pull-request list. `gh api --paginate` merges the pages
+#: into one JSON array (verified against gh 2.92 on the live install), so this
+#: bounds the number of round trips rather than the number of results — unlike
+#: `gh pr list --limit`, which truncates at its ceiling and says nothing.
+PR_PAGE_SIZE = 100
 
 #: The branch prefix `submit_suggestion.check_branch` and
-#: `audit_report.group_branch_for` both write. It is how a pull request is known
-#: to be the agent's own without asking the forge who authored it — an App's
-#: login is not stable across the REST/GraphQL split (see `self_login`).
+#: `audit_report.group_branch_for` both write. One of the three things that make
+#: a pull request the agent's own — see `is_agent_pull_request`, which is where
+#: the other two are, and why a prefix alone is not enough.
 AGENT_BRANCH_PREFIX = "platform-agent/"
 
 #: A label that opts a pull request out of every sweep, matching the convention
@@ -116,6 +120,15 @@ BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 #: `triage` roles into this legacy field, so `maintain` arrives as `write` and
 #: `triage` as `read` — which is the intended reading either way.
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
+
+#: `gh api` puts the HTTP status in its stderr line: `gh: Not Found (HTTP 404)`.
+#: A 404 from the collaborator endpoint is an answer; every other failure is not.
+HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
+
+#: The account line in `gh auth status`. Only the success spelling matches: a
+#: broken credential reports "Failed to log in to … account <login>", and that
+#: line names an account whose token no longer works.
+VIEWER_RE = re.compile(r"Logged in to \S+ account (\S+)")
 
 
 class ForgeError(Exception):
@@ -152,17 +165,10 @@ class PullRequest:
     author: str
     labels: tuple[str, ...] = ()
     url: str = ""
-
-    @property
-    def is_agent_authored(self) -> bool:
-        """Head branch, not author login.
-
-        The author is an App whose login spelling depends on which API answered
-        (`self_login`), and on a fork the head ref is still written by us. The
-        branch prefix is the one thing both writers of these pull requests —
-        `submit_suggestion.py` and `audit_report.py` — control directly.
-        """
-        return self.head_ref.startswith(AGENT_BRANCH_PREFIX)
+    #: `owner/name` of the repository the head branch lives in. Empty when the
+    #: fork it came from has been deleted, which `is_agent_pull_request` reads
+    #: as "not ours" rather than as "unknown".
+    head_repo: str = ""
 
     @property
     def is_ignored(self) -> bool:
@@ -184,6 +190,12 @@ class Comment:
     body: str
     can_write: bool
     created_at: str
+    #: False when the permission lookup did not answer — a proxy fault, a
+    #: timeout, a 5xx. `can_write` is then False because every caller must fail
+    #: closed, but the two are not the same fact: a refusal is a public comment
+    #: carrying a marker that stops the request ever being retried, and posting
+    #: one because the network hiccuped permanently refuses a maintainer.
+    can_write_known: bool = True
     #: Which endpoint this came from: "issue", "review_comment", or "review".
     #: Routes the reaction API, which has a different path per kind and none at
     #: all for a review.
@@ -206,7 +218,7 @@ class ForgeProvider(Protocol):
 
     def preflight(self) -> None: ...
 
-    def self_login(self, pr: PullRequest) -> str: ...
+    def viewer_login(self) -> str: ...
 
     def list_open_prs(self, repo: str) -> list[PullRequest]: ...
 
@@ -232,12 +244,49 @@ def normalise_login(login: str) -> str:
     marker the agent wrote is ever recognised as its own, and every tick
     re-answers the same comment — observed live before this was normalised.
     """
-    text = str(login or "").strip()
+    # Case is folded first, so the affix tests do not depend on the spelling the
+    # forge happened to use for them.
+    text = str(login or "").strip().lower()
     if text.startswith("app/"):
         text = text[len("app/") :]
     if text.endswith("[bot]"):
         text = text[: -len("[bot]")]
-    return text.lower()
+    return text
+
+
+def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
+    """Did the agent open this pull request, from a branch it wrote, here?
+
+    All three conditions, because each one alone is something a stranger can
+    arrange:
+
+    * **The branch prefix alone is not ownership.** A pull request from a fork
+      carries the bare branch name in `head.ref`, so anybody who can fork this
+      repository can open one whose head ref reads `platform-agent/anything`.
+      The sweep would then treat a stranger's pull request as the agent's own,
+      and — worse — `submit-suggestion` amends by pushing `head_ref` to *this*
+      repository, creating a branch under a name the stranger chose.
+    * **The author alone is not ownership either.** The agent opens pull
+      requests for GitOps changes on `platform-agent/*`; a pull request it
+      opened for some other purpose is not a review conversation this feature
+      should be driving.
+    * **`viewer` is the account this credential authenticates as**, not the
+      author of the pull request being examined. Deriving the agent's identity
+      from the thing it is deciding about is circular: on a pull request that
+      is not the agent's, `pr.author` is a human, the marker scan then looks for
+      the agent's bookkeeping in that human's comments, finds none, and the same
+      request is answered again on every tick forever.
+
+    An empty `viewer` means the credential could not name itself, and everything
+    is refused. See `GitHubProvider.viewer_login`.
+    """
+    if not viewer or not pr.head_repo:
+        return False
+    return (
+        normalise_login(pr.author) == normalise_login(viewer)
+        and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
+        and pr.head_repo.lower() == repo.lower()
+    )
 
 
 def _valid_repo_component(part: str) -> bool:
@@ -352,8 +401,11 @@ class GitHubProvider:
         # One entry per distinct commenter per provider instance, which the
         # gate builds fresh each tick. A busy thread is usually three or four
         # people, so this keeps the permission lookups to three or four calls
-        # rather than one per comment.
-        self._permission_cache: dict[str, bool] = {}
+        # rather than one per comment. None is a cached "did not answer".
+        self._permission_cache: dict[str, Optional[bool]] = {}
+        # Resolved at most once per tick; "" is a real answer meaning the
+        # credential could not name itself, and is cached as such.
+        self._viewer: Optional[str] = None
 
     # -- the seam ---------------------------------------------------------
     def _call(self, argv: Sequence[str], *, expect_json: bool = True):
@@ -387,43 +439,68 @@ class GitHubProvider:
         """
         gh_preflight(self._run)
 
-    def self_login(self, pr: PullRequest) -> str:
-        """The agent's own handle, taken from a pull request it authored.
+    def viewer_login(self) -> str:
+        """The account this credential authenticates as.
 
-        Deriving it from the data rather than from configuration is what makes
-        the mention trigger work with nothing to set up, and it cannot drift
-        from whatever account actually opened the pull request. It is only
-        meaningful for an agent-authored PR, which is the only scope the sweep
-        has.
+        `gh auth status` rather than `GET /user`, because the agent holds a
+        GitHub App *installation* token and `/user` answers `401 Bad
+        credentials` for one — verified on the live install. `auth status` reads
+        the account out of the credential store the sidecar wrote when it minted
+        the token, so it costs no API call and works for a token that cannot
+        introspect itself.
+
+        Empty when no working account can be read. Every caller treats that as
+        "sweep nothing": this login is what separates the agent's own pull
+        requests from a stranger's, and its own comments from a reviewer's, so
+        proceeding without it is how the agent starts answering itself.
         """
-        return normalise_login(pr.author)
+        if self._viewer is not None:
+            return self._viewer
+        result = self._run(["auth", "status"])
+        # `gh` has moved this between streams across versions, and the sidecar
+        # merges neither, so read both rather than depend on which one it is.
+        match = VIEWER_RE.search(f"{result.stdout or ''}\n{result.stderr or ''}")
+        self._viewer = normalise_login(match.group(1)) if match else ""
+        return self._viewer
 
     def list_open_prs(self, repo: str) -> list[PullRequest]:
+        """Every open pull request, paginated rather than truncated.
+
+        REST rather than `gh pr list`, for two reasons that both bite on a busy
+        repository. `--limit` truncates at its ceiling and human pull requests
+        share that budget, so the agent's own would eventually fall out of the
+        window — and the old code raised on a full page, which on a `deliver:
+        "all"` job at `*/10` is 144 identical warnings a day with the feature
+        switched off. `gh api --paginate` merges the pages instead.
+
+        The other reason is `head.repo.full_name`, which `gh pr list` does not
+        carry and which is the only field that tells a branch in this repository
+        from a same-named branch on somebody's fork.
+        """
         rows = self._call(
             [
-                "pr", "list", "-R", repo,
-                "--state", "open",
-                "--json", "number,headRefName,labels,author,url",
-                "--limit", str(PR_PAGE_LIMIT),
+                "api",
+                f"repos/{repo}/pulls?state=open&per_page={PR_PAGE_SIZE}",
+                "--paginate",
             ]
         )
-        prs = [
+        return [
             PullRequest(
                 number=int(row.get("number", 0)),
-                head_ref=str(row.get("headRefName", "")),
-                author=str((row.get("author") or {}).get("login", "")),
+                head_ref=str((row.get("head") or {}).get("ref", "")),
+                # Null when the fork has been deleted, which reads as "" and is
+                # rejected by `is_agent_pull_request` rather than assumed local.
+                head_repo=str(
+                    ((row.get("head") or {}).get("repo") or {}).get("full_name", "")
+                ),
+                author=str((row.get("user") or {}).get("login", "")),
                 labels=tuple(
                     str(label.get("name", "")) for label in (row.get("labels") or [])
                 ),
-                url=str(row.get("url", "")),
+                url=str(row.get("html_url", "")),
             )
             for row in (rows or [])
         ]
-        if len(prs) >= PR_PAGE_LIMIT:
-            # `gh` truncates silently. Saying so beats a sweep that quietly
-            # stops seeing the oldest open pull requests.
-            raise ForgeError("PR_PAGE_TRUNCATED", str(PR_PAGE_LIMIT))
-        return prs
 
     def list_comments(self, repo: str, pr: PullRequest) -> list[Comment]:
         """Every utterance on one pull request, from all three endpoints.
@@ -462,18 +539,21 @@ class GitHubProvider:
         out.sort(key=lambda c: (c.created_at, c.node_id))
         return out
 
-    def _has_write(self, repo: str, login: str) -> bool:
-        """May `login` direct the agent on `repo`?
+    def _has_write(self, repo: str, login: str) -> Optional[bool]:
+        """May `login` direct the agent on `repo`? None when nothing answered.
 
         Asks the collaborator-permission endpoint rather than reading
         `author_association` off the comment — see the module docstring for the
         App-token blindness that makes the field useless here.
 
-        A non-collaborator 404s, which `_call` raises as `REPO_UNREACHABLE`.
-        That is indistinguishable from a network fault at this layer, and both
-        resolve the same way: no write access, so no standing. Failing closed is
-        the only safe direction, because the answer gates whether a stranger's
-        comment can task the agent.
+        A non-collaborator 404s, and that is a definitive no. Any other failure
+        — a proxy fault, a timeout, a 5xx — is not an answer, and collapsing the
+        two into one `False` is worse than it looks: the sweep answers `False`
+        with a public refusal carrying `<!-- agent-refused:… -->`, and that
+        marker is exactly what stops the request being retried. A five-second
+        network blip would refuse a maintainer permanently, and they would have
+        to notice and re-comment. So the unknown gets its own value and the
+        caller waits for the next tick.
         """
         if not login:
             return False
@@ -481,13 +561,16 @@ class GitHubProvider:
         if key in self._permission_cache:
             return self._permission_cache[key]
         try:
-            data = self._call(
-                ["api", f"repos/{repo}/collaborators/{login}/permission"]
-            )
+            data = self._call(["api", f"repos/{repo}/collaborators/{login}/permission"])
+        except ForgeError as error:
+            status = HTTP_STATUS_RE.search(error.value or "")
+            if not status or status.group(1) != "404":
+                self._permission_cache[key] = None
+                return None
+            allowed = False
+        else:
             permission = str((data or {}).get("permission") or "").strip().lower()
-        except ForgeError:
-            permission = ""
-        allowed = permission in WRITE_PERMISSIONS
+            allowed = permission in WRITE_PERMISSIONS
         self._permission_cache[key] = allowed
         return allowed
 
@@ -501,12 +584,14 @@ class GitHubProvider:
             if kind == "review" and not body.strip():
                 continue
             author = str((row.get("user") or {}).get("login", ""))
+            access = self._has_write(repo, author)
             yield Comment(
                 node_id=str(row.get("node_id") or ""),
                 numeric_id=int(row.get("id") or 0),
                 author=author,
                 body=body,
-                can_write=self._has_write(repo, author),
+                can_write=bool(access),
+                can_write_known=access is not None,
                 created_at=str(row.get("submitted_at") or row.get("created_at") or ""),
                 kind=kind,
                 path=str(row.get("path") or ""),

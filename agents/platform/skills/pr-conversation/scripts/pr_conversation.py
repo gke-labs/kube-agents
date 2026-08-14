@@ -22,6 +22,13 @@ comment — it is the same request being answered again on every tick, ten minut
 apart, forever. So the marker is appended here, from the ``--comment-id`` the
 command already requires, and cannot be forgotten.
 
+Being unforgettable is not enough on its own, because the id is still the
+model's to supply. A numeric comment id, a truncated node id, or the id of a
+neighbouring comment all produce a marker that matches nothing, which is the
+same runaway by a slower road. ``--comment-id`` is therefore checked against the
+requests the forge reports as unanswered at that moment, and a mismatch fails
+before anything is posted.
+
 Why ``poll`` carries the whole thread and not just the triggers
 ---------------------------------------------------------------
 Being addressed is what *wakes* the agent; it is not the whole of what it needs
@@ -88,11 +95,62 @@ def _resolve_repo() -> str:
     return repo
 
 
-def _find_pr(provider, repo: str, number: int):
+def _find_pr(provider, repo: str, number: int, viewer: str):
+    """The agent's own open pull request `number`, or exit.
+
+    Scoped by `is_agent_pull_request` rather than by number alone: `reply`
+    posts publicly under the agent's identity, and the sweep only ever files
+    cards for pull requests the agent opened. A number that resolves to
+    somebody else's is a bad card or a bad hand-run, not something to answer.
+    """
     for pr in provider.list_open_prs(repo):
-        if pr.number == number:
-            return pr
+        if pr.number != number:
+            continue
+        if not forge.is_agent_pull_request(pr, repo, viewer):
+            _fail(f"{repo}#{number} is not one of this agent's pull requests.")
+        return pr
     _fail(f"{repo}#{number} is not an open pull request.")
+
+
+def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
+    """Every comment on one pull request, and the unanswered requests among them.
+
+    One implementation for both readers, because the sweep's filters are
+    load-bearing and a second copy that drifted would let the worker act on a
+    comment the gate deliberately passed over.
+    """
+    comments = provider.list_comments(repo, pr)
+    handled = pr_triggers.handled_node_ids(comments, viewer)
+    allowed_bots = pr_triggers.bot_allowlist()
+    requests = []
+    for comment in comments:
+        if comment.node_id in handled:
+            continue
+        if forge.normalise_login(comment.author) == viewer:
+            continue
+        if not pr_triggers.is_addressable_bot(comment, allowed_bots):
+            continue
+        trigger = pr_triggers.find_trigger(
+            comment.body, viewer, comment.node_id, comment.author
+        )
+        if trigger is None:
+            continue
+        requests.append(
+            {
+                "pr": pr.number,
+                "head_ref": pr.head_ref,
+                "comment_id": comment.node_id,
+                "author": comment.author,
+                "can_write": comment.can_write,
+                "can_write_known": comment.can_write_known,
+                "kind": trigger.kind,
+                "request": trigger.request,
+                "created_at": comment.created_at,
+                "path": comment.path,
+                "line": comment.line,
+            }
+        )
+    return comments, requests
 
 
 def _confined_body(path: str) -> str:
@@ -180,10 +238,14 @@ def handle_poll(args) -> int:
     provider = forge.provider_for()
     try:
         provider.preflight()
+        viewer = provider.viewer_login()
+        if not viewer:
+            print(json.dumps({"status": "ERROR", "reason": "VIEWER_UNKNOWN", "value": ""}))
+            return 0
         prs = [
             pr
             for pr in provider.list_open_prs(repo)
-            if pr.is_agent_authored and not pr.is_ignored
+            if forge.is_agent_pull_request(pr, repo, viewer) and not pr.is_ignored
         ]
         if args.pr:
             prs = [pr for pr in prs if pr.number == args.pr]
@@ -191,34 +253,7 @@ def handle_poll(args) -> int:
         found = []
         threads = []
         for pr in prs:
-            self_login = provider.self_login(pr)
-            comments = provider.list_comments(repo, pr)
-            handled = pr_triggers.handled_node_ids(comments, self_login)
-            pr_requests = []
-            for comment in comments:
-                if comment.node_id in handled:
-                    continue
-                if forge.normalise_login(comment.author) == self_login:
-                    continue
-                trigger = pr_triggers.find_trigger(
-                    comment.body, self_login, comment.node_id, comment.author
-                )
-                if trigger is None:
-                    continue
-                pr_requests.append(
-                    {
-                        "pr": pr.number,
-                        "head_ref": pr.head_ref,
-                        "comment_id": comment.node_id,
-                        "author": comment.author,
-                        "can_write": comment.can_write,
-                        "kind": trigger.kind,
-                        "request": trigger.request,
-                        "created_at": comment.created_at,
-                        "path": comment.path,
-                        "line": comment.line,
-                    }
-                )
+            comments, pr_requests = _requests_on(provider, repo, pr, viewer)
             if not pr_requests:
                 # No thread without a request in it: the worker is answering
                 # something, and a transcript of a pull request nobody addressed
@@ -226,7 +261,7 @@ def handle_poll(args) -> int:
                 continue
             found.extend(pr_requests)
             rows, omitted_earlier = _conversation(
-                comments, self_login, {row["comment_id"] for row in pr_requests}
+                comments, viewer, {row["comment_id"] for row in pr_requests}
             )
             thread = {"pr": pr.number, "head_ref": pr.head_ref, "comments": rows}
             if omitted_earlier:
@@ -259,8 +294,38 @@ def handle_poll(args) -> int:
 def _post(args, marker_kind: str) -> int:
     repo = _resolve_repo()
     provider = forge.provider_for()
-    provider.preflight()
-    pr = _find_pr(provider, repo, args.pr)
+
+    # Everything that talks to the forge before the post, inside one guard.
+    # `handle_poll` turns a `ForgeError` into a reason code the SKILL tells the
+    # model to read; leaving these outside the guard meant an auth blip handed
+    # it a Python traceback instead, after it had already written the body.
+    try:
+        provider.preflight()
+        viewer = provider.viewer_login()
+        if not viewer:
+            _fail("the GitHub credential could not name the account it authenticates as.")
+        pr = _find_pr(provider, repo, args.pr, viewer)
+        _, requests = _requests_on(provider, repo, pr, viewer)
+    except forge.ForgeError as error:
+        _fail(f"{error.reason}: {error.value}")
+
+    # The marker closes the request named by `--comment-id`, and the model
+    # supplies that id. A numeric id, a truncated node id, or the id of a
+    # different comment all post a real answer stamped with a marker that
+    # matches nothing — so `handled_node_ids` keeps returning the request, and
+    # the sweep re-answers it every ten minutes. That is the exact failure this
+    # helper exists to prevent, so the id is checked against the requests the
+    # forge reports as unanswered right now rather than trusted.
+    pending_ids = {row["comment_id"] for row in requests}
+    if args.comment_id not in pending_ids:
+        _fail(
+            f"{args.comment_id} is not an unanswered request on {repo}#{args.pr}. "
+            + (
+                "Unanswered right now: " + ", ".join(sorted(pending_ids))
+                if pending_ids
+                else "There are no unanswered requests on it."
+            )
+        )
 
     body = _confined_body(args.body_file).rstrip()
     stamped = f"{body}\n\n{pr_triggers.marker(args.comment_id, marker_kind)}\n"

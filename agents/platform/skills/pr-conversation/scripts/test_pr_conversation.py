@@ -22,7 +22,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -47,22 +47,24 @@ def _load_helper():
 helper = _load_helper()
 
 SELF = "kube-agents-bot"
+REPO = "acme/toolkit"
 
 
 class FakeProvider:
     supports_acknowledge = True
 
-    def __init__(self, prs=None, comments=None, post_error=None):
+    def __init__(self, prs=None, comments=None, post_error=None, viewer=SELF):
         self.prs = prs or []
         self.comments = comments or {}
         self.post_error = post_error
+        self._viewer = viewer
         self.posted = []
 
     def preflight(self):
         pass
 
-    def self_login(self, pr):
-        return SELF
+    def viewer_login(self):
+        return self._viewer
 
     def list_open_prs(self, repo):
         return list(self.prs)
@@ -77,9 +79,19 @@ class FakeProvider:
             self.posted.append((pr.number, handle.read()))
 
 
-def make_pr(number=12, head_ref="platform-agent/x", labels=()):
+def make_pr(
+    number=12,
+    head_ref="platform-agent/x",
+    labels=(),
+    author=f"{SELF}[bot]",
+    head_repo=REPO,
+):
     return forge.PullRequest(
-        number=number, head_ref=head_ref, author=f"{SELF}[bot]", labels=labels
+        number=number,
+        head_ref=head_ref,
+        author=author,
+        labels=labels,
+        head_repo=head_repo,
     )
 
 
@@ -92,6 +104,7 @@ def make_comment(
     kind="issue",
     path="",
     line=None,
+    can_write_known=True,
 ):
     return forge.Comment(
         node_id=node_id,
@@ -103,6 +116,7 @@ def make_comment(
         kind=kind,
         path=path,
         line=line,
+        can_write_known=can_write_known,
     )
 
 
@@ -123,7 +137,7 @@ class _Harness(unittest.TestCase):
         Path(path).write_text(content, encoding="utf-8")
         return path
 
-    def run_helper(self, argv, provider, repo="acme/toolkit", repo_error=None):
+    def run_helper(self, argv, provider, repo=REPO, repo_error=None):
         target = (
             mock.Mock(side_effect=repo_error)
             if repo_error
@@ -419,6 +433,20 @@ class ConversationContextTest(_Harness):
         self.assertNotIn("conversations", payload)
 
 
+def answerable(prs=None, request="/agent bump to 4", **kwargs):
+    """A provider with one unanswered request, ``IC_1``, on pull request 12.
+
+    Every `reply` and `refuse` path needs one: the helper checks
+    `--comment-id` against the requests the forge reports as unanswered, so a
+    fixture with no comments on it is a pull request with nothing to answer.
+    """
+    return FakeProvider(
+        prs=prs if prs is not None else [make_pr()],
+        comments={12: [make_comment("IC_1", request)]},
+        **kwargs,
+    )
+
+
 class ReplyTest(_Harness):
     def _reply(self, provider, body="Bumped it to 4.", command="reply"):
         path = self.scratch_file("reply.md", body)
@@ -429,7 +457,7 @@ class ReplyTest(_Harness):
 
     def test_the_marker_is_appended_by_the_helper(self):
         """The model cannot forget it, because the model does not write it."""
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         self._reply(provider)
         _number, posted = provider.posted[0]
         self.assertIn("Bumped it to 4.", posted)
@@ -437,7 +465,7 @@ class ReplyTest(_Harness):
 
     def test_the_posted_marker_reads_back_as_handled(self):
         """Round-trip: what `reply` writes is what the sweep's scan looks for."""
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         self._reply(provider)
         _number, posted = provider.posted[0]
         self.assertEqual(
@@ -448,19 +476,19 @@ class ReplyTest(_Harness):
         )
 
     def test_refuse_uses_the_refusal_marker(self):
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         self._reply(provider, body="Not in scope.", command="refuse")
         self.assertIn("<!-- agent-refused:IC_1 -->", provider.posted[0][1])
 
     def test_the_success_line_is_machine_readable(self):
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         _rc, out = self._reply(provider)
         payload = json.loads(out)
         self.assertEqual(payload["status"], "POSTED")
         self.assertEqual(payload["comment_id"], "IC_1")
 
     def test_a_body_outside_scratch_is_rejected(self):
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as handle:
             handle.write("elsewhere")
             outside = handle.name
@@ -474,7 +502,7 @@ class ReplyTest(_Harness):
 
     def test_a_symlink_out_of_scratch_is_rejected(self):
         """`realpath` before the prefix check, not after."""
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as handle:
             handle.write("elsewhere")
             outside = handle.name
@@ -489,7 +517,7 @@ class ReplyTest(_Harness):
         self.assertEqual(provider.posted, [])
 
     def test_a_missing_body_is_rejected(self):
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         with self.assertRaises(SystemExit):
             self.run_helper(
                 [
@@ -506,32 +534,147 @@ class ReplyTest(_Harness):
 
     def test_an_empty_body_is_rejected(self):
         """An empty comment marks the request answered without answering it."""
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         with self.assertRaises(SystemExit):
             self._reply(provider, body="   \n")
         self.assertEqual(provider.posted, [])
 
     def test_a_pr_that_is_not_open_is_rejected(self):
-        provider = FakeProvider(prs=[make_pr(13)])
+        provider = answerable(prs=[make_pr(13)])
         with self.assertRaises(SystemExit):
             self._reply(provider)
 
+    def test_a_pull_request_that_is_not_ours_is_rejected(self):
+        """The same scope rule as the sweep, enforced where the write happens.
+
+        `--pr` comes from a card, and a card is a pointer the worker is not
+        obliged to trust. Posting to a stranger's fork branch would put the
+        agent's voice on a pull request it never opened.
+        """
+        provider = answerable(prs=[make_pr(author="stranger")])
+        with self.assertRaises(SystemExit):
+            self._reply(provider)
+        self.assertEqual(provider.posted, [])
+
+    def test_a_credential_that_cannot_name_itself_blocks_the_post(self):
+        provider = answerable(viewer="")
+        with self.assertRaises(SystemExit):
+            self._reply(provider)
+        self.assertEqual(provider.posted, [])
+
+
     def test_a_failed_post_exits_non_zero(self):
-        provider = FakeProvider(
-            prs=[make_pr()], post_error=forge.ForgeError("REPO_UNREACHABLE", "403")
-        )
+        provider = answerable(post_error=forge.ForgeError("REPO_UNREACHABLE", "403"))
         with self.assertRaises(SystemExit) as ctx:
             self._reply(provider)
         self.assertNotEqual(ctx.exception.code, 0)
 
     def test_the_stamped_copy_does_not_survive_the_run(self):
-        provider = FakeProvider(prs=[make_pr()])
+        provider = answerable()
         self._reply(provider)
         leftovers = [
             name for name in os.listdir(self.scratch) if name != "reply.md"
         ]
         self.assertEqual(leftovers, [])
 
+
+class CommentIdValidationTest(_Harness):
+    """`--comment-id` is checked against the forge, not trusted.
+
+    A wrong id posts a real, visible answer stamped with a marker that closes
+    nothing: `handled_node_ids` keeps returning the request, so the sweep files
+    the card again on the next tick and the agent answers the same comment
+    every ten minutes. Failing before the post is the only place that loop can
+    be cut, because after it the comment is already public.
+    """
+
+    def _post(self, provider, comment_id, command="reply"):
+        path = self.scratch_file("reply.md", "Bumped it to 4.")
+        return self.run_helper(
+            [command, "--pr", "12", "--comment-id", comment_id, "--body-file", path],
+            provider,
+        )
+
+    def test_an_id_that_is_not_a_pending_request_is_rejected(self):
+        provider = answerable()
+        with self.assertRaises(SystemExit):
+            self._post(provider, "IC_TYPO")
+        self.assertEqual(provider.posted, [])
+
+    def test_the_numeric_id_is_not_the_node_id(self):
+        """The likeliest slip: both are on the row, only one closes the loop."""
+        provider = answerable()
+        with self.assertRaises(SystemExit):
+            self._post(provider, "1")
+        self.assertEqual(provider.posted, [])
+
+    def test_an_already_answered_request_cannot_be_answered_twice(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment("IC_1", "/agent x"),
+                    make_comment(
+                        "IC_9", pr_triggers.marker("IC_1"), author=f"{SELF}[bot]"
+                    ),
+                ]
+            },
+        )
+        with self.assertRaises(SystemExit):
+            self._post(provider, "IC_1")
+        self.assertEqual(provider.posted, [])
+
+    def test_an_untrusted_request_can_still_be_refused(self):
+        """Refusing is the answer to one, so it must stay reachable."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", can_write=False)]},
+        )
+        self._post(provider, "IC_1", command="refuse")
+        self.assertIn("<!-- agent-refused:IC_1 -->", provider.posted[0][1])
+
+    def test_a_bot_request_the_sweep_passed_over_is_not_answerable(self):
+        """The worker and the sweep must agree on who may address the agent.
+
+        They read the same allowlist through `pr_triggers`. If the worker were
+        laxer, a card filed for one comment would license answering an
+        unrelated bot on the same pull request.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]")]},
+        )
+        with self.assertRaises(SystemExit):
+            self._post(provider, "IC_1")
+        self.assertEqual(provider.posted, [])
+
+    def test_an_allowlisted_bot_is_answerable(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
+        )
+        with mock.patch.dict(
+            "os.environ", {pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}, clear=False
+        ):
+            self._post(provider, "IC_1")
+        self.assertIn("<!-- agent-answered:IC_1 -->", provider.posted[0][1])
+
+    def test_the_error_names_what_is_actually_pending(self):
+        """So the model's next attempt is a corrected id, not another guess."""
+        provider = answerable()
+        err = StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit):
+            self._post(provider, "IC_TYPO")
+        self.assertIn("IC_1", err.getvalue())
+
+    def test_a_pr_with_nothing_pending_says_so_rather_than_listing_nothing(self):
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", "looks good")]}
+        )
+        err = StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit):
+            self._post(provider, "IC_1")
+        self.assertIn("no unanswered requests", err.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

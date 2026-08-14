@@ -45,10 +45,19 @@ when `audit_report.py` migrates onto this module.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 
 from forge import normalise_login
+
+#: Comma-separated logins whose comments may address the agent despite ending in
+#: `[bot]`. Empty by default: two agents that answer each other's mentions is a
+#: loop nobody is watching, and the loop costs a model turn per lap. Policy
+#: rather than mechanism, and read here rather than in either consumer because
+#: the sweep and the worker skill must not disagree about it — a comment the
+#: gate passed over must not become one the worker acts on.
+BOT_ALLOWLIST_ENV = "PR_AGENT_BOT_ALLOWLIST"
 
 #: The command form. A leading `/` mirrors `/remediate` on the audit ledger and
 #: `/review` on this repository's own pull requests, so a reviewer who has seen
@@ -222,22 +231,55 @@ def strip_markers(text: str) -> str:
     return MARKER_RE.sub("", normalise_newlines(text)).strip()
 
 
-def handled_node_ids(comments, self_login: str) -> set[str]:
-    """Node ids already answered or refused, per the agent's own comments.
+def bot_allowlist() -> set[str]:
+    """Logins allowed to address the agent despite the `[bot]` suffix."""
+    raw = os.environ.get(BOT_ALLOWLIST_ENV, "")
+    return {normalise_login(name) for name in raw.split(",") if name.strip()}
 
-    `comments` is any iterable of `forge.Comment`. Only comments whose author
-    normalises to `self_login` are read: see the module docstring for why that
-    restriction is the whole security of the scheme.
+
+def is_addressable_bot(comment, allowed: set[str]) -> bool:
+    """May this comment be read as addressing the agent, given its author?
+
+    True for every human. A `[bot]` author has to be named in the allowlist,
+    which is what keeps two agents from answering each other's mentions in a
+    loop that costs a model turn per lap.
+    """
+    return not comment.is_bot or normalise_login(comment.author) in allowed
+
+
+def _marked_node_ids(comments, self_login: str, kinds) -> set[str]:
+    """Node ids carrying one of `kinds` in a comment the agent wrote itself.
+
+    Only comments whose author normalises to `self_login` are read: see the
+    module docstring for why that restriction is the whole security of the
+    scheme.
 
     Bodies are scanned raw rather than fence-stripped. The agent writes these
     markers itself and does not fence them; stripping first would only create a
     way for its own quoting to erase its own record.
     """
     wanted = normalise_login(self_login)
-    handled: set[str] = set()
+    found: set[str] = set()
     for comment in comments:
         if normalise_login(comment.author) != wanted:
             continue
-        for _kind, node_id in MARKER_RE.findall(comment.body or ""):
-            handled.add(node_id)
-    return handled
+        for kind, node_id in MARKER_RE.findall(comment.body or ""):
+            if kind in kinds:
+                found.add(node_id)
+    return found
+
+
+def handled_node_ids(comments, self_login: str) -> set[str]:
+    """Node ids already answered or refused, per the agent's own comments."""
+    return _marked_node_ids(comments, self_login, ("answered", "refused"))
+
+
+def refused_node_ids(comments, self_login: str) -> set[str]:
+    """Node ids the agent has already refused on this pull request.
+
+    Counted rather than merely tested, because refusals are bounded per pull
+    request as well as per tick: each one is a public comment, and an account
+    that cannot be acted on at all should not be able to make the agent write
+    an unbounded number of them.
+    """
+    return _marked_node_ids(comments, self_login, ("refused",))

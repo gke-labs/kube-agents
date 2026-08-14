@@ -14,8 +14,12 @@ Four properties carry most of the weight:
   and the bug is invisible until someone types in the wrong box.
 * **`--paginate` is present on every list.** A truncated page looks exactly
   like a complete one, so nothing downstream can notice its absence.
-* **Truncation is never silent.** `gh pr list --limit` drops the overflow
-  without a word; a full page therefore has to raise rather than be trusted.
+* **Ownership needs all three of author, branch and head repository.** Any one
+  of them alone is something a stranger can arrange — a fork PR carries the bare
+  branch name, so `platform-agent/anything` is a name anybody can choose.
+* **An unknown permission is not a "no".** A 404 from the collaborator endpoint
+  means no write access; a proxy fault means nothing at all, and the sweep turns
+  a "no" into a public refusal that is never retried.
 * **The repository parser agrees with `resolver.py`'s.** They are two copies of
   one hardened parser, and `ParserAgreementTest` is what stops them drifting
   until `resolver.py` migrates onto this module.
@@ -253,20 +257,78 @@ class NormaliseLoginTest(unittest.TestCase):
         self.assertEqual(forge.normalise_login(None), "")
 
 
-class PullRequestTest(unittest.TestCase):
-    def _pr(self, head_ref="platform-agent/fix-1", labels=()):
+REPO = "acme/toolkit"
+VIEWER = "kube-agents-bot"
+
+
+class IsAgentPullRequestTest(unittest.TestCase):
+    """Three conditions, and a test for each one failing on its own."""
+
+    def _pr(
+        self,
+        head_ref="platform-agent/fix-1",
+        author="kube-agents-bot[bot]",
+        head_repo=REPO,
+        labels=(),
+    ):
         return forge.PullRequest(
-            number=7, head_ref=head_ref, author="kube-agents-bot[bot]", labels=labels
+            number=7,
+            head_ref=head_ref,
+            author=author,
+            labels=labels,
+            head_repo=head_repo,
         )
 
-    def test_agent_branch_prefix_identifies_our_own_pr(self):
-        self.assertTrue(self._pr().is_agent_authored)
+    def _ours(self, pr, viewer=VIEWER):
+        return forge.is_agent_pull_request(pr, REPO, viewer)
 
-    def test_a_human_branch_is_not_agent_authored(self):
-        self.assertFalse(self._pr(head_ref="feat/whatever").is_agent_authored)
+    def test_our_own_pull_request_qualifies(self):
+        self.assertTrue(self._ours(self._pr()))
 
-    def test_a_branch_merely_containing_the_prefix_does_not_count(self):
-        self.assertFalse(self._pr(head_ref="wip/platform-agent/x").is_agent_authored)
+    def test_a_human_branch_does_not(self):
+        self.assertFalse(self._ours(self._pr(head_ref="feat/whatever")))
+
+    def test_a_branch_merely_containing_the_prefix_does_not(self):
+        self.assertFalse(self._ours(self._pr(head_ref="wip/platform-agent/x")))
+
+    def test_a_fork_branch_with_our_prefix_is_not_ours(self):
+        """The branch name is the attacker's to choose on a fork.
+
+        `head.ref` carries the bare branch name for a cross-repository pull
+        request, so anyone who can fork this repository can open one that reads
+        `platform-agent/anything`. Accepting it would hand a stranger's pull
+        request to `submit-suggestion`, which amends by pushing `head_ref` to
+        *this* repository.
+        """
+        self.assertFalse(
+            self._ours(self._pr(author="stranger", head_repo="stranger/toolkit"))
+        )
+
+    def test_our_prefix_on_a_fork_is_still_not_ours_even_authored_by_us(self):
+        self.assertFalse(self._ours(self._pr(head_repo="somebody/toolkit")))
+
+    def test_a_deleted_fork_reads_as_not_ours(self):
+        """`head.repo` is null once the fork is gone; unknown is not local."""
+        self.assertFalse(self._ours(self._pr(head_repo="")))
+
+    def test_someone_elses_pull_request_on_our_branch_name_is_not_ours(self):
+        """Where the re-answer loop came from.
+
+        A maintainer can push `platform-agent/x` here and open a pull request
+        on it. Keying identity off `pr.author` would then make a human the
+        agent's "self", so no marker it wrote would be recognised as its own and
+        every tick would re-answer the same comment.
+        """
+        self.assertFalse(self._ours(self._pr(author="maintainer")))
+
+    def test_the_author_comparison_is_normalised(self):
+        self.assertTrue(self._ours(self._pr(author="App/Kube-Agents-Bot")))
+
+    def test_repository_comparison_is_case_insensitive(self):
+        self.assertTrue(self._ours(self._pr(head_repo="Acme/Toolkit")))
+
+    def test_no_viewer_means_nothing_is_ours(self):
+        self.assertFalse(self._ours(self._pr(), viewer=""))
 
     def test_ignore_label_opts_out(self):
         self.assertTrue(self._pr(labels=("agent:ignore",)).is_ignored)
@@ -344,63 +406,96 @@ PRS_JSON = json.dumps(
     [
         {
             "number": 12,
-            "headRefName": "platform-agent/bump-replicas",
-            "author": {"login": "kube-agents-bot"},
+            "head": {
+                "ref": "platform-agent/bump-replicas",
+                "repo": {"full_name": "acme/toolkit"},
+            },
+            "user": {"login": "kube-agents-bot[bot]"},
             "labels": [{"name": "automated"}],
-            "url": "https://github.com/acme/toolkit/pull/12",
+            "html_url": "https://github.com/acme/toolkit/pull/12",
         },
         {
             "number": 13,
-            "headRefName": "feat/human-work",
-            "author": {"login": "someone"},
+            "head": {
+                "ref": "platform-agent/looks-like-ours",
+                # Same branch name, somebody else's repository.
+                "repo": {"full_name": "stranger/toolkit"},
+            },
+            "user": {"login": "stranger"},
             "labels": [],
-            "url": "https://github.com/acme/toolkit/pull/13",
+            "html_url": "https://github.com/acme/toolkit/pull/13",
         },
     ]
 )
 
+PULLS_ENDPOINT = "repos/acme/toolkit/pulls"
+
 
 class ListOpenPrsTest(unittest.TestCase):
     def test_rows_are_normalised(self):
-        provider = forge.GitHubProvider(run=FakeGh({"pr list": (0, PRS_JSON, "")}))
-        prs = provider.list_open_prs("acme/toolkit")
+        provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, PRS_JSON, "")}))
+        prs = provider.list_open_prs(REPO)
         self.assertEqual([p.number for p in prs], [12, 13])
         self.assertEqual(prs[0].head_ref, "platform-agent/bump-replicas")
         self.assertEqual(prs[0].labels, ("automated",))
-        self.assertTrue(prs[0].is_agent_authored)
-        self.assertFalse(prs[1].is_agent_authored)
+        self.assertEqual(prs[0].url, "https://github.com/acme/toolkit/pull/12")
+        self.assertTrue(forge.is_agent_pull_request(prs[0], REPO, VIEWER))
+        self.assertFalse(forge.is_agent_pull_request(prs[1], REPO, VIEWER))
+
+    def test_the_head_repository_is_carried_through(self):
+        """The field `gh pr list` does not have, and the fork check needs."""
+        provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, PRS_JSON, "")}))
+        prs = provider.list_open_prs(REPO)
+        self.assertEqual(prs[0].head_repo, "acme/toolkit")
+        self.assertEqual(prs[1].head_repo, "stranger/toolkit")
 
     def test_argv_scopes_the_repo_and_asks_only_for_open_prs(self):
-        fake = FakeGh({"pr list": (0, PRS_JSON, "")})
-        forge.GitHubProvider(run=fake).list_open_prs("acme/toolkit")
-        argv = fake.argv_containing("pr list")
-        self.assertIn("-R", argv)
-        self.assertEqual(argv[argv.index("-R") + 1], "acme/toolkit")
-        self.assertEqual(argv[argv.index("--state") + 1], "open")
+        fake = FakeGh({PULLS_ENDPOINT: (0, PRS_JSON, "")})
+        forge.GitHubProvider(run=fake).list_open_prs(REPO)
+        argv = fake.argv_containing(PULLS_ENDPOINT)
+        self.assertIn("state=open", " ".join(argv))
 
-    def test_a_full_page_raises_rather_than_truncating_silently(self):
+    def test_the_listing_paginates_rather_than_truncating(self):
+        """`gh pr list --limit` drops the overflow and says nothing.
+
+        Human pull requests share that budget, so on a busy repository the
+        agent's own would fall out of the window. The previous code raised on a
+        full page instead, which on a `deliver: "all"` job at `*/10` is 144
+        identical warnings a day with the feature switched off.
+        """
+        fake = FakeGh({PULLS_ENDPOINT: (0, PRS_JSON, "")})
+        forge.GitHubProvider(run=fake).list_open_prs(REPO)
+        self.assertIn("--paginate", fake.argv_containing(PULLS_ENDPOINT))
+
+    def test_a_full_page_is_returned_rather_than_refused(self):
         rows = json.dumps(
             [
                 {
                     "number": n,
-                    "headRefName": f"platform-agent/x{n}",
-                    "author": {"login": "bot"},
+                    "head": {"ref": f"platform-agent/x{n}", "repo": {"full_name": REPO}},
+                    "user": {"login": "bot"},
                     "labels": [],
                 }
-                for n in range(forge.PR_PAGE_LIMIT)
+                for n in range(forge.PR_PAGE_SIZE)
             ]
         )
-        provider = forge.GitHubProvider(run=FakeGh({"pr list": (0, rows, "")}))
-        with self.assertRaises(forge.ForgeError) as ctx:
-            provider.list_open_prs("acme/toolkit")
-        self.assertEqual(ctx.exception.reason, "PR_PAGE_TRUNCATED")
+        provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(len(provider.list_open_prs(REPO)), forge.PR_PAGE_SIZE)
 
     def test_missing_fields_do_not_crash_the_sweep(self):
-        provider = forge.GitHubProvider(run=FakeGh({"pr list": (0, "[{}]", "")}))
-        prs = provider.list_open_prs("acme/toolkit")
+        provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, "[{}]", "")}))
+        prs = provider.list_open_prs(REPO)
         self.assertEqual(prs[0].number, 0)
         self.assertEqual(prs[0].author, "")
-        self.assertFalse(prs[0].is_agent_authored)
+        self.assertEqual(prs[0].head_repo, "")
+        self.assertFalse(forge.is_agent_pull_request(prs[0], REPO, VIEWER))
+
+    def test_a_deleted_fork_leaves_a_null_head_repo(self):
+        rows = json.dumps(
+            [{"number": 4, "head": {"ref": "platform-agent/x", "repo": None}}]
+        )
+        provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(provider.list_open_prs(REPO)[0].head_repo, "")
 
 
 ISSUE_COMMENTS = json.dumps(
@@ -734,13 +829,142 @@ class AcknowledgeTest(unittest.TestCase):
         )
 
 
-class SelfLoginTest(unittest.TestCase):
-    def test_taken_from_the_pr_author_and_normalised(self):
-        pr = forge.PullRequest(
-            number=1, head_ref="platform-agent/x", author="Kube-Agents-Bot[bot]"
+AUTH_OK = (
+    "github.com\n"
+    "  ✓ Logged in to github.com account toshiowang-labs-kube-agents[bot] "
+    "(/var/lib/credential-proxy/home/.config/gh/hosts.yml)\n"
+    "  - Active account: true\n"
+)
+AUTH_BROKEN = (
+    "github.com\n"
+    "  X Failed to log in to github.com account toshiowang-labs-kube-agents[bot] "
+    "(/var/lib/credential-proxy/home/.config/gh/hosts.yml)\n"
+    "  - The token in hosts.yml is invalid.\n"
+)
+
+
+class ViewerLoginTest(unittest.TestCase):
+    """The identity that decides what is ours, and whose comments are ours."""
+
+    def test_the_account_is_read_from_auth_status_and_normalised(self):
+        provider = forge.GitHubProvider(run=FakeGh({"auth status": (0, AUTH_OK, "")}))
+        self.assertEqual(provider.viewer_login(), "toshiowang-labs-kube-agents")
+
+    def test_it_never_asks_the_user_endpoint(self):
+        """An installation token gets 401 from `GET /user` — verified live."""
+        fake = FakeGh({"auth status": (0, AUTH_OK, "")})
+        forge.GitHubProvider(run=fake).viewer_login()
+        self.assertNotIn(["api", "user"], fake.calls)
+
+    def test_stderr_is_read_too(self):
+        """`gh` has moved this between streams across versions."""
+        provider = forge.GitHubProvider(run=FakeGh({"auth status": (0, "", AUTH_OK)}))
+        self.assertEqual(provider.viewer_login(), "toshiowang-labs-kube-agents")
+
+    def test_a_broken_credential_names_nobody(self):
+        """The failure line names an account whose token no longer works."""
+        provider = forge.GitHubProvider(
+            run=FakeGh({"auth status": (1, AUTH_BROKEN, "")})
         )
-        provider = forge.GitHubProvider(run=FakeGh())
-        self.assertEqual(provider.self_login(pr), "kube-agents-bot")
+        self.assertEqual(provider.viewer_login(), "")
+
+    def test_unrecognisable_output_is_empty_rather_than_a_guess(self):
+        provider = forge.GitHubProvider(run=FakeGh({"auth status": (0, "hello", "")}))
+        self.assertEqual(provider.viewer_login(), "")
+
+    def test_it_is_resolved_once_per_provider(self):
+        fake = FakeGh({"auth status": (0, AUTH_OK, "")})
+        provider = forge.GitHubProvider(run=fake)
+        provider.viewer_login()
+        provider.viewer_login()
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["auth", "status"]]), 1)
+
+    def test_an_empty_answer_is_cached_too(self):
+        fake = FakeGh({"auth status": (0, "hello", "")})
+        provider = forge.GitHubProvider(run=fake)
+        provider.viewer_login()
+        provider.viewer_login()
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["auth", "status"]]), 1)
+
+
+class PermissionUnknownTest(unittest.TestCase):
+    """A 404 is an answer; anything else is not.
+
+    The sweep answers a `False` with a public refusal stamped with a marker that
+    stops the request ever being retried. Collapsing a transient fault into that
+    `False` permanently refuses a maintainer over a network blip.
+    """
+
+    def _comment_with(self, permission_response):
+        rows = json.dumps(
+            [
+                {
+                    "id": 1,
+                    "node_id": "IC_x",
+                    "user": {"login": "maintainer"},
+                    "body": "/agent go",
+                    "created_at": "2026-08-12T10:00:00Z",
+                }
+            ]
+        )
+        fake = FakeGh(
+            {
+                "issues/12/comments": (0, rows, ""),
+                "collaborators/maintainer/permission": permission_response,
+            }
+        )
+        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+        return forge.GitHubProvider(run=fake).list_comments(REPO, pr)[0]
+
+    def test_a_404_is_a_definitive_no(self):
+        comment = self._comment_with((1, "", "gh: Not Found (HTTP 404)"))
+        self.assertFalse(comment.can_write)
+        self.assertTrue(comment.can_write_known)
+
+    def test_a_server_error_is_not_an_answer(self):
+        comment = self._comment_with((1, "", "gh: Server Error (HTTP 502)"))
+        self.assertFalse(comment.can_write)
+        self.assertFalse(comment.can_write_known)
+
+    def test_a_proxy_fault_with_no_status_is_not_an_answer(self):
+        comment = self._comment_with((1, "", "connection refused"))
+        self.assertFalse(comment.can_write_known)
+
+    def test_a_timeout_is_not_an_answer(self):
+        comment = self._comment_with(
+            (1, "", f"'gh' timed out after {forge.GH_TIMEOUT_S}s.")
+        )
+        self.assertFalse(comment.can_write_known)
+
+    def test_a_granted_permission_is_known(self):
+        comment = self._comment_with(permission("write"))
+        self.assertTrue(comment.can_write)
+        self.assertTrue(comment.can_write_known)
+
+    def test_an_unknown_answer_is_cached_rather_than_retried_per_comment(self):
+        rows = json.dumps(
+            [
+                {
+                    "id": n,
+                    "node_id": f"IC_{n}",
+                    "user": {"login": "maintainer"},
+                    "body": "/agent go",
+                    "created_at": "2026-08-12T10:00:00Z",
+                }
+                for n in (1, 2, 3)
+            ]
+        )
+        fake = FakeGh(
+            {
+                "issues/12/comments": (0, rows, ""),
+                "collaborators/maintainer/permission": (1, "", "HTTP 502"),
+            }
+        )
+        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+        comments = forge.GitHubProvider(run=fake).list_comments(REPO, pr)
+        self.assertEqual(len(comments), 3)
+        lookups = [c for c in fake.calls if "collaborators/maintainer" in " ".join(c)]
+        self.assertEqual(len(lookups), 1)
 
 
 class ProviderForTest(unittest.TestCase):
@@ -772,7 +996,7 @@ class ProtocolConformanceTest(unittest.TestCase):
     def test_github_provider_implements_every_operation(self):
         provider = forge.GitHubProvider(run=FakeGh())
         for name in (
-            "self_login",
+            "viewer_login",
             "list_open_prs",
             "list_comments",
             "post_comment",

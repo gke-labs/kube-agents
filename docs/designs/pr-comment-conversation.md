@@ -174,10 +174,12 @@ Six operations are the complete set this feature needs from a forge:
 class ForgeProvider(Protocol):
     supports_acknowledge: bool
     def preflight(self) -> None                           # raises ForgeError with a reason code
-    def self_login(self, pr) -> str                       # normalised; strips "app/" and "[bot]"
-    def list_open_prs(self, repo) -> list[PullRequest]    # number, head_ref, labels, author, url
+    def viewer_login(self) -> str                         # the account the credential is; may be ""
+    def list_open_prs(self, repo) -> list[PullRequest]    # number, head_ref, head_repo, labels,
+                                                          # author, url
     def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
-                                                          # can_write, created_at, kind, path/line
+                                                          # can_write, can_write_known,
+                                                          # created_at, kind, path/line
     def post_comment(self, repo, pr, body_file) -> None
     def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
 ```
@@ -202,24 +204,38 @@ Three shapes exist because of a forge that is not GitHub:
   claim that GitHub was exempt was mistaken.
 - **`supports_acknowledge` is a capability flag.** Bitbucket Cloud has no reactions on pull-request
   comments, so the 👀 must be legitimately optional rather than assumed by the caller.
-- **`self_login` normalises both the `app/` prefix and the `[bot]` suffix.** GitHub gives one App
+- **`normalise_login` folds the `app/` prefix, the `[bot]` suffix and case.** GitHub gives one App
   three spellings, and a single tick sees all three: `gh pr list --json author` returns
   `app/<name>`, REST comment authors carry `<name>[bot]`, and a human @-mentions the bare `<name>`.
   The plan named only the suffix. Stripping one but not the other is worse than stripping neither,
   because the mismatch is silent: no marker the agent wrote is recognised as its own, and the
-  idempotency scan re-answers the same comment on every tick. That loop was observed live.
+  idempotency scan re-answers the same comment on every tick. That loop was observed live. Case is
+  folded first, so `App/Kube-Agents-Bot` reduces to the same token as `kube-agents-bot[bot]`;
+  folding after the prefix strip leaves the `app/` on and silently reintroduces the loop.
+- **`can_write_known` says whether the permission question was answered.** A `can_write` of `False`
+  conflates "this account is not a collaborator" with "the lookup failed", and the two want opposite
+  handling: the first is refused, the second must not be, because a refusal carries a marker and is
+  therefore permanent. The collaborator endpoint's 404 is an answer; any other failure is not, so
+  the provider reports it as unknown and the sweep holds the trigger for a tick rather than guessing.
 
 The module also owns the plumbing that would otherwise become a third copy: the `gh` runner, the
 `gh auth status` preflight, and the `Git Repo:` parsing that turns `SETTINGS.md` into an
 `owner/repo`.
 
-### Four departures from this section, and why
+### Five departures from this section, and why
 
-- **`list_agent_prs` became `list_open_prs`, plus two properties on `PullRequest`**
-  (`is_agent_authored`, `is_ignored`). Which branch prefix marks an agent's own work, and which
-  label opts a pull request out, are harness policy — they would be identical on every forge, and a
+- **`list_agent_prs` became `list_open_prs`, plus `forge.is_agent_pull_request(pr, repo, viewer)`
+  and an `is_ignored` property.** Which branch prefix marks an agent's own work, and which label
+  opts a pull request out, are harness policy — they would be identical on every forge, and a
   provider that filtered on them would make each new forge re-implement the same rule. The provider
   answers "what is open"; the caller answers "which of those are mine".
+- **`self_login(pr)` became `viewer_login()`.** Deriving identity from the pull request being judged
+  is circular: it answers "is this ours" with "whoever opened it", so any pull request looks
+  self-authored to the marker scan. `viewer_login()` asks the credential instead, and the answer
+  is a property of the token rather than of the thing under test. `GET /user` is not available — an
+  installation token cannot introspect itself and returns `401 Bad credentials` — so it parses the
+  account out of `gh auth status`, which reads the credential store and costs no API call. An empty
+  answer disables the whole sweep with a `⚠️` rather than falling back to the branch prefix.
 - **`preflight()` moved onto the protocol.** It began as a module-level function the sweep called
   before constructing a provider, which meant a test holding a fake provider still reached past it
   to the real `gh`. As a method, a caller that has a provider can never get behind it.
@@ -259,12 +275,23 @@ No new cron job and no new script: the watcher from §2 grows a `pr_comments` en
 reusing its repo resolution, its preflight, its per-sweep isolation, and its card filing. Everything
 deterministic lives here, so an idle tick still costs no model at all.
 
-- **Scope.** Open pull requests whose head branch starts with `platform-agent/` — the convention
-  shared by `submit_suggestion.check_branch` and `audit_report.group_branch_for` — minus any carrying
-  `agent:ignore`.
-- **Self-identity** is the pull request's own author login. Because scope is agent-authored PRs, this
-  discovers the mention handle with no configuration, and it is what stops the agent answering itself
-  into a loop.
+- **Scope.** Open pull requests that satisfy all three of: authored by the account the credential
+  authenticates as, a head branch starting with `platform-agent/` — the convention shared by
+  `submit_suggestion.check_branch` and `audit_report.group_branch_for` — and a head that lives in
+  the configured repository rather than a fork. Minus any carrying `agent:ignore`.
+
+  The plan scoped on the branch prefix alone, which is attacker-chosen: anyone may fork the
+  repository, push `platform-agent/anything`, and open a pull request from it. Every comment on that
+  pull request would then be read as a request on the agent's own work. The author check is what
+  closes it, the fork check is what stops a same-named branch on someone else's copy from standing
+  in for ours, and the prefix check remains because the agent also opens pull requests by hand
+  through `submit-suggestion` that are not conversations to watch.
+
+- **Self-identity** is `viewer_login()` — the account the GitHub credential authenticates as, asked
+  once per tick and shared by the scope test and the marker scan. The plan used the pull request's
+  own author login, which is circular (§3). If the credential cannot name itself the sweep does not
+  run at all: with no viewer there is no way to tell the agent's own marker from a pasted one, and
+  the `⚠️` line says so.
 - **Wake rule.** Explicit address only, applied after `strip_fenced_blocks`: `^[ \t]*/agent\b(.*)$`
   (multiline) or a bare `@<self-login>`. Human-to-human review chatter does not spend a turn, and a
   quoted or mid-sentence occurrence does not fire.
@@ -273,7 +300,14 @@ deterministic lives here, so an idle tick still costs no model at all.
   that. Anything else gets one refusal comment posted by the gate itself — refusing needs no
   reasoning, so it never spawns a worker. Authors ending `[bot]` are passed over in silence, with no
   marker and no refusal, unless listed in `PR_AGENT_BOT_ALLOWLIST`: refusing another bot is an
-  invitation to be answered.
+  invitation to be answered. The allowlist is read through `pr_triggers.is_addressable_bot`, so the
+  sweep and the worker cannot disagree about who may address the agent — a card filed for one
+  comment must not license answering an unrelated bot on the same pull request.
+- **A permission the forge could not report is held, not guessed.** `can_write_known` false skips
+  the trigger for the tick, writing nothing: treating it as trusted obeys a stranger, and treating
+  it as untrusted posts a public refusal at a collaborator over a transient API failure — which the
+  marker then makes permanent. Holding costs one tick and the next one asks again. The count goes
+  to stderr, like deferral.
 - **Anything the gate posts is written to `/opt/data/scratch`, never `/tmp`.** `gh` in this container
   is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
   filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
@@ -286,6 +320,13 @@ deterministic lives here, so an idle tick still costs no model at all.
   refusal comments in one tick, which is the amplification the trust gate exists to prevent.
   Deferral is logged to stderr rather than stdout — it is ordinary backpressure that clears on the
   next tick, not a fault the room needs to hear about.
+- **Refusals have a second, total bound**: `PR_AGENT_MAX_REFUSALS_PER_PR` (default 10), counted from
+  the `agent-refused` markers already in the thread. The per-tick cap alone does not bound the
+  total, because each refusal closes only the request it names — the next untrusted comment is a new
+  request, so ten ticks of three refusals is thirty comments on one pull request. The budget is
+  per pull request, so a thread being spammed cannot silence refusals on a quiet one, and a dropped
+  refusal is dropped rather than deferred: it is reported separately from `deferred` on stderr so
+  the two are not read as the same backpressure.
 - **Acknowledge** each surviving trigger (👀) before filing, when the provider supports it. Doing it
   in the gate rather than the worker means the reviewer sees a response within the tick, not after a
   model has been scheduled.
@@ -294,9 +335,11 @@ deterministic lives here, so an idle tick still costs no model at all.
   node ids, and the `notify_session_id` from §6. The node id enters that key case-preserved: it is
   base64, so folding its case could give two distinct comments one idempotency key and lose the
   second request.
-- **A pull request whose author login cannot be read is skipped loudly.** Self-identity is what §5
-  counts markers against, so an empty login would make every marker invisible and re-answer the same
-  request every ten minutes. Skipping is the safe direction; the `⚠️` line names the PR.
+- **A credential that cannot name itself stops the sweep loudly.** The viewer is what §5 counts
+  markers against, so an empty one would make every marker invisible and re-answer the same request
+  every ten minutes. Stopping is the safe direction, and it is the whole sweep rather than one pull
+  request: the identity is a property of the credential, so if it is missing nothing in the sweep is
+  decidable. The `⚠️` line says the watcher is not running and why.
 
 ### Why a third module
 
@@ -352,6 +395,15 @@ prompt:
    Bodies are confined to the scratch directory by the same `realpath` check as
    `resolver.handle_transition`, and an empty body is rejected: it would mark a request answered
    without answering it.
+
+   `--comment-id` is checked against the forge before anything is posted, rather than trusted. A
+   numeric id in place of a node id, a truncated one, or the id of a different comment all post a
+   real, visible answer stamped with a marker that closes nothing — so the sweep files the card
+   again on the next tick and the agent answers the same comment every ten minutes. After the post
+   the comment is public, so the only place to cut that loop is before it. The same check re-applies
+   the sweep's scope and bot rules at the point of writing: `--pr` comes from a card, and a card is
+   a pointer the worker is not obliged to trust.
+
 5. Complete the card with a one-line result. A request the worker posts neither a `reply` nor a
    `refuse` for is not lost — it arrives again on the next sweep. That makes an abandoned turn
    recoverable, but see the escalation below for why recoverable is not the same as noticed.

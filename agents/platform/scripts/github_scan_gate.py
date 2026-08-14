@@ -89,16 +89,20 @@ RESOLVER_TIMEOUT_S = 300
 
 # Most worker cards — and most refusals — one tick will produce. A reviewer who
 # fires ten requests at once gets the three oldest now and the rest on the next
-# tick; an account posting a hundred comments gets three refusals, not a
-# hundred. Both are bounded by the same number because both spend something the
+# tick. Both are bounded by the same number because both spend something the
 # repository can see.
 PR_MAX_PER_TICK_ENV = "PR_AGENT_MAX_PER_TICK"
 PR_MAX_PER_TICK_DEFAULT = 3
 
-# Comma-separated logins whose comments may address the agent despite ending in
-# `[bot]`. Empty by default: two agents that answer each other's mentions is a
-# loop nobody is watching, and the loop costs a model turn per lap.
-PR_BOT_ALLOWLIST_ENV = "PR_AGENT_BOT_ALLOWLIST"
+# How many refusals the agent will ever write on one pull request. The per-tick
+# cap alone does not bound this: each refusal carries a marker, so the next tick
+# moves on to the next three, and an account with no write access could make the
+# agent post a hundred public comments over an afternoon just by commenting a
+# hundred times. Past this many the requests are ignored in silence, which costs
+# the repository nothing — a collaborator can still say something, and
+# `agent:ignore` still parks the thread entirely.
+PR_MAX_REFUSALS_ENV = "PR_AGENT_MAX_REFUSALS_PER_PR"
+PR_MAX_REFUSALS_DEFAULT = 10
 
 
 @dataclass
@@ -348,24 +352,25 @@ def _forge_warning(error: Exception) -> str:
     return f"⚠️ **GitHub PR watcher is not running:** {detail}"
 
 
-def _max_per_tick() -> int:
-    raw = os.environ.get(PR_MAX_PER_TICK_ENV, "").strip()
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return PR_MAX_PER_TICK_DEFAULT
+        return default
     try:
         value = int(raw)
     except ValueError:
-        return PR_MAX_PER_TICK_DEFAULT
+        return default
     # A zero or negative cap is a legitimate way to park the sweep without
     # editing the roster, so it is honoured rather than clamped up to one.
     return max(0, value)
 
 
-def _bot_allowlist() -> set[str]:
-    raw = os.environ.get(PR_BOT_ALLOWLIST_ENV, "")
-    return {
-        forge.normalise_login(name) for name in raw.split(",") if name.strip()
-    }
+def _max_per_tick() -> int:
+    return _int_env(PR_MAX_PER_TICK_ENV, PR_MAX_PER_TICK_DEFAULT)
+
+
+def _max_refusals_per_pr() -> int:
+    return _int_env(PR_MAX_REFUSALS_ENV, PR_MAX_REFUSALS_DEFAULT)
 
 
 def _post_body(provider, repo: str, pr, body: str) -> None:
@@ -463,31 +468,38 @@ def sweep_pr_comments() -> SweepResult:
     provider = forge.provider_for()
     try:
         provider.preflight()
+        viewer = provider.viewer_login()
+        if not viewer:
+            # Without an identity the sweep cannot tell its own pull requests
+            # from a stranger's, nor its own comments from a reviewer's. Both
+            # readings fail dangerously, so it stops — loudly.
+            return SweepResult(
+                warnings=[
+                    "⚠️ **GitHub PR watcher is not running:** the GitHub "
+                    "credential could not name the account it authenticates as, "
+                    "so the agent cannot recognise its own pull requests."
+                ]
+            )
         prs = [
             pr
             for pr in provider.list_open_prs(repo)
-            if pr.is_agent_authored and not pr.is_ignored
+            if forge.is_agent_pull_request(pr, repo, viewer) and not pr.is_ignored
         ]
     except forge.ForgeError as error:
         return SweepResult(warnings=[_forge_warning(error)])
 
     cap = _max_per_tick()
-    allowed_bots = _bot_allowlist()
+    refusal_budget = _max_refusals_per_pr()
+    allowed_bots = pr_triggers.bot_allowlist()
     pending: list[_Pending] = []
     refusals: list[_Pending] = []
     unreadable: list[int] = []
-    anonymous: list[int] = []
+    indeterminate = 0
+    # Refusals already on each pull request, so the bound is a total rather than
+    # a per-tick allowance that resets every ten minutes.
+    refused_so_far: dict[int, int] = {}
 
     for pr in prs:
-        self_login = provider.self_login(pr)
-        if not self_login:
-            # Without a self identity there is no way to tell our own comments
-            # from anyone else's, so the marker scan would find nothing and the
-            # same request would be answered on every tick forever. Skipping is
-            # the safe direction, and it is loud below.
-            anonymous.append(pr.number)
-            continue
-
         try:
             comments = provider.list_comments(repo, pr)
         except forge.ForgeError:
@@ -497,52 +509,68 @@ def sweep_pr_comments() -> SweepResult:
             unreadable.append(pr.number)
             continue
 
-        handled = pr_triggers.handled_node_ids(comments, self_login)
+        handled = pr_triggers.handled_node_ids(comments, viewer)
+        refused_so_far[pr.number] = len(pr_triggers.refused_node_ids(comments, viewer))
 
         for comment in comments:
             if comment.node_id in handled:
                 continue
-            author = forge.normalise_login(comment.author)
-            if author == self_login:
+            if forge.normalise_login(comment.author) == viewer:
                 continue
-            if comment.is_bot and author not in allowed_bots:
+            if not pr_triggers.is_addressable_bot(comment, allowed_bots):
                 # No marker written: a bot comment is passed over, not refused.
                 # Answering one is how two agents end up talking to each other.
                 continue
             trigger = pr_triggers.find_trigger(
-                comment.body, self_login, comment.node_id, comment.author
+                comment.body, viewer, comment.node_id, comment.author
             )
             if trigger is None:
+                continue
+            if not comment.can_write_known:
+                # The permission lookup did not answer. Refusing now would post
+                # a public comment and mark the request closed forever on the
+                # strength of a network fault; waiting costs ten minutes.
+                indeterminate += 1
                 continue
             (pending if comment.can_write else refusals).append(
                 _Pending(pr=pr, comment=comment, trigger=trigger)
             )
 
+    if indeterminate:
+        # stderr: this is a transient the next tick clears, and a chat line
+        # every ten minutes during a proxy wobble is noise, not signal.
+        sys.stderr.write(
+            f"github_scan_gate: {indeterminate} PR trigger(s) held — write access "
+            "could not be determined this tick\n"
+        )
     if unreadable:
         warnings.append(
             "⚠️ **GitHub PR watcher could not read** "
             + ", ".join(f"{repo}#{n}" for n in sorted(unreadable))
             + " — those conversations were skipped this tick."
         )
-    if anonymous:
-        warnings.append(
-            "⚠️ **GitHub PR watcher has no author login for** "
-            + ", ".join(f"{repo}#{n}" for n in sorted(anonymous))
-            + " — it cannot tell its own comments apart there, so it is not "
-            "watching them."
-        )
-
     # Oldest first, so a burst of new comments cannot starve a request that has
     # been waiting. Ordering is global rather than per pull request because the
     # cap is global.
     pending.sort(key=lambda p: (p.comment.created_at, p.comment.node_id))
     refusals.sort(key=lambda p: (p.comment.created_at, p.comment.node_id))
 
-    for item in refusals[:cap]:
+    posted_refusals = 0
+    dropped_refusals = 0
+    for item in refusals:
         # Refusing needs no reasoning, so it never spends a model turn — but it
-        # does write to a public thread, which is why it is capped too. The
-        # marker is what stops the same account being refused every ten minutes
-        # forever.
+        # does write to a public thread, which is why it is bounded twice: by
+        # the per-tick cap it shares with worker cards, and by a total per pull
+        # request. The marker is what stops the same account being refused every
+        # ten minutes forever.
+        if posted_refusals >= cap:
+            dropped_refusals += 1
+            continue
+        if refused_so_far.get(item.pr.number, 0) >= refusal_budget:
+            # Past the budget the request is ignored rather than answered. No
+            # marker is written, so nothing is claimed to have been handled.
+            dropped_refusals += 1
+            continue
         body = f"{REFUSAL_BODY}\n\n{pr_triggers.marker(item.trigger.node_id, pr_triggers.REFUSED_MARKER)}"
         try:
             _post_body(provider, repo, item.pr, body)
@@ -550,14 +578,25 @@ def sweep_pr_comments() -> SweepResult:
             sys.stderr.write(
                 f"github_scan_gate: could not post refusal on #{item.pr.number}: {error}\n"
             )
+            continue
+        posted_refusals += 1
+        refused_so_far[item.pr.number] = refused_so_far.get(item.pr.number, 0) + 1
 
     accepted = pending[:cap]
-    deferred = len(pending) - len(accepted) + max(0, len(refusals) - cap)
+    deferred = len(pending) - len(accepted)
     if deferred:
         # stderr, not stdout: deferral is backpressure working as designed and
         # it clears on the next tick ten minutes later. Recorded rather than
         # silent, because a cap nobody can see reads as "we handled everything".
         sys.stderr.write(f"github_scan_gate: deferred {deferred} PR trigger(s) to the next tick\n")
+    if dropped_refusals:
+        # Counted separately from `deferred`, and worded differently, because
+        # some of these never come back: a request past the per-pull-request
+        # refusal budget is dropped, not queued.
+        sys.stderr.write(
+            f"github_scan_gate: {dropped_refusals} refusal(s) not posted "
+            f"(per-tick cap {cap}, per-PR budget {refusal_budget})\n"
+        )
 
     by_pr: dict[int, list[_Pending]] = {}
     for item in accepted:

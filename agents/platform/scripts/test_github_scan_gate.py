@@ -38,6 +38,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 gate = importlib.import_module("github_scan_gate")
 forge = importlib.import_module("forge")
+pr_triggers = importlib.import_module("pr_triggers")
 
 
 def _completed(stdout: str, returncode: int = 0, stderr: str = ""):
@@ -475,10 +476,10 @@ class FakeProvider:
 
     supports_acknowledge = True
 
-    def __init__(self, prs=None, comments=None, self_login=SELF, fail_on=()):
+    def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=()):
         self.prs = prs or []
         self.comments = comments or {}
-        self._self_login = self_login
+        self._viewer = viewer
         self.fail_on = set(fail_on)
         self.posted = []
         self.acknowledged = []
@@ -487,8 +488,8 @@ class FakeProvider:
     def preflight(self):
         self.preflighted = True
 
-    def self_login(self, pr):
-        return self._self_login
+    def viewer_login(self):
+        return self._viewer
 
     def list_open_prs(self, repo):
         return list(self.prs)
@@ -507,14 +508,32 @@ class FakeProvider:
         return True
 
 
-def make_pr(number=12, head_ref="platform-agent/x", labels=()):
+REPO = "acme/toolkit"
+
+
+def make_pr(
+    number=12,
+    head_ref="platform-agent/x",
+    labels=(),
+    author=f"{SELF}[bot]",
+    head_repo=REPO,
+):
     return forge.PullRequest(
-        number=number, head_ref=head_ref, author=f"{SELF}[bot]", labels=labels
+        number=number,
+        head_ref=head_ref,
+        author=author,
+        labels=labels,
+        head_repo=head_repo,
     )
 
 
 def make_comment(
-    node_id, body, author="reviewer", can_write=True, created_at="2026-08-12T10:00:00Z"
+    node_id,
+    body,
+    author="reviewer",
+    can_write=True,
+    created_at="2026-08-12T10:00:00Z",
+    can_write_known=True,
 ):
     return forge.Comment(
         node_id=node_id,
@@ -523,18 +542,23 @@ def make_comment(
         body=body,
         can_write=can_write,
         created_at=created_at,
+        can_write_known=can_write_known,
     )
 
 
 class PrCommentsSweepTest(unittest.TestCase):
-    def _sweep(self, provider, repo="acme/toolkit", env=None, repo_error=None):
+    def _sweep(self, provider, repo=REPO, env=None, repo_error=None):
         target = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=repo)
         with mock.patch.object(forge, "target_repo", target), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              mock.patch.dict("os.environ", env or {}, clear=False):
             import os
 
-            for key in (gate.PR_MAX_PER_TICK_ENV, gate.PR_BOT_ALLOWLIST_ENV):
+            for key in (
+                gate.PR_MAX_PER_TICK_ENV,
+                gate.PR_MAX_REFUSALS_ENV,
+                pr_triggers.BOT_ALLOWLIST_ENV,
+            ):
                 if not env or key not in env:
                     os.environ.pop(key, None)
             return gate.sweep_pr_comments()
@@ -761,7 +785,7 @@ class PrCommentsSweepTest(unittest.TestCase):
             comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
         )
         result = self._sweep(
-            provider, env={gate.PR_BOT_ALLOWLIST_ENV: "ci-bot"}
+            provider, env={pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}
         )
         self.assertEqual(len(result.cards), 1)
 
@@ -798,6 +822,151 @@ class PrCommentsSweepTest(unittest.TestCase):
         provider = FakeProvider(prs=[pr], comments={12: comments})
         self._sweep(provider, env={gate.PR_MAX_PER_TICK_ENV: "2"})
         self.assertEqual(len(provider.posted), 2)
+
+    def test_the_per_pr_refusal_budget_bounds_the_total_not_just_the_tick(self):
+        """The per-tick cap alone lets a thread grow refusals forever.
+
+        Each refusal carries a marker, so the request it answered is never
+        retried — but the *next* untrusted comment is a new request, and ten
+        ticks of two refusals is twenty comments on one pull request. The
+        budget counts the refusals already in the thread, so a spammer gets a
+        bounded reply and then silence.
+        """
+        pr = make_pr()
+        # Three refusals already posted by us, and two fresh untrusted requests.
+        already = [
+            make_comment(
+                f"IC_R{n}",
+                f"No. <!-- agent-refused:IC_{n} -->",
+                author=f"{SELF}[bot]",
+                created_at=f"2026-08-12T0{n}:30:00Z",
+            )
+            for n in range(3)
+        ]
+        fresh = [
+            make_comment(
+                f"IC_N{n}", "/agent x", can_write=False, created_at=f"2026-08-12T1{n}:00:00Z"
+            )
+            for n in range(2)
+        ]
+        provider = FakeProvider(prs=[pr], comments={12: already + fresh})
+        self._sweep(provider, env={gate.PR_MAX_REFUSALS_ENV: "4"})
+        # Budget 4, three already spent: exactly one more goes out.
+        self.assertEqual(len(provider.posted), 1)
+        self.assertIn("<!-- agent-refused:IC_N0 -->", provider.posted[0][1])
+
+    def test_an_exhausted_refusal_budget_posts_nothing_at_all(self):
+        pr = make_pr()
+        already = [
+            make_comment(
+                f"IC_R{n}",
+                f"No. <!-- agent-refused:IC_{n} -->",
+                author=f"{SELF}[bot]",
+                created_at=f"2026-08-12T0{n}:30:00Z",
+            )
+            for n in range(2)
+        ]
+        fresh = [make_comment("IC_N", "/agent x", can_write=False)]
+        provider = FakeProvider(prs=[pr], comments={12: already + fresh})
+        result = self._sweep(provider, env={gate.PR_MAX_REFUSALS_ENV: "2"})
+        self.assertEqual(provider.posted, [])
+        self.assertEqual(result.cards, [])
+
+    def test_the_budget_is_counted_per_pull_request(self):
+        """A noisy thread must not silence refusals on a quiet one."""
+        noisy = [
+            make_comment(
+                "IC_R0", "No. <!-- agent-refused:IC_0 -->", author=f"{SELF}[bot]"
+            ),
+            make_comment("IC_N0", "/agent x", can_write=False),
+        ]
+        provider = FakeProvider(
+            prs=[make_pr(12), make_pr(13)],
+            comments={
+                12: noisy,
+                13: [make_comment("IC_N1", "/agent y", can_write=False)],
+            },
+        )
+        self._sweep(provider, env={gate.PR_MAX_REFUSALS_ENV: "1"})
+        self.assertEqual([number for number, _body in provider.posted], [13])
+
+    # -- an unanswerable permission question -------------------------------
+    def test_a_trigger_whose_permission_is_unknown_is_held_not_guessed(self):
+        """Both guesses are wrong, so the sweep makes neither.
+
+        Treating an unknown as trusted obeys a stranger; treating it as
+        untrusted posts a public refusal at a collaborator over a transient
+        API failure — and the marker makes that refusal permanent. Holding
+        costs one tick, and the next tick asks again.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [make_comment("IC_1", "/agent x", can_write=False, can_write_known=False)]
+            },
+        )
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertEqual(provider.posted, [])
+        self.assertEqual(provider.acknowledged, [])
+
+    def test_a_held_trigger_is_answered_once_the_permission_resolves(self):
+        """Held, not dropped: nothing was written, so the next tick retries."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", can_write=True)]},
+        )
+        self.assertEqual(len(self._sweep(provider).cards), 1)
+
+    def test_holding_one_trigger_does_not_hold_its_neighbour(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment(
+                        "IC_1",
+                        "/agent a",
+                        can_write=False,
+                        can_write_known=False,
+                        created_at="2026-08-12T09:00:00Z",
+                    ),
+                    make_comment("IC_2", "/agent b", created_at="2026-08-12T10:00:00Z"),
+                ]
+            },
+        )
+        cards = self._sweep(provider).cards
+        self.assertEqual([c.idempotency_key for c in cards], ["pr-conv-acme-toolkit-12-IC_2"])
+
+    # -- whose pull request is it ------------------------------------------
+    def test_the_branch_prefix_alone_does_not_make_a_pr_ours(self):
+        """Anyone can push ``platform-agent/…`` to a fork and open a PR from it.
+
+        Scope was the branch name until a review pointed out that it is
+        attacker-chosen. The author has to match the account the credential
+        authenticates as, or a stranger's fork branch becomes a channel for
+        instructions the agent treats as its own work.
+        """
+        provider = FakeProvider(
+            prs=[make_pr(author="stranger")],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+        )
+        self.assertEqual(self._sweep(provider).cards, [])
+
+    def test_a_fork_head_is_out_of_scope_even_when_we_authored_it(self):
+        """A same-named branch on a fork is a different branch."""
+        provider = FakeProvider(
+            prs=[make_pr(head_repo="stranger/toolkit")],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+        )
+        self.assertEqual(self._sweep(provider).cards, [])
+
+    def test_the_author_match_ignores_the_bot_suffix_and_case(self):
+        """REST, GraphQL and ``gh auth status`` spell the same account three ways."""
+        provider = FakeProvider(
+            prs=[make_pr(author="App/Kube-Agents-Bot")],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+        )
+        self.assertEqual(len(self._sweep(provider).cards), 1)
 
     def test_a_zero_cap_parks_the_sweep_without_editing_the_roster(self):
         provider = FakeProvider(
@@ -840,17 +1009,22 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertEqual(len(result.cards), 1)
         self.assertIn("acme/toolkit#12", result.warnings[0])
 
-    def test_a_pr_with_no_author_login_is_skipped_loudly(self):
-        """No self identity means no way to tell an answered request from a new one."""
+    def test_a_credential_that_cannot_name_itself_is_loud(self):
+        """No viewer identity means no way to tell our own PR from anyone else's.
+
+        The sweep must not fall back to trusting the branch prefix: anyone can
+        push ``platform-agent/…`` to a fork and open a pull request from it.
+        Without a viewer the whole sweep is off, and it says so.
+        """
         provider = FakeProvider(
             prs=[make_pr()],
             comments={12: [make_comment("IC_1", "/agent x")]},
-            self_login="",
+            viewer="",
         )
         result = self._sweep(provider)
         self.assertEqual(result.cards, [])
         self.assertTrue(result.warnings)
-        self.assertIn("author login", result.warnings[0])
+        self.assertIn("could not name the account", result.warnings[0])
 
     def test_the_preflight_runs_through_the_provider(self):
         provider = FakeProvider()
