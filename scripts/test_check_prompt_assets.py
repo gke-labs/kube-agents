@@ -631,6 +631,33 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn(REPO / "agents/platform/SOUL.md", files)
         self.assertIn(REPO / "agents/platform/governance/compliance_audit_sop.md", files)
 
+    def test_it_reads_the_baked_docs_and_leaves_the_design_docs_alone(self):
+        """`agents/<profile>/docs/` holds two kinds of file, not one.
+
+        The Dockerfile bakes named runtime references out of that directory
+        into /opt/defaults/docs; the design docs beside them ship nowhere and
+        are read by a human in a checkout, where `agents/platform/...` is the
+        spelling that resolves. Globbing the directory swept both in and asked
+        the design docs to cite paths against a profile root they never reach
+        -- rewriting working citations into ones that resolve nowhere, which
+        is the opposite of this checker's purpose.
+        """
+        with mock.patch.object(cpa, "REPO", REPO):
+            files = cpa.instruction_files()
+        for baked in ("glossary.md", "gcp-console-links.md"):
+            self.assertIn(
+                REPO / "agents/platform/docs" / baked,
+                files,
+                f"{baked} is baked into the image; the agent does read it",
+            )
+        for design in ("autoops-architecture.md", "session_management.md"):
+            self.assertNotIn(
+                REPO / "agents/platform/docs" / design,
+                files,
+                f"{design} reaches no profile; checking it demands a rewrite "
+                "that breaks the citation for its only reader",
+            )
+
 
 class ProfileIsolationTests(unittest.TestCase):
     """Skills belong to one profile; a merged namespace hides two failures."""

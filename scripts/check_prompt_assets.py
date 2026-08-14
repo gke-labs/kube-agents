@@ -472,7 +472,10 @@ def instruction_files() -> list[Path]:
 
     Plugin and directory READMEs are excluded on purpose: they describe Hermes
     internals and this repository's own tooling, they are not copied into a
-    profile, and no agent reads them at runtime.
+    profile, and no agent reads them at runtime. The design docs that sit in
+    `agents/<profile>/docs/` alongside the baked runtime references are
+    excluded for the same reason -- see the comment on the `docs` entries
+    below for why the directory cannot simply be globbed.
     """
     found: list[Path] = []
     for profile in PROFILES:
@@ -482,8 +485,23 @@ def instruction_files() -> list[Path]:
         for name in ("SOUL.md", "AGENTS.md", "CAPABILITIES.md"):
             if (home / name).is_file():
                 found.append(home / name)
-        for sub in ("governance", "docs"):
-            found.extend(sorted((home / sub).glob("*.md")))
+        found.extend(sorted((home / "governance").glob("*.md")))
+        # `docs` is not a profile-home item and the layer does not take the
+        # directory: the Dockerfile bakes named files out of it into
+        # /opt/defaults/docs and leaves the rest. Those others are design docs
+        # -- docs/README.md calls them "not baked into the image despite its
+        # location" -- whose only reader is a human in a checkout, where their
+        # `agents/<profile>/...` citations resolve exactly as written. Globbing
+        # the directory swept them in and demanded the in-profile spelling for
+        # a profile they never reach, which rewrites a working citation into
+        # one that resolves nowhere. OPT_DEFAULTS lists the baked ones and
+        # `test_opt_defaults_matches_the_dockerfile` holds it to the COPYs, so
+        # a third one starts being checked on its own.
+        found.extend(
+            REPO / src
+            for _, src in OPT_DEFAULTS
+            if src.startswith(f"agents/{profile}/docs/") and (REPO / src).is_file()
+        )
         found.extend(
             md
             for md in sorted((home / "skills").rglob("*.md"))
