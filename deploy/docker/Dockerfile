@@ -876,6 +876,7 @@ RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
      agents/platform/docs/gcp-console-links.md \
+     agents/platform/docs/output-style.md \
      /opt/defaults/docs/
 
 
