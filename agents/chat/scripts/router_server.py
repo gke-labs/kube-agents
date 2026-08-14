@@ -19,6 +19,8 @@
 # for up to 5 minutes with no visible progress and was removed in favor of the
 # kanban-only model.
 
+import os
+
 from mcp.server.fastmcp import FastMCP
 
 # Same directory as this script, which Python puts on sys.path[0] when it runs
@@ -28,7 +30,29 @@ from mcp.server.fastmcp import FastMCP
 # rebinding the module's own never reaches.
 import agent_roster
 
+# Shared with the Platform Agent's platform_control server, which exposes the
+# same tool. Both profiles' scripts land in /opt/defaults/scripts (two COPY
+# lines in deploy/docker/Dockerfile) and the entrypoint copies that whole
+# directory to $HERMES_HOME/scripts, so this import resolves the same way the
+# agent_roster one above does.
+from notify_delivery import deliver_notification
+
 mcp = FastMCP("Chat Router")
+
+# The default profile's own config, which is where the `platforms` block saying
+# whether Google Chat or Slack is live ends up. Same file the Platform Agent
+# reads through agent_common_server.CONFIG_PATH on a stock install; spelled with
+# HERMES_HOME because a CR that sets spec.harness.hermes.agentHome moves it.
+CONFIG_PATH = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), "config.yaml")
+
+
+def _run_env() -> dict[str, str]:
+    """Environment for the `hermes send` subprocess.
+
+    HOME is redirected for the same reason agent_common_server._run_env does it:
+    the container's home is not writable by the agent user.
+    """
+    return {**os.environ, "HOME": "/tmp"}
 
 
 @mcp.tool()
@@ -49,6 +73,49 @@ def list_agents() -> str:
     # plugin has the better option there and simply stays quiet.
     roster = agent_roster.render()
     return agent_roster.UNKNOWN_ROSTER if roster is None else roster
+
+
+@mcp.tool()
+def send_notification(message: str, session_id: str = "") -> str:
+    """Post a message into the chat thread a session belongs to.
+
+    Use this to DELIVER a result that arrived somewhere the user cannot see —
+    above all a kanban card that finished on a session which reached you over
+    the API rather than over chat, such as a Kubernetes event alert (session ids
+    beginning `k8s-evt-`). Kanban posts a worker's progress into a chat thread
+    by itself; it cannot do that for an API session, so it wakes you instead and
+    your post IS the delivery. Without this call the report is written and then
+    lost.
+
+    Call it whenever you are woken for such a card, without trying to work out
+    whether the worker managed to post the report itself — some can and some
+    cannot, and you have no way to tell. If one already did, this returns
+    SKIPPED and posts nothing, so the duplicate you are worried about cannot
+    happen.
+
+    Do not use it to answer someone who is talking to you in a chat thread
+    already: your normal reply goes there on its own, and this would double it.
+
+    Args:
+        message: the text to post — for a finished card, the worker's `result`
+            passed through as-is. It is already written for the user, and a
+            paraphrase can only lose detail.
+        session_id: the session whose thread to reply in (e.g. `k8s-evt-a2cb3234`),
+            quoted from the request that started the work. Omitting it, or naming
+            a session with no chat thread, falls back to the home channel — the
+            report still lands, but not under the alert it answers.
+    """
+    # only_if_undelivered is what makes the instruction above safe: the front
+    # door relays unconditionally and the tool drops the post if the worker beat
+    # it to the thread. A Platform Agent has send_notification of its own; a
+    # Cluster Agent does not.
+    return deliver_notification(
+        message,
+        session_id,
+        config_path=CONFIG_PATH,
+        run_env=_run_env,
+        only_if_undelivered=True,
+    )
 
 
 if __name__ == "__main__":

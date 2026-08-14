@@ -36,6 +36,15 @@
 #     roster so the Chat Agent can pick the right kanban `assignee`. (The old
 #     synchronous `ask_agent` relay was removed: it blocked up to 300s with no
 #     visible progress. All delegation is now kanban-only.)
+#   - `mcp-router` (send_notification): the one egress. Kanban posts a worker's
+#     result into a chat thread by itself, but it cannot for a session that
+#     arrived over the API server — an event alert — so it wakes the card's
+#     creator and that turn's post IS the delivery (see `kanban.wake_on_events`
+#     below). The creator is this profile, which until now had no way to post
+#     anywhere, so every RCA delegated to a Cluster Agent, and every one this
+#     agent answered itself, was written and dropped (#630). The tool is on the
+#     router server rather than granted as `mcp-platform_control` precisely
+#     because the front door must not get the provisioning surface with it.
 #   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
 #     this chat thread and posts the specialist's progress back to it as each step
 #     completes, with no blocking timeout.
@@ -83,8 +92,19 @@ mcp_servers:
     command: "/opt/hermes/.venv/bin/python3"
     args:
       - "${HERMES_HOME}/scripts/router_server.py"
+    # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus
+    # the keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so
+    # every variable send_notification reads has to be listed. The same block on
+    # platform_control carries the full rationale for each; in short, without
+    # SESSION_KV_API_KEY the thread lookup 401s and the report silently falls
+    # back to the home channel, and without the two home-channel keys there is
+    # no fallback either.
     env:
       HERMES_HOME: "${HERMES_HOME}"
+      SESSION_KV_API_KEY: "${SESSION_KV_API_KEY}"
+      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
+      GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
+      SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.

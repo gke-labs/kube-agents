@@ -642,6 +642,197 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertIn("apply Option A", cta)
         self.assertIn("apply Option B", cta)
 
+    def test_the_delivery_obligation_is_stated_unconditionally(self):
+        # The obligation used to open "When calling your send_notification
+        # tool, you MUST pass this exact session ID", which makes the MUST
+        # govern the argument rather than the call. Live on autopush the Chat
+        # Agent compressed that faithfully to "Pass session_id 'k8s-evt-…' if
+        # notification tools are used", the platform worker read it as optional,
+        # and its RCA never left the card. Any wording whose obligation survives
+        # only while the reader keeps the subordinate clause is the same trap,
+        # so pin the shape: no conditional opener, and the MUST on the outcome.
+        payload = {"reason": "BackOff", "namespace": "triage-ab",
+                   "kind_of_object": "Pod", "name": "ab-host", "message": "back-off"}
+        query = session_kv_server._build_agent_query("k8s-evt-f21fe194", payload)
+
+        self.assertNotIn("When calling your send_notification tool", query)
+        self.assertIn("MUST reach the alert's chat thread", query)
+        # The routing id belongs in the same sentence as the obligation; split
+        # across paragraphs is how the two halves got separated before.
+        obligation = next(p for p in query.split("\n\n") if "MUST reach" in p)
+        self.assertIn("k8s-evt-f21fe194", obligation)
+
+    def test_the_delivery_obligation_covers_a_worker_with_no_notification_tool(self):
+        # A cluster-* profile is scoped without mcp-platform_control, so it has
+        # no send_notification at all (agents/cluster/config.yaml). Telling it
+        # to call one is an instruction it cannot follow; the card `result` plus
+        # the Chat Agent's relay is its delivery path, and the prompt has to say
+        # so or the obligation reads as unsatisfiable and gets dropped.
+        payload = {"reason": "BackOff", "namespace": "triage-ab",
+                   "kind_of_object": "Pod", "name": "ab-wolfram", "message": "back-off"}
+        obligation = next(
+            p for p in session_kv_server._build_agent_query("k8s-evt-91886b38", payload).split("\n\n")
+            if "MUST reach" in p
+        )
+        self.assertIn("If you do not have one", obligation)
+        self.assertIn("`result`", obligation)
+
+    def test_the_delivery_obligation_tells_a_delegator_not_to_paraphrase_it(self):
+        # This query is read by the Chat Agent, which never does the work
+        # itself: it files a kanban card and the obligation only reaches the
+        # worker if it survives that hop. On autopush it did for one assignee
+        # and not the other, from the same prompt seven seconds apart, so the
+        # instruction to copy rather than summarise is load-bearing.
+        payload = {"reason": "BackOff", "namespace": "triage-ab",
+                   "kind_of_object": "Pod", "name": "ab-host", "message": "back-off"}
+        obligation = next(
+            p for p in session_kv_server._build_agent_query("k8s-evt-f21fe194", payload).split("\n\n")
+            if "MUST reach" in p
+        )
+        self.assertIn("copy this paragraph into the card body verbatim", obligation)
+
+
+class TestUndeliveredReportDetection(unittest.TestCase):
+    """A triage that loses its report used to look exactly like one that worked.
+
+    The alert posts either way, the watcher reports a clean fire, and the turn
+    ends on a text response nobody reads — so the only durable evidence that an
+    RCA reached a human is a row in `incidents`, which `send_notification` is the
+    sole writer of. These tests pin the watch that turns that silence into a log
+    line (#630).
+    """
+
+    def setUp(self):
+        self._db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._db.close()
+        self._saved_path = session_kv_server.SESSION_KV_DB_PATH
+        session_kv_server.SESSION_KV_DB_PATH = self._db.name
+        import sqlite3
+
+        with sqlite3.connect(self._db.name) as conn:
+            conn.execute(
+                "CREATE TABLE incidents(chat_id TEXT NOT NULL, thread_id TEXT NOT NULL, "
+                "report TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "PRIMARY KEY (chat_id, thread_id))"
+            )
+
+    def tearDown(self):
+        session_kv_server.SESSION_KV_DB_PATH = self._saved_path
+        os.remove(self._db.name)
+
+    def _store(self, chat_id, thread_id):
+        import sqlite3
+
+        with sqlite3.connect(self._db.name) as conn:
+            conn.execute(
+                "INSERT INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
+                (chat_id, thread_id, "an RCA"),
+            )
+
+    def test_a_stored_incident_is_found(self):
+        self._store("spaces/AAA", "spaces/AAA/threads/xyz")
+        self.assertTrue(session_kv_server._incident_stored("spaces/AAA", "spaces/AAA/threads/xyz"))
+
+    def test_a_different_thread_does_not_count(self):
+        # The row is keyed on the pair; a report delivered for another alert is
+        # not evidence that this one arrived.
+        self._store("spaces/AAA", "spaces/AAA/threads/xyz")
+        self.assertFalse(session_kv_server._incident_stored("spaces/AAA", "spaces/AAA/threads/other"))
+
+    def test_an_unreadable_database_fails_closed(self):
+        # An I/O fault is not evidence of delivery. Warning on a report that did
+        # arrive costs a log line; staying quiet about one that did not is the
+        # failure this exists to catch.
+        session_kv_server.SESSION_KV_DB_PATH = "/nonexistent/dir/session_kv.db"
+        self.assertFalse(session_kv_server._incident_stored("spaces/AAA", "t"))
+
+    def test_the_watch_waits_rather_than_checking_once(self):
+        # The Chat Agent answers as soon as it has filed the kanban card, minutes
+        # before the worker finishes and the report is posted. A single immediate
+        # check would warn on every healthy triage.
+        calls = {"n": 0}
+
+        def appears_on_the_third_look(chat_id, thread_id):
+            calls["n"] += 1
+            return calls["n"] >= 3
+
+        with patch.object(session_kv_server, "_incident_stored", appears_on_the_third_look):
+            with patch.object(session_kv_server, "TRIAGE_DELIVERY_POLL_SECONDS", 0.001):
+                with patch.object(session_kv_server, "TRIAGE_DELIVERY_GRACE_SECONDS", 5):
+                    self.assertTrue(session_kv_server._await_incident("spaces/AAA", "t"))
+        self.assertEqual(calls["n"], 3)
+
+    def test_the_watch_gives_up_at_the_grace_period(self):
+        with patch.object(session_kv_server, "_incident_stored", lambda *a: False):
+            with patch.object(session_kv_server, "TRIAGE_DELIVERY_POLL_SECONDS", 0.001):
+                with patch.object(session_kv_server, "TRIAGE_DELIVERY_GRACE_SECONDS", 0.01):
+                    started = time.monotonic()
+                    self.assertFalse(session_kv_server._await_incident("spaces/AAA", "t"))
+        # Bounded, not unbounded: this runs on a background task per alert.
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_routing_returns_the_chat_id_to_look_the_incident_up_by(self):
+        # The incidents table is keyed on (chat_id, thread_id) and only this
+        # function knows how the chat_id was derived, so it has to hand it back.
+        import sqlite3
+
+        with sqlite3.connect(self._db.name) as conn:
+            conn.execute(
+                "CREATE TABLE session_metadata(session_id TEXT PRIMARY KEY, metadata TEXT NOT NULL, "
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                ("k8s-evt-abc", json.dumps({"platform": "google_chat"})),
+            )
+
+        chat_id = session_kv_server._register_session_routing(
+            "k8s-evt-abc", "google_chat", "spaces/AAA/threads/xyz"
+        )
+        self.assertEqual(chat_id, "spaces/AAA")
+
+    def test_routing_returns_none_when_there_is_no_session_row(self):
+        # Nothing was written, so there is nothing to look up later either.
+        self.assertIsNone(
+            session_kv_server._register_session_routing("missing", "google_chat", "spaces/AAA/threads/xyz")
+        )
+
+
+class TestGatewaySessionCreation(unittest.TestCase):
+    """The turn must survive a retried alert."""
+
+    def _http_error(self, code, body):
+        import urllib.error
+        from io import BytesIO
+
+        return urllib.error.HTTPError("http://gw/api/sessions", code, "err", {}, BytesIO(body.encode()))
+
+    def test_a_reused_title_is_accepted(self):
+        # The gateway answers `400 Title already in use` rather than 409 for a
+        # title it has seen. The title is keyed to the session id, so this only
+        # fires on a retry of the same alert — and aborting would lose the triage
+        # for exactly the reason this path exists. Same handling as the pubsub
+        # adapter's _run_turn_via_api.
+        with patch("urllib.request.urlopen", side_effect=self._http_error(400, "Title already in use")):
+            self.assertTrue(session_kv_server._create_gateway_session("http://gw", "sid", {}))
+
+    def test_a_conflict_is_accepted(self):
+        with patch("urllib.request.urlopen", side_effect=self._http_error(409, "exists")):
+            self.assertTrue(session_kv_server._create_gateway_session("http://gw", "sid", {}))
+
+    def test_other_400s_still_fail(self):
+        # Only the reused title is benign; a malformed request is a real error
+        # and must not be swallowed into a turn that never runs.
+        with patch("urllib.request.urlopen", side_effect=self._http_error(400, "malformed body")):
+            self.assertFalse(session_kv_server._create_gateway_session("http://gw", "sid", {}))
+
+
+class TestTurnTimeout(unittest.TestCase):
+    def test_the_ceiling_bounds_a_reasoning_loop_not_a_round_trip(self):
+        # 300s fired mid-investigation on #630, 4 minutes before the agent
+        # finished writing a 6,094-character report.
+        self.assertGreaterEqual(session_kv_server.TURN_TIMEOUT_SECONDS, 1800)
+
 
 if __name__ == "__main__":
     # Clean up temp database file on exit

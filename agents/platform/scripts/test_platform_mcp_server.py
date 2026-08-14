@@ -667,14 +667,20 @@ class TestSessionKvHeaders(unittest.TestCase):
             os.environ["SESSION_KV_API_KEY"] = self._saved
 
     def test_the_configured_token_becomes_a_bearer_header(self):
+        # The helper moved to notify_delivery when the Chat Agent's router MCP
+        # server started sharing this code; the header contract did not.
+        import notify_delivery
+
         os.environ["SESSION_KV_API_KEY"] = "test-session-kv-key"
-        headers = platform_mcp_server._session_kv_headers({"Content-Type": "application/json"})
+        headers = notify_delivery.session_kv_headers({"Content-Type": "application/json"})
         self.assertEqual(headers["Authorization"], "Bearer test-session-kv-key")
         self.assertEqual(headers["Content-Type"], "application/json")
 
     def test_an_unset_token_sets_no_header(self):
+        import notify_delivery
+
         os.environ.pop("SESSION_KV_API_KEY", None)
-        self.assertNotIn("Authorization", platform_mcp_server._session_kv_headers())
+        self.assertNotIn("Authorization", notify_delivery.session_kv_headers())
 
     def test_config_yaml_passes_the_key_into_this_subprocess(self):
         """Hermes hands a stdio MCP server only the keys named in `env`, so the
@@ -685,6 +691,83 @@ class TestSessionKvHeaders(unittest.TestCase):
         config = yaml.safe_load(config_path.read_text())
         env = config["mcp_servers"]["platform_control"]["env"]
         self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
+
+
+class TestDuplicateSuppression(unittest.TestCase):
+    """Two agents can be told to deliver the same report; only one may post it.
+
+    A `platform` assignee posts its own RCA and its card THEN completes, which
+    wakes the Chat Agent to relay a report already on the user's screen. The
+    front door cannot tell that assignee from a `cluster-*` one that cannot
+    post at all, so it always relays and asks the tool to drop the duplicate.
+    """
+
+    def _urlopen_returning(self, status):
+        resp = MagicMock()
+        resp.status = status
+        ctx = MagicMock()
+        ctx.__enter__.return_value = resp
+        return MagicMock(return_value=ctx)
+
+    def test_a_stored_report_reads_as_delivered(self):
+        import notify_delivery
+
+        with patch("urllib.request.urlopen", self._urlopen_returning(200)):
+            self.assertTrue(notify_delivery.incident_delivered("spaces/AAA", "t"))
+
+    def test_a_404_reads_as_not_delivered(self):
+        import urllib.error
+        from io import BytesIO
+
+        import notify_delivery
+
+        err = urllib.error.HTTPError("u", 404, "none", {}, BytesIO(b""))
+        with patch("urllib.request.urlopen", side_effect=err):
+            self.assertFalse(notify_delivery.incident_delivered("spaces/AAA", "t"))
+
+    def test_an_unreachable_kv_server_fails_open(self):
+        # Opposite of session_kv_server._incident_stored, on purpose: there a
+        # wrong answer costs a stray log line, here it costs the whole report.
+        import notify_delivery
+
+        with patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
+            self.assertFalse(notify_delivery.incident_delivered("spaces/AAA", "t"))
+
+    @patch.dict(os.environ, {"GOOGLE_CHAT_HOME_CHANNEL": "spaces/AAAA"})
+    def test_the_relay_posts_nothing_when_the_worker_already_did(self):
+        import notify_delivery
+
+        with patch.object(notify_delivery, "resolve_thread",
+                          return_value=("spaces/AAA", "t", "google_chat:spaces/AAA:t")):
+            with patch.object(notify_delivery, "incident_delivered", return_value=True):
+                with patch.object(notify_delivery, "subprocess") as sub:
+                    out = notify_delivery.deliver_notification(
+                        "the report", "k8s-evt-abc",
+                        config_path="/nonexistent.yaml", run_env=dict,
+                        only_if_undelivered=True,
+                    )
+        self.assertIn("SKIPPED", out)
+        sub.run.assert_not_called()
+
+    @patch.dict(os.environ, {"GOOGLE_CHAT_HOME_CHANNEL": "spaces/AAAA"})
+    def test_the_worker_itself_is_never_suppressed(self):
+        # platform_control's tool does not pass the flag, so a thread that
+        # already holds a report is no reason for the agent that wrote it to
+        # stay quiet — that check would deadlock the first delivery.
+        import notify_delivery
+
+        with patch.object(notify_delivery, "resolve_thread",
+                          return_value=("spaces/AAA", "t", "google_chat:spaces/AAA:t")):
+            with patch.object(notify_delivery, "incident_delivered") as looked_up:
+                with patch.object(notify_delivery, "subprocess") as sub:
+                    sub.run.return_value = MagicMock(stdout="posted")
+                    with patch.object(notify_delivery, "store_incident"):
+                        notify_delivery.deliver_notification(
+                            "the report", "k8s-evt-abc",
+                            config_path="/nonexistent.yaml", run_env=dict,
+                        )
+        looked_up.assert_not_called()
+        sub.run.assert_called_once()
 
 
 class TestSanitizationAndMutationRemoval(unittest.TestCase):

@@ -879,8 +879,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			// TestRenderConfigYAMLListsMatchChatConfig compares every rendered list
 			// against the image's, under a custom AgentHome as well as the default.
 			"args": []string{"${HERMES_HOME}/scripts/router_server.py"},
+			// Everything router_server.py's send_notification reads. Hermes gives a
+			// stdio MCP child only a safe baseline plus the keys named here, so an
+			// omission is silent: the thread lookup 401s without SESSION_KV_API_KEY
+			// and the report falls back to a home channel the other two keys name.
+			// Kept byte-identical to agents/chat/config.yaml — this map is merged
+			// over that file and a map merge takes the operator's value per key.
 			"env": map[string]string{
-				"HERMES_HOME": "${HERMES_HOME}",
+				"HERMES_HOME":              "${HERMES_HOME}",
+				"SESSION_KV_API_KEY":       "${SESSION_KV_API_KEY}",
+				"GOOGLE_CHAT_PROJECT_ID":   "${GOOGLE_CHAT_PROJECT_ID}",
+				"GOOGLE_CHAT_HOME_CHANNEL": "${GOOGLE_CHAT_HOME_CHANNEL}",
+				"SLACK_HOME_CHANNEL":       "${SLACK_HOME_CHANNEL}",
 			},
 		},
 	}

@@ -10,6 +10,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -43,6 +44,20 @@ app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+
+# The turn is driven synchronously, so this bounds a whole agent reasoning loop
+# rather than one HTTP round trip. The old 300s fired mid-investigation on a real
+# incident (#630) and took the report with it — a triage that thinks for six
+# minutes is working, not hung.
+TURN_TIMEOUT_SECONDS = float(os.getenv("TRIAGE_TURN_TIMEOUT_SECONDS", "1800"))
+
+# How long to keep watching for the report after the turn returns, and how often
+# to look. The turn lands on the Chat Agent, which delegates the investigation to
+# a kanban worker and answers long before that worker finishes; the report is
+# delivered on the completion wake, minutes later. A check that ran once, the
+# moment the turn returned, would therefore warn on every healthy triage.
+TRIAGE_DELIVERY_GRACE_SECONDS = float(os.getenv("TRIAGE_DELIVERY_GRACE_SECONDS", "900"))
+TRIAGE_DELIVERY_POLL_SECONDS = float(os.getenv("TRIAGE_DELIVERY_POLL_SECONDS", "30"))
 
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
@@ -452,8 +467,14 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
         return True, 0
 
 
-def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
-    """Save thread configurations in session_metadata SQLite table."""
+def _register_session_routing(session_id: str, platform: str, thread_id: str) -> str | None:
+    """Save thread configurations in session_metadata SQLite table.
+
+    Returns the chat_id it derived, so the caller can look the incident back up
+    by (chat_id, thread_id) once the turn is over. Returns None when the row
+    could not be written, which is also the case where there is nothing to look
+    up later.
+    """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             with conn:
@@ -474,8 +495,10 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
                         (json.dumps(meta), session_id)
                     )
+                    return meta["chat_id"]
     except Exception as exc:
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
+    return None
 
 
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
@@ -492,7 +515,15 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     except urllib.error.HTTPError as exc:
         if exc.code == 409:  # 409 Conflict means it already exists, which is acceptable
             return True
-        logger.error(f"Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
+        detail = exc.read().decode()
+        # The gateway also rejects a reused title with `400 Title already in use`
+        # rather than a 409 — see the same handling in the pubsub adapter's
+        # `_run_turn_via_api`. The title here is keyed to the session id, so this
+        # only fires when the same alert is retried, and aborting the turn over it
+        # would lose the triage for exactly the reason this code path exists.
+        if exc.code == 400 and "already in use" in detail:
+            return True
+        logger.error(f"Failed to create gateway API session (code {exc.code}): {detail}")
     except Exception as exc:
         logger.error(f"Failed to connect to gateway API server: {exc}")
     return False
@@ -529,13 +560,17 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
         f"- **Event Reason:** {event_reason}\n"
         f"- **Warning Message:** {message}\n\n"
-        f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
+        f"**Delivering the report is part of this task, not an optional extra.** The report MUST reach the alert's chat thread, "
+        f"and session_id='{session_id}' is what routes it there as a threaded reply. If you have a `send_notification` tool, call it with that session_id. "
+        f"If you do not have one, write the complete report into the kanban card's `result` and the Chat Agent relays it when the card completes. "
+        f"An analysis that stops at the card `result` with nobody to relay it is not delivered — it is lost, which is what issue #630 was. "
+        f"**If you are delegating this to another agent, copy this paragraph into the card body verbatim rather than summarising it** — a summary drops the obligation and the report is lost again.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
         f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
         f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
-        f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this:\n\n"
+        f"Format the report exactly like this:\n\n"
         f"📋 **Incident Triage**\n\n"
         f"- **Issue:** <Short 1-sentence description of the problem>\n"
         f"- **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
@@ -556,7 +591,22 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
 
 
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
-    """Post the agent query request to execute the diagnostic reasoning loop."""
+    """Post the agent query request to execute the diagnostic reasoning loop.
+
+    This blocks for the whole reasoning loop, so the elapsed time is logged
+    either way: a timeout here is indistinguishable from a hung gateway without
+    it, and on #630 the 300s ceiling fired 4 minutes before the agent finished
+    writing a 6,094-character report.
+
+    Unprefixed, so the turn is served by the gateway's `default` profile — the
+    front-door Chat Agent, which reads the alert and delegates it. That is
+    deliberate and is the only routing the gateway actually honours: the
+    `/p/<profile>/api/...` prefix the pubsub adapter uses is accepted by a
+    default-homed gateway and then ignored, verified against a live install by
+    three sessions (prefixed, unprefixed, and naming the profile in the body)
+    coming back with a byte-identical system prompt.
+    """
+    started = time.monotonic()
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions/{session_id}/chat",
@@ -564,11 +614,66 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=300.0) as resp:
+        with urllib.request.urlopen(req, timeout=TURN_TIMEOUT_SECONDS) as resp:
+            elapsed = time.monotonic() - started
             if resp.status != 200:
-                logger.error(f"Gateway API chat execution failed (status {resp.status})")
+                logger.error(
+                    f"Gateway API chat execution failed for {session_id} "
+                    f"(status {resp.status}, {elapsed:.1f}s)"
+                )
+            else:
+                logger.info(f"Triage turn for {session_id} returned after {elapsed:.1f}s")
     except Exception as exc:
-        logger.error(f"Failed to call gateway API chat execution: {exc}")
+        elapsed = time.monotonic() - started
+        logger.error(
+            f"Failed to call gateway API chat execution for {session_id} "
+            f"after {elapsed:.1f}s (limit {TURN_TIMEOUT_SECONDS:.0f}s): {exc}"
+        )
+
+
+def _incident_stored(chat_id: str, thread_id: str) -> bool:
+    """Has a report been delivered for this thread?
+
+    `send_notification` is the only writer of the incidents table and it writes
+    there on the same call that posts to chat, so a row is the one durable proof
+    that the RCA reached a human. Read the table directly rather than going back
+    through GET /v1/incidents/by-thread: this runs inside the process that
+    serves that endpoint, and a self-request would need the API key handed back
+    to itself.
+
+    Fails closed on error — an unreadable database is not evidence of delivery,
+    and the caller only logs.
+    """
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?",
+                (chat_id, thread_id),
+            ).fetchone()
+        return row is not None
+    except Exception as exc:
+        logger.error(f"Could not check whether an incident was stored for {thread_id}: {exc}")
+        return False
+
+
+def _await_incident(chat_id: str, thread_id: str) -> bool:
+    """Watch for the report, up to the grace period.
+
+    The Chat Agent's turn returns as soon as it has filed the card, so delivery
+    happens well after `_start_agent_turn` does. Poll rather than check once,
+    and return the moment the row appears.
+
+    Runs on a FastAPI background task, which is a worker thread rather than the
+    event loop, so blocking here does not hold up an inbound request.
+    """
+    deadline = time.monotonic() + TRIAGE_DELIVERY_GRACE_SECONDS
+    while True:
+        if _incident_stored(chat_id, thread_id):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(TRIAGE_DELIVERY_POLL_SECONDS, remaining))
 
 
 def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
@@ -579,8 +684,9 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     thread_id = _post_initial_alert(active_platform, alert_msg)
     
     # 2. Register thread-to-session mappings for two-way chat routing
+    chat_id = None
     if thread_id:
-        _register_session_routing(session_id, active_platform, thread_id)
+        chat_id = _register_session_routing(session_id, active_platform, thread_id)
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -598,6 +704,28 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 5. Formulate instructions query and execute the agent turn
     agent_query = _build_agent_query(session_id, payload)
     _start_agent_turn(api_url, session_id, agent_query, headers)
+
+    # 6. Say so when no report is ever delivered.
+    #
+    # A triage that loses its report is otherwise byte-identical to one that
+    # succeeds: the watcher reports a clean fire, this daemon returns 200, and
+    # the turn ends on a text response nobody reads. That silence is what let
+    # #630 run undetected for months — the alert posts either way, so a missing
+    # RCA looks like an agent that had nothing to say.
+    #
+    # Delivery is not this turn's job. The Chat Agent files a kanban card and
+    # answers immediately; the report is posted on the completion wake, by
+    # whichever profile did the work or by the Chat Agent relaying for one that
+    # cannot post. So this waits out the grace period before it complains.
+    if chat_id and thread_id and not _await_incident(chat_id, thread_id):
+        logger.warning(
+            f"Triage for {session_id} stored no incident for thread {thread_id} within "
+            f"{TRIAGE_DELIVERY_GRACE_SECONDS:.0f}s. The RCA was not delivered. Check that "
+            f"the kanban card was dispatched (a board with every worker slot held by an "
+            f"orphaned task dispatches nothing), and that whoever finished it posted the "
+            f"result — for a Cluster Agent that means the Chat Agent relaying it with "
+            f"send_notification."
+        )
 
 
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])

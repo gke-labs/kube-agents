@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from agent_common_server import _run_env, CONFIG_PATH
+from notify_delivery import deliver_notification
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -25,20 +26,6 @@ mcp = FastMCP("GKE Platform Control Plane")
 
 def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
-
-
-def _session_kv_headers(base: dict | None = None) -> dict:
-    """Authenticate a call to the loopback Session KV server on 8699.
-
-    Not API_SERVER_KEY: that value is the non-secret loopback sentinel. The key
-    used here comes from the pod secret and is injected into this container and
-    the credential-proxy container alike.
-    """
-    headers = dict(base or {})
-    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
 
 
 def _strip_kubectl_noise(stdout: str) -> str:
@@ -645,100 +632,15 @@ def send_notification(message: str, session_id: str = "") -> str:
         message: The plaintext or markdown-formatted message string to post.
         session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply. Optional.
     """
-    import urllib.request
-    import json
-    import os
-    
-    def get_enabled_platforms() -> list[str]:
-        platforms_found = []
-        try:
-            import yaml
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = yaml.safe_load(f) or {}
-                platforms = cfg.get("platforms", {})
-                if platforms.get("slack", {}).get("enabled"):
-                    platforms_found.append("slack")
-                if platforms.get("google_chat", {}).get("enabled"):
-                    platforms_found.append("google_chat")
-        except Exception:
-            pass
-
-        if not platforms_found:
-            if os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_HOME_CHANNEL"):
-                platforms_found.append("slack")
-            if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
-                platforms_found.append("google_chat")
-
-        if not platforms_found:
-            platforms_found.append("google_chat")
-
-        return platforms_found
-
-    enabled_platforms = get_enabled_platforms()
-    targets = []
-    chat_id = None
-    thread_id = None
-
-    if session_id:
-        try:
-            # Query the local metadata server for thread info
-            url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
-            req = urllib.request.Request(url, headers=_session_kv_headers(), method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status == 200:
-                    meta = json.loads(resp.read().decode("utf-8"))
-                    thread_id = meta.get("thread_id")
-                    chat_id = meta.get("chat_id")
-                    session_platform = meta.get("platform")
-                    if not session_platform or session_platform == "k8s-watcher":
-                        session_platform = "slack" if "slack" in enabled_platforms else "google_chat"
-                    if thread_id and chat_id:
-                        # Construct explicit target for send_message_tool
-                        targets.append(f"{session_platform}:{chat_id}:{thread_id}")
-        except Exception as exc:
-            # Fail-open: log error but fall back to broadcast targets
-            print(f"Failed to resolve session metadata for threading: {exc}")
-
-    if not targets:
-        for p in enabled_platforms:
-            if p == "slack":
-                home_channel = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
-                targets.append(f"slack:{home_channel}" if home_channel else "slack")
-            elif p == "google_chat":
-                home_channel = os.environ.get("GOOGLE_CHAT_HOME_CHANNEL", "").strip()
-                targets.append(f"google_chat:{home_channel}" if home_channel else "google_chat")
-            else:
-                targets.append(p)
-
-    results = []
-    for target in targets:
-        platform_name = target.split(":", 1)[0]
-        try:
-            res = subprocess.run(
-                ["hermes", "send", "--to", target, message],
-                capture_output=True, text=True, check=True, env=_run_env()
-            )
-            results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
-        except subprocess.CalledProcessError as e:
-            results.append(f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}")
-        except Exception as e:
-            results.append(f"ERROR: {platform_name}: {e}")
-
-    # after a successful hermes send, persist the report for two-way reply context if threaded
-    if chat_id and thread_id:
-        try:
-            req = urllib.request.Request(
-                "http://127.0.0.1:8699/v1/incidents",
-                data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
-                headers=_session_kv_headers({"Content-Type": "application/json"}), method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=2):
-                pass
-        except Exception as exc:
-            print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
-
-    return "\n".join(results) if results else "ERROR: No target platform configured."
+    # The implementation is shared with the Chat Agent's router MCP server, which
+    # exposes the same tool under the same name. See notify_delivery.py for why
+    # the front door needs an egress of its own.
+    return deliver_notification(
+        message,
+        session_id,
+        config_path=CONFIG_PATH,
+        run_env=_run_env,
+    )
 
 
 def start_session_kv_server() -> None:

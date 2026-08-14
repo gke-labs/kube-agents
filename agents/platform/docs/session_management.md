@@ -68,6 +68,8 @@ sequenceDiagram
     participant Watcher as k8s-event-watcher
     participant Proxy as session_kv_server (Port 8699)
     participant Gateway as Hermes Gateway (Port 8642)
+    participant Front as Chat Agent (default profile)
+    participant Board as Kanban Board
     participant Agent as Platform Agent LLM
     participant Chat as Google Chat / Slack
     participant Plugin as incident_context Plugin
@@ -81,7 +83,13 @@ sequenceDiagram
     Proxy->>Chat: Post Alert & Triage Report (N options, one marked Recommended)
     Note over Proxy: Store triage report in db (incidents table)
     Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Start Troubleshooter)
-    Gateway->>Agent: Wake up troubleshooter agent
+    Gateway->>Front: Serve the turn on `default` — the front-door Chat Agent
+    Front->>Board: kanban_create(assignee: platform | cluster-*)
+    Board->>Agent: Dispatch a worker as the assignee profile
+    Agent-->>Board: RCA written to the card's result
+    Board->>Front: Wake on completion (an API session has no thread to post into)
+    Front->>Chat: send_notification(result, session_id) — threaded under the alert
+    Note over Proxy: Warn if no incident row appears within the grace period
 
     Note over K8s, Watcher: Phase 2: Event Deduplication
     K8s->>Watcher: (Duplicate Warning Event occurs)
@@ -99,6 +107,65 @@ sequenceDiagram
     Agent->>Agent: Create branch, edit git manifests, open GitOps PR
     Agent->>Chat: Post threaded reply "Created PR #334"
 ```
+
+---
+
+## Who Delivers the Report
+
+An event alert reaches the gateway on an unprefixed path, so the turn is served by
+`default` — the front-door Chat Agent — which reads the alert and delegates it to a
+specialist with `kanban_create`. That is the intended shape: the Chat Agent decides where
+work goes.
+
+Delivery is the part that needs care, because **the report is not posted by whoever wrote
+it**. Kanban normally posts a finished card's `result` into the chat thread the card came
+from. An event alert has no such thread: it arrived over the API server, and the thread it
+belongs to is recorded in `session_metadata`, not in the card. So the board stays quiet and
+wakes the card's creator instead, and that turn's own post is the delivery
+(`kanban.wake_on_events` in `agents/chat/config.yaml`).
+
+The creator is always the Chat Agent, whatever the assignee. It therefore needs an egress of
+its own, and has exactly one: `send_notification`, on the `router` MCP server it already
+runs. Given the alert's session id the tool resolves `chat_id`/`thread_id` from
+`session_metadata`, posts there, and writes the `incidents` row. Without a session id it
+falls back to the home channel — the report lands, but not under the alert it answers.
+
+The tool is on `router` rather than granted as `mcp-platform_control` deliberately. The
+Platform Agent's server also carries the provisioning and Config Connector surface, and the
+whole design of the front door is that it holds no infrastructure tools. One tool on the
+server it already has is the smaller grant.
+
+Two consequences:
+
+- **A Cluster Agent cannot deliver its own RCA and is not expected to.** `platform_control`
+  is deliberately absent from `agents/cluster/config.yaml` — a Cluster Agent diagnoses, it
+  does not provision — so its report reaches the user only via the Chat Agent's relay.
+- **A wedged board loses the report before delivery is ever reached.** Workers are capped by
+  `kanban.max_in_progress`, and tasks left `running` when the pod dies are not reclaimed. Two
+  orphans against the default cap of 2 and the dispatcher spawns nothing at all. `hermes
+  kanban stats` shows a non-empty ready queue with no runners; `hermes kanban reclaim <id>`
+  frees the slot.
+
+### Detecting an Undelivered Report
+
+`send_notification` is the only writer of the `incidents` table, so a row is the one durable
+proof the RCA reached a human. After starting the turn the daemon watches for that row and
+logs a `WARNING` naming the session and thread if none appears within
+`TRIAGE_DELIVERY_GRACE_SECONDS` (default 900s, polled every
+`TRIAGE_DELIVERY_POLL_SECONDS`). It waits rather than checking once because the Chat Agent
+answers as soon as it has filed the card, minutes before the worker finishes.
+
+A warning, not an error: the daemon cannot distinguish a lost report from a slow one with
+certainty, and the alert itself has already been posted either way. The point is that the
+silent case is no longer silent — a triage that loses its report used to be byte-identical
+to one that succeeded at every layer.
+
+### How Long a Turn May Take
+
+`TRIAGE_TURN_TIMEOUT_SECONDS` (default 1800) bounds the synchronous call to the gateway.
+It is a whole agent reasoning loop, not an HTTP round trip; the previous 300s ceiling fired
+mid-investigation and took the report with it. The elapsed time is logged on both the success
+and failure paths, because without it a timeout is indistinguishable from a hung gateway.
 
 ---
 
