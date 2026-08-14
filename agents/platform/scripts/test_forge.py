@@ -409,6 +409,7 @@ PRS_JSON = json.dumps(
             "head": {
                 "ref": "platform-agent/bump-replicas",
                 "repo": {"full_name": "acme/toolkit"},
+                "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
             },
             "user": {"login": "kube-agents-bot[bot]"},
             "labels": [{"name": "automated"}],
@@ -441,6 +442,13 @@ class ListOpenPrsTest(unittest.TestCase):
         self.assertEqual(prs[0].url, "https://github.com/acme/toolkit/pull/12")
         self.assertTrue(forge.is_agent_pull_request(prs[0], REPO, VIEWER))
         self.assertFalse(forge.is_agent_pull_request(prs[1], REPO, VIEWER))
+
+    def test_the_head_sha_is_carried_through(self):
+        """What a reply's claim to have amended the branch is checked against."""
+        provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, PRS_JSON, "")}))
+        prs = provider.list_open_prs(REPO)
+        self.assertEqual(prs[0].head_sha, "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678")
+        self.assertEqual(prs[1].head_sha, "")
 
     def test_the_head_repository_is_carried_through(self):
         """The field `gh pr list` does not have, and the fork check needs."""
@@ -496,6 +504,43 @@ class ListOpenPrsTest(unittest.TestCase):
         )
         provider = forge.GitHubProvider(run=FakeGh({PULLS_ENDPOINT: (0, rows, "")}))
         self.assertEqual(provider.list_open_prs(REPO)[0].head_repo, "")
+
+
+COMMITS_ENDPOINT = "repos/acme/toolkit/pulls/12/commits"
+
+
+class ListCommitShasTest(unittest.TestCase):
+    """The read behind `pr_conversation reply --verify-commit`."""
+
+    def _pr(self):
+        return forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+
+    def test_shas_are_returned_tip_last(self):
+        rows = json.dumps([{"sha": "aaa1"}, {"sha": "bbb2"}])
+        provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(provider.list_commit_shas(REPO, self._pr()), ["aaa1", "bbb2"])
+
+    def test_the_listing_paginates(self):
+        """A long-lived pull request outruns one page, and a missed commit reads
+        as a false claim."""
+        fake = FakeGh({COMMITS_ENDPOINT: (0, "[]", "")})
+        forge.GitHubProvider(run=fake).list_commit_shas(REPO, self._pr())
+        self.assertIn("--paginate", fake.argv_containing(COMMITS_ENDPOINT))
+
+    def test_a_row_without_a_sha_is_dropped_not_returned_empty(self):
+        """An empty string would prefix-match nothing, but it would also make
+        `any(...)` on a short claim behave oddly. Drop it."""
+        rows = json.dumps([{"sha": ""}, {}, {"sha": "ccc3"}])
+        provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(provider.list_commit_shas(REPO, self._pr()), ["ccc3"])
+
+    def test_a_failure_raises_rather_than_reporting_no_commits(self):
+        """No commits and cannot tell are opposite answers to "did it land?"."""
+        provider = forge.GitHubProvider(
+            run=FakeGh({COMMITS_ENDPOINT: (1, "", "gh: Server Error (HTTP 500)")})
+        )
+        with self.assertRaises(forge.ForgeError):
+            provider.list_commit_shas(REPO, self._pr())
 
 
 ISSUE_COMMENTS = json.dumps(

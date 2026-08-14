@@ -114,6 +114,33 @@ If a request is out of scope, technically wrong, or something you should not do,
 say so in the reply. A reasoned refusal is a complete answer; silently not doing
 it is not.
 
+### Step 2b: Confirm the change landed before you describe it
+
+Every step above can fail — `prepare` can be refused, the push can lose a race,
+the edit can miss the file it was aimed at. So after `submit`, read the branch
+back and confirm the change is on it:
+
+```bash
+cd /opt/data/scratch && gh api "repos/<owner>/<repo>/pulls/<N>/commits" \
+  --jq '.[-1] | "\(.sha) \(.commit.message | split("\n")[0])"'
+```
+
+Then check the value you were asked to change actually reads that way now, on
+that branch — the file, not your memory of having edited it.
+
+> [!CAUTION] **Never describe a change you have not read back.** A reply is
+> stamped `agent-answered`, which closes the request for good: no later sweep
+> re-opens it, and the reviewer's next signal that nothing happened is the
+> deployment. Observed live — a worker whose `prepare` was blocked replied that
+> it had raised the memory limit and the replica count, and left a branch
+> holding neither.
+
+If the change could not be made, that is the reply: say what you tried, what
+stopped you, and what the branch still says. Post it with `--no-change`
+(Step 4). An honest "I could not do this" is a complete answer and closes the
+request; a claim that turns out to be false is the one outcome worse than
+silence. Complete the card as blocked, naming what blocked it.
+
 ### Step 3: Write the reply
 
 Write the body to a file under `/opt/data/scratch` — the only directory the
@@ -126,8 +153,12 @@ EOF
 ```
 
 The reply should answer the request and say what you did. If you changed the
-branch, name the commit and what it changed. Keep it to the length the question
-deserves.
+branch, name the commit you confirmed in Step 2b and what it changed. Keep it to
+the length the question deserves.
+
+Write it in the past tense only for what you have read back. "I have set the
+limit to 512Mi" is a statement about the branch, and Step 4 will refuse to post
+it unless the commit you name is on the pull request.
 
 Do not write the `<!-- agent-answered:... -->` marker yourself — Step 4 appends
 it. Writing one by hand into the wrong comment marks the wrong request handled.
@@ -136,10 +167,24 @@ it. Writing one by hand into the wrong comment marks the wrong request handled.
 
 ```bash
 "$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py reply \
-  --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md
+  --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md \
+  --verify-commit <sha from Step 2b>     # or: --no-change
 ```
 
-For a refusal, use `refuse` with the same arguments. Both stamp the comment with
+`reply` requires one of the two, and they are not interchangeable:
+
+- **`--verify-commit <sha>`** — this reply says the branch changed. The sha is
+  checked against the pull request's commits before anything is posted, so a
+  claim about a commit that is not there fails here rather than in the thread.
+  Give the commit `submit` made; an abbreviation of seven characters or more is
+  enough.
+- **`--no-change`** — this reply changed nothing on the branch. Correct for an
+  answer to a question, and correct for a change request you could not carry
+  out. Nothing about it is checkable, which is exactly why the body must not
+  claim a change.
+
+For a refusal, use `refuse`, which takes no such flag because a refusal never
+claims a change. Both stamp the comment with
 the marker that records this request as handled; **a request you do not post a
 `reply` or `refuse` for will be handed to you again on the next sweep**, ten
 minutes later, and again after that. If you decide a request needs no reply,

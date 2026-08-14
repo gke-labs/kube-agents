@@ -291,6 +291,50 @@ def handle_poll(args) -> int:
     return 0
 
 
+#: Shortest abbreviation accepted for `--verify-commit`. Git's own default.
+SHA_MIN_LEN = 7
+
+
+def _check_claim(provider, repo: str, pr, sha: str) -> None:
+    """Refuse to post a claim to have amended the branch until it is true.
+
+    A reply saying "I have bumped the replica count to 2" is checkable, and
+    checking it is the difference between a wrong answer and a lie the thread
+    keeps. It matters more here than it would elsewhere: the reply is stamped
+    `agent-answered`, so the request is closed for good and no later sweep
+    re-opens it. Observed live — a worker whose `prepare` step was blocked
+    reported both edits as made, stamped the marker, and left a branch still
+    holding the old values with nothing to notice it.
+
+    So `reply` makes the model say which world it is in — `--verify-commit
+    <sha>` or `--no-change` — and this checks the first against the forge. The
+    second is not verifiable here and is not pretended to be; what it buys is
+    that a false claim now has to survive the model asserting the opposite one
+    line above it, and it leaves that assertion in the command history.
+    """
+    if not sha:
+        return
+    wanted = sha.strip().lower()
+    if len(wanted) < SHA_MIN_LEN:
+        _fail(
+            f"--verify-commit {sha} is too short to identify a commit; "
+            f"give at least {SHA_MIN_LEN} characters."
+        )
+    try:
+        shas = [s.lower() for s in provider.list_commit_shas(repo, pr)]
+    except forge.ForgeError as error:
+        # Unverifiable is not verified. Posting anyway would put the claim in
+        # the thread with the marker that closes it.
+        _fail(f"could not read the commits on {repo}#{pr.number} to check the claim: {error}")
+    if not any(candidate.startswith(wanted) for candidate in shas):
+        _fail(
+            f"{sha} is not a commit on {repo}#{pr.number}, so the reply's claim to have "
+            "changed the branch is not true yet. Nothing was posted. The branch tip is "
+            f"{pr.head_sha or 'unknown'}"
+            + (f"; its commits are {', '.join(s[:8] for s in shas)}." if shas else ".")
+        )
+
+
 def _post(args, marker_kind: str) -> int:
     repo = _resolve_repo()
     provider = forge.provider_for()
@@ -326,6 +370,8 @@ def _post(args, marker_kind: str) -> int:
                 else "There are no unanswered requests on it."
             )
         )
+
+    _check_claim(provider, repo, pr, getattr(args, "verify_commit", ""))
 
     body = _confined_body(args.body_file).rstrip()
     stamped = f"{body}\n\n{pr_triggers.marker(args.comment_id, marker_kind)}\n"
@@ -394,6 +440,25 @@ def build_parser() -> argparse.ArgumentParser:
             required=True,
             help=f"path to the comment body, under {SCRATCH_DIR}",
         )
+        if name == "reply":
+            # Required and exclusive: an answer either changed the branch or it
+            # did not, and saying which is what `_check_claim` verifies. A
+            # refusal never claims a change, so it is not asked.
+            claim = cmd.add_mutually_exclusive_group(required=True)
+            claim.add_argument(
+                "--verify-commit",
+                default="",
+                metavar="SHA",
+                help="the commit this reply claims to have made; checked against "
+                "the pull request before anything is posted",
+            )
+            claim.add_argument(
+                "--no-change",
+                dest="verify_commit",
+                action="store_const",
+                const="",
+                help="this reply changed nothing on the branch",
+            )
         cmd.set_defaults(func=func)
 
     return parser

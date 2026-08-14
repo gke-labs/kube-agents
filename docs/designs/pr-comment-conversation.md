@@ -168,20 +168,21 @@ exceptions and is fail-open, so such a hook must catch internally and decide exp
 
 **Status: implemented** as `agents/platform/scripts/forge.py`.
 
-Six operations are the complete set this feature needs from a forge:
+Seven operations are the complete set this feature needs from a forge:
 
 ```python
 class ForgeProvider(Protocol):
     supports_acknowledge: bool
     def preflight(self) -> None                           # raises ForgeError with a reason code
     def viewer_login(self) -> str                         # the account the credential is; may be ""
-    def list_open_prs(self, repo) -> list[PullRequest]    # number, head_ref, head_repo, labels,
-                                                          # author, url
+    def list_open_prs(self, repo) -> list[PullRequest]    # number, head_ref, head_repo, head_sha,
+                                                          # labels, author, url
     def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
                                                           # can_write, can_write_known,
                                                           # created_at, kind, path/line
     def post_comment(self, repo, pr, body_file) -> None
     def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
+    def list_commit_shas(self, repo, pr) -> list[str]     # tip last; backs the reply claim check
 ```
 
 `GitHubProvider` implements it over the proxied `gh`, merging GitHub's three comment endpoints
@@ -392,7 +393,8 @@ prompt:
    requests too, so the worker can refuse one rather than appear to have missed it, and it returns
    the thread each request arrived in — see below.
 2. Act: answer a question directly; for a change request follow **submit-suggestion Step 5**, whose
-   `--force-with-lease` and protected-branch guards apply unchanged.
+   `--force-with-lease` and protected-branch guards apply unchanged. Then read the branch back and
+   confirm the change is on it — see the claim check below.
 3. Write the reply to a file under `/opt/data/scratch`.
 4. Post it with `pr_conversation.py reply --pr N --comment-id <node-id> --body-file …`, which appends
    the `agent-answered` marker — the helper stamps it from `--comment-id` rather than trusting the
@@ -409,6 +411,25 @@ prompt:
    the comment is public, so the only place to cut that loop is before it. The same check re-applies
    the sweep's scope and bot rules at the point of writing: `--pr` comes from a card, and a card is
    a pointer the worker is not obliged to trust.
+
+   **A reply must also declare whether it changed the branch, and a claim that it did is checked.**
+   `reply` requires exactly one of `--verify-commit <sha>` or `--no-change`; the first is verified
+   against the pull request's commits before anything is posted, and `refuse` is asked for neither
+   because a refusal never claims a change. This exists because of a live run: a worker whose
+   `submit-suggestion prepare` step was blocked replied "I have updated the Redis deployment … to
+   512Mi and the replica count to 2", stamped `agent-answered`, and left the branch on its original
+   commit with `256Mi` and one replica. The marker is what makes that unrecoverable — no later sweep
+   re-opens a closed request, so the false claim is the thread's final word and the reviewer's next
+   signal is the deployment. Being unable to do the work is a fine outcome and says so in the reply;
+   claiming to have done it is not.
+
+   The check is deliberately narrow. It settles the part a script can settle — whether the named
+   commit is on the pull request — and does not attempt to judge whether the commit does what the
+   reply says. `--no-change` is not verifiable at all, and is not pretended to be: what it buys is
+   that a false claim now has to survive the model asserting the opposite one line above it, on the
+   command line, where the turn's history keeps it. An unreadable commit list fails closed —
+   unverifiable is not verified, and posting anyway would put the claim in the thread with the
+   marker that closes it.
 
 5. Complete the card with a one-line result. A request the worker posts neither a `reply` nor a
    `refuse` for is not lost — it arrives again on the next sweep. That makes an abandoned turn

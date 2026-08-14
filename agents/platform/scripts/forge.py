@@ -169,6 +169,10 @@ class PullRequest:
     #: fork it came from has been deleted, which `is_agent_pull_request` reads
     #: as "not ours" rather than as "unknown".
     head_repo: str = ""
+    #: Tip of the head branch as the forge reported it on this read. Used to
+    #: check a reply's claim to have amended the branch, so it is deliberately
+    #: re-read at post time rather than carried from the sweep.
+    head_sha: str = ""
 
     @property
     def is_ignored(self) -> bool:
@@ -227,6 +231,8 @@ class ForgeProvider(Protocol):
     def post_comment(self, repo: str, pr: PullRequest, body_file: str) -> None: ...
 
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
+
+    def list_commit_shas(self, repo: str, pr: PullRequest) -> list[str]: ...
 
 
 def normalise_login(login: str) -> str:
@@ -493,6 +499,7 @@ class GitHubProvider:
                 head_repo=str(
                     ((row.get("head") or {}).get("repo") or {}).get("full_name", "")
                 ),
+                head_sha=str((row.get("head") or {}).get("sha", "")),
                 author=str((row.get("user") or {}).get("login", "")),
                 labels=tuple(
                     str(label.get("name", "")) for label in (row.get("labels") or [])
@@ -632,6 +639,23 @@ class GitHubProvider:
         except ForgeError:
             return False
         return True
+
+    def list_commit_shas(self, repo: str, pr: PullRequest) -> list[str]:
+        """Every commit on the pull request, tip last.
+
+        Exists so a reply that claims to have amended the branch can be checked
+        against the branch before it is posted. The head sha alone is not
+        enough: an amend that made two commits leaves the model naming the one
+        it wrote about, which is real and is not the tip.
+        """
+        rows = self._call(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr.number}/commits?per_page={PR_PAGE_SIZE}",
+                "--paginate",
+            ]
+        )
+        return [str(row.get("sha", "")) for row in (rows or []) if row.get("sha")]
 
 
 #: Host substring -> provider. One entry today; the point of the table is that

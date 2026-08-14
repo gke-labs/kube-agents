@@ -48,16 +48,20 @@ helper = _load_helper()
 
 SELF = "kube-agents-bot"
 REPO = "acme/toolkit"
+HEAD_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
 
 class FakeProvider:
     supports_acknowledge = True
 
-    def __init__(self, prs=None, comments=None, post_error=None, viewer=SELF):
+    def __init__(
+        self, prs=None, comments=None, post_error=None, viewer=SELF, commits=None
+    ):
         self.prs = prs or []
         self.comments = comments or {}
         self.post_error = post_error
         self._viewer = viewer
+        self.commits = COMMITS if commits is None else commits
         self.posted = []
 
     def preflight(self):
@@ -72,11 +76,20 @@ class FakeProvider:
     def list_comments(self, repo, pr):
         return list(self.comments.get(pr.number, []))
 
+    def list_commit_shas(self, repo, pr):
+        if isinstance(self.commits, Exception):
+            raise self.commits
+        return list(self.commits)
+
     def post_comment(self, repo, pr, body_file):
         if self.post_error:
             raise self.post_error
         with open(body_file, "r", encoding="utf-8") as handle:
             self.posted.append((pr.number, handle.read()))
+
+
+#: The commits on the fake pull request, tip last.
+COMMITS = ["0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", HEAD_SHA]
 
 
 def make_pr(
@@ -85,6 +98,7 @@ def make_pr(
     labels=(),
     author=f"{SELF}[bot]",
     head_repo=REPO,
+    head_sha=HEAD_SHA,
 ):
     return forge.PullRequest(
         number=number,
@@ -92,6 +106,7 @@ def make_pr(
         author=author,
         labels=labels,
         head_repo=head_repo,
+        head_sha=head_sha,
     )
 
 
@@ -451,7 +466,8 @@ class ReplyTest(_Harness):
     def _reply(self, provider, body="Bumped it to 4.", command="reply"):
         path = self.scratch_file("reply.md", body)
         return self.run_helper(
-            [command, "--pr", "12", "--comment-id", "IC_1", "--body-file", path],
+            [command, "--pr", "12", "--comment-id", "IC_1", "--body-file", path]
+            + (["--no-change"] if command == "reply" else []),
             provider,
         )
 
@@ -495,7 +511,8 @@ class ReplyTest(_Harness):
         self.addCleanup(os.unlink, outside)
         with self.assertRaises(SystemExit):
             self.run_helper(
-                ["reply", "--pr", "12", "--comment-id", "IC_1", "--body-file", outside],
+                ["reply", "--pr", "12", "--comment-id", "IC_1",
+                 "--body-file", outside, "--no-change"],
                 provider,
             )
         self.assertEqual(provider.posted, [])
@@ -511,7 +528,8 @@ class ReplyTest(_Harness):
         os.symlink(outside, link)
         with self.assertRaises(SystemExit):
             self.run_helper(
-                ["reply", "--pr", "12", "--comment-id", "IC_1", "--body-file", link],
+                ["reply", "--pr", "12", "--comment-id", "IC_1",
+                 "--body-file", link, "--no-change"],
                 provider,
             )
         self.assertEqual(provider.posted, [])
@@ -528,6 +546,7 @@ class ReplyTest(_Harness):
                     "IC_1",
                     "--body-file",
                     os.path.join(self.scratch, "nope.md"),
+                    "--no-change",
                 ],
                 provider,
             )
@@ -591,7 +610,8 @@ class CommentIdValidationTest(_Harness):
     def _post(self, provider, comment_id, command="reply"):
         path = self.scratch_file("reply.md", "Bumped it to 4.")
         return self.run_helper(
-            [command, "--pr", "12", "--comment-id", comment_id, "--body-file", path],
+            [command, "--pr", "12", "--comment-id", comment_id, "--body-file", path]
+            + (["--no-change"] if command == "reply" else []),
             provider,
         )
 
@@ -675,6 +695,107 @@ class CommentIdValidationTest(_Harness):
         with redirect_stderr(err), self.assertRaises(SystemExit):
             self._post(provider, "IC_1")
         self.assertIn("no unanswered requests", err.getvalue())
+
+
+class ClaimVerificationTest(_Harness):
+    """A reply may not claim a commit the branch does not have.
+
+    Observed live: a worker whose amend was blocked replied "I have updated the
+    Redis deployment … to 512Mi and the replica count to 2", stamped
+    `agent-answered`, and left the branch on its original commit with `256Mi`
+    and one replica. The marker means no later sweep re-opens it, so the false
+    claim is the thread's final word. Checking the sha is the part of that a
+    script can settle.
+    """
+
+    def _reply(self, provider, *claim):
+        path = self.scratch_file("reply.md", "Bumped it to 4 in a1b2c3d.")
+        return self.run_helper(
+            ["reply", "--pr", "12", "--comment-id", "IC_1", "--body-file", path]
+            + list(claim),
+            provider,
+        )
+
+    def test_a_real_commit_is_accepted(self):
+        provider = answerable()
+        rc, out = self._reply(provider, "--verify-commit", HEAD_SHA)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["status"], "POSTED")
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_an_abbreviated_sha_is_accepted(self):
+        """Git's own abbreviation, and what a commit message quotes."""
+        provider = answerable()
+        rc, _out = self._reply(provider, "--verify-commit", HEAD_SHA[:8])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_an_earlier_commit_on_the_pr_is_accepted(self):
+        """An amend that made two commits: the one written about is not the tip."""
+        provider = answerable()
+        rc, _out = self._reply(provider, "--verify-commit", COMMITS[0])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_a_commit_that_is_not_on_the_pr_posts_nothing(self):
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", "deadbeefdeadbeef")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("is not a commit", err.getvalue())
+
+    def test_the_failure_names_the_branch_tip(self):
+        """So the model can tell "wrong sha" from "the amend never landed"."""
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", "deadbeefdeadbeef")
+        self.assertIn(HEAD_SHA, err.getvalue())
+
+    def test_a_sha_too_short_to_identify_anything_is_rejected(self):
+        """`a1b` matches the head here and would match anything anywhere."""
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", "a1b")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("too short", err.getvalue())
+
+    def test_an_unreadable_commit_list_is_not_a_pass(self):
+        """Unverifiable is not verified — the claim carries a closing marker."""
+        provider = answerable(commits=forge.ForgeError("REPO_UNREACHABLE", "#12"))
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", HEAD_SHA)
+        self.assertEqual(provider.posted, [])
+        self.assertIn("could not read the commits", err.getvalue())
+
+    def test_no_change_asks_the_forge_nothing(self):
+        """An answer that changed nothing has no claim to check."""
+        provider = answerable(commits=forge.ForgeError("REPO_UNREACHABLE", "#12"))
+        rc, _out = self._reply(provider, "--no-change")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_a_refusal_is_not_asked_to_declare_one(self):
+        """A refusal never claims a change, so the flag is not on `refuse`."""
+        provider = answerable(request="/agent delete prod")
+        path = self.scratch_file("reply.md", "No.")
+        rc, _out = self.run_helper(
+            ["refuse", "--pr", "12", "--comment-id", "IC_1", "--body-file", path],
+            provider,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_the_declaration_is_required(self):
+        """Neither flag is silence, and silence is how the false claim got out."""
+        provider = answerable()
+        with self.assertRaises(SystemExit):
+            self._reply(provider)
+        self.assertEqual(provider.posted, [])
+
 
 if __name__ == "__main__":
     unittest.main()
