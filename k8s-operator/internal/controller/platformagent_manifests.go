@@ -1653,7 +1653,27 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
-	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
+
+	// The credential proxy is a NATIVE SIDECAR -- an init container carrying
+	// restartPolicy: Always -- and not an ordinary container.
+	//
+	// It owns port 8643, which the Service targets, and it shares a network
+	// namespace with the agent sandbox. As an ordinary container the two started
+	// in parallel and raced for the bind. The agent wins that race whenever it
+	// wants to: bind 0.0.0.0:8643 from the sandbox and the proxy dies with
+	// EADDRINUSE into CrashLoopBackOff, leaving the agent holding the port the
+	// Service routes to. Reproduced on a live cluster on 10 August.
+	//
+	// A native sidecar starts before any app container and the kubelet does not
+	// start app containers until it reports ready. So the proxy holds 8643
+	// before the sandbox process exists, and the race has no start line.
+	//
+	// This is also the ordering the pod needs for its own sake: every credentialed
+	// call the agent makes goes through this proxy, so an agent that starts first
+	// is an agent whose early tool calls fail.
+	//
+	// Requires Kubernetes 1.29+ for SidecarContainers to be GA.
+	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -1929,6 +1949,22 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
 // Its environment and volume mounts are intentionally disjoint from the agent
 // container even though both containers share a Pod network namespace.
+// asNativeSidecar converts a container into a Kubernetes native sidecar: an init
+// container that never exits and that the kubelet keeps running for the life of
+// the pod.
+//
+// The distinction that matters here is ordering. App containers do not start
+// until every native sidecar reports ready, which is what lets the credential
+// proxy claim its ports before the agent sandbox exists to contest them.
+//
+// A native sidecar also needs a restart policy of its own -- without it the
+// kubelet treats the container as an ordinary init container and waits for it to
+// exit, which for a long-running proxy means the pod never progresses.
+func asNativeSidecar(c corev1.Container) corev1.Container {
+	c.RestartPolicy = ptr.To(corev1.ContainerRestartPolicyAlways)
+	return c
+}
+
 func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
 	image := resolveCredentialProxyImage(agent.Spec.Deployment)
 	pullPolicy := corev1.PullAlways
