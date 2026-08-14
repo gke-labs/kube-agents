@@ -57,7 +57,7 @@ prompt: |
 expected_output: |
   critical requirements:
   - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
-  - The root cause is that the manifest references image tag v2.14.0, which does not exist in the us-docker.pkg.dev/acme-prod/apps/fraud-scorer repository, so the kubelet cannot pull it and backs off.
+  - The root cause is that the manifest references image tag v2.14.0, which does not exist in the registry, so the image cannot be pulled.
   - The diagnosis is specific to the missing tag and is explicitly not blamed on registry authentication, imagePullSecrets, or node network problems, since the message confirms the registry authenticated and tag v2.13.4 exists.
   - The "Proposed Fixes (GitOps)" section labels its options "Option A", "Option B", ... in order, and exactly one option is marked "Recommended" when more than one is proposed while none is marked when only one is proposed.
   - Every proposed fix is a declarative manifest change, such as pinning the image back to the published v2.13.4 tag or publishing v2.14.0 before the manifest references it, and never a kubectl set image, kubectl patch, or kubectl apply against the live cluster.

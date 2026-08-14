@@ -62,7 +62,7 @@ prompt: |
 expected_output: |
   critical requirements:
   - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
-  - The root cause is that the ledger-api container's working set exceeded its own configured memory limit of 512Mi, so the container was OOM-killed with exit code 137 and restarted.
+  - The root cause is that the ledger-api container's own memory usage exceeded its configured 512Mi limit, so the container itself was OOM-killed.
   - The root cause is NOT attributed to node-level memory pressure, insufficient node capacity, or node eviction, and the report does not recommend adding nodes or a larger machine type as the primary fix.
   - The "Proposed Fixes (GitOps)" section labels its options "Option A", "Option B", ... in order, and exactly one option is marked "Recommended" when more than one is proposed while none is marked when only one is proposed.
   - Every proposed fix is a declarative change to the checked-in manifests, such as raising resources.limits.memory and the matching request or tuning the application's heap settings, and never an imperative kubectl patch, kubectl set resources, or kubectl apply against the live cluster.
