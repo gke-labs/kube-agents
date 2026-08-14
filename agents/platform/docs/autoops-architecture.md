@@ -151,7 +151,7 @@ inject envelope with its own `kind`.
 ### Contract 2 · Session & state
 
 **One session per incident, held in two tables**
-(`scripts/session_kv_server.py`):
+(`agents/platform/scripts/session_kv_server.py`):
 
 ```sql
 CREATE TABLE session_metadata (        CREATE TABLE incidents (
@@ -262,7 +262,7 @@ questions, with no pipeline change.
 | Quota inspection                                             | Compute, IP space, `SSD_TOTAL_GB` and friends          | Future    |
 | Runbook / knowledge retrieval                                | Team-specific procedure and history                    | Future    |
 
-Two MCP servers are configured in `config.yaml`: `platform_control` (local) and the
+Two MCP servers are configured in `agents/platform/config.yaml`: `platform_control` (local) and the
 hosted `gke` endpoint. Adding a tool is additive and requires no pipeline change — but until a tool
 exists, the journeys that depend on it are out of reach, and saying otherwise on a slide is how
 architectures lose credibility.
