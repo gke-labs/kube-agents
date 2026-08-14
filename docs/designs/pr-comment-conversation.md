@@ -730,7 +730,11 @@ Two things remain by design. The four earlier `[audit]` issues on the test repos
 fleet-audit ledgers, not test artifacts. And the `👀` reactions and agent replies on the closed pull
 request stay where they are: they are the record that the validation happened.
 
-The third round leaves pull request #10, its branch `platform-agent/live-test-thread-context` and
-the cards `t_98e02d59`, `t_180fa8de` and `t_82b6021a` to be cleaned up the same way, and leaves the
-PVC carrying `kubectl cp`'d copies of the scripts rather than the image's — which the next rebuild
-overwrites, and which the pull-request body names rather than implying an image-shipped test.
+The third round was cleaned up the same way: pull request #10 closed with a comment saying why and
+its branch `platform-agent/live-test-thread-context` deleted, so `clusters/dev/redis-deployment.yaml`
+— the only file it ever touched — never reached `main` either. Its three cards, `t_98e02d59`,
+`t_180fa8de` and `t_82b6021a`, are still on the board; archiving them is a write to the live pod and
+is outstanding on that permission rather than on a decision. What the round does leave by design is
+the PVC carrying `kubectl cp`'d copies of the scripts rather than the image's — which the next
+rebuild overwrites, and which the pull-request body names rather than implying an image-shipped
+test.
