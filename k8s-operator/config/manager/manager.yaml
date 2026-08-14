@@ -62,7 +62,12 @@ spec:
             - containerPort: 8081
               name: health
               protocol: TCP
-            - containerPort: 9443
+            # 10250, not controller-runtime's default 9443: it is the only non-443 port
+            # GKE's automatic control-plane-to-node firewall rule permits, so a private
+            # cluster reaches the webhook without a per-cluster VPC rule. See DefaultPort
+            # in internal/webhook/platformagent_webhook.go. Keep in sync with the Service
+            # targetPort in config/webhook/service.yaml.
+            - containerPort: 10250
               name: webhook-server
               protocol: TCP
           securityContext:

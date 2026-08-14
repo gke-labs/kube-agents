@@ -112,9 +112,17 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # claim to completion — p50 264s and p90 1102s of nothing on the live board —
 # which is the single biggest reason delegation feels slower than doing the work
 # in the thread. kanban_heartbeat(note=...) already writes the note; the
-# notifier just never delivered that kind. Two anchored edits, so the surgery
+# notifier just never delivered that kind. Three anchored edits, so the surgery
 # lives in an applier script. See the module docstring in
 # deploy/docker/patches/kanban_progress_lines.py.
+# The third edit is what keeps the fix from becoming its own nuisance: the notes
+# roll into ONE message per card, edited in place, so a five-milestone card pings
+# the space once instead of five times and the completion is the notification.
+# Every failure mode of that is silent -- an unresolved import, an adapter that
+# stopped overriding edit_message, a render budget that crossed the adapter's
+# text cap all degrade to one-message-per-note, which is exactly what shipped
+# before and so looks like nothing is wrong. verify_kanban_progress_lines.py
+# therefore drives the patched runtime rather than grepping it.
 # The _WAKE_KINDS grep below pins upstream's tuple as it stands AT THIS POINT in
 # the build, and nothing more: apply_kanban_notifier.py replaces that whole line
 # further down this stage, so the tuple does not exist in the shipped image. The
@@ -126,19 +134,23 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # base-image bump changes the text apply_kanban_notifier.py anchors on, which is
 # a clearer error than that applier's own anchor miss.
 COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
-COPY deploy/docker/patches/apply_kanban_progress_lines.py /tmp/apply_kanban_progress_lines.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_progress_lines.py /opt/hermes && \
+# Applier and verifier share one COPY into a directory, for the same reason the
+# kanban_notifier pair below does: this stage is the base for `credential-proxy`,
+# which has already hit Docker's layer-depth ceiling once (build f9f1747c,
+# 2026-08-07), so a new build gate does not buy a layer.
+COPY deploy/docker/patches/apply_kanban_progress_lines.py \
+     deploy/docker/patches/verify_kanban_progress_lines.py \
+     /tmp/kanban-progress/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
     grep -q '"block_loop_detected", "heartbeat")' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q '_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")' /opt/hermes/gateway/kanban_watchers.py && \
     /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
-from gateway.kanban_progress_lines import progress_note; \
-exit(1) if progress_note(None) or progress_note({}) or progress_note({'note': '  '}) else None; \
-exit(1) if progress_note({'note': 'scanned 3 of 7'}) != 'scanned 3 of 7' else None; \
-exit(1) if len(progress_note({'note': 'word ' * 500})) > 300 else None" && \
-    rm /tmp/apply_kanban_progress_lines.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/verify_kanban_progress_lines.py && \
+    rm -rf /tmp/kanban-progress
 
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's

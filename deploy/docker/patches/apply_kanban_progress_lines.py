@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wire gateway/kanban_progress_lines.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Four anchored
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Five anchored
 edits across two files plus an appended import, with the same guarantee as the
 other patches in that file: every anchor must be found exactly once, every
 edited file must still parse, and anything else fails the build loudly rather
@@ -63,9 +63,50 @@ RENDER_PATCHED = (
     '                            msg = f"⏳ {board_tag}{tag}{note}"\n'
 ) + RENDER_ANCHOR
 
+# --- roll consecutive progress notes into one message -----------------------
+#
+# The notifier funnels every line it posts — progress and terminal alike —
+# through this one send. Routing it through ``deliver`` is therefore the whole
+# of the rolling-message behaviour: one anchor, and no branch of the render
+# chain above needs to know about it. Every name passed is already in scope
+# here (``board_tag`` is computed once per delivery, ``tag``/``kind``/``ev``
+# per event).
+#
+# The 24-space indent on ``try:`` and 28 on its body place this inside
+# ``for d in deliveries: ... for ev in d["events"]:``, the same block the
+# render branch above is inserted into.
+
+SEND_ANCHOR = (
+    "                        try:\n"
+    "                            _send_res = await adapter.send(\n"
+    '                                sub["chat_id"], msg, metadata=metadata,\n'
+    "                            )\n"
+)
+
+SEND_PATCHED = (
+    "                        try:\n"
+    "                            # kube-agents patch: one rolling message per\n"
+    "                            # card. A progress note edits the message the\n"
+    "                            # card already has instead of posting another,\n"
+    "                            # so a five-milestone card pings the space once\n"
+    "                            # rather than five times. A terminal event\n"
+    "                            # settles that message and then posts its own,\n"
+    "                            # which is the notification people want. Any\n"
+    "                            # platform that cannot edit falls back to this\n"
+    "                            # same send(). The return value keeps send()'s\n"
+    "                            # shape, so the SendResult check below and the\n"
+    "                            # failure accounting are both unchanged.\n"
+    "                            # See gateway/kanban_progress_lines.py.\n"
+    "                            _send_res = await _progress_deliver(\n"
+    "                                self, adapter, sub, kind, ev, msg, metadata,\n"
+    '                                header=f"{board_tag}{tag}",\n'
+    "                            )\n"
+)
+
 IMPORT_LINE = (
     "\n\n# kube-agents patch: see gateway/kanban_progress_lines.py\n"
     "from gateway.kanban_progress_lines import progress_note as _progress_note\n"
+    "from gateway.kanban_progress_lines import deliver as _progress_deliver\n"
 )
 
 # --- tell the model what a note actually does -------------------------------
@@ -91,8 +132,10 @@ SCHEMA_PATCHED = (
     '        "straight into the chat thread watching this card, within "\n'
     '        "seconds, without interrupting your run or costing a turn — so "\n'
     '        "call this at every milestone the user should see rather than "\n'
-    '        "leaving them in silence until you complete. Pure side effect — "\n'
-    '        "no work changes."\n'
+    '        "leaving them in silence until you complete. Notes after the "\n'
+    '        "first are added to the same message, so calling this often "\n'
+    '        "builds a running log and does not spam the thread. Pure side "\n'
+    '        "effect — no work changes."\n'
     "    ),\n"
 )
 
@@ -126,6 +169,7 @@ PATCHES = (
         (
             (KINDS_ANCHOR, KINDS_PATCHED, 1),
             (RENDER_ANCHOR, RENDER_PATCHED, 1),
+            (SEND_ANCHOR, SEND_PATCHED, 1),
         ),
         IMPORT_LINE,
     ),

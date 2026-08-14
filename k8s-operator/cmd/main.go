@@ -64,6 +64,7 @@ func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
+	var webhookPort int
 	var enableLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
@@ -83,6 +84,15 @@ func main() {
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
 	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
 	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.IntVar(&webhookPort, "webhook-port", agentwebhook.DefaultPort,
+		"The port the webhook server binds to. Defaults to 10250 because GKE's automatic "+
+			"control-plane-to-node firewall rule only permits tcp:443 and tcp:10250; on a private "+
+			"cluster the API server cannot reach a webhook on any other port without a manual VPC "+
+			"firewall rule, and failurePolicy=Fail then blocks all PlatformAgent writes. The "+
+			"kubelet's 10250 is bound on the node IP in a different network namespace, so there is "+
+			"no conflict. Changing this alone is not enough: the manager containerPort and the "+
+			"webhook Service targetPort have to move with it, or the API server dials a port "+
+			"nothing is listening on.")
 	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
@@ -96,6 +106,17 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Reject an out-of-range --webhook-port rather than letting controller-runtime
+	// silently substitute its own default: webhook.Options.Port <= 0 falls back to 9443
+	// (pkg/webhook/server.go), the one port this operator sets DefaultPort to avoid. That
+	// spelling is easy to reach by analogy with --metrics-bind-address=0, which does mean
+	// "off", and the only symptom would be an info-level log line followed by fail-closed
+	// admission blocking every PlatformAgent write.
+	if webhookPort < 1 || webhookPort > 65535 {
+		setupLog.Error(nil, "invalid --webhook-port: must be between 1 and 65535", "port", webhookPort)
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -118,6 +139,7 @@ func main() {
 		webhookTLSOpts := tlsOpts
 		webhookServerOptions := webhook.Options{
 			TLSOpts: webhookTLSOpts,
+			Port:    webhookPort,
 		}
 
 		if len(webhookCertPath) > 0 {

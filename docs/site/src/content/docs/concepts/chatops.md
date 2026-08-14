@@ -36,7 +36,7 @@ Unlike Slack's, this one is not covered by `/sethome`. That command writes the *
 2. Chat sends the message event to the topic; the Chat Agent consumes it from the subscription.
 3. The Chat Agent picks the right specialist from the injected roster and files a kanban card with the full request context (`kanban_create`).
 4. The gateway's kanban dispatcher spawns the specialist — for infrastructure work, the Platform Agent (`hermes -p platform`) — which runs the tool loop and completes the card with a one-line `summary` and the full answer in `result`.
-5. The originating chat session is auto-subscribed to the card, so the thread fills itself: each `kanban_heartbeat(note=…)` milestone posts as a `⏳` line while the specialist works, and the completion posts as a `✔ … done` line carrying the `result` verbatim. The notifier delivers both directly and the Chat Agent is woken for neither; it is woken when a card blocks or fails.
+5. The originating chat session is auto-subscribed to the card, so the thread fills itself: each `kanban_heartbeat(note=…)` milestone adds a `⏳` line to one rolling message that the notifier edits in place while the specialist works — so a card with five milestones notifies the space once, not five times — and the completion posts as a separate `✔ … done` message carrying the `result` verbatim. The rolling message is then marked finished (`✓`, or `⏹` for a card that failed). The notifier delivers all of it directly and the Chat Agent is woken for none of it; it is woken when a card blocks or fails.
 
 ### E2E coverage
 
