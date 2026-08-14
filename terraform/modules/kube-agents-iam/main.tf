@@ -17,6 +17,7 @@ locals {
   agent_read_only_roles = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
+    "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
     "roles/iam.serviceAccountUser",
