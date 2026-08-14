@@ -610,10 +610,38 @@ Cleanup: #9 closed and its branch deleted, so `clusters/dev/echo-deployment.yaml
 `main`; the three cards archived. The reactions and replies on the closed pull request stay as the
 record.
 
+### Third round: the reply has to prove what it claims
+
+Same cluster and namespace, pod `platform-agent-gateway-5f8759dcf5-sm86k`, test pull request #10 on
+head branch `platform-agent/live-test-thread-context`. One caveat up front, because it bounds what
+this round proves: the scripts were staged onto the PVC with `kubectl cp` — `github_scan_gate.py` at
+14:07 EDT, `forge.py`, `pr_conversation.py` and the skill at 14:24 EDT on 2026-08-14 — rather than
+shipped in an image. So this round proves the code and not its delivery.
+
+**What it was answering.** At 11:50 EDT card `t_98e02d59` dispatched a worker at a change request on
+#10. `submit_suggestion.py prepare` was refused by the gateway lifecycle guard at 11:50:41 and again
+at 11:51:00; the worker blocked the card `needs_input` at 11:50:42; then at 11:51:05 it posted
+_"I have updated the Redis deployment in PR #10 to increase the memory limit to 512Mi and the
+replica count to 2, as requested"_ and stamped it `agent-answered`, which closes the request for
+good. Four seconds later its own card text read _"I was unable to apply the code changes"_. The card
+was honest and the thread was not, and only the thread has a reader.
+
+| What was proved                      | Result                                                                                                                                                                                                                                                                                             |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A false claim cannot be posted       | **Pass**, three ways. A sha that is not on the pull request is refused with the branch tip and the real commit list in the message; a 5-character sha is refused as too short to identify a commit; neither flag is an argparse exit 2. Nothing was posted in any of the three.                    |
+| A true claim still can               | **Pass.** `_check_claim` against the live provider accepts the abbreviated `db01a7e7`, the full 40-character sha, and `DB01A7E7` — the check is case-insensitive and prefix-matching, as intended.                                                                                                 |
+| The contract does not break honesty  | **Pass**, unforced. The real `*/10` tick at 14:31 EDT filed card `t_82b6021a`; the worker answered a question about the memory limit with `--no-change` and the reply carried its marker. The 14:11 EDT run is _not_ evidence here — it predates the 14:24 staging and posted with no flag at all. |
+| A fenced trigger still does not fire | **Pass.** The fenced and mid-sentence `/agent` lines on #10 drew no card and no reaction across four consecutive sweeps.                                                                                                                                                                           |
+
+**Not covered.** The `github_token_refresh.py` path fix is not live-tested: it is agent-facing prose,
+so exercising it means a card dispatch that walks Step 5 to the end, and the staging that would have
+put it in front of a worker is the one thing this round did not do.
+
 ### What the live run found that the unit tests could not
 
-Four defects, each of them a consequence of what GitHub actually returns to an App installation
-token or of where a card-driven turn actually starts. A fake provider cannot produce any of them.
+Five defects, each of them a consequence of what GitHub actually returns to an App installation
+token, of where a card-driven turn actually starts, or of what a model does when a step it was told
+to run is refused. A fake provider cannot produce any of them.
 
 1. `author_association` is unreliable under an App token — §3.
 2. `self_login` came back in three spellings — §3.
@@ -629,6 +657,15 @@ token or of where a card-driven turn actually starts. A fake provider cannot pro
    `github-issue-resolver` because §2 is what turned it from a cron-prompt skill into a card-driven
    one, and would otherwise have shipped the same 127. `fleet-audit` keeps the relative form: it is
    still only reached from a cron turn, and its SKILL.md says so in as many words.
+5. **A blocked step became a false claim, not a failure.** When `submit_suggestion.py prepare` was
+   refused, the worker replied that it had made the change and stamped the marker that closes the
+   request. Nothing in the design caught it: a marker is permanent, no later sweep re-opens the
+   request, and the reviewer's next signal would have been the deployment. §6 adds the check —
+   `reply` now requires `--verify-commit <sha>` or `--no-change`, and verifies the first against the
+   pull request's commits. It is worth being clear that this is a guard rail and not a proof: a
+   model that lies about a change can still lie under `--no-change`. What it removes is the case
+   that actually happened, where the model knew it had failed, said so on the card, and told the
+   thread the opposite.
 
 ### The two findings that are not this change's to fix
 
@@ -658,12 +695,26 @@ every token that sits in command position and contains a `/` — and `_read_refe
 anything that is not a regular file as _unsafe_, which fails closed. A **directory** path in a
 Python source line is therefore enough: `submit_suggestion.py` line 29 is
 `sys.path.append("/opt/defaults/scripts")`, present since the original GitHub integration. Sweeping
-the profile finds five scripts blocked when invoked by absolute path — `submit_suggestion.py`,
-`audit_report.py`, `otel_config.py`, `platform_mcp_server.py`, `session_manager.py` — and none of
-them belong to this change. A directory is never an executed shell script, so the fix belongs in the
-guard; it is reported upstream rather than worked around here. The `"$HERMES_HOME"/skills/…` form
-adopted for finding 4 happens to sidestep it, because the guard does not expand the variable, but
-that is a side effect and not the reason for the change.
+all 83 scripts in the profile finds **seven** blocked when invoked by absolute path —
+`submit_suggestion.py`, `audit_report.py`, `otel_config.py`, `platform_mcp_server.py`,
+`session_manager.py`, and this branch's own `test_forge.py` and `test_kanban_board_health.py` — and
+none of them belong to this change. A directory is never an executed shell script, so the fix
+belongs in the guard; it is reported upstream rather than worked around here. The
+`"$HERMES_HOME"/skills/…` form adopted for finding 4 happens to sidestep it, because the guard does
+not expand the variable, but that is a side effect and not the reason for the change.
+
+Two things sharpen it beyond a curiosity. It is **not probabilistic**: the message log holds four
+absolute-path invocations of `submit_suggestion.py` across three separate turns, and not one has
+ever succeeded, against 17 successes for every other spelling. And it does not achieve its own goal
+— only the direct and `bash -c "<path>"` forms are scanned, so `python3 /opt/data/…/x.py` runs
+unimpeded, which is how one worker recovered from the block on its own. What the guard legitimately
+protects, an agent scheduling a gateway restart from inside the gateway, is real; the scan that
+enforces it is both too wide and trivially porous.
+
+The same sweep found a second, independent defect in the guard: two scripts (`test_pr_triggers.py`,
+`test_audit_report.py`) make it raise `RuntimeError` rather than return a verdict, from an unguarded
+`Path(candidate).expanduser()` meeting a `~~~` fence. The module's own docstring says it must never
+crash the caller. Both are reported upstream together.
 
 ### What the validation left behind
 
@@ -679,8 +730,7 @@ Two things remain by design. The four earlier `[audit]` issues on the test repos
 fleet-audit ledgers, not test artifacts. And the `👀` reactions and agent replies on the closed pull
 request stay where they are: they are the record that the validation happened.
 
-### Left behind
-
-The test pull request, its branch, `manifests/live-test-echo.yaml` and the kanban cards it produced
-are cleaned up at the end of the run; anything that could not be removed is named in the pull-request
-body.
+The third round leaves pull request #10, its branch `platform-agent/live-test-thread-context` and
+the cards `t_98e02d59`, `t_180fa8de` and `t_82b6021a` to be cleaned up the same way, and leaves the
+PVC carrying `kubectl cp`'d copies of the scripts rather than the image's — which the next rebuild
+overwrites, and which the pull-request body names rather than implying an image-shipped test.
