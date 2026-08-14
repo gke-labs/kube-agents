@@ -64,9 +64,12 @@ test: manifests generate fmt vet setup-envtest test-python ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: test-python
+# Discovery, not a hand-maintained list. The list version was stale: it named
+# three files and missed test_scoped_sa_pool.py and test_session_kv_server.py,
+# so tests that existed and passed locally were never run by this target.
 test-python: ## Run Python tests.
-	cd internal/controller && python3 -m unittest test_leader_elect.py
-	cd ../agents/platform/scripts && python3 -m unittest test_slack_relay_patch.py test_credential_proxy.py test_sitecustomize.py
+	cd internal/controller && python3 -m unittest discover -s . -p 'test_*.py'
+	cd ../agents/platform/scripts && python3 -m unittest discover -s . -p 'test_*.py'
 
 ##@ Build
 
