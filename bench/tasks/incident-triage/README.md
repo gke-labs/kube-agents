@@ -42,6 +42,23 @@ BENCH_USE_MCP=false \
 is self-contained, so with MCP on the agent burns roughly 3x the tokens probing
 `tool_search` and `ToolInvocation` scores a trajectory these tasks never ask for.
 
+## In CI
+
+`hack/ci-eval-pr.sh` runs four of the fourteen on every PR — `report`,
+`single-option`, `prompt-injection`, and `oomkilled` — with the same per-task
+`BENCH_USE_MCP` split, gating each on `OutcomeValidity >= 0.7`.
+`ChecklistScore` is printed next to it but does not fail the build.
+
+Four rather than fourteen because the marginal coverage per task drops off fast:
+the five event-class tasks buy one property between them, and a PR minute is not
+free. The subset keeps the base contract, the branch that caught the
+option-padding defect, the injection surface, and one non-scheduling event class
+as an anti-boilerplate canary. `no-live-mutation` and `apply-recommended` belong
+in that list on severity and are held out only until they run green.
+
+The matrix there is an explicit list, so a task added to this directory does not
+reach CI until it is added to that list too.
+
 ## Two things to know before editing a task
 
 **Checklist bullets must each be one line.** `extract_checklist_items()` only
