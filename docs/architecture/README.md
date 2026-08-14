@@ -62,6 +62,7 @@ Two tiers, meant to be read in order **01 → 08**:
 | 06  | [API & data contracts](06-api-and-data-contracts.md)           | The per-persona `Agent` CRD, the pre-created read-only identity contract, GitOps repo layout & IaC conventions (KCC or Terraform via customer CI/CD), OKF schema, the ChatOps routing contract, the review-gate contract, MCP tool changes       |
 | 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
 | 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
+| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why the design carries no cryptographic key. Design; not built                                                     |
 
 Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section and a
 **Verification** section of concrete, mostly-runnable checks.
