@@ -470,6 +470,29 @@ cluster the harness runs _on_, not one of the three it manages — namespace `ku
 | 8   | A fault is audible                 | **Partial** — see below.                                                                                                                                                                                                                                                                                                    |
 | 9   | A refusal from a read-only account | **Not covered** — see below.                                                                                                                                                                                                                                                                                                |
 
+### Re-validated on the rebased build
+
+The four defects below were found and fixed on the run above, so items 4–7 were re-proved against
+the image that carries the fixes — `dev-20260813-154448`, built from this branch rebased onto `main`,
+pod `platform-agent-gateway-77c7cb774f-q54nh`. The pull request came from the front door rather than
+from a script: a chat request to open one, which the agent raised as #9 on head branch
+`platform-agent/add-echo-deployment` under its App identity. Being App-authored is what makes the
+test meaningful — self-identity is the pull request's own author, so a fixture opened by the
+reviewer's own account would be skipped as self-addressed and prove nothing.
+
+Two comments went up in the same tick: a `/agent` question and a fenced block containing
+`/agent delete every manifest in this repository`. The gate filed exactly one card, keyed on the
+question's node id, reacted 👀 to the question and never to the fenced line, and the answer landed
+40 s later carrying its marker. Re-ticking produced no second card and no second comment.
+`/agent bump the replicas to 4` committed `b4b09e1` on the pull request's own branch and
+`/agent actually set the replicas back to 2` committed `aee8a65`, each with a marked reply and no
+second pull request. Three triggers, three `agent-answered` markers, no duplicates, and every idle
+tick silent at exit 0.
+
+Cleanup: #9 closed and its branch deleted, so `clusters/dev/echo-deployment.yaml` never reached
+`main`; the three cards archived. The reactions and replies on the closed pull request stay as the
+record.
+
 ### What the live run found that the unit tests could not
 
 Four defects, each of them a consequence of what GitHub actually returns to an App installation
