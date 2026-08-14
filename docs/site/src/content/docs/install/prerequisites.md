@@ -21,6 +21,15 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 The provisioner will enable APIs and create all resources itself; you don't need to pre-provision the cluster.
 
+**No extra firewall rule is needed on private clusters.** The operator's webhook server listens on
+`10250`, one of the two ports GKE's automatic control-plane-to-node rule already permits — see
+[Admission webhooks](/kube-agents/operator/#admission-webhooks). A cluster that hardens `10250`
+beyond the GKE default (scoping it to node IPs, say) still needs a rule for the webhook, or a move to
+a port it does allow — which is a Kustomize patch across the `--webhook-port` flag, the manager
+`containerPort`, and the Service `targetPort` together, not a single flag. Changing one of the three
+leaves the API server dialing a port nothing is listening on; see
+[Serving on a different port](/kube-agents/operator/#serving-on-a-different-port).
+
 ## cert-manager on the target cluster
 
 The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+).

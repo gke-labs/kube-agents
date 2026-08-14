@@ -47,13 +47,19 @@ CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
 # authenticate nothing. See docs/credential-isolation-design.md.
-SESSION_KV_API_KEY_ENV = "SESSION_KV_API_KEY"
+#
+# Named for what it holds — the *name* of an environment variable, never the
+# key itself. An identifier matching `api_key` turns every log line that
+# mentions it into a clear-text-logging finding
+# (CodeQL py/clear-text-logging-sensitive-data), and the error below has to
+# name the variable an operator is being told to set.
+SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 
 
 def _expected_api_key() -> str:
     # Read per request rather than at import: the value arrives from the pod
     # environment, and tests set it around individual calls.
-    return (os.getenv(SESSION_KV_API_KEY_ENV) or "").strip()
+    return (os.getenv(SESSION_KV_AUTH_ENV) or "").strip()
 
 
 def _presented_api_key(authorization: str, x_api_key: str) -> str:
@@ -81,7 +87,7 @@ def verify_api_key(
         logger.error(
             "%s is not set — refusing every authenticated request. "
             "Re-run provisioning so the pod secret carries a session KV key.",
-            SESSION_KV_API_KEY_ENV,
+            SESSION_KV_AUTH_ENV,
         )
         raise HTTPException(status_code=503, detail="session KV authentication is not configured")
 

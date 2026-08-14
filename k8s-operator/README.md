@@ -12,7 +12,7 @@ The operator is built using the Kubebuilder framework and is written in Go.
 
 Before building or deploying the operator, ensure you have the following installed:
 
-- [Go](https://go.dev/doc/install) (version 1.25+)
+- [Go](https://go.dev/doc/install) (version 1.26+)
 - [Docker](https://docs.docker.com/get-docker/) or Podman (for building container images)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) (configured to access your Kubernetes/GKE cluster)
 - Access to a running Kubernetes/GKE cluster
@@ -192,6 +192,8 @@ ENABLE_WEBHOOKS=false go run ./cmd/main.go
 
 > [!TIP]
 > This compiles and runs the entry point [main.go](cmd/main.go) with webhooks disabled. The process runs in the foreground, prints reconciliation logs, and watches for custom resource events in the cluster.
+
+When webhooks are enabled, the server binds `10250` rather than Kubebuilder's usual `9443`: it is one of only two ports GKE's automatic control-plane-to-node firewall rule permits, so a private cluster reaches the webhook without a hand-added VPC rule. Where 10250 is not the reachable port, `--webhook-port`, the manager `containerPort`, and the Service `targetPort` have to be changed together — the flag alone moves the listener and leaves the Service dialing a dead port, which fail-closed admission turns into a wedged cluster. The rationale, the Kustomize patch that moves all three, the drift guard across them, and the recovery steps for an unreachable webhook are in [Admission webhooks](../docs/site/src/content/docs/operator/index.md#admission-webhooks).
 
 ### Step 4: Apply Sample Custom Resources
 

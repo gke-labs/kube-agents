@@ -39,7 +39,7 @@ spec:
             # Chart installs ship no webhook Service, certificate, or
             # Mutating/ValidatingWebhookConfiguration, so the admission
             # webhooks must stay off — enabling them without that wiring
-            # crashes the manager (no cert mount, nothing serving :9443).
+            # crashes the manager (no cert mount, nothing serving :10250).
             - name: ENABLE_WEBHOOKS
               value: "false"
             {{- with .Values.operator.extraEnv }}

@@ -4,7 +4,7 @@
 {{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
 {{- end }}
 {{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
 {{- if not (hasKey $defaultModels $provider) }}
 {{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
@@ -224,6 +224,23 @@ spec:
             cidr: 169.254.20.10/32
         - ipBlock:
             cidr: 169.254.169.254/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The two peers
+        # below cover both shapes: the literal handles the classic service
+        # range, and the excepted block handles any VIP outside private space
+        # (34.118.224.0/20 today, whatever GKE allocates next). The except list
+        # mirrors the 443 rule, so port 53 reaches nothing internal that the
+        # 443 rule does not already deny.
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
     - ports:
         - port: 443
           protocol: TCP

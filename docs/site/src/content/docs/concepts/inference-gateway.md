@@ -47,7 +47,7 @@ The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_D
 | `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
 | ------------------ | ---------------------------- | ------------------------------------------ |
 | `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
-| `anthropic`        | `claude-sonnet-4-5-20250929` | Uses `ANTHROPIC_API_KEY`.                  |
+| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
 | `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
 | `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth).     |
 | `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |

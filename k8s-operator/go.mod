@@ -1,6 +1,6 @@
 module github.com/gke-labs/kube-agents/k8s-operator
 
-go 1.25.8
+go 1.26.6
 
 require (
 	github.com/google/go-cmp v0.7.0

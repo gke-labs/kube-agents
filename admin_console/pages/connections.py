@@ -13,45 +13,24 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console.connections import CheckStatus
-from admin_console.connection_sidebar import render_connection_controls
+from admin_console.connection_session import recover_app_shell
+from admin_console.connection_sidebar import (
+    connection_controller,
+    render_connection_controls,
+)
 
+recover_app_shell()
 st.title("Connection")
 render_connection_controls()
+controller = connection_controller()
+if not controller.project_id:
+    st.stop()
+
+report = controller.cluster.report
+if report is None or controller.connected_target is None:
+    st.stop()
+
 st.divider()
-project_id = str(st.session_state.get("selected_project", "")).strip()
-connected_target = st.session_state.get("connected_target")
-
-if not project_id:
-    st.info("Choose a project above to connect.")
-    st.stop()
-
-report = st.session_state.get(f"connection_report:{project_id}")
-if report is None:
-    st.info("Connect above to run the verification checklist.")
-    st.stop()
-
-if connected_target and connected_target.project_id == project_id:
-    st.success(
-        f"Connected to {connected_target.cluster_name} · "
-        f"{connected_target.location}."
-    )
-elif report.clusters and len(report.kube_agents_hosts) != 1:
-    if report.kube_agents_hosts:
-        reason = (
-            f"{len(report.kube_agents_hosts)} clusters are labeled "
-            "kube-agents-host=true"
-        )
-    else:
-        reason = "no cluster is labeled kube-agents-host=true"
-    st.error(
-        f"Automatic cluster detection failed because {reason}. "
-        "Select the kube-agents host above."
-    )
-elif report.failed:
-    st.error("Connection was not established. Resolve the failed checks and retry.")
-else:
-    st.info("Not connected. Review the non-passing checks and retry above.")
-
 st.caption(f"Last checked {report.checked_at:%Y-%m-%d %H:%M:%S UTC}")
 metrics = st.columns(3)
 metrics[0].metric("Passed", report.passed)
@@ -74,7 +53,7 @@ for check in report.checks:
             st.markdown(check.guidance)
 
 st.subheader("Google Cloud")
-encoded_project = urllib.parse.quote(project_id, safe="")
+encoded_project = urllib.parse.quote(controller.project_id, safe="")
 link_columns = st.columns(3)
 link_columns[0].link_button(
     "Logs Explorer",

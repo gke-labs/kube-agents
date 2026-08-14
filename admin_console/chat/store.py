@@ -215,6 +215,28 @@ def _encode_interaction(interaction: Interaction) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
+def _decode_task_projection(payload: dict) -> TaskProjection:
+    """Decode known task fields while tolerating additive stored metadata."""
+    return TaskProjection(
+        task_id=str(payload["task_id"]),
+        title=str(payload["title"]),
+        assignee=str(payload["assignee"]),
+        status=str(payload["status"]),
+        summary=str(payload.get("summary") or ""),
+        error=str(payload.get("error") or ""),
+        run_count=int(payload.get("run_count") or 0),
+    )
+
+
+def _decode_tool_call(payload: dict) -> ToolCallEvidence:
+    """Decode known tool fields while tolerating additive stored metadata."""
+    return ToolCallEvidence(
+        name=str(payload["name"]),
+        status=str(payload["status"]),
+        source=str(payload.get("source") or "root_run"),
+    )
+
+
 def _decode_interaction(raw: str) -> Interaction:
     payload = json.loads(raw)
     return Interaction(
@@ -231,9 +253,11 @@ def _decode_interaction(raw: str) -> Interaction:
         error=str(payload.get("error") or ""),
         diagnostics=tuple(str(item) for item in payload.get("diagnostics", [])),
         approval=payload.get("approval"),
-        tasks=tuple(TaskProjection(**task) for task in payload.get("tasks", [])),
+        tasks=tuple(
+            _decode_task_projection(task) for task in payload.get("tasks", [])
+        ),
         tool_calls=tuple(
-            ToolCallEvidence(**tool) for tool in payload.get("tool_calls", [])
+            _decode_tool_call(tool) for tool in payload.get("tool_calls", [])
         ),
     )
 

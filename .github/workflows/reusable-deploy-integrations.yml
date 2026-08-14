@@ -12,10 +12,10 @@ on:
         type: boolean
         default: false
         description: "If true, bypasses paths filter and forces deployment of all integrations"
-      checkout_ref:
+      checkout_sha:
         required: true
         type: string
-        description: "The git ref to pass to actions/checkout"
+        description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
 jobs:
   detect-changes:
@@ -28,7 +28,8 @@ jobs:
         if: ${{ inputs.force_deploy == false }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Detect changes
         if: ${{ inputs.force_deploy == false }}
@@ -75,13 +76,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
-          cache-dependency-path: "k8s-operator/go.sum"
+          # No module cache: this job holds the target environment's deploy
+          # credentials, and a cache it writes on the default branch is
+          # restorable by every branch built off it.
+          cache: false
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -134,13 +139,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
-          cache-dependency-path: "k8s-operator/go.sum"
+          # No module cache: this job holds the target environment's deploy
+          # credentials, and a cache it writes on the default branch is
+          # restorable by every branch built off it.
+          cache: false
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -235,13 +244,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
-          cache-dependency-path: "k8s-operator/go.sum"
+          # No module cache: this job holds the target environment's deploy
+          # credentials, and a cache it writes on the default branch is
+          # restorable by every branch built off it.
+          cache: false
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0

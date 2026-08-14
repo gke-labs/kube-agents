@@ -74,7 +74,7 @@ def persisted_backend_factory(account: str) -> BackendFactory:
 
     def build() -> ChatBackend:
         connection = load_connection(account)
-        if connection is None:
+        if connection is None or not connection.usable:
             raise RuntimeError(
                 "No verified portal connection is available. Open Connection and connect "
                 "to a kube-agents host first."

@@ -2,32 +2,57 @@
 #
 # This is the config.yaml for the front-door Chat Agent — the `default` Hermes
 # profile that receives all chat ingress. It is written to
-# /opt/chat-template/config.yaml at build time and is the BASE from which
-# docker-entrypoint.sh rebuilds the default profile home's config.yaml
-# ($HERMES_HOME/config.yaml) on every start.
+# /opt/chat-template/config.yaml at build time, and docker-entrypoint.sh seeds
+# the default profile home's config.yaml ($HERMES_HOME/config.yaml) from it on a
+# FRESH volume. After that the live file belongs to the running agent, with one
+# exception: step 2d back-fills, at every start, any key the live file does not
+# hold at all — the repair for a `save_config` that stripped a then-pinned leaf,
+# or a release that stopped pinning one. So ADDING a key here does reach an
+# existing install on its next roll; CHANGING one does not, because the live file
+# already holds it and the back-fill never overrules a value the agent has. A
+# changed value reaches a deployed agent only through the operator — the managed
+# scope or the overlay in (3) and (4) below — or by hand.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# THE LIVE FILE HAS THREE AUTHORS, and this is only one of them:
+# WHAT THE AGENT ACTUALLY LOADS IS FOUR THINGS, and this is only one of them:
 #
-#   1. this file, the base;
-#   2. the operator's render (k8s-operator renderConfigYAML), delivered as the
-#      ConfigMap key profile-default.overlay.yaml and merged on top;
-#   3. the running agent, which writes to its own config — /sethome records the
-#      home channel, the monitoring policy mints monitoring.install_id.
+#   1. this file, the base, seeded onto the PVC on a fresh volume and back-filled
+#      into it thereafter;
+#   2. the running agent's own writes to that PVC copy — /sethome records the
+#      home channel, the monitoring policy mints monitoring.install_id, slash
+#      commands save preferences;
+#   3. the operator's overlay for this profile (renderDefaultProfileOverlayYAML,
+#      ConfigMap key profile-default.overlay.yaml), merged INTO the PVC copy by
+#      entrypoint step 2.7 at startup. It carries the operator settings that stay
+#      mutable afterwards — an untargeted AgentPlugin's enablement and its
+#      non-gateway config, and spec.harness.tuning;
+#   4. the operator's render (k8s-operator renderConfigYAML), mounted read-only
+#      at /etc/hermes/config.yaml as Hermes' MANAGED SCOPE and overlaid, per leaf
+#      key, on top of 1+2+3 at every load.
 #
-# deploy/shared/default_profile_config.py reconciles the three with a three-way
-# merge: the operator wins any key it and the runtime both changed, the runtime
-# keeps its own edits everywhere else. The file is NOT mounted from the ConfigMap;
-# it was once, and that made it read-only, which is what made /sethome fail.
+# The managed scope wins, and it wins without touching the PVC: hermes merges it
+# in on load, strips its keys back out of anything the agent saves, and rejects
+# `hermes config set` against them. So the operator's model endpoint and platform
+# settings are immutable at runtime while the file itself stays writable. It was
+# once subPath-mounted over $HERMES_HOME/config.yaml instead, which made the file
+# read-only — that is what made /sethome fail (issue #658).
 #
-# Keep this file and renderConfigYAML in sync in BOTH directions. Lists are
-# unioned, so an entry dropped from one side survives in the other — removing a
-# toolset or plugin means removing it here AND there. The operator's
-# TestRenderConfigYAMLListsMatchChatConfig fails when the two diverge.
+# (3) and (4) do not overlap, and must not — a key the operator both pins and
+# merges would be written to the PVC and then overruled on load, so withdrawing
+# it from the CR would change nothing anyone could see.
+#
+# /etc/hermes is MACHINE-GLOBAL — one file
+# for every profile in the pod, not just this one — so it carries only what is
+# identical for every profile AND beyond the agent's own repair: `model`,
+# `platforms`, `approvals.cron_mode`, `display.platforms`. Everything
+# profile-shaped below — toolsets, plugins.enabled, mcp_servers, kanban, memory —
+# is this file's alone. Do not add any of it to renderConfigYAML: the merge is
+# per leaf key and lists REPLACE rather than union, so a list pinned there would
+# hand the platform specialist the front door's tools and vice versa.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
@@ -60,24 +85,26 @@ model:
   default: model-default
   base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
   api_key: none
+  # The wire protocol a custom provider on this base_url resolves to anyway. Stated
+  # explicitly to match the operator's managed render, where its purpose is to pin the
+  # key so `/model … --global` cannot persist a different one.
+  api_mode: chat_completions
 
 # MCP Servers configuration. Routing/relay surface only.
 #
-# `args` must stay BYTE-IDENTICAL to renderConfigYAML's, which is why it is a
-# ${HERMES_HOME} placeholder and not a path. Lists are unioned by the merge (see
-# the header), and a command line is the one kind of list a union corrupts
-# rather than extends: two differing entries become two argv words, and python3
-# runs the first. Hardcoding /opt/data made them differ under a custom
+# `args` is a ${HERMES_HOME} placeholder rather than a path because this file is
+# the only thing that declares it: hardcoding /opt/data broke a custom
 # spec.harness.hermes.agentHome, where /opt/data/scripts/router_server.py does
 # not exist — the entrypoint copies /opt/defaults into the custom home — so the
 # router MCP died at startup and the Chat Agent had no roster to delegate
 # against.
 #
-# The placeholder is also what makes THIS file correct on its own, which it has
-# to be: the entrypoint seeds a fresh PVC straight from it, before the operator's
-# overlay is merged. HERMES_HOME is exported by docker-entrypoint.sh line 5 and
-# resolved in `args` by tools/mcp_tool.py `_interpolate_env_vars`, the same
-# expansion the `env` block below already depends on.
+# The operator renders no mcp_servers at all, deliberately: the managed scope is
+# machine-global and its merge REPLACES lists, so a command line pinned there
+# would be handed to every profile in the pod. HERMES_HOME is exported by
+# docker-entrypoint.sh line 5 and resolved in `args` by tools/mcp_tool.py
+# `_interpolate_env_vars`, the same expansion the `env` block below already
+# depends on.
 mcp_servers:
   router:
     command: "/opt/hermes/.venv/bin/python3"
@@ -172,11 +199,12 @@ kanban:
   # of cards spawns processes until the cgroup OOM killer takes them, which kills a
   # child rather than the container and so produces no restart and no event.
   #
-  # On an operator-managed install this line is overwritten: the operator renders
-  # the same value into its config ConfigMap and the entrypoint force-syncs that
-  # over this file. It is here for the install that runs the image without the
-  # operator, which would otherwise be the only one left uncapped. The operator's
-  # defaultKanbanMaxInProgress is authoritative; keep the two the same.
+  # This line is the default on every install. The operator does not pin it: its
+  # managed scope is machine-global and this is a front-door setting. An operator
+  # that wants a different cap sets spec.harness.tuning.maxInProgress, which the
+  # operator writes into profile-default.overlay.yaml and the entrypoint merges
+  # over this key at startup — so keep this value in step with
+  # defaultKanbanMaxInProgress in platformagent_manifests.go.
   max_in_progress: 2
 
 # Denylist applied last for every platform key — the authoritative guarantee that
@@ -229,14 +257,14 @@ platforms:
   # Slack egress presentation. `enabled` is the operator's to set, from the CR's
   # spec.integration.slack.
   #
-  # This block is one of the two copies the header warns about, and the one that
-  # does NOT run on a deployed agent: the operator's rendered config.yaml is
-  # subPath-mounted straight over $HERMES_HOME/config.yaml, so the file below is
-  # what the adapter reads only where nothing mounts over it — a local `docker
-  # run`, or a profile started off the image alone. Setting `rich_blocks` here
-  # and nowhere else changes nothing in a cluster. Its twin is
-  # renderConfigYAML in k8s-operator/internal/controller/platformagent_manifests.go
-  # (search `Platforms.Slack.Extra`), pinned by TestBuildConfigMapSlackRichBlocks.
+  # `platforms` is the one subtree the operator also renders, so this block has a
+  # twin and the managed scope's copy is the one a deployed agent obeys: the
+  # overlay wins per leaf key at every load. Setting `rich_blocks` here and
+  # nowhere else therefore changes nothing in a cluster — it is read only where
+  # nothing mounts /etc/hermes, a local `docker run` or a profile started off the
+  # image alone. The twin is renderConfigYAML in
+  # k8s-operator/internal/controller/platformagent_manifests.go (search
+  # `Platforms.Slack.Extra`), pinned by TestBuildConfigMapSlackRichBlocks.
   # Change one, change both.
   slack:
     extra:
@@ -316,11 +344,14 @@ platforms:
 # entirely. They do get the same provider under `read_only: true`, which is why
 # agents/platform/config.yaml names it too.
 #
-# `provider` here is a default, not the decision. On an operator-deployed pod this
-# whole file is replaced by the rendered ConfigMap, which carries the install's
-# choice from spec.harness.memory.provider; the value below is what a run without
-# the operator gets. It names the file store, matching the CRD default, so that a
-# bare `hermes` run needs no service outside the pod. See
+# `provider` here is the decision for THIS profile, and the only one it gets. The
+# operator renders no `memory` block into the managed scope — that scope is
+# machine-global, and a provider pinned there would be handed to every specialist
+# in the pod, including the ones that carry no human identity to scope a store by.
+# spec.harness.memory.provider still reaches the platform profile through its own
+# overlay; it no longer reaches the front door, so changing the store here means
+# changing this file and rebuilding. It names the file store, matching the CRD
+# default, so that a bare `hermes` run needs no service outside the pod. See
 # docs/designs/memory.md#choosing-a-provider.
 #
 # It also fails closed in shared Google Chat threads. build_session_key()

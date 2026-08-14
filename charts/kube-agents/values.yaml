@@ -5,7 +5,7 @@ operator:
   # CREDENTIAL_PROXY_IMAGE / FLUENT_BIT_IMAGE:
   #   extraEnv:
   #     - name: FLUENT_BIT_IMAGE
-  #       value: registry.corp/mirror/fluent-bit:5.0.7
+  #       value: registry.corp/mirror/fluent-bit:5.1.0
   extraEnv: []
   image:
     repository: ghcr.io/gke-labs/kube-agents/k8s-operator

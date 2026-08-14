@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import time
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
@@ -16,7 +19,7 @@ from admin_console.agent_chat import ChatRunResult, MAX_HISTORY_MESSAGES
 from admin_console.agent_runtime import AgentTaskUpdate, TaskUpdateResult
 from admin_console.api.app import create_app
 from admin_console.chat.service import ChatService
-from admin_console.chat.models import Interaction, InteractionStatus
+from admin_console.chat.models import Interaction, InteractionStatus, TaskProjection
 from admin_console.chat.store import SQLiteInteractionStore
 from admin_console.clients.portal_api import PortalApiClient, PortalApiError
 from admin_console.connection_persistence import save_connection
@@ -636,6 +639,40 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["detail"]["error"]["code"], "stale_target_scope")
 
+    def test_api_rejects_target_pending_revalidation(self):
+        target = DeploymentTarget(
+            "test-project-01",
+            "test-cluster-01",
+            "us-central1",
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "KUBE_AGENTS_ADMIN_USER": "admin@example.com",
+                "KUBE_AGENTS_ADMIN_CONNECTION_STATE": str(
+                    Path(directory) / "connection.json"
+                ),
+            },
+        ):
+            save_connection(
+                "admin@example.com",
+                target,
+                datetime.now(UTC),
+                usable=False,
+            )
+            client, _ = client_for(ScriptedBackend())
+
+            response = client.get(
+                "/api/v1/agents",
+                headers=deployment_target_headers(target),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"]["error"]["code"],
+            "connection_unavailable",
+        )
+
     def test_client_calls_the_cancel_endpoint(self):
         class CancelledResponse:
             status_code = 200
@@ -688,6 +725,57 @@ class InteractionApiTest(unittest.TestCase):
             self.assertEqual(persisted.tool_calls[0].name, "kanban_create")
             self.assertEqual(events[-1].event, "interaction.completed")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_sqlite_store_ignores_additive_fields_from_another_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interactions.db"
+            store = SQLiteInteractionStore(path)
+            now = datetime.now(UTC)
+            interaction = Interaction(
+                interaction_id="ix_additive_fields",
+                agent_id="platform-agent",
+                profile="default",
+                session_id="portal_additive_fields",
+                input_text="Inspect the cluster",
+                status=InteractionStatus.COMPLETED,
+                created_at=now,
+                updated_at=now,
+                tasks=(
+                    TaskProjection(
+                        task_id="task-1",
+                        title="Inspect",
+                        assignee="platform",
+                        status="done",
+                    ),
+                ),
+            )
+            store.create(interaction)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                raw = connection.execute(
+                    "SELECT payload FROM interactions WHERE interaction_id = ?",
+                    (interaction.interaction_id,),
+                ).fetchone()[0]
+                payload = json.loads(raw)
+                payload["tasks"][0]["skills"] = ["runtime-debugging"]
+                payload["tool_calls"] = [
+                    {
+                        "name": "kanban_create",
+                        "status": "completed",
+                        "source": "root_run",
+                        "duration_ms": 42,
+                    }
+                ]
+                connection.execute(
+                    "UPDATE interactions SET payload = ? WHERE interaction_id = ?",
+                    (json.dumps(payload), interaction.interaction_id),
+                )
+
+            reopened = SQLiteInteractionStore(path)
+            persisted = reopened.get(interaction.interaction_id)
+
+            self.assertEqual(persisted.tasks[0].task_id, "task-1")
+            self.assertEqual(persisted.tool_calls[0].name, "kanban_create")
+            self.assertEqual(reopened.recover_incomplete(), 0)
 
     def test_sqlite_store_redacts_prompts_but_backend_receives_the_original(self):
         backend = ScriptedBackend()

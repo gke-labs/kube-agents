@@ -1,70 +1,120 @@
-/* Kubernetes docs palette + Docsy-style typography. Light-only site.
+/* Terminal-navy palette + system typography. Dark-only site.
  *
- * Colors adapted from kubernetes/website's `_variables_project.scss`:
- *   $primary:            #326ce5  (K8s brand blue)
- *   $secondary:          #495057  (slate)
- *   $light-grey:         #f9f9f9
- *   $medium-light-grey:  #6f6f6f
- *   $medium-grey:        #4c4c4c
- *   $dark-grey:          #303030
- *   $feature:            #daeaf9  (soft-blue callout tint)
- *   $feature-inset:      #eeeeee
+ * Colors sampled directly from the Claude Code terminal UI (deep navy
+ * canvas, saturated syntax accents). Surface and accent hexes below
+ * are the measured pixel values, not approximations:
+ *   canvas:      #0f1728  (52% of the reference image)
+ *   slate rule:  #3f4553
+ *   warm white:  #f8f8f3  (primary text)
+ *   light gray:  #ced2d6  (secondary text)
+ *   cyan:        #2acaca  (links, primary accent)
+ *   chip teal:   #2090af  (filled chip background)
+ *   violet:      #bd86f9  (inline code, hex literals)
+ *   amber:       #fcc140  (status / caution)
+ *   coral:       #fb7081  (errors / danger)
+ *   green:       #58c660  (success)
+ *   lime:        #a9e051  (added lines)
+ *   periwinkle:  #b1baf5  (branch names / meta)
+ *
+ * The palette is deliberately polychrome: the accent hues rotate
+ * across sidebar groups, link cards, and headings so the page reads
+ * as a syntax-highlighted surface rather than one blue on one gray.
+ * Every foreground/background pair below was checked against WCAG
+ * 2.1 — body pairs clear 4.5:1, large/UI pairs clear 3:1.
  *
  * Starlight semantically inverts its color vars between themes:
  *   --sl-color-white: highest-contrast text on the current bg
- *                     (white in dark mode, near-black in light mode)
- *   --sl-color-black: the page bg (dark in dark mode, white in light)
- *   --sl-color-gray-1 (darkest text) → gray-7 (lightest bg)
+ *   --sl-color-black: the page bg
+ *   --sl-color-gray-1 (brightest text) → gray-7 (darkest surface)
  *
- * Server-side Starlight ships <html data-theme="dark"> and flips it
- * client-side via its ThemeProvider script. To avoid a flash of dark
- * (which reads as invisible white-on-white text under our overrides),
- * we duplicate every override under BOTH :root, [data-theme='light'],
- * AND [data-theme='dark'] — so the initial dark-attributed render
- * already paints with light-mode values.
+ * The site is dark-only: ThemeProvider.astro pins data-theme='dark'
+ * before hydration, and every override below is duplicated under BOTH
+ * :root, [data-theme='light'], AND [data-theme='dark'] — so a stray
+ * light attribution (old localStorage value) still paints navy.
  */
 
 :root,
 :root[data-theme='light'],
 :root[data-theme='dark'] {
-  /* Typography — Docsy-style system stack, matches kubernetes.io */
-  --sl-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-    Oxygen-Sans, Ubuntu, Cantarell, 'Helvetica Neue', Arial, sans-serif;
-  --sl-font-system-mono: SFMono-Regular, Menlo, Monaco, Consolas,
-    'Liberation Mono', 'Courier New', monospace;
+  /* Typography — system stack, monospace matches the terminal source */
+  --sl-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
+    Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+  --sl-font-system-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo,
+    Consolas, 'Liberation Mono', monospace;
 
-  /* Semantic color tokens — light-mode values under both themes */
-  --sl-color-white: #303030; /* high-contrast text (K8s $dark-grey) */
-  --sl-color-gray-1: #303030; /* body prose */
-  --sl-color-gray-2: #4c4c4c; /* strong text (K8s $medium-grey) */
-  --sl-color-gray-3: #6f6f6f; /* muted metadata (K8s $medium-light-grey) */
-  --sl-color-gray-4: #8a8a8a; /* faded / captions */
-  --sl-color-gray-5: #dcdcdc; /* borders */
-  --sl-color-gray-6: #eeeeee; /* subtle surface (K8s $feature-inset) */
-  --sl-color-gray-7: #f9f9f9; /* softer surface (K8s $light-grey) */
-  --sl-color-black: #ffffff; /* used as page bg */
+  /* Raw palette — referenced by the semantic tokens below so the
+   * whole system can be re-hued from one place. */
+  --ka-navy: #0f1728;
+  --ka-navy-bar: #0a1120;
+  --ka-navy-panel: #172136;
+  --ka-navy-elevated: #1e2a44;
+  --ka-cyan: #2acaca;
+  --ka-cyan-bright: #6fe0e0;
+  --ka-teal: #2090af;
+  --ka-violet: #bd86f9;
+  --ka-violet-bright: #d3b3fc;
+  --ka-amber: #fcc140;
+  --ka-amber-bright: #ffd479;
+  --ka-coral: #fb7081;
+  --ka-coral-bright: #ff9aa6;
+  --ka-green: #58c660;
+  --ka-green-bright: #8ce08f;
+  --ka-lime: #a9e051;
+  --ka-peri: #b1baf5;
+
+  /* Semantic color tokens */
+  --sl-color-white: #f8f8f3; /* high-contrast text  16.8:1 */
+  --sl-color-gray-1: #e8ecf4; /* body prose          15.1:1 */
+  --sl-color-gray-2: #ced2d6; /* strong text         11.8:1 */
+  --sl-color-gray-3: #9aa3b8; /* muted metadata       7.1:1 */
+  --sl-color-gray-4: #6f7891; /* decorative / borders only (4.1:1) */
+  --sl-color-gray-5: #3f4553; /* borders */
+  --sl-color-gray-6: #1e2a44; /* elevated surface */
+  --sl-color-gray-7: #172136; /* panel surface */
+  --sl-color-black: #0f1728; /* used as page bg */
 
   /* Surfaces */
-  --sl-color-bg: #ffffff;
-  --sl-color-bg-nav: #ffffff;
-  --sl-color-bg-sidebar: #f9f9f9;
-  --sl-color-bg-inline-code: #f0f4fa; /* softly K8s-blue tinted */
-  --sl-color-bg-accent: #326ce5;
+  --sl-color-bg: #0f1728;
+  --sl-color-bg-nav: #0a1120; /* app bar, a shade below canvas */
+  --sl-color-bg-sidebar: #0d1424;
+  --sl-color-bg-inline-code: #272745; /* violet-tinted */
+  --sl-color-bg-accent: #2acaca;
+  --sl-color-backdrop-overlay: rgba(6, 10, 20, 0.8);
 
   /* Text */
-  --sl-color-text: #303030;
-  --sl-color-text-accent: #326ce5; /* links = K8s brand blue */
-  --sl-color-text-invert: #ffffff;
+  --sl-color-text: #e8ecf4;
+  --sl-color-text-accent: #2acaca; /* links = terminal cyan  8.9:1 */
+  --sl-color-text-invert: #0f1728; /* navy text on bright fills */
 
   /* Hairlines / borders */
-  --sl-color-hairline: #e2e5ea;
-  --sl-color-hairline-shade: #d0d5db;
-  --sl-color-hairline-light: #eeeeee;
+  --sl-color-hairline: #2b3650;
+  --sl-color-hairline-shade: #3f4553;
+  --sl-color-hairline-light: #202b44;
 
-  /* Accent ramp (Kubernetes blue) */
-  --sl-color-accent-low: #daeaf9; /* K8s $feature callout tint */
-  --sl-color-accent: #326ce5; /* K8s brand blue */
-  --sl-color-accent-high: #2557b8; /* darker for hover / active */
+  /* Accent ramp (cyan) */
+  --sl-color-accent-low: #13303f;
+  --sl-color-accent: #2acaca;
+  --sl-color-accent-high: #6fe0e0;
+
+  /* Status ramps — Starlight reads these for asides
+   * (note=blue, tip=purple, caution=orange, danger=red). The -low
+   * values are the hue pre-blended over the navy canvas at 14%, kept
+   * as solid hexes so nested translucency can't stack. */
+  --sl-color-blue-low: #13303f;
+  --sl-color-blue: #2acaca;
+  --sl-color-blue-high: #6fe0e0;
+  --sl-color-green-low: #193030;
+  --sl-color-green: #58c660;
+  --sl-color-green-high: #8ce08f;
+  --sl-color-orange-low: #302f2b;
+  --sl-color-orange: #fcc140;
+  --sl-color-orange-high: #ffd479;
+  --sl-color-red-low: #302334;
+  --sl-color-red: #fb7081;
+  --sl-color-red-high: #ff9aa6;
+  --sl-color-purple-low: #272745;
+  --sl-color-purple: #bd86f9;
+  --sl-color-purple-high: #d3b3fc;
 
   /* Content measure + type scale */
   --sl-content-width: 55rem;
@@ -72,20 +122,288 @@
   --sl-text-base: 1rem;
 }
 
-/* Underline links on hover (matches kubernetes.io convention:
- * $link-decoration: none; $link-hover-decoration: underline;) */
+/* Text selection picks up the accent instead of the browser default */
+::selection {
+  background: rgba(42, 202, 202, 0.28);
+  color: var(--sl-color-white);
+}
+
+/* --- Global chrome ------------------------------------------------ */
+
+/* No rules around the chrome. Starlight frames it with two 1px
+ * `--sl-color-hairline-shade` lines — under the app bar and down the
+ * right of the sidebar (PageFrame.astro) — and on this palette both
+ * read as seams rather than as structure. They are redundant anyway:
+ * the tone step from app bar (--sl-color-bg-nav) through sidebar
+ * (--sl-color-bg-sidebar) to canvas (--sl-color-bg) already separates
+ * the three surfaces. `none` rather than simply omitting the property,
+ * because Starlight sets these itself and they have to be unset. */
+.header {
+  border-bottom: none;
+}
+.sidebar-pane {
+  border-inline-end: none;
+}
+/* Starlight divides the social icons from the theme and language
+ * selectors with a 2rem vertical rule. Both selectors are gone here
+ * (dark-only, single language), so the divider dangles off the right
+ * edge separating the GitHub icon from nothing. */
+.social-icons::after {
+  display: none;
+}
+
+/* Site title — gradient wordmark, cyan through violet, set in the
+ * monospace stack. `kube-agents` is a command you type, so it reads as
+ * one; it also ties the wordmark to the code blocks it sits above.
+ * Slight negative tracking keeps monospace from looking loose at
+ * display weight. */
+.site-title {
+  font-family: var(--sl-font-system-mono);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  background-image: linear-gradient(95deg, #2acaca 0%, #b1baf5 55%, #bd86f9 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Skip-to-content link — navy on cyan (8.9:1) */
+.sl-skip-link:focus {
+  background-color: var(--sl-color-accent);
+  color: var(--sl-color-text-invert);
+}
+
+/* Mobile menu button — ghost button on the app bar, not a bright disc */
+starlight-menu-button button {
+  background-color: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+  border: 1px solid var(--sl-color-hairline);
+  box-shadow: none;
+}
+starlight-menu-button button[aria-expanded='true'] {
+  background-color: var(--sl-color-accent-low);
+  color: var(--sl-color-accent-high);
+  border-color: var(--sl-color-accent);
+}
+
+/* --- Sidebar ------------------------------------------------------
+ * The main polychrome device: each top-level group owns a hue, worn
+ * by its label and the rule down the left of its children. Groups are
+ * `li > details > summary .large`; standalone entries are `li > a.large`.
+ */
+.sidebar-content a {
+  border-radius: 6px;
+}
+.sidebar-content a:hover {
+  background-color: var(--sl-color-gray-7);
+  color: var(--sl-color-white);
+}
+/* The current page wears its own group's hue, not a fixed accent, so
+ * the highlight agrees with the group label above it. Falls back to
+ * the accent for any link outside a hued group. Every pairing clears
+ * AA on the tint (5.4:1 worst case, coral). */
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover {
+  background-color: var(--ka-group-tint, var(--sl-color-accent-low));
+  color: var(--ka-group-hue, var(--sl-color-accent-high));
+  font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--ka-group-hue, var(--sl-color-accent));
+}
+
+.sidebar-content ul.top-level > li > details > summary .large,
+.sidebar-content ul.top-level > li > a.large {
+  color: var(--ka-group-hue, var(--sl-color-white));
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+/* Children hang off a rule in the parent group's hue, set midway
+ * between the group label and the child labels so it reads as
+ * indentation rather than as an edge on the list.
+ *
+ * The rule is painted by a pseudo-element rather than by this list's
+ * `border-inline-start`, which is where it used to live. A border can
+ * only sit on the box's own edge, so moving it inward means growing
+ * `margin-inline-start` and shrinking `padding-inline-start` by the
+ * same amount — and the padding here (12px) is smaller than the
+ * distance to cover (19px), so it would go negative. Paying for it out
+ * of the link padding instead would drag the active-page pill inward
+ * with the text. Positioning the rule absolutely leaves every box in
+ * this subtree exactly where it was.
+ *
+ * Measured at 1680px, identically for all six groups: the list's
+ * padding box starts at x=22, the group label's text at x=24, and the
+ * child links' text at x=59. Their midpoint, x=41, is 19px into the
+ * padding box. */
+.sidebar-content ul.top-level > li > details > ul {
+  position: relative;
+  padding-inline-start: 0.75rem;
+  margin-inline-start: 0.35rem;
+}
+.sidebar-content ul.top-level > li > details > ul::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 19px;
+  width: 1px;
+  background: var(--ka-group-rule, var(--sl-color-hairline));
+}
+/* ...and off exactly one. Starlight draws its own rule per item
+ * (`ul ul li`, SidebarSublist.astro) in --sl-color-hairline-light, which
+ * sits 21px to the right of the hued one above and reads as a second,
+ * broken line beside it. Suppress it only at this depth, where the hued
+ * rule has already replaced it; a third level would still need it. */
+.sidebar-content ul.top-level > li > details > ul > li {
+  border-inline-start: none;
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 1) {
+  --ka-group-hue: var(--ka-cyan);
+  --ka-group-rule: rgba(42, 202, 202, 0.35);
+  --ka-group-tint: rgba(42, 202, 202, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 2) {
+  --ka-group-hue: var(--ka-green);
+  --ka-group-rule: rgba(88, 198, 96, 0.35);
+  --ka-group-tint: rgba(88, 198, 96, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 3) {
+  --ka-group-hue: var(--ka-violet);
+  --ka-group-rule: rgba(189, 134, 249, 0.35);
+  --ka-group-tint: rgba(189, 134, 249, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 4) {
+  --ka-group-hue: var(--ka-amber);
+  --ka-group-rule: rgba(252, 193, 64, 0.35);
+  --ka-group-tint: rgba(252, 193, 64, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 5) {
+  --ka-group-hue: var(--ka-peri);
+  --ka-group-rule: rgba(177, 186, 245, 0.35);
+  --ka-group-tint: rgba(177, 186, 245, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 6) {
+  --ka-group-hue: var(--ka-lime);
+  --ka-group-rule: rgba(169, 224, 81, 0.35);
+  --ka-group-tint: rgba(169, 224, 81, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 7) {
+  --ka-group-hue: var(--ka-coral);
+  --ka-group-rule: rgba(251, 112, 129, 0.35);
+  --ka-group-tint: rgba(251, 112, 129, 0.16);
+}
+.sidebar-content ul.top-level > li:nth-child(8n + 8) {
+  --ka-group-hue: var(--ka-cyan-bright);
+  --ka-group-rule: rgba(111, 224, 224, 0.35);
+  --ka-group-tint: rgba(111, 224, 224, 0.16);
+}
+
+/* Table of contents — current heading in accent, with a marker rule */
+starlight-toc a[aria-current='true'],
+starlight-toc a[aria-current='true']:hover {
+  color: var(--sl-color-accent-high);
+  border-inline-start-color: var(--sl-color-accent);
+}
+
+/* --- Prose --------------------------------------------------------- */
+
 .sl-markdown-content a {
   text-decoration: none;
 }
 .sl-markdown-content a:hover {
   text-decoration: underline;
+  color: var(--sl-color-accent-high);
 }
 
-/* Hero title/tagline use --sl-color-white; guarantee they're dark */
-.hero h1,
-.hero .tagline {
+/* Headings step through the palette so a long page has landmarks.
+ * The h2 rule hangs off `.sl-heading-wrapper`, not the h2 itself:
+ * anchor-links.css makes the heading element inline, so a border on
+ * it would stop at the end of the text instead of spanning the
+ * column. Gradient via border-image — a flat rule reads as a seam. */
+.sl-markdown-content h2 {
   color: var(--sl-color-white);
 }
+.sl-markdown-content .sl-heading-wrapper:has(> h2) {
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      rgba(42, 202, 202, 0.6) 0%,
+      rgba(189, 134, 249, 0.32) 45%,
+      rgba(43, 54, 80, 0) 92%
+    )
+    1;
+}
+.sl-markdown-content h3 {
+  color: var(--ka-cyan-bright);
+}
+.sl-markdown-content h4 {
+  color: var(--ka-peri);
+}
+/* Anchor-link icons pick up the accent rather than muted gray. */
+.sl-markdown-content .sl-anchor-link {
+  color: var(--sl-color-accent);
+}
+
+/* Inline code — violet on a violet-tinted panel, the way the
+ * reference renders hex literals. 5.4:1.
+ *
+ * `:where(:not(.not-content *))` here and on the table rules below is
+ * Starlight's opt-out marker: a component embedded in a page (the chat
+ * replay on the home page, an Expressive Code frame) carries
+ * `not-content` and brings its own styling. Starlight's core rules
+ * already honour it; these did not, so an embedded table inherited
+ * `display: block` and an embedded `code` a violet border. Wrapped in
+ * `:where()` so the selectors keep the specificity they had and nothing
+ * else in the cascade shifts. */
+.sl-markdown-content :not(pre) > code:where(:not(.not-content *)) {
+  padding: 0.15em 0.4em;
+  border-radius: 5px;
+  background: var(--sl-color-bg-inline-code);
+  color: var(--ka-violet);
+  border: 1px solid rgba(189, 134, 249, 0.22);
+}
+/* Inside a colored aside or a heading, inherit instead of clashing. */
+.sl-markdown-content .starlight-aside :not(pre) > code,
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) :not(pre) > code {
+  color: inherit;
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+/* Blockquote — violet rule, matching the inline-code hue */
+.sl-markdown-content blockquote {
+  border-inline-start: 3px solid var(--ka-violet);
+  padding-inline-start: 1rem;
+  color: var(--sl-color-gray-2);
+}
+
+/* Horizontal rule — a spectrum wash instead of a gray line */
+.sl-markdown-content hr {
+  height: 1px;
+  border: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(42, 202, 202, 0.5) 0%,
+    rgba(189, 134, 249, 0.5) 50%,
+    rgba(251, 112, 129, 0.35) 100%
+  );
+}
+
+/* List markers in accent — cheap, pervasive color */
+.sl-markdown-content ul > li::marker {
+  color: var(--ka-cyan);
+}
+.sl-markdown-content ol > li::marker {
+  color: var(--ka-amber);
+  font-weight: 600;
+}
+
+/* Asides: Starlight supplies the hue from the ramps above; add a
+ * rounded corner and let the title icon carry the accent. */
+.starlight-aside {
+  border-radius: 0 6px 6px 0;
+}
+
+/* --- Hero ---------------------------------------------------------- */
 
 /* Stack the hero vertically with the banner above the title/tagline.
  * Our custom Hero.astro omits Starlight's scoped <style> block, so we
@@ -123,16 +441,28 @@
 .hero .copy > * {
   max-width: 50ch;
 }
+/* Gradient wordmark, monospace to match the site title. `color` is set
+ * first as the fallback for engines that ignore background-clip: text.
+ * Monospace glyphs are wider, so the upper clamp bound comes down from
+ * 3.5rem to keep the title on one line at the narrow end of the range. */
 .hero h1 {
-  font-size: clamp(2rem, calc(1rem + 4vw), 3.5rem);
+  font-family: var(--sl-font-system-mono);
+  font-size: clamp(1.75rem, calc(0.9rem + 3.4vw), 3rem);
+  letter-spacing: -0.03em;
   line-height: 1.15;
   font-weight: 600;
   margin: 0;
+  color: var(--sl-color-white);
+  background-image: linear-gradient(100deg, #2acaca 0%, #b1baf5 48%, #bd86f9 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 .hero .tagline {
   font-size: clamp(1rem, calc(0.9rem + 0.6vw), 1.25rem);
   color: var(--sl-color-gray-2);
   line-height: 1.5;
+  max-width: 65ch;
 }
 .hero .actions {
   display: flex;
@@ -149,17 +479,18 @@
 .sl-link-button {
   align-items: center;
   border: 1px solid transparent;
-  border-radius: 999rem;
+  border-radius: 6px;
   display: inline-flex;
-  font-size: 0.95rem;
-  font-weight: 500;
+  font-size: 0.9rem;
+  font-weight: 600;
   gap: 0.5em;
   line-height: 1.2;
-  padding: 0.55rem 1.25rem;
+  padding: 0.55rem 1.1rem;
   text-decoration: none;
   transition:
     background-color 120ms ease,
     border-color 120ms ease,
+    color 120ms ease,
     transform 120ms ease;
   white-space: nowrap;
 }
@@ -168,40 +499,41 @@
   text-decoration: none;
 }
 
-/* Primary (Kubernetes blue) — the main audience CTA */
+/* Primary — filled cyan chip with navy text (8.9:1), the shape the
+ * reference uses for its active status chip. */
 .sl-link-button.primary {
-  background-color: var(--sl-color-accent);
-  color: #ffffff;
-  border-color: var(--sl-color-accent);
+  background-color: var(--ka-cyan);
+  color: var(--sl-color-text-invert);
+  border-color: var(--ka-cyan);
 }
 .sl-link-button.primary:hover {
-  background-color: var(--sl-color-accent-high);
-  border-color: var(--sl-color-accent-high);
-  color: #ffffff;
+  background-color: var(--ka-cyan-bright);
+  border-color: var(--ka-cyan-bright);
+  color: var(--sl-color-text-invert);
 }
 
-/* Secondary — outlined blue on white, complements primary */
+/* Secondary — violet outline, the palette's second voice */
 .sl-link-button.secondary {
-  background-color: #ffffff;
-  color: var(--sl-color-accent);
-  border-color: var(--sl-color-accent);
+  background-color: transparent;
+  color: var(--ka-violet);
+  border-color: rgba(189, 134, 249, 0.55);
 }
 .sl-link-button.secondary:hover {
-  background-color: var(--sl-color-accent-low);
-  border-color: var(--sl-color-accent-high);
-  color: var(--sl-color-accent-high);
+  background-color: var(--sl-color-purple-low);
+  border-color: var(--ka-violet);
+  color: var(--ka-violet-bright);
 }
 
-/* Minimal (icon-only) — used for GitHub link. Round pill, no fill,
- * subtle hairline border; hovers to the accent. */
+/* Minimal (icon-only) — used for the GitHub link */
 .sl-link-button.minimal {
-  background-color: transparent;
+  background-color: var(--sl-color-gray-7);
   color: var(--sl-color-gray-2);
-  border-color: var(--sl-color-hairline);
+  border-color: var(--sl-color-hairline-shade);
 }
 .sl-link-button.minimal:hover {
-  color: var(--sl-color-accent);
+  color: var(--sl-color-accent-high);
   border-color: var(--sl-color-accent);
+  background-color: var(--sl-color-accent-low);
 }
 .sl-link-button.icon-only {
   padding: 0.55rem;
@@ -223,19 +555,44 @@
   border: 0;
 }
 
-/* LinkCard tiles: soft border + accent hover */
-.sl-link-card {
+/* --- Cards --------------------------------------------------------- */
+
+/* LinkCard / Card tiles rotate hues in DOM order, so a grid of them
+ * reads as a palette rather than a wall of one color. */
+.sl-link-card,
+.card {
   border: 1px solid var(--sl-color-hairline) !important;
-  background: #ffffff !important;
+  background: var(--sl-color-gray-7) !important;
+  border-radius: 8px !important;
   transition:
     border-color 120ms ease,
     box-shadow 120ms ease,
     transform 120ms ease;
 }
+.sl-link-card {
+  box-shadow: inset 3px 0 0 var(--ka-card-hue, var(--ka-cyan));
+}
 .sl-link-card:hover {
-  border-color: var(--sl-color-accent) !important;
-  box-shadow: 0 2px 16px rgba(50, 108, 229, 0.12);
+  border-color: var(--ka-card-hue, var(--ka-cyan)) !important;
+  box-shadow:
+    inset 3px 0 0 var(--ka-card-hue, var(--ka-cyan)),
+    0 2px 18px rgba(0, 0, 0, 0.45);
   transform: translateY(-1px);
+}
+.sl-link-card:nth-child(5n + 1) {
+  --ka-card-hue: var(--ka-cyan);
+}
+.sl-link-card:nth-child(5n + 2) {
+  --ka-card-hue: var(--ka-violet);
+}
+.sl-link-card:nth-child(5n + 3) {
+  --ka-card-hue: var(--ka-green);
+}
+.sl-link-card:nth-child(5n + 4) {
+  --ka-card-hue: var(--ka-amber);
+}
+.sl-link-card:nth-child(5n + 5) {
+  --ka-card-hue: var(--ka-coral);
 }
 .sl-link-card .title,
 .sl-link-card a {
@@ -244,20 +601,30 @@
 .sl-link-card .description {
   color: var(--sl-color-gray-2) !important;
 }
+/* Card component icons take the tile hue. */
+.card .icon {
+  color: var(--ka-card-hue, var(--ka-cyan));
+}
+.card:nth-child(5n + 1) {
+  --ka-card-hue: var(--ka-cyan);
+}
+.card:nth-child(5n + 2) {
+  --ka-card-hue: var(--ka-violet);
+}
+.card:nth-child(5n + 3) {
+  --ka-card-hue: var(--ka-green);
+}
+.card:nth-child(5n + 4) {
+  --ka-card-hue: var(--ka-amber);
+}
+.card:nth-child(5n + 5) {
+  --ka-card-hue: var(--ka-coral);
+}
 
-/* Focus ring — brand color */
+/* Focus ring — accent cyan */
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
   outline: 2px solid var(--sl-color-accent);
   outline-offset: 2px;
-}
-
-/* Inline code — subtle border keeps it distinct in prose */
-.sl-markdown-content :not(pre) > code {
-  border: 1px solid var(--sl-color-hairline);
-  padding: 0.05rem 0.35rem;
-  border-radius: 4px;
-  background: var(--sl-color-bg-inline-code);
-  color: var(--sl-color-gray-1);
 }
 
 /* --- Tables ---
@@ -265,38 +632,77 @@
  * `read_many_files` were breaking at underscores. Also prevent any
  * inline code inside a table cell from wrapping mid-token.
  */
-.sl-markdown-content table code {
+.sl-markdown-content table:where(:not(.not-content *)) code {
   white-space: nowrap;
   word-break: keep-all;
   overflow-wrap: normal;
 }
-.sl-markdown-content table td:first-child,
-.sl-markdown-content table th:first-child {
+.sl-markdown-content table:where(:not(.not-content *)) td:first-child,
+.sl-markdown-content table:where(:not(.not-content *)) th:first-child {
   white-space: nowrap;
 }
-.sl-markdown-content table {
-  display: table;
-  width: 100%;
+/* `display: block` + `overflow-x: auto` keeps a wide table scrolling
+ * inside its column instead of widening the whole document — the
+ * `display: table` this replaces cost the reference tables their
+ * scroll container and pushed the page to 979px on a 415px viewport.
+ * `width: max-content` bounded by `min/max-width` keeps a narrow
+ * table filling the column and a wide one clipped to it. */
+.sl-markdown-content table:where(:not(.not-content *)) {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
 }
-.sl-markdown-content table th,
-.sl-markdown-content table td {
+.sl-markdown-content table:where(:not(.not-content *)) th,
+.sl-markdown-content table:where(:not(.not-content *)) td {
   border-bottom: 1px solid var(--sl-color-hairline);
   padding: 0.6rem 0.75rem;
   vertical-align: top;
 }
-.sl-markdown-content table th {
+.sl-markdown-content table:where(:not(.not-content *)) th {
   text-align: left;
-  background: var(--sl-color-gray-7);
-  color: var(--sl-color-gray-1);
+  background: var(--sl-color-gray-6);
+  color: var(--ka-cyan-bright);
   font-weight: 600;
+  border-bottom-color: var(--ka-cyan);
 }
-.sl-markdown-content table tbody tr:hover {
+.sl-markdown-content table:where(:not(.not-content *)) tbody tr:hover {
   background: var(--sl-color-gray-7);
+}
+/* A wide table scrolls in place (above), but unlike a code block it
+ * gets the platform scrollbar — which on macOS is an overlay that stays
+ * invisible until something scrolls, so nothing says the row continues
+ * past the right edge. Declaring the pseudo-elements opts the table out
+ * of overlay behaviour in Blink and WebKit; `scrollbar-width`/`-color`
+ * do the same in Gecko. The colours are the two Expressive Code
+ * scrollbar overrides from astro.config.mjs, so both scroll containers
+ * on a page look alike. Scoped to the table rather than set globally:
+ * the page and sidebar keep the platform's own scrollbars. */
+.sl-markdown-content table:where(:not(.not-content *)) {
+  scrollbar-width: thin;
+  scrollbar-color: #2090af80 transparent;
+}
+.sl-markdown-content table:where(:not(.not-content *))::-webkit-scrollbar {
+  height: 0.75rem;
+}
+.sl-markdown-content table:where(:not(.not-content *))::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sl-markdown-content table:where(:not(.not-content *))::-webkit-scrollbar-thumb {
+  background-color: #2090af80;
+  border: 4px solid transparent;
+  background-clip: content-box;
+  border-radius: 10px;
+}
+.sl-markdown-content table:where(:not(.not-content *))::-webkit-scrollbar-thumb:hover {
+  background-color: #2acacacc;
 }
 
-/* Mermaid diagrams: rendered SVG on top, expand button, collapsed source
- * below. Set up by public/mermaid-render.js at page load. */
+/* --- Mermaid ---
+ * Rendered SVG on top, expand button, collapsed source below. Set up
+ * by public/mermaid-render.js at page load. */
 .mermaid-block {
   margin: 1.5rem 0;
 }
@@ -334,8 +740,8 @@
   height: 1.6rem;
   padding: 0;
   color: var(--sl-color-gray-3);
-  background: rgba(255, 255, 255, 0.85);
-  border: 1px solid var(--sl-color-hairline);
+  background: rgba(15, 23, 40, 0.85);
+  border: 1px solid var(--sl-color-hairline-shade);
   border-radius: 0.3rem;
   cursor: pointer;
   transition:
@@ -346,8 +752,8 @@
 }
 .mermaid-expand:hover,
 .mermaid-expand:focus-visible {
-  color: var(--sl-color-accent);
-  background: #ffffff;
+  color: var(--sl-color-accent-high);
+  background: var(--sl-color-accent-low);
   border-color: var(--sl-color-accent);
 }
 .mermaid-expand svg {
@@ -381,7 +787,7 @@ details.mermaid-source[open] > summary {
   position: fixed;
   inset: 0;
   z-index: 1000;
-  background: rgba(15, 23, 33, 0.72);
+  background: rgba(6, 10, 20, 0.82);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -394,13 +800,14 @@ details.mermaid-source[open] > summary {
   height: 99vh;
   max-width: 99vw;
   max-height: 99vh;
-  background: #ffffff;
+  background: var(--sl-color-gray-7);
+  border: 1px solid var(--sl-color-hairline-shade);
   border-radius: 0.5rem;
   padding: 0.5rem 0.75rem 0.75rem;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  box-shadow: 0 20px 60px rgba(15, 23, 33, 0.4);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
 }
 .mermaid-modal-close {
   align-self: flex-end;
@@ -409,7 +816,7 @@ details.mermaid-source[open] > summary {
   font-weight: 500;
   color: var(--sl-color-gray-2);
   background: transparent;
-  border: 1px solid var(--sl-color-hairline);
+  border: 1px solid var(--sl-color-hairline-shade);
   border-radius: 0.375rem;
   cursor: pointer;
   transition:
@@ -418,7 +825,7 @@ details.mermaid-source[open] > summary {
 }
 .mermaid-modal-close:hover,
 .mermaid-modal-close:focus-visible {
-  color: var(--sl-color-accent);
+  color: var(--sl-color-accent-high);
   border-color: var(--sl-color-accent);
 }
 .mermaid-modal-stage {
@@ -440,4 +847,84 @@ details.mermaid-source[open] > summary {
   max-width: 100%;
   max-height: 100%;
   display: block;
+}
+
+/* --- Print ---
+ * Starlight's print.css forces a light palette under bare `:root`,
+ * but the [data-theme] selectors in our token block out-rank it —
+ * browsers skip printing dark backgrounds, so without this block a
+ * printout would be light-gray text on white paper. Re-assert
+ * Starlight's print palette at matching specificity (values mirror
+ * node_modules/@astrojs/starlight/style/print.css; the --sl-hue-*
+ * vars it references are defined in props.css and never overridden
+ * here). */
+@media print {
+  :root,
+  :root[data-theme='light'],
+  :root[data-theme='dark'] {
+    --sl-color-white: hsl(224, 10%, 10%);
+    --sl-color-gray-1: hsl(224, 14%, 16%);
+    --sl-color-gray-2: hsl(224, 10%, 23%);
+    --sl-color-gray-3: hsl(224, 7%, 36%);
+    --sl-color-gray-4: hsl(224, 6%, 56%);
+    --sl-color-gray-5: hsl(224, 6%, 77%);
+    --sl-color-gray-6: hsl(224, 20%, 94%);
+    --sl-color-gray-7: hsl(224, 19%, 97%);
+    --sl-color-black: hsl(0, 0%, 100%);
+
+    --sl-color-orange-high: hsl(var(--sl-hue-orange), 80%, 25%);
+    --sl-color-orange: hsl(var(--sl-hue-orange), 90%, 60%);
+    --sl-color-orange-low: hsl(var(--sl-hue-orange), 90%, 88%);
+    --sl-color-green-high: hsl(var(--sl-hue-green), 80%, 22%);
+    --sl-color-green: hsl(var(--sl-hue-green), 90%, 46%);
+    --sl-color-green-low: hsl(var(--sl-hue-green), 85%, 90%);
+    --sl-color-blue-high: hsl(var(--sl-hue-blue), 80%, 30%);
+    --sl-color-blue: hsl(var(--sl-hue-blue), 90%, 60%);
+    --sl-color-blue-low: hsl(var(--sl-hue-blue), 88%, 90%);
+    --sl-color-purple-high: hsl(var(--sl-hue-purple), 90%, 30%);
+    --sl-color-purple: hsl(var(--sl-hue-purple), 90%, 60%);
+    --sl-color-purple-low: hsl(var(--sl-hue-purple), 80%, 90%);
+    --sl-color-red-high: hsl(var(--sl-hue-red), 80%, 30%);
+    --sl-color-red: hsl(var(--sl-hue-red), 90%, 60%);
+    --sl-color-red-low: hsl(var(--sl-hue-red), 80%, 90%);
+
+    --sl-color-accent-high: hsl(234, 80%, 30%);
+    --sl-color-accent: hsl(234, 90%, 60%);
+    --sl-color-accent-low: hsl(234, 88%, 90%);
+
+    --sl-color-text: var(--sl-color-gray-2);
+    --sl-color-text-accent: var(--sl-color-accent);
+    --sl-color-text-invert: var(--sl-color-black);
+    --sl-color-bg: var(--sl-color-black);
+    --sl-color-bg-nav: var(--sl-color-gray-7);
+    --sl-color-bg-sidebar: var(--sl-color-bg);
+    --sl-color-bg-inline-code: var(--sl-color-gray-6);
+    --sl-color-bg-accent: var(--sl-color-accent);
+    --sl-color-hairline: var(--sl-color-gray-5);
+    --sl-color-hairline-light: var(--sl-color-gray-6);
+    --sl-color-hairline-shade: var(--sl-color-gray-6);
+
+    --sl-color-backdrop-overlay: hsla(225, 9%, 36%, 0.66);
+  }
+
+  /* Gradient text and colored code would print as invisible or muddy. */
+  .site-title,
+  .hero h1 {
+    background-image: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--sl-color-white);
+  }
+  .sl-markdown-content :not(pre) > code {
+    color: var(--sl-color-gray-1);
+    border-color: var(--sl-color-gray-5);
+  }
+  .sl-markdown-content h3,
+  .sl-markdown-content h4,
+  .sl-markdown-content table th {
+    color: var(--sl-color-white);
+  }
+  .sl-markdown-content .sl-heading-wrapper:has(> h2) {
+    border-image: none;
+    border-bottom-color: var(--sl-color-gray-5);
+  }
 }

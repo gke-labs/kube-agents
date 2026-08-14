@@ -35,6 +35,23 @@ spec:
             cidr: 169.254.20.10/32
         - ipBlock:
             cidr: 10.96.0.10/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The 10.96.0.10
+        # literal above handles the classic service range; the excepted block
+        # below handles any VIP outside private space (34.118.224.0/20 today,
+        # whatever GKE allocates next). The except list mirrors the 443 rule in
+        # the sibling networkpolicy-external-egress.yaml, so port 53 reaches
+        # nothing internal that 443 does not already deny.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
     # 2. GCP Metadata Server, link-local address only. Nothing rewrites a request to
     #    these ports onto another address.
     - ports:

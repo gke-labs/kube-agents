@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from threading import Event
 from unittest.mock import patch
 
 from admin_console.connections import (
     CheckStatus,
     CommandResult,
+    ConnectionChecksCancelled,
     connection_is_ready,
+    project_connection_is_ready,
     run_connection_checks,
 )
 from admin_console.project_config import DeploymentTarget
@@ -76,7 +79,44 @@ class UnlabeledRunner(SuccessfulRunner):
         return super().run(arguments, timeout=timeout)
 
 
+class NoClustersRunner(SuccessfulRunner):
+    def run(self, arguments: list[str], *, timeout: int = 15) -> CommandResult:
+        if arguments[:3] == ["container", "clusters", "list"]:
+            self.calls.append(arguments)
+            return CommandResult(0, "[]")
+        return super().run(arguments, timeout=timeout)
+
+
+class AuditTimeoutRunner(SuccessfulRunner):
+    def run(self, arguments: list[str], *, timeout: int = 15) -> CommandResult:
+        if arguments[:2] == ["logging", "read"] and "audit_event" in arguments[2]:
+            self.calls.append(arguments)
+            return CommandResult(124, timed_out=True)
+        return super().run(arguments, timeout=timeout)
+
+
 class ConnectionDiagnosticsTest(unittest.TestCase):
+    def test_cancelled_probe_stops_after_current_bounded_command(self):
+        cancelled = Event()
+
+        class CancellingRunner:
+            calls = 0
+
+            def run(self, arguments, *, timeout=15):
+                self.calls += 1
+                cancelled.set()
+                return CommandResult(0, "ok")
+
+        runner = CancellingRunner()
+        with self.assertRaises(ConnectionChecksCancelled):
+            run_connection_checks(
+                "test-project-01",
+                runner=runner,
+                cancel_event=cancelled,
+            )
+
+        self.assertEqual(runner.calls, 1)
+
     @patch.dict(os.environ, {"KUBE_AGENTS_ADMIN_USER": "user@example.com"})
     def test_successful_read_checks_without_trace_network_probe(self):
         runner = SuccessfulRunner()
@@ -121,6 +161,32 @@ class ConnectionDiagnosticsTest(unittest.TestCase):
         self.assertIn("minimum read permissions", checks["project"].guidance)
         self.assertEqual(checks["logging"].status, CheckStatus.SKIPPED)
         self.assertEqual(checks["trace"].status, CheckStatus.SKIPPED)
+        self.assertFalse(project_connection_is_ready(report))
+
+    def test_project_connection_allows_readable_gke_without_clusters(self):
+        report = run_connection_checks(
+            "test-project-01",
+            runner=NoClustersRunner(),
+            include_trace_probe=False,
+        )
+
+        self.assertEqual(report.clusters, ())
+        self.assertTrue(project_connection_is_ready(report))
+
+    def test_project_connection_can_skip_slower_telemetry_probes(self):
+        runner = SuccessfulRunner()
+
+        report = run_connection_checks(
+            "test-project-01",
+            runner=runner,
+            include_telemetry_probes=False,
+        )
+
+        self.assertTrue(project_connection_is_ready(report))
+        self.assertFalse(
+            any(call[:2] == ["logging", "read"] for call in runner.calls)
+        )
+        self.assertFalse(any(check.key == "trace" for check in report.checks))
 
     @patch("admin_console.agent_runtime.AgentRuntimeProvider")
     def test_unlabeled_single_cluster_requires_manual_selection(self, provider_type):
@@ -159,6 +225,30 @@ class ConnectionDiagnosticsTest(unittest.TestCase):
         self.assertEqual(check.status, CheckStatus.PASS)
         self.assertIn("2 profile(s) and 11 session(s)", check.summary)
         provider.check_connection.assert_called_once_with("test-agent-01")
+        self.assertTrue(connection_is_ready(report))
+
+    @patch("admin_console.agent_runtime.AgentRuntimeProvider")
+    def test_telemetry_failure_does_not_lock_runtime_pages(self, provider_type):
+        provider = provider_type.return_value
+        provider.list_agents.return_value = ("test-agent-01",)
+        provider.check_connection.return_value = (2, 11)
+
+        report = run_connection_checks(
+            "test-project-01",
+            expected_target=DeploymentTarget(
+                "test-project-01",
+                "test-cluster-01",
+                "us-east4",
+            ),
+            runner=AuditTimeoutRunner(),
+            include_trace_probe=False,
+            include_agent_runtime_probe=True,
+        )
+
+        self.assertEqual(
+            next(check for check in report.checks if check.key == "audit").status,
+            CheckStatus.FAIL,
+        )
         self.assertTrue(connection_is_ready(report))
 
 

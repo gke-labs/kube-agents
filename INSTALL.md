@@ -120,7 +120,7 @@ Before beginning installation, ensure your environment meets the following requi
 
 | CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                           |
 | :------------------------------ | :---------------------------------------------- | :------------------------- | :---------------------------------------------------------------------------------------------------- |
-| **Go**                          | `1.25+`                                         | `go version`               | Required for building operator binaries and running tests.                                            |
+| **Go**                          | `1.26+`                                         | `go version`               | Required for building operator binaries and running tests.                                            |
 | **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                                  |
 | **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                              |
 | **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).    |

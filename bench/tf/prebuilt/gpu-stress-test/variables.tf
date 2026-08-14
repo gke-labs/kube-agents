@@ -56,3 +56,18 @@ variable "kubeconfig_path" {
   description = "Target path to write kubeconfig (KinD-only)"
   default     = "./kind-kubeconfig.yaml"
 }
+
+# Identify the CI run that created this infra so a janitor can find what a run
+# killed before teardown left behind. tofu reads these from TF_VAR_* in the
+# environment; both are empty outside CI.
+variable "prow_build_id" {
+  type        = string
+  description = "Prow BUILD_ID of the run creating this infra"
+  default     = ""
+}
+
+variable "prow_pull_number" {
+  type        = string
+  description = "Pull request number the run belongs to"
+  default     = ""
+}

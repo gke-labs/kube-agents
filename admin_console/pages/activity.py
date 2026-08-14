@@ -11,16 +11,28 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 import streamlit as st
 
-from admin_console.activity_scope import render_activity_scope
+from admin_console.activity_scope import (
+    load_activity_snapshot,
+    render_activity_load_more,
+    render_activity_scope,
+)
+from admin_console.causal_flow import CausalFlowProjection
+from admin_console.connection_session import recover_app_shell
 from admin_console.charts import causality_sankey, interaction_timeline
-from admin_console.domain import AttributionLevel
-from admin_console.ui import render_telemetry_status, section_title
+from admin_console.ui import (
+    paginated_selectable_table,
+    render_telemetry_status,
+    section_title,
+)
 
+recover_app_shell()
 st.title("Activity Explorer")
 provider = render_activity_scope()
-all_events = provider.list_activity()
+snapshot = load_activity_snapshot(provider)
+all_events = list(snapshot.events)
 
-render_telemetry_status(provider)
+render_telemetry_status(snapshot)
+render_activity_load_more(provider)
 
 with st.container(border=True):
     filter_columns = st.columns([1.2, 1, 1, 1, 1.2])
@@ -35,6 +47,21 @@ with st.container(border=True):
     selected_triggers = filter_columns[2].multiselect("Trigger", triggers)
     selected_agents = filter_columns[3].multiselect("Agent", agents)
     selected_statuses = filter_columns[4].multiselect("Status", statuses)
+
+filter_token = repr(
+    (
+        query,
+        tuple(selected_users),
+        tuple(selected_triggers),
+        tuple(selected_agents),
+        tuple(selected_statuses),
+    )
+)
+previous_filter_token = st.session_state.get("activity_filter_token")
+if previous_filter_token is not None and previous_filter_token != filter_token:
+    st.query_params.pop("activity_page", None)
+    st.query_params.pop("activity_event", None)
+st.session_state.activity_filter_token = filter_token
 
 
 def matches(event) -> bool:
@@ -58,30 +85,21 @@ if not events:
 flow_tab, timeline_tab, ledger_tab = st.tabs(["Flow", "Timeline", "Forensic ledger"])
 
 with flow_tab:
-    proven_events = [
-        event
-        for event in events
-        if event.attribution
-        in {AttributionLevel.EXPLICIT, AttributionLevel.INHERITED}
-    ]
+    causal_flow = CausalFlowProjection.from_events(events)
     section_title(
         "Causal flow",
-        "Proven or inherited trigger/user → agent → tool/action → outcome. "
-        "Edge width is evidence-record count.",
+        "Normalized OTel source → agent → LLM work → outcome. Edge width is "
+        "canonical action count; raw source fields remain in node evidence.",
     )
-    if proven_events:
+    if causal_flow.events:
         st.plotly_chart(
-            causality_sankey(proven_events),
+            causality_sankey(list(causal_flow.events)),
             width="stretch",
             config={"displayModeBar": False},
         )
     else:
-        st.info("No explicit or inherited causal evidence exists in this scope.")
-    excluded = len(events) - len(proven_events)
-    st.caption(
-        f"{excluded} inferred or missing-attribution record(s) excluded from the flow. "
-        "No time-adjacent joins are created."
-    )
+        st.info("No LLM or LLM-produced work exists in this scope.")
+    st.caption(causal_flow.summary)
 
 with timeline_tab:
     interaction_options = sorted(
@@ -127,6 +145,9 @@ with timeline_tab:
             )
 
 with ledger_tab:
+    ordered_events = sorted(
+        events, key=lambda item: item.occurred_at, reverse=True
+    )
     rows = [
         {
             "Time": event.occurred_at.strftime("%Y-%m-%d %H:%M:%S"),
@@ -141,39 +162,52 @@ with ledger_tab:
             "Cluster": event.cluster or "—",
             "Event ID": event.event_id,
         }
-        for event in sorted(events, key=lambda item: item.occurred_at, reverse=True)
+        for event in ordered_events
     ]
-    selected = st.dataframe(
-        rows,
-        width="stretch",
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
+    event_ids = [event.event_id for event in ordered_events]
+    requested_event = str(st.query_params.get("activity_event", "")).strip()
+    selected_event = (
+        requested_event if requested_event in event_ids else event_ids[0]
     )
-    if selected.selection.rows:
-        event = sorted(events, key=lambda item: item.occurred_at, reverse=True)[
-            selected.selection.rows[0]
-        ]
-        with st.container(border=True):
-            st.subheader(event.action_name)
-            st.write(event.summary)
-            st.json(
-                {
-                    "event_id": event.event_id,
-                    "interaction_id": event.interaction_id,
-                    "session_id": event.session_id,
-                    "task_id": event.task_id,
-                    "parent_task_id": event.parent_task_id,
-                    "trace_id": event.trace_id,
-                    "resource": {
-                        "cluster": event.cluster,
-                        "namespace": event.namespace,
-                        "name": event.resource,
-                    },
-                    "attribution": event.attribution.value,
-                    "evidence": event.details,
-                }
-            )
-            evidence_url = event.details.get("evidence_url")
-            if evidence_url:
-                st.link_button("Open source evidence", evidence_url)
+    clicked_event, _ = paginated_selectable_table(
+        rows,
+        event_ids,
+        selected_event,
+        key_prefix="activity_ledger",
+        page_query="activity_page",
+        selection_query="activity_event",
+        state_token=filter_token,
+        page_size=50,
+        column_config={
+            "Action": st.column_config.TextColumn(width="large"),
+            "Event ID": st.column_config.TextColumn(width="large"),
+        },
+    )
+    if clicked_event != selected_event:
+        st.query_params["activity_event"] = clicked_event
+        st.rerun()
+    st.query_params["activity_event"] = selected_event
+    event = ordered_events[event_ids.index(selected_event)]
+    with st.container(border=True):
+        st.subheader(event.action_name)
+        st.write(event.summary)
+        st.json(
+            {
+                "event_id": event.event_id,
+                "interaction_id": event.interaction_id,
+                "session_id": event.session_id,
+                "task_id": event.task_id,
+                "parent_task_id": event.parent_task_id,
+                "trace_id": event.trace_id,
+                "resource": {
+                    "cluster": event.cluster,
+                    "namespace": event.namespace,
+                    "name": event.resource,
+                },
+                "attribution": event.attribution.value,
+                "evidence": event.details,
+            }
+        )
+        evidence_url = event.details.get("evidence_url")
+        if evidence_url:
+            st.link_button("Open source evidence", evidence_url)

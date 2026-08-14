@@ -14,6 +14,7 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 import streamlit as st
 
+from admin_console.connection_session import recover_app_shell
 from admin_console.connection_gate import require_connection
 from admin_console.agent_runtime import (
     TaskUpdateResult,
@@ -37,6 +38,8 @@ HISTORY_WINDOWS = {
 TASK_POLL_INTERVAL = "5s"
 TASK_EMPTY_POLL_LIMIT = 3
 TASK_ERROR_POLL_LIMIT = 3
+
+recover_app_shell()
 
 
 def query_value(name: str) -> str:

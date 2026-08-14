@@ -5,9 +5,9 @@ import unittest
 from collections.abc import Callable
 
 from admin_console.agent_chat import (
-    ChatCommandResult,
     AgentChatError,
     AgentChatProvider,
+    ChatCommandResult,
 )
 from admin_console.project_config import DeploymentTarget
 

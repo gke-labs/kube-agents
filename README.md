@@ -14,6 +14,10 @@
 
 📗 **Full documentation: [gke-labs.github.io/kube-agents](https://gke-labs.github.io/kube-agents/)**
 
+[![An SRE types "@kube-agents run a full self-health check across the fleet" into a Google Chat room. The agent replies in a thread and streams its report back section by section: fleet and cluster state, agent and sidecar health, the active cron audit schedule, and a closing summary of warnings and failures.](.github/assets/chat-demo.webp)](https://gke-labs.github.io/kube-agents/)
+
+_An SRE asks for a fleet self-health check; the agent answers in the thread. An illustrative replay — the names and figures are examples. It runs live at the top of the [documentation site](https://gke-labs.github.io/kube-agents/)._
+
 ---
 
 ## ⚡ Try it now

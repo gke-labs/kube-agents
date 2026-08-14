@@ -59,27 +59,50 @@ type filterConfig struct {
 	// and do self-clear — but splitting it needs error-class classification rather
 	// than a reason match, and is tracked separately.)
 	backoffMinCount int
+	// imagePullTransientMinCount is the same debounce again, for the half of the
+	// image-pull family that self-clears. The exemption noted above is too coarse:
+	// registry rate limits, 5xx and connection timeouts canonicalize to exactly the
+	// same ImagePullBackOff as a bad tag, and kubelet resolves them on its own retry
+	// schedule. Gates pullClassRetryable only — terminal and unclassified causes
+	// still fire on event #1, so the failure modes this does not recognize behave
+	// exactly as they did before it existed.
+	imagePullTransientMinCount int
 }
 
+// filterThresholds carries the count debounces as a named group. They are all
+// small positive ints with the same default, so as positional arguments they were
+// one transposition away from silently gating the wrong family — a bug no test
+// would catch, since every value is individually plausible.
+type filterThresholds struct {
+	unhealthyMinCount          int
+	backoffMinCount            int
+	imagePullTransientMinCount int
+}
+
+// defaultMinCount applies to every debounce that was left unset. Three is the
+// count at which kubelet's retry schedule has visibly failed to resolve something
+// on its own, and is the value --unhealthy-min-count has always used.
+const defaultMinCount = 3
+
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
-func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []string, unhealthyMinCount, backoffMinCount int) filterConfig {
+func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []string, th filterThresholds) filterConfig {
 	if len(reasons) == 0 {
 		reasons = defaultReasons
 	}
-	if unhealthyMinCount <= 0 {
-		unhealthyMinCount = 3
+	orDefault := func(n int) int {
+		if n <= 0 {
+			return defaultMinCount
+		}
+		return n
 	}
-	if backoffMinCount <= 0 {
-		backoffMinCount = 3
+	return filterConfig{
+		allowedReasons:             stringSet(reasons),
+		allowedNamespaces:          stringSet(allowNamespaces),
+		excludedNamespaces:         stringSet(excludeNamespaces),
+		unhealthyMinCount:          orDefault(th.unhealthyMinCount),
+		backoffMinCount:            orDefault(th.backoffMinCount),
+		imagePullTransientMinCount: orDefault(th.imagePullTransientMinCount),
 	}
-	fc := filterConfig{
-		allowedReasons:     stringSet(reasons),
-		allowedNamespaces:  stringSet(allowNamespaces),
-		excludedNamespaces: stringSet(excludeNamespaces),
-		unhealthyMinCount:  unhealthyMinCount,
-		backoffMinCount:    backoffMinCount,
-	}
-	return fc
 }
 
 // stringSet converts a slice of strings to a lookup map for fast O(1) checks.
@@ -120,6 +143,7 @@ const (
 	gateNamespaceNotAllowed filterGate = "namespace_not_allowed"
 	gateUnhealthyMinCount   filterGate = "unhealthy_min_count"
 	gateBackoffMinCount     filterGate = "backoff_min_count"
+	gateImagePullTransient  filterGate = "imagepull_transient_min_count"
 )
 
 // Decide applies the filtering rules in order and returns the first gate that
@@ -156,6 +180,13 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 	// pull — canonicalizeReason splits those two apart on exactly that distinction.
 	if canonicalizeReason(ev.Key.Reason, ev.Message) == "CrashLoopBackOff" && belowMinCount(ev.Count, f.cfg.backoffMinCount) {
 		return gateBackoffMinCount
+	}
+	// Keyed on the class the dispatcher resolved, not on the message in hand: the
+	// event carrying "429 Too Many Requests" and the event that actually backs off
+	// are two different events. Only pullClassRetryable is gated — a bad tag and
+	// anything unrecognized still fire on event #1.
+	if ev.PullClass == pullClassRetryable && belowMinCount(ev.Count, f.cfg.imagePullTransientMinCount) {
+		return gateImagePullTransient
 	}
 	return gateAccepted
 }

@@ -26,7 +26,7 @@ docs/site/
 ├── astro.config.mjs         # base URL, sidebar, theme wiring
 ├── package.json
 ├── src/
-│   ├── components/          # Hero, ThemeSelect, ThemeProvider overrides (light-only)
+│   ├── components/          # Hero, ThemeSelect, ThemeProvider overrides (dark-only)
 │   ├── content/
 │   │   ├── docs/            # every page in the site
 │   │   └── content.config.ts

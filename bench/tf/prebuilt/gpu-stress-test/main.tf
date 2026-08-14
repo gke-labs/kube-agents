@@ -30,15 +30,29 @@ terraform {
   }
 }
 
+# GCP label values accept lowercase letters, digits, '-' and '_' only, so the
+# Prow ids go in verbatim.
+locals {
+  ci_labels = {
+    "managed-by"  = "kube-agents-bench"
+    "build-id"    = var.prow_build_id != "" ? var.prow_build_id : "local"
+    "pull-number" = var.prow_pull_number != "" ? var.prow_pull_number : "none"
+  }
+}
+
 provider "google" {
   project = var.project_id != "" ? var.project_id : null
   region  = var.location != "" && var.location != "local" ? var.location : null
+
+  # module.cluster declares no provider of its own and so inherits this one:
+  # the labels reach the cluster it creates without forking that module.
+  default_labels = local.ci_labels
 }
 
 provider "kind" {}
 
 module "cluster" {
-  source = "git::https://github.com/kubernetes-sigs/devops-bench.git//tf/modules/cluster?ref=4670d76dcc497e8f515d51c2bb6bad6ced7100b6"
+  source = "../../modules/cluster"
 
   infra_provider  = var.infra_provider
   cluster_name    = var.cluster_name
