@@ -695,10 +695,10 @@ every token that sits in command position and contains a `/` — and `_read_refe
 anything that is not a regular file as _unsafe_, which fails closed. A **directory** path in a
 Python source line is therefore enough: `submit_suggestion.py` line 29 is
 `sys.path.append("/opt/defaults/scripts")`, present since the original GitHub integration. Sweeping
-all 83 scripts in the profile finds **seven** blocked when invoked by absolute path —
-`submit_suggestion.py`, `audit_report.py`, `otel_config.py`, `platform_mcp_server.py`,
-`session_manager.py`, and this branch's own `test_forge.py` and `test_kanban_board_health.py` — and
-none of them belong to this change. A directory is never an executed shell script, so the fix
+all 83 scripts staged in the deployed profile finds **seven** blocked when invoked by absolute
+path — `submit_suggestion.py`, `audit_report.py`, `otel_config.py`, `platform_mcp_server.py`,
+`session_manager.py`, `test_kanban_board_health.py` and `test_forge.py`. Only the last is this
+branch's, and none of the seven is blocked by anything this change did. A directory is never an executed shell script, so the fix
 belongs in the guard; it is reported upstream rather than worked around here. The
 `"$HERMES_HOME"/skills/…` form adopted for finding 4 happens to sidestep it, because the guard does
 not expand the variable, but that is a side effect and not the reason for the change.

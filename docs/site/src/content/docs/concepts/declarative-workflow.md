@@ -20,7 +20,7 @@ Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-lab
 
 The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of `/opt/data/SETTINGS.md` (per `SOUL.md §1`). The flow:
 
-1. Runs `./skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON.
+1. Runs `"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON. The path is spelled from `$HERMES_HOME` because the skill is reached from a kanban card as well as from a cron turn, and only a cron turn starts in the profile directory.
 2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
 3. Runs the same helper with `submit --workspace … --branch … --title … --body …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`.
 4. The script prints the PR URL to stdout; the agent posts it to Chat.
