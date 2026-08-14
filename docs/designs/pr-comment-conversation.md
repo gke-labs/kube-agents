@@ -330,6 +330,12 @@ deterministic lives here, so an idle tick still costs no model at all.
 - **Acknowledge** each surviving trigger (👀) before filing, when the provider supports it. Doing it
   in the gate rather than the worker means the reviewer sees a response within the tick, not after a
   model has been scheduled.
+- **`--dry-run` reaches into the sweeps, not just the card filing.** The refusal and the 👀 are
+  written by the sweep, so a flag that only suppressed `file_card` would still post to a public
+  thread — and a refusal carries `agent-refused`, which closes the request it names for good. A dry
+  run that left that behind would be worse than no dry run at all. It reports what it would have
+  done on stderr rather than going quiet. One thing it cannot cover, and says so on stderr: the
+  issues sweep runs `resolver.py poll`, whose stale-label sweep has no dry-run of its own.
 - **One card per pull request**, assigned to `platform`, keyed
   `pr-conv-<owner>-<repo>-<n>-<node-id>`, carrying the PR number, head ref, the triggering comment
   node ids, and the `notify_session_id` from §6. The node id enters that key case-preserved: it is

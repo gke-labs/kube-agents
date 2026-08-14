@@ -325,7 +325,7 @@ class MainTest(unittest.TestCase):
 
     def test_idle_tick_prints_nothing(self):
         """The property the whole job exists for: silence costs nothing."""
-        rc, out, filed = self._run({"issues": lambda dry_run=False: gate.SweepResult()})
+        rc, out, filed = self._run({"issues": lambda _dry=False: gate.SweepResult()})
         self.assertEqual(rc, 0)
         self.assertEqual(out, "")
         self.assertEqual(filed, [])
@@ -334,7 +334,7 @@ class MainTest(unittest.TestCase):
         """Work is handed to a worker, not announced. The card is the message."""
         card = gate.Card(title="t", body="b", idempotency_key="k")
         rc, out, filed = self._run(
-            {"issues": lambda dry_run=False: gate.SweepResult(cards=[card])}
+            {"issues": lambda _dry=False: gate.SweepResult(cards=[card])}
         )
         self.assertEqual(rc, 0)
         self.assertEqual(out, "")
@@ -342,7 +342,7 @@ class MainTest(unittest.TestCase):
 
     def test_warnings_reach_stdout(self):
         rc, out, _ = self._run(
-            {"issues": lambda dry_run=False: gate.SweepResult(warnings=["⚠️ broken"])}
+            {"issues": lambda _dry=False: gate.SweepResult(warnings=["⚠️ broken"])}
         )
         self.assertEqual(rc, 0)
         self.assertIn("⚠️ broken", out)
@@ -350,12 +350,12 @@ class MainTest(unittest.TestCase):
     def test_a_raising_sweep_does_not_stop_its_sibling(self):
         """Sweep isolation — what two separate cron jobs used to give for free."""
 
-        def boom(dry_run=False):
+        def boom(_dry=False):
             raise RuntimeError("kaboom")
 
         card = gate.Card(title="t", body="b", idempotency_key="k")
         rc, out, filed = self._run(
-            {"broken": boom, "working": lambda dry_run=False: gate.SweepResult(cards=[card])}
+            {"broken": boom, "working": lambda _dry=False: gate.SweepResult(cards=[card])}
         )
         self.assertEqual(rc, 0)
         self.assertEqual(filed, [card])
@@ -363,7 +363,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("`broken` sweep failed", out)
 
     def test_a_raising_sweep_is_reported_not_swallowed(self):
-        def boom(dry_run=False):
+        def boom(_dry=False):
             raise RuntimeError("kaboom")
 
         rc, out, filed = self._run({"broken": boom})
@@ -377,8 +377,8 @@ class MainTest(unittest.TestCase):
         unwanted = gate.Card(title="unwanted", body="b", idempotency_key="k2")
         rc, out, filed = self._run(
             {
-                "issues": lambda dry_run=False: gate.SweepResult(cards=[wanted]),
-                "pr_comments": lambda dry_run=False: gate.SweepResult(cards=[unwanted]),
+                "issues": lambda _dry=False: gate.SweepResult(cards=[wanted]),
+                "pr_comments": lambda _dry=False: gate.SweepResult(cards=[unwanted]),
             },
             env={gate.SWEEPS_ENV: "issues"},
         )
@@ -389,11 +389,19 @@ class MainTest(unittest.TestCase):
     def test_dry_run_files_nothing(self):
         card = gate.Card(title="t", body="b", idempotency_key="k")
         rc, out, filed = self._run(
-            {"issues": lambda dry_run=False: gate.SweepResult(cards=[card])}, argv=["--dry-run"]
+            {"issues": lambda _dry=False: gate.SweepResult(cards=[card])}, argv=["--dry-run"]
         )
         self.assertEqual(rc, 0)
         self.assertEqual(filed, [])
         self.assertEqual(out, "")
+
+    def test_dry_run_reaches_the_sweep_itself(self):
+        """Card filing is not the only write. Refusals and 👀 are the sweep's."""
+        seen = []
+        self._run({"issues": lambda dry=False: (seen.append(dry), gate.SweepResult())[1]},
+                  argv=["--dry-run"])
+        self._run({"issues": lambda dry=False: (seen.append(dry), gate.SweepResult())[1]})
+        self.assertEqual(seen, [True, False])
 
 
 class ParseTaskIdTest(unittest.TestCase):
@@ -547,7 +555,7 @@ def make_comment(
 
 
 class PrCommentsSweepTest(unittest.TestCase):
-    def _sweep(self, provider, repo=REPO, env=None, repo_error=None):
+    def _sweep(self, provider, repo=REPO, env=None, repo_error=None, dry_run=False):
         target = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=repo)
         with mock.patch.object(forge, "target_repo", target), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
@@ -561,7 +569,7 @@ class PrCommentsSweepTest(unittest.TestCase):
             ):
                 if not env or key not in env:
                     os.environ.pop(key, None)
-            return gate.sweep_pr_comments()
+            return gate.sweep_pr_comments(dry_run)
 
     # -- the quiet paths ---------------------------------------------------
     def test_no_repo_configured_is_silence_not_a_fault(self):
@@ -724,6 +732,28 @@ class PrCommentsSweepTest(unittest.TestCase):
             comments={12: [make_comment("IC_1", "/agent x", author=f"{SELF}[bot]")]},
         )
         self.assertEqual(self._sweep(provider).cards, [])
+
+    # -- --dry-run is a read-only pass, or it is a lie ---------------------
+    def test_a_dry_run_writes_nothing_to_the_thread(self):
+        """The refusal and the 👀 are the sweep's writes, not `main`'s.
+
+        A refusal carries `<!-- agent-refused:… -->`, which closes the request
+        it names for good — the one thing a dry run must not leave behind.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment("IC_1", "/agent bump it"),
+                    make_comment("IC_2", "/agent delete prod", can_write=False),
+                ]
+            },
+        )
+        result = self._sweep(provider, dry_run=True)
+        self.assertEqual(provider.posted, [])
+        self.assertEqual(provider.acknowledged, [])
+        # Still reports what it would have done — a silent dry run proves nothing.
+        self.assertEqual(len(result.cards), 1)
 
     # -- the trust gate ----------------------------------------------------
     def test_an_account_without_write_access_is_refused_not_obeyed(self):

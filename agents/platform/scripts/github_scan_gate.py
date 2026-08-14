@@ -447,12 +447,18 @@ def _pr_card(pr, triggers: list, repo: str) -> Card:
     )
 
 
-def sweep_pr_comments() -> SweepResult:
+def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     """Find review comments that addressed the agent and have no answer yet.
 
     Everything deterministic happens here, so an idle tick costs a handful of
     API calls and no model at all. The model is woken only for a request that
     exists, is from someone permitted to make it, and has not been answered.
+
+    `dry_run` has to reach this far in. Refusals and acknowledgements are
+    posted by the sweep, not by `main`, so a flag that only suppressed card
+    filing would still write to a public pull-request thread — and a refusal
+    carries `<!-- agent-refused:… -->`, which permanently closes the request it
+    names. A dry run that leaves that behind is worse than no dry run at all.
     """
     warnings: list[str] = []
 
@@ -572,6 +578,14 @@ def sweep_pr_comments() -> SweepResult:
             dropped_refusals += 1
             continue
         body = f"{REFUSAL_BODY}\n\n{pr_triggers.marker(item.trigger.node_id, pr_triggers.REFUSED_MARKER)}"
+        if dry_run:
+            sys.stderr.write(
+                f"github_scan_gate: would refuse {item.trigger.node_id} "
+                f"on #{item.pr.number} (@{item.comment.author})\n"
+            )
+            posted_refusals += 1
+            refused_so_far[item.pr.number] = refused_so_far.get(item.pr.number, 0) + 1
+            continue
         try:
             _post_body(provider, repo, item.pr, body)
         except forge.ForgeError as error:
@@ -603,7 +617,12 @@ def sweep_pr_comments() -> SweepResult:
         # Acknowledge before filing, so the reviewer sees something inside this
         # tick rather than after a model has been scheduled. Best-effort by
         # contract: a forge with no reactions returns False and nothing changes.
-        if provider.supports_acknowledge:
+        if dry_run:
+            sys.stderr.write(
+                f"github_scan_gate: would acknowledge {item.comment.node_id} "
+                f"on #{item.pr.number}\n"
+            )
+        elif provider.supports_acknowledge:
             try:
                 provider.acknowledge(repo, item.comment)
             except forge.ForgeError:
