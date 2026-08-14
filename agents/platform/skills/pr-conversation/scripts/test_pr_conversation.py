@@ -83,14 +83,26 @@ def make_pr(number=12, head_ref="platform-agent/x", labels=()):
     )
 
 
-def make_comment(node_id, body, author="reviewer", can_write=True):
+def make_comment(
+    node_id,
+    body,
+    author="reviewer",
+    can_write=True,
+    created_at="2026-08-12T10:00:00Z",
+    kind="issue",
+    path="",
+    line=None,
+):
     return forge.Comment(
         node_id=node_id,
         numeric_id=1,
         author=author,
         body=body,
         can_write=can_write,
-        created_at="2026-08-12T10:00:00Z",
+        created_at=created_at,
+        kind=kind,
+        path=path,
+        line=line,
     )
 
 
@@ -210,6 +222,201 @@ class PollTest(_Harness):
             ["poll"], FakeProvider(), repo_error=forge.RepoUnparseable("evil.com/a/b")
         )
         self.assertEqual(json.loads(out)["reason"], "GIT_REPO_UNPARSEABLE")
+
+
+class ConversationContextTest(_Harness):
+    """The thread that travels with the requests.
+
+    Being addressed is what wakes the agent; it is not the whole of what it has
+    to read. These pin that the untagged half of a review discussion reaches the
+    worker, that it arrives marked well enough to be weighed rather than obeyed,
+    and that when a cap bites the payload says so.
+    """
+
+    def poll_threads(self, provider, argv=("poll",)):
+        _rc, out = self.run_helper(list(argv), provider)
+        return json.loads(out)
+
+    def test_untagged_comments_travel_with_the_request(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment(
+                        "IC_1", "2 feels low for prod", created_at="2026-08-12T09:00:00Z"
+                    ),
+                    make_comment(
+                        "IC_2",
+                        "agreed, but this is dev",
+                        author="other",
+                        created_at="2026-08-12T09:30:00Z",
+                    ),
+                    make_comment(
+                        "IC_3", "/agent why 2?", created_at="2026-08-12T10:00:00Z"
+                    ),
+                ]
+            },
+        )
+        payload = self.poll_threads(provider)
+        thread = payload["conversations"][0]
+        self.assertEqual(thread["pr"], 12)
+        self.assertEqual(
+            [row["comment_id"] for row in thread["comments"]],
+            ["IC_1", "IC_2", "IC_3"],
+        )
+        self.assertEqual(
+            [row["is_request"] for row in thread["comments"]], [False, False, True]
+        )
+        self.assertEqual(thread["comments"][0]["body"], "2 feels low for prod")
+
+    def test_comments_arrive_oldest_first_whatever_order_the_provider_gave(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment(
+                        "IC_late", "/agent x", created_at="2026-08-12T12:00:00Z"
+                    ),
+                    make_comment(
+                        "IC_early", "some context", created_at="2026-08-12T08:00:00Z"
+                    ),
+                ]
+            },
+        )
+        thread = self.poll_threads(provider)["conversations"][0]
+        self.assertEqual(
+            [row["comment_id"] for row in thread["comments"]], ["IC_early", "IC_late"]
+        )
+
+    def test_the_agents_own_earlier_answers_are_in_the_thread(self):
+        """So it can build on them rather than repeat or contradict one."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment(
+                        "IC_1",
+                        f"I chose 2 for cost.\n\n{pr_triggers.marker('IC_0')}",
+                        author=f"{SELF}[bot]",
+                        created_at="2026-08-12T09:00:00Z",
+                    ),
+                    make_comment("IC_2", "/agent and for prod?"),
+                ]
+            },
+        )
+        thread = self.poll_threads(provider)["conversations"][0]
+        mine = thread["comments"][0]
+        self.assertTrue(mine["is_self"])
+        self.assertFalse(thread["comments"][1]["is_self"])
+        # The marker is bookkeeping, and prompting the model with the syntax
+        # invites it to write one into prose that `reply` then stamps again.
+        self.assertEqual(mine["body"], "I chose 2 for cost.")
+
+    def test_a_read_only_authors_comment_is_context_and_says_so(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment(
+                        "IC_1",
+                        "the image tag looks stale",
+                        author="stranger",
+                        can_write=False,
+                        created_at="2026-08-12T09:00:00Z",
+                    ),
+                    make_comment("IC_2", "/agent is it?"),
+                ]
+            },
+        )
+        thread = self.poll_threads(provider)["conversations"][0]
+        self.assertFalse(thread["comments"][0]["can_write"])
+        self.assertFalse(thread["comments"][0]["is_request"])
+        self.assertTrue(thread["comments"][1]["can_write"])
+
+    def test_an_inline_review_comment_keeps_the_line_it_hangs_off(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment(
+                        "RC_1",
+                        "this replica count",
+                        kind="review_comment",
+                        path="clusters/dev/echo.yaml",
+                        line=7,
+                        created_at="2026-08-12T09:00:00Z",
+                    ),
+                    make_comment("IC_2", "/agent explain"),
+                ]
+            },
+        )
+        row = self.poll_threads(provider)["conversations"][0]["comments"][0]
+        self.assertEqual(row["kind"], "review_comment")
+        self.assertEqual(row["path"], "clusters/dev/echo.yaml")
+        self.assertEqual(row["line"], 7)
+
+    def test_a_long_comment_is_cut_and_reports_how_much(self):
+        body = "x" * (helper.CONTEXT_MAX_BODY_CHARS + 250)
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={
+                12: [
+                    make_comment("IC_1", body, created_at="2026-08-12T09:00:00Z"),
+                    make_comment("IC_2", "/agent thoughts?"),
+                ]
+            },
+        )
+        row = self.poll_threads(provider)["conversations"][0]["comments"][0]
+        self.assertEqual(len(row["body"]), helper.CONTEXT_MAX_BODY_CHARS)
+        self.assertEqual(row["truncated_chars"], 250)
+
+    def test_a_short_comment_is_not_marked_truncated(self):
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", "/agent x")]}
+        )
+        row = self.poll_threads(provider)["conversations"][0]["comments"][0]
+        self.assertNotIn("truncated_chars", row)
+
+    def test_a_long_thread_keeps_the_recent_end_and_counts_what_it_dropped(self):
+        comments = [
+            make_comment(
+                f"IC_{n:03d}", f"turn {n}", created_at=f"2026-08-12T{n // 60:02d}:{n % 60:02d}:00Z"
+            )
+            for n in range(helper.CONTEXT_MAX_COMMENTS + 5)
+        ]
+        comments.append(make_comment("IC_TRIG", "/agent x", created_at="2026-08-13T00:00:00Z"))
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        thread = self.poll_threads(provider)["conversations"][0]
+        self.assertEqual(len(thread["comments"]), helper.CONTEXT_MAX_COMMENTS)
+        self.assertEqual(thread["omitted_earlier"], 6)
+        # The trigger being answered is at the recent end, which is why the cap
+        # drops the oldest here and the oldest-first rule applies to triggers.
+        self.assertEqual(thread["comments"][-1]["comment_id"], "IC_TRIG")
+
+    def test_a_thread_within_the_cap_says_nothing_about_omissions(self):
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", "/agent x")]}
+        )
+        self.assertNotIn("omitted_earlier", self.poll_threads(provider)["conversations"][0])
+
+    def test_only_pull_requests_with_a_request_carry_a_thread(self):
+        provider = FakeProvider(
+            prs=[make_pr(12), make_pr(13)],
+            comments={
+                12: [make_comment("IC_1", "just chatting")],
+                13: [make_comment("IC_2", "/agent x")],
+            },
+        )
+        payload = self.poll_threads(provider)
+        self.assertEqual([t["pr"] for t in payload["conversations"]], [13])
+
+    def test_nothing_waiting_carries_no_transcript(self):
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", "looks good")]}
+        )
+        payload = self.poll_threads(provider)
+        self.assertEqual(payload["status"], "NO_REQUESTS")
+        self.assertNotIn("conversations", payload)
 
 
 class ReplyTest(_Harness):

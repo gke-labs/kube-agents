@@ -4,10 +4,10 @@
 Three subcommands, one job each:
 
 * ``poll`` — print the unanswered requests on one pull request, or all of them,
-  as JSON. The `github-repo-watcher` cron job runs the same logic to decide
-  whether to file a card; this exposes it so the worker can re-read the truth in
-  Step 1, and so a human debugging a missed trigger can run the exact thing the
-  watcher ran.
+  as JSON, each alongside the conversation it arrived in. The
+  `github-repo-watcher` cron job runs the same logic to decide whether to file a
+  card; this exposes it so the worker can re-read the truth in Step 1, and so a
+  human debugging a missed trigger can run the exact thing the watcher ran.
 * ``reply`` — post a comment from a file and stamp it with the marker that
   records the request as answered.
 * ``refuse`` — the same, with the refusal marker, for a request the agent has
@@ -21,6 +21,22 @@ had to remember to type it, the failure mode of forgetting is not a missing
 comment — it is the same request being answered again on every tick, ten minutes
 apart, forever. So the marker is appended here, from the ``--comment-id`` the
 command already requires, and cannot be forgotten.
+
+Why ``poll`` carries the whole thread and not just the triggers
+---------------------------------------------------------------
+Being addressed is what *wakes* the agent; it is not the whole of what it needs
+to read. "Why this value?" is only answerable against the discussion that
+preceded it, and two reviewers may have settled the question between themselves
+before anyone typed ``/agent``. So every comment on the pull request travels
+with the requests, whether or not it addressed the agent and whether or not its
+author has write access — ``is_request``, ``is_self`` and ``can_write`` mark
+each one so the worker can weigh it.
+
+That widens what reaches the model: a comment from an account with no write
+access is now in the prompt even though it can never be acted on. It is
+context, never instruction, and the SKILL.md says so in the terms the model
+reads. The trust decision stays exactly where it was — on ``can_write`` of the
+comment that did the addressing.
 
 Reply bodies are confined to ``/opt/data/scratch`` by the same ``realpath``
 check ``resolver.handle_transition`` uses. The body is posted publicly, so the
@@ -47,6 +63,14 @@ import forge  # noqa: E402
 import pr_triggers  # noqa: E402
 
 SCRATCH_DIR = "/opt/data/scratch"
+
+# How much of a thread travels with the requests. Both caps are generous enough
+# that no ordinary review conversation meets them, and both report what they
+# dropped — `omitted_earlier` on the thread, `truncated_chars` on the comment —
+# because a silently shortened transcript reads as a complete one, and the
+# worker would answer confidently from a conversation it only half saw.
+CONTEXT_MAX_COMMENTS = 40
+CONTEXT_MAX_BODY_CHARS = 4000
 
 
 def _fail(message: str):
@@ -93,6 +117,50 @@ def _confined_body(path: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _context_body(body: str) -> tuple[str, int]:
+    """A comment body as the model should see it, and how much was cut."""
+    text = pr_triggers.strip_markers(body)
+    if len(text) <= CONTEXT_MAX_BODY_CHARS:
+        return text, 0
+    return text[:CONTEXT_MAX_BODY_CHARS], len(text) - CONTEXT_MAX_BODY_CHARS
+
+
+def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
+    """The thread one pull request's requests arrived in, oldest first.
+
+    Sorted here as well as in the provider: ordering is part of this payload's
+    contract — "who said what, in what order" is most of the context — and a
+    provider that returns its endpoints unmerged should not silently degrade it.
+
+    When the cap bites it drops the *oldest* comments, the opposite of the
+    sweep's oldest-first rule for triggers. A trigger is a queue and starving
+    its head is unfair; a transcript is a story and its recent end is the part
+    that explains the request being answered now.
+    """
+    ordered = sorted(comments, key=lambda c: (c.created_at, c.node_id))
+    omitted_earlier = max(0, len(ordered) - CONTEXT_MAX_COMMENTS)
+    rows = []
+    for comment in ordered[omitted_earlier:]:
+        body, truncated = _context_body(comment.body)
+        row = {
+            "comment_id": comment.node_id,
+            "author": comment.author,
+            "created_at": comment.created_at,
+            "kind": comment.kind,
+            "can_write": comment.can_write,
+            "is_self": forge.normalise_login(comment.author) == self_login,
+            "is_request": comment.node_id in request_ids,
+            "body": body,
+        }
+        if comment.path:
+            row["path"] = comment.path
+            row["line"] = comment.line
+        if truncated:
+            row["truncated_chars"] = truncated
+        rows.append(row)
+    return rows, omitted_earlier
+
+
 def handle_poll(args) -> int:
     """Report unanswered requests, in the vocabulary the sweep uses.
 
@@ -121,10 +189,12 @@ def handle_poll(args) -> int:
             prs = [pr for pr in prs if pr.number == args.pr]
 
         found = []
+        threads = []
         for pr in prs:
             self_login = provider.self_login(pr)
             comments = provider.list_comments(repo, pr)
             handled = pr_triggers.handled_node_ids(comments, self_login)
+            pr_requests = []
             for comment in comments:
                 if comment.node_id in handled:
                     continue
@@ -135,7 +205,7 @@ def handle_poll(args) -> int:
                 )
                 if trigger is None:
                     continue
-                found.append(
+                pr_requests.append(
                     {
                         "pr": pr.number,
                         "head_ref": pr.head_ref,
@@ -149,6 +219,19 @@ def handle_poll(args) -> int:
                         "line": comment.line,
                     }
                 )
+            if not pr_requests:
+                # No thread without a request in it: the worker is answering
+                # something, and a transcript of a pull request nobody addressed
+                # is prompt it has no use for.
+                continue
+            found.extend(pr_requests)
+            rows, omitted_earlier = _conversation(
+                comments, self_login, {row["comment_id"] for row in pr_requests}
+            )
+            thread = {"pr": pr.number, "head_ref": pr.head_ref, "comments": rows}
+            if omitted_earlier:
+                thread["omitted_earlier"] = omitted_earlier
+            threads.append(thread)
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))
         return 0
@@ -160,7 +243,16 @@ def handle_poll(args) -> int:
     # request it must not act on so it can say so, rather than appearing to
     # have missed it. `can_write` is on each row and the SKILL.md is explicit
     # that a false one is refused.
-    print(json.dumps({"status": "FOUND", "repository": repo, "requests": found}))
+    print(
+        json.dumps(
+            {
+                "status": "FOUND",
+                "repository": repo,
+                "requests": found,
+                "conversations": threads,
+            }
+        )
+    )
     return 0
 
 

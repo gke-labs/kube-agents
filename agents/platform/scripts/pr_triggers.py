@@ -208,6 +208,20 @@ def marker(node_id: str, kind: str = ANSWERED_MARKER) -> str:
     return f"<!-- {kind}:{node_id} -->"
 
 
+def strip_markers(text: str) -> str:
+    """Drop idempotency markers from a body on its way into the model's context.
+
+    Markers are bookkeeping between the sweep and `pr_conversation.py`, and a
+    reviewer reading the thread never sees them rendered. Carrying them into the
+    prompt invites the model to imitate the syntax in prose it writes itself,
+    which `reply` would then stamp a second, real marker onto.
+
+    This is for display only. `handled_node_ids` still reads raw bodies, because
+    a body the agent has stripped is not the record the forge holds.
+    """
+    return MARKER_RE.sub("", normalise_newlines(text)).strip()
+
+
 def handled_node_ids(comments, self_login: str) -> set[str]:
     """Node ids already answered or refused, per the agent's own comments.
 

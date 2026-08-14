@@ -140,6 +140,36 @@ class FindTriggerTest(unittest.TestCase):
         self.assertEqual(len(trigger.summary), pr_triggers.MAX_REQUEST_CHARS)
 
 
+class StripMarkersTest(unittest.TestCase):
+    """Markers come off a body on its way into the model's context, only there."""
+
+    def test_a_marker_is_removed_and_the_prose_kept(self):
+        body = "I chose 2 for cost.\n\n<!-- agent-answered:IC_1 -->"
+        self.assertEqual(pr_triggers.strip_markers(body), "I chose 2 for cost.")
+
+    def test_every_marker_goes_not_just_the_first(self):
+        body = "<!-- agent-answered:IC_1 -->a<!-- agent-refused:IC_2 -->b"
+        self.assertEqual(pr_triggers.strip_markers(body), "ab")
+
+    def test_a_body_that_is_only_a_marker_becomes_empty(self):
+        self.assertEqual(pr_triggers.strip_markers("<!-- agent-answered:IC_1 -->"), "")
+
+    def test_an_ordinary_html_comment_survives(self):
+        """Only this scheme's markers are bookkeeping; the rest is the author's."""
+        self.assertEqual(pr_triggers.strip_markers("<!-- note -->x"), "<!-- note -->x")
+
+    def test_stripping_does_not_change_what_counts_as_answered(self):
+        """`handled_node_ids` reads raw bodies — a stripped one is not the record."""
+        body = "Done.\n\n<!-- agent-answered:IC_1 -->"
+        self.assertEqual(pr_triggers.handled_node_ids([comment(SELF, body)], SELF), {"IC_1"})
+        self.assertEqual(
+            pr_triggers.handled_node_ids(
+                [comment(SELF, pr_triggers.strip_markers(body))], SELF
+            ),
+            set(),
+        )
+
+
 class HandledNodeIdsTest(unittest.TestCase):
     def test_a_self_authored_marker_marks_a_request_answered(self):
         comments = [comment(SELF, "Done.\n\n<!-- agent-answered:IC_1 -->")]

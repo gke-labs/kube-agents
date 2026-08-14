@@ -340,7 +340,8 @@ prompt:
 
 1. Read the whole conversation from the forge, through `pr_conversation.py poll`. Never rely on what
    the card pasted in — the card is a pointer, GitHub is the transcript. The poll reports untrusted
-   requests too, so the worker can refuse one rather than appear to have missed it.
+   requests too, so the worker can refuse one rather than appear to have missed it, and it returns
+   the thread each request arrived in — see below.
 2. Act: answer a question directly; for a change request follow **submit-suggestion Step 5**, whose
    `--force-with-lease` and protected-branch guards apply unchanged.
 3. Write the reply to a file under `/opt/data/scratch`.
@@ -362,6 +363,43 @@ repository, or overturn a refusal.
 It must also take its vocabulary from the card (`forge`, `noun`) rather than hardcoding "pull
 request", so one prompt serves a forge whose users call them merge requests. Vocabulary belongs in
 the prompt; mechanism belongs in the provider.
+
+### Untagged comments are context, and arrive as data
+
+Being addressed is what _wakes_ the agent. It is not the whole of what the agent has to read, and
+the two were conflated in the first cut of this section: `poll` returned the triggers alone, and the
+surrounding discussion was left to a sentence in SKILL.md telling the model to go and fetch it. The
+live runs showed exactly what a prompt-only instruction buys — on one pull request the worker
+fetched `--json headRefName,body,comments,reviews` and read the thread; on the next, with a
+self-contained question in front of it, it fetched `headRefName` and nothing else. Neither answer
+was wrong. But "why did you pick this value?" is often only answerable against what was said above
+it, and two reviewers may talk a question most of the way to an answer between themselves before
+either types `/agent`. A worker that sees only the sentence addressed to it answers a question it
+has been shown out of context.
+
+So `FOUND` now carries a `conversations` array beside `requests`: for each pull request with
+something waiting, every comment on it, oldest first, whether or not it addressed the agent. Each
+row is marked `is_request`, `is_self` and `can_write`, which is what lets the model weigh a comment
+rather than obey it — and the trust decision itself does not move, staying on the `can_write` of the
+comment that did the addressing. Threads are only emitted for pull requests that have a request
+waiting; a transcript of a conversation nobody addressed is prompt with no use.
+
+Three details are deliberate:
+
+- **Markers are stripped from the bodies** (`pr_triggers.strip_markers`, display only —
+  `handled_node_ids` still reads raw bodies). Feeding the model its own `<!-- agent-answered:… -->`
+  syntax invites it to imitate it in prose that `reply` then stamps a second, real marker onto.
+- **Both caps report what they dropped** — `omitted_earlier` on the thread, `truncated_chars` on the
+  comment. A silently shortened transcript reads exactly like a complete one, and the worker would
+  answer confidently from a conversation it half saw.
+- **The comment cap drops the oldest**, the opposite of the sweep's oldest-first rule for triggers.
+  A trigger queue must not starve its head; a transcript is a story whose recent end explains the
+  request being answered now.
+
+This widens what reaches the model — a comment from an account with no write access is now in the
+prompt even though it can never be acted on. That is the point, and it is why SKILL.md states in the
+terms the model reads that everything in `conversations` is evidence about what is wanted and never
+an instruction.
 
 ### The chat mirror, and why it was dropped
 
