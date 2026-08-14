@@ -48,13 +48,15 @@ export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
 
-# Optional Cloud Build private worker pool. Unset by default, so builds keep
-# going to the project's default pool. Opt in by exporting a full resource
-# name: projects/PROJECT/locations/REGION/workerPools/POOL
-# The region is read back out of that name because `gcloud builds submit`
-# otherwise falls back to the `global` region, which cannot reach a regional
-# pool.
-BUILD_POOL_ARGS=()
+# Where the image builds run. Either a private worker pool or a sized machine
+# on the default pool -- never both, because a pool declares its own machine
+# and rejects being told a different one.
+#
+# Opt into a pool by exporting CLOUD_BUILD_WORKER_POOL as a full resource name:
+# projects/PROJECT/locations/REGION/workerPools/POOL. Unset by default, which
+# is the CI path. The region is read back out of that name because
+# `gcloud builds submit` otherwise falls back to the `global` region, which
+# cannot reach a regional pool.
 if [ -n "${CLOUD_BUILD_WORKER_POOL:-}" ]; then
   case "$CLOUD_BUILD_WORKER_POOL" in
     projects/*/locations/*/workerPools/*) ;;
@@ -63,10 +65,17 @@ if [ -n "${CLOUD_BUILD_WORKER_POOL:-}" ]; then
       exit 1
       ;;
   esac
-  BUILD_POOL_ARGS=(
+  BUILD_WORKER_ARGS=(
     --worker-pool="$CLOUD_BUILD_WORKER_POOL"
     --region="$(echo "$CLOUD_BUILD_WORKER_POOL" | cut -d'/' -f4)"
   )
+else
+  # The default pool's unspecified machine is two vCPUs, which is most of why
+  # the image builds are the single largest phase of this job. The build also
+  # runs the operator step alongside the agent build (see
+  # deploy/docker/cloudbuild-ci.yaml), and that is only real overlap on a
+  # worker with cores to spare rather than two contending for the same pair.
+  BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)
 fi
 
 START_TIME=$SECONDS
@@ -81,15 +90,13 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # ─── 4. Build Container Images ────────────────────────────────────────────────
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
-gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
-  --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
-  --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet .
-
-gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
-  --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
-  --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet .
-
-gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet k8s-operator
+# One submit, not three. credential-proxy derives from platform, so building
+# them as consecutive steps on one worker lets the second reuse the first's
+# layers instead of rebuilding the chain on a cold daemon; the operator build
+# runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
+gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
+  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PLATFORM_LATEST=${AR_REPO}/platform-agent:latest,_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_PROXY_LATEST=${AR_REPO}/credential-proxy:latest,_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+  --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
 echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 
 # ─── 5. Provisioning Pipeline Execution ───────────────────────────────────────
