@@ -1727,11 +1727,6 @@ class CommandExecutor:
             # editor could never have succeeded.
             "GIT_EDITOR": "false",
             "GIT_SEQUENCE_EDITOR": "false",
-            # them from a fixed https prefix); note this does refuse the `file`
-            # protocol, so a local-path clone would need `https:file`.
-            "GIT_ALLOW_PROTOCOL": "https",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": str(self.git_config_global),
             # An editor is a command git runs, and `core.editor` is settable
             # from the `.git/config` the agent can write. `git commit` with no
             # `-m` and `git tag -a` with no `-m` both launch it — argv the

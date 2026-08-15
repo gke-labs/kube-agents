@@ -66,6 +66,8 @@ kube-agents/
 ├── scripts/release/                               Release Candidate automation scripts README
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
+├── tests/conformance/                             security-invariant conformance
+│                                                  suite README
 └── tests/e2e/                                     Google Chat E2E suite README
 ```
 
@@ -361,6 +363,7 @@ only what the title does not say.
 | `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set; mutually exclusive with `provision_04_gcp_iam.sh`. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
 | `terraform/modules/chat-pubsub/README.md` | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM; mutually exclusive with `provision_05_gcp_gchat.sh`. | Chat Pub/Sub, service identities, IAM | Infrastructure engineers |
 | `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (PEM import stays with `provision_10_deploy_github_minter.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
+| `tests/conformance/README.md` | Component README | The deterministic conformance suite: one assertion per security invariant, the bucket it falls in, and the historical attack it would have caught. Records the twelve invariants the product currently violates as expected failures. | Invariant coverage, buckets, mutation results | Security reviewers; `tests/e2e/README.md` covers the cluster-bound suite |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
 
 ## 5. Keeping this map fresh
