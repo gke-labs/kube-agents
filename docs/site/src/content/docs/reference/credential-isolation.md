@@ -50,6 +50,12 @@ Naming a cluster is not extra authority — `get-credentials` is bound by the sa
 
 This is a floor, not an ownership check: the wrapper sends an argument array and a working directory, never a caller identity, so the sidecar can tell that a push is happening inside _some_ lease but not whose. Whether the lease is the caller's own is checked in the sandbox by the skill that holds it. [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) is canonical for the layout and the reaper.
 
+**`kubectl` and `gcloud` are read-only by default.** The proxy enforces that `kubectl` may not run mutating verbs like `delete`, `create`, `patch`, or `rollout restart`, and that `gcloud` may not run commands that change cloud resources. It refuses the flags that would change which identity a command authenticates as or which server receives the credential — `--as`, `--server`, `--token`, `--kuberc`, `--insecure-skip-tls-verify` and their `gcloud` equivalents — and the refusal comes back as `SECURITY_POLICY_BLOCKED` with a rule such as `kubernetes.read-only` or `kubernetes.identity-change-forbidden`.
+
+**This allowlist is currently the only thing enforcing that posture.** There is no second layer beneath it today: a command it fails to refuse runs against the cluster with the sidecar's full credential. Kubernetes impersonation is planned and not yet deployed; once it ships, the API server will authorize each request as the requesting human user and this allowlist becomes the outer of two layers rather than the whole control. Note also that the current deployment shares one Google service account across every agent — that is the gap impersonation closes, not a mitigation.
+
+A first deployment in a live environment will find read-only commands nobody anticipated. The fix is to add the verb to the allowlist in `command_policy.py` and ship it; that keeps the change reviewable and scoped to the one command that was missing. Report the blocked command to your infrastructure team with the rule id from the refusal.
+
 ## Credential placement
 
 | Data                             | Sandbox                | Credential sidecar        |
