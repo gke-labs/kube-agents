@@ -70,6 +70,31 @@ The default **read-only** set binds viewer roles only:
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
+`roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project. The [scoped service account pool](#the-scoped-service-account-pool) is how a Terraform install narrows that.
+
+## The scoped service account pool
+
+:::caution[Not functional as of 2026-08-12]
+The pool is provisioned but its members hold no IAM grant, and it is disabled by default. Each member was scoped by an IAM Condition on the cluster's `resource.name`, and that grants nothing for Kubernetes object operations — measured across four condition spellings, including one asserting only that the call is a GKE call. Removing the condition without removing the grant would have given every member project-wide `roles/container.viewer`, so both were removed.
+
+Authority arrives with per-cluster Kubernetes RBAC, which is a separate change. Until then, leave `scoped_clusters` empty and the broker runs on the agent's own identity as it did before.
+:::
+
+A Terraform install can provision one service account per GKE cluster. The credential broker then mints a short-lived token for the account a request's target cluster maps to, rather than running on the agent's own identity.
+
+Set it with the `scoped_clusters` variable on the [`kube-agents-iam`](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/kube-agents-iam) module; `terraform/examples/full-install` defaults it to the cluster it provisions. Two things follow, and both are intended:
+
+- **The agent's own GSA was to drop `roles/container.viewer`**, keeping `roles/container.clusterViewer` — able to enumerate clusters and run `get-credentials`, unable to read anything inside one. The two changes are coupled because neither is safe alone: narrowing the agent with no working pool breaks every read, and arming the pool while the agent stays wide leaves the ceiling the pool exists to remove. **Suspended 2026-08-12**, since the pool grants nothing and the first of those failure modes is the live one.
+- **A cluster that is not in the pool is refused**, not served by a wider credential. Adding a cluster to the fleet without adding it to `scoped_clusters` produces a refusal naming the missing scope.
+
+The module grants the agent `roles/iam.serviceAccountTokenCreator` **on each pool member as a resource**, never at project level. At project level that role would let the agent mint a token for any service account in the project, which would make the pool decorative.
+
+The mapping reaches the broker through `spec.security.scopedServiceAccounts` on the [`PlatformAgent` CR](/kube-agents/operator/platformagent-crd/) — the operator renders it into the credential-proxy ConfigMap and sets `CREDENTIAL_PROXY_SCOPED_SA_POOL` on the broker container. That variable is rendered in both directions, so which credential mode an install is in is readable from the Deployment.
+
+**A script-provisioned install has no pool.** `provision_04_gcp_iam.sh` installs against one cluster it is pointed at interactively and has nowhere to get a cluster list from, so the pool is Terraform-only. Because the broker arms the pool by default, such an install must set `CREDENTIAL_PROXY_SCOPED_SA_POOL=0` explicitly; without it the broker refuses to start rather than falling back to the wide credential.
+
+**What the pool does not cover.** It scopes what goes _through_ the credential broker. The `gke` MCP server proxies to `container.googleapis.com/mcp` from the agent container on the ambient Workload Identity credential and never reaches the broker, so what bounds that path is the size of the agent's own grant — which is the other half of why `roles/container.viewer` comes off it.
+
 The **custom** set binds exactly the roles listed in `PLATFORM_AGENT_CUSTOM_ROLES` (space- or comma-separated; the provisioner prompts for it and requires a non-empty value when this set is selected) — none of the built-in role bundles are added.
 
 ### Why there is no `gke-admin` set

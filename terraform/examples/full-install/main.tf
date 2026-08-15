@@ -78,12 +78,36 @@ module "gke_cluster" {
   depends_on = [google_project_service.required]
 }
 
+locals {
+  # Defaults to the cluster this composition creates, so an unconfigured install
+  # gets per-cluster credentials rather than one identity that reads the whole
+  # project. Named from `var.*` rather than from `module.gke_cluster.*` on
+  # purpose: the pool's service accounts would otherwise depend on the cluster
+  # existing, and Terraform would refuse to plan the IAM until after the cluster
+  # was created. The two values are the same by construction -- the gke_cluster
+  # module is given exactly these.
+  scoped_clusters = var.scoped_clusters != null ? var.scoped_clusters : [{
+    project_id   = var.project_id
+    location     = var.location
+    cluster_name = var.cluster_name
+  }]
+
+  # Indexed by the same key the module uses, so the emails coming back out of
+  # the module can be rejoined with the tuple that produced them without
+  # re-deriving anything.
+  scoped_pool_entries = {
+    for cluster in local.scoped_clusters :
+    "projects/${cluster.project_id}/locations/${cluster.location}/clusters/${cluster.cluster_name}" => cluster
+  }
+}
+
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id    = var.project_id
-  namespace     = var.namespace
-  project_roles = var.project_roles
+  project_id      = var.project_id
+  namespace       = var.namespace
+  project_roles   = var.project_roles
+  scoped_clusters = local.scoped_clusters
 
   depends_on = [google_project_service.required]
 }
@@ -192,6 +216,19 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        # The mapping the credential broker selects from. It has to reach the
+        # cluster as data rather than being recomputed there: the broker refuses
+        # a scope it has no entry for, so a second implementation of the naming
+        # rule would turn a mismatch into a refusal at request time instead of a
+        # diff at plan time.
+        scopedServiceAccounts = [
+          for key in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
+            projectId           = local.scoped_pool_entries[key].project_id
+            location            = local.scoped_pool_entries[key].location
+            clusterName         = local.scoped_pool_entries[key].cluster_name
+            serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
+          }
+        ]
       }
       credentials = {
         create = true

@@ -85,6 +85,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the sidecar for this reason.
 
 The sandbox and credential sidecar must not share a process namespace, and must not run as the same user, while the sidecar holds credentials: either one exposes the sidecar's environment variables through `/proc`. The Pod does neither. `shareProcessNamespace` is unset in every configuration, including the dashboard-enabled one that previously set it, and the sidecar runs as a user of its own. The two containers do still share a Pod, and so a network namespace and one Pod identity; see the limitation in the design.
+<<<<<<< HEAD
 
 `spec.security.splitCredentialBrokerPod` removes that last sharing, and is off by default because it requires ReadWriteMany storage for the agent data volume — the broker executes commands in directories the agent creates there, so both Pods must mount the claim read-write at the same path, which a ReadWriteOnce persistent disk cannot do across nodes. Enabling it without that storage fails as a scheduling problem rather than a policy one: the broker Pod cannot attach the volume, never becomes a Service endpoint, and every proxied command reports the credential proxy as unavailable.
 
@@ -93,6 +94,8 @@ When it is on, the broker call is authenticated: the agent presents an audience-
 `spec.security.egressPolicy: Allowlist` is what the split then makes possible: a default-deny egress NetworkPolicy on the agent Pod, denying the link-local metadata server by not listing it. Without it the sandbox can mint the Workload Identity token directly and bypass the broker and every control in front of it, which is the isolation design's own stated assumption — that the agent does not deliberately ask — turned into an enforced boundary. It requires the split, because a NetworkPolicy selects Pods and not containers and the broker reaches the metadata server on purpose; the combination without it is refused with a `Degraded` status rather than rendered.
 
 **Both flags default off, so a stock install has neither property.** Two further conditions the operator cannot enforce: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and policies are additive, so any other policy selecting the agent Pod with wider egress reopens it. The control also removes the agent's web search, headless browser, two MCP servers and direct `github.com` access — deliberately, since unrestricted egress from a sandbox running a headless browser is the exfiltration path, but it is a cost to weigh rather than a free win.
+=======
+>>>>>>> 9108380 (fix(security): stop the sandbox sharing a process namespace and a UID)
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 

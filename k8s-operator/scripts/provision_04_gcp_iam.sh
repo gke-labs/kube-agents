@@ -219,6 +219,22 @@ get_platform_agent_roles() {
   # RBAC and hands it container.clusters.impersonate, which IAM has no
   # resourceNames equivalent for. `custom` remains for operators who need
   # broader roles and are willing to name them.
+  #
+  # This list still carries roles/container.viewer, and the Terraform module's
+  # equivalent drops it when a scoped service account pool is provisioned. That
+  # is not drift. The pool is Terraform-only, deliberately: it needs a list of
+  # the clusters to provision for, and this script installs against one cluster
+  # it is being pointed at interactively. There is nowhere here for that list to
+  # come from that would not be a worse version of a Terraform variable.
+  #
+  # The consequence is worth stating plainly, because it is not obvious and it
+  # bites at startup rather than at install time. A script-provisioned deployment
+  # has no pool, so the agent keeps the single wide identity, and the credential
+  # broker -- which arms the pool by default -- must be told so explicitly with
+  # CREDENTIAL_PROXY_SCOPED_SA_POOL=0. Without that the broker refuses to start
+  # rather than quietly falling back to the credential the pool exists to
+  # replace. `tests/test_agent_iam_ceiling.py` pins both lists against each
+  # other so this stays a documented difference rather than an accident.
   case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     read-only)
       echo "${read_only_roles[*]}"

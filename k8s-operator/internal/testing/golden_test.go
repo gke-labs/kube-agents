@@ -81,6 +81,23 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// The scoped service account pool on. Diff this against
+			// platformagent-tagged.yaml and the whole of what
+			// spec.security.scopedServiceAccounts renders is a ConfigMap key,
+			// a SubPath mount and two environment variables — which is the
+			// point of the fixture. The exit criterion for that work is that
+			// the cluster-to-account mapping is readable off a manifest rather
+			// than inferred from what the broker does at runtime, and a golden
+			// file is the only artifact that can hold that claim honestly.
+			name:         "PlatformAgentScopedServiceAccounts",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-scoped-sa.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scoped-sa.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
 			// The egress policy on. Diff this against
 			// platformagent-split-broker.yaml and the whole of what
 			// spec.security.egressPolicy renders is one NetworkPolicy —

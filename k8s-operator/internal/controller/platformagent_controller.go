@@ -679,6 +679,12 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 // This is a log line and not a Degraded status because the access mode of an
 // existing claim cannot be changed in place: an operator who hits it has to
 // provision new storage, and blocking reconcile would not help them do that.
+// on this volume, and refuses any directory outside it. With ReadWriteOnce the
+// two Pods cannot both mount it read-write unless they land on the same node,
+// and every proxied command fails with a 400 rather than degrading. This is a
+// log line and not a Degraded status because the access mode of an existing
+// claim cannot be changed in place: an operator who hits it has to provision
+// new storage, and blocking reconcile would not help them do that.
 func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
 	log := logf.FromContext(ctx)
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -812,6 +818,7 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 		"policy", policy.Name, "rules", len(policy.Spec.Egress))
 	return nil
 }
+
 
 // deleteIfOwned removes a namespaced object this controller created, refusing
 // to touch one it does not own.
