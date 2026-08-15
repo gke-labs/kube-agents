@@ -121,10 +121,11 @@ func volumeNamed(volumes []corev1.Volume, name string) *corev1.Volume {
 func assertBrokerHomeIsOffTheSharedWorkspace(t *testing.T, spec corev1.PodSpec, brokerContainer string) {
 	t.Helper()
 
-	broker := brokerContainerNamed(spec.Containers, brokerContainer)
-	if broker == nil {
+	container, found := findContainer(spec, brokerContainer)
+	if !found {
 		t.Fatalf("no %s container in this Pod: the layout moved and this test is now asserting nothing", brokerContainer)
 	}
+	broker := &container
 	stateDir, found := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_STATE_DIR")
 	if !found {
 		t.Fatal("the broker has no CREDENTIAL_PROXY_STATE_DIR, so its HOME is wherever the image's default is")

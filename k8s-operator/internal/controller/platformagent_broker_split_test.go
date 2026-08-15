@@ -102,8 +102,8 @@ func hasVolume(volumes []corev1.Volume, name string) bool {
 func TestTheGateOffLeavesTheSidecarLayoutAlone(t *testing.T) {
 	pod := buildPodTemplateSpec(splitBrokerAgent(false), "c", "f", "s", "p", nil, renderOptions{})
 
-	if brokerContainerNamed(pod.Spec.Containers, "envoy-credential-proxy") == nil {
-		t.Error("expected the credential proxy sidecar in the agent Pod")
+	if _, found := findContainer(pod.Spec, "envoy-credential-proxy"); !found {
+		t.Error("expected the credential proxy sidecar in the agent Pod (as native sidecar initContainer)")
 	}
 	if brokerContainerNamed(pod.Spec.Containers, "agent-api-proxy") != nil {
 		t.Error("the split-only API proxy container must not appear with the gate off")
@@ -127,7 +127,7 @@ func TestTheGateOnMovesTheBrokerOffTheAgentPod(t *testing.T) {
 	agent := splitBrokerAgent(true)
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
 
-	if brokerContainerNamed(pod.Spec.Containers, "envoy-credential-proxy") != nil {
+	if _, found := findContainer(pod.Spec, "envoy-credential-proxy"); found {
 		t.Error("the credential broker must not remain in the agent Pod")
 	}
 	apiProxy := brokerContainerNamed(pod.Spec.Containers, "agent-api-proxy")
