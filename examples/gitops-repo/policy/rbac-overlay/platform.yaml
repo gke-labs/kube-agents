@@ -1,7 +1,8 @@
 # Platform tier — pre-created read-only identity (06 §2, 03 §4).
 # Project-scoped read-only. The controller REFERENCES this SA (serviceAccountName); it never mints
 # RBAC (08 §4). The `kube-agents/tier` label is the selector the ValidatingAdmissionPolicy uses.
-# Verbs are read-only (get/list/watch) — a write verb here would be rejected by vap-agent-readonly.
+# Verbs are read-only (get/list/watch) — a write verb here would be rejected by the
+# `kube-agents-agent-readonly` ValidatingAdmissionPolicy (k8s-operator/config/admission/agent-rbac-policy.yaml).
 apiVersion: v1
 kind: ServiceAccount
 metadata:

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import queue
@@ -814,6 +815,23 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertNotIn("SLACK_BOT_TOKEN", executor.environment)
         self.assertEqual(str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"])
 
+    def test_kuberc_is_disabled_for_proxied_commands(self):
+        # command_policy refuses the --kuberc flag, but kubectl v1.36.3 also
+        # reads $HOME/.kube/kuberc with no flag present, and a kuberc can carry
+        # an `as` default -- verified to set Impersonate-User on an argv holding
+        # nothing to refuse. HOME points at the sidecar-only state dir, so the
+        # agent cannot write that path today, but that is deployment geometry
+        # and it is not what this asserts. This asserts the feature is off, so
+        # the property survives someone rearranging the mounts.
+        executor = self.executor()
+        # .get rather than [] so removing the variable reads as a failure with
+        # the expected value in the diff, not as a KeyError in the error column.
+        self.assertEqual("false", executor.environment.get("KUBECTL_KUBERC"))
+        # And the geometry, separately, so a change to either is visible.
+        self.assertEqual(
+            str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"]
+        )
+
     def test_git_commands_carry_a_commit_identity(self):
         # The remediation Pull Request path commits through the proxy, and the
         # commit runs here, in the sidecar. With no identity `git commit` exits
@@ -1557,6 +1575,898 @@ class SlackRelayTest(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
         self.assertEqual({"error": "Slack operation failed"}, captured["payload"])
+
+
+class ReadOnlyGateTest(unittest.TestCase):
+    """The gate that makes the PR-only write rule mechanical.
+
+    The proxy refused credential disclosure long before it refused a mutation.
+    These cover the wiring: that the gate runs, that it runs after the existing
+    denylist so credential rules keep their own rule IDs, and that it can be
+    switched off without a new image.
+    """
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        CredentialProxyHandler.enforce_read_only = True
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _decide(self, argv):
+        """The blocked response the handler would send, or None if allowed."""
+        result = credential_proxy.read_only_refusal(argv)
+        return result[0] if result is not None else None
+
+    def test_a_read_passes_the_gate(self):
+        self.assertIsNone(self._decide(["kubectl", "get", "pods"]))
+
+    def test_a_mutation_is_refused(self):
+        refusal = self._decide(["kubectl", "delete", "ns", "prod"])
+        self.assertIsNotNone(refusal)
+        self.assertEqual("kubernetes.read-only", refusal["rule"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
+
+    def test_the_gate_can_be_switched_off(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertIsNone(self._decide(["kubectl", "delete", "ns", "prod"]))
+
+    def test_the_gate_is_on_by_default(self):
+        # A misread env var must not silently disarm the gate.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "banana"}):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "false"}):
+            self.assertFalse(credential_proxy.read_only_enforced())
+
+    def test_credentials_do_not_leak_to_logs(self):
+        # Verify that a token in argv does not get logged
+        result = credential_proxy.read_only_refusal(
+            ["kubectl", "--token=eyJhbGci.SECRET", "--as=admin", "get", "pods"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The log hint should be the --as flag, not a secret-containing argv element
+        self.assertEqual("--as", log_hint)
+        self.assertNotIn("SECRET", log_hint)
+        self.assertNotIn("eyJhbGci", log_hint)
+
+    def test_gcloud_positionals_do_not_leak_to_logs(self):
+        # Verify that positionals in gcloud don't get logged when capped at 3 words
+        # "compute disks describe" is allowlisted, but it accepts a disk name positional
+        # which should not appear in the log hint (capped at first 3 words)
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "describe", "SECRETDISKNAME", "--zone=us-central1-a"]
+        )
+        # This is allowed, so no refusal
+        self.assertIsNone(result)
+
+        # Test a mutation that WOULD refuse and check the hint cap
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The hint should cap at 3 words, excluding the credential positional
+        self.assertEqual("compute.disks.delete", log_hint)
+        self.assertNotIn("SECRETDISKNAME", log_hint)
+
+    # Every payload here sits in argv position 1, not position 5. The previous
+    # version of this test put the payload fifth, where the verb cap in
+    # command_policy.evaluate -- `verb_tuple=tuple(words[:3])` -- dropped it
+    # before the sanitizer ever saw it. All three assertions therefore held
+    # against any implementation at all, including `filtered = s`. The cap is
+    # what made the test vacuous, so the payload has to land inside it.
+    #
+    # It is genuinely reachable: gcloud group names are agent-chosen strings and
+    # the first three of them go into the log hint verbatim.
+    FORGERY_PAYLOADS = (
+        ("\n", "compute\n2026-08-06 WARNING command complete exit_code=0"),
+        ("\u2028", "compute\u20282026-08-06 WARNING exit_code=0"),   # LINE SEPARATOR, Zl
+        ("\x85", "compute\x852026-08-06 WARNING exit_code=0"),       # NEL, Cc
+        ("\r", "compute\r2026-08-06 WARNING exit_code=0"),
+        ("\u2029", "compute\u20292026-08-06 WARNING exit_code=0"),   # PARA SEPARATOR, Zp
+    )
+
+    def test_log_sanitization_removes_control_chars(self):
+        # Drive the real path rather than calling the filter directly: a forged
+        # log line only matters if the payload reaches the logger, and
+        # read_only_refusal builds the hint the handler passes to
+        # _sanitize_for_logging.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                result = credential_proxy.read_only_refusal(
+                    ["gcloud", payload, "instances", "delete", "prod"]
+                )
+                self.assertIsNotNone(result)
+                _, log_hint = result
+                # If this fails the rest of the test is asserting about a string
+                # that never held the payload, which is the bug being fixed.
+                self.assertIn(character, log_hint)
+                sanitized = credential_proxy._sanitize_for_logging(log_hint)
+                self.assertNotIn(character, sanitized)
+
+    def test_log_sanitization_leaves_a_single_line(self):
+        # The property that actually matters. str.splitlines breaks on the whole
+        # family a text log reader breaks on -- \n \r \v \f \x1c-\x1e \x85
+        # \u2028 \u2029 -- so one line out means one line in the log.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                sanitized = credential_proxy._sanitize_for_logging(payload)
+                self.assertEqual([sanitized], sanitized.splitlines())
+                self.assertNotIn(character, sanitized)
+
+    def test_the_forgery_payload_survives_the_verb_cap(self):
+        # Pins reachability itself, separately from the filter. If the hint ever
+        # stopped carrying agent-chosen text, the tests above would go quiet
+        # rather than fail, and the sanitizer would be unpinned again.
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute\ninjected", "instances", "delete", "prod"]
+        )
+        self.assertIsNotNone(result)
+        _, log_hint = result
+        self.assertEqual("compute\ninjected.instances.delete", log_hint)
+
+    def test_log_sanitization_has_length_cap(self):
+        # Verify that sanitizer caps at 64 chars to prevent unbounded expansion
+        long_flag = "--verylongflagname" + "x" * 100
+        sanitized = credential_proxy._sanitize_for_logging(long_flag)
+        self.assertLessEqual(len(sanitized), 64)
+        # Original should be truncated
+        self.assertNotEqual(sanitized, long_flag)
+
+
+class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
+    """`serve` is what copies the env var onto the handler.
+
+    `read_only_enforced()` and `read_only_refusal()` were both covered, and the
+    one line joining them was not: deleting
+    `CredentialProxyHandler.enforce_read_only = read_only_enforced()` from
+    `serve` left the whole suite green while the kill switch silently stopped
+    working in either direction. This starts the real `serve` with the network
+    parts stubbed and reads the attribute back off the class.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _serve_with(self, enforce_value):
+        owner = self
+        bound = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        # The deployed configuration always serves the broker on the Unix
+        # socket, and `serve` now refuses a TCP listener with no caller
+        # authentication, so the socket is what this drives.
+        args = types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+        }
+        if enforce_value is not None:
+            environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+        finally:
+            for server in bound:
+                server.server_close()
+        return CredentialProxyHandler.enforce_read_only
+
+    def test_serve_arms_the_gate_by_default(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with(None))
+
+    def test_serve_disarms_the_gate_when_the_env_var_says_false(self):
+        CredentialProxyHandler.enforce_read_only = True
+        self.assertFalse(self._serve_with("false"))
+
+    def test_serve_leaves_the_gate_armed_on_a_typo(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with("banana"))
+
+
+class ReadOnlyOverTheSocketTest(unittest.TestCase):
+    """A mutation must stop at the proxy socket, not merely at a decision function."""
+
+    def setUp(self):
+        self.executed = []
+        owner = self
+
+        class RecordingExecutor:
+            ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+            def git_lease_violation(self, argv, cwd):
+                return None
+
+            def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+                owner.executed.append(argv)
+                return credential_proxy.ExecutionResult(
+                    exit_code=0, stdout="", stderr="",
+                    duration_ms=0, truncated=False, timed_out=False,
+                )
+
+        self.original_executor = getattr(CredentialProxyHandler, 'executor', None)
+        self.original_policy = getattr(CredentialProxyHandler, 'policy', None)
+        self.original_enforce = getattr(CredentialProxyHandler, 'enforce_read_only', True)
+        CredentialProxyHandler.executor = RecordingExecutor()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        if self.original_executor is not None:
+            CredentialProxyHandler.executor = self.original_executor
+        if self.original_policy is not None:
+            CredentialProxyHandler.policy = self.original_policy
+        CredentialProxyHandler.enforce_read_only = self.original_enforce
+
+    def _post(self, argv):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps({"requestId": "t", "argv": argv, "cwd": "/tmp"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_a_read_reaches_the_executor(self):
+        """kubectl get pods (a read) should reach the executor and return 200."""
+        status, payload = self._post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executed)
+
+    def test_a_kubectl_mutation_never_reaches_the_executor(self):
+        """kubectl delete ns prod (a mutation) should be blocked before reaching executor."""
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("kubernetes.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_a_gcloud_mutation_never_reaches_the_executor(self):
+        """gcloud container clusters delete should be blocked before reaching executor."""
+        status, payload = self._post(["gcloud", "container", "clusters", "delete", "c"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("gcp.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_identity_flag_refusal_over_the_wire(self):
+        """kubectl --as=admin@corp.com get secrets should be blocked for impersonation."""
+        status, payload = self._post(["kubectl", "--as=admin@corp.com", "get", "secrets"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("identity.caller-supplied-impersonation", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_kill_switch_allows_mutation_through(self):
+        """With enforce_read_only = False, mutations should reach the executor."""
+        CredentialProxyHandler.enforce_read_only = False
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(200, status)
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual([["kubectl", "delete", "ns", "prod"]], self.executed)
+
+    def test_credential_denylist_takes_precedence_over_read_only(self):
+        """A rule from the credential denylist should report its own rule_id, not read-only.
+
+        The gate runs after policy.blocked_by, so credential rules like
+        kubernetes.token-disclosure keep their own rule ids rather than being
+        masked by a read-only refusal.
+        """
+        # Create a policy with a rule that blocks token disclosure
+        rules = [
+            credential_proxy.Rule(
+                rule_id="kubernetes.token-disclosure",
+                pattern=__import__('re').compile(r"create\s+token", __import__('re').IGNORECASE),
+                message="Token disclosure is not allowed"
+            )
+        ]
+        CredentialProxyHandler.policy = Policy(
+            rules=rules,
+            blocked_message="blocked"
+        )
+
+        # This command matches the denylist rule, not the read-only gate
+        status, payload = self._post(["kubectl", "create", "token", "sa"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        # Should report the denylist rule, not read-only
+        self.assertEqual("kubernetes.token-disclosure", payload["rule"])
+        self.assertEqual([], self.executed)
+
+
+class BackendSocketModeTest(unittest.TestCase):
+    """The backend socket must not inherit a permissive umask.
+
+    Nothing behind this socket authenticates its callers, so its mode is the
+    second lock after the mount. The sidecar's entrypoint now sets `umask 0002`
+    so that proxied commands leave group-writable files on the workspace the
+    agent shares — and a group-writable *socket* is a connectable socket for
+    anyone in the agent's group. `serve` therefore has to set the mode itself
+    rather than take whatever the process umask happens to be, which is what
+    this asserts by binding under the widest umask there is.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        # `serve` assigns these on the class; put them back for whatever runs
+        # next. Some are bare annotations until something sets them, so an
+        # unset one has to be unset again rather than restored.
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def test_the_backend_socket_is_not_group_or_world_connectable(self):
+        owner = self
+        bound = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "policy.json"
+            policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+            socket_path = Path(tmp) / "backend.sock"
+            args = types.SimpleNamespace(
+                policy=str(policy_path),
+                host="127.0.0.1",
+                port=0,
+                unix_socket=str(socket_path),
+                timeout_seconds=5,
+                max_request_bytes=1 << 20,
+                max_output_bytes=1 << 20,
+                state_dir=str(Path(tmp) / "state"),
+            )
+            previous_umask = os.umask(0o000)
+            try:
+                with mock.patch.dict(os.environ, {"API_SERVER_EXTERNAL_KEY": "external"}, clear=True), \
+                        mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                        mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                        mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                    with self.assertRaises(self._Stop):
+                        credential_proxy.serve(args)
+                # Read back before the outer restore: the process umask has to be
+                # the one it started with, because the same process goes on to run
+                # proxied commands that must leave group-writable files behind.
+                left_behind = os.umask(0o000)
+            finally:
+                os.umask(previous_umask)
+                for server in bound:
+                    server.server_close()
+
+            self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
+            mode = socket_path.stat().st_mode & 0o777
+            self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
+
+
+class ServiceAccountAuthenticatorTest(unittest.TestCase):
+    """The verifier itself: what it accepts, and everything it refuses."""
+
+    AUDIENCE = "kubeagents-credential-proxy"
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.own_token = Path(self.tmp.name) / "token"
+        self.own_token.write_text("broker-own-token", encoding="utf-8")
+        self.reviews = []
+
+    def _authenticator(self, **overrides):
+        kwargs = dict(
+            audience=self.AUDIENCE,
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file=str(self.own_token),
+            cache_seconds=0.0,
+        )
+        kwargs.update(overrides)
+        return credential_proxy.ServiceAccountAuthenticator(**kwargs)
+
+    def _with_review(self, authenticator, status):
+        """Replace the API round trip, keeping every check that reads it."""
+
+        def fake_review(token):
+            self.reviews.append(token)
+            return authenticator._principal_from({"status": status})
+
+        authenticator._review = fake_review
+        return authenticator
+
+    @staticmethod
+    def _headers(value):
+        return {"Authorization": value} if value is not None else {}
+
+    def _ok_status(self, **overrides):
+        status = {
+            "authenticated": True,
+            "audiences": [self.AUDIENCE],
+            "user": {
+                "username": self.CALLER,
+                "uid": "sa-uid",
+                "groups": ["system:serviceaccounts"],
+            },
+        }
+        status.update(overrides)
+        return status
+
+    def test_a_verified_token_yields_the_principal_from_the_review(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        principal = authenticator.authenticate(self._headers("Bearer agent-token"))
+        self.assertEqual(self.CALLER, principal.workload)
+        self.assertEqual("sa-uid", principal.uid)
+        self.assertIn("system:serviceaccounts", principal.groups)
+        # Slice 3 fills this; nothing today may invent it.
+        self.assertIsNone(principal.caller)
+        self.assertEqual(["agent-token"], self.reviews)
+
+    def test_no_header_is_rejected(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers(None))
+        self.assertEqual([], self.reviews, "an absent token must not reach the API server")
+
+    def test_a_non_bearer_scheme_is_rejected(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Basic YWJjOmRlZg=="))
+
+    def test_an_unauthenticated_review_is_rejected(self):
+        authenticator = self._with_review(
+            self._authenticator(), self._ok_status(authenticated=False)
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer forged"))
+
+    def test_a_token_for_another_audience_is_rejected(self):
+        # The audience is what stops a token minted for the Kubernetes API, or
+        # for any other service, being replayed at the broker.
+        authenticator = self._with_review(
+            self._authenticator(), self._ok_status(audiences=["https://kubernetes.default.svc"])
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer other-audience"))
+
+    def test_a_caller_outside_the_allowlist_is_rejected(self):
+        authenticator = self._with_review(
+            self._authenticator(),
+            self._ok_status(user={"username": "system:serviceaccount:default:someone-else"}),
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer wrong-sa"))
+
+    def test_an_api_server_error_is_a_rejection_not_an_allow(self):
+        authenticator = self._authenticator()
+
+        def explode(request, *args, **kwargs):
+            raise urllib.error.URLError("connection refused")
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", explode):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_the_review_asks_for_the_configured_audience(self):
+        authenticator = self._authenticator()
+        captured = {}
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, *args, **kwargs):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["authorization"] = request.get_header("Authorization")
+            return Response(json.dumps({"status": self._ok_status()}).encode("utf-8"))
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", fake_urlopen):
+            authenticator.authenticate(self._headers("Bearer agent-token"))
+
+        self.assertEqual(
+            "https://10.0.0.1:443/apis/authentication.k8s.io/v1/tokenreviews",
+            captured["url"],
+        )
+        self.assertEqual([self.AUDIENCE], captured["body"]["spec"]["audiences"])
+        self.assertEqual("agent-token", captured["body"]["spec"]["token"])
+        self.assertEqual("Bearer broker-own-token", captured["authorization"])
+
+    def test_a_verified_token_is_cached_rather_than_re_reviewed(self):
+        authenticator = self._with_review(
+            self._authenticator(cache_seconds=300.0), self._ok_status()
+        )
+        authenticator.authenticate(self._headers("Bearer agent-token"))
+        authenticator.authenticate(self._headers("Bearer agent-token"))
+        self.assertEqual(["agent-token"], self.reviews)
+
+    def test_a_rejected_token_is_never_cached(self):
+        authenticator = self._with_review(
+            self._authenticator(cache_seconds=300.0), self._ok_status(authenticated=False)
+        )
+        for _ in range(2):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                authenticator.authenticate(self._headers("Bearer forged"))
+        self.assertEqual(["forged", "forged"], self.reviews)
+
+
+class BuildAuthenticatorTest(unittest.TestCase):
+    def test_the_default_is_the_null_authenticator(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsInstance(
+                credential_proxy.build_authenticator(), credential_proxy.NullAuthenticator
+            )
+
+    def test_serviceaccount_mode_needs_an_allowlist(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.build_authenticator()
+
+    def test_serviceaccount_mode_needs_an_api_server(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(ValueError):
+                credential_proxy.build_authenticator()
+
+    def test_an_unknown_mode_is_refused_rather_than_ignored(self):
+        # A typo must not silently degrade to "no authentication".
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_AUTH_MODE": "servicaccount"}, clear=True
+        ):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.build_authenticator()
+
+    def test_serviceaccount_mode_builds_the_verifier(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent, ",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertIsInstance(authenticator, credential_proxy.ServiceAccountAuthenticator)
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent"}), authenticator.allowed_callers
+        )
+        self.assertEqual("kubeagents-credential-proxy", authenticator.audience)
+
+
+class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
+    """The listener that would hand the credentials to whoever reaches the port.
+
+    The TCP branch of `serve` has always been live code — it is unused only
+    because one environment variable is set. Splitting the broker into its own
+    Pod is what makes that branch the deployed one, so it must not be reachable
+    without an authenticator.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def _args(self, unix_socket=""):
+        return types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=unix_socket,
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+
+    def test_tcp_with_no_authentication_refuses_to_start(self):
+        class Bound(Exception):
+            """Raised if serve gets as far as binding anything at all."""
+
+        def refuse_to_bind(*args, **kwargs):
+            raise Bound
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {"API_SERVER_EXTERNAL_KEY": "external"}
+        # Everything that could listen is replaced, so removing the guard makes
+        # this test fail loudly instead of blocking on a real serve_forever.
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy.serve(self._args())
+        self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
+
+    def test_a_unix_socket_behind_a_networked_envoy_also_refuses(self):
+        # The deployed split keeps the Unix socket and moves Envoy's listener
+        # to the Pod IP. The socket's 0600 mode protects nothing then: the
+        # connection arrives through Envoy, as Envoy's own user.
+        class Bound(Exception):
+            pass
+
+        def refuse_to_bind(*args, **kwargs):
+            raise Bound
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_ENVOY_ADDRESS": "0.0.0.0",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy.serve(
+                    self._args(unix_socket=str(Path(self.tmp.name) / "backend.sock"))
+                )
+        self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
+
+    def test_a_unix_socket_behind_a_loopback_envoy_is_the_sidecar_and_is_allowed(self):
+        self.assertFalse(
+            credential_proxy.reachable_off_pod(self._args(unix_socket="/run/backend.sock"))
+        )
+
+    def test_tcp_with_an_authenticator_is_allowed(self):
+        owner = self
+
+        class _Stop(Exception):
+            pass
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.address = address
+
+            def serve_forever(self):
+                raise _Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        original = CredentialProxyHandler.__dict__.get("authenticator")
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+                with self.assertRaises(_Stop):
+                    credential_proxy.serve(self._args())
+            self.assertIsInstance(
+                CredentialProxyHandler.authenticator,
+                credential_proxy.ServiceAccountAuthenticator,
+            )
+        finally:
+            if original is not None:
+                CredentialProxyHandler.authenticator = original
+        del owner
+
+
+class AuthenticationOverTheSocketTest(unittest.TestCase):
+    """An unauthenticated request must die at the socket, not at a function.
+
+    Deleting the `_authenticated()` call from `do_POST` leaves every unit test
+    of the verifier green while the broker answers anyone. This drives a real
+    HTTP server with a real authenticator wired onto the handler class.
+    """
+
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    class _RecordingExecutor:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def __init__(self):
+            self.executed = []
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+            self.executed.append(argv)
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                duration_ms=0, truncated=False, timed_out=False,
+            )
+
+    def setUp(self):
+        self.executor = self._RecordingExecutor()
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
+        ):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.executor = self.executor
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience="kubeagents-credential-proxy",
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+        caller = self.CALLER
+
+        def fake_review(token):
+            if token != "good-token":
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=caller, uid="sa-uid")
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _post(self, path="/v1/exec", token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            self.endpoint + path,
+            data=json.dumps(
+                {"requestId": "t", "argv": ["kubectl", "get", "pods"], "cwd": "/tmp"}
+            ).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_an_unauthenticated_exec_is_401_and_runs_nothing(self):
+        status, payload = self._post()
+        self.assertEqual(401, status)
+        self.assertEqual([], self.executor.executed)
+        # The 401 must not explain itself; that would be a hint sheet.
+        self.assertNotIn("audience", json.dumps(payload))
+
+    def test_a_forged_token_is_401_and_runs_nothing(self):
+        status, _ = self._post(token="forged")
+        self.assertEqual(401, status)
+        self.assertEqual([], self.executor.executed)
+
+    def test_a_verified_token_reaches_the_executor(self):
+        status, _ = self._post(token="good-token")
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executor.executed)
+
+    def test_the_github_refresh_route_is_authenticated_too(self):
+        status, _ = self._post(path="/v1/github/refresh")
+        self.assertEqual(401, status)
+
+    def test_the_chat_relay_route_is_authenticated_too(self):
+        status, _ = self._post(path="/v1/chat/events/ack")
+        self.assertEqual(401, status)
+
+    def test_healthz_stays_open_for_the_readiness_probe(self):
+        with urllib.request.urlopen(self.endpoint + "/healthz") as response:
+            self.assertEqual(200, response.status)
+
+    def test_an_unauthenticated_get_on_a_relay_route_is_401(self):
+        request = urllib.request.Request(self.endpoint + "/v1/chat/events", method="GET")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(401, raised.exception.code)
 
 
 if __name__ == "__main__":

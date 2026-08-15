@@ -66,6 +66,12 @@ rules:
       - update
       - watch
   - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+  - apiGroups:
       - autoscaling
     resources:
       - horizontalpodautoscalers
@@ -210,3 +216,11 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resourceNames:
+      - view
+    resources:
+      - clusterroles
+    verbs:
+      - bind

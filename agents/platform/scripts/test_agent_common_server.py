@@ -39,6 +39,17 @@ def _load_agent_common_server():
     except Exception:
         import session_manager as real_session_manager
 
+        def _stub_if_missing(name, module):
+            # Stub only a module that really cannot be imported. These entries
+            # outlive this file: unittest discovery imports every test module
+            # into one process, and a fake pydantic left here (a ModuleType
+            # bearing nothing but Field) is what fastapi finds when
+            # test_session_kv_server imports it seventeen modules later.
+            try:
+                importlib.import_module(name)
+            except Exception:
+                sys.modules[name] = module
+
         mcp = types.ModuleType("mcp"); mcp.__path__ = []
         mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
         fastmcp = types.ModuleType("mcp.server.fastmcp")
@@ -46,10 +57,11 @@ def _load_agent_common_server():
             tool=lambda *a, **k: (lambda f: f), run=lambda: None)
         pydantic = types.ModuleType("pydantic")
         pydantic.Field = lambda *a, **k: None
-        sys.modules.update({
-            "mcp": mcp, "mcp.server": mcp_server, "mcp.server.fastmcp": fastmcp,
-            "pydantic": pydantic, "session_manager": real_session_manager,
-        })
+        _stub_if_missing("mcp", mcp)
+        _stub_if_missing("mcp.server", mcp_server)
+        _stub_if_missing("mcp.server.fastmcp", fastmcp)
+        _stub_if_missing("pydantic", pydantic)
+        sys.modules["session_manager"] = real_session_manager
         return importlib.import_module("agent_common_server")
 
 

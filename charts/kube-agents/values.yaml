@@ -1,3 +1,17 @@
+# Cluster-wide ValidatingAdmissionPolicies that backstop agent RBAC at apply
+# time: read verbs only, no Secrets, and no cluster-scoped binding to a
+# namespace-tier agent ServiceAccount. Read the header of
+# templates/agent-rbac-admission-policy.yaml before relying on them — notably,
+# they cannot check the rules of a *referenced* Role, and the content policy is
+# evadable by a manifest that carries neither the `kube-agents/tier` label nor
+# the `*-agent` naming convention.
+#
+# Turn off for: a cluster below Kubernetes 1.30 (where the policy API is not yet
+# v1 and the install would fail), or a second kube-agents release in a cluster
+# that already has these — the objects are cluster singletons with fixed names.
+admissionPolicy:
+  enabled: true
+
 operator:
   enabled: true
   # Extra environment variables for the controller manager, e.g. the

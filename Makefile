@@ -106,7 +106,8 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
-	$(wildcard scripts/test_*.py)))
+	$(wildcard scripts/test_*.py) \
+	$(wildcard tests/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
@@ -115,6 +116,19 @@ PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicor
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
+
+# One command for "is this branch landable": everything a PR must pass, ordered
+# so the cheapest check fails first.
+#
+# Added because the answer used to be three commands nobody could remember, and
+# a handoff doc had to carry the recipe. If you add a suite, add it here.
+verify: ## Run everything a PR must pass: go build, go vet, go test, python tests.
+	@echo "==> go build"; cd k8s-operator && go build ./...
+	@echo "==> go vet";   cd k8s-operator && go vet ./...
+	@echo "==> go test";  cd k8s-operator && go test ./...
+	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
+	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> verify OK"
 
 test-python: ## Run the Python unit tests outside k8s-operator/.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \

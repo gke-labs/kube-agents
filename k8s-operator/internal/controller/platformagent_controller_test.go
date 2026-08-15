@@ -58,6 +58,11 @@ func setupScheme() *runtime.Scheme {
 }
 
 // fakeServerSideApplyInterceptors returns interceptor.Funcs to handle Server-Side Apply (SSA) in the controller-runtime fake client.
+// ssaApplyInterceptor is the name this stack's tests use for the fake
+// client's Server-Side Apply support; main grew fakeServerSideApplyInterceptors
+// for the same job while the stack was in flight. One aliases the other.
+func ssaApplyInterceptor() interceptor.Funcs { return fakeServerSideApplyInterceptors() }
+
 func fakeServerSideApplyInterceptors() interceptor.Funcs {
 	return interceptor.Funcs{
 		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -178,7 +183,12 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	proxyC, found := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	if !found {
+		t.Errorf("expected Deployment to contain Envoy credential sidecar")
+	} else if proxyC.RestartPolicy == nil || *proxyC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("credential proxy must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+	}
 
 	// Service
 	svc := &corev1.Service{}
@@ -266,25 +276,82 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		UID:        agent.UID,
 		Controller: ptr.To(true),
 	}
-	objects := []client.Object{
-		agent,
+	removed := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
+	// The metadata-deny NetworkPolicy is a guardrail this controller does not
+	// create. Invariant C5 forbids deleting it, so it belongs on the survivor
+	// side of this test, not the deleted side.
+	guardrail := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}}
+
+	objects := append([]client.Object{agent, guardrail}, removed...)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.deleteLegacyCredentialIsolationResources(context.Background(), agent); err != nil {
 		t.Fatalf("deleteLegacyCredentialIsolationResources failed: %v", err)
 	}
-	for _, object := range objects[1:] {
+	for _, object := range removed {
 		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)
 		if !errors.IsNotFound(err) {
 			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
 		}
+	}
+	surviving := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(guardrail), surviving); err != nil {
+		t.Errorf("the metadata-deny NetworkPolicy is a guardrail the controller does not create; it must survive reconcile (invariant C5), got %v", err)
+	}
+}
+
+// TestReconcileDoesNotDeleteTheMetadataDenyGuardrail runs a full Reconcile
+// rather than the cleanup helper alone, so the assertion holds no matter which
+// step of Reconcile a future change wires the deletion into.
+func TestReconcileDoesNotDeleteTheMetadataDenyGuardrail(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-agent",
+			Namespace:  "test-ns",
+			UID:        types.UID("agent-uid"),
+			Finalizers: []string{platformAgentFinalizer},
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "proj",
+				Location:    "us-central1",
+				ClusterName: "cluster",
+			},
+		},
+	}
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-sandbox-metadata-deny",
+			Namespace: "test-ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: agentv1alpha1.GroupVersion.String(),
+				Kind:       "PlatformAgent",
+				Name:       agent.Name,
+				UID:        agent.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, policy).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
+		t.Fatalf("Reconcile deleted the metadata-deny NetworkPolicy; invariant C5 forbids a controller deleting a guardrail it did not create: %v", err)
 	}
 }
 

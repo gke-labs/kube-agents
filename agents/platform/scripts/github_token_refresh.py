@@ -14,6 +14,8 @@ import time
 import urllib.request
 import urllib.error
 
+from credential_proxy_client import authorization_headers
+
 TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token")
 
 def log(msg: str):
@@ -56,7 +58,9 @@ def refresh_git_credentials(target_repo: str = None) -> str:
         request = urllib.request.Request(
             proxy_url.rstrip("/") + "/v1/github/refresh",
             data=json.dumps({"repository": repository}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            # Empty in the sidecar deployment; carries the caller's projected
+            # ServiceAccount token when the broker runs in its own Pod.
+            headers={"Content-Type": "application/json", **authorization_headers()},
             method="POST",
         )
         try:

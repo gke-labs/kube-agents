@@ -16,6 +16,35 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 # Add the directory containing session_kv_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+# session_kv_server imports agent_common_server, which imports mcp.server.fastmcp.
+# That symbol is absent from some installed versions of the mcp package, and when
+# it is, this whole module fails to import -- so every test in it silently does
+# not run. That is how three denial tests for the /inject authentication came to
+# be passing-by-not-existing. Stub only when the real import fails, so a working
+# environment still exercises the real path.
+try:  # pragma: no cover - depends on the installed mcp version
+    import mcp.server.fastmcp  # noqa: F401
+except Exception:  # pragma: no cover
+    import types
+
+    _stub = types.ModuleType("mcp.server.fastmcp")
+
+    class _FastMCP:  # minimal stand-in; nothing under test touches it
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def tool(self, *args, **kwargs):
+            def decorate(fn):
+                return fn
+
+            return decorate
+
+        def run(self, *args, **kwargs):
+            pass
+
+    _stub.FastMCP = _FastMCP
+    sys.modules["mcp.server.fastmcp"] = _stub
+
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
 
