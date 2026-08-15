@@ -781,6 +781,45 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
+      initContainers:
+        - args:
+            - |-
+              rm -rf -- \
+                /workspace/home/.config/gcloud \
+                /workspace/home/.config/gh \
+                /workspace/home/.aws/credentials \
+                /workspace/home/.aws/cli/cache \
+                /workspace/home/.aws/sso/cache \
+                /workspace/home/.azure \
+                /workspace/home/.docker/config.json \
+                /workspace/home/.git-credentials \
+                /workspace/home/.hermes/.env \
+                /workspace/home/.kube/config \
+                /workspace/home/.netrc \
+                /workspace/home/.npmrc \
+                /workspace/home/.pypirc
+          command:
+            - sh
+            - -ec
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+          imagePullPolicy: IfNotPresent
+          name: sandbox-credential-cleanup
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /workspace
+              name: platform-agent-data-vol
         - command:
             - /usr/local/bin/start-services
           env:
@@ -861,6 +900,7 @@ spec:
                 - http://127.0.0.1:8765/healthz
             initialDelaySeconds: 5
             periodSeconds: 15
+          restartPolicy: Always
           resources:
             limits:
               cpu: "2"
@@ -895,45 +935,6 @@ spec:
               name: event-watcher-ksa-token
               readOnly: true
             - mountPath: /opt/data
-              name: platform-agent-data-vol
-      initContainers:
-        - args:
-            - |-
-              rm -rf -- \
-                /workspace/home/.config/gcloud \
-                /workspace/home/.config/gh \
-                /workspace/home/.aws/credentials \
-                /workspace/home/.aws/cli/cache \
-                /workspace/home/.aws/sso/cache \
-                /workspace/home/.azure \
-                /workspace/home/.docker/config.json \
-                /workspace/home/.git-credentials \
-                /workspace/home/.hermes/.env \
-                /workspace/home/.kube/config \
-                /workspace/home/.netrc \
-                /workspace/home/.npmrc \
-                /workspace/home/.pypirc
-          command:
-            - sh
-            - -ec
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: sandbox-credential-cleanup
-          resources:
-            limits:
-              cpu: 200m
-              memory: 256Mi
-            requests:
-              cpu: 100m
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-          volumeMounts:
-            - mountPath: /workspace
               name: platform-agent-data-vol
       securityContext:
         fsGroup: 10000
