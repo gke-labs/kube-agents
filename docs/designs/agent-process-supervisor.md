@@ -33,15 +33,18 @@ that needs a supervised sibling to rediscover the same ground.
 Every file this design cites, linked to `main`. Line numbers in the prose below were taken on
 2026-08-13 and will drift; the links will not.
 
-| File                                                                                                                                                                           | Its part in this design                                          |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
-| [`k8s-operator/internal/controller/leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py)                       | The script that becomes the supervisor. 159 lines; read it whole |
-| [`k8s-operator/internal/controller/test_leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/test_leader_elect.py)             | Its four existing tests, two of which S1 breaks                  |
-| [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh)                                                   | `exec "$@"`, the `IS_BOOTSTRAP_PRIMARY` gate, and step 5         |
-| [`k8s-operator/internal/controller/platformagent_manifests.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests.go) | `Args`, the probes, the Service selector, the two stale comments |
-| [`k8s-operator/internal/controller/manifest_helpers.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/manifest_helpers.go)               | Replica count and Deployment strategy                            |
-| [`agents/platform/scripts/platform_mcp_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/platform_mcp_server.py)                           | The second, racing KV-server launcher                            |
-| [`deploy/shared/entrypoint_gate_check.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/entrypoint_gate_check.sh)                                           | Asserts port 8699 is released; changes at S4                     |
+| File                                                                                                                                                                                     | Its part in this design                                          |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| [`k8s-operator/internal/controller/leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py)                                 | The script that becomes the supervisor. 159 lines; read it whole |
+| [`k8s-operator/internal/controller/test_leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/test_leader_elect.py)                       | Its four existing tests, two of which S1 breaks                  |
+| [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh)                                                             | `exec "$@"`, the `IS_BOOTSTRAP_PRIMARY` gate, and step 5         |
+| [`k8s-operator/internal/controller/platformagent_manifests.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests.go)           | `Args`, the probes, the Service selector, the two stale comments |
+| [`k8s-operator/internal/controller/platformagent_manifests_test.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests_test.go) | Where the `replicas > 1` path is asserted today                  |
+| [`k8s-operator/internal/controller/manifest_helpers.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/manifest_helpers.go)                         | Replica count and Deployment strategy                            |
+| [`k8s-operator/api/v1alpha1/common_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/common_types.go)                                               | The CRD's optional `availability.replicas` (P1)                  |
+| [`agents/platform/scripts/platform_mcp_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/platform_mcp_server.py)                                     | The second, racing KV-server launcher                            |
+| [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)                                         | The process S4 adopts; cited in 3.7A only                        |
+| [`deploy/shared/entrypoint_gate_check.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/entrypoint_gate_check.sh)                                                     | Asserts port 8699 is released; changes at S4                     |
 
 ## 1. What exists today
 
@@ -49,8 +52,8 @@ Every file this design cites, linked to `main`. Line numbers in the prose below 
 
 The image `ENTRYPOINT` is
 [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh),
-which builds the shared tree and ends in `exec "$@"` (`:1008`). What `"$@"` is depends on the
-replica count:
+which builds the shared tree and ends in `exec "$@"` (`docker-entrypoint.sh:1008`). What `"$@"` is
+depends on the replica count:
 
 | Replicas | Gateway container `Args`                              | What supervises `hermes gateway run` |
 | -------- | ----------------------------------------------------- | ------------------------------------ |
@@ -58,7 +61,8 @@ replica count:
 | > 1      | `/opt/hermes/.venv/bin/python3 $HOME/leader_elect.py` | `leader_elect.py`                    |
 
 The operator sets `Args` only in the `replicas > 1` branch, and sets `ENABLE_LEADER_ELECTION` /
-`LEADER_ELECTION_LEASE_NAME` / `LEADER_ELECTION_NAMESPACE` in the same branch (`:1574-1589`) —
+`LEADER_ELECTION_LEASE_NAME` / `LEADER_ELECTION_NAMESPACE` in the same branch
+(`platformagent_manifests.go:1574-1589`) —
 [`platformagent_manifests.go:2207-2212`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests.go):
 
 ```go
@@ -133,7 +137,7 @@ fails, which is a TOCTOU against the entrypoint's background start. The loser ex
 `EADDRINUSE` into a log file on the PVC.
 
 The entrypoint's start is no longer unconditional. It is gated on `IS_BOOTSTRAP_PRIMARY`
-(`:191-195`), which is `0` for `PLATFORM_AGENT_ROLE=sidecar`:
+(`docker-entrypoint.sh:191-195`), which is `0` for `PLATFORM_AGENT_ROLE=sidecar`:
 
 ```bash
 # 5. Start background microservices (FastAPI proxy)
@@ -159,7 +163,7 @@ again.
 ### 1.3 One supervision idiom
 
 `leader_elect.py` handles exactly one process and has one response to it exiting — the whole of it,
-at `:134-153`:
+at `leader_elect.py:134-153`:
 
 ```python
 if holder == pod_name:
@@ -185,16 +189,43 @@ else:
 ```
 
 A single `process` global, `sys.exit` when it exits, and a 10 s grace on loss. The `SIGTERM` path
-(`:25-55`) repeats the same terminate-wait-kill and then releases the lease. Three things follow
-that section 2 turns into problems: the crash response restarts the whole container without
-releasing anything (P3), the state is one variable rather than a table (3.2), and the 10 s grace
-is one of the two terms in the timing inequality (P5).
+(`leader_elect.py:25-55`) repeats the same terminate-wait-kill and then releases the lease. Three
+things follow that section 2 turns into problems: the crash response restarts the whole container
+without releasing anything (P3), the state is one variable rather than a table (3.2), and the 10 s
+grace is one of the two terms in the timing inequality (P5).
 
 ### 1.4 No health signal from the gateway container
 
-The `platform-agent` container declares no probe of any kind (`platformagent_manifests.go:2248-2270`).
-The only readiness probe in the pod belongs to the `envoy-credential-proxy` container, and it is
-the shape 3.4's probe should match — an existing, working example in the same file (`:1911-1918`):
+The `platform-agent` container declares no probe of any kind. The whole container spec is short
+enough to show, and the point is what is absent from it
+(`platformagent_manifests.go:2248-2266`):
+
+```go
+Name:            "platform-agent",
+Image:           image,
+ImagePullPolicy: pullPolicy,
+Args:            args,
+Ports: []corev1.ContainerPort{
+	{
+		Name:          "api",
+		ContainerPort: 8642,
+	},
+},
+Env:          gatewayEnvVars,
+Resources:    resources,
+VolumeMounts: volumeMounts,
+SecurityContext: &corev1.SecurityContext{
+	AllowPrivilegeEscalation: ptr.To(false),
+	Capabilities: &corev1.Capabilities{
+		Drop: []corev1.Capability{"ALL"},
+	},
+},
+```
+
+No `ReadinessProbe`, no `LivenessProbe`, no `StartupProbe` — the container that serves port 8642 is
+never asked a question. The only readiness probe in the pod belongs to the `envoy-credential-proxy`
+container, and it is the shape 3.4's probe should match — an existing, working example in the same
+file (`platformagent_manifests.go:1911-1918`):
 
 ```go
 ReadinessProbe: &corev1.Probe{
@@ -209,19 +240,19 @@ ReadinessProbe: &corev1.Probe{
 Nothing the gateway container runs — the gateway itself, the KV server's `/healthz` — is ever
 asked whether it is alive.
 
-At `replicas > 1` the Service selector gains `kubeagents.io/is-leader=true` (`:2730`), so
-followers are already excluded from endpoints by label. Readiness today therefore changes
-nothing about routing, and its absence costs only visibility.
+At `replicas > 1` the Service selector gains `kubeagents.io/is-leader=true`
+(`platformagent_manifests.go:2730`), so followers are already excluded from endpoints by label.
+Readiness today therefore changes nothing about routing, and its absence costs only visibility.
 
 ### 1.5 The timing parameters
 
-| Parameter                    | Value                                      | Where                                |
-| ---------------------------- | ------------------------------------------ | ------------------------------------ |
-| `lease_duration_seconds`     | 15 s                                       | `leader_elect.py:70`                 |
-| poll interval                | 5 s + U(0,2)                               | `:71`, `:156`                        |
-| process termination grace    | 10 s                                       | `:36`, `:148`                        |
-| Deployment strategy, `n = 1` | **Recreate**                               | `manifest_helpers.go:270-272`        |
-| Deployment strategy, `n > 1` | RollingUpdate, 25% surge / 25% unavailable | `manifest_helpers.go:61`, `:285-292` |
+| Parameter                    | Value                                      | Where                                                   |
+| ---------------------------- | ------------------------------------------ | ------------------------------------------------------- |
+| `lease_duration_seconds`     | 15 s                                       | `leader_elect.py:70`                                    |
+| poll interval                | 5 s + U(0,2)                               | `leader_elect.py:71`, `leader_elect.py:156`             |
+| process termination grace    | 10 s                                       | `leader_elect.py:36`, `leader_elect.py:148`             |
+| Deployment strategy, `n = 1` | **Recreate**                               | `manifest_helpers.go:270-272`                           |
+| Deployment strategy, `n > 1` | RollingUpdate, 25% surge / 25% unavailable | `manifest_helpers.go:61`, `manifest_helpers.go:285-292` |
 
 The single-replica row matters for 3.4 and is easy to miss: the default deployment does not roll,
 it is torn down and replaced. A readiness probe that never passes there is not a stalled rollout
@@ -298,7 +329,7 @@ mode rather than adding a branch beside it.
 
 ### P3 — One process exiting restarts the whole container, and the crash path leaks leader state
 
-The response to a process that has exited is two lines (`:139-141`):
+The response to a process that has exited is two lines (`leader_elect.py:139-141`):
 
 ```python
 elif process.poll() is not None:
@@ -316,8 +347,35 @@ because a container restart re-runs the entrypoint from the top, which rebuilds 
 and starts another Session KV server.
 
 **It bypasses the cleanup path.** `sys.exit` here is not `release_lease_and_exit`; that function
-is only ever reached through the signal handlers registered at `:63-64`. So the crash path never
-calls `update_pod_label(v1, False)` and never clears `holder_identity`:
+is only ever reached through the signal handlers registered at `leader_elect.py:63-64`:
+
+```python
+signal.signal(signal.SIGTERM, release_lease_and_exit)
+signal.signal(signal.SIGINT,  release_lease_and_exit)
+```
+
+Everything that function does on the way out is therefore skipped when a supervised process
+exits (`leader_elect.py:41-55`):
+
+```python
+    try:
+        config.load_incluster_config()
+        coordination_v1 = client.CoordinationV1Api()
+        v1 = client.CoreV1Api()
+
+        lease = coordination_v1.read_namespaced_lease(name=lease_name, namespace=namespace)
+        if lease.spec.holder_identity == pod_name:
+            print(f"[{pod_name}] Releasing lease...", flush=True)
+            lease.spec.holder_identity = None
+            coordination_v1.replace_namespaced_lease(name=lease_name, namespace=namespace, body=lease)
+            update_pod_label(v1, False)
+    except Exception as e:
+        print(f"[LeaderElect] Error releasing lease: {e}", file=sys.stderr, flush=True)
+
+    sys.exit(0)
+```
+
+So the crash path never calls `update_pod_label(v1, False)` and never clears `holder_identity`:
 
 | On process crash               | State left behind                                     |
 | ------------------------------ | ----------------------------------------------------- |
@@ -343,9 +401,24 @@ The invisibility half is 1.4: no probe, so `/healthz` on 8699 is never called an
 process is indistinguishable from a running one.
 
 The trap is in the obvious fix. A readiness probe that reports on a **leader-only** process marks
-every follower NotReady, and the rollout arithmetic does not survive that. At `replicas: 2` with
-`defaultSurgePercent = "25%"` on both knobs (`manifest_helpers.go:61`, `:285-292`), Kubernetes
-rounds `maxSurge` **up** and `maxUnavailable` **down**:
+every follower NotReady, and the rollout arithmetic does not survive that. Both knobs are set
+from the same constant — `defaultSurgePercent = "25%"` (`manifest_helpers.go:61`), applied at
+`manifest_helpers.go:285-292`:
+
+```go
+if intendedReplicas > 1 {
+	strategy = appsv1.DeploymentStrategy{
+		Type: appsv1.RollingUpdateDeploymentStrategyType,
+		RollingUpdate: &appsv1.RollingUpdateDeployment{
+			MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+			MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+		},
+	}
+}
+```
+
+One constant, two knobs — but Kubernetes rounds them in opposite directions: `maxSurge` **up**
+and `maxUnavailable` **down**. At `replicas: 2` that asymmetry is the whole problem:
 
 | Setting          | 25% of 2 | Rounding | Effective |
 | ---------------- | -------- | -------- | --------- |
@@ -402,7 +475,7 @@ nothing prevents two processes from both believing they hold it for a bounded wi
 
 The loop does self-terminate on a partition, though by accident rather than by design. A non-404
 `ApiException` leaves `holder` at its initialised `None` and falls through to the loss branch
-(`:111-153`):
+(`leader_elect.py:111-153`):
 
 ```python
 except ApiException as e:
@@ -439,7 +512,7 @@ mode = elected  if LEADER_ELECTION_LEASE_NAME and LEADER_ELECTION_NAMESPACE else
 ```
 
 - **`solo`** — behave as a permanent leader. Start the processes, supervise them, never contact
-  the API server, never label the pod. This replaces the `os.execvp` at `:61`; the reason to
+  the API server, never label the pod. This replaces the `os.execvp` at `leader_elect.py:60-61`; the reason to
   supervise rather than exec is that there is more than one process to start, and that is true
   independent of how many replicas there are.
 - **`elected`** — today's loop, unchanged in structure: acquire, label, start processes, renew,
@@ -454,9 +527,10 @@ single-replica case this removes:
   single replica today. The operator already names the owner explicitly with
   `AGENT_SHARED_STATE_SETUP=owner`, so nothing changes in behaviour — but the comment gets simpler
   and should be updated rather than left describing a case that no longer exists.
-- The `Args, never Command` comment (`:2197-2206`) explains the exec-target choice partly in terms
-  of the entrypoint "start[ing] the Session KV server on 8699 that the event-watcher is pointed
-  at". That clause survives S1 but not S4, where the entrypoint stops starting it.
+- The `Args, never Command` comment (`platformagent_manifests.go:2197-2206`) explains the
+  exec-target choice partly in terms of the entrypoint "start[ing] the Session KV server on 8699
+  that the event-watcher is pointed at". That clause survives S1 but not S4, where the entrypoint
+  stops starting it.
 
 ### 3.2 The process table
 
@@ -515,6 +589,43 @@ Per process, not per pod:
   [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md) and must fit inside the cap.
 - On lease loss, stop all processes (reverse start order) before returning to the watch loop.
   Termination keeps today's 10 s grace and `SIGKILL` fallback.
+
+Sketched, to fix the shape rather than the implementation — this is the replacement for the
+`elif process.poll() is not None: sys.exit(...)` of 1.3:
+
+```python
+RESTART_CAP    = 5     # restarts ...
+RESTART_WINDOW = 300   # ... within this many seconds
+BACKOFF_MAX    = 30
+
+class Supervised:
+    def __init__(self, name, argv):
+        self.name, self.argv = name, argv
+        self.proc = None
+        self.backoff = 1
+        self.restarts = deque()          # monotonic timestamps, trimmed to RESTART_WINDOW
+
+    def reap(self, now):
+        """Called once per poll. Returns False if this process is past its cap."""
+        if self.proc is None or self.proc.poll() is None:
+            return True                  # not started, or still running
+
+        self.restarts.append(now)
+        while self.restarts and now - self.restarts[0] > RESTART_WINDOW:
+            self.restarts.popleft()
+        if len(self.restarts) >= RESTART_CAP:
+            return False                 # give up -> supervisor exits via the cleanup path
+
+        self.proc = None
+        self.retry_at = now + self.backoff
+        self.backoff = min(self.backoff * 2, BACKOFF_MAX)
+        return True
+```
+
+Two properties matter more than the details. `reap` returning `False` must route through
+`release_lease_and_exit`, not `sys.exit` — that is the P3 regression this design must not
+reintroduce. And the restart counter is **per process**: the gateway flapping must not consume
+the KV server's budget, which is the whole point of "per process, not per pod."
 
 ### 3.4 Health endpoint and readiness
 
@@ -619,10 +730,10 @@ the outgoing leader has stopped its processes before any other pod can acquire t
 ### 3.6 What the Lease does not do
 
 It does not fence. A leader partitioned from the API server keeps running until its own next poll
-fails — and today's loop does self-terminate in that case, because a non-404 `ApiException`
-leaves `holder` as `None` and falls into the loss branch (`:111-153`) — but "eventually
-self-terminates" is not the same as "cannot still be writing". Nothing about the Lease prevents
-two processes from both believing they are the leader for a bounded window.
+fails — and today's loop does self-terminate in that case, because a non-404 `ApiException` leaves
+`holder` as `None` and falls into the loss branch (`leader_elect.py:111-153`) — but "eventually
+self-terminates" is not the same as "cannot still be writing". Nothing about the Lease prevents two
+processes from both believing they are the leader for a bounded window.
 
 Consequences for anything a process owns exclusively:
 
@@ -733,13 +844,16 @@ supervised, because it builds the tree the processes read. Any init system would
 - Set the gateway container's `Args` to the supervisor at **every** replica count
   (`platformagent_manifests.go:2209-2212`). Note that the branch currently tests the effective
   replica count, so this also fixes the `scaleToZero` case in 1.1.
-- Add the readiness probe of 3.4 to the `platform-agent` container (`:2248-2270`).
+- Add the readiness probe of 3.4 to the `platform-agent` container
+  (`platformagent_manifests.go:2248-2270`).
 - Raise `lease_duration_seconds` to 30 s. That constant lives in
   `k8s-operator/internal/controller/leader_elect.py:70`, a real file that
-  `platformagent_manifests.go:3305` pulls in with `//go:embed` and `:169` mounts as a ConfigMap
-  key — it is not an inline string literal in the Go source.
-- Update the two comments named in 3.1: `AGENT_SHARED_STATE_SETUP` at `:59-69` and
-  `Args, never Command` at `:2197-2206`.
+  `platformagent_manifests.go:3305` pulls in with `//go:embed` and
+  `platformagent_manifests.go:169` mounts as a ConfigMap key — it is not an inline string literal
+  in the Go source.
+- Update the two comments named in 3.1: `AGENT_SHARED_STATE_SETUP` at
+  `platformagent_manifests.go:59-69` and `Args, never Command` at
+  `platformagent_manifests.go:2197-2206`.
 - Golden files in `k8s-operator/internal/testing/testdata/platform/expected/` gain the probe and,
   at a single replica, the `Args` they currently omit.
 
@@ -790,27 +904,44 @@ The existing file mocks the `kubernetes` package wholesale before importing the 
 passes with `sys.modules['kubernetes']` unset is the real assertion that 3.1's "never contact the
 API server" holds.
 
-**Timing.** Assert the inequality in code rather than in prose — a startup check that
-`lease_duration_seconds > max_poll_interval + grace` and refuses to start otherwise. It is one
-line, and it is the only thing that keeps 3.5 true after someone tunes a constant.
+**Timing.** Assert the inequality in code rather than in prose. It is genuinely one statement,
+placed where the constants are defined so that tuning one without the other cannot start:
+
+```python
+lease_duration_seconds = 30
+base_poll_interval     = 5
+poll_jitter            = 2
+process_shutdown_grace = 10
+
+# 3.5: the outgoing leader must be finished before anyone else may acquire.
+assert lease_duration_seconds > base_poll_interval + poll_jitter + process_shutdown_grace, (
+    f"lease_duration_seconds={lease_duration_seconds} must exceed "
+    f"{base_poll_interval}+{poll_jitter} poll + {process_shutdown_grace} grace"
+)
+```
+
+This is the only thing that keeps 3.5 true after someone tunes a constant, and it fails at
+startup — loudly, in the pod's own logs — rather than at the failover it would otherwise
+silently break.
 
 **Operator.** `platformagent_manifests_test.go` for `Args` at a single replica and the probe on
 both; the golden files above.
 
 Note where the existing coverage sits, because S1 lands unevenly across it. The `replicas > 1`
-branch is asserted by targeted unit tests — `:2351` pins the exact `Args` slice, `:2289-2293` the
-election environment — but **all three golden files render `replicas: 1`**, so no golden exercises
-the elected path at all; `leader_elect.py` appears in them only as a ConfigMap key and a
-volumeMount. S1 therefore changes every golden (each gains `Args` where it has none today) while
-the elected-path assertions stay where they are. A green golden diff is not evidence that the
-elected path still works, and vice versa.
+branch is asserted by targeted unit tests — `platformagent_manifests_test.go:2351` pins the exact
+`Args` slice, `platformagent_manifests_test.go:2289-2293` the election environment — but **all three
+golden files render `replicas: 1`**, so no golden exercises the elected path at all;
+`leader_elect.py` appears in them only as a ConfigMap key and a volumeMount. S1 therefore changes
+every golden (each gains `Args` where it has none today) while the elected-path assertions stay
+where they are. A green golden diff is not evidence that the elected path still works, and vice
+versa.
 
-**Entrypoint.** `deploy/shared/entrypoint_gate_check.sh:313-324` asserts that port 8699 is
-released after each case, and its header comment (`:27-31`) plus the reaper at `:87` are written
-around step 5 owning that port. `tests/test_docker_entrypoint.py:19` uses the `logs/` directory
-step 5 creates as its probe. All of them change at S4, not before. The site's
-`deploy/docker-images.md:57,78` describes the entrypoint as starting the Session KV server and
-goes stale then too.
+**Entrypoint.** `deploy/shared/entrypoint_gate_check.sh:313-324` asserts that port 8699 is released
+after each case, and its header comment (`entrypoint_gate_check.sh:27-31`) plus the reaper at
+`entrypoint_gate_check.sh:87` are written around step 5 owning that port.
+`tests/test_docker_entrypoint.py:19` uses the `logs/` directory step 5 creates as its probe. All of
+them change at S4, not before. The site's `deploy/docker-images.md:57,78` describes the entrypoint
+as starting the Session KV server and goes stale then too.
 
 **End-to-end**, at `replicas: 2`:
 
