@@ -8612,6 +8612,354 @@ spec:
                     Security configures RBAC, Pod Security, and Workload
                     Identity.
                   properties:
+                    egressAllowlist:
+                      description: |-
+                        EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.
+                        Ignored for any other egressPolicy value.
+                      properties:
+                        controlPlaneCIDRs:
+                          description: |-
+                            ControlPlaneCIDRs are the address ranges of the Kubernetes API server,
+                            permitted on port 443.
+
+                            Refused, with the same Degraded report extraRules gets, if a range
+                            contains a metadata server address or is broader than /16 (/32 for
+                            IPv6). A GKE control plane is a /28 or a single address, so a wider
+                            range is an internet rule in a field named for the control plane — and
+                            this policy is an exfiltration control as well as a metadata one.
+
+                            The operator cannot derive this and NetworkPolicy has no selector for it:
+                            on GKE the control plane is outside the cluster, at a private /28 you
+                            chose at creation time or at a public address, and the in-cluster
+                            "kubernetes" Service is translated to that address before policy is
+                            evaluated. Leaving this empty is allowed and is the stricter choice, but
+                            it costs the event-watcher sidecar its API-server connection, so cluster
+                            events stop reaching the agent. Find the range with
+                            `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+                          items:
+                            type: string
+                          type: array
+                        extraRules:
+                          description: |-
+                            ExtraRules are appended verbatim to the rendered policy, for
+                            destinations a plugin or a custom sidecar needs.
+
+                            A rule that would re-permit the metadata server is not rendered — an
+                            escape hatch that can reopen the escape is not one. It is also not
+                            silently skipped: the agent goes Degraded with reason
+                            EgressAllowlistRefused, naming the rule and why, and is not reconciled
+                            until the spec is fixed. A dropped rule that left the agent Ready would
+                            mean an unreachable destination with nothing in kubectl describe to
+                            explain it.
+                          items:
+                            description: |-
+                              NetworkPolicyEgressRule describes a particular set of traffic that is allowed out of pods
+                              matched by a NetworkPolicySpec's podSelector. The traffic must match both ports and to.
+                              This type is beta-level in 1.8
+                            properties:
+                              ports:
+                                description: |-
+                                  ports is a list of destination ports for outgoing traffic.
+                                  Each item in this list is combined using a logical OR. If this field is
+                                  empty or missing, this rule matches all ports (traffic not restricted by port).
+                                  If this field is present and contains at least one item, then this rule allows
+                                  traffic only if the traffic matches at least one port in the list.
+                                items:
+                                  description:
+                                    NetworkPolicyPort describes a port to
+                                    allow traffic on
+                                  properties:
+                                    endPort:
+                                      description: |-
+                                        endPort indicates that the range of ports from port to endPort if set, inclusive,
+                                        should be allowed by the policy. This field cannot be defined if the port field
+                                        is not defined or if the port field is defined as a named (string) port.
+                                        The endPort must be equal or greater than port.
+                                      format: int32
+                                      type: integer
+                                    port:
+                                      anyOf:
+                                        - type: integer
+                                        - type: string
+                                      description: |-
+                                        port represents the port on the given protocol. This can either be a numerical or named
+                                        port on a pod. If this field is not provided, this matches all port names and
+                                        numbers.
+                                        If present, only traffic on the specified protocol AND port will be matched.
+                                      x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        protocol represents the protocol (TCP, UDP, or SCTP) which traffic must match.
+                                        If not specified, this field defaults to TCP.
+                                      type: string
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              to:
+                                description: |-
+                                  to is a list of destinations for outgoing traffic of pods selected for this rule.
+                                  Items in this list are combined using a logical OR operation. If this field is
+                                  empty or missing, this rule matches all destinations (traffic not restricted by
+                                  destination). If this field is present and contains at least one item, this rule
+                                  allows traffic only if the traffic matches at least one item in the to list.
+                                items:
+                                  description: |-
+                                    NetworkPolicyPeer describes a peer to allow traffic to/from. Only certain combinations of
+                                    fields are allowed
+                                  properties:
+                                    ipBlock:
+                                      description: |-
+                                        ipBlock defines policy on a particular IPBlock. If this field is set then
+                                        neither of the other fields can be.
+                                      properties:
+                                        cidr:
+                                          description: |-
+                                            cidr is a string representing the IPBlock
+                                            Valid examples are "192.168.1.0/24" or "2001:db8::/64"
+                                          type: string
+                                        except:
+                                          description: |-
+                                            except is a slice of CIDRs that should not be included within an IPBlock
+                                            Valid examples are "192.168.1.0/24" or "2001:db8::/64"
+                                            Except values will be rejected if they are outside the cidr range
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                        - cidr
+                                      type: object
+                                    namespaceSelector:
+                                      description: |-
+                                        namespaceSelector selects namespaces using cluster-scoped labels. This field follows
+                                        standard label selector semantics; if present but empty, it selects all namespaces.
+
+                                        If podSelector is also set, then the NetworkPolicyPeer as a whole selects
+                                        the pods matching podSelector in the namespaces selected by namespaceSelector.
+                                        Otherwise it selects all pods in the namespaces selected by namespaceSelector.
+                                      properties:
+                                        matchExpressions:
+                                          description:
+                                            matchExpressions is a list of
+                                            label selector requirements. The requirements
+                                            are ANDed.
+                                          items:
+                                            description: |-
+                                              A label selector requirement is a selector that contains values, a key, and an operator that
+                                              relates the key and values.
+                                            properties:
+                                              key:
+                                                description:
+                                                  key is the label key that
+                                                  the selector applies to.
+                                                type: string
+                                              operator:
+                                                description: |-
+                                                  operator represents a key's relationship to a set of values.
+                                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                                type: string
+                                              values:
+                                                description: |-
+                                                  values is an array of string values. If the operator is In or NotIn,
+                                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                                  the values array must be empty. This array is replaced during a strategic
+                                                  merge patch.
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                              - key
+                                              - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          description: |-
+                                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                    podSelector:
+                                      description: |-
+                                        podSelector is a label selector which selects pods. This field follows standard label
+                                        selector semantics; if present but empty, it selects all pods.
+
+                                        If namespaceSelector is also set, then the NetworkPolicyPeer as a whole selects
+                                        the pods matching podSelector in the Namespaces selected by NamespaceSelector.
+                                        Otherwise it selects the pods matching podSelector in the policy's own namespace.
+                                      properties:
+                                        matchExpressions:
+                                          description:
+                                            matchExpressions is a list of
+                                            label selector requirements. The requirements
+                                            are ANDed.
+                                          items:
+                                            description: |-
+                                              A label selector requirement is a selector that contains values, a key, and an operator that
+                                              relates the key and values.
+                                            properties:
+                                              key:
+                                                description:
+                                                  key is the label key that
+                                                  the selector applies to.
+                                                type: string
+                                              operator:
+                                                description: |-
+                                                  operator represents a key's relationship to a set of values.
+                                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                                type: string
+                                              values:
+                                                description: |-
+                                                  values is an array of string values. If the operator is In or NotIn,
+                                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                                  the values array must be empty. This array is replaced during a strategic
+                                                  merge patch.
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                              - key
+                                              - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          description: |-
+                                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                            operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            type: object
+                          type: array
+                      type: object
+                    egressPolicy:
+                      description: |-
+                        EgressPolicy selects the NetworkPolicy the operator renders for the agent
+                        Pod. "None" (the default) renders nothing.
+
+                        "Allowlist" renders a default-deny egress policy that permits only the
+                        destinations the agent legitimately needs, which denies the link-local
+                        metadata server — 169.254.169.254, where anything that can make an HTTP
+                        request can mint the node or Workload Identity service account's tokens —
+                        by simply not listing it.
+
+                        REQUIRES splitCredentialBrokerPod: true. This is not a stylistic pairing,
+                        it is the whole reason the split exists. Containers in one Pod share a
+                        network namespace, and the credential broker reaches the metadata server
+                        on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
+                        cannot deny the metadata server to the agent container while allowing it
+                        to the broker container beside it. With the broker still a sidecar, this
+                        policy would take the broker's credentials away and every proxied
+                        command would fail. The operator therefore refuses to render it in that
+                        configuration and reports Degraded rather than breaking the agent — so
+                        the default install, which has the split off, is NOT protected from the
+                        metadata server. See docs/site reference/credential-isolation.md.
+
+                        Three further conditions the operator cannot check for you.
+
+                          - The policy does nothing at all on a cluster whose CNI does not
+                            enforce NetworkPolicy (GKE Standard without network policy enabled);
+                            Autopilot and GKE Dataplane V2 always enforce.
+                          - NetworkPolicies are additive, so any other policy in the namespace
+                            that selects this Pod and permits wider egress re-opens what this
+                            one closes.
+                          - NodeLocal DNSCache, if the cluster runs it, may lose DNS entirely.
+                            It runs hostNetwork, so on Cilium and Dataplane V2 its traffic
+                            carries a host or remote-node identity, which neither the
+                            k8s-app: node-local-dns Pod selector nor the 169.254.20.10/32 CIDR
+                            peer in the rendered DNS rule is guaranteed to match. Both work on
+                            an iptables dataplane, which is why both are rendered. This is the
+                            only one of the three that can take the agent down rather than
+                            quietly weaken it — every allowlisted destination is reached by
+                            name, so no DNS means no egress at all. Check
+                            `kubectl -n kube-system get ds node-local-dns` and confirm
+                            resolution from the agent container after enabling.
+
+                        WHAT IT BREAKS, and this is not a short list. The allowlist covers DNS,
+                        the credential broker, LiteLLM, the managed OpenTelemetry collector, and
+                        whatever egressAllowlist adds. Everything else the agent container
+                        reaches on its own goes away:
+
+                          - the "web" toolset (DuckDuckGo) and the "browser" toolset (headless
+                            Chromium), both of which the platform and cluster-* profiles enable;
+                          - the MCP servers that call container.googleapis.com and
+                            developerknowledge.googleapis.com;
+                          - github.com reached directly from the sandbox;
+                          - the GKE metadata lookups in cluster_agent_reconcile.py, which fail
+                            soft — set RECONCILE_PROJECT and RECONCILE_EXCLUDE to restore what
+                            they were for.
+
+                        Those are not accidental casualties. A headless browser with
+                        unrestricted egress is the exfiltration path, so the capabilities this
+                        removes are the same ones that make the control worth having. Restore
+                        individual destinations with egressAllowlist.extraRules — noting that
+                        NetworkPolicy matches addresses, never DNS names, so restoring a hosted
+                        service means naming its address ranges.
+
+                        Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
+                        that call the broker, and the broker is on the allowlist.
+
+                        TURNING THIS OFF DOES NOT DELETE THE POLICY, and reverting both flags
+                        together will break the agent. An egress policy is a guardrail, and the
+                        operator will not remove a guardrail it may not have created, so setting
+                        this back to "None" leaves <name>-sandbox-metadata-deny in place. That
+                        is fail-closed and harmless on its own — but it is not harmless
+                        alongside splitCredentialBrokerPod: false.
+
+                        The trap is that reverting the split alone is refused (see above), so
+                        the natural way out is to turn both off in one edit. Do that and the
+                        broker becomes a sidecar again, inside the very Pod the leftover policy
+                        selects, and the policy does not list the metadata server.
+
+                        What you see is a crashlooping agent, not a quietly broken one. The Pod
+                        template changed, and the deployment strategy is Recreate at the default
+                        single replica, so the old Pod goes away first. The new sidecar runs
+                        CREDENTIAL_PROXY_BOOTSTRAP_COMMAND before it serves anything — a gcloud
+                        container clusters get-credentials, rendered whenever spec.harness names
+                        a project, location and cluster, which the Helm chart requires — and
+                        that command needs the metadata server and container.googleapis.com,
+                        both of which the leftover policy denies. The bootstrap raises, the
+                        runtime exits, the sidecar entrypoint's `wait -n` takes the container
+                        with it, and the Pod enters CrashLoopBackOff. ReadyReplicas stays 0, so
+                        the agent reports phase Provisioning with Ready=False and "Waiting for
+                        deployment replicas to be ready".
+
+                        That status is accurate but says nothing about a NetworkPolicy. The
+                        sidecar log is where the cause is: gcloud failing to reach the metadata
+                        server. Check for a leftover <name>-sandbox-metadata-deny before
+                        diagnosing anything else.
+
+                        (An agent whose spec.harness omits those cluster fields has no bootstrap
+                        command, so its sidecar starts cleanly and the Pod does report Ready
+                        while every proxied command fails at the network. That configuration is
+                        reachable by hand, not through the chart.)
+
+                        Revert in three steps instead, which never leaves a broker inside a
+                        policy that denies it:
+
+                          1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
+                          2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
+                             (safe now — with the field off the operator will not re-apply it,
+                             whereas deleting it while the field is still "Allowlist" only
+                             earns it back on the next reconcile);
+                          3. set splitCredentialBrokerPod: false.
+                      enum:
+                        - None
+                        - Allowlist
+                      type: string
                     serviceAccountAnnotations:
                       additionalProperties:
                         type: string
@@ -8624,6 +8972,35 @@ spec:
                         ServiceAccountName is the Kubernetes Service Account
                         bound to the Deployment.
                       type: string
+                    splitCredentialBrokerPod:
+                      description: |-
+                        SplitCredentialBrokerPod moves the credential broker out of the agent Pod
+                        into a Deployment and Service of its own, so that a compromised agent no
+                        longer shares a network namespace with the process holding the cloud
+                        credentials.
+
+                        REQUIRES ReadWriteMany storage for the agent data volume, and defaults to
+                        false for that reason. The broker runs proxied commands with a working
+                        directory the agent created on the shared data PVC, so both Pods must
+                        mount that PVC read-write at the same path and see the same files there.
+                        The default GKE persistent disk is ReadWriteOnce, which cannot do that
+                        across two Pods on different nodes; the cluster needs Filestore or GCS
+                        Fuse (storage class "standard-rwx" or equivalent) before this is enabled.
+
+                        Without it the failure is a scheduling one, not a policy one. The broker
+                        Pod cannot attach the volume, stays Pending with a Multi-Attach error,
+                        and never becomes a Service endpoint — so every proxied command reports
+                        "credential proxy unavailable: [Errno 111] Connection refused", the same
+                        symptom an unhealthy sidecar produces. If the scheduler happens to place
+                        both Pods on one node it will instead appear to work, which makes the
+                        misconfiguration intermittent and worth ruling out first.
+
+                        Two further caveats. The agent Pod and the broker Pod share one
+                        ServiceAccount, because the Workload Identity IAM binding names it, so
+                        the identity the broker verifies is per-ServiceAccount rather than
+                        per-Pod. And the bearer token the agent presents crosses the cluster
+                        network in cleartext.
+                      type: boolean
                   type: object
                 telemetry:
                   description: Telemetry configures OpenTelemetry export for this agent.

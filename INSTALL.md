@@ -369,6 +369,20 @@ make install
 make deploy IMG=$IMG
 ```
 
+Then apply the agent-RBAC admission policies. `make deploy` does **not** include them — they are
+deliberately outside the kustomize overlay, because its `namePrefix` would rewrite each policy's
+name without rewriting the `spec.policyName` its binding refers to, leaving both bindings pointing
+at nothing and the policies silently inert:
+
+```bash
+# Kubernetes 1.30+ only (ValidatingAdmissionPolicy v1). Skip on older clusters.
+kubectl apply -f config/admission/agent-rbac-policy.yaml
+```
+
+Skipping this leaves agent RBAC without its admission backstop. Read that file's header for what
+the policies do and do not enforce — notably, they cannot check the rules of a role that a binding
+merely _references_.
+
 Verify controller readiness:
 
 ```bash

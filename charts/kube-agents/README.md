@@ -169,6 +169,23 @@ Exactly one owner creates the agent's KSA, depending on
   does not create it — the **chart** renders it instead, so a default install
   still starts.
 
+### Agent-RBAC admission policies
+
+`admissionPolicy.enabled` (default `true`) installs two cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, generated from
+`k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
+that grants a write or privilege-escalation verb, grants Secrets, or gives a
+namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
+check the rules of a role a binding _references_ — CEL cannot read another
+object — and the content policy only selects manifests carrying the
+`kube-agents/tier` label; see that file's header.
+
+Set `admissionPolicy.enabled=false` on a cluster below Kubernetes 1.30 (the
+policy API is not `v1` there and the install fails), or for a second kube-agents
+release in a cluster that already has them — the objects are cluster singletons
+with fixed names, so Helm refuses the second install on ownership rather than
+duplicating them.
+
 ## Uninstalling
 
 The `PlatformAgent` resource carries a finalizer that only the operator can
@@ -182,7 +199,9 @@ helm uninstall kube-agents -n kubeagents-system
 
 ## Notes
 
-- **Admission webhooks are not part of chart installs** (deliberate follow-up
+- **Admission _webhooks_ are not part of chart installs** — distinct from the
+  agent-RBAC `ValidatingAdmissionPolicy` objects above, which are in-tree CEL,
+  need no certificates, and do ship (deliberate follow-up
   scope, not an oversight: they need cert-manager wiring and carry
   `failurePolicy: Fail` risk, so they warrant their own change). The chart
   ships no webhook Service, certificate, or `*WebhookConfiguration`, and pins
@@ -195,8 +214,8 @@ helm uninstall kube-agents -n kubeagents-system
   manually when upgrading across CRD changes. Automating this (pre-upgrade
   hook) is deliberate follow-up scope; it first matters when upgrading between
   two published releases.
-- The CRD and RBAC manifests under this chart are generated copies of
-  `k8s-operator/config/` — edit the source and run `make chart-sync` (CI
-  enforces this via `make chart-check`).
+- The CRD, RBAC and admission-policy manifests under this chart are generated
+  copies of `k8s-operator/config/` — edit the source and run `make chart-sync`
+  (CI enforces this via `make chart-check`).
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.
