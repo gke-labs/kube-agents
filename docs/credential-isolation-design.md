@@ -365,7 +365,8 @@ Reducing both is the motivation for having the runtime receive file content from
 the sandbox rather than operate inside a directory the sandbox controls; until
 that lands, a cloned working tree is sandbox-controlled input and not a trust
 boundary.
-  neutralizes hooks installed into a fresh clone from a template directory; and
+neutralizes hooks installed into a fresh clone from a template directory; and
+
 - the filesystem monitor, which names a program and is invoked by a read-only
   verb, is disabled; and
 - both editors git launches — the message editor and the rebase sequence editor

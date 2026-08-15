@@ -95,7 +95,8 @@ When it is on, the broker call is authenticated: the agent presents an audience-
 
 **Both flags default off, so a stock install has neither property.** Two further conditions the operator cannot enforce: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and policies are additive, so any other policy selecting the agent Pod with wider egress reopens it. The control also removes the agent's web search, headless browser, two MCP servers and direct `github.com` access — deliberately, since unrestricted egress from a sandbox running a headless browser is the exfiltration path, but it is a cost to weigh rather than a free win.
 =======
->>>>>>> 9108380 (fix(security): stop the sandbox sharing a process namespace and a UID)
+
+> > > > > > > 9108380 (fix(security): stop the sandbox sharing a process namespace and a UID)
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 
