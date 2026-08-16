@@ -12,7 +12,7 @@
 **Scope:** how long-lived processes inside the `platform-agent` container are started,
 supervised, and stopped — at every replica count — and how their health reaches the kubelet.
 **Owns:** the container's process model, `leader_elect.py`'s two modes, the per-process restart
-policy, the supervisor health endpoint and the readiness probe that reads it, the lease timing
+policy, the supervisor's health status and the probes that read it, the lease timing
 parameters, and what the Lease does and does not fence.
 **Does not own:** what any individual supervised process does. The Session KV server is specified in
 [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md), which depends on this design for
@@ -43,7 +43,7 @@ Every file this design cites, linked to `main`. Line numbers in the prose below 
 | [`k8s-operator/internal/controller/manifest_helpers.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/manifest_helpers.go)                         | Replica count and Deployment strategy                            |
 | [`k8s-operator/api/v1alpha1/common_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/common_types.go)                                               | The CRD's optional `availability.replicas` (P1)                  |
 | [`agents/platform/scripts/platform_mcp_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/platform_mcp_server.py)                                     | The second, racing KV-server launcher                            |
-| [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)                                         | The process S4 adopts; cited in 3.7A only                        |
+| [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)                                         | The process S4 adopts; cited in 3.8A only                        |
 | [`deploy/shared/entrypoint_gate_check.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/entrypoint_gate_check.sh)                                                     | Asserts port 8699 is released; changes at S4                     |
 
 ## 1. What exists today
@@ -318,7 +318,7 @@ intended effect.
 Even when the operator does make the script the exec target, it hands supervision back
 immediately. The `execvp` shown in 1.1 is not an early return — it is a process-image
 replacement: same PID, new program, and **no return on success**. There is no interpreter frame
-left to run a second `Popen`, register a signal handler, or serve a health endpoint.
+left to run a second `Popen`, register a signal handler, or publish a health status.
 
 This matters beyond the unconfigured case, because it rules out the smallest possible fix. "Just
 add the KV server as a second `Popen` in `leader_elect.py`" works only on the elected path; on
@@ -432,7 +432,7 @@ Today's no-probe state at least rolls.
 
 At a single replica the failure mode is worse, not milder: the strategy there is `Recreate`
 (1.5), so the old pod is torn down _before_ the new one is created. A probe that never passes is
-then an outage with nothing to roll back to. This is why 3.4 has followers answer `200` — the
+then an outage with nothing to roll back to. This is why 3.4 keeps followers Ready — the
 probe reports on the supervisor, which every replica runs, rather than on processes only the
 leader has.
 
@@ -512,11 +512,33 @@ mode = elected  if LEADER_ELECTION_LEASE_NAME and LEADER_ELECTION_NAMESPACE else
 ```
 
 - **`solo`** — behave as a permanent leader. Start the processes, supervise them, never contact
-  the API server, never label the pod. This replaces the `os.execvp` at `leader_elect.py:60-61`; the reason to
-  supervise rather than exec is that there is more than one process to start, and that is true
-  independent of how many replicas there are.
+  the API server, never label the pod. This replaces the `os.execvp` at `leader_elect.py:60-61`;
+  the reason to supervise rather than exec is that there is more than one process to start, and
+  that is true independent of how many replicas there are.
 - **`elected`** — today's loop, unchanged in structure: acquire, label, start processes, renew,
   and on loss drop the label and stop them.
+
+**Why two modes rather than "always elect"?** Running the election at every replica count would
+be one code path instead of two, and it is not blocked by permissions: the leader `Role` and
+`RoleBinding` granting lease and pod access are reconciled **unconditionally**
+(`platformagent_controller.go:798-812`), not gated on replica count. So the argument for `solo` is
+not that it avoids RBAC.
+
+The argument is availability. An elected supervisor cannot start the gateway until it has talked
+to the API server and won a lease. At one replica — the default, and the case with no second pod
+to fall back on — that would make an API-server outage into an agent outage, for an election with
+exactly one candidate whose result is a foregone conclusion. `solo` keeps the default deployment
+independent of the control plane, and confines the election to the configuration that actually
+has something to elect.
+
+Two consequences worth naming. `solo` is chosen from the environment the operator renders, not
+from an observed pod count, so a Deployment scaled directly with `kubectl scale` — outside the
+CR — briefly runs several pods that all believe they are permanent leaders. The operator
+reconciles the replica count back, and at one replica the volume is `ReadWriteOnce`, which limits
+the blast radius; it is a pre-existing hazard rather than one this design introduces, but making
+the mode explicit is what makes it visible. And a `solo` supervisor never labels the pod, so at
+one replica the Service selector must continue not to require `kubeagents.io/is-leader`
+(`platformagent_manifests.go:2730` adds it only above one replica) — S1 must not disturb that.
 
 Making the script the exec target at every replica count is what collapses 1.1's table to one
 row. It has two knock-ons, both of them comments in the operator that are written around the
@@ -540,10 +562,16 @@ either of them may shell out to. The supervisor holds them in a table rather tha
 `process` global of 1.3, and the rest of this design says "process" for a table entry wherever
 that is unambiguous.
 
-| Supervised process   | Start order | Stop order | Notes                                                              |
-| -------------------- | ----------- | ---------- | ------------------------------------------------------------------ |
-| Session KV server    | 1           | 2          | started first, stopped last: the gateway's plugins are its clients |
-| `hermes gateway run` | 2           | 1          |                                                                    |
+| Supervised process   | Start | Stop | Criticality                                               |
+| -------------------- | ----- | ---- | --------------------------------------------------------- |
+| Session KV server    | 1     | 2    | **optional** — the gateway's plugins fail open without it |
+| `hermes gateway run` | 2     | 1    | **required** — the container exists to run it             |
+
+**Criticality is a property of the table, not a footnote**, and 3.3 and 3.4 both branch on it. An
+optional process being down costs a feature; a required one being down means the container is not
+doing its job. Collapsing the two — treating any stopped process as equivalent — is how a
+fail-open dependency turns into an outage, which is a mistake this design made in an earlier
+draft and 3.4 now avoids explicitly.
 
 Both replica counts collapse to one tree, differing only in the supervisor's mode:
 
@@ -555,40 +583,71 @@ Both replica counts collapse to one tree, differing only in the supervisor's mod
     │                                       │
     └─ exec ▸  leader_elect.py              └─ exec ▸  leader_elect.py
                  │  mode = solo                          │  mode = elected
-                 │  /healthz :8700                       │  /healthz :8700
+                 │  run/supervisor.json                  │  run/supervisor.json
                  │                                       │  holds <agent>-leader
                  ├─[1] session_kv_server                 ├─[1] session_kv_server
                  └─[2] hermes gateway run                └─[2] hermes gateway run
 
                                           A follower runs the same supervisor with
-                                          nothing under it, and still answers 200.
+                                          nothing under it, and is still Ready.
 ```
 
 The numbering is the start order; stop runs in reverse.
 
 The ordering is deliberate rather than incidental. The plugins inside the gateway fail open when
 the KV server is absent, so a slow start costs attribution rather than availability — but the
-dependency runs in that direction and the start order should say so.
+dependency runs in that direction and the start order should say so. On the way down the same
+dependency dictates the reverse: stop the gateway first so its plugins stop calling the KV
+server, then stop the KV server.
+
+**Stopping is sequential, and that has a cost 3.5 and 3.8 both have to account for.** Each
+process gets its own grace before `SIGKILL`, so the shutdown budget is the _sum_ over the table,
+not one grace. Two processes at 10 s each is 20 s, and adding a third makes it 30 s. Two things
+are sized against that total rather than against a single grace: the lease inequality (3.5) and
+the pod's `terminationGracePeriodSeconds` (3.8).
 
 Both write to inherited stdout/stderr rather than to a file on the PVC, so their output reaches
-fluent-bit like everything else and nothing grows unbounded on the volume.
+fluent-bit like everything else and nothing grows unbounded on the volume. The cost of sharing
+one stream is that lines from the two interleave with nothing to tell them apart — today the KV
+server at least has its own file. Inheriting the descriptors directly, rather than piping through
+the supervisor to add a prefix, is the deliberate choice: a pump thread per process is a new way
+to block or lose output, and the processes already prefix their own lines
+(`[LeaderElect]`, uvicorn's own format). If that proves insufficient in practice, the fix belongs
+in the processes' log formats, not in the supervisor.
 
 ### 3.3 Restart policy
 
 Per process, not per pod:
 
 - On exit, restart with exponential backoff (1 s doubling to 30 s).
-- Count restarts in a sliding window. Past the cap — **5 restarts in 5 minutes** — the supervisor
-  gives up on that process and exits, so the kubelet restarts the container. **That exit goes
-  through the same cleanup as `SIGTERM`** — drop the label, stop the remaining processes, release
-  the lease — rather than through today's bare `sys.exit`. P3 is precisely the bug of having a
-  second, cleanup-free way out; the supervisor must not reintroduce it.
-- A process that has never started successfully is treated the same way, with the same cap. This
-  matters for the KV server, which may legitimately need to wait out a departing leader's file
-  lock; the length of that wait belongs to
-  [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md) and must fit inside the cap.
-- On lease loss, stop all processes (reverse start order) before returning to the watch loop.
-  Termination keeps today's 10 s grace and `SIGKILL` fallback.
+- Count restarts in a sliding window, **per process**. The gateway flapping must not consume the
+  KV server's budget.
+- Past the cap — **5 restarts in 5 minutes** — what happens depends on the criticality column of
+  3.2, and this is the part an earlier draft got wrong:
+
+  | Past the cap | Action                                                                                                            |
+  | ------------ | ----------------------------------------------------------------------------------------------------------------- |
+  | **required** | Give up. The supervisor exits, and the kubelet restarts the container.                                            |
+  | **optional** | Give up on **that process only**. Leave it stopped, mark the supervisor `degraded`, keep everything else running. |
+
+  A uniform cap that always exits is P3 wearing a different hat: it means a KV server
+  crash-looping on a corrupt database eventually takes a perfectly healthy gateway down with it,
+  and each cycle re-runs the 1008-line entrypoint. That is the exact complaint P3 makes about
+  today's behaviour, arriving five restarts later. An optional process that cannot start is a
+  degradation and must be reported as one, not escalated into a container restart.
+
+- **The exit path is `release_lease_and_exit`, never a bare `sys.exit`.** Dropping the label,
+  stopping the remaining processes and releasing the lease all have to happen. P3 is precisely
+  the bug of having a second, cleanup-free way out; the supervisor must not reintroduce it.
+- **Failure to start counts as a restart.** `Popen` can raise before there is anything to poll —
+  a missing binary, an unwritable log path — and that must feed the same counter rather than
+  spinning at full speed. This is also the path the KV server takes while it waits out a
+  departing leader's file lock; the length of that wait belongs to
+  [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
+  and must fit inside the cap.
+- On lease loss, stop all processes in reverse start order before returning to the watch loop.
+  Termination keeps today's 10 s grace and `SIGKILL` fallback per process — see 3.2 on why the
+  total, not the per-process figure, is what 3.5 and 3.8 are sized against.
 
 Sketched, to fix the shape rather than the implementation — this is the replacement for the
 `elif process.poll() is not None: sys.exit(...)` of 1.3:
@@ -599,81 +658,210 @@ RESTART_WINDOW = 300   # ... within this many seconds
 BACKOFF_MAX    = 30
 
 class Supervised:
-    def __init__(self, name, argv):
-        self.name, self.argv = name, argv
+    def __init__(self, name, argv, required):
+        self.name, self.argv, self.required = name, argv, required
         self.proc = None
+        self.state = "pending"           # pending | running | backoff | gave_up
         self.backoff = 1
+        self.retry_at = 0
         self.restarts = deque()          # monotonic timestamps, trimmed to RESTART_WINDOW
 
-    def reap(self, now):
-        """Called once per poll. Returns False if this process is past its cap."""
-        if self.proc is None or self.proc.poll() is None:
-            return True                  # not started, or still running
+    def start(self, now):
+        try:
+            self.proc = subprocess.Popen(self.argv)
+            self.state = "running"
+        except OSError as exc:           # missing binary, unwritable path, ...
+            log(f"{self.name}: start failed: {exc}")
+            self.proc = None
+            self._penalise(now)          # a failed start is a restart, or it spins
 
+    def poll(self, now):
+        """Once per supervisor iteration. False => a REQUIRED process is past its cap."""
+        if self.state == "gave_up":
+            return not self.required
+        if self.state == "backoff" and now >= self.retry_at:
+            self.start(now)
+        elif self.state == "running" and self.proc.poll() is not None:
+            log(f"{self.name}: exited {self.proc.returncode}")
+            self.proc = None
+            self._penalise(now)
+        return self.state != "gave_up" or not self.required
+
+    def _penalise(self, now):
         self.restarts.append(now)
         while self.restarts and now - self.restarts[0] > RESTART_WINDOW:
             self.restarts.popleft()
         if len(self.restarts) >= RESTART_CAP:
-            return False                 # give up -> supervisor exits via the cleanup path
-
-        self.proc = None
+            self.state = "gave_up"       # required -> supervisor exits; optional -> degraded
+            return
+        self.state = "backoff"
         self.retry_at = now + self.backoff
         self.backoff = min(self.backoff * 2, BACKOFF_MAX)
-        return True
 ```
 
-Two properties matter more than the details. `reap` returning `False` must route through
-`release_lease_and_exit`, not `sys.exit` — that is the P3 regression this design must not
-reintroduce. And the restart counter is **per process**: the gateway flapping must not consume
-the KV server's budget, which is the whole point of "per process, not per pod."
+The shape is what matters, not the details. `poll` returning `False` — only ever for a
+**required** process — routes through `release_lease_and_exit`, not `sys.exit`. A `gave_up`
+**optional** process leaves the supervisor running and surfaces as `degraded` in 3.4's status. And
+`start` failing is charged to the same counter as an exit, because otherwise a missing binary is
+an infinite loop at full speed rather than a bounded one.
 
-### 3.4 Health endpoint and readiness
+### 3.4 Health status and readiness
 
-The supervisor serves `GET /healthz` on `127.0.0.1:8700`, and it is the only thing the readiness
-probe consults:
+#### A status file, not an HTTP server
 
-| Pod state                                     | Response                                             |
-| --------------------------------------------- | ---------------------------------------------------- |
-| follower (elected mode, not the holder)       | `200 {"role": "follower", "processes": []}`          |
-| leader or solo, every process running         | `200 {"role": "leader"\|"solo", "processes": [...]}` |
-| leader or solo, a process down or backing off | `503 {"role": …, "processes": [… "state": "down"]}`  |
+The supervisor writes a status document to `$PLATFORM_AGENT_HOME/run/supervisor.json` at the end
+of every poll iteration — atomically, temp-file-and-rename — and the probe is an `exec` that
+reads it:
 
-A follower answering `200` is the point: it keeps every replica Ready, so the rollout arithmetic
-in P4 works, while a leader with a stopped process still goes NotReady and leaves the endpoint list.
-Because the Service already selects on the leader label, NotReady on a leader is what actually
-removes the only endpoint there is — which is the visibility that 1.4 lacks.
+```json
+{
+  "role": "leader",
+  "ready": true,
+  "degraded": true,
+  "updated_at": 1755000000,
+  "processes": [
+    { "name": "session_kv", "required": false, "state": "gave_up" },
+    {
+      "name": "gateway",
+      "required": true,
+      "state": "running",
+      "listening": true
+    }
+  ]
+}
+```
+
+An earlier draft served this over `GET /healthz` on `127.0.0.1:8700` and probed it with
+`httpGet`. **That combination cannot work**: a probe's `httpGet` connects to the _pod IP_, not to
+loopback, so a server bound to `127.0.0.1` is unreachable from the kubelet and the probe fails
+every time. Binding `0.0.0.0` instead would fix the probe and put an unauthenticated status
+endpoint on the pod IP, which the NetworkPolicy's ingress allowlist (8642/8643, plus 9119 for the
+dashboard) does not cover.
+
+A file avoids the dilemma and is smaller in every direction. There is no port to allocate, no
+HTTP server to run inside what is otherwise a `time.sleep` loop, no thread sharing mutable state
+with the poll loop — and it matches the repository, where **every existing probe is an `exec`**
+and none is an `httpGet`.
+
+#### Freshness is the point of `updated_at`
+
+Serving health from a thread beside the poll loop has a failure mode that is easy to miss and
+fatal to the purpose: if the loop wedges — blocked on an API call, which 3.6 concedes can
+happen — the thread keeps answering `200` from stale state. The probe would report healthy
+precisely when the supervisor has stopped supervising.
+
+A file makes the check trivial, so the probe does it: if `updated_at` is older than three poll
+intervals the supervisor is not running its loop, whatever the rest of the document says.
+
+```bash
+#!/bin/sh
+# readiness: exit 0 = Ready. Reads only; never blocks on anything but the file.
+S="$PLATFORM_AGENT_HOME/run/supervisor.json"
+[ -f "$S" ] || exit 1
+python3 - "$S" <<'EOF' || exit 1
+import json, sys, time
+s = json.load(open(sys.argv[1]))
+if time.time() - s["updated_at"] > 30:   # 3 x the poll interval: the loop has wedged
+    sys.exit(1)
+sys.exit(0 if s["ready"] else 1)
+EOF
+```
+
+#### What `ready` means, and what it deliberately does not
+
+| Pod state                                            | `ready` | Effect                                    |
+| ---------------------------------------------------- | ------- | ----------------------------------------- |
+| follower (elected mode, not the holder)              | `true`  | stays Ready; runs nothing                 |
+| leader or solo, everything running                   | `true`  | serving                                   |
+| leader or solo, an **optional** process down         | `true`  | Ready but `degraded: true`                |
+| leader or solo, the **required** process not running | `false` | NotReady, leaves the endpoint list        |
+| status file older than three poll intervals          | `false` | NotReady — the supervisor's loop is stuck |
+
+Two of these rows are load-bearing.
+
+**A follower answering `true`** keeps every replica Ready, so the rollout arithmetic in P4 works.
+Because the Service already selects on the leader label, a follower's readiness changes no
+routing; it only has to not stall the rollout.
+
+**An optional process down must not make the pod NotReady.** 3.2 says the KV server's absence
+costs attribution rather than availability. A probe that answered `false` for it would take the
+leader out of the endpoint list — turning a fail-open degradation into a total outage, and making
+the probe strictly worse than having none. `degraded` is what carries that signal instead: it is
+visible in the status file and in the logs, and it is what an alert should fire on, but it does
+not touch routing.
+
+#### The residual gap: running is not serving
+
+`state: "running"` means the process has a PID. It does not mean it is serving. To narrow that,
+the supervisor also does a TCP connect to the gateway's `127.0.0.1:8642` each poll and records
+`listening` — cheap, no new endpoint required, and strictly stronger than a PID check, because it
+proves the listener is bound.
+
+It is still not proof of service: a gateway that accepts connections and then wedges reports
+`listening: true`. Closing that needs a cheap health route on the gateway itself — the closest
+thing today is `POST /v1/responses` (`hack/ci-deploy.sh:133`), which is a model call and far too
+expensive to run every 10 s. **This is a known and accepted limitation of S2**, not something the
+probe silently covers; it is listed as an open question in 8.
 
 ```yaml
 readinessProbe:
-  httpGet: { path: /healthz, port: 8700 }
+  exec: { command: ["/opt/hermes/bin/supervisor-ready"] }
   initialDelaySeconds: 10
   periodSeconds: 10
   failureThreshold: 6
 ```
 
-`failureThreshold × periodSeconds` must exceed the longest legitimate process start, or a slow
-start at failover becomes a container restart. That is the constraint the KV server's
-lock-acquisition window has to be chosen against, in both directions.
+`failureThreshold × periodSeconds` = 60 s must exceed the longest legitimate start of a
+**required** process. Note what failing does and does not do: a failed **readiness** probe removes
+the pod from the endpoint list; it never restarts the container. Only a liveness probe restarts.
+So the 60 s buys tolerance of a slow start without flapping the endpoint list, and the KV server's
+lock-acquisition window is bounded by the restart cap of 3.3 rather than by this figure.
 
-The 60 s that arithmetic buys is also the margin protecting the single-replica case, where the
-strategy is `Recreate` (1.5) and there is no old pod left to serve while a new one fails to
-become Ready. `solo` mode has no election to lose and no follower branch, so the only way to be
-NotReady there is a process that really has stopped — but the first probe this container has ever carried is
-worth rolling to one agent before the fleet.
+At a single replica the strategy is `Recreate` (1.5), so there is no old pod serving while a new
+one fails to become Ready. `solo` mode has no election to lose and no follower branch, so the only
+way to be NotReady there is a required process that really is down — but this is the first probe
+this container has ever carried, and it is worth rolling to one agent before the fleet.
 
-No liveness probe. A supervisor that has given up already exits (3.3), which is the same outcome
-with fewer ways to be wrong.
+#### On the liveness probe
+
+An earlier draft declined one on the grounds that "a supervisor that has given up already exits."
+That covers giving up; it does not cover **hanging**, and the two are different failures. A
+supervisor blocked forever inside an API call never exits, and under a readiness-only regime the
+pod goes NotReady and simply stays there — no restart, no recovery, manual intervention. At one
+replica, with `Recreate`, that is an indefinite outage.
+
+The freshness check above turns that state into a NotReady signal, which is the diagnosis. Turning
+it into a _recovery_ needs a liveness probe running the same script with a longer threshold:
+
+```yaml
+livenessProbe:
+  exec: { command: ["/opt/hermes/bin/supervisor-ready"] }
+  initialDelaySeconds: 60
+  periodSeconds: 20
+  failureThreshold: 6 # 120 s — must be comfortably longer than readiness
+```
+
+Sequencing matters more than the numbers. A liveness probe that fires wrongly is a restart loop,
+and this container has never carried a probe of any kind, so **liveness ships after readiness has
+soaked**, not with it. 5 splits them across S2 and S2b for that reason.
 
 ### 3.5 Lease timing
 
-State the inequality and pick parameters that satisfy it:
+State the inequality and pick parameters that satisfy it. **The shutdown term is the sum over the
+process table, not one process's grace** — 3.2 stops them sequentially, so each one's grace is
+paid in turn:
 
 ```
-lease_duration_seconds  >  max_poll_interval + process_shutdown_grace
+lease_duration_seconds  >  max_poll_interval + Σ(per-process shutdown grace)
 ```
 
-Today that reads `15 > 7 + 10`, which is false. Laid out on a timeline from the moment the
-outgoing leader stops being the holder:
+Getting this wrong is easy and was wrong in an earlier draft, which sized the proposal against a
+single 10 s grace and claimed a 13 s margin. With the two-process table of 3.2 the shutdown term
+is 20 s, and the same proposal has a margin of 3 s. **The term grows with every process added to
+the table**, so this is a constraint that silently tightens as the design succeeds.
+
+Today, with one process, the term is 10 s. Laid out on a timeline from the moment the outgoing
+leader stops being the holder:
 
 ```text
   TODAY — lease_duration = 15 s        15 > 7 + 10   is FALSE
@@ -697,32 +885,52 @@ outgoing leader stops being the holder:
   17     SIGKILL; processes finally gone    already running
 
 
-  PROPOSED — lease_duration = 30 s     30 > 7 + 10   holds
+  PROPOSED — lease 30 s, poll 3+U(0,1), two processes    30 > 4 + 20   holds
 
    t     outgoing leader                    any other replica
   ────   ──────────────────────────────     ──────────────────────────────
    0     loses the lease
-   7     notices; SIGTERM to its processes
-  17     SIGKILL; processes gone
+   4     notices; stops the gateway
+  14     gateway gone; stops session_kv
+  24     session_kv gone — table empty
          ·
-         ·  13 s margin — nothing of the outgoing leader is running
+         ·  6 s margin
          ·
   30                                        lease expires — may acquire
 ```
 
-P5 is the two-second overlap in the upper timeline. The proposal:
+P5 is the two-second overlap in the upper timeline.
 
-| Parameter                 | Today        | Proposed  |
-| ------------------------- | ------------ | --------- |
-| `lease_duration_seconds`  | 15 s         | **30 s**  |
-| poll interval             | 5 s + U(0,2) | unchanged |
-| process termination grace | 10 s         | unchanged |
+#### Three ways to satisfy it, and they are not equally priced
 
-`30 > 7 + 10` holds with margin. The cost is a longer failover blackhole — the window in which
-the Service has zero ready endpoints grows by up to 15 s — which is a real regression in
-availability bought for a real guarantee about exclusively-held resources. It is the right trade
-only because the blackhole already exists and is already documented as inherited
-(`leader_elect.py:12-16`); consumers must retry across it either way.
+The inequality can be repaired from either side, and an earlier draft reached for the most
+expensive one without weighing the others:
+
+| Option                                   | Result with two processes | Cost                                                    |
+| ---------------------------------------- | ------------------------- | ------------------------------------------------------- |
+| A. Raise the lease, 15 → 30 s            | `30 > 7 + 20`, margin 3 s | **+15 s failover blackhole** — a real availability loss |
+| B. Shorten each grace, 10 → 4 s          | `15 > 7 + 8`, margin 0 s  | processes get under half the time to shut down cleanly  |
+| C. Shorten the poll, 5+U(0,2) → 3+U(0,1) | `15 > 4 + 20` — **fails** | ~1.7× more lease reads; nothing else                    |
+| **A + C** (proposed)                     | `30 > 4 + 20`, margin 6 s | +15 s blackhole, ~1.7× lease reads                      |
+
+C alone cannot carry it — the shutdown term dominates once there are two processes — but it is
+nearly free and doubles the margin that A alone provides, which matters because that margin has
+to absorb a third process later. B is the one to avoid: 4 s is not obviously enough for the
+gateway to finish in-flight work, and buying failover safety by truncating clean shutdown trades
+one correctness problem for another.
+
+| Parameter                 | Today        | Proposed         |
+| ------------------------- | ------------ | ---------------- |
+| `lease_duration_seconds`  | 15 s         | **30 s**         |
+| poll interval             | 5 s + U(0,2) | **3 s + U(0,1)** |
+| process termination grace | 10 s         | unchanged        |
+
+The cost is a longer failover blackhole — the window in which the Service has zero ready
+endpoints grows by up to 15 s — which is a real regression in availability bought for a real
+guarantee about exclusively-held resources. It is the right trade only because the blackhole
+already exists and is already documented as inherited (`leader_elect.py:12-16`); consumers must
+retry across it either way. The faster poll partly repays it: the outgoing leader now notices 3 s
+sooner, and a _new_ leader also detects an expired lease sooner.
 
 The guarantee this buys is narrow and should be stated as such: **in the absence of a partition,
 the outgoing leader has stopped its processes before any other pod can acquire the lease.**
@@ -744,7 +952,72 @@ Consequences for anything a process owns exclusively:
 Callers that need continuity across the window retry; the server deduplicates. This design does
 not attempt more, and 6 records why.
 
-### 3.7 Alternatives considered
+### 3.7 The supervisor is PID 1, and PID 1 has a job
+
+3.1 makes the supervisor the entrypoint's `exec` target at every replica count, which makes it
+PID 1 in the container. That is already true above one replica, so none of this is new — but
+generalising it to the default deployment makes it worth stating, because PID 1 carries two
+obligations an ordinary process does not.
+
+**Signals.** The kernel installs no default handlers for PID 1: an unhandled `SIGTERM` is
+_ignored_ rather than fatal. `leader_elect.py:63-64` already registers one, so this works today;
+it is listed because deleting that registration would not fail any test, and the symptom — pods
+that take the full grace period and then die by `SIGKILL` on every rollout, losing the lease
+release every time — is a slow, easily-misattributed regression.
+
+**Reaping.** Orphaned processes reparent to PID 1, and PID 1 must `wait()` for them or they
+accumulate as zombies until the PID table fills. This matters here more than it would elsewhere:
+the agent shells out constantly, and the KV server runs `hermes send` per alert. So the loop
+reaps once per iteration:
+
+```python
+def reap_orphans(table):
+    """Reap grandchildren that reparented to us. MUST NOT reap the table's own processes."""
+    owned = {p.proc.pid for p in table if p.proc is not None}
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return                        # nothing left to reap
+        if pid == 0:
+            return                        # children exist, none have exited
+        if pid in owned:
+            # Should not happen: Popen.poll() reaps these. If it does, the
+            # Supervised entry has lost its exit status -- log loudly.
+            log(f"reaper took pid {pid} out from under the process table")
+```
+
+The `owned` check is the part that is easy to get wrong. A bare `waitpid(-1)` will happily reap a
+supervised process before `Popen.poll()` sees it, after which that entry's exit status is gone and
+`poll()` cannot tell the difference between "still running" and "already exited" — the restart
+policy of 3.3 stops working, silently. Reaping and supervising have to agree on who owns which
+PID.
+
+**This is also the strongest argument for `tini`**, which does exactly the above and is far better
+tested than the twelve lines here. 3.8B rejects `tini` as a _supervisor_; it does not reject it as
+PID 1. Running `tini -- python3 leader_elect.py` gets correct reaping and signal forwarding for
+free while leaving every lease decision in the supervisor. The reason not to is the image
+dependency and one more moving part in the boot path; the reason to is that reaping is fiddly and
+already solved. **Either is defensible, and the choice should be made deliberately rather than by
+omission** — 8 records it as open.
+
+**`terminationGracePeriodSeconds` has to be raised.** The operator does not set it, so it is the
+Kubernetes default of **30 s**, and the shutdown path now has to fit inside that:
+
+```
+  10 s   stop the gateway   (grace, then SIGKILL)
++ 10 s   stop session_kv    (grace, then SIGKILL)      -- sequential, see 3.2
++  ~2 s  read + rewrite the Lease, patch off the label
+= ~22 s  against a 30 s budget
+```
+
+Roughly 8 s of headroom, and a third process in the table erases it. When the budget is exceeded
+the kubelet `SIGKILL`s the supervisor mid-cleanup — which loses the lease release and the label
+drop, arriving at exactly the leaked-leader state P3 describes, by a different route. Set
+`terminationGracePeriodSeconds: 60` explicitly on the pod, and treat it as a value derived from
+the process table rather than a constant.
+
+### 3.8 Alternatives considered
 
 #### A. Make the Session KV server its own container
 
@@ -826,16 +1099,24 @@ are independent of where the KV server runs. 5 keeps S1–S2 separable for that 
 #### B. Adopt a general init system as PID 1
 
 `tini`, `s6-overlay`, `supervisord` and friends solve process supervision properly and are better
-tested than anything written here. They are the wrong shape for this container for one reason:
-start and stop are **lease-driven**, not static. A generic supervisor's model is "keep this set of
-programs running"; what is needed is "run this set only while this pod holds a Lease, and stop
-them in order when it does not." Expressing that means teaching the supervisor about the Lease,
-at which point the election logic lives in a config file and a set of hook scripts instead of in
-`leader_elect.py`, and the pod gains an image dependency for the privilege.
+tested than anything written here. **Two separate jobs are easy to conflate here, and only one of
+them is being rejected.**
 
-There is also an ordering constraint: `docker-entrypoint.sh` must run before anything is
-supervised, because it builds the tree the processes read. Any init system would have to be its
-`exec` target — which is the slot `leader_elect.py` already occupies.
+**As the supervisor — rejected.** Start and stop in this container are **lease-driven**, not
+static. A generic supervisor's model is "keep this set of programs running"; what is needed is
+"run this set only while this pod holds a Lease, and stop them in reverse order when it does
+not." Expressing that means teaching the supervisor about the Lease, at which point the election
+logic lives in a config file and a set of hook scripts instead of in `leader_elect.py`, and the
+pod gains an image dependency for the privilege. There is also an ordering constraint:
+`docker-entrypoint.sh` must run before anything is supervised, because it builds the tree the
+processes read, so any init system would have to be its `exec` target — the slot the supervisor
+occupies.
+
+**As PID 1 — open, and arguably yes.** `tini`'s actual job is zombie reaping and signal
+forwarding, which 3.7 shows this design has to do either way and can get wrong in a way no test
+would catch. `tini -- python3 leader_elect.py` composes cleanly with everything above: `tini`
+reaps and forwards, the supervisor owns every lease decision. This is complementary to the design
+rather than an alternative to it, and 8 records the choice as open rather than settling it here.
 
 ---
 
@@ -844,13 +1125,18 @@ supervised, because it builds the tree the processes read. Any init system would
 - Set the gateway container's `Args` to the supervisor at **every** replica count
   (`platformagent_manifests.go:2209-2212`). Note that the branch currently tests the effective
   replica count, so this also fixes the `scaleToZero` case in 1.1.
-- Add the readiness probe of 3.4 to the `platform-agent` container
-  (`platformagent_manifests.go:2248-2270`).
-- Raise `lease_duration_seconds` to 30 s. That constant lives in
-  `k8s-operator/internal/controller/leader_elect.py:70`, a real file that
+- Add the **exec** readiness probe of 3.4 to the `platform-agent` container
+  (`platformagent_manifests.go:2248-2270`) — matching the `envoy-credential-proxy` probe's shape,
+  not an `httpGet`. The liveness probe follows in a later phase, not with it.
+- Set `terminationGracePeriodSeconds: 60` on the pod spec (3.7). It is unset today, so it is 30 s,
+  which the two-process shutdown budget does not fit inside with useful margin.
+- Raise `lease_duration_seconds` to 30 s and lower the poll interval to `3 + U(0,1)` (3.5). Both
+  constants live in `k8s-operator/internal/controller/leader_elect.py:70-71`, a real file that
   `platformagent_manifests.go:3305` pulls in with `//go:embed` and
-  `platformagent_manifests.go:169` mounts as a ConfigMap key — it is not an inline string literal
+  `platformagent_manifests.go:169` mounts as a ConfigMap key — they are not inline string literals
   in the Go source.
+- Ship the readiness script the probe execs. It is a new file in the image rather than an operator
+  change, but it versions with the operator's embedded `leader_elect.py` and has to move with it.
 - Update the two comments named in 3.1: `AGENT_SHARED_STATE_SETUP` at
   `platformagent_manifests.go:59-69` and `Args, never Command` at
   `platformagent_manifests.go:2197-2206`.
@@ -861,15 +1147,27 @@ supervised, because it builds the tree the processes read. Any init system would
 
 ## 5. Migration
 
-| Phase | Change                                                                                                                                                           | Risk                                                                                                                                                                                    |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S1    | Supervisor modes and the process table, with the gateway as the only process. Operator sets `Args` unconditionally. Behaviour-preserving at both replica counts. | Low — the single-replica path gains a parent process and nothing else                                                                                                                   |
-| S2    | Per-process restart policy and the health endpoint; readiness probe on the gateway container.                                                                    | Medium — first probe on this container, and at one replica the strategy is `Recreate`, so a probe that never passes is an outage rather than a stalled rollout. Roll to one agent first |
-| S3    | Lease duration to 30 s.                                                                                                                                          | Low — longer blackhole, no new failure mode                                                                                                                                             |
-| S4    | Second process adopted (the Session KV server), and entrypoint step 5 plus the MCP launcher deleted. Owned by `session-kv-decomposition.md` phase 3.             | Medium — the entrypoint gate check asserts on step 5                                                                                                                                    |
+| Phase | Change                                                                                                                                                                                | Risk                                                                                                                                                                                    |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1    | Supervisor modes and the process table, with the gateway as the only process. PID-1 reaping (3.7). Operator sets `Args` unconditionally. Behaviour-preserving at both replica counts. | Low — the single-replica path gains a parent process and nothing else                                                                                                                   |
+| S2    | Per-process restart policy, the status file, and the **readiness** probe.                                                                                                             | Medium — first probe on this container, and at one replica the strategy is `Recreate`, so a probe that never passes is an outage rather than a stalled rollout. Roll to one agent first |
+| S2b   | **Liveness** probe over the same script, longer threshold.                                                                                                                            | Medium — a wrongly-firing liveness probe is a restart loop. Ships only after S2's readiness has soaked                                                                                  |
+| S3    | Lease 30 s, poll `3 + U(0,1)`, `terminationGracePeriodSeconds: 60`.                                                                                                                   | Low — longer blackhole, no new failure mode                                                                                                                                             |
+| S4    | Second process adopted (the Session KV server), and entrypoint step 5 plus the MCP launcher deleted. Owned by `session-kv-decomposition.md` phase 3.                                  | Medium — the entrypoint gate check asserts on step 5                                                                                                                                    |
 
-S1–S3 are independently shippable and are worth shipping before anything needs them. S4 is where
-this design and the KV decomposition meet.
+**S1, S2 and S2b are worth shipping on their own merits.** They fix P1–P4, which are live defects
+independent of anything the KV decomposition does: the KV server is already an unsupervised second
+process, the crash path already leaks leader state, and the gateway already has no probe.
+
+**S3 is different, and should not ship on its own.** Its guarantee — release-before-acquire — has
+no consumer today. Nothing currently holds a resource exclusively across a failover: there is no
+`locking_mode=EXCLUSIVE` anywhere, the entrypoint's `flock` is released before `exec`, and port
+8699 is per-pod rather than shared. So S3 pays up to 15 s of extra failover blackhole for a
+property nothing yet relies on. **Sequence it with S4**, which is what introduces the exclusive
+hold that makes it necessary. The two parts of S3 that are useful immediately — the faster poll
+and the raised grace period — can go with S2 instead, since both only ever help.
+
+S4 is where this design and the KV decomposition meet.
 
 ---
 
@@ -894,10 +1192,21 @@ assertion, which the process table of 3.2 makes false the moment there are two p
 against the process table rather than against a single `Popen`.
 
 Then add: mode selection from the environment; solo mode starts processes and never touches the
-API client; a process exiting is restarted with backoff; the restart cap exits the supervisor
-**and drops the label and releases the lease on the way out**, which is the regression test for
-P3;
-lease loss stops processes in reverse order; the health endpoint's three responses.
+API client; a process exiting is restarted with backoff; a `Popen` that _raises_ is charged to the
+same counter rather than spinning; lease loss stops processes in reverse order.
+
+The cases that carry the corrections in 3.3, 3.4 and 3.7 deserve naming individually, because each
+is a bug this design had in an earlier draft:
+
+- A **required** process past its cap exits the supervisor **through the cleanup path** — the
+  label is dropped and the lease released. This is the regression test for P3.
+- An **optional** process past its cap leaves the supervisor running, the required process
+  untouched, and the status file `ready: true, degraded: true`. This is the test that a fail-open
+  dependency cannot cause an outage.
+- The status file's `updated_at` goes stale when the loop is blocked, and the probe script exits
+  non-zero on it. Simulate by holding the loop, not by editing the file.
+- The reaper does **not** consume a supervised process's exit status: spawn an orphan, reap it,
+  and assert the process table still observes its own process exiting normally.
 
 The existing file mocks the `kubernetes` package wholesale before importing the module
 (`test_leader_elect.py:5-13`). Solo mode must not need that mock at all — a solo-mode test that
@@ -909,16 +1218,30 @@ placed where the constants are defined so that tuning one without the other cann
 
 ```python
 lease_duration_seconds = 30
-base_poll_interval     = 5
-poll_jitter            = 2
+base_poll_interval     = 3
+poll_jitter            = 1
 process_shutdown_grace = 10
 
 # 3.5: the outgoing leader must be finished before anyone else may acquire.
-assert lease_duration_seconds > base_poll_interval + poll_jitter + process_shutdown_grace, (
+# The shutdown term is the SUM over the process table -- 3.2 stops them one at a
+# time -- so this tightens automatically when a process is added.
+shutdown_budget = process_shutdown_grace * len(PROCESS_TABLE)
+assert lease_duration_seconds > base_poll_interval + poll_jitter + shutdown_budget, (
     f"lease_duration_seconds={lease_duration_seconds} must exceed "
-    f"{base_poll_interval}+{poll_jitter} poll + {process_shutdown_grace} grace"
+    f"{base_poll_interval}+{poll_jitter} poll + {shutdown_budget} shutdown "
+    f"({len(PROCESS_TABLE)} processes x {process_shutdown_grace}s)"
 )
 ```
+
+Deriving the shutdown term from `len(PROCESS_TABLE)` rather than hard-coding it is the point. The
+inequality is not a fact about three constants; it is a fact about the constants _and the size of
+the table_, and the table is the thing most likely to grow. Written this way, adding a third
+process fails at startup instead of quietly eating the margin.
+
+`terminationGracePeriodSeconds` is subject to the same arithmetic (3.7) but lives in the operator,
+so it cannot be asserted from inside the pod. Assert it in `platformagent_manifests_test.go`
+instead: the rendered grace period must exceed the same `shutdown_budget` plus a lease-release
+allowance.
 
 This is the only thing that keeps 3.5 true after someone tunes a constant, and it fails at
 startup — loudly, in the pod's own logs — rather than at the failover it would otherwise
@@ -954,11 +1277,23 @@ kubectl -n kubeagents-system get pod <follower> \
 kubectl -n kubeagents-system rollout restart deploy/<agent>-gateway
 kubectl -n kubeagents-system rollout status  deploy/<agent>-gateway --timeout=5m
 
-# Killing a process takes the leader out of endpoints without restarting the pod.
+# Killing the OPTIONAL process must NOT remove the leader from endpoints -- it is
+# degraded, not unready. This is the check that 3.4 did not turn a fail-open
+# dependency into an outage.
 kubectl -n kubeagents-system exec <leader> -c platform-agent -- pkill -f 'session_kv'
-kubectl -n kubeagents-system get endpoints <agent>
+kubectl -n kubeagents-system get endpoints <agent>          # leader still listed
+kubectl -n kubeagents-system exec <leader> -c platform-agent -- \
+  cat /opt/data/run/supervisor.json                          # ready:true, degraded:true
+# ...and the supervisor restarts it, so degraded clears on its own.
 
-# And the supervisor restarts it, so the pod comes back on its own.
+# Killing the REQUIRED process does remove it, and it comes back.
+kubectl -n kubeagents-system exec <leader> -c platform-agent -- pkill -f 'hermes gateway'
+kubectl -n kubeagents-system get endpoints <agent>          # leader gone, then returns
+
+# Graceful shutdown fits the grace period: no SIGKILL in the events, and the
+# lease is released rather than left to expire. This is the 3.7 budget check.
+kubectl -n kubeagents-system delete pod <leader> --wait=true
+kubectl -n kubeagents-system get lease <agent>-leader -o jsonpath='{.spec.holderIdentity}'
 ```
 
 At a single replica the check is simply that the container comes up with a supervisor as its main
@@ -977,5 +1312,26 @@ today.
 - **No supervision of sidecars.** This owns processes inside the `platform-agent` container. The
   event watcher, the credential proxy, and fluent-bit are containers, and the kubelet already
   supervises those. The converse — moving a supervised process **out** into a container of its
-  own, so that the kubelet supervises it too — is the alternative weighed and rejected in 3.7A,
+  own, so that the kubelet supervises it too — is the alternative weighed and rejected in 3.8A,
   along with the conditions under which it would become the better answer.
+- **No proof that a process is serving, only that it is listening.** 3.4 records why: the gateway
+  has no cheap health route, and inventing one is a change to the gateway rather than to its
+  supervisor. Listed in 8 rather than hidden.
+
+---
+
+## 8. Open questions
+
+Decisions this design deliberately leaves open, recorded so they are made rather than defaulted
+into.
+
+| #   | Question                                                                                                                                                                                                                                                                                                       | Bears on |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Q1  | **`tini` as PID 1, or hand-rolled reaping?** 3.7 shows the reap loop is twelve lines and has one subtle failure (consuming a supervised process's exit status) that no test would obviously catch. `tini -- python3 leader_elect.py` is complementary, not competing. Cost is an image dependency.             | S1       |
+| Q2  | **How does the probe learn the gateway is _serving_, not merely listening?** The TCP connect in 3.4 is strictly better than a PID check and strictly weaker than a health check. Closing it needs a cheap route on the gateway; `POST /v1/responses` is a model call and far too expensive at probe frequency. | S2, S2b  |
+| Q3  | **Is 5-in-5-minutes the right cap, given the kubelet's own backoff sits underneath it?** For a required process the supervisor exiting hands over to `CrashLoopBackOff`, so the two compose. The cap may be redundant for required processes and only genuinely load-bearing for optional ones.                | S2       |
+| Q4  | **Should the readiness script live in the image or the ConfigMap?** It versions with the embedded `leader_elect.py`, so they must move together; the ConfigMap already carries one file for exactly that reason.                                                                                               | S2       |
+
+Q1 and Q3 are cheap to settle during implementation. Q2 is the one that should not be quietly
+dropped: it is the difference between a probe that detects a stopped process and one that detects
+a broken one, and the design currently only claims the former.
