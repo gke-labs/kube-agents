@@ -1,13 +1,74 @@
 # 09 — The Capability Envelope
 
-**Status:** Design. Not built. This document specifies how a request's authority travels between
-agents once they are separate workloads.
+**Status:** Design. Not built.
 
-[05-system-architecture.md](05-system-architecture.md) describes agents as separate principals and
-[03-security-model.md](03-security-model.md) states that model output is never an authorization
-signal. Both assume a request carries the authority of the human who made it, across every hop.
-Nothing today carries it: the personas share one process, so "who asked" is ambient rather than
-transmitted. This is the mechanism that makes it transmitted.
+> **Specifies the end state, not current behaviour.** Nothing here is implemented. See
+> [README.md](README.md) for the delta against what ships today.
+
+> **Depends on a pending revision to core invariant #3.** [README.md](README.md) states that agents
+> never call each other directly. The mechanism below is a per-hop path between agents, so it does
+> not hold under that invariant as written. It is filed here so the mechanism can be reviewed on its
+> merits; **it is not agreed and must not be built until the invariant question is settled.** §1
+> states the case.
+
+**Overview:** [README.md](README.md) · **Depends on:** [03](03-security-model.md),
+[05](05-system-architecture.md), [08](08-agent-runtime-and-identity.md) · **Tier:** Foundational
+(north star)
+
+---
+
+## TL;DR
+
+Once agents are separate workloads a request crosses three or four hops between the human and the
+action, and every hop is somewhere "who asked" can be dropped. This specifies an **attenuating
+capability**: minted at ingress from the human's verified identity, narrowed at each hop, never
+widened.
+
+**No token format. Nothing signed. No cryptographic key anywhere in the design.** The capability
+lives in NATS KV and the message carries only a lookup id. Integrity comes from connection-time
+subject permissions, which NATS enforces before a message is parsed. Two rules make it hold: a
+parent **names the one agent permitted to descend from it**, and only a verification service may
+read the store. Revocation is deleting an entry.
+
+This is the **deferred hardening** already named in [03](03-security-model.md) §4a and
+[08](08-agent-runtime-and-identity.md) §5, with a different mechanism.
+
+## 1. What this decides, and what it supersedes
+
+**Those two sections stay canonical for the requirement.** [03](03-security-model.md) §4a is
+explicit that v1 does **not** check the requester's own permissions, files per-request authority as
+"Deferred hardening — user-scoped authorization", and points at
+[08](08-agent-runtime-and-identity.md) §5. This document does not restate the requirement or the
+trade; read them there.
+
+What changes here is the **mechanism**. 03 §4a sketches it as `SubjectAccessReview` for Kubernetes
+plus `testIamPermissions` / Policy Troubleshooter for GCP, with per-run downscoped tokens. The GCP
+half was measured on a live cluster on 12 August and does not work:
+
+- OAuth scopes do not constrain Kubernetes object operations -- a token minted `container.read-only`
+  created a namespace.
+- **No IAM Condition of any kind scopes a Kubernetes object operation.** Four spellings, four
+  service accounts, one cluster, all refused, including
+  `resource.service == "container.googleapis.com"`, which asserts nothing beyond "this is a GKE
+  call". A conditioned binding is stored correctly, reported by Policy Troubleshooter as found and
+  relevant, and grants nothing.
+
+Generalising both: **GCP-layer credential attenuation does not reach Kubernetes object
+authorization.** "Down-scope the agent's effective authority with per-run tokens" therefore has no
+GCP mechanism behind it, and a Credential Access Boundary would not have rescued it either.
+
+**This is the replacement for that half.** Attenuation moves into the envelope rather than the
+credential, and the per-cluster credential becomes a Kubernetes ServiceAccount token minted by the
+broker -- cluster-scoped by construction, because the issuer is the cluster. Where this and 08 §5
+disagree on mechanism, this is the later measurement. Where they disagree on requirement, 03 §4a
+wins.
+
+**On invariant #3.** The invariant bans a transport; what it protects is a property -- that agents
+do not form an unaudited call graph, and that being called grants no authority. A durable bus with
+replay is shared state by any reasonable reading, and this document is a stronger answer to the
+authority half than anything currently specified. The proposal is therefore to restate #3 as the
+property rather than delete it. That is a decision for the README's invariant list, with its
+rationale, and it is not made here.
 
 ## The recommendation, first
 
@@ -21,29 +82,39 @@ cryptographic key. There are none in this design.
 ## How it works
 
 **Gateway.** Mints the capability, writes it to KV under `cap.root.<request-id>`, and puts the id
--- not the capability -- into the A2A message.
+-- not the capability -- into the message. The entry names the one agent permitted to descend from
+it.
 
-**Broker.** Reads the id off the message, looks the capability up in KV. The agent behind it
-never sees either.
+**Broker.** Reads the id off the message and asks the verifier to resolve it. The agent behind it
+sees neither the capability nor the store.
 
-**Attenuation.** A hop that narrows writes a _new_ entry -- narrower capability, pointer to its
-parent -- under its own namespace, and passes the new id downstream.
+**Attenuation.** A hop that narrows writes a _new_ entry -- narrower capability, a pointer to its
+parent, and the next hop as its own delegate -- under its own namespace, and passes the new id
+downstream.
 
-**Verification.** Walk the chain to the root. Confirm the root sits under `cap.root.*`. Confirm
-each link is narrower than its parent. Refuse otherwise.
+**Verification.** Four checks, all required. Walk the chain to the root. Confirm the root sits
+under `cap.root.*`. Confirm each link is narrower than its parent. Confirm **each link was written
+by the agent its parent named as delegate**. Refuse otherwise.
 
 ```
-   gateway   writes  cap.root.req-8f2a        = {tier: operator, scope: project-P}
+   gateway   writes  cap.root.req-8f2a      = {tier: operator, scope: project-P,
+                                               delegate: fleet-recon}
                      └─ message carries "req-8f2a"
 
-   hop A     reads   cap.root.req-8f2a
-             writes  cap.hop.fleet-recon.1    = {..., scope: cluster-C}   parent: cap.root.req-8f2a
+   hop A     verifier resolves it: fleet-recon is the named delegate, so it may descend
+             writes  cap.hop.fleet-recon.1  = {..., scope: cluster-C,
+                                               delegate: platform-a}
+                                              parent: cap.root.req-8f2a
                      └─ message carries "cap.hop.fleet-recon.1"
 
-   hop B     reads   that, walks to root, checks each link narrows
-             writes  cap.hop.platform-a.7     = {tier: reader, scope: cluster-C}
+   hop B     verifier resolves that: chain narrows, and platform-a is the named delegate
+             writes  cap.hop.platform-a.7   = {tier: reader, scope: cluster-C, ...}
                      └─ and so on
 ```
+
+A hop delegating to several agents writes one child per recipient, each naming a single delegate.
+A list would also work; one child per recipient keeps the audit trail exact about who was handed
+what.
 
 ## Why this needs no crypto
 
@@ -52,6 +123,7 @@ message is parsed. So:
 
 - Only the gateway may publish under `cap.root.*`
 - Each broker may publish only under `cap.hop.<its-own-agent-id>.*`
+- **No broker may read `cap.*` at all.** Only the verification service holds read.
 
 That buys the two properties a signature would have bought:
 
@@ -59,10 +131,35 @@ That buys the two properties a signature would have bought:
 publishing on a subject NATS refuses you at connection time.
 
 **Did each link narrow.** The verifier reads parent and child and compares. A compromised broker
-that writes something wider than it received is caught by the next hop walking the chain.
+that writes something wider than it received is caught when the next hop resolves the chain.
 
 The integrity comes from connection-time permissions rather than from cryptography. Same
 guarantee, no key to custody, rotate, distribute or recover.
+
+### The subject prefix does not prove entitlement to the parent
+
+Worth stating separately, because an earlier draft of this design got it wrong and the failure is
+not obvious.
+
+Write permission proves who wrote a child. It proves nothing about whether that writer ever
+_received_ the parent the child names. Without a further rule, a compromised broker writes
+`cap.hop.<its-own-id>.N` naming `parent: cap.root.<somebody-else's-request>` -- a root minted for a
+more privileged human -- and every check passes. The root is under `cap.root.*`, each link narrows,
+and the prefix correctly proves who wrote the child. The hop has escalated by descending from
+someone else's origin. Request ids are not secrets, so naming one is no barrier.
+
+**Two rules close it, and both are needed.**
+
+**The parent names its delegate.** Every entry carries the single agent id permitted to write
+children of it, and verification refuses a child whose writer is not that agent. Authority to
+descend is granted by the parent's author and proved by the subject prefix, rather than inferred
+from the child.
+
+**Only the verifier reads.** If every broker could walk the chain itself, every broker would need
+read across `cap.*`, which is what makes other agents' roots discoverable in the first place.
+Moving the walk into one service removes discovery and removes the need to distribute read at all.
+The verifier sits on the request path, which is the same shape -- and the same cost -- as the NATS
+auth callout this design already accepts.
 
 **Revocation is deleting an entry**, which is the other reason to prefer this. A signed token is
 valid until it expires no matter what you learn in the meantime.
@@ -72,22 +169,31 @@ there are no messages to authorize, so that dependency is smaller than it first 
 
 ## What this does not solve
 
-Two things, stated so nobody assumes otherwise.
+Three things, stated so nobody assumes otherwise.
 
 **Attenuation is code.** A hop that forwards without narrowing is a hole, and no token format or
 KV scheme fixes that. Real tension with "structural, not behavioural."
 
-The bound that makes it survivable: a hop can only forward what it _received_, and every
-capability descends from one the gateway minted from the requester's own authority.
+The bound that makes it survivable: a hop can only descend from a parent that named it, and every
+chain terminates at a root the gateway minted from the requester's own authority.
 
-> **A broken hop cannot exceed the origin.** Worst case is "narrowed less than intended", never
-> "escalated past the human who asked."
+> **A broken hop cannot exceed what it was delegated.** Worst case is "narrowed less than
+> intended", never "escalated past the human who asked."
 
-That is the sentence to have ready when someone probes the design. It holds under imperfect
-implementation, which is the only kind there is.
+That is the sentence to have ready when someone probes the design, and it is worth knowing exactly
+what carries it: the delegate rule above, and nothing else. Drop that rule and the claim is simply
+false. It holds under imperfect implementation, which is the only kind there is, but it does not
+hold under a missing rule.
 
-**Chain depth.** Verification walks to the root, so a long chain is a lot of KV reads. Not a
-problem at three or four hops. Worth watching if agent-to-agent chains get deeper.
+**Chain depth.** Resolution walks to the root, so a long chain is a lot of KV reads. Those are now
+the verifier's reads rather than every broker's, which makes them cacheable per id -- a chain is
+immutable once written, so the only invalidation is revocation. Not a problem at three or four
+hops. Worth watching if chains get deeper.
+
+**The verifier is trusted and on the request path.** It is the only component holding read across
+`cap.*`, so compromising it exposes every in-flight capability, and if it is down nothing
+authorizes. That is a real concentration and it is the price of not distributing read. It belongs
+in the same tier of scrutiny as the auth callout, with no model attached to it.
 
 ---
 
@@ -141,6 +247,56 @@ cluster C does not work against cluster D whether or not our code is correct tod
 It is also why the RBAC-over-IAM measurement felt like a win rather than a setback. We went
 looking for a way to _express_ per-cluster scope and found the scope was already structural one
 layer down.
+
+## Goals & non-goals
+
+### Goals
+
+- Make **effective authority = agent ceiling ∩ requester** hold across process boundaries, not only
+  inside one process.
+- Carry it with **no cryptographic key anywhere** -- nothing to custody, rotate, distribute or
+  recover.
+- **Revocation that takes effect now**, by deleting an entry, rather than waiting out a TTL.
+- Give audit "who asked" directly, without a correlation step across hops.
+
+### Non-goals
+
+- **Not a replacement for the read-only ceiling or the PR gate** ([03](03-security-model.md) §1).
+  This narrows authority within those bounds; it never widens anything and never creates a write
+  path.
+- **Not offline-capable.** A hop that must authorize without reaching the bus is out of scope --
+  see the biscuit note above if that ever changes.
+- **Not credential attenuation.** The envelope narrows what a request may ask for. The credential
+  handed to the API server is a separate mechanism (a per-cluster ServiceAccount token, §1).
+- **Not a defence against a compromised gateway.** The gateway is the root of trust for the whole
+  chain; if it lies about who asked, everything below inherits the lie.
+- **Not per-user granularity.** Capabilities carry tiers, so this is as fine-grained as the tier map
+  and no finer.
+
+## Verification
+
+Every check below asserts a **denial**. A test that only confirms an authorised request succeeds
+cannot distinguish a working control from an absent one, and several of the failure modes here are
+silent.
+
+- **Descent without delegation is refused:** a broker writes a child naming a parent that names a
+  _different_ agent as delegate. Resolution fails. This is the check that carries the "cannot exceed
+  what it was delegated" claim; without it the design is broken, so it is the first test to write.
+- **Widening is refused:** a child granting a tier or scope its parent does not hold fails
+  resolution, whether it widens by one field or replaces the payload wholesale.
+- **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
+  including one that terminates at a well-formed `cap.hop.*` entry.
+- **Only the gateway mints roots:** any other connection publishing to `cap.root.*` is rejected by
+  NATS **at connect**, not by application code.
+- **No broker writes in another broker's namespace:** broker A publishing to `cap.hop.<B>.*` is
+  rejected at connect.
+- **No broker reads the store:** a broker connection attempting any read on `cap.*` is rejected at
+  connect. Assert this for a broker that legitimately participates in a chain, since the whole point
+  is that participation does not imply read.
+- **Revocation is immediate:** delete an entry mid-flight; the next resolution of any id descending
+  from it fails.
+- **The agent never sees the capability:** from inside an agent container, the capability id and the
+  KV store are both unreachable -- no bus credential, no verifier route.
 
 ## References
 
