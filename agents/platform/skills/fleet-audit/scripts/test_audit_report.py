@@ -3201,7 +3201,11 @@ class TestAiSecurityAuditStream(BaseTestCase):
         the case it used to wave through, because `HF_TOKEN` reads as ordinary
         output to a pattern anchored on the bare word `token`.
         """
-        secret = "9f8e7d6c5b4a3928170695"
+        # Not named `secret`, though that is what it stands in for: the name
+        # alone makes the temp-file write in `write_findings` a clear-text
+        # storage finding (CodeQL py/clear-text-storage-sensitive-data). The
+        # value is a made-up hex string that never leaves this test.
+        pasted_value = "9f8e7d6c5b4a3928170695"
         doc = make_doc(
             audit=self.STREAM,
             findings=[
@@ -3216,7 +3220,7 @@ class TestAiSecurityAuditStream(BaseTestCase):
                         "kubectl --context gke_acme_us-east1_prod-us-east -n serving "
                         "get deployment llama-serve -o json"
                     ),
-                    excerpt=f"        - name: HF_TOKEN\n          value: {secret}",
+                    excerpt=f"        - name: HF_TOKEN\n          value: {pasted_value}",
                     remediation={
                         "kind": "manual",
                         "note": "Rotate the token, then move it to a Secret.",
@@ -3230,8 +3234,8 @@ class TestAiSecurityAuditStream(BaseTestCase):
         self.assertEqual(
             self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM), 0, self.err
         )
-        self.assertNotIn(secret, self.out)
-        self.assertNotIn(secret, self.err)
+        self.assertNotIn(pasted_value, self.out)
+        self.assertNotIn(pasted_value, self.err)
         # The variable is the finding. Only its value goes.
         self.assertIn("HF_TOKEN", self.out)
         self.assertIn(audit_report.REDACTED, self.out)

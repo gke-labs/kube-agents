@@ -39,6 +39,21 @@ import (
 // as a principal with update permissions can remove the annotation before deleting.
 const PreventDeletionAnnotation = "kubeagents.x-k8s.io/prevent-deletion"
 
+// DefaultPort is the port the webhook server binds to unless --webhook-port says otherwise.
+//
+// It is 10250 rather than controller-runtime's 9443 because GKE's automatic
+// control-plane-to-node firewall rule permits only tcp:443 and tcp:10250. On a private
+// cluster the API server dials the endpoint pod IP on the Service's targetPort, so a
+// webhook on any other port is unreachable until someone adds a VPC firewall rule per
+// cluster — and with failurePolicy=Fail an unreachable webhook blocks every PlatformAgent
+// create, update, and delete. 10250 is the kubelet's port, but the kubelet binds it on the
+// node IP in a separate network namespace, so a pod listening on 10250 does not collide.
+//
+// The manifests must agree with this value: config/manager/manager.yaml sets it as the
+// container port and config/webhook/service.yaml as the Service targetPort. A mismatch
+// reproduces exactly the outage described above, so TestWebhookPortsMatchDefault guards it.
+const DefaultPort = 10250
+
 // restrictedServiceAccounts is the set of high-privilege service account names forbidden in PlatformAgent spec.
 var restrictedServiceAccounts = map[string]struct{}{
 	"cluster-admin": {},

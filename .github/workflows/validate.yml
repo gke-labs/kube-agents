@@ -10,6 +10,33 @@ permissions:
   contents: read
 
 jobs:
+  # A job of its own rather than a step in `validate` below, for two reasons.
+  # It needs none of that job's setup -- no Helm, no Terraform, no pip, just the
+  # preinstalled python3 -- so it reports in seconds instead of waiting behind
+  # them. And a step would be masked: a broken `terraform fmt` means these
+  # findings never print, the author fixes Terraform, pushes, and only then
+  # discovers the prompt errors. A separate job gets its own status line and
+  # cannot be hidden by a failure it has nothing to do with.
+  #
+  # Deliberately unfiltered. A paths filter is precisely what kept the Python
+  # suite from running at all (see python-tests.yml), and a check on prose that
+  # only starts when prose changes would miss the rename that broke it -- that
+  # rename lands in a directory name.
+  prompt-assets:
+    name: Agent instructions cite assets that exist
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Findings are emitted as GitHub annotations as well as to stderr, so a
+      # broken reference lands on the line that holds it in Files Changed. This
+      # layer has no human reader at review time; a red check the author has to
+      # go digging in a log for is most of the way to no check at all.
+      - name: Check prompt assets
+        run: make prompt-check
+
   validate:
     runs-on: ubuntu-latest
 

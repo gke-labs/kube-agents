@@ -78,6 +78,15 @@ CONFIGMAP_NAME: str = "platform-agent-config"
 # pluginProfileMountRoot in the operator.
 PLUGIN_MOUNT_ROOT: str = "/opt/agent-plugins"
 AGENT_HOME: str = "/opt/data"
+# Where the operator's render for the default profile lands in the pod. Hermes overlays
+# it per leaf key over AGENT_HOME/config.yaml at load; nothing copies it into that file,
+# so a probe looking for the render has to read it here. Mounted on the platform-agent
+# container, which is the one agent_exec execs into.
+MANAGED_CONFIG: str = "/etc/hermes/config.yaml"
+# The front door's overlay, merged into $AGENT_HOME/config.yaml at startup. It carries
+# what the operator owns for the default profile but must not pin pod-wide: an
+# untargeted plugin's enablement and non-gateway config, and the board's limits.
+DEFAULT_OVERLAY: str = "profile-default.overlay.yaml"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
 # rather than on the bare unique string: the unique string is also merged into
@@ -456,14 +465,18 @@ def wait_deployment_rollout(deployment_name: str, timeout: str = "180s") -> None
 
 
 def get_platform_configmap_yaml() -> str:
-    """The operator's render for the default profile — the Chat Agent front door.
+    """The operator's managed scope — pinned over every profile in the pod.
 
     This used to live under a `config.yaml` key that was subPath-mounted straight over
     the agent's own config. That made the file read-only, so `/sethome` and every other
-    runtime write to it failed. It is an overlay like every other profile's now, merged
-    into the writable file at startup.
+    runtime write to it failed. It is the managed scope now — mounted read-only at
+    /etc/hermes and overlaid per leaf key, leaving the agent's own file writable.
+
+    It is deliberately narrow, and it is NOT "the default profile's config": it reaches
+    every profile at once, so it carries only what is identical for all of them. What
+    the operator owns for the front door alone travels by DEFAULT_OVERLAY instead.
     """
-    return get_overlay_yaml("profile-default.overlay.yaml")
+    return get_overlay_yaml("managed-config.yaml")
 
 
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:
@@ -570,7 +583,10 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
     apply_kubectl_manifest(untargeted_manifest)
 
     time.sleep(3)
-    cm_config_untargeted = get_platform_configmap_yaml()
+    # Both halves of the render: the front door's overlay is where a plugin with no
+    # targetProfile would land, and the managed scope is where its `platforms` subtree
+    # would. A plugin whose agentRef names another agent must reach neither.
+    cm_config_untargeted = get_overlay_yaml(DEFAULT_OVERLAY) + "\n" + get_platform_configmap_yaml()
     assert UNTARGETED_PLUGIN_CR_NAME not in cm_config_untargeted, "Untargeted plugin should NOT be in plugins.enabled"
     assert "untargeted_setting" not in cm_config_untargeted, "Untargeted config setting should NOT be merged"
     log("Verified non-matching agentRef plugin was ignored by operator.")
@@ -632,33 +648,61 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
     assert skill_verified, f"Skill 'e2e-skill' was NOT verified as available in logs for {unique_str}"
     log(f"Skill 'e2e-skill' successfully verified as available in Hermes for plugin build {unique_str}!")
 
-    cm_config = get_platform_configmap_yaml()
-    log("--- CONFIGMAP MERGED VALUES (e2e_test_setting & plugins.enabled) ---")
+    # A plugin with no targetProfile belongs to the front door, and the front door takes
+    # the operator's settings by two routes. Its enablement and its `approvals` subtree
+    # are profile-shaped, so they go in the default profile's overlay; only the
+    # gateway-scoped `platforms` subtree would reach the pod-wide managed scope.
+    cm_config = get_overlay_yaml(DEFAULT_OVERLAY)
+    log("--- DEFAULT OVERLAY MERGED VALUES (e2e_test_setting & plugins.enabled) ---")
     for line in cm_config.splitlines():
         if any(k in line for k in ["e2e_test_setting", "unique_id", PLUGIN_CR_NAME]):
             print(line, flush=True)
 
     # 5a. Verify allowed config subtree is merged
-    assert "e2e_test_setting" in cm_config and unique_str in cm_config, f"Config change '{unique_str}' missing from ConfigMap"
-    assert PLUGIN_CR_NAME in cm_config, f"'{PLUGIN_CR_NAME}' missing from plugins.enabled in ConfigMap"
-    log("Verified allowed subtree 'approvals.e2e_test_setting' was merged into ConfigMap.")
+    assert "e2e_test_setting" in cm_config and unique_str in cm_config, (
+        f"Config change '{unique_str}' missing from {DEFAULT_OVERLAY}"
+    )
+    assert PLUGIN_CR_NAME in cm_config, f"'{PLUGIN_CR_NAME}' missing from plugins.enabled in {DEFAULT_OVERLAY}"
+    assert "e2e_test_setting" not in get_platform_configmap_yaml(), (
+        "an untargeted plugin's approvals subtree must not be pinned pod-wide: the "
+        "managed scope reaches every specialist, not just the front door"
+    )
+    log(f"Verified allowed subtree 'approvals.e2e_test_setting' was merged into {DEFAULT_OVERLAY}.")
 
-    # 5a-ii. ...and that it reaches the agent. The ConfigMap is only half the journey:
-    # the default profile's render is now an overlay the entrypoint merges into the
-    # agent's own writable config.yaml, and every failure mode of that merge is silent.
-    # For most of this deployment's life the render never arrived at all — the entrypoint
-    # copied the image's config over the mount on every start — and no test noticed,
-    # because they all stopped at the ConfigMap.
+    # 5a-ii. ...and that it reaches the agent. The ConfigMap is only half the journey,
+    # and every failure mode of the second half is silent. For most of this deployment's
+    # life the operator's settings never arrived at all — the entrypoint copied the
+    # image's config over the mount on every start — and no test noticed, because they
+    # all stopped at the ConfigMap.
+    #
+    # `approvals` is profile-shaped, so it rides in profile-default.overlay.yaml and the
+    # entrypoint merges it into the agent's OWN config.yaml. It is deliberately not in
+    # the managed scope: that file is machine-global, and one profile's approvals policy
+    # must not become every profile's. Step 5a-iii checks the other route.
     live = agent_exec_until(
         f"grep -q {unique_str} {AGENT_HOME}/config.yaml && echo MERGED || echo ABSENT",
         "MERGED",
     )
     assert "MERGED" in live, (
         f"'{unique_str}' is in the ConfigMap but not in {AGENT_HOME}/config.yaml — the "
-        f"operator's render is not reaching the running agent: {live}"
+        f"operator's default-profile overlay is not reaching the running agent: {live}"
     )
-    # And the file must still be writable, which is the whole reason it is merged rather
-    # than mounted: `/sethome` and monitoring.install_id write to it at runtime.
+
+    # 5a-iii. The managed scope arrived too. It carries a different, narrower set — the
+    # model endpoint and the chat platform wiring — and nothing in the pod rewrites it,
+    # so a projection that never landed would leave the agent unpinned and silent about
+    # it.
+    pinned = agent_exec_until(
+        f"grep -q 'base_url' {MANAGED_CONFIG} && echo PINNED || echo ABSENT",
+        "PINNED",
+    )
+    assert "PINNED" in pinned, (
+        f"{MANAGED_CONFIG} does not carry the pinned model endpoint; the managed scope "
+        f"is not reaching the running agent: {pinned}"
+    )
+    # And the agent's own config must still be writable, which is the whole reason the
+    # render lands beside it rather than on top of it: `/sethome` and monitoring.install_id
+    # write to it at runtime.
     writable = agent_exec_until(
         f"test -w {AGENT_HOME}/config.yaml && echo WRITABLE || echo READ-ONLY", "WRITABLE"
     )
@@ -666,7 +710,8 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
         f"{AGENT_HOME}/config.yaml must be writable — a read-only mount here is what made "
         f"`/sethome` fail with EACCES: {writable}"
     )
-    log(f"Verified the render reached a writable {AGENT_HOME}/config.yaml.")
+    log(f"Verified the overlay reached {AGENT_HOME}/config.yaml, the managed scope reached "
+        f"{MANAGED_CONFIG}, and the agent's config stayed writable.")
 
     # 5b. Verify disallowed config subtree is REJECTED / STRIPPED OUT
     assert "disallowed_test_subtree" not in cm_config and "forbidden_key" not in cm_config, "Disallowed config subtree should NOT be in ConfigMap!"
@@ -727,9 +772,15 @@ def step7_verify_log_silence_after_removal(unique_str: str) -> None:
 def step8_verify_config_cleanup(unique_str: str) -> None:
     """Step 8: Check that config change and plugin entry are removed from ConfigMap."""
     log("STEP 8: Verifying config change is removed from ConfigMap...")
-    new_cm_config = get_platform_configmap_yaml()
+    # Both halves of the ConfigMap, because the render is split across them and checking
+    # one would pass while the other still named the plugin. With the only untargeted
+    # plugin gone and no tuning set, the default overlay has nothing left to say and the
+    # operator drops the key entirely — get_overlay_yaml returns "" for a missing key, so
+    # these read as satisfied either way, which is the intended outcome.
+    new_cm_config = get_overlay_yaml(DEFAULT_OVERLAY)
+    managed = get_platform_configmap_yaml()
 
-    log("--- CONFIGMAP PLUGINS LIST AFTER PLUGIN REMOVAL ---")
+    log("--- DEFAULT OVERLAY PLUGINS LIST AFTER PLUGIN REMOVAL ---")
     in_plugins = False
     for line in new_cm_config.splitlines():
         if "plugins:" in line:
@@ -737,13 +788,21 @@ def step8_verify_config_cleanup(unique_str: str) -> None:
         if in_plugins:
             print(line, flush=True)
 
-    assert unique_str not in new_cm_config and "e2e_test_setting" not in new_cm_config, f"Config change '{unique_str}' is STILL in ConfigMap"
-    log("Confirmed config change is no longer present in ConfigMap.")
+    for where, body in ((DEFAULT_OVERLAY, new_cm_config), ("managed-config.yaml", managed)):
+        assert unique_str not in body and "e2e_test_setting" not in body, (
+            f"Config change '{unique_str}' is STILL in {where}"
+        )
+    assert PLUGIN_CR_NAME not in new_cm_config, (
+        f"'{PLUGIN_CR_NAME}' is still in plugins.enabled in {DEFAULT_OVERLAY}; the agent "
+        "would try to import a plugin whose files are gone"
+    )
+    log("Confirmed config change is no longer present in the ConfigMap.")
 
-    # Withdrawal has to reach the agent too, and it is the harder half. The startup merge
-    # carries the runtime's own edits across restarts, so it has to tell "the operator
-    # stopped saying this" apart from "the agent wrote this itself" — get that wrong and a
-    # deleted plugin's config outlives the plugin, on a file nothing ever rewrites.
+    # Withdrawal has to reach the agent too, and it is the harder half. A merge is not
+    # reversible on its own: the key is now in the agent's own writable config.yaml, and
+    # nothing rewrites that file wholesale. It is undone only because profile_overlay.py
+    # recorded what it applied and what the config held beforehand. Step 6 already
+    # replaced the pod, so this reads the file the running agent actually loaded.
     live = agent_exec_until(
         f"grep -q e2e_test_setting {AGENT_HOME}/config.yaml && echo STILL-THERE || echo GONE",
         "GONE",
@@ -838,8 +897,8 @@ def step10_verify_orphaned_agent_ref_status(plugin_image: str) -> None:
         assert phase == "Degraded", f"Expected Degraded for an orphaned agentRef, got '{phase}'"
         assert reason == "AgentNotFound", f"Expected reason AgentNotFound, got '{reason}'"
 
-        # It must still be kept out of the agent's config.
-        cm_config = get_platform_configmap_yaml()
+        # It must still be kept out of the agent's config — either half of it.
+        cm_config = get_overlay_yaml(DEFAULT_OVERLAY) + "\n" + get_platform_configmap_yaml()
         assert UNTARGETED_PLUGIN_CR_NAME not in cm_config, "Orphaned plugin must not reach plugins.enabled"
     finally:
         run_kubectl(["delete", "agentplugin", UNTARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
@@ -1144,21 +1203,21 @@ spec:
         )
         log(f"Verified plugin enabled in {overlay_key}.")
 
-        default_cfg = get_platform_configmap_yaml()
+        default_cfg = get_overlay_yaml(DEFAULT_OVERLAY) + "\n" + get_platform_configmap_yaml()
         assert TARGETED_PLUGIN_CR_NAME not in default_cfg, (
             "a targeted plugin must NOT be enabled on the default profile: that would load a "
             "privileged skill plugin into the deliberately tool-stripped front door"
         )
-        log("Verified targeted plugin is absent from the default profile config.")
+        log("Verified targeted plugin is absent from the default profile's config.")
 
-        # Gateway-scoped `platforms` stays on the default profile even for a targeted
+        # Gateway-scoped `platforms` goes to the managed scope even for a targeted
         # plugin: platform adapters are gateway singletons, so a subscription routed to a
         # named profile is configured where nothing listens and ingress stops silently.
         assert "approvals" in overlay, f"profile-scoped `approvals` should follow the plugin:\n{overlay}"
         assert "platforms" not in overlay, (
-            f"gateway-scoped `platforms` must stay on the default profile, got:\n{overlay}"
+            f"gateway-scoped `platforms` must stay in the managed scope, got:\n{overlay}"
         )
-        log("Verified config subtree scoping (platforms -> default, approvals -> profile).")
+        log("Verified config subtree scoping (platforms -> managed scope, approvals -> profile).")
 
         # The image volume is staged OUTSIDE the data PVC and linked into the profile at
         # startup. Mounting it into the PVC had the kubelet create profiles/<name>/ before
@@ -1214,8 +1273,12 @@ spec:
         ])
         reconcile_and_wait()
 
-        assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
-            "maxInProgress should reach the default profile config"
+        assert "max_in_progress: 1" in get_overlay_yaml(DEFAULT_OVERLAY), (
+            "maxInProgress should reach the default profile's overlay"
+        )
+        assert "max_in_progress" not in get_platform_configmap_yaml(), (
+            "the board cap is a front-door setting and must not be pinned pod-wide, "
+            "where it would cap every specialist's board too"
         )
         tuned = get_overlay_yaml(overlay_key)
         assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
@@ -1223,7 +1286,7 @@ spec:
         assert "max_turns: 150" in cluster_overlay, (
             f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
         )
-        log("Verified tuning reaches the default config and both profile overlays.")
+        log("Verified tuning reaches the default overlay and both profile overlays.")
 
         # Withdrawing tuning must drop the overlays. Cluster profile configs are not
         # force-synced from the image, so the entrypoint's unapply step is what stops the
@@ -1238,14 +1301,23 @@ spec:
         assert "profileclass-cluster" not in keys, (
             f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
         )
-        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour: withdrawing
-        # tuning falls back to the operator's own cap. Uncapped is the state that lets a
-        # burst of cards spawn a worker process each until the OOM killer takes them, and
-        # a removed CR field must not be a way back into it.
-        assert "max_in_progress: 2" in get_platform_configmap_yaml(), (
-            "removing tuning must fall back to the operator's dispatch cap, not to uncapped"
+        assert "max_in_progress" not in get_overlay_yaml(DEFAULT_OVERLAY), (
+            "removing tuning must drop the board cap from the default overlay"
         )
-        log("Verified tuning removal drops the overlays and falls back to the operator's dispatch cap.")
+        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour. The operator
+        # stops overriding it, and the cap committed in agents/chat/config.yaml takes over
+        # — which is why this reads the agent's own file rather than the ConfigMap.
+        # Uncapped is the state that lets a burst of cards spawn a worker process each
+        # until the OOM killer takes them, and a removed CR field must not be a way back
+        # into it.
+        capped = agent_exec_until(
+            f"grep -q 'max_in_progress: 2' {AGENT_HOME}/config.yaml && echo CAPPED || echo OPEN",
+            "CAPPED",
+        )
+        assert "CAPPED" in capped, (
+            f"removing tuning must fall back to the image's dispatch cap, not to uncapped: {capped}"
+        )
+        log("Verified tuning removal drops the overlays and falls back to the image's dispatch cap.")
 
         # Withdrawing the plugin has to undo both halves. A stale link would leave a
         # dangling entry in the profile's plugins dir, and a stale plugins.enabled entry

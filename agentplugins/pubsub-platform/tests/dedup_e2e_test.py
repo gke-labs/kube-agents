@@ -540,9 +540,14 @@ def install_plugins() -> None:
 def deployed_route(timeout_sec: int = 240) -> dict:
     """Read the route the agent is actually running, once the pod serving it is up.
 
+    Read from the managed scope (/etc/hermes/config.yaml), where the operator projects
+    its render for the default profile. Hermes overlays that file leaf by leaf over the
+    agent's own /opt/data/config.yaml at load; nothing copies it there, so the route
+    never appears in the writable file.
+
     Polled rather than read once: the operator rewrites the deployment after the CRs
     land, so for a stretch after the installer returns the only Running pod is the old
-    one, whose config.yaml has no route in it yet.
+    one, whose render has no route in it yet.
     """
     deadline = time.time() + timeout_sec
     problem = "no pod answered"
@@ -551,7 +556,7 @@ def deployed_route(timeout_sec: int = 240) -> dict:
             raw = in_pod(
                 "/opt/hermes/.venv/bin/python3 -c \""
                 "import json, yaml;"
-                "c = yaml.safe_load(open('/opt/data/config.yaml'));"
+                "c = yaml.safe_load(open('/etc/hermes/config.yaml'));"
                 f"r = c['platforms']['pubsub']['extra']['subscriptions']['{ROUTE}'];"
                 "print(json.dumps({'dedup': bool(r.get('deduplicate_fields')),"
                 " 'dispatch': r.get('dispatch', 'api'), 'filter': bool(r.get('filter'))}))\"",
@@ -560,7 +565,7 @@ def deployed_route(timeout_sec: int = 240) -> dict:
         except (AssertionError, ValueError) as exc:
             problem = str(exc)[:200] or problem
         if time.time() >= deadline:
-            die(f"route '{ROUTE}' never appeared in the agent's config.yaml after "
+            die(f"route '{ROUTE}' never appeared in /etc/hermes/config.yaml after "
                 f"{timeout_sec}s: {problem}")
         time.sleep(5)
 

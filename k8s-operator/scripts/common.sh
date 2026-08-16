@@ -209,7 +209,7 @@ DEFAULT_MODEL_PROVIDER="gemini"
 default_model_for_provider() {
   case "${1:-}" in
     chatgpt | openai) echo "gpt-5.4" ;;
-    anthropic) echo "claude-sonnet-4-5-20250929" ;;
+    anthropic) echo "claude-opus-5" ;;
     *) echo "gemini-3.5-flash" ;;
   esac
 }

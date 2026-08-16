@@ -4,7 +4,7 @@
 {{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
 {{- end }}
 {{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
 {{- if not (hasKey $defaultModels $provider) }}
 {{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}

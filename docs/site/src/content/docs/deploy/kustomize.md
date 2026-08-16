@@ -140,7 +140,7 @@ The exposed ports:
 
 - `config/crd/` — the `PlatformAgent` and `AgentPlugin` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
-- `config/webhook/` — admission webhook config (validating + mutating).
+- `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager.
 - `config/integrations/github/` — Minty deployment.
 - `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and `chatgpt` and `vertex_ai` overlays).
