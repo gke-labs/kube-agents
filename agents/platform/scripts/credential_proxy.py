@@ -573,8 +573,85 @@ class Policy:
         return cls(rules=rules, blocked_message=blocked_message)
 
     def blocked_by(self, argv: list[str]) -> Rule | None:
-        command = shlex.join(argv)
-        return next((rule for rule in self.rules if rule.pattern.search(command)), None)
+        return next(
+            (rule for rule in self.rules if rule.pattern.search(policy_match_text(argv))),
+            None,
+        )
+
+
+# Flags whose value is prose the agent wrote, not part of the command. Their
+# values are dropped before the rules see the argv.
+#
+# Every rule in the shipped policy is a word search across the whole joined
+# command -- `\bgh\b(?:\s+\S+)*?\s+pr\b(?:\s+\S+)*?\s+merge\b` and its
+# siblings -- and shlex.join leaves the spaces inside a quoted argument as real
+# spaces. A body is therefore searched exactly like a subcommand path. The
+# submit-suggestion skill instructs the agent to close every pull request body
+# with "Please review the code diffs and merge this PR to trigger the GitOps
+# CI/CD rollout!", so `gh pr create --body "<that>"` contained a `pr` token and
+# a later `merge` token and was refused by github.merge: the product's own
+# GitOps suggestion, blocked at the broker. The same shape reaches the older
+# rules -- a body mentioning `gh auth token` trips github.token-disclosure --
+# so this is a defect in how matching works rather than in the new rules.
+#
+# Values only. The flag names stay, because a rule may legitimately key on the
+# presence of one.
+_FREE_TEXT_FLAGS = frozenset(
+    {
+        "--body", "-b", "--title", "-t", "--notes", "--message", "-m",
+        "--description", "--comment",
+    }
+)
+
+
+def policy_match_text(argv: list[str]) -> str:
+    """The command as the policy rules should read it.
+
+    Two normalisations, both of which the rules would otherwise get wrong in
+    opposite directions.
+
+    Free-text flag values are dropped, so prose the agent wrote is not searched
+    for command tokens. Without this the denylist refuses the agent's own pull
+    requests -- a false positive that takes the product down rather than an
+    attacker.
+
+    Attached shorthand values are split apart. gh, kubectl and gcloud are all
+    Cobra/pflag, which accepts a shorthand's value with no separator, so
+    `gh api -XPUT repos/o/r/pulls/1/merge` is `-X PUT` and performs the merge
+    that `github.api-mutation` exists to refuse -- while matching neither
+    branch of it, because there is no whitespace or `=` after `-X`. Splitting
+    `-XPUT` into `-X PUT` closes that without the rule having to enumerate
+    spellings. `-fmerge_method=squash` becomes `-f merge_method=squash` for the
+    same reason.
+
+    Splitting is deliberately unconditional for single-dash tokens rather than
+    gated on a table of value-taking shorthands: emitting `-A w` for the
+    boolean cluster `-Aw` costs nothing, since no rule keys on a bare letter,
+    and a table would be one more thing to keep in step with four upstream
+    CLIs.
+    """
+    tokens: list[str] = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        name, separator, _ = token.partition("=")
+        if name in _FREE_TEXT_FLAGS:
+            # `--body=<prose>` carries its value in the same token; `--body
+            # <prose>` in the next one.
+            skip_next = not separator
+            tokens.append(name)
+            continue
+        if (
+            len(token) > 2
+            and token.startswith("-")
+            and not token.startswith("--")
+        ):
+            tokens.extend([token[:2], token[2:].lstrip("=")])
+            continue
+        tokens.append(token)
+    return shlex.join(tokens)
 
 
 @dataclass(frozen=True)

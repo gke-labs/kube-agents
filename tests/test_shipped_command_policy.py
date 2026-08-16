@@ -210,3 +210,73 @@ class ShippedPolicyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheRulesReadCommandsNotProse(ShippedPolicyTest):
+    """The two directions the joined-string match got wrong.
+
+    Both were found by review on the pull request that added these rules, and
+    both are properties of how matching works rather than of the patterns: the
+    rules are word searches over `shlex.join(argv)`, and join leaves the spaces
+    inside a quoted argument as real spaces.
+    """
+
+    def test_the_agents_own_pull_request_is_not_refused(self):
+        # submit-suggestion/SKILL.md tells the agent to close every body with
+        # this sentence, and submit_suggestion.py passes it to `gh pr create`
+        # inline. Before the fix the joined string held a `pr` token and a
+        # later `merge` token, so github.merge refused every GitOps suggestion
+        # the product exists to raise -- the denylist taking the product down
+        # rather than an attacker.
+        body = (
+            "Automated suggestion from the Platform Agent.\n\n"
+            "Please review the code diffs and merge this PR to trigger the "
+            "GitOps CI/CD rollout!"
+        )
+        for argv, desc in (
+            (["gh", "pr", "create", "--repo", "acme/fleet", "--title",
+              "chore: raise replicas", "--body", body], "--body <prose>"),
+            (["gh", "pr", "create", "--repo", "acme/fleet", "--body=" + body],
+             "--body=<prose>"),
+            (["gh", "pr", "review", "1", "--request-changes", "--body",
+              "do not merge this until the drift is confirmed"],
+             "a veto whose body says merge"),
+            (["gh", "issue", "comment", "7", "--body",
+              "run the release workflow once this lands"],
+             "a comment naming a workflow run"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertIsNone(self.policy.blocked_by(argv), desc)
+
+    def test_an_attached_shorthand_still_reaches_the_rule(self):
+        # gh is Cobra/pflag, which takes a shorthand's value with no separator.
+        # `-XPUT` is `-X PUT` and performs the merge, and
+        # PUT /repos/{o}/{r}/pulls/{n}/merge needs no request body -- so before
+        # the fix a single command merged with the real credential while
+        # matching neither branch of github.api-mutation.
+        for argv, desc in (
+            (["gh", "api", "-XPUT", "repos/o/r/pulls/1/merge"], "-XPUT"),
+            (["gh", "api", "-XPOST", "repos/o/r/releases"], "-XPOST"),
+            (["gh", "api", "repos/o/r/pulls/1/merge", "-fmerge_method=squash"],
+             "-f with attached key=value"),
+            (["gh", "api", "-X", "PUT", "repos/o/r/pulls/1/merge"],
+             "the detached spelling still refused"),
+        ):
+            with self.subTest(desc=desc):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule, desc)
+                self.assertEqual("github.api-mutation", rule.rule_id, desc)
+
+    def test_the_older_rules_are_unchanged(self):
+        # The normalisation runs for every rule, not only the new ones, so the
+        # pre-existing disclosure and replacement rules are pinned here too.
+        for argv, expected in (
+            (["gh", "auth", "token"], "github.token-disclosure"),
+            (["gh", "auth", "login"], "github.credential-replacement"),
+            (["gcloud", "auth", "print-access-token"], "gcp.access-token-disclosure"),
+            (["kubectl", "create", "token", "default"], "kubernetes.token-disclosure"),
+        ):
+            with self.subTest(rule=expected):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule, expected)
+                self.assertEqual(expected, rule.rule_id)
