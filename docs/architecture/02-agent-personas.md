@@ -133,7 +133,9 @@ below); v1 coordinates on GitOps + OKF alone.
 **What makes a substrate acceptable, rather than which ones are named.** The rule is about the
 _properties_ of the channel, not its implementation. An interaction must be:
 
-- **Durable** — it survives the sender and can be replayed.
+- **Durable** — the record outlives the exchange and can be inspected afterwards. _Replay_ is a
+  useful property where a substrate offers it, not a requirement: a latest-wins status file
+  qualifies, an ephemeral call does not.
 - **Attributable** — it records **what** originated the work: the authenticated human for a direct
   instruction, or the trigger identity (job or event identifier, trace ID) for autonomous work, per
   [`security-requirements.md`](../security-requirements.md) §5. Much of this architecture is

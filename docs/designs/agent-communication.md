@@ -24,7 +24,7 @@ Two communication channels, with different shapes and different reliability requ
 
 **Guiding principles**
 
-1. **No agent-to-agent prompting.** Agents never call each other. They coordinate through shared state (files) and, when delegating, through the kanban board. This avoids the delegation/loop antipatterns.
+1. **No agent-to-agent prompting.** No agent injects a prompt into another's context, and no agent blocks waiting on another. They coordinate through durable state (files) and, when delegating, through the kanban board. This avoids the delegation/loop antipatterns. It is the **non-authoritative** property of [02](../architecture/02-agent-personas.md) §2.3 under an older name — a peer's output is data, never instruction.
 2. **Constrain writes, free reads.** Writers use a schema-enforcing tool; readers use ordinary file tools. LLMs are reliable at reading files and less reliable at bespoke interfaces, so only the _write_ path is a tool.
 3. **Co-located now, migrateable later.** For the MVP all profiles share one pod and one PVC. The design keeps a single seam (the write helper) where a future cross-pod transport would slot in without changing the reader contract.
 
