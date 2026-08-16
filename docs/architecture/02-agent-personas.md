@@ -136,11 +136,24 @@ _properties_ of the channel, not its implementation. An interaction must be:
 - **Durable** — the record outlives the exchange and can be inspected afterwards. _Replay_ is a
   useful property where a substrate offers it, not a requirement: a latest-wins status file
   qualifies, an ephemeral call does not.
-- **Attributable** — it records **what** originated the work: the authenticated human for a direct
-  instruction, or the trigger identity (job or event identifier, trace ID) for autonomous work, per
-  [`security-requirements.md`](../security-requirements.md) §5. Much of this architecture is
-  deliberately unprompted — heartbeat scans, drift detection, cron — so requiring a human here
-  would fail on the system working as designed.
+- **Attributable** — it records **which human** originated the work, and unprompted work is no
+  exception. For a direct instruction that is the authenticated requester. For scheduled or
+  triggered work it is the human who **registered** the trigger: a registration is a reviewed
+  artifact, so the delegating human is on the record, and **their entitlements are re-resolved at
+  execution time** rather than frozen at registration — a registrant who loses access takes their
+  schedules' authority with them. The trigger's own identity (job or event identifier, trace ID) is
+  recorded alongside for correlation, per
+  [`security-requirements.md`](../security-requirements.md) §5.
+
+  **A human originator is not a human _present_.** Unattended work has someone to authorize
+  against and no one to ask, so it intersects against read-only with **no escalation path** — a
+  scheduled run that needs a decision stops and waits for one rather than proceeding.
+
+  > **Delta from current state:** `jobs.json` carries `id`, `name`, `schedule`, `prompt`, `skills`,
+  > `deliver` and `enabled` — no registrant. Binding each schedule to the human who registered it,
+  > and re-resolving that human at execution, lands with the scheduled-work design; today only the
+  > trigger identity is recorded.
+
 - **Non-escalating** — receiving a message grants the receiver no authority it did not already
   hold. A message may request work; it never confers permission to do it.
 - **Non-authoritative** — the receiver treats a peer message as **untrusted input**, exactly as it
@@ -149,8 +162,9 @@ _properties_ of the channel, not its implementation. An interaction must be:
   triggers is authorized **at the receiver, by the receiver's own scope** — never by the fact that a
   peer sent it. In v1 that is the read-only, tier-scoped ceiling ([03](03-security-model.md) §3);
   intersecting it with the originating human's own permissions is the deferred hardening in
-  [03](03-security-model.md) §4a. Where work has no originating human there is nothing to intersect
-  with, so it stays bounded by read-only with no escalation path.
+  [03](03-security-model.md) §4a. That intersection applies to unprompted work too — against the
+  registrant, re-resolved at execution — with the difference that no one is present to escalate to,
+  so it stays bounded by read-only.
 
 **These are necessary, not sufficient.** A substrate meeting all four is not thereby approved; it
 still has to satisfy the rest of the security model ([03](03-security-model.md)), and a new one is
@@ -469,9 +483,9 @@ A harness confirms this doc's design with:
 - **Indirect coordination:** assert the four properties in §2.3, not the absence of a channel. No
   agent opens a **synchronous** connection to another and blocks on the reply (negative test: a
   request/response attempt between agent pods fails). Every cross-tier interaction leaves a durable
-  record naming its originator — a human, or a trigger identity for unprompted work — as a GitOps
-  commit, OKF entry, or replayable message on an approved bus, and none appears only as an
-  ephemeral call. Work arriving from a peer is bounded by the receiver's own ceiling (negative
+  record naming the human who originated it — the requester, or the registrant of the trigger for
+  unprompted work, with the trigger identity recorded alongside — as a GitOps commit, OKF entry, or
+  durable message on an approved bus, and none appears only as an ephemeral call. Work arriving from a peer is bounded by the receiver's own ceiling (negative
   test: a peer message requesting work outside the receiver's tier scope is refused **by the
   receiver**, not by the sender declining to ask). Refusing it against the _originating human's_
   permissions is deferred with the rest of per-request authorization
