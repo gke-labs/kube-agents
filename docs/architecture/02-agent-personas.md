@@ -134,14 +134,21 @@ below); v1 coordinates on GitOps + OKF alone.
 _properties_ of the channel, not its implementation. An interaction must be:
 
 - **Durable** — it survives the sender and can be replayed.
-- **Attributable** — it records which human originated the work.
+- **Attributable** — it records **what** originated the work: the authenticated human for a direct
+  instruction, or the trigger identity (job or event identifier, trace ID) for autonomous work, per
+  [`security-requirements.md`](../security-requirements.md) §5. Much of this architecture is
+  deliberately unprompted — heartbeat scans, drift detection, cron — so requiring a human here
+  would fail on the system working as designed.
 - **Non-escalating** — receiving a message grants the receiver no authority it did not already
   hold. A message may request work; it never confers permission to do it.
 - **Non-authoritative** — the receiver treats a peer message as **untrusted input**, exactly as it
   treats chat text, cluster object contents, tool output, logs and issue bodies
   ([03](03-security-model.md) §1, §5). It may inform work; it never authorizes it. Whatever work it
-  triggers is authorized _at the receiver_, against the originating human's entitlement — never
-  against the fact that a peer sent it.
+  triggers is authorized **at the receiver, by the receiver's own scope** — never by the fact that a
+  peer sent it. In v1 that is the read-only, tier-scoped ceiling ([03](03-security-model.md) §3);
+  intersecting it with the originating human's own permissions is the deferred hardening in
+  [03](03-security-model.md) §4a. Where work has no originating human there is nothing to intersect
+  with, so it stays bounded by read-only with no escalation path.
 
 **These are necessary, not sufficient.** A substrate meeting all four is not thereby approved; it
 still has to satisfy the rest of the security model ([03](03-security-model.md)), and a new one is
@@ -460,11 +467,13 @@ A harness confirms this doc's design with:
 - **Indirect coordination:** assert the four properties in §2.3, not the absence of a channel. No
   agent opens a **synchronous** connection to another and blocks on the reply (negative test: a
   request/response attempt between agent pods fails). Every cross-tier interaction leaves a durable
-  record naming the originating human — GitOps commit, OKF entry, or a replayable message on an
-  approved bus — and none appears only as an ephemeral call. Work arriving from a peer is
-  authorized at the receiver against that human's entitlement (negative test: a peer message
-  requesting work the originating human may not do is refused, and refused by the receiver rather
-  than by the sender declining to ask).
+  record naming its originator — a human, or a trigger identity for unprompted work — as a GitOps
+  commit, OKF entry, or replayable message on an approved bus, and none appears only as an
+  ephemeral call. Work arriving from a peer is bounded by the receiver's own ceiling (negative
+  test: a peer message requesting work outside the receiver's tier scope is refused **by the
+  receiver**, not by the sender declining to ask). Refusing it against the _originating human's_
+  permissions is deferred with the rest of per-request authorization
+  ([03](03-security-model.md) §4a).
 - **Chat entrypoints & routing:** each persona exposes its own authenticated entrypoint (one per
   audience); the ChatOps gateway resolves a slash command or `@<tier>-<scope>` handle to the matching
   `(tier, scope)` agent **deterministically** (no inference), and enforces that agent's `AllowedUsers`
