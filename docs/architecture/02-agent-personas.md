@@ -131,14 +131,39 @@ A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred 
 below); v1 coordinates on GitOps + OKF alone.
 
 **What makes a substrate acceptable, rather than which ones are named.** The rule is about the
-_properties_ of the channel, not its implementation: an interaction must be **durable** (it
-survives the sender, and can be replayed), **attributable** (it records which human originated the
-work), and **non-escalating** (receiving a message grants the receiver no authority it did not
-already hold — a message may request work, never confer permission to do it). GitOps and OKF
-qualify because git is all three. A durable, replayable message bus qualifies on the same terms and
-is not excluded by this section. What is excluded is **synchronous request/response between
-agents**: an ephemeral call, invisible after the fact, in which one agent waits on another and the
-call itself is the only record.
+_properties_ of the channel, not its implementation. An interaction must be:
+
+- **Durable** — it survives the sender and can be replayed.
+- **Attributable** — it records which human originated the work.
+- **Non-escalating** — receiving a message grants the receiver no authority it did not already
+  hold. A message may request work; it never confers permission to do it.
+- **Non-authoritative** — the receiver treats a peer message as **untrusted input**, exactly as it
+  treats chat text, cluster object contents, tool output, logs and issue bodies
+  ([03](03-security-model.md) §1, §5). It may inform work; it never authorizes it. Whatever work it
+  triggers is authorized _at the receiver_, against the originating human's entitlement — never
+  against the fact that a peer sent it.
+
+**These are necessary, not sufficient.** A substrate meeting all four is not thereby approved; it
+still has to satisfy the rest of the security model ([03](03-security-model.md)), and a new one is
+a design decision, not a checklist result.
+
+GitOps and OKF qualify because git is all four. A durable, replayable message bus can qualify on
+the same terms and is not excluded by this section. What is excluded is **synchronous
+request/response between agents**: an ephemeral call, invisible after the fact, in which one agent
+blocks on another and the call itself is the only record.
+
+**The fourth property is the one that does real work, and it is why the third is not enough.** A
+peer message carries another agent's model output. Absent the fourth property a bus would let agent
+A's LLM output enter agent B's context as though it were trusted — a prompt-injection channel whose
+sender is trusted infrastructure, which is worse than the untrusted sources §5 already enumerates.
+GitOps and OKF avoid this incidentally, because a human reviews what lands. A bus has to say it
+outright.
+
+**This does not move the review gate.** Invariants 1, 2 and 5 put a human in front of every
+_mutation_, and nothing an agent learns from a peer reaches infrastructure except through a
+reviewed PR. What this section governs is how agents **coordinate**, not how changes **land**.
+Human-gating each individual message would not survive a fleet of any size, and it is not what the
+review gate is for: the gate belongs on the change, not on the conversation.
 
 Runtime **session state** (conversation transcripts, per-user profile facts, mid-task scratch) is a
 _separate_ concern — high-frequency, ephemeral, per-user — handled by the existing gateway store
@@ -149,7 +174,7 @@ neither OKF nor mem0.
 
 How coordination flows: a parent provisioning a child, or an escalation that becomes a change, is a
 GitOps commit others observe; an observation or escalation _not yet_ a change is written to curated
-knowledge (OKF). Nothing is a direct call. This indirection keeps tiers
+knowledge (OKF). Nothing is a synchronous call. This indirection keeps tiers
 loosely coupled and is what makes failure isolation
 ([04-workflow-model.md](04-workflow-model.md) §6) possible: no agent depends on another being online
 at request time.
@@ -322,7 +347,7 @@ reconciles** the child as a running, scoped agent. So:
   the controller reconciles them with namespace-scoped read-only identity.
 
 **Escalation flows the other way.** A lower agent that needs a change outside its scope escalates a
-request _upward_ to its parent — **indirectly, via shared state** (§2.3), not a direct call — which
+request _upward_ to its parent — **indirectly, via durable state** (§2.3), not a synchronous call — which
 the parent picks up via an **event trigger** (a watch/webhook that wakes it) or, as a backstop, its
 **heartbeat**, then either acts within its own authority or escalates further. No agent ever widens its
 own scope.
@@ -432,9 +457,14 @@ A harness confirms this doc's design with:
   controller's cardinality webhook**.
 - **Per-persona identity:** each agent pod's `spec.serviceAccountName` is its tier/scope read-only KSA
   (03 §3); labels `kube-agents/tier` and `kube-agents/parent` are set.
-- **Indirect coordination:** a negative connectivity test shows no agent can open a network connection
-  to another agent (NetworkPolicy denies); cross-tier requests appear only as GitOps commits / OKF
-  entries, never direct calls.
+- **Indirect coordination:** assert the four properties in §2.3, not the absence of a channel. No
+  agent opens a **synchronous** connection to another and blocks on the reply (negative test: a
+  request/response attempt between agent pods fails). Every cross-tier interaction leaves a durable
+  record naming the originating human — GitOps commit, OKF entry, or a replayable message on an
+  approved bus — and none appears only as an ephemeral call. Work arriving from a peer is
+  authorized at the receiver against that human's entitlement (negative test: a peer message
+  requesting work the originating human may not do is refused, and refused by the receiver rather
+  than by the sender declining to ask).
 - **Chat entrypoints & routing:** each persona exposes its own authenticated entrypoint (one per
   audience); the ChatOps gateway resolves a slash command or `@<tier>-<scope>` handle to the matching
   `(tier, scope)` agent **deterministically** (no inference), and enforces that agent's `AllowedUsers`

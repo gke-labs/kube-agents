@@ -138,8 +138,8 @@ acceptance criteria pass.
   ([06](06-api-and-data-contracts.md) §2b, [03](03-security-model.md) §4a).
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
   read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
-  because the agent's SA is namespace-scoped; cross-tier requests go via shared state, never a direct
-  call; an **ambiguous NL message** triggers a clarifying question rather than a mis-route
+  because the agent's SA is namespace-scoped; cross-tier requests go via durable, attributable state
+  ([02](02-agent-personas.md) §2.3), never a synchronous call; an **ambiguous NL message** triggers a clarifying question rather than a mis-route
   ([06](06-api-and-data-contracts.md) §10). (Per-user confused-deputy protection is deferred,
   [03](03-security-model.md) §4a.)
 
@@ -155,7 +155,7 @@ acceptance criteria pass.
   unprompted**. (Semantic recall / mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
 - **Accept:** a Kubernetes watch fires an agent reaction (e.g. a crash-looping workload) **without**
   waiting for the next heartbeat poll; an escalation written by a lower tier is picked up by its parent
-  (no direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
+  (no synchronous call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
   drift** (RBAC / NetworkPolicy / version skew) → the Platform Agent detects it and opens a
   **corrective PR unprompted** — never a direct fix (satisfies [01](01-vision-scope.md) §7 SC4).
 
