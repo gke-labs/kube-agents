@@ -554,11 +554,27 @@ def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
     honoured by v1.36.3 and delivered the bearer token to that address, which is
     the credential-exfiltration Critical again through a different spelling.
 
-    `-s` is the only shorthand among the refused flags, so this is one instance
-    rather than a class: `-v` takes its own value and is not refused, and `-h`
-    dead-ends in help output. Any `-s`-prefixed token is the server flag --
-    pflag only groups shorthands that take no value, and `--server` does take
-    one -- so there is no `-sX` that means something else.
+    `-s` is the only shorthand among the refused flags, but it is a class rather
+    than one instance, because pflag lets shorthands cluster. The earlier
+    reasoning here -- "pflag only groups shorthands that take no value, and
+    `--server` does take one" -- had the rule backwards. parseSingleShortArg
+    walks a cluster character by character: every shorthand carrying a
+    NoOptDefVal (each boolean) consumes nothing and the walk continues, and the
+    *first value-taking* shorthand swallows the rest of the token, or the next
+    argv element when nothing is left. A run of booleans ending in `s` is
+    therefore `--server`, and cobra merges the root command's persistent
+    `-s, --server` into every subcommand's flag set.
+
+    Measured against the shipped flags: `kubectl get` registers the booleans
+    `-A`, `-R` and `-w`, and `kubectl logs` registers `-f` and `-p`, so
+    `kubectl get pods -As http://host`, `-Rs …` and `kubectl logs x -fs …` all
+    reached the server flag while `-s` and `-sVALUE` were refused. The cluster
+    is expanded below rather than matched by a wider prefix test, because
+    stripping dashes and looking for an `s` would refuse `--sort-by`,
+    `--since` and `--selector`, none of which are identity flags.
+
+    The flag name is returned rather than the token, so the address the agent
+    chose never reaches a log line.
     """
     for token in argv[1:]:
         name, _, _ = token.partition("=")
@@ -576,9 +592,21 @@ def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
         # this rule -- stripping dashes before testing for `s` -- would refuse
         # all three.
         #
-        # The flag name is returned rather than the token, so the address the
-        # agent chose never reaches a log line.
         if token.startswith("-s") and token != "-s":
+            return "-s"
+        # Shorthand cluster: `-As http://host`. Only single-dash tokens that are
+        # not `--` long flags can cluster, and `-s...` is already handled above,
+        # so what reaches here is a cluster whose first character is not `s`.
+        # Any `s` later in the run is the server flag as soon as every character
+        # before it is a boolean -- and since a value-taking shorthand ends the
+        # walk, an `s` preceded only by other letters is refused rather than
+        # guessed at. Erring toward refusal is the C2 direction.
+        if (
+            len(token) > 2
+            and token.startswith("-")
+            and not token.startswith("--")
+            and "s" in token[1:]
+        ):
             return "-s"
     return None
 

