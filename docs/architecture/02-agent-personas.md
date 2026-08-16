@@ -483,9 +483,13 @@ A harness confirms this doc's design with:
 - **Indirect coordination:** assert the four properties in §2.3, not the absence of a channel. No
   agent opens a **synchronous** connection to another and blocks on the reply (negative test: a
   request/response attempt between agent pods fails). Every cross-tier interaction leaves a durable
-  record naming the human who originated it — the requester, or the registrant of the trigger for
-  unprompted work, with the trigger identity recorded alongside — as a GitOps commit, OKF entry, or
-  durable message on an approved bus, and none appears only as an ephemeral call. Work arriving from a peer is bounded by the receiver's own ceiling (negative
+  record — a GitOps commit, OKF entry, or durable message on an approved bus — and none appears
+  only as an ephemeral call. **v1:** a direct instruction names the authenticated requester;
+  unprompted work records the trigger identity (job or event identifier, trace ID) per
+  [`security-requirements.md`](../security-requirements.md) §5. Naming the **registrant** of a
+  trigger is **deferred** with the scheduled-work design (§2.3 Delta), so until it lands an
+  unprompted interaction is conformant without naming a human — including
+  [07](07-implementation-roadmap.md) Phase 4's unprompted corrective PR. Work arriving from a peer is bounded by the receiver's own ceiling (negative
   test: a peer message requesting work outside the receiver's tier scope is refused **by the
   receiver**, not by the sender declining to ask). Refusing it against the _originating human's_
   permissions is deferred with the rest of per-request authorization
