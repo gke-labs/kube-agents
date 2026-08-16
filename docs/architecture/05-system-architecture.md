@@ -130,8 +130,10 @@ own **read-only, tier-scoped** identity — not by the requester (access is limi
 **F3 — Coordination (indirect):** agents publish/observe durable state — GitOps repo (declarative),
 OKF (curated knowledge) — reacting via **event triggers where available** (Kubernetes watches, alert /
 GitHub webhooks) with the **heartbeat as backstop** ([04](04-workflow-model.md) §4). No synchronous
-agent-to-agent calls; any substrate meeting the durable / attributable / non-escalating test in
-[02](02-agent-personas.md) §2.3 qualifies.
+agent-to-agent calls. Substrate choice is governed by the four-property test in
+[02](02-agent-personas.md) §2.3, which is **necessary but not sufficient** — adopting a new
+substrate is a design decision, not a checklist result. The properties are enumerated there and
+nowhere else; do not restate them here.
 
 **F4 — Provisioning cascade:** Platform Agent → proposes a **cluster-admin** agent (an `Agent` CR **+ its
 read-only KSA/RBAC/Workload-Identity manifests**); Cluster Admin Agent → proposes **developer-team**
