@@ -114,10 +114,11 @@ confused-deputy gap per-request) is deferred hardening. See
 > tool and a `gke` MCP server bound to `container.googleapis.com`). The end state removes direct
 > mutation from agents entirely; see [01-vision-scope.md](01-vision-scope.md) §6.
 
-### 2.3 Coordination is indirect (shared state, not direct calls)
+### 2.3 Coordination is indirect (durable state, not synchronous calls)
 
-Agents **never call each other directly** — there is no agent-to-agent RPC or API. They coordinate
-through **shared state**, reacting to it via **event triggers where a signal exists** (Kubernetes
+Agents **never call each other synchronously** — there is no agent-to-agent RPC or request/response
+API, and no agent blocks waiting on another. They coordinate through **durable, attributable
+state**, reacting to it via **event triggers where a signal exists** (Kubernetes
 watches, alert/GitHub webhooks) with a periodic **heartbeat as the backstop** ([04](04-workflow-model.md)
 §4). Two kinds of state serve two distinct purposes, each with the tool suited to it:
 
@@ -128,6 +129,16 @@ watches, alert/GitHub webhooks) with a periodic **heartbeat as the backstop** ([
 
 A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
 below); v1 coordinates on GitOps + OKF alone.
+
+**What makes a substrate acceptable, rather than which ones are named.** The rule is about the
+_properties_ of the channel, not its implementation: an interaction must be **durable** (it
+survives the sender, and can be replayed), **attributable** (it records which human originated the
+work), and **non-escalating** (receiving a message grants the receiver no authority it did not
+already hold — a message may request work, never confer permission to do it). GitOps and OKF
+qualify because git is all three. A durable, replayable message bus qualifies on the same terms and
+is not excluded by this section. What is excluded is **synchronous request/response between
+agents**: an ephemeral call, invisible after the fact, in which one agent waits on another and the
+call itself is the only record.
 
 Runtime **session state** (conversation transcripts, per-user profile facts, mid-task scratch) is a
 _separate_ concern — high-frequency, ephemeral, per-user — handled by the existing gateway store
@@ -186,7 +197,7 @@ entrypoint, one per audience" above: cluster admins reach `@cluster-<cluster>`, 
 separate per-tier agent pods** — _not_ a shared "one pod hosts many agents" multiplexer (that
 co-located design is deliberately deferred, [08](08-agent-runtime-and-identity.md) §3), and _not_
 an agent calling another agent (coordination stays indirect, §2.3). It routes a _human's_ message
-to the addressed agent; agents still never call each other.
+to the addressed agent; agents still never call each other synchronously.
 
 **Routing is not an authorization signal.** Which agent a message reaches is a _convenience_, never
 a privilege grant. The gateway enforces the target agent's trusted-human allowlist (`AllowedUsers`)

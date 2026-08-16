@@ -201,8 +201,11 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 3. A developer team self-serves a workload via its agent and is **provably unable** to affect
    another namespace or escalate.
 4. All three agents are **read-only** on cluster/cloud APIs; the only write path is a reviewed PR.
-5. Agents coordinate **only** indirectly (GitOps + OKF); a negative test confirms no direct
-   agent-to-agent call path exists.
+5. Agents coordinate **only** through durable, attributable state; a negative test confirms no
+   **synchronous** agent-to-agent call path exists — no agent blocks on a response from another,
+   and no inter-agent interaction leaves the system without a record. Assert the property, not the
+   transport: a test asserting the absence of _any_ inter-agent channel would forbid substrates
+   [02](02-agent-personas.md) §2.3 permits.
 6. The review-gate blocks an unmitigated high-severity change; every mutation is attributable and
    revertible.
 7. Failure-isolation chaos tests (Phase 6) pass — no cascade.
