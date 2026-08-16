@@ -417,18 +417,23 @@ if intendedReplicas > 1 {
 }
 ```
 
-One constant, two knobs — but Kubernetes rounds them in opposite directions: `maxSurge` **up**
-and `maxUnavailable` **down**. At `replicas: 2` that asymmetry is the whole problem:
+One constant, two knobs — but Kubernetes rounds them in opposite directions: `maxSurge` **up** and
+`maxUnavailable` **down**. Evaluating `defaultSurgePercent` through
+`intstr.GetScaledValueFromIntOrPercent`, the same helper the Deployment controller uses, gives the
+effective values per replica count:
 
-| Setting          | 25% of 2 | Rounding | Effective |
-| ---------------- | -------- | -------- | --------- |
-| `maxSurge`       | 0.5      | up       | 1         |
-| `maxUnavailable` | 0.5      | down     | **0**     |
+| Replicas | `maxSurge` (rounds up) | `maxUnavailable` (rounds down) | Rollout needs |
+| -------- | ---------------------- | ------------------------------ | ------------- |
+| 1        | 1                      | **0**                          | all 1 Ready   |
+| 2        | 1                      | **0**                          | all 2 Ready   |
+| 3        | 1                      | **0**                          | all 3 Ready   |
+| 4        | 1                      | 1                              | 3 of 4 Ready  |
+| 8        | 2                      | 2                              | 6 of 8 Ready  |
 
-`maxUnavailable: 0` means the rollout may never drop below 2 available pods — and with a
-leader-only probe only one pod can ever be Ready, so it never reaches 2 and stalls until
-`progressDeadlineSeconds`, which the operator does not set and therefore defaults to 600 s.
-Today's no-probe state at least rolls.
+`maxUnavailable: 0` holds not just at two replicas but at **every count below four** — so a
+leader-only probe, under which exactly one pod can ever be Ready, stalls the rollout at 2 and 3
+replicas alike, until `progressDeadlineSeconds`, which the operator does not set and therefore
+defaults to 600 s. Today's no-probe state at least rolls.
 
 At a single replica the failure mode is worse, not milder: the strategy there is `Recreate`
 (1.5), so the old pod is torn down _before_ the new one is created. A probe that never passes is
@@ -639,6 +644,12 @@ Per process, not per pod:
 - **The exit path is `release_lease_and_exit`, never a bare `sys.exit`.** Dropping the label,
   stopping the remaining processes and releasing the lease all have to happen. P3 is precisely
   the bug of having a second, cleanup-free way out; the supervisor must not reintroduce it.
+- **Cleanup writes a final `ready: false` status before exiting.** Without it the last document on
+  disk still says `ready: true`, and the probe keeps returning Ready for up to the staleness
+  window (3.4) while the container is on its way down. A PoC hit exactly this: after the
+  supervisor exited on a required process, the probe still reported `ready=True healthy` because
+  the file was only a second old. One write on the way out closes it; the staleness check is the
+  backstop, not the mechanism.
 - **Failure to start counts as a restart.** `Popen` can raise before there is anything to poll —
   a missing binary, an unwritable log path — and that must feed the same counter rather than
   spinning at full speed. This is also the path the KV server takes while it waits out a
@@ -675,16 +686,18 @@ class Supervised:
             self.proc = None
             self._penalise(now)          # a failed start is a restart, or it spins
 
-    def poll(self, now):
+    def on_exit(self, code, now):
+        """Called ONLY by reap() in 3.7, which owns every waitpid in this process.
+        Deliberately no self.proc.poll() anywhere here -- see 3.7 for why a second
+        caller of waitpid silently rewrites a crash into a clean exit."""
+        log(f"{self.name}: exited {code}")
+        self.exit, self.proc, self.state = code, None, "exited"
+        self._penalise(now)
+
+    def tick(self, now):
         """Once per supervisor iteration. False => a REQUIRED process is past its cap."""
-        if self.state == "gave_up":
-            return not self.required
-        if self.state == "backoff" and now >= self.retry_at:
+        if self.state == "pending" or (self.state == "backoff" and now >= self.retry_at):
             self.start(now)
-        elif self.state == "running" and self.proc.poll() is not None:
-            log(f"{self.name}: exited {self.proc.returncode}")
-            self.proc = None
-            self._penalise(now)
         return self.state != "gave_up" or not self.required
 
     def _penalise(self, now):
@@ -699,7 +712,7 @@ class Supervised:
         self.backoff = min(self.backoff * 2, BACKOFF_MAX)
 ```
 
-The shape is what matters, not the details. `poll` returning `False` — only ever for a
+The shape is what matters, not the details. `tick` returning `False` — only ever for a
 **required** process — routes through `release_lease_and_exit`, not `sys.exit`. A `gave_up`
 **optional** process leaves the supervisor running and surfaces as `degraded` in 3.4's status. And
 `start` failing is charged to the same counter as an exit, because otherwise a missing binary is
@@ -970,28 +983,52 @@ accumulate as zombies until the PID table fills. This matters here more than it 
 the agent shells out constantly, and the KV server runs `hermes send` per alert. So the loop
 reaps once per iteration:
 
+**Reaping and `Popen.poll()` cannot coexist**, and the failure is quieter than it looks. An
+earlier draft of this section proposed reaping `-1` and skipping PIDs found in the process table.
+That does not work, for two reasons a PoC established rather than argued:
+
+- **The guard is too late.** By the time `waitpid(-1)` has returned a PID, it has already consumed
+  that process's status. Checking membership afterwards detects the theft; it does not prevent it.
+- **`poll()` then reports success, not "unknown".** CPython's `Popen._internal_poll` catches the
+  resulting `ECHILD` and sets `returncode = 0`. Measured: a process that exited **3**, reaped
+  externally first, is subsequently reported by `poll()` as having exited **0**.
+
+That second point is the dangerous one. The supervisor does not see a confusing state it might
+log and recover from — it sees a clean, successful exit. Any policy that treats exit 0 as
+"stopped on purpose" would stop restarting a process that is in fact crash-looping, and the
+restart cap of 3.3 would never fire.
+
+So there is exactly one `waitpid` in the design, and it **dispatches** rather than discards:
+
 ```python
-def reap_orphans(table):
-    """Reap grandchildren that reparented to us. MUST NOT reap the table's own processes."""
-    owned = {p.proc.pid for p in table if p.proc is not None}
+def reap(table):
+    """The single point of truth for child exits. Nothing else may call waitpid/poll."""
+    by_pid = {p.proc.pid: p for p in table if p.proc is not None}
     while True:
         try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
+            pid, sts = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
-            return                        # nothing left to reap
+            return                              # no children at all
         if pid == 0:
-            return                        # children exist, none have exited
-        if pid in owned:
-            # Should not happen: Popen.poll() reaps these. If it does, the
-            # Supervised entry has lost its exit status -- log loudly.
-            log(f"reaper took pid {pid} out from under the process table")
+            return                              # children exist, none have exited
+        code = os.waitstatus_to_exitcode(sts)
+        entry = by_pid.get(pid)
+        if entry is None:
+            continue                            # an orphan grandchild; reaped, discarded
+        entry.exit = code                       # <- the status the table would otherwise lose
+        entry.proc, entry.state = None, "exited"
+        entry.penalise(time.monotonic())
 ```
 
-The `owned` check is the part that is easy to get wrong. A bare `waitpid(-1)` will happily reap a
-supervised process before `Popen.poll()` sees it, after which that entry's exit status is gone and
-`poll()` cannot tell the difference between "still running" and "already exited" — the restart
-policy of 3.3 stops working, silently. Reaping and supervising have to agree on who owns which
-PID.
+The consequence for 3.3 is a constraint, not an option: `Supervised.poll()` as sketched there must
+**not** call `self.proc.poll()` — which is why the sketch there splits `tick` (start and cap
+arithmetic) from `on_exit` (called only from here). Two callers of `waitpid` is the bug; one caller
+that knows the table is the design.
+
+This raises the value of Q1 in 8 considerably. `tini` does the reaping half correctly and by
+construction — but note that it does **not** remove the constraint above, because `tini` only
+reaps PIDs the supervisor has not claimed. The supervisor still needs one owner of its own
+children's statuses.
 
 **This is also the strongest argument for `tini`**, which does exactly the above and is far better
 tested than the twelve lines here. 3.8B rejects `tini` as a _supervisor_; it does not reject it as
@@ -1172,6 +1209,32 @@ S4 is where this design and the KV decomposition meet.
 ---
 
 ## 6. Verification
+
+### 6.0 What was prototyped, and what it changed
+
+The mechanisms in 3.3–3.7 were built as a throwaway prototype before this design was finalised —
+a supervisor with the process table, criticality, backoff and cap, the status file, the probe, and
+sequential shutdown, with the lease stubbed to a file so it runs without Kubernetes. Six
+experiments; **three of them falsified something this document previously asserted**, and those
+corrections are already folded into the sections above.
+
+| #   | Claim under test                                                   | Result                                                                                                                                                                    |
+| --- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E1  | A generic `waitpid(-1)` breaks the table's view of its own process | **Confirmed, and worse than stated.** See 3.7 — `poll()` reports `0`, not "unknown", and the proposed guard does not work                                                 |
+| E2  | `httpGet` cannot reach a server bound to `127.0.0.1`               | **Confirmed.** `ECONNREFUSED` from the routable address; `0.0.0.0` connects. `HTTPGetAction.Host` "defaults to the pod IP"                                                |
+| E3  | 25% yields `maxUnavailable: 0` at 2 replicas                       | **Confirmed and widened** — it is 0 at 1, 2 _and_ 3 replicas (P4)                                                                                                         |
+| E4  | Optional-vs-required divergence at the cap                         | **Confirmed.** Optional → `ready:true, degraded:true`, supervisor lives. Required → cleanup, then exit. Also surfaced the stale-`ready:true`-on-exit gap now fixed in 3.3 |
+| E5  | Shutdown is the sum over the table                                 | **Confirmed.** 10 s / 20 s / 30 s for 1 / 2 / 3 processes at a 10 s grace — 3 processes overruns the 30 s default and needs 3.7's 60 s                                    |
+| E6  | The inequality catches table growth                                | **Confirmed.** Reproduces every margin in 3.5: today −2, option A +3, A+C +6, and A+C with a third process −4 (refuses to start)                                          |
+
+E2 and E3 are checks against the authoritative source rather than against reasoning: E2 reads
+`HTTPGetAction.Host`'s own documentation in the vendored `k8s.io/api`, and E3 evaluates
+`defaultSurgePercent` through `intstr.GetScaledValueFromIntOrPercent` — the function the Deployment
+controller itself calls.
+
+The prototype is not proposed for the repository. Its value was in being wrong three times before
+any of this reached an implementation PR, and the cases it exercised are the ones listed under
+**Unit** below.
 
 **Unit.** `leader_elect.py` has four tests today —
 [`test_leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/test_leader_elect.py),
