@@ -128,9 +128,14 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
 #
 # agents/platform/docs is the live case: the Dockerfile copies it to
 # /opt/defaults/docs and nowhere else, so it reaches the default profile and no
-# specialist. `scripts` is here because the entrypoint makes it the one
-# exception, symlinking $TARGET_DIR/scripts into profiles/platform (line 538)
-# -- a link it would not need if that layer reached the profile on its own.
+# specialist. `scripts` is here because it is the one exception, and it is in
+# BOTH lists: the entrypoint symlinks $TARGET_DIR/scripts into the platform
+# profile and into every profiles/cluster-*, and cluster_agent_profile.py makes
+# the same link for a cluster profile it scaffolds -- a link neither would need
+# if that layer reached the profile home on its own. The cluster half is not
+# cosmetic: the `notify` MCP server is launched as
+# ${HERMES_HOME}/scripts/notify_server.py, and HERMES_HOME is the profile home
+# in a worker spawned as `hermes -p <name>`.
 #
 # `chat` is deliberately absent: it *is* the default profile, so its home is
 # $TARGET_DIR and the /opt/defaults layer resolves there in full.
@@ -150,7 +155,14 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
         }
     ),
     "cluster": frozenset(
-        {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills"}
+        {
+            "SOUL.md",
+            "AGENTS.md",
+            "CAPABILITIES.md",
+            "config.yaml",
+            "skills",
+            "scripts",
+        }
     ),
 }
 
