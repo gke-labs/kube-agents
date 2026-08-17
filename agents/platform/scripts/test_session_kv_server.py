@@ -643,6 +643,301 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertIn("apply Option B", cta)
 
 
+class FakeResponse:
+    """The two attributes _post_gateway touches on a urlopen result."""
+
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def http_error(code):
+    import urllib.error
+
+    return urllib.error.HTTPError(
+        url="http://gw/api/sessions", code=code, msg="nope", hdrs=None, fp=None
+    )
+
+
+class Recorder:
+    """Stands in for urlopen, recording the URL and body of every request."""
+
+    def __init__(self, *results):
+        # One entry per call: an int status, or an exception to raise.
+        self.results = list(results)
+        self.urls = []
+        self.bodies = []
+        self.timeouts = []
+
+    def __call__(self, req, timeout=None):
+        self.urls.append(req.full_url)
+        self.bodies.append(json.loads(req.data.decode("utf-8")))
+        self.timeouts.append(timeout)
+        result = self.results.pop(0) if self.results else 200
+        if isinstance(result, Exception):
+            raise result
+        return FakeResponse(result)
+
+
+GATEWAY_HEADERS = {"Content-Type": "application/json"}
+
+
+class TestTriageProfileIsNamed(unittest.TestCase):
+    """The triage turn has to be routed, not left to whatever `default` means.
+
+    The gateway picks a profile from the URL path prefix, so an unprefixed
+    request is served by `default` — the Chat Agent. No `platform_control`, so
+    no `send_notification`, so no way for the RCA to reach chat or the
+    incidents table. The turn still does the diagnostic work and still ends
+    clean, which is what made the failure so hard to see (#630).
+    """
+
+    def test_session_creation_asks_for_the_profile_prefix(self):
+        rec = Recorder(200)
+        with patch("urllib.request.urlopen", rec):
+            self.assertTrue(
+                session_kv_server._create_gateway_session("http://gw", "k8s-evt-1", GATEWAY_HEADERS)
+            )
+        self.assertEqual(rec.urls, ["http://gw/p/platform/api/sessions"])
+
+    def test_agent_turn_asks_for_the_profile_prefix(self):
+        rec = Recorder(200)
+        with patch("urllib.request.urlopen", rec):
+            session_kv_server._start_agent_turn(
+                "http://gw", "k8s-evt-1", "diagnose this", GATEWAY_HEADERS
+            )
+        self.assertEqual(rec.urls, ["http://gw/p/platform/api/sessions/k8s-evt-1/chat"])
+        self.assertEqual(rec.bodies[0]["message"], "diagnose this")
+
+    def test_the_profile_default_is_the_platform_agent(self):
+        self.assertEqual(session_kv_server.PLATFORM_API_PROFILE, "platform")
+
+    def test_the_prefix_is_dropped_when_the_profile_is_default(self):
+        """Asking `default` for `/p/default/...` would be a needless 404 round trip."""
+        for value in ("default", ""):
+            with self.subTest(profile=value):
+                with patch.object(session_kv_server, "PLATFORM_API_PROFILE", value):
+                    self.assertEqual(
+                        session_kv_server._profile_urls("http://gw", "/api/sessions"),
+                        ["http://gw/api/sessions"],
+                    )
+
+    def test_the_turn_is_given_the_whole_reasoning_loop(self):
+        """The timeout bounds an agent turn, not an HTTP round trip (#630)."""
+        self.assertGreaterEqual(session_kv_server.TURN_TIMEOUT_SECONDS, 1800)
+        rec = Recorder(200)
+        with patch("urllib.request.urlopen", rec):
+            session_kv_server._start_agent_turn(
+                "http://gw", "k8s-evt-1", "diagnose this", GATEWAY_HEADERS
+            )
+        self.assertEqual(rec.timeouts, [session_kv_server.TURN_TIMEOUT_SECONDS])
+
+
+class TestTriageProfileFallback(unittest.TestCase):
+    """A gateway that does not serve the prefix must not lose triage over it."""
+
+    def test_an_unserved_prefix_falls_back_to_the_plain_path(self):
+        rec = Recorder(http_error(404), 200)
+        with patch("urllib.request.urlopen", rec):
+            status = session_kv_server._post_gateway(
+                "http://gw", "/api/sessions", {"a": 1}, GATEWAY_HEADERS, 10.0
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            rec.urls, ["http://gw/p/platform/api/sessions", "http://gw/api/sessions"]
+        )
+        # The retry must keep everything else about the request.
+        self.assertEqual(rec.bodies[1], {"a": 1})
+
+    def test_other_failures_are_not_retried(self):
+        """A repeat of a 500 is a second outage; on /chat it is a second LLM turn."""
+        rec = Recorder(http_error(500))
+        with patch("urllib.request.urlopen", rec):
+            with self.assertRaises(Exception):
+                session_kv_server._post_gateway(
+                    "http://gw", "/api/sessions", {"a": 1}, GATEWAY_HEADERS, 10.0
+                )
+        self.assertEqual(len(rec.urls), 1)
+
+    def test_a_second_404_is_not_retried_again(self):
+        """One fallback, not a loop: the plain path answering 404 is a real answer."""
+        rec = Recorder(http_error(404), http_error(404))
+        with patch("urllib.request.urlopen", rec):
+            with self.assertRaises(Exception):
+                session_kv_server._post_gateway(
+                    "http://gw", "/api/sessions", {"a": 1}, GATEWAY_HEADERS, 10.0
+                )
+        self.assertEqual(len(rec.urls), 2)
+
+    def test_conflict_still_counts_as_created(self):
+        """409 means the session already exists, which was always acceptable."""
+        rec = Recorder(http_error(409))
+        with patch("urllib.request.urlopen", rec):
+            self.assertTrue(
+                session_kv_server._create_gateway_session("http://gw", "k8s-evt-1", GATEWAY_HEADERS)
+            )
+
+    def test_conflict_is_not_mistaken_for_a_missing_prefix(self):
+        """409 has to reach the caller, not be retried onto `default`."""
+        rec = Recorder(http_error(409))
+        with patch("urllib.request.urlopen", rec):
+            with self.assertRaises(Exception):
+                session_kv_server._post_gateway(
+                    "http://gw", "/api/sessions", {"a": 1}, GATEWAY_HEADERS, 10.0
+                )
+        self.assertEqual(len(rec.urls), 1)
+
+
+class TriageDatabaseCase(unittest.TestCase):
+    """The temp database is shared by the whole file, so clear what we assert on."""
+
+    def setUp(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM incidents")
+                conn.execute("DELETE FROM session_metadata")
+
+    def seed_session(self, session_id):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (session_id, json.dumps({})),
+                )
+
+    def store_incident(self, chat_id, thread_id, report="the RCA"):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
+                    (chat_id, thread_id, report),
+                )
+
+
+class TestRegisterSessionRoutingReturnsChatId(TriageDatabaseCase):
+    """The caller needs the chat_id back to look the incident up afterwards."""
+
+    def test_google_chat_chat_id_is_returned(self):
+        self.seed_session("k8s-evt-1")
+        self.assertEqual(
+            session_kv_server._register_session_routing(
+                "k8s-evt-1", "google_chat", "spaces/AAAA/threads/BBBB"
+            ),
+            "spaces/AAAA",
+        )
+
+    def test_slack_chat_id_is_returned(self):
+        self.seed_session("k8s-evt-2")
+        with patch.dict(os.environ, {"SLACK_HOME_CHANNEL": "C123"}, clear=False):
+            self.assertEqual(
+                session_kv_server._register_session_routing("k8s-evt-2", "slack", "1699999.1234"),
+                "C123",
+            )
+
+    def test_an_unknown_session_returns_none(self):
+        """No row to update means no chat_id, and nothing to look up later."""
+        self.assertIsNone(
+            session_kv_server._register_session_routing(
+                "nope", "google_chat", "spaces/A/threads/B"
+            )
+        )
+
+    def test_the_returned_chat_id_is_the_one_written_to_metadata(self):
+        import sqlite3
+
+        self.seed_session("k8s-evt-3")
+        thread = "spaces/CCCC/threads/DDDD"
+        returned = session_kv_server._register_session_routing("k8s-evt-3", "google_chat", thread)
+        with sqlite3.connect(temp_db_path) as conn:
+            stored = json.loads(
+                conn.execute(
+                    "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-3",)
+                ).fetchone()[0]
+            )
+        self.assertEqual(returned, stored["chat_id"])
+        self.assertEqual(stored["thread_id"], thread)
+
+
+class TestIncidentStored(TriageDatabaseCase):
+    """A row is the one durable proof the RCA reached a human."""
+
+    def test_false_when_the_turn_delivered_nothing(self):
+        self.assertFalse(session_kv_server._incident_stored("spaces/A", "spaces/A/threads/B"))
+
+    def test_true_once_send_notification_has_written_its_row(self):
+        self.store_incident("spaces/A", "spaces/A/threads/B")
+        self.assertTrue(session_kv_server._incident_stored("spaces/A", "spaces/A/threads/B"))
+
+    def test_another_threads_incident_does_not_count(self):
+        self.store_incident("spaces/A", "spaces/A/threads/OTHER")
+        self.assertFalse(session_kv_server._incident_stored("spaces/A", "spaces/A/threads/B"))
+
+    def test_an_unreadable_database_is_not_read_as_delivered(self):
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", "/nonexistent/dir/x.db"):
+            self.assertFalse(session_kv_server._incident_stored("spaces/A", "spaces/A/threads/B"))
+
+
+class TestUndeliveredTriageIsLogged(TriageDatabaseCase):
+    """A triage that lost its report stops being indistinguishable from one that worked."""
+
+    THREAD = "spaces/A/threads/B"
+
+    def setUp(self):
+        super().setUp()
+        self.seed_session("k8s-evt-1")
+
+    def _run_trigger(self, thread_id=THREAD):
+        return [
+            patch.object(session_kv_server, "get_active_platform", return_value="google_chat"),
+            patch.object(session_kv_server, "_post_initial_alert", return_value=thread_id),
+            patch.object(session_kv_server, "_create_gateway_session", return_value=True),
+            patch.object(session_kv_server, "_start_agent_turn"),
+        ]
+
+    def _trigger(self, thread_id=THREAD):
+        patches = self._run_trigger(thread_id)
+        for p in patches:
+            p.start()
+        try:
+            session_kv_server.trigger_agent_troubleshooter(
+                "k8s-evt-1", "alert", {"reason": "Failed"}
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_turn_that_stored_no_incident_warns(self):
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as caught:
+            self._trigger()
+        self.assertTrue(
+            any("no incident stored" in line for line in caught.output),
+            f"expected a warning naming the undelivered thread, got: {caught.output}",
+        )
+
+    def test_a_delivered_turn_is_quiet(self):
+        self.store_incident("spaces/A", self.THREAD)
+        with patch.object(session_kv_server.logger, "warning") as warn:
+            self._trigger()
+        warn.assert_not_called()
+
+    def test_no_chat_thread_means_no_warning(self):
+        """An alert that never posted has no thread it could have delivered into."""
+        with patch.object(session_kv_server.logger, "warning") as warn:
+            self._trigger(thread_id=None)
+        warn.assert_not_called()
+
+
 if __name__ == "__main__":
     # Clean up temp database file on exit
     try:
