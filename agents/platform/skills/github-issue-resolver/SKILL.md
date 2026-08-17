@@ -116,9 +116,9 @@ Two callers reach this skill, and they end differently. Check `$HERMES_KANBAN_TA
   `kanban_complete(result=..., summary=...)`, or `kanban_block(kind=...)` if you
   could not finish. **Never end a card run without one of them**, whatever the
   outcome and however little there was to do: a worker that just stops exits
-  rc=0, is reaped as a `protocol_violation`, and burns one of the card's attempts
-  (`deploy/docker/patches/verify_kanban_worker_tools.py`). `result` is the only
-  field the requester receives, so put the outcome there — the issue number and
+  rc=0, is reaped as a `protocol_violation`, and burns one of the card's
+  attempts. `result` is the only field the requester receives, so put the outcome
+  there — the issue number and
   what you did, or one line saying there was nothing to do. Do **not** answer
   `[SILENT]`: the card is the channel, and a completed card notifies nobody who
   was not already subscribed.
