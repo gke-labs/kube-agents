@@ -1212,11 +1212,24 @@ S4 is where this design and the KV decomposition meet.
 
 ### 6.0 What was prototyped, and what it changed
 
-The mechanisms in 3.3–3.7 were built as a throwaway prototype before this design was finalised —
-a supervisor with the process table, criticality, backoff and cap, the status file, the probe, and
-sequential shutdown, with the lease stubbed to a file so it runs without Kubernetes. Six
-experiments; **three of them falsified something this document previously asserted**, and those
-corrections are already folded into the sections above.
+The mechanisms in 3.3–3.7 were prototyped before this design was finalised — a supervisor with the
+process table, criticality, backoff and cap, the status file, the probe, and sequential shutdown,
+with the lease stubbed to a file so it runs without Kubernetes. **Three of the experiments
+falsified something this document previously asserted**, and those corrections are folded into the
+sections above.
+
+The prototype lives in
+[`agent-process-supervisor/`](https://github.com/gke-labs/kube-agents/tree/main/docs/designs/agent-process-supervisor)
+next to this file and runs with the standard library alone:
+
+```bash
+cd docs/designs/agent-process-supervisor && python3 run_experiments.py
+```
+
+Every experiment asserts, so a non-zero exit means a claim below has stopped holding. It is
+**not wired into CI** — the timing-based cases are prototype-grade — and it is meant to be
+**deleted at S1/S2**, when its cases become the `test_leader_elect.py` additions listed under
+**Unit** below.
 
 | #   | Claim under test                                                   | Result                                                                                                                                                                    |
 | --- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1232,9 +1245,8 @@ E2 and E3 are checks against the authoritative source rather than against reason
 `defaultSurgePercent` through `intstr.GetScaledValueFromIntOrPercent` — the function the Deployment
 controller itself calls.
 
-The prototype is not proposed for the repository. Its value was in being wrong three times before
-any of this reached an implementation PR, and the cases it exercised are the ones listed under
-**Unit** below.
+Its value was in being wrong three times before any of this reached an implementation PR, and the
+cases it exercised are the ones listed under **Unit** below.
 
 **Unit.** `leader_elect.py` has four tests today —
 [`test_leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/test_leader_elect.py),
