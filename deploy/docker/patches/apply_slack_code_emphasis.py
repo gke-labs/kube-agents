@@ -48,8 +48,8 @@ asymmetry is why this reads as a formatting bug rather than a broken agent: the
 identical source renders one way in a paragraph and another in a list item.
 
 The agents cannot route around it. ``agents/platform/SOUL.md`` §0 tells every
-worker to "write standard Markdown and not Slack's own mrkdwn — ``**bold**``,
-not ``*bold*`` — because the adapter converts for you". ``**`code`**`` is
+worker to "always write standard Markdown (``**bold**``, ``[text](url)``),
+never a platform's own dialect: the adapter converts for you". ``**`code`**`` is
 standard Markdown, and backticked identifiers are required by the report-format
 stanza in ``kanban_report_format.py``, so the two rules together steer workers
 straight into this case.

@@ -454,7 +454,7 @@ the interactive pipeline.
 - The manual Chat/Slack registrations in
   [Step 5 of Method 1](#step-5-enable-google-chat--slack-integrations-manual-required-steps)
   apply to this method too.
-- Until the first `vX.Y.Z` release tag exists, keep the default `image_tag = "latest"`
+- Until the first `X.Y.Z` release tag exists, keep the default `image_tag = "latest"`
   (see the guide's image-tag note).
 
 ## Teardown & Cleanup

@@ -2150,6 +2150,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
+		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
 	}
 	var result []corev1.EnvVar
@@ -2293,7 +2294,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// APPENDED LAST, and that position is the guard, not a style choice. It is not routed
 	// through mergeEnvVars because this is the operator's own declaration rather than a
 	// default a user may replace, and one caller can in fact try: `spec.deployment.env`
-	// cannot reach this container (safeSandboxEnvOverrides copies four OTEL_* names and
+	// cannot reach this container (safeSandboxEnvOverrides copies five OTEL_* names and
 	// drops the rest), but extractAgentPluginEnvVars copies an AgentPlugin's spec.env
 	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
 	// otherwise turn the shared-state setup off for the whole agent, and the symptom —

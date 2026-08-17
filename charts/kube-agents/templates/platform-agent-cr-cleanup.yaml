@@ -1,0 +1,136 @@
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled }}
+{{- /*
+  Deletes the PlatformAgent CR and waits for its finalizer BEFORE Helm removes
+  the operator.
+
+  Without this, `helm uninstall` (and `terraform destroy`, which calls it) leaves
+  the CR stranded: the finalizer "kubeagents.x-k8s.io/finalizer" can only be
+  cleared by the operator, and Helm deletes the CR and the operator in the same
+  pass without waiting for the first to finish. The namespace then hangs in
+  Terminating. pre-delete is the one window where the operator is guaranteed to
+  still be running.
+
+  The hook is deliberately best-effort: the container exits 0 even when the wait
+  times out. A failed hook aborts the whole uninstall, which is a strictly worse
+  outcome than the stranded CR this exists to prevent.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-cr-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-cr-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["platformagents"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-cr-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-cr-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-cr-cleanup
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-cr-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  {{- /* Bounds the hook even if the pod never becomes ready; comfortably above the wait. */}}
+  activeDeadlineSeconds: {{ .Values.platformAgent.cleanupHook.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "kube-agents.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Release.Name }}-cr-cleanup
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cleanup
+          image: {{ .Values.platformAgent.cleanupHook.image | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- /*
+            The trailing `|| true` is what makes the best-effort contract above
+            real: `kubectl delete --wait` exits non-zero when the finalizer does
+            not clear within the timeout, and with backoffLimit 0 that would
+            fail the Job and abort the uninstall. It needs a shell, which is why
+            the image is not the distroless registry.k8s.io/kubectl.
+            --ignore-not-found makes an already-deleted CR a success, which is
+            the common case when the teardown tooling removed it first.
+          */}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              kubectl delete platformagent {{ .Values.platformAgent.name | quote }}
+              --namespace={{ .Release.Namespace }}
+              --ignore-not-found
+              --wait
+              --timeout={{ .Values.platformAgent.cleanupHook.timeout }}
+              || true
+          env:
+            {{- /* kubectl caches discovery under $HOME; the root filesystem is read-only. */}}
+            - name: HOME
+              value: /tmp
+          volumeMounts:
+            - name: cache
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: cache
+          emptyDir: {}
+{{- end }}

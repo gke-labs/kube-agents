@@ -19,6 +19,14 @@
 {{- end }}
 {{- end }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
+{{- /*
+  Rendered once here and used twice below — as the ConfigMap body and as the
+  input to the Deployment's checksum. Three aliases for one upstream model,
+  mirroring the kustomize base: the agent configs only ever request
+  "model-default", but a caller that names the harness ("hermes-agent") or the
+  concrete model gets routed rather than a 404 from the gateway.
+*/}}
+{{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -29,12 +37,7 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    model_list:
-      - model_name: model-default
-        litellm_params:
-          model: {{ printf "%s/%s" $provider $model }}
-    litellm_settings:
-      callbacks: {{ $callbacks }}
+    {{- $config | nindent 4 }}
 {{- if eq $provider "vertex_ai" }}
 ---
 {{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
@@ -78,8 +81,10 @@ spec:
       labels:
         app: litellm
       annotations:
-        # Roll the pods when the rendered LiteLLM config changes.
-        checksum/config: {{ printf "%s/%s/%s" $provider $model $callbacks | sha256sum }}
+        # Hashes the rendered config itself, not the inputs it was rendered
+        # from: an edit to the config template has to roll the pods too, and
+        # the subPath mount below means nothing else will deliver it.
+        checksum/config: {{ $config | sha256sum }}
     spec:
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}

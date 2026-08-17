@@ -116,8 +116,8 @@ validate_immutable_ref() {
       ;;
   esac
   if [[ ! "$ref" =~ ^[0-9a-fA-F]{40}$ ]] \
-    && [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-    print_error "Image/source ref must be a full 40-character commit SHA or a SemVer release tag (vX.Y.Z)."
+    && [[ ! "$ref" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    print_error "Image/source ref must be a full 40-character commit SHA or a pure numeric SemVer release tag (X.Y.Z, e.g. 0.1.0)."
     return 1
   fi
 }
@@ -203,6 +203,7 @@ backfill_session_kv_keys() {
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
+
   if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if [ "$PARAM_DRY_RUN" = "true" ]; then
       print_warning "Dry-run cannot verify source/image alignment because '$repo_dir' is not a Git worktree."
@@ -443,7 +444,10 @@ main() {
   write_report "SUCCESS"
 
   print_step "🎉 Upgrade Complete!"
-  echo -e "${C_GREEN}${C_BOLD}🏆  kube-agents ${PARAM_UPGRADE_MODE} upgrade completed successfully!${C_RESET}"
 }
 
-main "$@"
+if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then
+  main "$@"
+else
+  echo "ℹ️ Sourced upgrade.sh functions without executing main (KUBE_AGENTS_SOURCE_ONLY=true)." >&2
+fi

@@ -56,6 +56,24 @@ Full contract: AGENTS.md, "Pull Request Hygiene".
 
 -
 
+## Self-Review
+
+<!--
+Required: an empty section is not an answer. You are this change's first hostile
+reader, and this is where you say so. Which pass you ran, what you looked for,
+what it found, and what you did with each finding — fixed, or deliberately not,
+with the reason.
+
+"No findings" is a normal outcome and a complete answer only when you also say
+what you looked for. A reason for not fixing something is an answer when it is an
+argument about this change; "out of scope" and "will fix later" on their own are
+not.
+
+Full contract: AGENTS.md, "Pull Request Hygiene".
+-->
+
+-
+
 ## Risk & Rollout
 
 <!--

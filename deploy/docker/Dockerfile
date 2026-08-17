@@ -23,7 +23,7 @@
 #     python3 scripts/check_image_layers.py
 #
 ARG HERMES_AGENT_TAG
-ARG ENVOY_VERSION=v1.38.0
+ARG ENVOY_VERSION=v1.39.0
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 
 # Every binary in the final image must match the architecture the image ships

@@ -42,6 +42,7 @@ Mirror the provisioning steps in reverse. Full table on [Uninstall](/kube-agents
 
 ## Common gotchas
 
-- **cert-manager.** Step 03 auto-installs cert-manager (v1.14.4) unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, so you normally don't need to install it yourself. All steps are idempotent, so you can safely re-run.
+- **cert-manager.** Step 03 auto-installs cert-manager (v1.21.1) unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, so you normally don't need to install it yourself. All steps are idempotent, so you can safely re-run.
+- **cert-manager under CI.** That "unless already available" guard does not apply when `CI` is truthy. `run_deploy_step` replaces each step's verify function with a literal `false` in a pipeline (`common.sh`), so step 03 re-applies the cert-manager release manifest on every CI run, and `confirm_action` does not prompt. Where the installed version differs from the pinned one — after a version bump, or on a cluster deliberately pinned to something newer — that re-apply is an unattended in-place cert-manager change, CRDs included, on the component that issues the operator webhook's certificate. Pin cert-manager yourself, or keep the pipeline off clusters where that is not wanted.
 - **`vars.sh` collision.** If you rerun the provisioner against a different project without wiping `vars.sh`, you'll target the previous project. Delete `vars.sh` to reset.
 - **Autopilot leader election.** On GKE Autopilot, step 03 installs cert-manager with leader election disabled automatically (kube-system restrictions) — see [Prerequisites](/kube-agents/install/prerequisites/#gke-autopilot-install).

@@ -174,156 +174,46 @@ restating the claim).
 
 ### Phase 2b — Establish intent
 
-Read the PR description (`body`) and any issue it links (`gh issue view <M> --repo "$REPO"`), then
-write down, in one sentence, **what this PR claims to do**. Keep that sentence; it is the yardstick
-for Angle I and it is what tells you whether a given change belongs here at all.
+Read the PR description (`body`) and any issue it links (`gh issue view <M> --repo "$REPO"`), and
+carry both into step 3 of the skill below. On a pull request the description is also a thing that
+can be wrong: a body promising a behaviour the diff does not implement, or silent about one it
+does, is itself a finding.
 
-Two failure modes to avoid. Do not let the description talk you out of a defect — "known
-limitation, follow-up PR" in the body does not make a dropped guard correct, though it does change
-how you phrase the finding. And do not treat the description as a description of the diff: where
-the two disagree, the diff is what merges. A body that promises a behaviour the diff does not
-implement, or omits a behaviour the diff does, is itself a finding.
+### Phase 3 — Find the candidates and verify them
 
-### Phase 3 — Find candidates (ten angles)
+Run `$MAIN_ROOT/.agents/skills/review-adversarial/SKILL.md`. It is the repository's review method
+and the canonical home for the ten angles and the verification discipline; read it now and work it
+in order — intent, angles A–J, then the verification step, which is not optional.
 
-Work through all ten angles below yourself, in sequence, in this context. Do not skip an angle
-because an earlier one found nothing there, and do not let one angle's conclusion suppress
-another's — if two angles flag the same line for different reasons, record both.
+Its step 1 is already satisfied: you are a subagent that did not write this change, which is the
+separation it asks for. Do not spawn another one. Start at its step 2.
 
-Each angle surfaces up to six candidates, each with a `file`, a `line`, a one-line `summary`, and a
-concrete `failure_scenario`. Pass every candidate with a nameable failure scenario through to
-Phase 4 — finders that silently drop half-believed candidates are the dominant cause of misses.
-A candidate you cannot express as a failure scenario is not yet a candidate.
+`$MAIN_ROOT` is not decoration. You are standing in the worktree, which holds the pull request's
+own content: a bare path would load the review method **from the change under review**, so a fork
+branch could edit the angles that judge it, and a branch cut before the skill existed would find no
+file at all and silently review nothing. Read it from the primary checkout, the way Phase 2 and
+Phase 4 already read the saved-review directory.
 
-**Angle A — line-by-line diff scan.** Read every hunk, line by line. Then read the enclosing
-function for each hunk — bugs in unchanged lines of a touched function are in scope, since the PR
-re-exposes or fails to fix them. For every line ask: what input, state, timing, or platform makes
-this line wrong? Inverted or wrong conditions, off-by-one, nil/undefined deref, missing `await`,
-unchecked `err`, falsy-zero checks, wrong-variable copy-paste, an error swallowed in a catch,
-unescaped regex metacharacters.
+Two substitutions for this context:
 
-**Angle B — removed-behavior auditor.** For every line the diff deletes or replaces, name the
-invariant it enforced, then find where the new code re-establishes it. If you cannot find it,
-that's a candidate: a removed guard, a dropped error path, a narrowed validation, a deleted test
-that was covering a real case, a loosened RBAC or NetworkPolicy rule.
+- **The diff range is the one Phase 1b settled on** — `$BASE_REF...HEAD` after a clean merge, or
+  `$BASE_REF...pr<N>` when the merge conflicted and was aborted. Never `main` on its own.
+- **Angle J already has an author to filter by**, which the skill cannot assume:
+  `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
+  review comments on any sibling touching adjacent paths.
 
-**Angle C — cross-file tracer.** For each function, template, chart value, or CRD field the diff
-changes, grep for its consumers and check whether the change breaks any of them: a new
-precondition, a changed return shape, a renamed key a manifest still reads, a timing dependency.
-Trace runtime wiring through to the source — which container an env var lands in, which process
-reads a port, which service account a binding actually grants — rather than inferring it from names.
+One thing the skill has no way to know about:
 
-**Angle D — operations and security.** This repo provisions clusters and holds credentials, so
-weigh blast radius: IAM and RBAC scope, credential handling and redaction, NetworkPolicy reach,
-what an agent is newly permitted to do, and whether a failure mode degrades or destroys. Check that
-third-party GitHub Actions are pinned to a full commit SHA with the version in a trailing comment.
+- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"`. If
+  `mergeStateStatus` is `BLOCKED` or `DIRTY`, determine _why_ — failing required checks, merely
+  `REVIEW_REQUIRED`, missing labels, or the merge conflict you already found. The `tide` check
+  usually states its reason outright. Report which it is; they mean very different things.
 
-**Angle E — reuse.** The angles above hunt for bugs; this one and the next two hunt for cleanup in
-the changed code. Flag new code that re-implements something the codebase already has — grep shared
-and adjacent modules, and name the existing helper to call instead.
+The skill's step 6 does not apply: dispositions belong to the author, and you fix nothing here. Its
+"single confident first pass" constraint does, and it covers the saved file, the PR comment, and
+your report back — everywhere.
 
-**Angle F — simplification and efficiency.** Flag unnecessary complexity the diff adds: redundant
-or derivable state, copy-paste with slight variation, deep nesting, dead code left behind. And
-wasted work: repeated I/O, independent operations run sequentially, blocking work added to startup
-or a hot path. Name the simpler or cheaper form that does the same job.
-
-**Angle G — altitude.** Check that each change sits at the right depth rather than being a fragile
-bandaid. Special cases layered onto shared infrastructure are a sign the fix isn't deep enough —
-prefer generalizing the underlying mechanism.
-
-**Angle H — conventions and docs.** Read the `AGENTS.md` / `CLAUDE.md` files that govern the changed
-code: the repo root, plus any in a directory that is an ancestor of a changed file (a directory's
-file only applies at or below it). Flag a violation only when you can quote the exact rule and the
-exact line that breaks it — no style preferences, no "spirit of the doc" inferences. Name the file
-and quote the rule so the report can cite it. This is also where docs drift belongs: one canonical
-home per fact, generated `<!-- BEGIN GENERATED -->` regions regenerated rather than hand-edited,
-identifiers verified against source rather than against other docs.
-
-**Angle I — scope and test coverage.** Hold the diff against the intent sentence from Phase 2b.
-Flag changes that do not serve it: an unrelated refactor riding along, a dependency bump nobody
-asked for, a behaviour change buried in a PR described as a rename, reformatting that inflates the
-diff and hides the real hunks. Repo convention is scoped changes and no unrelated formatting, so
-cite the rule when it applies. Judge by whether a change serves the stated intent, not by how large
-it is — a big diff that does one thing is in scope, and a three-line change that does a second
-thing is not.
-
-Then check that the intent is actually tested: for each behaviour the PR claims, name the test that
-would fail if that behaviour regressed. Where there is none, the candidate is the untested
-behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
-regression test, and new error paths nothing exercises, are the usual cases.
-
-**Angle J — sibling pull requests.** Every angle so far has looked only at this PR. Widen once:
-
-```bash
-gh pr list --repo "$REPO" --author <login> --state open --json number,title,files
-```
-
-Read the review comments on any sibling that touches adjacent paths. Three things come out of this
-that nothing else in the review can see. A finding already accepted on a sibling usually applies
-here unchanged — apply it rather than rediscovering it. A near-identical PR that has diverged is
-itself a finding: name which copy carries the fix and which does not, because merge order then
-decides whether the fix survives. And where one PR is a superset of others, say so — reviewing the
-subset in isolation spends effort on a diff that may never merge.
-
-For cleanup, altitude, conventions, scope, and sibling candidates the `failure_scenario` states the concrete
-cost — what is duplicated, wasted, harder to maintain, out of scope, or which rule or untested
-behaviour is at risk — instead of a crash. Correctness bugs always outrank them when the output cap
-forces a cut.
-
-Prefer running things over reasoning about them: execute the test suites the PR touches and
-reproduce the failures you claim. Also check merge mechanics: `gh pr checks <N> --repo "$REPO"`. If
-`mergeStateStatus` is `BLOCKED` or `DIRTY`, determine _why_ — failing required checks, merely
-`REVIEW_REQUIRED`, missing labels, or the merge conflict you already found. The `tide` check usually
-states its reason outright. Report which it is; they mean very different things.
-
-### Phase 4 — Verify every claim (this phase is not optional)
-
-Dedup first: candidates pointing at the same line and the same mechanism collapse into the one with
-the most concrete failure scenario.
-
-Then take each surviving candidate and re-derive it from the source as if you were a hostile second
-reviewer trying to get it thrown out. Open the actual file and read the actual code path — do not
-re-read your own notes, and do not accept a claim because it sounded right when you wrote it.
-Confirm the mechanism, not just the conclusion: a real defect reached by an imaginary code path is
-still a wrong finding. Assign each one a verdict:
-
-- **CONFIRMED** — you can name the inputs or state that trigger it and the resulting wrong output,
-  crash, or misconfiguration. Quote the line.
-- **PLAUSIBLE** — the mechanism is real but the trigger is uncertain (timing, environment, cluster
-  state). State what would confirm it. Realistic-but-unproven is PLAUSIBLE, not REFUTED:
-  concurrency races, nil on a rare-but-reachable path (error handler, cold cache, absent optional
-  field), falsy-zero treated as missing, off-by-one on a boundary the code does not exclude, a
-  regex or allowlist that lost an anchor.
-- **REFUTED** — factually wrong (the code doesn't say that), provably impossible (show the type,
-  constant, or invariant), already handled in this diff (cite the guard), or pure style with no
-  observable effect. Quote the line that proves it.
-
-Keep CONFIRMED and PLAUSIBLE. Then rewrite the finding list so it reflects only what survived:
-
-- **Claim holds** → keep it as written.
-- **Claim holds but the mechanism, severity, line number, or blast radius is wrong** → rewrite the
-  finding to the corrected version. The finding now reads as though the corrected version is what
-  you found in the first place.
-- **REFUTED, or you cannot verify it** → delete it entirely. Do not demote it to a footnote, a
-  "worth checking" aside, or a parenthetical. If the underlying uncertainty is genuinely worth the
-  author's time, restate it as an open question in its own right, with the uncertainty stated
-  plainly in the finding body — never as a correction to something you previously asserted.
-
-Then clean up after the edit, because these are what give away a second pass:
-
-1. Re-sort findings by severity (`BLOCKER` / `HIGH` / `MEDIUM` / `LOW`) and **renumber from 1 with
-   no gaps**.
-2. Update every cross-reference between findings to the new numbers.
-3. Update any count in the prose ("three blockers") to match the surviving set.
-4. Re-read the whole document once for tense and voice consistency.
-
-**The finished review must read as a single confident first pass.** It must contain no
-"Correction", "Verification pass", "on second look", "an earlier draft said", "downgraded from",
-"initially I thought", no diff-of-claims, and no changelog of your own reasoning. The reader should
-have no way to tell that Phase 4 happened. This constraint applies to the saved file, the PR
-comment, and your report back — everywhere.
-
-### Phase 5 — Output
+### Phase 4 — Output
 
 Save the review to `$MAIN_ROOT/.claude/pr-reviews/pr-<N>-<short-slug>.md`, matching the structure of
 the files already in that directory:

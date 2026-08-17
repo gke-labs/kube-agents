@@ -143,6 +143,7 @@ identifier appears, add its source here.
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go` |
 | OTLP endpoint default, discovery candidates, and `otlpEndpointSource` values | `k8s-operator/internal/controller/telemetry.go` |
 | Registry prefix default (`REGISTRY_PREFIX`) | `k8s-operator/scripts/common.sh` |
+| GKE host-discovery label | `k8s-operator/scripts/common.sh` |
 | GitOps clone layout (`/opt/data/gitops/...`) and leases | `agents/platform/scripts/gitops_workspace.py` |
 | fleet-audit finding-id pattern and rendering caps | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
 | Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml` |
@@ -300,7 +301,7 @@ only what the title does not say.
 | `install/quickstart-gke.mdx` | Site page | One-command bootstrap of cluster, operator, and Platform Agent; what just happened; common flags. | `provision.sh`, toggles, uninstall pointer | — |
 | `install/prerequisites.md` | Site page | What must be in place before provisioning: tooling, GCP project, cert-manager, chat platform, LLM credentials. | Prerequisites | — |
 | `install/manual.md` | Site page | Installing the Platform Agent workspace into an existing Hermes-compatible harness by hand. | Copy workspace, register, wire infra | — |
-| `install/helm-and-kind.md` | Site page | Points to the canonical Helm chart and Terraform modules in `main` (published from the first `vX.Y.Z` tag) and states Kind is unsupported. | Chart/module pointers, no Kind | — |
+| `install/helm-and-kind.md` | Site page | Points to the canonical Helm chart and Terraform modules in `main` (published from the first `X.Y.Z` tag) and states Kind is unsupported. | Chart/module pointers, no Kind | — |
 | `install/uninstall.md` | Site page | Removing the agent, operator, and provisioned GCP resources; agent-only vs full teardown. | Teardown | — |
 | `deploy/index.md` | Site page | Hub for the deploy section: Docker, Kustomize, Minty, release versioning, telemetry, GitOps. | Navigation | — |
 | `deploy/kustomize.md` | Site page | What ships in `deploy/kustomize/` and what the operator lays down on top of it. | Base vs operator-created objects | — |
@@ -358,6 +359,7 @@ only what the title does not say.
 | `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set; mutually exclusive with `provision_04_gcp_iam.sh`. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
 | `terraform/modules/chat-pubsub/README.md` | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM; mutually exclusive with `provision_05_gcp_gchat.sh`. | Chat Pub/Sub, service identities, IAM | Infrastructure engineers |
 | `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (PEM import stays with `provision_10_deploy_github_minter.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
+| `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; mutually exclusive with `provision_12_gke_backup_plan.sh`, and opt-in in both paths for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
 
 ## 5. Keeping this map fresh

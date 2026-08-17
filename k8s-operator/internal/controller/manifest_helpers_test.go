@@ -382,7 +382,7 @@ func TestWithCommonLabels(t *testing.T) {
 }
 
 // TestVersionedDefaultImage pins the wiring that lets a release build change the
-// default agent image tag via -ldflags "-X ...DefaultPlatformAgentVersion=vX.Y.Z":
+// default agent image tag via -ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z":
 // overriding the variable must flow through defaultPlatformAgentImage() and the
 // credential-proxy sidecar derivation. Overriding (rather than asserting against
 // the current value) is what makes the test non-tautological — a hardcoded
@@ -392,17 +392,17 @@ func TestVersionedDefaultImage(t *testing.T) {
 	t.Setenv(credentialProxyImageEnvVar, "")
 
 	orig := DefaultPlatformAgentVersion
-	DefaultPlatformAgentVersion = "v9.9.9-test"
+	DefaultPlatformAgentVersion = "9.9.9-test"
 	t.Cleanup(func() { DefaultPlatformAgentVersion = orig })
 
-	want := "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9-test"
+	want := "ghcr.io/gke-labs/kube-agents/platform-agent:9.9.9-test"
 	if got := defaultPlatformAgentImage(); got != want {
 		t.Errorf("defaultPlatformAgentImage() = %q, want %q — the injected version must flow through at call time", got, want)
 	}
 
 	// The credential-proxy sidecar must carry the same tag as the defaulted
 	// agent image, so a versioned release rolls both together.
-	wantSidecar := "ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9-test"
+	wantSidecar := "ghcr.io/gke-labs/kube-agents/credential-proxy:9.9.9-test"
 	if got := resolveCredentialProxyImage(nil); got != wantSidecar {
 		t.Errorf("resolveCredentialProxyImage(nil) = %q, want %q", got, wantSidecar)
 	}

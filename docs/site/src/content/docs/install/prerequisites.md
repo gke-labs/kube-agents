@@ -34,10 +34,14 @@ leaves the API server dialing a port nothing is listening on; see
 
 The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+).
 
-**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.14.4 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) Install it by hand only if you are:
+**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.21.1 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) The Terraform composition `terraform/examples/full-install` installs the same version as its own `helm_release` — set `enable_cert_manager = false` there if the cluster already has it, because unlike the script it does not detect an existing install and the apply fails on the existing CRDs.
 
-- deploying into an existing cluster without the provisioning scripts ([Manual install](/kube-agents/install/manual/)), or
+Install it by hand only if you are:
+
+- deploying into an existing cluster without the provisioning scripts or Terraform ([Manual install](/kube-agents/install/manual/)), or
 - pinning a specific cert-manager version.
+
+The Helm chart on its own is the one path that never installs cert-manager: a chart that shipped a `Certificate` into a cluster without the CRDs would fail at apply time for everyone. It therefore leaves the operator's admission webhooks off (`operator.webhooks.enabled=false`) until you install cert-manager and turn them on. See the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md).
 
 ### Standard install (recommended)
 
@@ -70,7 +74,7 @@ helm install cert-manager jetstack/cert-manager \
 If Helm isn't available:
 
 ```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml
 ```
 
 On Autopilot you'll additionally need to patch the deployments to append `--leader-elect=false`. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.

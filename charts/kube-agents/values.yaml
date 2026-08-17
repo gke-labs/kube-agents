@@ -12,6 +12,57 @@ operator:
     tag: "" # defaults to Chart.appVersion
     pullPolicy: IfNotPresent
   replicaCount: 1
+  # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
+  # delete protection, mirroring k8s-operator/config/webhook. Without them the
+  # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
+  # adds on top does not.
+  webhooks:
+    # Off by default, unlike the kustomize install path. The webhooks need a
+    # serving certificate, cert-manager is what issues it, and the chart cannot
+    # install cert-manager for you: a release that shipped a Certificate into a
+    # cluster without the CRD would fail at apply time for every existing user.
+    # terraform/examples/full-install installs cert-manager and turns this on.
+    enabled: false
+    certManager:
+      # Render the self-signed Issuer, the Certificate, and the
+      # cert-manager.io/inject-ca-from annotation that fills in each webhook
+      # configuration's caBundle. This is the only certificate source the chart
+      # knows how to build, and it needs cert-manager's CRDs to already exist in
+      # the cluster.
+      #
+      # Turning it off leaves the Service, the webhook configurations, and the
+      # manager's cert mount in place and makes the certificate somebody else's
+      # job: provide a Secret named <release>-webhook-certs holding tls.crt and
+      # tls.key valid for <release>-webhook-service.<namespace>.svc, and inject
+      # the matching caBundle into both webhook configurations. Neither is
+      # rendered here, so a mistake cannot fail the install — and under the
+      # default failurePolicy of Ignore it does not fail admission either: the
+      # API server's call to the webhook fails and the object is admitted
+      # anyway, with validation and defaulting silently skipped. Set
+      # failurePolicy=Fail if you want a broken certificate to surface as
+      # rejected admissions instead.
+      enabled: true
+    # What the API server does when the webhook is unreachable.
+    #
+    # `Ignore` here where the kustomize copy says `Fail`, and the reason is Helm's
+    # apply order rather than a difference of opinion about safety. Helm applies
+    # Mutating/ValidatingWebhookConfiguration before both the Certificate and the
+    # PlatformAgent CR, so on a fresh install the webhooks are registered while
+    # the operator is still waiting for a cert cert-manager has not issued yet.
+    # Under `Fail` the API server would then reject this chart's own PlatformAgent
+    # CR and the install would deadlock every time. The kustomize path does not
+    # hit this because provision_03 waits for the operator to be Available and a
+    # later step applies the CR.
+    #
+    # What `Ignore` costs: a PlatformAgent written while the operator is down is
+    # admitted without the webhook's defaulting and validation. The CRD's CEL
+    # rules and OpenAPI defaults still apply, and the operator's own fallbacks
+    # cover the fields the mutating webhook would have set.
+    #
+    # Set `Fail` for the kustomize guarantee. It is safe in a release that does
+    # not also create the CR (platformAgent.enabled=false), and after the first
+    # install once the operator is serving.
+    failurePolicy: Ignore
   resources:
     limits:
       cpu: 500m
@@ -75,6 +126,9 @@ litellm:
     # must be a region (or "global"), so override it on a zonal cluster.
     projectId: ""
     location: ""
+  # Keep in step with the kustomize base
+  # (k8s-operator/config/integrations/litellm/base/deployment.yaml); the
+  # parity check fails the build when they diverge.
   image:
     repository: ghcr.io/berriai/litellm
     tag: v1.96.2
@@ -102,11 +156,81 @@ platformAgent:
     clusterName: ""
     location: ""
     projectId: ""
+    # Hermes runtime knobs, mirroring the HERMES_* variables the provisioning
+    # scripts substitute into platform-agent.yaml.template. `null` omits the
+    # field so the CRD's own default applies — note that the script path
+    # defaults dashboardEnabled to false while the CRD defaults it to true, so
+    # set this explicitly if the two installs must agree.
+    hermes:
+      dashboardEnabled: null
+      pluginsDebug: null
+      agentHome: "" # CRD default: /opt/data
+    # Agent memory persistence. Defaults match both the CRD and the scripts'
+    # MEMORY_ENABLED / MEMORY_PROVIDER / USER_PROFILE_ENABLED defaults.
+    # Hindsight-backed providers (kube_agents_memory, hindsight) need the
+    # Hindsight API server and Postgres from
+    # k8s-operator/config/integrations/hindsight/, which only
+    # provision_13_deploy_hindsight.sh deploys — this chart does not. Selecting
+    # one here points the agent at a hindsight-api Service that a chart-only
+    # install never created. The default multiuser_memory needs none of that.
+    memory:
+      enabled: null # CRD default: false
+      provider: "" # CRD default: multiuser_memory
+      userProfileEnabled: null # CRD default: false
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent
       tag: "" # defaults to Chart.appVersion
-      pullPolicy: IfNotPresent
+      # Always, matching platform-agent.yaml.template — and load-bearing for the
+      # Terraform composition, whose image_tag defaults to "latest": under
+      # IfNotPresent a node with a cached "latest" never picks up a new build.
+      # The parity check compares this against the template.
+      #
+      # Set IfNotPresent when you pin `tag` to a release: on an immutable tag
+      # Always only adds a registry round-trip per pod start, and turns an
+      # unreachable ghcr.io during a reschedule into ImagePullBackOff instead of
+      # a start from the node's cache. See the chart README.
+      pullPolicy: Always
+    availability:
+      # Number of agent pods. `null` omits the field; the operator defaults to 1.
+      replicas: null
+      # RuntimeClass for the agent pod. Set to "gvisor" for GKE Sandbox kernel
+      # isolation — that needs the sandbox node pool
+      # k8s-operator/scripts/provision_02_gvisor_nodepool.sh creates, which has
+      # no Terraform equivalent. Empty omits the field.
+      runtimeClassName: ""
+    # Extra environment for the agent container, applied after the operator's own
+    # values so it overrides them. The case this exists for is telemetry: the
+    # operator's endpoint ladder always resolves to SOMETHING — an in-cluster
+    # collector if it discovers one, otherwise the GKE managed collector at
+    # opentelemetry-collector.gke-managed-otel — and a cluster that runs neither
+    # has no way to say "no telemetry". The exporter then retries a hostname that
+    # does not resolve for the life of the pod. Turn it off with:
+    #
+    #   env:
+    #     - name: OTEL_SDK_DISABLED
+    #       value: "true"
+    #
+    # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
+    # off switch, not the way to point at one.
+    env: []
+  # pre-delete hook that removes the PlatformAgent CR and waits for the operator
+  # to clear its finalizer, before Helm deletes the operator itself. Without it,
+  # `helm uninstall` and `terraform destroy` strand the CR and hang the namespace
+  # in Terminating — the manual "delete the CR first" step the READMEs used to
+  # require. Best-effort by design: the hook exits 0 even on timeout, because a
+  # failed pre-delete hook aborts the entire uninstall.
+  cleanupHook:
+    enabled: true
+    # Needs kubectl AND a shell: the `|| true` that keeps a wait timeout from
+    # failing the hook (and with it the whole uninstall) needs `sh -c`, which
+    # rules out the distroless registry.k8s.io/kubectl. Skew of a minor or two
+    # is fine for a delete.
+    image: alpine/k8s:1.34.9
+    # How long to wait for the finalizer to clear.
+    timeout: 120s
+    # Bounds the Job itself (image pull, scheduling) above that wait.
+    activeDeadlineSeconds: 300
   security:
     # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
     # binding must target this KSA (see the chart README); the default matches

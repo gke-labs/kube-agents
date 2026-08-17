@@ -47,7 +47,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: api
-          image: ghcr.io/vectorize-io/hindsight-api:0.8.6@sha256:3db1536d84a14a10afbd08cc8f82bf4eec03c123d950705226c999bea14ca0f0
+          image: ghcr.io/vectorize-io/hindsight-api:0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab
           ports:
             - name: http
               containerPort: 8888

@@ -12,14 +12,68 @@ spec:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
     projectId: {{ required "platformAgent.harness.projectId is required" .Values.platformAgent.harness.projectId | quote }}
+    {{- /*
+      Every optional field below goes through kube-agents.compactFields, which
+      drops null and "" but keeps `false` and `0`, and which renders nothing at
+      all when the whole group is unset — so the parent key disappears with its
+      children instead of being guarded by a hand-maintained `or`.
+    */}}
+    {{- $hermes := .Values.platformAgent.harness.hermes | default dict }}
     hermes:
       apiServerSecretRef:
         name: {{ .Values.platformAgent.credentials.secretName | quote }}
         key: API_SERVER_KEY
+      {{- with include "kube-agents.compactFields" (dict
+            "dashboardEnabled" $hermes.dashboardEnabled
+            "pluginsDebug" $hermes.pluginsDebug
+            "agentHome" $hermes.agentHome) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+    {{- $memory := .Values.platformAgent.harness.memory | default dict }}
+    {{- with include "kube-agents.compactFields" (dict
+          "memoryEnabled" $memory.enabled
+          "provider" $memory.provider
+          "userProfileEnabled" $memory.userProfileEnabled) }}
+    memory:
+      {{- . | nindent 6 }}
+    {{- end }}
   deployment:
     image: {{ .Values.platformAgent.deployment.image.repository | quote }}
     tag: {{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion | quote }}
     imagePullPolicy: {{ .Values.platformAgent.deployment.image.pullPolicy }}
+    {{- $availability := .Values.platformAgent.deployment.availability | default dict }}
+    {{- with include "kube-agents.compactFields" (dict
+          "replicas" $availability.replicas
+          "runtimeClassName" $availability.runtimeClassName) }}
+    availability:
+      {{- . | nindent 6 }}
+    {{- end }}
+    {{- /*
+      The operator applies spec.deployment.env AFTER its own container env, so
+      anything set here wins. That is the only way to reach settings the operator
+      computes rather than exposes — OTEL_SDK_DISABLED being the one that matters
+      in practice, since the telemetry ladder always resolves to some endpoint and
+      a cluster with no collector otherwise retries a dead one forever.
+    */}}
+    {{- with .Values.platformAgent.deployment.env }}
+    env:
+      {{- /*
+        `value` is quoted rather than passed through toYaml because the CRD types
+        it as a string: `--set ...value=true` yields a YAML boolean, which the API
+        server rejects. valueFrom is a structured EnvVarSource, so it goes through
+        untouched.
+      */}}
+      {{- range . }}
+      - name: {{ .name | quote }}
+        {{- if hasKey . "value" }}
+        value: {{ .value | quote }}
+        {{- end }}
+        {{- with .valueFrom }}
+        valueFrom:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
     {{- with .Values.platformAgent.security.serviceAccountAnnotations }}

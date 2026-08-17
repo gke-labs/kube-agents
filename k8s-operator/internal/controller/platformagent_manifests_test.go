@@ -967,6 +967,19 @@ func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesOtelSdkDisabled(t *testing.T) {
+	// The chart documents OTEL_SDK_DISABLED as the off-switch for clusters
+	// with no OTLP collector, where the exporter otherwise retries an
+	// unresolvable hostname for the life of the pod. Off the allowlist the
+	// documented recipe renders, validates, and silently does nothing.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "OTEL_SDK_DISABLED", Value: "true"},
+	})
+	if len(got) != 1 || got[0].Name != "OTEL_SDK_DISABLED" || got[0].Value != "true" {
+		t.Fatalf("expected OTEL_SDK_DISABLED to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without

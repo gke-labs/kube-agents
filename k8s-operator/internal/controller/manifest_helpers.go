@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	// DefaultPlatformAgentVersion is injected at build time via -ldflags "-X ...DefaultPlatformAgentVersion=vX.Y.Z"
+	// DefaultPlatformAgentVersion is injected at build time via -ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z"
 	// or defaults to "latest" during local development.
 	DefaultPlatformAgentVersion = "latest"
 )

@@ -35,6 +35,11 @@ resource "google_container_cluster" "autopilot" {
 
   enable_autopilot    = true
   deletion_protection = var.deletion_protection
+  resource_labels     = var.resource_labels
+
+  # Matches provision_01's --enable-fqdn-network-policy. Autopilot always runs
+  # Dataplane V2, so the script's --enable-dataplane-v2 needs no counterpart.
+  enable_fqdn_network_policy = var.enable_fqdn_network_policy
 
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
@@ -49,6 +54,25 @@ resource "google_container_cluster" "autopilot" {
     content {
       state    = "ENCRYPTED"
       key_name = google_kms_crypto_key.gke_key[0].id
+    }
+  }
+
+  # Backup for GKE. provision_01_gcp_cluster.sh creates its cluster with
+  # `--addons=GcpFilestoreCsiDriver,BackupRestore`, so the agent is installed
+  # on a backup-capable cluster either way; the gke-backup-plan module (and
+  # provision_12_gke_backup_plan.sh) then schedules the backups themselves.
+  # The agent has to be enabled on the cluster before a BackupPlan can
+  # target it.
+  #
+  # Only the BackupRestore half is mirrored. Nothing in the harness mounts a
+  # Filestore volume, and this module builds an Autopilot cluster, where
+  # `gcloud container clusters create-auto` has no --addons flag to pass either
+  # half. Recorded in the divergence lists that
+  # .agents/skills/review-iac-parity/SKILL.md and scripts/check_iac_parity.py
+  # share.
+  addons_config {
+    gke_backup_agent_config {
+      enabled = var.enable_backup_agent
     }
   }
 

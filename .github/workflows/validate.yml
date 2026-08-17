@@ -55,6 +55,9 @@ jobs:
       - name: Check chart CRD/RBAC copies are in sync
         run: make chart-check
 
+      - name: Check the install surfaces agree
+        run: make iac-parity-check
+
       - name: Validate Helm Chart
         run: |
           # clusterName/location/projectId are required values with no
@@ -73,6 +76,102 @@ jobs:
           # Rendering without the required values must fail.
           if helm template test-release charts/kube-agents > /dev/null 2>&1; then
             echo "expected 'required' guards to fail the render" >&2
+            exit 1
+          fi
+
+          # kube-agents.compactFields keeps `false` and `0` — the whole reason
+          # it exists over `with`, and the one thing here no other check covers.
+          # A regression drops an explicit `dashboardEnabled: false` from the CR,
+          # the CRD default of `true` applies, and the render stays valid YAML:
+          # lint passes, iac-parity-check passes (it reads values.yaml, not the
+          # render), and the dashboard comes up on an install that asked for it
+          # off.
+          # --show-only isolates the CR: `memory:` also appears in every
+          # resources block, and matching one of those would make this pass for
+          # the wrong reason.
+          rendered=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --show-only templates/platform-agent-cr.yaml \
+            --set platformAgent.harness.hermes.dashboardEnabled=false \
+            --set platformAgent.harness.memory.enabled=false \
+            --set platformAgent.deployment.availability.replicas=0)
+          for expected in "dashboardEnabled: false" "memoryEnabled: false" "replicas: 0"; do
+            if ! grep -qF "$expected" <<<"$rendered"; then
+              echo "compactFields dropped '$expected' from the rendered CR" >&2
+              exit 1
+            fi
+          done
+
+          # ...and the parent key disappears when every child is unset, which is
+          # what lets callers write `{{- with (include ...) }}`. hermes is not in
+          # this list: it carries a mandatory apiServerSecretRef and so always
+          # renders — only the optional fields inside it are compacted.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --show-only templates/platform-agent-cr.yaml \
+            | grep -qE "^\s+(memory|availability):"; then
+            echo "an all-unset parent block still rendered" >&2
+            exit 1
+          fi
+
+          # Webhooks: off by default, fully wired when on.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            | grep -qE "WebhookConfiguration|kind: Certificate"; then
+            echo "webhook objects rendered while operator.webhooks.enabled=false" >&2
+            exit 1
+          fi
+          webhooks=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set operator.webhooks.enabled=true)
+          for expected in \
+            "kind: MutatingWebhookConfiguration" \
+            "kind: ValidatingWebhookConfiguration" \
+            "kind: Certificate" \
+            "kind: Issuer" \
+            "cert-manager.io/inject-ca-from:" \
+            "containerPort: 10250" \
+            "/tmp/k8s-webhook-server/serving-certs"; do
+            if ! grep -qF "$expected" <<<"$webhooks"; then
+              echo "webhook render is missing '$expected'" >&2
+              exit 1
+            fi
+          done
+          if ! grep -qF 'value: "true"' <<<"$(grep -A1 ENABLE_WEBHOOKS <<<"$webhooks")"; then
+            echo "ENABLE_WEBHOOKS did not follow operator.webhooks.enabled" >&2
+            exit 1
+          fi
+
+          # failurePolicy=Fail on a fresh install that also creates the CR
+          # deadlocks (Helm registers the webhooks before the operator holds a
+          # certificate), so the chart must refuse to render it.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set operator.webhooks.enabled=true \
+            --set operator.webhooks.failurePolicy=Fail > /dev/null 2>&1; then
+            echo "expected the fresh-install failurePolicy=Fail guard to fire" >&2
+            exit 1
+          fi
+          # The same combination is fine without the CR, and on an upgrade.
+          helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set operator.webhooks.enabled=true \
+            --set operator.webhooks.failurePolicy=Fail \
+            --set platformAgent.enabled=false > /dev/null
+          helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set operator.webhooks.enabled=true \
+            --set operator.webhooks.failurePolicy=Fail --is-upgrade > /dev/null
+
+          # The pre-delete cleanup hook: on by default, gone when disabled, and
+          # carrying the `|| true` that keeps a wait timeout from failing the
+          # hook and aborting the uninstall — the hook's whole contract.
+          hook=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}")
+          for expected in \
+            "helm.sh/hook: pre-delete" \
+            "|| true"; do
+            if ! grep -qF "$expected" <<<"$hook"; then
+              echo "cleanup hook render is missing '$expected'" >&2
+              exit 1
+            fi
+          done
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set platformAgent.cleanupHook.enabled=false \
+            | grep -qF "helm.sh/hook: pre-delete"; then
+            echo "cleanup hook rendered while platformAgent.cleanupHook.enabled=false" >&2
             exit 1
           fi
 

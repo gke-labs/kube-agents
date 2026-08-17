@@ -103,18 +103,37 @@ FORMAT_MARKER = "## Report format"
 #: Appended to a new card's ``body`` when it says nothing about report shape.
 #: Written as instructions to the worker, in the second person, because that is
 #: what the rest of a card body is and the model reads the whole thing as one
-#: brief. Every rule here is one the detector below can actually measure, so the
-#: card, the schema wording and the delivery log all describe the same contract.
+#: brief. Everything the detector below measures is stated here, so the card,
+#: the schema wording and the delivery log never describe different contracts.
+#: The reverse does not hold: the lead-with-the-answer, `###`, length and link
+#: rules are stated and not measured, because they came from ``SOUL.md`` §7 and
+#: this stanza travels *in* the task text, where the persona does not. Measuring
+#: them would mean new defect classes and a louder delivery log for something no
+#: reader has yet called wrong — the WARNING tier stays where the evidence is.
 REPORT_FORMAT_STANZA = """\
 ## Report format
 
 Put the full answer in `result` as standard Markdown — the gateway posts it
-verbatim into the requester's chat thread, where Slack renders it as blocks:
+verbatim into the requester's chat thread, where Slack renders it as blocks
+and Google Chat flattens headings to bold, drops tables, and splits anything
+past 4000 characters across messages:
 
-- Open with one sentence saying what happened, then give the detail.
-- Use `##` and `###` for sections. Never `#` — the chat message already shows
-  the card title, so an H1 renders as a second, duplicate banner.
-- Put tabular data in a Markdown pipe table with a `---` separator row.
+- Lead with the answer: what is true, or what is wrong and what you want done.
+  Then the detail. Do not narrate the request back or how you investigated.
+- Use `##` for sections. Never `#` — the chat message already shows the card
+  title, so an H1 renders as a second, duplicate banner — and no `###`: Google
+  Chat flattens every level to bold, so a sub-level is invisible there. If you
+  are triaging an incident, SOUL.md §7 fixes the sections; use exactly those.
+- Aim under 2,000 characters. Past 4,000 Google Chat delivers your report as
+  several messages rather than one, so if the deliverable is genuinely longer,
+  publish it, link it, and keep `result` to the headline findings and that
+  link. Never drop a finding to fit.
+- Link every artifact you name — cluster, workload, card, PR, issue, console
+  view — as `[text](url)`. Both platforms convert it; a bare id is clickable on
+  neither.
+- Put tabular data in a Markdown pipe table with a `---` separator row, but
+  keep it to a few short columns and never let the table be the only place a
+  fact lives — Google Chat drops it.
 - Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
 - Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
   renders those as flat text.\
@@ -186,21 +205,24 @@ SERIOUS_DEFECTS = ("top-level-heading", "ascii-substitute")
 #: act on it.
 DEFECT_ADVICE = {
     "top-level-heading": (
-        "`result` starts a line with `#`. If that is a heading, use `##` or "
-        "`###` instead — the chat message already carries this card's title, so "
-        "an H1 renders as a second banner saying the same thing. If it is a "
-        "comment in a manifest, diff or script, put that block in a ``` fence: "
+        "`result` starts a line with `#`. If that is a heading, use `##` "
+        "instead — the chat message already carries this card's title, so an H1 "
+        "renders as a second banner saying the same thing. If it is a comment "
+        "in a manifest, diff or script, put that block in a ``` fence: "
         "unfenced, it renders as a wall of text and its first comment reads as "
         "a heading. Do not delete the `#` in that case."
     ),
     "ascii-substitute": (
         "`result` marks its sections with `=== Title ===` or ALL-CAPS numbering "
         "and has no real Markdown. Slack renders that as flat text. Use `##` "
-        "headings, and a pipe table with a `---` separator row for tabular data."
+        "headings. A pipe table with a `---` separator row is fine for a few "
+        "short columns, but Google Chat drops tables, so never let one be the "
+        "only place a fact lives."
     ),
     "heading-without-prose": (
-        "`result` is a heading over a bare list. Open with one sentence saying "
-        "what happened, then the list."
+        "`result` is a heading over a bare list. Put the answer on the first "
+        "line — what is true, or what is wrong and what you want done — then "
+        "the list. One line, not a preamble."
     ),
     "unquoted-numerics": (
         "`result` has raw values outside backticks. Wrap ids, paths, epochs, "

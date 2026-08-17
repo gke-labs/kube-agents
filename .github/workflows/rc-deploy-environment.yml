@@ -58,7 +58,6 @@ jobs:
           IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
@@ -70,7 +69,6 @@ jobs:
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
-          MEMORY_ENABLED: ${{ vars.MEMORY_ENABLED }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
         run: ./scripts/release/validate_and_log_deploy_summary.sh
@@ -99,7 +97,6 @@ jobs:
           IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
@@ -110,7 +107,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
-          MEMORY_ENABLED: ${{ vars.MEMORY_ENABLED }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
         run: ./scripts/release/provision_rc_environment.sh

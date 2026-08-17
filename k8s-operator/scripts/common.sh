@@ -37,6 +37,10 @@ else
   C_WHITE='\033[97m'
 fi
 
+# Stable project-level discovery marker for the GKE cluster hosting kube-agents.
+# Keep this value aligned with the Terraform full-install composition and admin portal.
+KUBE_AGENTS_HOST_LABEL="kube-agents-host"
+
 # ─── UI Helpers ───────────────────────────────────────────────────────────────
 print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>>  $1  <<<${C_RESET}"; }
 print_success() { echo -e "  ${C_GREEN}✓ $1${C_RESET}"; }
@@ -686,6 +690,29 @@ cluster_exists() {
   gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }
 
+host_label_value() {
+  gcloud container clusters describe "$CLUSTER_NAME" \
+    --location="$REGION" \
+    --project="$PROJECT_ID" \
+    --format="value(resourceLabels.${KUBE_AGENTS_HOST_LABEL})" 2>/dev/null
+}
+
+verify_host_label() {
+  [ "$(host_label_value)" = "true" ]
+}
+
+update_host_label() {
+  gcloud container clusters update "$CLUSTER_NAME" \
+    --location="$REGION" \
+    --project="$PROJECT_ID" \
+    --update-labels="${KUBE_AGENTS_HOST_LABEL}=true" \
+    --quiet
+}
+
+execute_host_label() {
+  retry 3 5 update_host_label
+}
+
 connect_cluster() {
   print_info "Fetching cluster credentials..."
   gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
@@ -746,6 +773,29 @@ wait_for_k8s_resource() {
   # Step 2: Wait for condition availability
   kubectl wait --for="condition=${condition}" "${resource}" -n "${namespace}" --timeout="${timeout}" || return 1
   print_success "${resource} reached state: ${condition}."
+}
+
+register_host_label() {
+  print_step "3. Register kube-agents host"
+  print_info "Verifying current state..."
+
+  if verify_host_label; then
+    print_success "Already completed: 3. Register kube-agents host"
+    return 0
+  fi
+
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[DRY-RUN] Would execute: 3. Register kube-agents host"
+    return 0
+  fi
+
+  print_info "Applying ${KUBE_AGENTS_HOST_LABEL}=true to '${CLUSTER_NAME}'..."
+  if execute_host_label; then
+    print_success "Registered the kube-agents host."
+  else
+    print_warning "Could not apply ${KUBE_AGENTS_HOST_LABEL}=true. Provisioning will continue; rerun step 08 to retry host discovery registration."
+  fi
+  return 0
 }
 
 confirm_action() {

@@ -20,7 +20,7 @@ roles explicitly.
 
 ```hcl
 module "kube_agents_iam" {
-  source             = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/kube-agents-iam?ref=vX.Y.Z"
+  source             = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/kube-agents-iam?ref=1.2.0"
   project_id         = "my-gcp-project"
   service_account_id = "kubeagents-platform-gsa"
   namespace          = "kubeagents-system"

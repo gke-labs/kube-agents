@@ -449,7 +449,7 @@ It adds exactly two workloads to `kubeagents-system`.
 
 **1. `hindsight-api` — a `Deployment`, one replica** (`api.yaml`).
 
-- Image `ghcr.io/vectorize-io/hindsight-api:0.8.6`, pinned by digest.
+- Image `ghcr.io/vectorize-io/hindsight-api:0.9.1`, pinned by digest.
 - Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;
   `/health` backs both probes. Liveness waits 30s because model loading dominates
   cold start.

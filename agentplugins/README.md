@@ -64,6 +64,11 @@ patterns it implements — `**/name`, anchored paths, `*` and `?` within a path 
 it refuses a `.dockerignore` that uses anything else (`!` re-includes, a `**` anywhere but
 the front) rather than matching it differently from Docker.
 
+A source tree may hold only regular files and directories, and an installer refuses one
+that does not. A symlink is the case worth naming: it lands in the layer but not in the
+digest, so re-pointing one would change the image without changing the tag — and the two
+builders do not agree on what it becomes in the first place.
+
 Two defaults are load-bearing:
 
 - **Artifact Registry, not `gcr.io`.** Container Registry is deprecated and its hosts are
@@ -112,8 +117,15 @@ Two defaults are load-bearing:
 | Kind             | Where                                  | Needs a cluster |
 | ---------------- | -------------------------------------- | --------------- |
 | Unit             | `<plugin>/tests/test_*.py`             | no              |
+| Shared library   | `lib/tests/test_plugin_image.py`       | no              |
 | Live deployment  | `<plugin>/tests/*_e2e_test.py`         | yes             |
 | Manual scenarios | `gke-stockout-investigator/scenarios/` | yes             |
+
+The shared-library suite shells out to bash and covers the parts of
+[`lib/plugin_image.sh`](lib/plugin_image.sh) whose failures are silent: the `.dockerignore`
+matcher, the content tag moving when it should and standing still when it should not, and
+the registry discovery. It lives under `lib/tests/` so the same CI loop that discovers
+`<plugin>/tests/` picks it up.
 
 A live-deployment test installs what it tests by running the plugins' own `install.sh`
 first, so what it exercises is the chart in this repository rather than whatever happens

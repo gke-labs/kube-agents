@@ -24,6 +24,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 - **Branch location.** Push PR branches to your fork, not to the upstream repository.
 - **PR template.** Use [`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/gke-labs/kube-agents/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Don't use `--fill` with `gh pr create` — it bypasses the template.
 - **Live validation.** Every PR describes how the change was exercised against a real, running installation. See [Live validation](#live-validation) below.
+- **Self-review.** Every PR arrives already reviewed by its author, and says what that review found. See [Self-review](#self-review) below.
 
 ## Local validation
 
@@ -86,6 +87,24 @@ What that section should say:
 - **Cleanup.** Remove test artifacts, restore prior state, and note anything left behind.
 
 Some changes can't reach a running installation — docs-only edits, CI workflow changes, code paths that need infrastructure you don't have. Write "Not live-tested" and say why. An empty section is not an answer.
+
+## Self-review
+
+Nobody reads a change as cheaply as the person who wrote it, and right now the first hostile reader of most pull requests here is a reviewer who has never seen the code. So every pull request is reviewed by its author first, and the template's **Self-Review** section says what that pass found.
+
+[`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this requirement in full and is canonical; what follows summarises it, so trust it over this page if the two ever differ.
+
+The method is the repository's own review skill, [`.agents/skills/review-adversarial/SKILL.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/skills/review-adversarial/SKILL.md) — run it against your branch diff with whatever agent you use. It works ten angles over the change, then re-derives each candidate from the source as a hostile second reader and throws out what it cannot defend.
+
+Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it.
+
+What the section should say:
+
+- **What you looked for**, in the skill's terms — which angles you ran, and which you could not.
+- **What it found, and where each finding ended up.** Fixed, naming the commit or hunk; or deliberately not fixed, with a reason. A reason is an argument about this change — the path is unreachable for a stated invariant, the fix belongs to the issue you just filed. "Out of scope" or "will fix later" alone is not.
+- **Nothing you cannot back.** A self-review the diff contradicts is worse than no self-review: it spends the reviewer's trust before they reach the code.
+
+"No findings" is an ordinary outcome on a good change and costs you nothing — provided you also say what you looked for. A pass that names none of its angles is indistinguishable from no pass at all.
 
 ## Code review
 

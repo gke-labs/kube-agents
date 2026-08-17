@@ -35,6 +35,11 @@ __pycache__/
 !*.tfvars.example
 terraform.tfvars.json
 
+# Terraform override files are environment-local by convention: lifecycle.sh
+# writes (and normally removes) providers_lifecycle_override.tf mid-import,
+# and a user's backend override belongs to their environment, not the example.
+*_override.tf
+
 # Local helm package output
 *.tgz
 

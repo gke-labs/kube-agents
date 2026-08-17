@@ -3,10 +3,11 @@
 # 🤖 Step 8: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
 # Idempotent script that connects to GKE, renders the platform-agent.yaml
-# template, deploys it to the cluster, and fails unless the operator reconciles
-# the change into the agent Deployment (override the wait budget with
-# AGENT_READY_TIMEOUT, default 600s). Whether the Deployment then rolls out is
-# verified by step 13, after the agent's dependencies exist.
+# template, deploys it to the cluster, labels the host cluster for discovery,
+# and fails unless the operator reconciles the change into the agent Deployment
+# (override the wait budget with AGENT_READY_TIMEOUT, default 600s). Whether the
+# Deployment then rolls out is verified by step 13, after the agent's
+# dependencies exist.
 # ==============================================================================
 
 set -e
@@ -216,6 +217,7 @@ execute_custom_resource() {
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_step "2. Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
+register_host_label
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
 echo -e "\n${C_GREEN}${C_BOLD}✓ PlatformAgent Custom Resource applied and reconciled by the operator!${C_RESET}"

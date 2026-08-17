@@ -2,8 +2,8 @@
 # ==============================================================================
 # 🧹 Step 8: Teardown PlatformAgent Custom Resource
 # ==============================================================================
-# Idempotent script to clean up the applied PlatformAgent Custom Resource (CR)
-# and delete the local generated manifest file.
+# Idempotent script to clean up the applied PlatformAgent Custom Resource (CR),
+# remove the host-discovery label, and delete the local generated manifest file.
 # ==============================================================================
 
 set -euo pipefail
@@ -23,7 +23,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 ensure_teardown_state
 
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
-confirm_action "This will permanently delete the PlatformAgent Custom Resource and its generated manifest file." \
+confirm_action "This will permanently delete the PlatformAgent Custom Resource and its generated manifest file, and remove the host-discovery label." \
   "GCP Project:$PROJECT_ID" \
   "GKE Cluster:$CLUSTER_NAME" \
   "Namespace:$NAMESPACE"
@@ -72,6 +72,34 @@ if [ -f "$local_yaml" ]; then
     rm -f "$local_yaml"
     echo -e "  ${C_GREEN}✓ Deleted platform-agent.yaml${C_RESET}"
   fi
+fi
+
+# ─── Step 4: Remove Host Discovery Label ──────────────────────────────────────
+label_cleanup_failed=0
+if ! HOST_LABEL=$(host_label_value); then
+  print_warning "Could not inspect the '${KUBE_AGENTS_HOST_LABEL}' cluster label; verify it manually."
+  label_cleanup_failed=1
+elif [ "$HOST_LABEL" = "true" ]; then
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    echo -e "  ${C_GREEN}[DRY-RUN] Would remove the '${KUBE_AGENTS_HOST_LABEL}' cluster label.${C_RESET}"
+  else
+    print_info "Removing the '${KUBE_AGENTS_HOST_LABEL}' cluster label..."
+    if gcloud container clusters update "$CLUSTER_NAME" \
+      --location="$REGION" \
+      --project="$PROJECT_ID" \
+      --remove-labels="$KUBE_AGENTS_HOST_LABEL" \
+      --quiet; then
+      print_success "Removed the kube-agents host label."
+    else
+      print_warning "Could not remove the '${KUBE_AGENTS_HOST_LABEL}' label; remove it manually."
+      label_cleanup_failed=1
+    fi
+  fi
+fi
+
+if [ "$label_cleanup_failed" -eq 1 ]; then
+  print_error "PlatformAgent teardown completed with warnings; review the messages above."
+  exit 1
 fi
 
 echo -e "\n${C_GREEN}${C_BOLD}✅ PlatformAgent Custom Resource successfully cleaned up!${C_RESET}"

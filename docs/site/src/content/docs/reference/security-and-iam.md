@@ -51,7 +51,7 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 
 ## GCP IAM permission sets
 
-`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`). Both entry points choose from the same three: the provisioner prompts for it, and the zero-friction installer asks the same question — or takes `--permission-set` / `--custom-roles` — before writing `vars.sh`. `read-only` is the default in both:
+`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`). All three entry points choose from the same sets, and `read-only` is the default in each: the provisioner prompts for it; the zero-friction installer asks the same question — or takes `--permission-set` / `--custom-roles` — before writing `vars.sh`; and the Terraform composition takes the same three values in a `permission_set` variable in `terraform.tfvars`, with `custom` requiring a `project_roles` list (setting `project_roles` explicitly overrides `permission_set` either way).
 
 | Permission set | `PLATFORM_AGENT_PERMISSION_SET` | Use it when                                                    |
 | -------------- | ------------------------------- | -------------------------------------------------------------- |

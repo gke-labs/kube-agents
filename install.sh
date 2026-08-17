@@ -31,10 +31,12 @@ configure_colors
 
 # ─── Process Lock File & Error Trap Handling ────────────────────────────────
 LOCK_FILE="/tmp/kube-agents-install.lock"
-if command -v flock >/dev/null 2>&1 && exec 200>"$LOCK_FILE" 2>/dev/null; then
-  if ! flock -n 200 2>/dev/null; then
-    echo -e "  \033[93m⚠ Another instance of kube-agents installer is currently running. Exiting.\033[0m" >&2
-    exit 1
+if command -v flock >/dev/null 2>&1; then
+  if ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
+    if ! flock -n 200 2>/dev/null; then
+      echo -e "  \033[93m⚠ Another instance of kube-agents installer is currently running. Exiting.\033[0m" >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -96,6 +98,7 @@ Flags for AI Agents & Automation:
                                 currently platform-agent-host)
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | chatgpt | openai
                                 (default: gemini)
+  --model-default-name=NAME     Default model name for the provider
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
   --vertex-location=REGION      Vertex AI serving location (default: --region)
   --gemini-api-key=KEY          Gemini API Key
@@ -108,6 +111,7 @@ Flags for AI Agents & Automation:
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
+  --user-profile-enabled=BOOL   Enable user profile persona extensions (default: false)
   --memory=MODE                 Long-term agent memory: file | hindsight | off
                                 (default: file)
                                   file      SMALL / PERSONAL deployments, and the default —
@@ -129,6 +133,9 @@ Flags for AI Agents & Automation:
   --registry-prefix=PATH        Container registry path without a URL scheme
   --allow-unverified-source     Provision from a dirty or mismatched checkout (local script edits
                                 are applied even though the deployed image was built elsewhere)
+  --enable-google-chat          Enable Google Chat integration
+  --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat (default: platform-agent-chat-events)
+  --google-chat-mode=MODE       Google Chat output mode: default | debug (default: default)
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
   -h, --help, -?                Show this help message
 EOF
@@ -144,6 +151,7 @@ parse_args() {
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
+      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
@@ -156,11 +164,14 @@ parse_args() {
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
       --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
       --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --user-profile-enabled=*) PARAM_USER_PROFILE_ENABLED="${1#*=}"; shift ;;
       --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
       --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
+      --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+      --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
       -h|--help|-\?|help) show_help; exit 0 ;;
       *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
     esac
@@ -226,7 +237,8 @@ define_print_helpers
 # own, before any checkout exists, so the source is guarded: in that case the
 # workspace step clones the repository and provision_01 enforces the same
 # minimum a few steps later.
-_min_versions="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/k8s-operator/scripts/min_versions.sh"
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+_min_versions="${_script_dir}/k8s-operator/scripts/min_versions.sh"
 if [ -r "$_min_versions" ]; then
   # CI runs shellcheck without -x, so the source= hint alone still raises
   # SC1091 for a file it was not handed as input.
@@ -250,8 +262,8 @@ validate_immutable_ref() {
       ;;
   esac
   if [[ ! "$ref" =~ ^[0-9a-fA-F]{40}$ ]] \
-    && [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-    print_error "Image/source ref must be a full 40-character commit SHA or a SemVer release tag (vX.Y.Z)."
+    && [[ ! "$ref" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    print_error "Image/source ref must be a full 40-character commit SHA or a pure numeric SemVer release tag (X.Y.Z, e.g. 0.1.0)."
     return 1
   fi
 }
@@ -382,7 +394,12 @@ acquire_source_repo() {
   local dest_var="$1"
   local expected_ref="$2"
   local resolved_dir=""
-  if [ -f "k8s-operator/scripts/provision.sh" ]; then
+  local script_dir=""
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/k8s-operator/scripts/provision.sh" ]; then
+    resolved_dir="$script_dir"
+    print_success "Using repository directory: $resolved_dir"
+  elif [ -f "k8s-operator/scripts/provision.sh" ]; then
     resolved_dir="$(pwd)"
     print_success "Using current repository directory: $resolved_dir"
   else
@@ -1195,8 +1212,13 @@ main() {
   if [ -z "$allowed_users" ]; then
     allowed_users_hint="empty list"
   fi
-  local chat_topic_name="platform-agent-chat-events"
-  local chat_sub_name="platform-agent-chat-events-sub"
+  local chat_topic_name="${PARAM_CHAT_TOPIC_NAME:-${CHAT_TOPIC_NAME:-platform-agent-chat-events}}"
+  local chat_sub_name="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+  local google_chat_mode="${PARAM_GOOGLE_CHAT_MODE:-${GOOGLE_CHAT_MODE:-default}}"
+  if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
+    print_error "--google-chat-mode must be either 'default' or 'debug'."
+    exit 1
+  fi
   local slack_bot_token=""
   local slack_app_token=""
   local slack_allowed_users=""
@@ -1208,7 +1230,7 @@ main() {
       google_chat_enabled="true"
       prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
         allowed_users "$allowed_users" false "$allowed_users_hint"
-      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "platform-agent-chat-events"
+      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
       ;;
     2)
       slack_enabled="true"
@@ -1223,7 +1245,7 @@ main() {
       slack_enabled="true"
       prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
         allowed_users "$allowed_users" false "$allowed_users_hint"
-      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "platform-agent-chat-events"
+      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
       prompt_read "Slack Bot Token (xoxb-...)" slack_bot_token "" true
       prompt_read "Slack App Token (xapp-...)" slack_app_token "" true
       prompt_read "Allowed Slack User IDs / Emails (comma-separated)" slack_allowed_users "$allowed_users"
@@ -1242,8 +1264,10 @@ main() {
     print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, chatgpt, or openai."
     exit 1
   fi
-  local model_default_name=""
-  model_default_name="$(default_model_for_provider "$model_provider")"
+  local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
+  if [ -z "$model_default_name" ]; then
+    model_default_name="$(default_model_for_provider "$model_provider")"
+  fi
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
   # two are the only credentials it needs and both default to the install target.
@@ -1556,6 +1580,7 @@ main() {
   write_state_var "$vars_file" CHAT_TOPIC_NAME "$chat_topic_name"
   write_state_var "$vars_file" CHAT_SUB_NAME "$chat_sub_name"
   write_state_var "$vars_file" GOOGLE_CHAT_ENABLED "$google_chat_enabled"
+  write_state_var "$vars_file" GOOGLE_CHAT_MODE "$google_chat_mode"
   write_state_var "$vars_file" SLACK_ENABLED "$slack_enabled"
   write_state_var "$vars_file" SLACK_BOT_TOKEN "$slack_bot_token"
   write_state_var "$vars_file" SLACK_APP_TOKEN "$slack_app_token"
@@ -1575,7 +1600,7 @@ main() {
   write_state_var "$vars_file" GITHUB_PEM_PATH "$github_pem_path"
   write_state_var "$vars_file" MEMORY_ENABLED "$memory_enabled"
   write_state_var "$vars_file" MEMORY_PROVIDER "$memory_provider"
-  write_state_var "$vars_file" USER_PROFILE_ENABLED "false"
+  write_state_var "$vars_file" USER_PROFILE_ENABLED "${PARAM_USER_PROFILE_ENABLED:-${USER_PROFILE_ENABLED:-false}}"
   write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
   write_state_var "$vars_file" OPERATOR_IMAGE "${registry_prefix}/k8s-operator"
@@ -1713,4 +1738,8 @@ main() {
   fi
 }
 
-main "$@"
+if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then
+  main "$@"
+else
+  echo "ℹ️ Sourced install.sh functions without executing main (KUBE_AGENTS_SOURCE_ONLY=true)." >&2
+fi
