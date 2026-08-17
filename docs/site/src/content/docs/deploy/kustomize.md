@@ -58,6 +58,12 @@ The base [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kub
 > - **Operator Deployments**: The operator automatically discovers the real control plane endpoint IPs (from `default/kubernetes` Endpoints, `KUBERNETES_SERVICE_HOST`, and Service ClusterIP). You can supply custom CIDRs (including private fleet cluster control plane subnets like `172.16.0.0/28` and Private Service Connect VIPs) via the `kubeagents.x-k8s.io/apiserver-cidr` or `kubeagents.x-k8s.io/custom-egress-cidrs` annotation on the `PlatformAgent` CR, or the `KUBERNETES_API_SERVER_CIDR` environment variable on the operator deployment. To enable strict domain-level FQDN egress filtering on Dataplane V2 in operator mode, set the annotation `kubeagents.x-k8s.io/enable-fqdn-network-policy: "true"` on the `PlatformAgent` CR so the operator omits the blanket `0.0.0.0/0:443` IP rule.
 > - **Static Kustomize Deployments**: When deploying with Kustomize, override the API server CIDR by patching the dedicated `platform-agent-apiserver-egress` policy directly.
 
+> [!IMPORTANT]
+> **Workload Identity metadata egress**: The same DNAT applies to the metadata server, on every GKE datapath rather than only Dataplane V2. A pod dials `169.254.169.254:80`, and the node rewrites that to the node-local metadata daemon on TCP `988` before `NetworkPolicy` is evaluated — to `169.254.169.252` on the iptables datapath, and to the hosting node's internal IP on Dataplane V2. A policy that permits only `169.254.169.254/32` therefore drops every Application Default Credentials token fetch, and the symptom is `gcloud` reporting "You do not currently have an active account selected" inside the pod.
+>
+> - **Operator Deployments**: The operator permits `169.254.169.252/32` and discovers each node's internal IP, refreshing the `/32` set as nodes join and leave. Nothing to configure.
+> - **Static Kustomize Deployments**: [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) ships the `169.254.169.252/32` rule, which covers the iptables datapath. On Dataplane V2 a static manifest cannot know the node addresses: patch the port-`988` rule with one `/32` per node in your overlay, or use the operator.
+
 Do **not** edit base manifests directly. If your cluster uses a different service CIDR, is a GKE Dataplane V2 cluster, is managing private-endpoint fleet clusters, or is a GKE Private Cluster with a specific Control Plane VIP range (e.g., `172.16.0.0/28`), override the CIDR cleanly in your deployment overlay using a Kustomize patch in your `kustomization.yaml`:
 
 ```yaml
@@ -134,11 +140,16 @@ The exposed ports:
 
 - `config/crd/` — the `PlatformAgent` and `AgentPlugin` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
-- `config/webhook/` — admission webhook config (validating + mutating).
+- `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager.
 - `config/integrations/github/` — Minty deployment.
-- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and a `chatgpt` overlay).
+- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and `chatgpt` and `vertex_ai` overlays).
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, and PVC.
+- `config/integrations/hindsight/` — the Chat Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `NetworkPolicy`, and `PodMonitoring`.
+
+Each is built and applied on its own; there is no aggregate kustomization over
+`config/integrations/`, because all but Hindsight need `envsubst` over the built
+output before it can be applied.
 
 Deploy these via `make deploy-*` from `k8s-operator/`:
 
@@ -147,4 +158,5 @@ make deploy                     # operator
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy
+make deploy-hindsight           # memory store
 ```

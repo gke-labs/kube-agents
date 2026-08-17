@@ -7,7 +7,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 ## Local tooling
 
-- **Google Cloud SDK** (`gcloud`) — [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`.
+- **Google Cloud SDK** (`gcloud`) — **576.0.0 or newer**, [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`. Cluster creation enables Managed OpenTelemetry with `--managed-otel-scope`, which reached GA in gcloud 576.0.0 (2026-07-14); on an older SDK the flag exists only on the alpha and beta tracks and cluster creation fails. The installer checks this before it touches any cloud resource — `gcloud components update` if it complains.
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The provisioner points it at the GKE cluster it creates.
 - **Docker or Podman** — required by the operator dev workflow (`make docker-build`) if you rebuild images locally. Not required for a stock install.
 - **Bash 4+** — the provisioning scripts are bash.
@@ -21,11 +21,20 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 The provisioner will enable APIs and create all resources itself; you don't need to pre-provision the cluster.
 
+**No extra firewall rule is needed on private clusters.** The operator's webhook server listens on
+`10250`, one of the two ports GKE's automatic control-plane-to-node rule already permits — see
+[Admission webhooks](/kube-agents/operator/#admission-webhooks). A cluster that hardens `10250`
+beyond the GKE default (scoping it to node IPs, say) still needs a rule for the webhook, or a move to
+a port it does allow — which is a Kustomize patch across the `--webhook-port` flag, the manager
+`containerPort`, and the Service `targetPort` together, not a single flag. Changing one of the three
+leaves the API server dialing a port nothing is listening on; see
+[Serving on a different port](/kube-agents/operator/#serving-on-a-different-port).
+
 ## cert-manager on the target cluster
 
 The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+).
 
-**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.14.4 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) Install it by hand only if you are:
+**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.21.1 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) Install it by hand only if you are:
 
 - deploying into an existing cluster without the provisioning scripts ([Manual install](/kube-agents/install/manual/)), or
 - pinning a specific cert-manager version.
@@ -61,7 +70,7 @@ helm install cert-manager jetstack/cert-manager \
 If Helm isn't available:
 
 ```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml
 ```
 
 On Autopilot you'll additionally need to patch the deployments to append `--leader-elect=false`. Because argument indices vary by cert-manager version, verify the arg list before patching — a positional JSON patch (`/args/1`) will silently corrupt an unexpected version.

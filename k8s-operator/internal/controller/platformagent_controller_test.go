@@ -678,7 +678,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "")
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
 	if netpol.Name != "test-agent-gateway-netpol" {
 		t.Errorf("expected Name 'test-agent-gateway-netpol', got %s", netpol.Name)
 	}
@@ -729,11 +729,13 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
 		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80/8080)")
 	}
+	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
+	// address as well as the link-local one even when the cluster has no nodes.
 	ruleMeta988 := findEgressRule(988, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.252/32"
 	})
-	if ruleMeta988 == nil || len(ruleMeta988.To) != 1 {
-		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 988)")
+	if ruleMeta988 == nil || len(ruleMeta988.To) != 2 {
+		t.Errorf("expected 2 peers in GCP Workload Identity egress rule (port 988)")
 	}
 	ruleLiteLLM := findEgressRule(4000, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "litellm"
@@ -784,7 +786,7 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "")
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
 	if len(netpol.Spec.Ingress) != 1 {
 		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
 	}
@@ -804,7 +806,7 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", true, "")
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", true, "", nil)
 	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
 	// 2. GCP WI / Metadata server (80, 8080)
@@ -834,13 +836,13 @@ func TestBuildNetworkPolicy_CustomAPIHost(t *testing.T) {
 		},
 	}
 
-	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "")
+	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "", nil)
 	ruleIPv4 := findAPIServerEgressRule(netpolIPv4)
 	if ruleIPv4 == nil || len(ruleIPv4.To) == 0 || ruleIPv4.To[0].IPBlock == nil || ruleIPv4.To[0].IPBlock.CIDR != "10.0.0.5/32" {
 		t.Errorf("expected IPv4 CIDR '10.0.0.5/32', got %v", ruleIPv4)
 	}
 
-	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, "10.96.0.10", false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, "10.96.0.10", false, "", nil)
 	ruleIPv6 := findAPIServerEgressRule(netpolIPv6)
 	if ruleIPv6 == nil || len(ruleIPv6.To) == 0 || ruleIPv6.To[0].IPBlock == nil || ruleIPv6.To[0].IPBlock.CIDR != "fd00::1/128" {
 		t.Errorf("expected IPv6 CIDR 'fd00::1/128', got %v", ruleIPv6)
@@ -914,7 +916,7 @@ func TestBuildNetworkPolicy_InvalidAPIHost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			netpol := buildNetworkPolicy(agent, tt.apiHosts, "10.96.0.10", false, "")
+			netpol := buildNetworkPolicy(agent, tt.apiHosts, "10.96.0.10", false, "", nil)
 			rule := findAPIServerEgressRule(netpol)
 			if rule == nil {
 				t.Fatalf("API server egress rule (port 6443) not found in netpol")
@@ -940,8 +942,8 @@ func TestBuildNetworkPolicy_Idempotent(t *testing.T) {
 		},
 	}
 
-	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "")
-	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "")
+	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "", nil)
+	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "", nil)
 	if !reflect.DeepEqual(np1.Spec, np2.Spec) {
 		t.Errorf("buildNetworkPolicy is not idempotent: consecutive calls produced different specs")
 	}
@@ -954,7 +956,7 @@ func TestBuildNetworkPolicy_ExternalHTTPSExceptList(t *testing.T) {
 			Namespace: "test-ns",
 		},
 	}
-	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "")
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
 
 	var httpsRule *networkingv1.NetworkPolicyEgressRule
 	for i := range netpol.Spec.Egress {
@@ -1020,7 +1022,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 1. IPv4 dynamic DNS clusterIP
-	netpolGKE := buildNetworkPolicy(agent, nil, "34.118.224.10", false, "")
+	netpolGKE := buildNetworkPolicy(agent, nil, "34.118.224.10", false, "", nil)
 	dnsRuleGKE := findDNSEgressRule(netpolGKE)
 	if dnsRuleGKE == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolGKE")
@@ -1037,7 +1039,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 2. IPv6 dynamic DNS clusterIP
-	netpolIPv6 := buildNetworkPolicy(agent, nil, "2001:db8::10", false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, nil, "2001:db8::10", false, "", nil)
 	dnsRuleIPv6 := findDNSEgressRule(netpolIPv6)
 	if dnsRuleIPv6 == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolIPv6")
@@ -1054,7 +1056,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 3. Fallback when invalid or empty
-	netpolFallback := buildNetworkPolicy(agent, nil, "invalid-ip", false, "")
+	netpolFallback := buildNetworkPolicy(agent, nil, "invalid-ip", false, "", nil)
 	dnsRuleFallback := findDNSEgressRule(netpolFallback)
 	if dnsRuleFallback == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolFallback")
@@ -1068,6 +1070,165 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 	if !foundFallback {
 		t.Errorf("expected fallback 10.96.0.10/32 for invalid DNS clusterIP")
+	}
+}
+
+func TestBuildNetworkPolicy_MetadataNodeIPs(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	nodeIPs := []string{"10.150.0.2", "10.150.0.3", "10.150.0.2", "fd00:1::1", "invalid-ip"}
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nodeIPs)
+
+	// The DNAT targets belong on 988 and nowhere else: the node rewrites the port along
+	// with the address, so a node /32 on 80 or 8080 would widen the sandbox's reach
+	// without admitting a single extra token fetch.
+	got80 := egressCIDRsForPort(netpol, 80)
+	want80 := []string{"169.254.169.254/32"}
+	if !reflect.DeepEqual(got80, want80) {
+		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
+	}
+
+	got8080 := egressCIDRsForPort(netpol, 8080)
+	if !reflect.DeepEqual(got8080, want80) {
+		t.Errorf("expected port 8080 metadata peers %v, got %v", want80, got8080)
+	}
+
+	// Deduplicated, sorted, and formatted /32 for IPv4 and /128 for IPv6.
+	got988 := egressCIDRsForPort(netpol, 988)
+	want988 := []string{
+		"10.150.0.2/32",
+		"10.150.0.3/32",
+		"169.254.169.252/32",
+		"169.254.169.254/32",
+		"fd00:1::1/128",
+	}
+	if !reflect.DeepEqual(got988, want988) {
+		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
+	}
+}
+
+// egressCIDRsForPort returns the ipBlock CIDRs of the first egress rule naming port.
+func egressCIDRsForPort(netpol *networkingv1.NetworkPolicy, port int32) []string {
+	for i := range netpol.Spec.Egress {
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port == nil || p.Port.IntVal != port {
+				continue
+			}
+			var cidrs []string
+			for _, peer := range netpol.Spec.Egress[i].To {
+				if peer.IPBlock != nil {
+					cidrs = append(cidrs, peer.IPBlock.CIDR)
+				}
+			}
+			return cidrs
+		}
+	}
+	return nil
+}
+
+// The link-local address alone is not enough on any GKE datapath, so a policy built
+// with no nodes in the cluster must still carry the daemon's own address.
+func TestBuildNetworkPolicy_MetadataDaemonPeerWithoutNodes(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
+
+	got := egressCIDRsForPort(netpol, 988)
+	want := []string{"169.254.169.252/32", "169.254.169.254/32"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expected metadata daemon peers %v, got %v", want, got)
+	}
+}
+
+// The node IPs in the policy have to come from the live Node list. Nothing else in the
+// suite would notice NodeInternalIP being read as NodeExternalIP, which would publish
+// public node addresses and fix nothing.
+func TestReconcileNetworkPolicy_NodeInternalIPs(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	node := func(name, internal, external string) *corev1.Node {
+		return &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.NodeStatus{
+				Addresses: []corev1.NodeAddress{
+					{Type: corev1.NodeExternalIP, Address: external},
+					{Type: corev1.NodeInternalIP, Address: internal},
+					{Type: corev1.NodeHostName, Address: name},
+				},
+			},
+		}
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, node("node-a", "10.150.0.4", "34.1.1.1"), node("node-b", "10.150.0.5", "34.1.1.2")).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	ctx := context.Background()
+	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "test-agent-gateway-netpol"}, netpol); err != nil {
+		t.Fatalf("failed to get generated NetworkPolicy: %v", err)
+	}
+
+	got := egressCIDRsForPort(netpol, 988)
+	want := []string{"10.150.0.4/32", "10.150.0.5/32", "169.254.169.252/32", "169.254.169.254/32"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expected metadata daemon peers %v, got %v", want, got)
+	}
+}
+
+// A failed Node list must abort the reconcile. Carrying on would apply a policy built
+// from an empty node set, stripping the /32s out of a working policy.
+func TestReconcileNetworkPolicy_NodeListErrorAborts(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	interceptors := fakeServerSideApplyInterceptors()
+	interceptors.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if _, ok := list.(*corev1.NodeList); ok {
+			return fmt.Errorf("boom")
+		}
+		return cl.List(ctx, list, opts...)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(interceptors).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	err := r.reconcileNetworkPolicy(context.Background(), agent, "")
+	if err == nil {
+		t.Fatalf("expected reconcileNetworkPolicy to fail when the Node list fails")
+	}
+	if !strings.Contains(err.Error(), "failed to list nodes") {
+		t.Errorf("expected a node-list error, got %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if getErr := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns", Name: "test-agent-gateway-netpol"}, netpol); getErr == nil {
+		t.Errorf("expected no NetworkPolicy to be applied after the node list failed")
 	}
 }
 
@@ -1142,6 +1303,205 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
 	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
 		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+}
+
+// Pressing the emergency stop has to leave a mark somewhere a human looks. The pod
+// stays Ready with the watcher off, so `kubectl describe platformagent` is the only
+// place that can distinguish a fleet with no incidents from a fleet that stopped
+// looking, and an install left switched off is the failure this condition exists to
+// prevent.
+func TestPlatformAgentReconciler_Reconcile_EventWatcherDisabledCondition(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-off",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:    "test-project",
+				Location:     "us-central1",
+				ClusterName:  "test-cluster",
+				EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-off",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	// First adds the finalizer, second writes status.
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != eventWatcherDisabledReason {
+		t.Fatalf("expected %s condition False/%s, got %v", eventWatcherConditionType, eventWatcherDisabledReason, cond)
+	}
+	// The message is what the operator reads at 3am, so it has to name the field
+	// rather than only the symptom — nothing else tells them how to undo this.
+	if !strings.Contains(cond.Message, "spec.harness.eventWatcher.enabled") {
+		t.Errorf("the condition must name the field that turns it back on, got %q", cond.Message)
+	}
+	// Deliberately off is not degraded. Flipping the phase would make the stop
+	// look like a fault and hide a real one behind it.
+	if updated.Status.Phase == "Degraded" {
+		t.Error("disabling the watcher is a decision, not a degradation")
+	}
+
+	// Turning it back on has to clear the condition. A stale one would report an
+	// install as blind while it is watching, which is the more dangerous of the
+	// two ways to be wrong.
+	updated.Spec.Harness.EventWatcher.Enabled = ptr.To(true)
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to re-enable the watcher: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after re-enable failed: %v", err)
+	}
+
+	restored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, restored); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(restored.Status.Conditions, eventWatcherConditionType); cond != nil {
+		t.Errorf("expected the %s condition to be removed once watching resumes, got %v", eventWatcherConditionType, cond)
+	}
+}
+
+// The condition must not exist on an install that never mentions the field, which
+// is every install today. A condition present on all of them says nothing, and
+// would train readers to ignore the one case it is meant to flag.
+func TestPlatformAgentReconciler_Reconcile_NoEventWatcherConditionByDefault(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-default",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-default",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType); cond != nil {
+		t.Errorf("expected no %s condition on a default install, got %v", eventWatcherConditionType, cond)
+	}
+}
+
+// A condition already carrying the right Status and Reason must still have its
+// text refreshed. The message is the recovery instruction — what a reader of
+// `kubectl describe` is told to do to undo the stop — so a release that rewords
+// it has to reach installs that are already stopped. Nothing else about such an
+// install changes between reconciles, so if the no-op comparison ignored the
+// message the old wording would be frozen there forever.
+func TestPlatformAgentReconciler_Reconcile_EventWatcherMessageIsRefreshed(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-stale",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:    "test-project",
+				Location:     "us-central1",
+				ClusterName:  "test-cluster",
+				EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)},
+			},
+		},
+		Status: agentv1alpha1.AgentStatus{
+			Conditions: []metav1.Condition{{
+				Type:               eventWatcherConditionType,
+				Status:             metav1.ConditionFalse,
+				Reason:             eventWatcherDisabledReason,
+				Message:            "wording from a previous release",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-stale",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType)
+	if cond == nil {
+		t.Fatalf("expected the %s condition to survive, got none", eventWatcherConditionType)
+	}
+	if cond.Message != eventWatcherDisabledMessage {
+		t.Errorf("stale condition message was never refreshed:\n got: %q\nwant: %q", cond.Message, eventWatcherDisabledMessage)
 	}
 }
 

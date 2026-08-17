@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from admin_console.connections import CommandResult, CommandRunner, GcloudRunner
+from admin_console.connections import CommandRunner, GcloudRunner
 from admin_console.domain import (
     ActivityEvent,
     AttributionLevel,
@@ -40,7 +42,14 @@ _SECRET_PATTERNS = (
     ),
 )
 _DETAIL_LIMIT = 8_000
+DEFAULT_SOURCE_PAGES = 2
+SOURCE_PAGES_PER_LOAD = 2
+MAX_LOGGING_PAGES = 10
 MAX_TRACE_PAGES = 10
+LOGGING_PAGE_SIZE = 500
+LOGGING_TIMEOUT_SECONDS = 60
+TRACE_TIMEOUT_SECONDS = 30
+TELEMETRY_LOAD_DEADLINE_SECONDS = 90
 _SECRET_KEY = re.compile(rf"(?i){_SECRET_NAME}")
 
 
@@ -52,6 +61,7 @@ class TelemetrySourceState:
     truncated: bool
     detail: str
     pages_read: int = 0
+    can_load_more: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,8 +77,19 @@ class TelemetrySnapshot:
     @property
     def incomplete(self) -> bool:
         return any(
-            source.status == "error" or source.truncated for source in self.sources
+            source.status in {"error", "partial"} or source.truncated
+            for source in self.sources
         )
+
+
+@dataclass
+class _PageCursor:
+    """Opaque source cursor retained only inside one portal UI session."""
+
+    next_token: str = ""
+    pages_read: int = 0
+    complete: bool = False
+    error: str = ""
 
 
 def _parse_time(value: object, fallback: datetime) -> datetime:
@@ -284,6 +305,12 @@ def normalize_logging_row(
         "audit_event": audit_event,
         "log_name": _first(row, "logName"),
     }
+    container_name = _first(labels, "container_name")
+    if container_name == "fluent-bit":
+        details["collector_container"] = container_name
+    pod_name = _first(labels, "pod_name")
+    if pod_name:
+        details["workload_pod"] = pod_name
     for source_key, detail_key in (
         ("args", "tool_arguments"),
         ("result", "tool_result"),
@@ -306,8 +333,8 @@ def normalize_logging_row(
         status=status,
         summary=summary,
         agent_name=_first(payload, "agent_profile", "agent_name")
-        or _first(labels, "container_name")
-        or "platform-agent",
+        or ("gateway-runtime" if container_name == "fluent-bit" else container_name)
+        or "agent-runtime",
         platform=_first(payload, "platform"),
         user_id=_first(payload, "user_id", "user.id"),
         session_id=session_id,
@@ -323,18 +350,16 @@ def normalize_logging_row(
     )
 
 
-def _trace_trigger(labels: dict[str, Any], session_id: str) -> TriggerKind:
-    kind = _first(labels, "trigger.kind", "hermes.session.kind")
-    if kind == "cron" or session_id.startswith("cron_"):
-        return TriggerKind.CRON
-    if kind == "event":
-        return TriggerKind.EVENT
-    if kind == "retry":
-        return TriggerKind.RETRY
-    if kind in {"agent_followup", "followup"}:
+def _trace_trigger(labels: dict[str, Any]) -> TriggerKind:
+    """Return only a trigger kind explicitly carried by OTel attributes."""
+    kind = _first(labels, "trigger.kind")
+    if kind in {item.value for item in TriggerKind}:
+        return TriggerKind(kind)
+    session_kind = _first(labels, "hermes.session.kind")
+    if session_kind in {item.value for item in TriggerKind}:
+        return TriggerKind(session_kind)
+    if session_kind == "followup":
         return TriggerKind.AGENT_FOLLOWUP
-    if _first(labels, "user.id", "hermes.sender.id", "chat.platform"):
-        return TriggerKind.HUMAN
     return TriggerKind.UNKNOWN
 
 
@@ -384,6 +409,25 @@ def normalize_trace(
         for span in spans
         if isinstance(span, dict)
     ]
+    origin_attributes = (
+        "session.id",
+        "user.id",
+        "hermes.sender.id",
+        "chat.platform",
+        "trigger.kind",
+        "hermes.session.kind",
+    )
+    trace_origin = {
+        attribute: next(
+            (
+                value
+                for labels in trace_labels
+                if (value := _first(labels, attribute))
+            ),
+            "",
+        )
+        for attribute in origin_attributes
+    }
     root_user = next(
         (
             _first(labels, "user.id", "hermes.sender.id")
@@ -392,6 +436,11 @@ def normalize_trace(
         ),
         "",
     )
+    spans_by_id = {
+        _first(span, "spanId"): span
+        for span in spans
+        if isinstance(span, dict) and _first(span, "spanId")
+    }
     events: list[ActivityEvent] = []
     for span in spans:
         if not isinstance(span, dict):
@@ -410,12 +459,15 @@ def normalize_trace(
         action_type, action_name, status = _span_classification(name, labels)
         start = _parse_time(span.get("startTime"), datetime.now(UTC))
         end = _parse_time(span.get("endTime"), start)
-        trigger = _trace_trigger(labels, session_id)
+        trigger = _trace_trigger(
+            {
+                **trace_origin,
+                **{key: value for key, value in labels.items() if value},
+            }
+        )
         user_id = _first(labels, "user.id", "hermes.sender.id") or root_user
         if not user_id:
             user_id = session_users.get(session_id, "")
-            if user_id:
-                trigger = TriggerKind.HUMAN
         if _first(labels, "interaction.id"):
             attribution = AttributionLevel.EXPLICIT
         elif user_id or trigger != TriggerKind.UNKNOWN:
@@ -441,15 +493,24 @@ def normalize_trace(
             f"?project={urllib.parse.quote(project_id, safe='')}"
             f"&tid={urllib.parse.quote(trace_id, safe='')}"
         )
+        parent_span_id = _first(span, "parentSpanId")
+        parent_span = spans_by_id.get(parent_span_id, {})
         details = {
             "source": "cloud_trace",
             "source_record_id": f"{trace_id}/{span_id}",
             "evidence_url": evidence_url,
             "span_name": name,
             "span_id": span_id,
-            "parent_span_id": _first(span, "parentSpanId"),
+            "parent_span_id": parent_span_id,
+            "parent_span_name": _first(parent_span, "name"),
             "correlation_id": _first(labels, "correlation.id"),
         }
+        for attribute in origin_attributes:
+            value = _first(labels, attribute)
+            if value:
+                details[f"otel.{attribute}"] = value
+            elif trace_origin[attribute]:
+                details[f"otel.trace.{attribute}"] = trace_origin[attribute]
         for keys, detail_key in (
             (("input.value", "gen_ai.input.messages"), "input"),
             (("output.value", "gen_ai.output.messages"), "output"),
@@ -501,7 +562,7 @@ def normalize_trace(
 
 
 class CloudTelemetryProvider:
-    """Load a bounded snapshot from Cloud Logging and Cloud Trace."""
+    """Incrementally load a bounded snapshot from Logging and Trace."""
 
     def __init__(
         self,
@@ -511,9 +572,10 @@ class CloudTelemetryProvider:
         cluster: str = "",
         namespace: str = "kubeagents-system",
         hours: int = 24,
-        log_limit: int = 1_000,
+        log_limit: int = LOGGING_PAGE_SIZE,
+        log_pages: int = DEFAULT_SOURCE_PAGES,
         trace_limit: int = 100,
-        trace_pages: int = 1,
+        trace_pages: int = DEFAULT_SOURCE_PAGES,
         runner: CommandRunner | None = None,
     ) -> None:
         if not is_valid_project_id(project_id):
@@ -524,17 +586,44 @@ class CloudTelemetryProvider:
             raise ValueError("invalid Kubernetes namespace")
         if hours not in {1, 6, 24, 72, 168, 720}:
             raise ValueError("unsupported telemetry window")
+        if not 1 <= log_pages <= MAX_LOGGING_PAGES:
+            raise ValueError("logging pages must be between 1 and 10")
         if not 1 <= trace_pages <= MAX_TRACE_PAGES:
             raise ValueError("trace pages must be between 1 and 10")
+        if not 1 <= log_limit <= LOGGING_PAGE_SIZE:
+            raise ValueError("logging page size must be between 1 and 500")
+        if not 1 <= trace_limit <= 100:
+            raise ValueError("trace page size must be between 1 and 100")
         self.project_id = project_id
         self.cluster = cluster
         self.namespace = namespace
         self.hours = hours
         self.log_limit = log_limit
+        self.log_pages = log_pages
         self.trace_limit = trace_limit
         self.trace_pages = trace_pages
         self.runner = runner or GcloudRunner(account)
         self._snapshot: TelemetrySnapshot | None = None
+        self._start: datetime | None = None
+        self._end: datetime | None = None
+        self._logging_rows: dict[str, dict[str, Any]] = {}
+        self._logging_cursors = (_PageCursor(), _PageCursor())
+        self._trace_rows: dict[str, dict[str, Any]] = {}
+        self._trace_cursor = _PageCursor()
+
+    @property
+    def loaded(self) -> bool:
+        return self._snapshot is not None
+
+    @property
+    def can_load_more(self) -> bool:
+        return any(
+            not cursor.complete and cursor.pages_read < MAX_LOGGING_PAGES
+            for cursor in self._logging_cursors
+        ) or (
+            not self._trace_cursor.complete
+            and self._trace_cursor.pages_read < MAX_TRACE_PAGES
+        )
 
     def list_activity(self) -> list[ActivityEvent]:
         return list(self.get_snapshot().events)
@@ -544,124 +633,232 @@ class CloudTelemetryProvider:
             self._snapshot = self._load()
         return self._snapshot
 
-    def _load_logging(
-        self,
-    ) -> tuple[list[ActivityEvent], TelemetrySourceState, dict[str, str]]:
+    def load_more(
+        self, pages: int = SOURCE_PAGES_PER_LOAD
+    ) -> TelemetrySnapshot:
+        """Append the next bounded source pages without rereading prior pages."""
+        if pages < 1:
+            raise ValueError("pages must be positive")
+        if self._snapshot is None:
+            return self.get_snapshot()
+        deadline = time.monotonic() + TELEMETRY_LOAD_DEADLINE_SECONDS
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+            if any(
+                not cursor.complete and cursor.pages_read < MAX_LOGGING_PAGES
+                for cursor in self._logging_cursors
+            ):
+                futures.append(
+                    executor.submit(self._advance_logging, pages, deadline)
+                )
+            if (
+                not self._trace_cursor.complete
+                and self._trace_cursor.pages_read < MAX_TRACE_PAGES
+            ):
+                futures.append(executor.submit(self._advance_trace, pages, deadline))
+            for future in futures:
+                future.result()
+        self._snapshot = self._build_snapshot()
+        return self._snapshot
+
+    def _logging_queries(self) -> tuple[str, str]:
         base = (
             'resource.type="k8s_container" '
             f'AND resource.labels.namespace_name="{self.namespace}"'
         )
         if self.cluster:
             base += f' AND resource.labels.cluster_name="{self.cluster}"'
-        # Separate indexed payload variants instead of one broad OR query. This
-        # is materially faster in Cloud Logging and keeps each read bounded.
-        queries = (
-            f'({base}) AND jsonPayload.log:"audit_event"',
-            f"({base}) AND jsonPayload.audit_event:*",
+        assert self._start is not None and self._end is not None
+        interval = (
+            f' timestamp>="{self._start:%Y-%m-%dT%H:%M:%SZ}"'
+            f' AND timestamp<="{self._end:%Y-%m-%dT%H:%M:%SZ}"'
+        )
+        return (
+            f'({base}) AND jsonPayload.log:"audit_event" AND{interval}',
+            f"({base}) AND jsonPayload.audit_event:* AND{interval}",
         )
 
-        def read(query: str) -> CommandResult:
-            return self.runner.run(
-                [
-                    "logging",
-                    "read",
-                    query,
-                    f"--project={self.project_id}",
-                    f"--freshness={self.hours}h",
-                    f"--limit={self.log_limit}",
-                    "--order=desc",
-                    "--format=json",
-                ],
-                timeout=20,
+    @staticmethod
+    def _remaining_timeout(deadline: float, maximum: int) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        return max(1.0, min(float(maximum), remaining))
+
+    @staticmethod
+    def _http_error(source: str, exc: BaseException) -> str:
+        if isinstance(exc, urllib.error.HTTPError):
+            if exc.code in {401, 403}:
+                return f"{source} permission was denied."
+            return f"{source} returned HTTP {exc.code}."
+        if isinstance(exc, TimeoutError):
+            return f"{source} read timed out."
+        if isinstance(exc, urllib.error.URLError) and isinstance(
+            exc.reason, TimeoutError
+        ):
+            return f"{source} read timed out."
+        if isinstance(exc, json.JSONDecodeError):
+            return f"{source} returned invalid JSON."
+        return f"{source} could not be read."
+
+    def _logging_token(self) -> str:
+        result = self.runner.run(["auth", "print-access-token"], timeout=15)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def _advance_logging_query(
+        self,
+        query: str,
+        cursor: _PageCursor,
+        token: str,
+        pages: int,
+        deadline: float,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page_budget = min(pages, MAX_LOGGING_PAGES - cursor.pages_read)
+        for _ in range(page_budget):
+            if cursor.complete:
+                break
+            body: dict[str, Any] = {
+                "resourceNames": [f"projects/{self.project_id}"],
+                "filter": query,
+                "orderBy": "timestamp desc",
+                "pageSize": self.log_limit,
+            }
+            if cursor.next_token:
+                body["pageToken"] = cursor.next_token
+            request = urllib.request.Request(
+                "https://logging.googleapis.com/v2/entries:list",
+                data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
             )
-
-        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
-            results = list(executor.map(read, queries))
-        failures = [result for result in results if result.returncode != 0]
-        if failures:
-            detail = "Cloud Logging read failed."
-            if any(result.timed_out for result in failures):
-                detail = "Cloud Logging read timed out."
-            elif any(
-                "permission" in result.stderr.lower() or "403" in result.stderr
-                for result in failures
-            ):
-                detail = "Cloud Logging permission was denied."
-            return [], TelemetrySourceState(
-                "Cloud Logging", "error", 0, False, detail
-            ), {}
-        rows_by_id: dict[str, dict[str, Any]] = {}
-        for result in results:
             try:
-                result_rows = json.loads(result.stdout or "[]")
-            except json.JSONDecodeError:
-                return [], TelemetrySourceState(
-                    "Cloud Logging",
-                    "error",
-                    0,
-                    False,
-                    "Cloud Logging returned invalid JSON.",
-                ), {}
-            if not isinstance(result_rows, list):
-                continue
-            for row in result_rows:
-                if not isinstance(row, dict):
-                    continue
-                key = _first(row, "insertId") or _event_id("row", row)
-                rows_by_id[key] = row
-        rows = list(rows_by_id.values())
-        events = [
-            event
-            for row in rows
-            if isinstance(row, dict)
-            if (event := normalize_logging_row(row, self.project_id)) is not None
-        ]
-        session_users = {
-            event.session_id: event.user_id
-            for event in events
-            if event.session_id and event.user_id
-        }
-        truncated = any(
-            len(json.loads(result.stdout or "[]")) >= self.log_limit
-            for result in results
-        )
-        status = "ready" if events else "empty"
-        detail = (
-            f"Read {len(rows)} matching audit record(s)."
-            if rows
-            else "No matching audit records were found in this window."
-        )
-        return events, TelemetrySourceState(
-            "Cloud Logging", status, len(rows), truncated, detail
-        ), session_users
+                timeout = self._remaining_timeout(
+                    deadline, LOGGING_TIMEOUT_SECONDS
+                )
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (
+                http.client.HTTPException,
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ) as exc:
+                cursor.error = self._http_error("Cloud Logging", exc)
+                break
+            page_rows = (
+                payload.get("entries", []) if isinstance(payload, dict) else []
+            )
+            if not isinstance(page_rows, list):
+                page_rows = []
+            rows.extend(row for row in page_rows if isinstance(row, dict))
+            cursor.pages_read += 1
+            cursor.next_token = (
+                str(payload.get("nextPageToken") or "")
+                if isinstance(payload, dict)
+                else ""
+            )
+            cursor.complete = not cursor.next_token
+            cursor.error = ""
+        return rows
 
-    def _load_trace(
+    def _advance_logging(self, pages: int, deadline: float) -> None:
+        token = self._logging_token()
+        if not token:
+            for cursor in self._logging_cursors:
+                cursor.error = "Cloud Logging authentication is unavailable."
+            return
+        try:
+            queries = self._logging_queries()
+            with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+                futures = [
+                    executor.submit(
+                        self._advance_logging_query,
+                        query,
+                        cursor,
+                        token,
+                        pages,
+                        deadline,
+                    )
+                    for query, cursor in zip(
+                        queries, self._logging_cursors, strict=True
+                    )
+                ]
+                for future in futures:
+                    for row in future.result():
+                        key = _first(row, "insertId") or _event_id("row", row)
+                        self._logging_rows[key] = row
+        finally:
+            token = ""
+
+    def _logging_source_state(self) -> TelemetrySourceState:
+        rows = len(self._logging_rows)
+        pages = sum(cursor.pages_read for cursor in self._logging_cursors)
+        errors = tuple(
+            dict.fromkeys(
+                cursor.error
+                for cursor in self._logging_cursors
+                if cursor.error
+            )
+        )
+        truncated = any(not cursor.complete for cursor in self._logging_cursors)
+        can_load_more = any(
+            not cursor.complete and cursor.pages_read < MAX_LOGGING_PAGES
+            for cursor in self._logging_cursors
+        )
+        status = "partial" if errors and rows else "error" if errors else "ready"
+        if not rows and not errors:
+            status = "empty"
+        detail = f"Read {rows} matching audit record(s) across {pages} page(s)."
+        if not rows and not errors:
+            detail = "No matching audit records were found in this window."
+        if errors:
+            prefix = (
+                f"Retained {rows} audit record(s) from {pages} page(s). "
+                if rows
+                else ""
+            )
+            detail = prefix + " ".join(errors)
+        return TelemetrySourceState(
+            "Cloud Logging",
+            status,
+            rows,
+            truncated,
+            detail,
+            pages,
+            can_load_more,
+        )
+
+    def _read_trace_pages(
         self,
         start: datetime,
         end: datetime,
-        session_users: dict[str, str],
-    ) -> tuple[list[ActivityEvent], TelemetrySourceState]:
+        cursor: _PageCursor,
+        traces_by_id: dict[str, dict[str, Any]],
+        pages: int,
+        deadline: float,
+    ) -> None:
         token_result = self.runner.run(
             ["auth", "application-default", "print-access-token"], timeout=15
         )
         token = token_result.stdout.strip()
         if token_result.returncode != 0 or not token:
-            return [], TelemetrySourceState(
-                "Cloud Trace",
-                "error",
-                0,
-                False,
-                "Application Default Credentials are unavailable.",
-            )
+            cursor.error = "Application Default Credentials are unavailable."
+            return
         terms = ["label:session.id"]
         if self.cluster:
             terms.append(f"+k8s.cluster.name:{self.cluster}")
-        traces: list[dict[str, Any]] = []
-        next_page_token = ""
-        pages_read = 0
-        read_error = ""
+        page_budget = min(pages, MAX_TRACE_PAGES - cursor.pages_read)
         try:
-            for page_number in range(1, self.trace_pages + 1):
+            for _ in range(page_budget):
+                if cursor.complete:
+                    break
                 parameters = {
                     "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "endTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -670,8 +867,8 @@ class CloudTelemetryProvider:
                     "orderBy": "start desc",
                     "filter": " ".join(terms),
                 }
-                if next_page_token:
-                    parameters["pageToken"] = next_page_token
+                if cursor.next_token:
+                    parameters["pageToken"] = cursor.next_token
                 query = urllib.parse.urlencode(parameters)
                 request = urllib.request.Request(
                     f"https://cloudtrace.googleapis.com/v1/projects/"
@@ -682,80 +879,151 @@ class CloudTelemetryProvider:
                     },
                 )
                 try:
-                    with urllib.request.urlopen(request, timeout=30) as response:
-                        payload = json.loads(response.read().decode("utf-8"))
-                except urllib.error.HTTPError as exc:
-                    read_error = (
-                        "Cloud Trace permission was denied."
-                        if exc.code in {401, 403}
-                        else f"Cloud Trace returned HTTP {exc.code}."
+                    timeout = self._remaining_timeout(
+                        deadline, TRACE_TIMEOUT_SECONDS
                     )
+                    with urllib.request.urlopen(request, timeout=timeout) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                except (
+                    http.client.HTTPException,
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    TimeoutError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    cursor.error = self._http_error("Cloud Trace", exc)
                     break
-                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                    read_error = "Cloud Trace could not be read."
-                    break
-
                 page_traces = (
                     payload.get("traces", []) if isinstance(payload, dict) else []
                 )
                 if not isinstance(page_traces, list):
                     page_traces = []
-                traces.extend(
-                    trace for trace in page_traces if isinstance(trace, dict)
-                )
-                pages_read = page_number
-                next_page_token = (
+                for trace in page_traces:
+                    if not isinstance(trace, dict):
+                        continue
+                    key = _first(trace, "traceId") or _event_id("trace", trace)
+                    traces_by_id[key] = trace
+                cursor.pages_read += 1
+                cursor.next_token = (
                     str(payload.get("nextPageToken") or "")
                     if isinstance(payload, dict)
                     else ""
                 )
-                if not next_page_token:
-                    break
+                cursor.complete = not cursor.next_token
+                cursor.error = ""
         finally:
             token = ""
-            token_result = CommandResult(0)
 
-        events = [
-            event
-            for trace in traces
-            for event in normalize_trace(trace, self.project_id, session_users)
-        ]
-        if read_error:
-            detail = read_error
-            if traces:
-                detail = (
-                    f"Read {len(traces)} matching trace(s) across {pages_read} page(s) "
-                    f"before a later page failed. {read_error}"
-                )
-            return events, TelemetrySourceState(
-                "Cloud Trace",
-                "error",
-                len(traces),
-                bool(next_page_token),
-                detail,
-                pages_read,
-            )
-
-        truncated = bool(next_page_token)
-        status = "ready" if events else "empty"
+    def _trace_source_state(
+        self, events: list[ActivityEvent], cursor: _PageCursor
+    ) -> TelemetrySourceState:
+        traces = len(self._trace_rows)
+        truncated = not cursor.complete
+        if cursor.error:
+            status = "partial" if traces else "error"
+        else:
+            status = "ready" if traces else "empty"
         detail = (
-            f"Read {len(traces)} matching trace(s) and {len(events)} span(s) "
-            f"across {pages_read} page(s)."
+            f"Read {traces} matching trace(s) and {len(events)} span(s) "
+            f"across {cursor.pages_read} page(s)."
             if traces
             else "No session-attributed traces were found in this window."
         )
-        return events, TelemetrySourceState(
-            "Cloud Trace", status, len(traces), truncated, detail, pages_read
+        if cursor.error:
+            prefix = (
+                f"Retained {traces} trace(s) from {cursor.pages_read} page(s). "
+                if traces
+                else ""
+            )
+            detail = prefix + cursor.error
+        return TelemetrySourceState(
+            "Cloud Trace",
+            status,
+            traces,
+            truncated,
+            detail,
+            cursor.pages_read,
+            not cursor.complete and cursor.pages_read < MAX_TRACE_PAGES,
         )
 
-    def _load(self) -> TelemetrySnapshot:
-        end = datetime.now(UTC)
-        start = end - timedelta(hours=self.hours)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            logging_future = executor.submit(self._load_logging)
-            trace_future = executor.submit(self._load_trace, start, end, {})
-            log_events, log_state, session_users = logging_future.result()
-            trace_events, trace_state = trace_future.result()
+    def _advance_trace(self, pages: int, deadline: float) -> None:
+        assert self._start is not None and self._end is not None
+        self._read_trace_pages(
+            self._start,
+            self._end,
+            self._trace_cursor,
+            self._trace_rows,
+            pages,
+            deadline,
+        )
+
+    def _load_trace(
+        self,
+        start: datetime,
+        end: datetime,
+        session_users: dict[str, str],
+    ) -> tuple[list[ActivityEvent], TelemetrySourceState]:
+        cursor = _PageCursor()
+        traces_by_id: dict[str, dict[str, Any]] = {}
+        self._read_trace_pages(
+            start,
+            end,
+            cursor,
+            traces_by_id,
+            self.trace_pages,
+            time.monotonic() + TELEMETRY_LOAD_DEADLINE_SECONDS,
+        )
+        events = [
+            event
+            for trace in traces_by_id.values()
+            for event in normalize_trace(trace, self.project_id, session_users)
+        ]
+        traces = len(traces_by_id)
+        if cursor.error:
+            status = "partial" if traces else "error"
+        else:
+            status = "ready" if traces else "empty"
+        detail = (
+            f"Read {traces} matching trace(s) and {len(events)} span(s) "
+            f"across {cursor.pages_read} page(s)."
+            if traces
+            else "No session-attributed traces were found in this window."
+        )
+        if cursor.error:
+            prefix = (
+                f"Retained {traces} trace(s) from {cursor.pages_read} page(s). "
+                if traces
+                else ""
+            )
+            detail = prefix + cursor.error
+        return events, TelemetrySourceState(
+            "Cloud Trace",
+            status,
+            traces,
+            not cursor.complete,
+            detail,
+            cursor.pages_read,
+            not cursor.complete and cursor.pages_read < MAX_TRACE_PAGES,
+        )
+
+    def _build_snapshot(self) -> TelemetrySnapshot:
+        assert self._start is not None and self._end is not None
+        log_events = [
+            event
+            for row in self._logging_rows.values()
+            if (event := normalize_logging_row(row, self.project_id)) is not None
+        ]
+        session_users = {
+            event.session_id: event.user_id
+            for event in log_events
+            if event.session_id and event.user_id
+        }
+        trace_events = [
+            event
+            for trace in self._trace_rows.values()
+            for event in normalize_trace(trace, self.project_id, session_users)
+        ]
         trace_events = [
             replace(
                 event,
@@ -779,9 +1047,27 @@ class CloudTelemetryProvider:
         return TelemetrySnapshot(
             self.project_id,
             self.cluster,
-            start,
-            end,
+            self._start,
+            self._end,
             datetime.now(UTC),
             tuple(events),
-            (log_state, trace_state),
+            (
+                self._logging_source_state(),
+                self._trace_source_state(trace_events, self._trace_cursor),
+            ),
         )
+
+    def _load(self) -> TelemetrySnapshot:
+        self._end = datetime.now(UTC)
+        self._start = self._end - timedelta(hours=self.hours)
+        deadline = time.monotonic() + TELEMETRY_LOAD_DEADLINE_SECONDS
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            logging_future = executor.submit(
+                self._advance_logging, self.log_pages, deadline
+            )
+            trace_future = executor.submit(
+                self._advance_trace, self.trace_pages, deadline
+            )
+            logging_future.result()
+            trace_future.result()
+        return self._build_snapshot()

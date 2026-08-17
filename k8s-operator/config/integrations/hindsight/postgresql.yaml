@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hindsight-postgresql
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+  ports:
+    - name: postgresql
+      protocol: TCP
+      port: 5432
+      targetPort: postgresql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hindsight-postgresql
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+spec:
+  serviceName: hindsight-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: postgresql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hindsight
+        app.kubernetes.io/component: postgresql
+    spec:
+      containers:
+        - name: postgresql
+          # pgvector supplies the vector extension Hindsight's embeddings need.
+          # Pinned by digest: upstream publishes only a floating `latest` tag, so
+          # without this a pod reschedule can silently change the database engine.
+          image: ankane/pgvector:latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              value: hindsight
+            - name: POSTGRES_DB
+              value: hindsight
+            # A subdirectory, not the mount root: the RWO volume arrives with a
+            # lost+found entry and initdb refuses a non-empty data directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # No password. This database is reachable only from the Hindsight
+            # API pod (see networkpolicy.yaml) and holds nothing that is not
+            # already in the agent's context, so a credential here would buy
+            # nothing and cost an install step: a password has to be generated
+            # somewhere, agree between two keys, and be rotated by someone.
+            #
+            # Note this is read by initdb and written into pg_hba.conf *once*.
+            # Flipping it on an existing volume does nothing — the data
+            # directory keeps whatever auth method it was created with.
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: trust
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 8Gi

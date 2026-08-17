@@ -30,9 +30,13 @@ permissions:
 
 jobs:
   call-deploy:
+    # inherit, not an explicit mapping: the called workflow's jobs read
+    # GH_APP_ID, an environment secret. A `uses:` job cannot declare an
+    # environment, so mapping the secrets here would evaluate them in this job,
+    # pass GH_APP_ID through empty, and silently skip the minter deploy.
     secrets: inherit
-    uses: ./.github/workflows/reusable-deploy-integrations.yml
+    uses: ./.github/workflows/reusable-deploy-integrations.yml # zizmor: ignore[secrets-inherit]
     with:
       target_environment: "autopush"
       force_deploy: ${{ github.event_name == 'workflow_dispatch' }}
-      checkout_ref: ${{ github.ref }}
+      checkout_sha: ${{ github.sha }}

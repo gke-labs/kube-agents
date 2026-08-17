@@ -36,7 +36,8 @@ init_var_image_tag
 "${SCRIPT_DIR}/provision_10_deploy_github_minter.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_11_deploy_inference_replay.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_12_gke_backup_plan.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_13_verify_agent_rollout.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_13_deploy_hindsight.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_14_verify_agent_rollout.sh" $DRY_RUN_ARG
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Infrastructure & Cloud Resources Provisioned Successfully!  <<<${C_RESET}"
 

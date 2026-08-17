@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from admin_console.kube_access import (
+    GKEKubeAccess,
+    KubeCommandResult,
+    kube_failure_guidance,
+)
 from admin_console.project_config import (
     DeploymentTarget,
     is_valid_cluster_name,
@@ -502,42 +505,23 @@ print(json.dumps(payload, ensure_ascii=False))
 '''
 
 
-@dataclass(frozen=True)
-class KubeCommandResult:
-    returncode: int
-    stdout: str = ""
-    stderr: str = ""
-    timed_out: bool = False
-
-
 class KubeRunner(Protocol):
     def run(self, arguments: list[str], *, timeout: int = 20) -> KubeCommandResult: ...
 
 
 class KubectlRunner:
+    """Runtime adapter over the portal's shared GKE access component."""
+
+    def __init__(
+        self,
+        target: DeploymentTarget,
+        *,
+        access: GKEKubeAccess | None = None,
+    ) -> None:
+        self.access = access or GKEKubeAccess(target)
+
     def run(self, arguments: list[str], *, timeout: int = 20) -> KubeCommandResult:
-        environment = os.environ.copy()
-        account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "").strip()
-        if account:
-            environment["CLOUDSDK_CORE_ACCOUNT"] = account
-        try:
-            completed = subprocess.run(
-                ["kubectl", *arguments],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired:
-            return KubeCommandResult(124, timed_out=True)
-        except OSError as exc:
-            return KubeCommandResult(127, stderr=type(exc).__name__)
-        return KubeCommandResult(
-            completed.returncode,
-            completed.stdout,
-            completed.stderr,
-        )
+        return self.access.run(arguments, timeout=timeout)
 
 
 class AgentRuntimeError(RuntimeError):
@@ -809,10 +793,10 @@ class AgentRuntimeProvider:
         ):
             raise ValueError("invalid agent runtime target")
         self.target = target
-        self.runner = runner or KubectlRunner()
         self.context = (
             f"gke_{target.project_id}_{target.location}_{target.cluster_name}"
         )
+        self.runner = runner or KubectlRunner(target)
 
     def _base(self) -> list[str]:
         return ["--context", self.context, "-n", self.target.namespace]
@@ -820,22 +804,24 @@ class AgentRuntimeProvider:
     def _json(self, result: KubeCommandResult, component: str) -> dict:
         if result.returncode != 0:
             error = result.stderr.lower()
-            if result.timed_out:
-                guidance = "Check cluster connectivity and retry."
-            elif "context" in error or "not found" in error:
-                guidance = (
-                    "Load the cluster context with `gcloud container clusters "
-                    f"get-credentials {self.target.cluster_name} "
-                    f"--location {self.target.location} "
-                    f"--project {self.target.project_id}`."
-                )
-            elif "forbidden" in error or "permission" in error:
-                guidance = (
-                    "Request read access to PlatformAgent resources and pods/exec "
-                    "in the selected namespace."
-                )
-            else:
-                guidance = "Confirm the cluster, namespace, gateway pod, and kubectl access."
+            guidance = kube_failure_guidance(result)
+            if not guidance:
+                if result.timed_out:
+                    guidance = "Check cluster connectivity, then retry."
+                elif "context" in error or "not found" in error:
+                    guidance = (
+                        "Confirm the selected project, cluster, and location, "
+                        "then retry."
+                    )
+                elif "forbidden" in error or "permission" in error:
+                    guidance = (
+                        "Request read access to PlatformAgent resources and pods/exec "
+                        "in the selected namespace."
+                    )
+                else:
+                    guidance = (
+                        "Confirm the cluster, namespace, gateway pod, and kubectl access."
+                    )
             raise AgentRuntimeError(f"{component} failed.", guidance)
         try:
             payload = json.loads(result.stdout)

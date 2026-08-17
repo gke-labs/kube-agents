@@ -11,8 +11,10 @@ into kubeagents-system, or override the agent's model endpoint.
 {{- if .Values.platformAgent.enabled }}
 
 Before the agent pod can start, the Secret "{{ .Values.platformAgent.credentials.secretName }}"
-must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry plus your
-model-provider key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).
+must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry{{ if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "vertex_ai") }}. The
+vertex_ai provider needs no model API key — the gateway authenticates with
+Workload Identity.{{ else }} plus your
+model-provider key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).{{ end }}
 {{- if .Values.platformAgent.credentials.create }}
 This release created it from platformAgent.credentials.data, generating
 SESSION_KV_API_KEY and SESSION_KV_SALT (preserved across upgrades).

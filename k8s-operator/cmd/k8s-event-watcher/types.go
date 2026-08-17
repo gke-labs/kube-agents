@@ -64,6 +64,16 @@ type TriageEvent struct {
 	// counter is separate — see dedup.go.
 	Count int
 	Type  string
+	// PullClass and PullCause are the only fields not read off the
+	// *corev1.Event. The dispatcher fills them in for image-pull failures
+	// by resolving the event's message through pullClassMemo, because the
+	// event that names the cause and the event that backs off are two
+	// different events and only one of them carries the text. PullCause
+	// is that text, which may therefore have arrived on an earlier event
+	// than this one. Left at pullClassUnknown / "" for everything else.
+	// See pullfailure.go.
+	PullClass pullClass
+	PullCause string
 }
 
 // InjectPayload is the JSON body POSTed to
@@ -71,22 +81,32 @@ type TriageEvent struct {
 // design doc's "Inject payload shape" section verbatim so playbook
 // skills can pattern-match against them.
 type InjectPayload struct {
-	Kind         string         `json:"kind"`
-	Reason       string         `json:"reason"`
-	Namespace    string         `json:"namespace"`
-	KindOfObject string         `json:"kind_of_object"`
-	Name         string         `json:"name"`
-	Container    string         `json:"container,omitempty"`
-	UID          string         `json:"uid"`
-	Message      string         `json:"message"`
-	Count        int            `json:"count"`
-	FirstSeen    time.Time      `json:"first_seen"`
-	LastSeen     time.Time      `json:"last_seen"`
-	Cluster      string         `json:"cluster"`
-	Project      string         `json:"project,omitempty"`
-	Location     string         `json:"location,omitempty"`
-	Context      PayloadContext `json:"context"`
-	Type         string         `json:"type"`
+	Kind         string `json:"kind"`
+	Reason       string `json:"reason"`
+	Namespace    string `json:"namespace"`
+	KindOfObject string `json:"kind_of_object"`
+	Name         string `json:"name"`
+	Container    string `json:"container,omitempty"`
+	UID          string `json:"uid"`
+	Message      string `json:"message"`
+	// PullCause carries the image-pull error text when Message does not.
+	// All four events kubelet emits for one pull failure collapse onto a
+	// single dedup key, so whichever crosses the debounce threshold first
+	// is the only one injected — and three of the four are bare statuses
+	// ("Error: ImagePullBackOff") that say nothing about what went wrong.
+	// Additive rather than a substitution into Message, so reason, count
+	// and the timestamps still all describe the same event object.
+	// Omitted whenever Message already carries the cause, and for every
+	// non-image-pull event.
+	PullCause string         `json:"pull_cause,omitempty"`
+	Count     int            `json:"count"`
+	FirstSeen time.Time      `json:"first_seen"`
+	LastSeen  time.Time      `json:"last_seen"`
+	Cluster   string         `json:"cluster"`
+	Project   string         `json:"project,omitempty"`
+	Location  string         `json:"location,omitempty"`
+	Context   PayloadContext `json:"context"`
+	Type      string         `json:"type"`
 }
 
 // PayloadContext is the nested "context" object on InjectPayload.

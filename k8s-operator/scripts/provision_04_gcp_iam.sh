@@ -23,6 +23,8 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var_platform_agent_permission_set
+# Needed here too: vertex_ai is the only provider that adds an IAM step.
+init_var_model_provider
 
 
 if [ -z "${GITHUB_ORG:-}" ]; then
@@ -276,6 +278,50 @@ execute_platform_agent() {
 }
 
 
+# Step 5: Configure LiteLLM Vertex AI IAM
+# Only the GSA side belongs here; the KSA comes from the vertex_ai overlay in step
+# 9, and a Workload Identity binding may name a KSA that does not exist yet.
+verify_litellm_vertex_iam() {
+  if [ "${MODEL_PROVIDER:-}" != "vertex_ai" ]; then
+    print_info "Model provider is '${MODEL_PROVIDER:-unset}', not 'vertex_ai'. Skipping LiteLLM Vertex IAM setup."
+    return 0
+  fi
+  local vertex_project="${VERTEX_PROJECT_ID:-$PROJECT_ID}"
+  local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  gcloud services list --enabled --project="${vertex_project}" --format="value(config.name)" 2>/dev/null \
+    | grep -q 'aiplatform.googleapis.com' || return 1
+
+  # No roles passed: the model-serving grant lands on the Vertex project, which
+  # is not necessarily this one, so it is checked separately below.
+  verify_agent_iam "${LITELLM_KSA_NAME}" "${LITELLM_GSA_NAME}" || return 1
+
+  gcloud projects get-iam-policy "${vertex_project}" \
+      --flatten="bindings[].members" \
+      --filter="bindings.members:serviceAccount:${gsa_email}" \
+      --format="value(bindings.role)" 2>/dev/null \
+    | grep -Fxq "roles/aiplatform.user"
+}
+execute_litellm_vertex_iam() {
+  if [ "${MODEL_PROVIDER:-}" != "vertex_ai" ]; then
+    return 0
+  fi
+  local vertex_project="${VERTEX_PROJECT_ID:-$PROJECT_ID}"
+  local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  print_info "Enabling Vertex AI API on ${vertex_project}..."
+  gcloud services enable aiplatform.googleapis.com --project="${vertex_project}" || return 1
+
+  execute_agent_iam "LiteLLM Vertex" "${LITELLM_KSA_NAME}" "${LITELLM_GSA_NAME}" || return 1
+
+  print_info "Granting roles/aiplatform.user to ${LITELLM_GSA_NAME} on ${vertex_project}..."
+  gcloud projects add-iam-policy-binding "${vertex_project}" \
+      --member="serviceAccount:${gsa_email}" \
+      --role="roles/aiplatform.user" \
+      --quiet >/dev/null || return 1
+}
+
+
 # Step 6: Configure GitHub Token Minter IAM
 verify_github_minter_iam() {
   if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
@@ -297,6 +343,7 @@ run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Ensure GKE Workload Identity Pool" verify_cluster_workload_pool execute_cluster_workload_pool 10
 run_step "3. Migrate Node Pools to the GKE Metadata Server" verify_node_pool_metadata execute_node_pool_metadata 5
 run_step "4. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
-run_step "5. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
+run_step "5. Configure LiteLLM Vertex AI Workload Identity" verify_litellm_vertex_iam execute_litellm_vertex_iam 5
+run_step "6. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"

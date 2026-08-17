@@ -2,12 +2,14 @@
 
 Run: python3 -m unittest discover -s deploy/docker -p 'test_*.py'
 
-Two guarantees are pinned here, both invisible from any single source file:
+Three guarantees are pinned here, all invisible from any single source file:
 
   * the process the entrypoint execs starts inside the shared workspace, so the
-    credential-proxy shims are not refused before they run; and
+    credential-proxy shims are not refused before they run;
   * the vendored Python tree carries a bytecode cache, since the runtime cannot
-    build one.
+    build one; and
+  * the event watcher's emergency stop reads the variable the operator writes,
+    and reads it the way the CRD promises.
 
 The entrypoint assertions run the real script rather than reading it. Every
 step it takes is gated on an absolute image path (/opt/hermes, /opt/defaults)
@@ -28,6 +30,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = REPO_ROOT / "deploy" / "shared" / "docker-entrypoint.sh"
+START_SERVICES = REPO_ROOT / "deploy" / "shared" / "start-services.sh"
 DOCKERFILE = REPO_ROOT / "deploy" / "docker" / "Dockerfile"
 MANIFESTS_GO = (
     REPO_ROOT
@@ -144,6 +147,125 @@ class EntrypointStartsInsideTheWorkspaceTest(unittest.TestCase):
         self.assertRegex(
             go,
             r'Name:\s*"CREDENTIAL_PROXY_WORKSPACE_ROOT",\s*Value:\s*homeDir',
+        )
+
+
+class EventWatcherEmergencyStopTest(unittest.TestCase):
+    """The red button that stops cluster event ingestion mid-storm.
+
+    `spec.harness.eventWatcher.enabled: false` reaches the sidecar as one
+    environment variable and is acted on by one `case` statement in
+    start-services.sh. Neither end can be checked from the other: the operator's
+    tests never read the script, the script is never run outside the image, and
+    a container with no watcher in it stays Ready and looks healthy. So the
+    failure mode is silent in both directions — a rename leaves the button
+    pressing nothing, and a parsing slip stops event ingestion on installs that
+    never asked for it.
+
+    The gate is extracted from the real script and run, rather than pattern
+    matched: what matters is the answer bash gives for a given value, and the
+    `case` patterns are shell globs whose behaviour is easy to misread.
+    """
+
+    def setUp(self):
+        self.script = START_SERVICES.read_text()
+        # The variable name as the script itself spells it, so a rename on
+        # either side of the contract fails rather than half-applying.
+        match = re.search(
+            r'case "\$\{([A-Za-z_][A-Za-z0-9_]*):-true\}" in', self.script
+        )
+        self.assertIsNotNone(
+            match,
+            "start-services.sh no longer switches on a defaulted "
+            "EVENT_WATCHER_ENABLED-style variable; the emergency stop in the "
+            "PlatformAgent CRD now reaches nothing",
+        )
+        self.env_var = match.group(1)
+
+        body = re.search(
+            r"^event_watcher_disabled\(\) \{.*?^\}$",
+            self.script,
+            flags=re.M | re.S,
+        )
+        self.assertIsNotNone(
+            body, "start-services.sh has no event_watcher_disabled function"
+        )
+        self.gate = body.group(0)
+
+    def ask_gate(self, value):
+        """Run the real gate for `value` (None = unset) and return its verdict."""
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if value is not None:
+            env[self.env_var] = value
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"set -euo pipefail\n{self.gate}\n"
+                "if event_watcher_disabled; then echo DISABLED; "
+                "else echo ENABLED; fi",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_an_unset_variable_keeps_the_watcher_running(self):
+        # Every install that predates the field, and every one that never sets
+        # it. Going quiet on upgrade would be the worst possible default: no
+        # incident is reported and nothing says why.
+        self.assertEqual(self.ask_gate(None), "ENABLED")
+
+    def test_false_stops_the_watcher(self):
+        for value in ("false", "False", "FALSE"):
+            with self.subTest(value=value):
+                self.assertEqual(self.ask_gate(value), "DISABLED")
+
+    def test_true_is_what_the_operator_writes_on_a_normal_install(self):
+        # strconv.FormatBool emits exactly this, so it is the value present on
+        # the overwhelming majority of pods.
+        self.assertEqual(self.ask_gate("true"), "ENABLED")
+
+    def test_an_unrecognised_value_fails_towards_watching(self):
+        # Deliberate asymmetry. A typo that silently stops event ingestion is
+        # invisible; one that leaves the watcher running shows up with the next
+        # event. So the ambiguous case keeps watching — and says so.
+        self.assertEqual(self.ask_gate("flase"), "ENABLED")
+        self.assertEqual(self.ask_gate(""), "ENABLED")
+
+    def test_the_gate_runs_before_the_watcher_is_launched(self):
+        # A gate placed after the binary starts would disable nothing.
+        start = self.script.index("start_event_watcher() {")
+        launched = self.script.index("/usr/local/bin/k8s-event-watcher", start)
+        gated = self.script.index("if event_watcher_disabled; then", start)
+        self.assertLess(
+            gated,
+            launched,
+            "start_event_watcher launches the watcher before consulting the "
+            f"{self.env_var} gate",
+        )
+
+    def test_the_disabled_path_says_so_loudly(self):
+        # The only signal there is. The readiness probe covers the credential
+        # proxy alone, so a pod with no watcher is externally identical to a
+        # healthy one; the log line has to name the consequence and the way
+        # back, not just the flag.
+        disabled_branch = self.script[
+            self.script.index("if event_watcher_disabled; then") :
+        ].split("\n  fi\n", 1)[0]
+        self.assertIn("DISABLED", disabled_branch)
+        self.assertIn("spec.harness.eventWatcher.enabled", disabled_branch)
+
+    def test_the_operator_writes_the_variable_the_script_reads(self):
+        # The other half of the contract, and the half `go test` cannot see.
+        self.assertRegex(
+            MANIFESTS_GO.read_text(),
+            rf'Name:\s*"{self.env_var}"',
+            f"the operator never sets {self.env_var}, so the CRD's "
+            "eventWatcher.enabled field controls nothing",
         )
 
 

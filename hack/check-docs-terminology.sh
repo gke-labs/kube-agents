@@ -63,6 +63,27 @@ forbid 'platform-agent-ksa' \
 forbid 'platform-agent-system' \
   "Stale namespace. The namespace is kubeagents-system."
 
+# --- GKE host-discovery label -------------------------------------------
+# Ground truth: k8s-operator/scripts/common.sh. The Terraform full-install
+# composition must mirror the stable key because it cannot source Bash.
+HOST_LABEL=$(awk -F'"' '/^KUBE_AGENTS_HOST_LABEL=/{print $2; exit}' k8s-operator/scripts/common.sh)
+if [ -z "$HOST_LABEL" ]; then
+  echo "ERROR: could not read KUBE_AGENTS_HOST_LABEL from k8s-operator/scripts/common.sh." >&2
+  exit 1
+fi
+
+WRONG_HOST_LABEL=$(search 'kube-?agents-host=true' | grep -vF "${HOST_LABEL}=true" || true)
+if [ -n "$WRONG_HOST_LABEL" ]; then
+  echo "::error::Documented host-discovery label does not match KUBE_AGENTS_HOST_LABEL=${HOST_LABEL}."
+  printf '%s\n\n' "$WRONG_HOST_LABEL" | sed 's/^/    /'
+  FAILED=1
+fi
+
+if ! grep -qE "\"${HOST_LABEL}\"[[:space:]]*=[[:space:]]*\"true\"" terraform/examples/full-install/main.tf; then
+  echo "::error::Terraform full-install composition does not apply ${HOST_LABEL}=true."
+  FAILED=1
+fi
+
 # --- Go toolchain ---------------------------------------------------------
 # Ground truth: k8s-operator/go.mod
 GO_MOD_VERSION=$(awk '/^go /{print $2; exit}' k8s-operator/go.mod)

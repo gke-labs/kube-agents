@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the multiuser_memory provider.
 
-The provider lives at ``agents/platform/plugins/memory/multiuser_memory/`` and is
+The provider lives at ``agents/chat/plugins/memory/multiuser_memory/`` and is
 loaded by hermes-agent, so it imports modules that only exist inside the agent
 image. They are stubbed below and the plugin is loaded straight from its path.
 
@@ -11,7 +11,7 @@ submodule, so a test file sitting there would have its module-level stub
 installation run inside the real agent.
 
 Not run in CI (only ``make validate`` runs there). Run locally:
-    python3 agents/platform/scripts/test_multiuser_memory.py
+    python3 agents/chat/scripts/test_multiuser_memory.py
 """
 
 import hashlib
@@ -102,7 +102,7 @@ class MultiUserMemoryTestCase(unittest.TestCase):
     def provider(self, **kwargs):
         p = mum.MultiUserFileMemoryProvider()
         kwargs.setdefault("hermes_home", str(self.home))
-        kwargs.setdefault("user_id", "dmitry@example.com")
+        kwargs.setdefault("user_id", "alice@example.com")
         p.initialize("session-1", **kwargs)
         return p
 
@@ -131,7 +131,7 @@ class TestPrivateStore(MultiUserMemoryTestCase):
         self.provider(chat_type="dm").handle_tool_call(
             "multiuser_memory", {"action": "add", "target": "user", "content": "x"}
         )
-        self.assertEqual(self.user_files(), [_expected_filename("dmitry@example.com")])
+        self.assertEqual(self.user_files(), [_expected_filename("alice@example.com")])
 
     def test_hash_separates_identities_that_sanitize_alike(self):
         # "a@b.com" and "a_b.com" both sanitize to "a_b.com"; only the digest

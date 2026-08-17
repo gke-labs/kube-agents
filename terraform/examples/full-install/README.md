@@ -12,7 +12,8 @@ same cluster, service accounts, and IAM bindings.
   destroy), including the Cloud KMS API for GKE database encryption and the Chat
   API when Google Chat is enabled.
 - A GKE Autopilot cluster ([`gke-cluster`](../../modules/gke-cluster) module)
-  with Workload Identity and Cloud KMS database encryption (CMEK) enabled.
+  with Workload Identity and Cloud KMS database encryption (CMEK) enabled, and
+  the `kube-agents-host=true` discovery label applied.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
   module): the `kubeagents-platform-gsa` service account, its read-only
   project roles, and the Workload Identity binding to the
@@ -38,6 +39,11 @@ same cluster, service accounts, and IAM bindings.
   idempotent without reading the cluster — and because rotating the salt
   re-anonymises every user, severing their past sessions from their future
   ones.
+- Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
+  a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
+  the gateway's service account, `roles/aiplatform.user` on
+  `vertex_project_id`, and the Workload Identity annotation the chart needs.
+  Vertex takes no API key, so no `*_api_key` variable applies.
 
 > [!WARNING]
 > The credential variables (`api_server_key`, `*_api_key`, Slack tokens) are
@@ -138,6 +144,10 @@ would install the chart from the OCI registry rather than a local path — see
 the [chart README](../../../charts/kube-agents/README.md).
 
 ## Teardown
+
+Use Terraform for teardown; do not mix this install path with the shell provisioner's
+`teardown_*.sh` scripts. In particular, `teardown_08_deploy_platform_agent.sh` removes the
+Terraform-managed `kube-agents-host` label out of band and causes plan drift.
 
 `terraform destroy` removes the Helm release, but that also removes the
 operator — and the `PlatformAgent` CR carries a finalizer only the operator

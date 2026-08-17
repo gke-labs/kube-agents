@@ -576,20 +576,51 @@ override identity or correlation fields.
 
 ## UI structure
 
-- **Connection:** one editable project selector with source-labeled suggestions,
-  project-ID validation, and mutually exclusive Connect and
-  Disconnect controls at the top of Setup. Connect auto-selects the one
-  GKE cluster labeled `kube-agents-host=true`. Zero or multiple labeled hosts
-  produce a red detection error and a separate manual cluster picker whose
-  action is Select. Selection is locked while connected. Observability remains
-  unavailable until required checks pass. Successful local connections persist
-  only validated target metadata in an owner-only server-side file bound to the
-  launcher-verified gcloud account. Reopen always revalidates before restoring
-  access; an open browser session revalidates every ten minutes. Connect, Select,
-  restore, and revalidation checks execute outside Streamlit's render thread so
-  navigation and page content remain responsive. A sidebar status component
-  observes the background future; only its completed result changes verified
-  state. Disconnect deletes the persisted target.
+- **Connection:** two ordered cards—Step 1 Project, then Step 2 Cluster—use one
+  shared action component and the same Connect, Connecting, and Connected state
+  machine. Only the deepest connected level exposes Disconnect, and only an
+  explicit Connect attempt exposes Abort, so the page never presents two
+  competing teardown actions. Background revalidation keeps the cluster
+  Connected and leaves Disconnect available.
+  A session-scoped connection controller is the single source for selection,
+  both level phases, the pending verification, reports, failures, and the
+  verified target. The Connection UI sends commands to that controller, and
+  every provider-backed page reads its target through one shared gate; URL and
+  persisted values are projections rather than parallel connection states.
+  Controller bootstrap is a shared idempotent operation because Streamlit may
+  resume the selected page directly after a development-server rebuild without
+  first executing the application entry point.
+  Project Connect verifies identity, project access, and GKE discovery, then
+  reveals the cluster picker; it never establishes the cluster connection.
+  Exactly one GKE cluster labeled `kube-agents-host=true` is preselected, while
+  zero or multiple labeled hosts produce one concise picker caption. Cluster
+  Connect verifies the selected kube-agents runtime. At either level, Abort
+  immediately detaches pending verification so its late result cannot change
+  state. A failed attempt shows one actionable error naming the failed check,
+  observed reason, and next action, with no partial checklist; the checklist
+  appears after both levels succeed. Disconnect unwinds the hierarchy: Cluster
+  Disconnect retains the project connection, then exposes Project Disconnect.
+  Selection is locked at its connected level. Cluster readiness requires
+  identity, project, GKE, and agent-runtime access. Logging or Trace failures
+  remain visible in the checklist and their own surfaces without locking
+  runtime-backed Chat, Task Kanban, or Scheduled Cron.
+  Observability remains unavailable until required checks pass. One shared GKE
+  access component obtains credentials in a process-private temporary
+  kubeconfig and serves connection verification, observability, cron, and Chat
+  without modifying the user's normal kubeconfig. Successful local
+  connections persist only validated target metadata in an owner-only
+  server-side lease bound to the launcher-verified gcloud account; credentials
+  and kubeconfig content are never stored. Reopen under the same account resumes
+  that exact lease and immediately revalidates it. A failed revalidation locks
+  runtime access and marks the retained target as requiring revalidation; URL,
+  provisioning, and configured-project targets without a verified lease cannot
+  connect automatically. An open browser session revalidates every ten minutes.
+  Both connection levels and revalidation execute outside Streamlit's render
+  thread so navigation and page content remain responsive. A sidebar status
+  component observes the background future; only its completed result changes
+  verified state. Tabs reconcile the shared lease, so a disconnect, suspension,
+  or target change in one tab detaches stale tabs and late background results
+  cannot recreate an obsolete lease. Disconnect deletes the persisted target.
   The same page shows checklist results for CLI authentication, ADC, APIs, GKE,
   agent runtime state, Logging, structured audit events, and Trace.
 - **Agentic:** Chat is the interactive surface for working with the agent.
@@ -613,13 +644,35 @@ override identity or correlation fields.
   dependencies, linked chat, delivery state, runs, results, comments,
   attachments, and lifecycle events.
 - **Activity Explorer:** filters, aggregate Sankey, per-interaction timeline,
-  forensic ledger, and page-local activity scope.
+  a 50-row URL-paginated forensic ledger, and page-local activity scope.
+  The Sankey is a semantic projection over Cloud Trace lineage: one node
+  contribution per individual `api.*` model request, LLM-child tool or approval
+  span, and agent skill load. Its typed source projection groups by raw OTel
+  user, platform, normalized cron job, explicit trigger, or session kind, with
+  raw `session.id` as the final fallback. It retains all available origin
+  evidence, its scope, distinct sessions, and bounded raw-value samples.
+  It does not map `k8s-watcher` to Human or Event. It excludes aggregate
+  `llm.*`/turn wrappers, gateway/chat lifecycle spans, and parallel Logging
+  evidence from the flow only; Timeline and the forensic ledger retain the raw
+  evidence. Fluent Bit remains collector metadata and is never presented as an
+  agent.
+  Overview and Activity Explorer share the same visible loading component for
+  initial reads, refreshes, and incremental source pages. Logging and Trace
+  retain opaque continuation cursors only inside the Streamlit session, append
+  two bounded pages per load, and preserve successful earlier pages when a
+  later page fails. Logging uses two non-overlapping queries with 500-record
+  pages and a 60-second request timeout; Trace and each Logging query stop
+  after ten pages, and both sources share a 90-second load deadline. Source
+  pagination and ledger pagination remain separate concerns.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,
-  active and recent executions, manual-versus-scheduled trigger evidence, and a
-  UTC calendar of recent runs and projected cron or interval occurrences for
-  the next 21 days. High-frequency schedules are summarized per job and day.
-  An enabled job without a live profile ticker is explicitly reported as
-  unable to run automatically.
+  and one execution table with a row per job title. Each row retains run and
+  outcome counts, latest activity, and participating profiles, then expands in
+  place to show every bounded execution's start, trigger, duration, status,
+  profile, and error without a second table. A UTC calendar shows recent runs
+  and projected cron or interval occurrences for the next 21 days.
+  High-frequency schedules are summarized per job and day. An enabled job
+  without a live profile ticker is explicitly reported as unable to run
+  automatically.
 
 ## Current data readiness
 
@@ -638,7 +691,7 @@ remain labeled as missing instead of being filled with demo data.
 | Attribution coverage                    | Computed from explicit, inherited, and missing live identifiers                                          | No     | Partial             | Yes                      | Propagate trusted interaction identity through every action                                             |
 | Recent work and active-agent summaries  | Aggregations over normalized live events                                                                 | No     | Yes                 | Yes                      | Join the Kanban task read model                                                                         |
 | Activity filters                        | URL-persisted project, cluster, and time; local event filters                                            | No     | Yes                 | Yes                      | Persist all investigation filters in the URL                                                            |
-| Causal-flow Sankey                      | Only explicit and inherited records; missing/inferred excluded                                           | No     | Partial             | Yes                      | Add first-class gaps and separately styled inferred joins                                               |
+| Causal-flow Sankey                      | Trace lineage plus typed source aggregation for LLM requests, tools/approvals, and skill loads           | No     | Partial             | Yes                      | Add first-class gaps and separately styled inferred joins                                               |
 | Interaction timeline                    | Uses trusted `interaction.id` when present, otherwise Trace ID                                           | No     | Partial             | Yes                      | Generate and propagate `interaction.id` at every trusted ingress                                        |
 | Forensic ledger and event details       | Live normalized evidence with source IDs and Console deep links                                          | No     | Yes                 | Yes                      | Add controlled evidence export                                                                          |
 | User prompts and agent responses        | Access-controlled Trace evidence, portal-redacted and size-bounded                                       | No     | Yes                 | Yes                      | Add policy-aware reveal auditing and upstream DLP scrubbing                                             |
@@ -651,7 +704,7 @@ remain labeled as missing instead of being filled with demo data.
 | Credential-proxy activity               | Not ingested; no proxy events are fabricated                                                             | N/A    | Yes                 | No                       | Normalize proxy request ID, policy decision, command digest, execution state, exit code, and duration   |
 | Approval activity                       | Live Trace spans and structured request/response audit records                                           | No     | Yes                 | Yes                      | Correlate requester, approver, policy, command digest, and interaction ID                               |
 | Scheduled Cron page                     | Bounded live Hermes job stores, execution databases, profile ticker health, and recent/upcoming calendar | No     | Yes                 | Yes                      | Add a dedicated policy-aware scheduler API and retained execution pagination                            |
-| Time window and retention state         | URL-persisted bounded windows and Trace page budget with source errors and truncation shown              | No     | Yes                 | Yes                      | Add retention and sampling metadata from source configuration                                           |
+| Time window and retention state         | URL window, session-local Logging/Trace cursors, and visible source errors/truncation                    | No     | Yes                 | Yes                      | Add retention and sampling metadata from source configuration                                           |
 | Refreshable and shareable investigation | Project, cluster, and window persist; local filters do not                                               | N/A    | N/A                 | Partial                  | Persist filters, interaction, and selected evidence in URL query parameters                             |
 | Saved case or evidence export           | Not implemented                                                                                          | N/A    | N/A                 | No                       | Export access-controlled evidence bundles with source IDs, query scope, redaction state, and timestamps |
 
@@ -712,8 +765,9 @@ present time-adjacent records as proven causality.
 ## Current boundaries
 
 - Activity is live and read-only; no demo events are used by application pages.
-- Logging and Trace reads are capped. Reaching a cap is shown as incomplete;
-  continuation-token pagination is not yet implemented.
+- Logging and Trace reads use session-local continuation cursors and are
+  capped. Reaching a cap is shown as incomplete and asks the user to narrow the
+  time window.
 - Common credential forms are redacted before evidence is rendered, but this
   is not a replacement for upstream secret and PII scrubbing.
 - Trusted interaction identity is not present on every source record. The UI

@@ -13,6 +13,11 @@ fi
 # load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
+# Minimum tool versions. Sourced from the helper's own directory rather than
+# SCRIPT_DIR, which callers under scripts/dev/ override to point at themselves.
+# shellcheck source=k8s-operator/scripts/min_versions.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/min_versions.sh"
+
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 # Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
 # is routinely redirected — install.sh tees it to a log, CI captures it — and
@@ -31,6 +36,10 @@ else
   C_BOLD='\033[1m'
   C_WHITE='\033[97m'
 fi
+
+# Stable project-level discovery marker for the GKE cluster hosting kube-agents.
+# Keep this value aligned with the Terraform full-install composition and admin portal.
+KUBE_AGENTS_HOST_LABEL="kube-agents-host"
 
 # ─── UI Helpers ───────────────────────────────────────────────────────────────
 print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>>  $1  <<<${C_RESET}"; }
@@ -204,13 +213,13 @@ DEFAULT_MODEL_PROVIDER="gemini"
 default_model_for_provider() {
   case "${1:-}" in
     chatgpt | openai) echo "gpt-5.4" ;;
-    anthropic) echo "claude-sonnet-4-5-20250929" ;;
+    anthropic) echo "claude-opus-5" ;;
     *) echo "gemini-3.5-flash" ;;
   esac
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|chatgpt|openai)$ ]]
 }
 
 # The GCP IAM role bundles provision_04_gcp_iam.sh knows how to grant. Kubernetes
@@ -278,11 +287,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, chatgpt, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, chatgpt, openai."
     exit 1
   fi
 
@@ -290,6 +299,14 @@ init_var_model_provider() {
   DEFAULT_MODEL="$(default_model_for_provider "$MODEL_PROVIDER")"
 
   init_var "MODEL_DEFAULT_NAME" "$DEFAULT_MODEL" "Enter Model Default Name"
+
+  # Vertex has no API key; it needs a billing project and a serving location,
+  # which is not always the cluster's region — Model Garden serves each partner
+  # model from its own subset.
+  if [ "$MODEL_PROVIDER" = "vertex_ai" ]; then
+    init_var "VERTEX_PROJECT_ID" "${PROJECT_ID:-}" "Enter Vertex AI Project ID"
+    init_var "VERTEX_LOCATION" "${REGION:-$DEFAULT_REGION}" "Enter Vertex AI Location"
+  fi
 }
 
 init_var_platform_agent_permission_set() {
@@ -310,6 +327,68 @@ init_var_platform_agent_permission_set() {
   fi
 }
 
+# ─── Memory Provider ──────────────────────────────────────────────────────────
+# The accepted values for MEMORY_PROVIDER.
+#
+# Two of these ship in this repo, and the difference between them is the whole
+# choice: `kube_agents_memory` wraps the upstream `hindsight` plugin and needs an
+# API server and a Postgres database in the cluster, while `multiuser_memory`
+# keeps a per-user Markdown file inside the pod and needs nothing at all. The
+# rest are the external plugins Hermes ships — see `memory.provider` in its
+# hermes_cli/config.py.
+#
+# `multiuser_memory` is the default because it is what this repo shipped before
+# `kube_agents_memory` existed: re-running provisioning against an install that
+# never chose a provider must not silently grow it a Postgres database.
+#
+# `none` is this installer's spelling of "no external provider — keep Hermes'
+# built-in store". Hermes itself spells that as the empty string, but an empty
+# string cannot survive the trip through the CR: an absent field takes the CRD
+# default, and the operator only overrides a non-empty one. So the choice is
+# carried as `none` and the operator translates it back to "" when it renders
+# config.yaml.
+MEMORY_PROVIDER_CHOICES="none kube_agents_memory multiuser_memory hindsight mem0 openviking holographic retaindb byterover"
+
+init_var_memory_provider() {
+  init_var "MEMORY_PROVIDER" "multiuser_memory" \
+    "Enter agent memory provider (${MEMORY_PROVIDER_CHOICES// /, })"
+
+  MEMORY_PROVIDER=$(echo "$MEMORY_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+
+  # Someone answering the prompt with a bare Enter after clearing the default
+  # means "no memory", which is `none` here.
+  if [ -z "$MEMORY_PROVIDER" ]; then
+    MEMORY_PROVIDER="none"
+  fi
+
+  local choice valid=1
+  for choice in $MEMORY_PROVIDER_CHOICES; do
+    if [ "$MEMORY_PROVIDER" = "$choice" ]; then
+      valid=0
+      break
+    fi
+  done
+  if [ "$valid" -ne 0 ]; then
+    print_error "Invalid agent memory provider '$MEMORY_PROVIDER'. Must be one of: ${MEMORY_PROVIDER_CHOICES// /, }."
+    exit 1
+  fi
+
+  # Persist the normalised value so the migration and the lower-casing stick,
+  # and so the later steps that read vars.sh see what this step decided.
+  save_var "MEMORY_PROVIDER" "$MEMORY_PROVIDER"
+}
+
+# True when the selected provider is backed by the in-cluster Hindsight service.
+# `kube_agents_memory` wraps the upstream `hindsight` plugin, so both talk to the
+# same API server and both need step 13 to have run; nothing else does.
+memory_provider_uses_hindsight() {
+  local provider
+  provider=$(echo "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  case "$provider" in
+    kube_agents_memory | hindsight) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 is_non_interactive() {
   [ ! -t 0 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline
@@ -319,6 +398,11 @@ is_non_interactive() {
 # between deploys, so it is scoped to a single pipeline execution. provision.sh
 # prompts once up front and exports it; the per-step scripts inherit it from
 # the environment and only prompt when run standalone.
+#
+# Only the steps that deploy an image built from this repo need one, and they
+# say so by setting REQUIRES_IMAGE_TAG=1 before calling load_state. Demanding it
+# from every step made the secrets and integration steps — none of which mention
+# IMAGE_TAG — fail outright in non-interactive mode.
 init_var_image_tag() {
   if [ -z "${IMAGE_TAG:-}" ]; then
     if is_non_interactive; then
@@ -355,7 +439,9 @@ load_state() {
     && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
     print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
   fi
-  init_var_image_tag
+  if [ "${REQUIRES_IMAGE_TAG:-0}" -eq 1 ]; then
+    init_var_image_tag
+  fi
   init_var_registry_prefix
   export NAMESPACE="kubeagents-system"
   export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
@@ -365,6 +451,8 @@ load_state() {
   export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
   export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
   export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+  export LITELLM_KSA_NAME="kubeagents-litellm"
+  export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
 }
 
 ensure_teardown_state() {
@@ -383,6 +471,8 @@ ensure_teardown_state() {
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
     export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
     export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+    export LITELLM_KSA_NAME="kubeagents-litellm"
+    export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
   else
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
@@ -435,6 +525,8 @@ ensure_teardown_state() {
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
     export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
     export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+    export LITELLM_KSA_NAME="kubeagents-litellm"
+    export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
   fi
 }
 
@@ -598,6 +690,29 @@ cluster_exists() {
   gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }
 
+host_label_value() {
+  gcloud container clusters describe "$CLUSTER_NAME" \
+    --location="$REGION" \
+    --project="$PROJECT_ID" \
+    --format="value(resourceLabels.${KUBE_AGENTS_HOST_LABEL})" 2>/dev/null
+}
+
+verify_host_label() {
+  [ "$(host_label_value)" = "true" ]
+}
+
+update_host_label() {
+  gcloud container clusters update "$CLUSTER_NAME" \
+    --location="$REGION" \
+    --project="$PROJECT_ID" \
+    --update-labels="${KUBE_AGENTS_HOST_LABEL}=true" \
+    --quiet
+}
+
+execute_host_label() {
+  retry 3 5 update_host_label
+}
+
 connect_cluster() {
   print_info "Fetching cluster credentials..."
   gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
@@ -658,6 +773,29 @@ wait_for_k8s_resource() {
   # Step 2: Wait for condition availability
   kubectl wait --for="condition=${condition}" "${resource}" -n "${namespace}" --timeout="${timeout}" || return 1
   print_success "${resource} reached state: ${condition}."
+}
+
+register_host_label() {
+  print_step "3. Register kube-agents host"
+  print_info "Verifying current state..."
+
+  if verify_host_label; then
+    print_success "Already completed: 3. Register kube-agents host"
+    return 0
+  fi
+
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[DRY-RUN] Would execute: 3. Register kube-agents host"
+    return 0
+  fi
+
+  print_info "Applying ${KUBE_AGENTS_HOST_LABEL}=true to '${CLUSTER_NAME}'..."
+  if execute_host_label; then
+    print_success "Registered the kube-agents host."
+  else
+    print_warning "Could not apply ${KUBE_AGENTS_HOST_LABEL}=true. Provisioning will continue; rerun step 08 to retry host discovery registration."
+  fi
+  return 0
 }
 
 confirm_action() {

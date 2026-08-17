@@ -111,17 +111,36 @@ mcp_servers:
 # `list(dict.fromkeys(a + b))`. So an entry removed here but left in
 # deploy/shared/defaults/config.yaml comes back at image build. Both copies of
 # `mcp-agent_common` had to go; see the note above that file's `mcp_servers`.
+#
+# `memory` is a GATE for the memory provider, not a tool grant:
+# inject_memory_provider_tools() bails unless it is listed, and that injection is
+# the only path by which the provider's tools reach the model. It is on both keys
+# because a kanban worker resolves its toolsets from `cli`
+# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db.py) while the API server
+# path uses `api_server`; a specialist reached either way must see the same
+# memory. Which tools that actually yields is decided by the provider — under
+# `memory.read_only` below it is the two read tools and nothing else.
+#
+# The toolset also surfaces Hermes' own built-in `memory` tool (MEMORY.md /
+# USER.md), whose check_fn is unconditional. It is inert here for the same reason
+# it is on the Chat Agent: `memory_enabled: false` leaves agent._memory_store as
+# None and tools/memory_tool.py short-circuits on a null store. That flag is what
+# keeps this profile read-only in fact and not only in the provider — flipping it
+# would hand a writable file store to an agent whose whole design here is that it
+# cannot write.
 platform_toolsets:
   cli:
     - hermes-cli
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - memory
   api_server:
     - hermes-api-server
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
+    - memory
 
 # Top-level `toolsets` gates the kanban orchestrator surface: the kanban tools
 # live in the core pool (surfaced via hermes-cli/hermes-api-server), and their
@@ -172,14 +191,49 @@ tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
 
-# No memory provider. `multiuser_memory` keys its per-user store off the gateway
-# identity (agent._user_id), which only the Chat Agent has — the Platform Agent is
-# reached through the kanban dispatcher, which spawns workers with no human
-# identity attached, so every write here landed in one anonymous `default` bucket.
-# Per-user memory lives on the front door only (see agents/chat/config.yaml); the
-# Platform Agent receives the resolved facts inline in each kanban card body.
+# Shared memory, read-only.
+#
+# PERSONAL memory is still impossible here and always will be: it keys off the
+# gateway identity (agent._user_id), which only the Chat Agent has. The kanban
+# dispatcher spawns workers with no human attached, so every personal write from
+# here landed in one anonymous bucket. The provider fails closed on that by
+# itself — with no user identity it recalls `scope:shared` only.
+#
+# SHARED memory is readable, because withholding it did not stop this agent
+# needing the corpus; it stopped it getting the corpus *from a curated source*.
+# Measured across ten probes, a specialist with no sanctioned route improvised
+# five, the worst of which was a 79,815-byte fork of the shared corpus written
+# into its own skill file, reloaded into context on every invocation, curated by
+# nobody and auditable by nobody. A stale private copy is a worse outcome than a
+# read.
+#
+# `read_only: true` is what keeps this one-way. It removes `memory_retain` from
+# the schemas the model sees, refuses the call if it is made anyway, and turns
+# off automatic capture. A specialist that could write shared memory could
+# launder its own derived-from-prior-runs conclusions into the corpus as facts;
+# what it concludes is a finding for its result, not a recorded fact.
+#
+# `memory_enabled: false` is not a contradiction of the provider being on: it
+# gates only the built-in file store, and the provider loads off `provider`
+# alone. See the note on the toolset gate above.
+#
+# `provider` here is a default, not the decision. The operator overwrites it from
+# spec.harness.memory.provider through this profile's overlay (memoryOverlay in
+# k8s-operator/internal/controller/platformagent_manifests.go), because the choice
+# belongs to the install and this file is baked into the image. It writes an empty
+# value for any provider that cannot be made read-only and scoped by tag — a
+# per-user file provider has no identity to key on here. The value below is what a
+# run without the operator gets, and it is empty for that same reason: the default
+# store is the per-user file one, which a specialist cannot use, so a specialist
+# with nobody to ask reads its facts from the kanban card instead. An install that
+# chooses `hindsight` is what fills this in.
+#
+# See docs/designs/memory.md and agents/chat/config.yaml (the front door, where
+# writes do happen).
 memory:
   memory_enabled: false
+  provider: ""
+  read_only: true
   user_profile_enabled: false
 
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`

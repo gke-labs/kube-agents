@@ -1,313 +1,146 @@
-"""Connection lifecycle and Setup-page controls."""
+"""Connection page rendering over the shared connection controller."""
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import streamlit as st
 
 from admin_console import connections
-from admin_console.connection_persistence import (
-    PersistedConnection,
-    delete_connection,
-    save_connection,
+from admin_console.connection_controller import (
+    CONNECTION_CONTROLLER_KEY,
+    ConnectionAction,
+    ConnectionController,
+    ConnectionPhase,
 )
-from admin_console.project_config import (
-    DeploymentTarget,
-    is_valid_cluster_name,
-    is_valid_location,
-    is_valid_project_id,
-)
-
-CONNECTION_REFRESH_INTERVAL = timedelta(minutes=10)
-CONNECTION_ACTION_KEY = "connection_action"
-CONNECTION_JOB_KEY = "connection_job"
-CONNECTION_ACTIONS = {"connect", "select", "restore", "refresh"}
-
-
-@dataclass(frozen=True)
-class ConnectionJob:
-    """One cloud verification running outside Streamlit's render thread."""
-
-    kind: str
-    project_id: str
-    expected_target: DeploymentTarget | None
-    future: Future[connections.ConnectionReport]
+from admin_console.connection_session import initialize_connection_controller
+from admin_console.project_config import is_valid_project_id
 
 
 @st.cache_resource
-def _connection_executor() -> ThreadPoolExecutor:
+def connection_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=2, thread_name_prefix="kube-agents-connect")
 
 
-def clear_connected_state() -> None:
-    """Forget the verified target and its derived providers, but retain scope."""
-    for key in (
-        "connected_target",
-        "telemetry_provider",
-        "telemetry_provider_key",
-        "telemetry_refresh",
-        "connection_last_verified_at",
-    ):
-        st.session_state.pop(key, None)
-
-
-def _persist_connection(
-    target: DeploymentTarget,
-    verified_at: datetime,
-) -> None:
-    """Persist only non-secret target metadata for the verified local account."""
-    try:
-        save_connection(
-            str(st.session_state.get("authenticated_user", "")),
-            target,
-            verified_at,
+def connection_controller() -> ConnectionController:
+    controller = st.session_state.get(CONNECTION_CONTROLLER_KEY)
+    if not isinstance(controller, ConnectionController):
+        package_parent = Path(__file__).resolve().parents[1]
+        controller = initialize_connection_controller(
+            package_parent,
+            connection_executor(),
         )
-        st.session_state.persisted_connection = PersistedConnection(
-            target,
-            str(st.session_state.get("authenticated_user", "")),
-            verified_at,
-        )
-        st.session_state.pop("connection_persistence_error", None)
-    except (OSError, ValueError) as exc:
-        st.session_state.connection_persistence_error = (
-            f"Connection is active for this browser session but could not be "
-            f"persisted ({type(exc).__name__})."
-        )
-
-
-def _mark_connected(
-    target: DeploymentTarget,
-    report: connections.ConnectionReport,
-) -> None:
-    st.session_state.connected_target = target
-    st.session_state.connection_last_verified_at = report.checked_at
-    _persist_connection(target, report.checked_at)
-
-
-def _set_scope(project_id: str, cluster_name: str = "", location: str = "") -> None:
-    st.session_state.selected_project = project_id
-    st.query_params["project"] = project_id
-    if is_valid_cluster_name(cluster_name) and is_valid_location(location):
-        st.session_state.selected_cluster = cluster_name
-        st.session_state.selected_location = location
-        st.query_params["cluster"] = cluster_name
-        st.query_params["location"] = location
-    else:
-        st.session_state.pop("selected_cluster", None)
-        st.session_state.pop("selected_location", None)
-        st.query_params.pop("cluster", None)
-        st.query_params.pop("location", None)
-
-
-def _target_for_cluster(
-    project_id: str, cluster: connections.ClusterInfo
-) -> DeploymentTarget:
-    provisioned = st.session_state.get("provisioned_target")
-    namespace = (
-        provisioned.namespace
-        if provisioned
-        and provisioned.project_id == project_id
-        and provisioned.cluster_name == cluster.name
-        and provisioned.location == cluster.location
-        else "kubeagents-system"
-    )
-    return DeploymentTarget(
-        project_id,
-        cluster.name,
-        cluster.location,
-        namespace=namespace,
-        source=(
-            "kube-agents-host label"
-            if cluster.is_kube_agents_host
-            else "manual selection"
-        ),
-    )
-
-
-def _start_connection_job(
-    kind: str,
-    project_id: str,
-    expected_target: DeploymentTarget | None,
-) -> None:
-    """Submit a connection check without blocking the page render."""
-    future = _connection_executor().submit(
-        connections.run_connection_checks,
-        project_id,
-        expected_target=expected_target,
-        include_agent_runtime_probe=True,
-    )
-    st.session_state[CONNECTION_ACTION_KEY] = {
-        "kind": kind,
-        "project_id": project_id,
-        "target": expected_target,
-    }
-    st.session_state[CONNECTION_JOB_KEY] = ConnectionJob(
-        kind,
-        project_id,
-        expected_target,
-        future,
-    )
-
-
-def _finish_connection_job(job: ConnectionJob) -> None:
-    """Apply a completed background check on Streamlit's render thread."""
-    try:
-        report = job.future.result()
-        st.session_state[f"connection_report:{job.project_id}"] = report
-        target = job.expected_target
-        if job.kind == "connect":
-            if len(report.kube_agents_hosts) == 1:
-                target = _target_for_cluster(job.project_id, report.kube_agents_hosts[0])
-                _set_scope(job.project_id, target.cluster_name, target.location)
-            elif report.clusters:
-                _set_scope(job.project_id)
-
-        if connections.connection_is_ready(report) and target is not None:
-            _mark_connected(target, report)
-            _set_scope(target.project_id, target.cluster_name, target.location)
-            if job.kind in {"connect", "select"}:
-                st.toast(f"Connected to {target.cluster_name}.")
-        elif job.kind == "refresh":
-            clear_connected_state()
-            st.session_state.connection_refresh_failed = True
-        elif job.kind == "restore":
-            st.session_state.connection_action_error = (
-                "The saved connection failed verification. Retry Connect."
-            )
-    except Exception as exc:
-        if job.kind == "refresh":
-            clear_connected_state()
-            st.session_state.connection_refresh_failed = True
-        elif job.kind == "restore":
-            st.session_state.connection_action_error = (
-                "The saved connection could not be restored "
-                f"({type(exc).__name__}). Retry Connect."
-            )
-        else:
-            st.session_state.connection_action_error = (
-                "Connection checks stopped unexpectedly "
-                f"({type(exc).__name__}). Retry Connect."
-            )
-    finally:
-        st.session_state.pop(CONNECTION_ACTION_KEY, None)
-        st.session_state.pop(CONNECTION_JOB_KEY, None)
-    st.rerun(scope="app")
-
-
-def _job_status_label(kind: str) -> str:
-    return {
-        "connect": "Connecting to kube-agents…",
-        "select": "Verifying the selected cluster…",
-        "restore": "Restoring and verifying your saved connection…",
-        "refresh": "Revalidating your connection…",
-    }.get(kind, "Checking the connection…")
+    return controller
 
 
 @st.fragment(run_every=1)
 def maintain_connection() -> None:
-    """Start and observe connection work without blocking the application UI."""
-    job = st.session_state.get(CONNECTION_JOB_KEY)
-    if isinstance(job, ConnectionJob):
-        status = st.status(
-            _job_status_label(job.kind),
-            state="running",
-            expanded=True,
-        )
-        status.caption("You can continue using the navigation while this finishes.")
-        if job.future.done():
-            _finish_connection_job(job)
-        return
-
-    pending_action = st.session_state.get(CONNECTION_ACTION_KEY)
-    if isinstance(pending_action, dict):
-        kind = str(pending_action.get("kind", ""))
-        project_id = str(pending_action.get("project_id", ""))
-        target = pending_action.get("target")
-        if (
-            kind in {"connect", "select"}
-            and is_valid_project_id(project_id)
-            and (target is None or isinstance(target, DeploymentTarget))
-        ):
-            _start_connection_job(kind, project_id, target)
-            st.rerun(scope="app")
-        st.session_state.pop(CONNECTION_ACTION_KEY, None)
-
-    active_target = st.session_state.get("connected_target")
-    is_connected = active_target is not None
-    current_project = str(st.session_state.get("selected_project", "")).strip()
-
-    persisted = st.session_state.get("persisted_connection")
-    restore_key = ""
-    if isinstance(persisted, PersistedConnection):
-        target = persisted.target
-        restore_key = f"{target.project_id}|{target.cluster_name}|{target.location}"
-        scope_matches = (
-            target.project_id == current_project
-            and target.cluster_name == st.session_state.get("selected_cluster", "")
-            and target.location == st.session_state.get("selected_location", "")
-        )
-        if (
-            not is_connected
-            and scope_matches
-            and st.session_state.get("connection_restore_attempted") != restore_key
-        ):
-            st.session_state.connection_restore_attempted = restore_key
-            _start_connection_job("restore", target.project_id, target)
-            st.rerun(scope="app")
-            return
-
-    last_verified = st.session_state.get("connection_last_verified_at")
-    existing_report = (
-        st.session_state.get(f"connection_report:{active_target.project_id}")
-        if is_connected
-        else None
-    )
-    if (
-        is_connected
-        and not isinstance(last_verified, datetime)
-        and isinstance(existing_report, connections.ConnectionReport)
-        and connections.connection_is_ready(existing_report)
-    ):
-        _mark_connected(active_target, existing_report)
-        last_verified = existing_report.checked_at
-    refresh_due = (
-        is_connected
-        and isinstance(last_verified, datetime)
-        and datetime.now(timezone.utc) - last_verified >= CONNECTION_REFRESH_INTERVAL
-    )
-    if refresh_due:
-        _start_connection_job("refresh", active_target.project_id, active_target)
+    """Poll the one session controller and schedule bounded revalidation."""
+    controller = connection_controller()
+    if controller.reconcile_persisted_lease():
         st.rerun(scope="app")
+
+    event = controller.poll()
+    if event is not None:
+        if event.outcome == "connected" and event.message:
+            st.toast(event.message)
+        st.rerun(scope="app")
+
+    if controller.refresh_due():
+        controller.refresh(connection_executor())
+        st.rerun(scope="app")
+
+    job = controller.job
+    if job is None:
+        return
+    label = {
+        ConnectionAction.PROJECT: "Connecting to the selected project…",
+        ConnectionAction.CLUSTER: "Connecting to the selected cluster…",
+        ConnectionAction.REFRESH: "Revalidating the cluster connection…",
+    }[job.action]
+    status = st.status(label, state="running", expanded=True)
+    status.caption("You can continue using the navigation while this finishes.")
+
+
+def _render_connection_actions(
+    key: str,
+    *,
+    connected: bool,
+    connecting: bool,
+    revalidating: bool = False,
+    blocked: bool = False,
+    connect_disabled: bool = False,
+    can_disconnect: bool = False,
+) -> tuple[bool, bool]:
+    """Render one primary action and only the currently relevant escape action."""
+    show_secondary = connecting or (connected and can_disconnect)
+    if show_secondary:
+        primary, secondary = st.columns(2)
+    else:
+        primary = st.container()
+        secondary = None
+    if connecting:
+        primary_label = "Connecting…"
+        primary_icon = ":material/progress_activity:"
+        state = "connecting"
+    elif revalidating:
+        primary_label = "Revalidating…"
+        primary_icon = ":material/progress_activity:"
+        state = "revalidating"
+    elif connected:
+        primary_label = "Connected"
+        primary_icon = ":material/check_circle:"
+        state = "connected"
+    else:
+        primary_label = "Connect"
+        primary_icon = ":material/cable:"
+        state = "disconnected"
+    primary_clicked = primary.button(
+        primary_label,
+        type="primary",
+        icon=primary_icon,
+        width="stretch",
+        disabled=(
+            connected or connecting or revalidating or blocked or connect_disabled
+        ),
+        key=f"{key}_primary_{state}",
+    )
+    secondary_clicked = False
+    if secondary is not None:
+        secondary_clicked = secondary.button(
+            "Abort" if connecting else "Disconnect",
+            icon=(":material/cancel:" if connecting else ":material/link_off:"),
+            width="stretch",
+            disabled=blocked and not (connected and can_disconnect),
+            key=f"{key}_secondary_{'abort' if connecting else 'disconnect'}",
+        )
+    return primary_clicked, secondary_clicked
+
+
+def _cluster_key(cluster: connections.ClusterInfo) -> str:
+    return f"{cluster.name}|{cluster.location}"
 
 
 def render_connection_controls() -> None:
-    """Render project, cluster, connect, and disconnect controls on Setup."""
-    active_target = st.session_state.get("connected_target")
-    is_connected = active_target is not None
-    current_project = str(st.session_state.get("selected_project", "")).strip()
-
-    candidates = st.session_state.get("project_candidates", ())
-    candidate_sources = st.session_state.get("project_candidate_sources", {})
+    """Render project and cluster controls from the same state pages consume."""
+    controller = connection_controller()
+    candidates = controller.project_candidates
+    candidate_sources = {
+        candidate.project_id: candidate.source for candidate in candidates
+    }
     project_ids = [candidate.project_id for candidate in candidates]
     preferred_index = (
-        project_ids.index(current_project)
-        if current_project in project_ids
+        project_ids.index(controller.project_id)
+        if controller.project_id in project_ids
         else (0 if project_ids else None)
     )
-    pending_action = st.session_state.get(CONNECTION_ACTION_KEY)
-    action_kind = (
-        str(pending_action.get("kind", ""))
-        if isinstance(pending_action, dict)
-        else ""
-    )
-    if action_kind not in CONNECTION_ACTIONS:
-        action_kind = ""
-    is_working = bool(action_kind)
+    project_connecting = controller.action is ConnectionAction.PROJECT
+    project_connected = controller.project.phase is ConnectionPhase.CONNECTED
 
-    with st.container():
+    with st.container(border=True):
+        st.markdown("#### Step 1 · Project")
+        st.caption("Verify Google Cloud access and discover clusters.")
         selected_option = st.selectbox(
             "Project",
             project_ids,
@@ -319,177 +152,166 @@ def render_connection_controls() -> None:
             ),
             placeholder="Select or enter a Google Cloud project ID",
             accept_new_options=True,
-            disabled=is_connected or is_working,
+            disabled=project_connected or controller.working,
+            label_visibility="collapsed",
             key="connection_project_option",
         )
-        requested_project = str(selected_option or "").strip()
-        project_is_valid = is_valid_project_id(requested_project)
-        if requested_project and not project_is_valid:
+        project_id = str(selected_option or "").strip()
+        project_is_valid = is_valid_project_id(project_id)
+        if project_id and not project_is_valid:
             st.error("Enter a valid Google Cloud project ID.")
-
-        if (
-            not is_connected
-            and project_is_valid
-            and requested_project != current_project
-        ):
-            clear_connected_state()
-            _set_scope(requested_project)
+        if project_is_valid and project_id != controller.project_id:
+            controller.select_project(project_id)
+            st.query_params["project"] = project_id
+            st.query_params.pop("cluster", None)
+            st.query_params.pop("location", None)
             st.rerun()
 
-        project_id = requested_project
-        report = (
-            st.session_state.get(f"connection_report:{project_id}")
-            if project_is_valid
-            else None
-        )
-        host_count = len(report.kube_agents_hosts) if report else 0
-        manual_selection_required = bool(
-            report and report.clusters and host_count != 1 and not is_connected
-        )
-        if is_connected:
-            st.caption(
-                f"Cluster: {active_target.cluster_name} · {active_target.location}"
+        project_connect_clicked, project_secondary_clicked = (
+            _render_connection_actions(
+                "project_connection",
+                connected=project_connected,
+                connecting=project_connecting,
+                blocked=controller.working and not project_connecting,
+                connect_disabled=not project_is_valid,
+                can_disconnect=(
+                    project_connected
+                    and controller.connected_target is None
+                    and not controller.working
+                ),
             )
-        else:
-            st.caption("Cluster is selected automatically from kube-agents-host=true.")
-
-        connect, disconnect = st.columns(2)
-        connecting = action_kind in {"connect", "restore"}
-        if is_connected:
-            connect_label = "Connected"
-            connect_icon = ":material/check_circle:"
-        elif connecting:
-            connect_label = "Connecting…"
-            connect_icon = ":material/progress_activity:"
-        else:
-            connect_label = "Connect"
-            connect_icon = ":material/cable:"
-        connect_clicked = connect.button(
-            connect_label,
-            type="primary",
-            icon=connect_icon,
-            width="stretch",
-            disabled=(
-                is_connected
-                or manual_selection_required
-                or is_working
-                or not project_is_valid
-            ),
-            key=(
-                "connect_to_kube_agents_busy"
-                if connecting
-                else "connect_to_kube_agents"
-            ),
         )
-        disconnect_clicked = disconnect.button(
-            "Disconnect",
-            icon=":material/link_off:",
-            width="stretch",
-            disabled=not is_connected or is_working,
-            key="disconnect_project",
-        )
-
-        if disconnect_clicked:
-            clear_connected_state()
-            delete_connection()
-            st.session_state.persisted_connection = None
-            st.session_state.pop("connection_restore_attempted", None)
-            st.toast("Disconnected from kube-agents.")
+        if project_connect_clicked:
+            controller.connect_project(connection_executor())
             st.rerun()
-
-        if connect_clicked:
-            st.session_state[CONNECTION_ACTION_KEY] = {
-                "kind": "connect",
-                "project_id": project_id,
-            }
-            st.rerun()
-
-        cluster_by_key: dict[str, connections.ClusterInfo] = {}
-        if manual_selection_required:
-            if host_count == 0:
-                st.error(
-                    "Automatic cluster detection failed: no GKE cluster is labeled "
-                    "kube-agents-host=true. Select the cluster that hosts kube-agents."
-                )
+        if project_secondary_clicked:
+            if project_connecting:
+                controller.abort()
+                st.toast("Project connection aborted.")
             else:
-                st.error(
-                    "Automatic cluster detection failed: "
-                    f"{host_count} GKE clusters are labeled kube-agents-host=true. "
-                    "Select the intended host."
-                )
+                controller.disconnect_project()
+                st.session_state.pop("connection_project_option", None)
+                st.query_params.pop("cluster", None)
+                st.query_params.pop("location", None)
+                st.toast("Disconnected from project.")
+            st.rerun()
+        if controller.project.error and not project_connecting:
+            st.error(controller.project.error)
 
-            ordered_clusters = sorted(
-                report.clusters,
-                key=lambda cluster: (
-                    not cluster.is_kube_agents_host,
-                    cluster.name,
-                    cluster.location,
-                ),
-            )
-            cluster_by_key = {
-                f"{cluster.name}|{cluster.location}": cluster
-                for cluster in ordered_clusters
-            }
+    if not project_connected:
+        with st.container(border=True):
+            st.markdown("#### Step 2 · Cluster")
+            st.caption("Connect the project to choose its kube-agents host.")
+        return
 
-            def cluster_label(key: str) -> str:
-                cluster = cluster_by_key[key]
-                suffix = " · kube-agents host" if cluster.is_kube_agents_host else ""
-                return f"{cluster.name} · {cluster.location}{suffix}"
+    report = controller.project.report
+    clusters = report.clusters if report else ()
+    display_target = controller.connected_target or controller.selected_target
+    if display_target and not any(
+        item.name == display_target.cluster_name
+        and item.location == display_target.location
+        for item in clusters
+    ):
+        clusters = (
+            *clusters,
+            connections.ClusterInfo(
+                display_target.cluster_name,
+                display_target.location,
+                "RUNNING",
+                display_target.source == "kube-agents-host label",
+            ),
+        )
+    ordered_clusters = sorted(
+        clusters,
+        key=lambda cluster: (
+            not cluster.is_kube_agents_host,
+            cluster.name,
+            cluster.location,
+        ),
+    )
+    cluster_by_key = {_cluster_key(cluster): cluster for cluster in ordered_clusters}
+    selected_target = controller.selected_target
+    selected_key = (
+        f"{selected_target.cluster_name}|{selected_target.location}"
+        if selected_target
+        else ""
+    )
+    cluster_keys = list(cluster_by_key)
+    selected_index = cluster_keys.index(selected_key) if selected_key in cluster_keys else 0
+    cluster_connecting = controller.action is ConnectionAction.CLUSTER
+    cluster_refreshing = controller.action is ConnectionAction.REFRESH
+    cluster_connected = controller.cluster.phase is ConnectionPhase.CONNECTED
 
-            selected_key = st.selectbox(
-                "Cluster",
-                list(cluster_by_key),
-                format_func=cluster_label,
-                disabled=is_working,
-                key=f"manual_cluster:{project_id}",
-            )
-            selecting = action_kind == "select"
-            select_clicked = st.button(
-                "Selecting…" if selecting else "Select",
-                type="primary",
-                icon=(
-                    ":material/progress_activity:"
-                    if selecting
-                    else ":material/check:"
-                ),
-                width="stretch",
-                disabled=is_working,
-                key=(
-                    "select_kube_agents_cluster_busy"
-                    if selecting
-                    else "select_kube_agents_cluster"
-                ),
-            )
-            if select_clicked:
-                selected_cluster = cluster_by_key[selected_key]
-                st.session_state[CONNECTION_ACTION_KEY] = {
-                    "kind": "select",
-                    "project_id": project_id,
-                    "target": _target_for_cluster(project_id, selected_cluster),
-                }
-                st.rerun()
+    with st.container(border=True):
+        st.markdown("#### Step 2 · Cluster")
+        st.caption("Verify the selected kube-agents runtime.")
 
-        if is_connected:
-            st.caption(
-                f"Connected · {active_target.cluster_name} · {active_target.location}"
+        def cluster_label(cluster_key: str) -> str:
+            cluster = cluster_by_key[cluster_key]
+            suffix = " · kube-agents host" if cluster.is_kube_agents_host else ""
+            return f"{cluster.name} · {cluster.location}{suffix}"
+
+        selected_key = st.selectbox(
+            "Cluster",
+            cluster_keys,
+            index=selected_index if cluster_keys else None,
+            format_func=cluster_label,
+            placeholder="No GKE clusters found",
+            disabled=cluster_connected or controller.working,
+            label_visibility="collapsed",
+            key=f"cluster_connection_option:{controller.project_id}",
+        )
+        selected_cluster = cluster_by_key.get(str(selected_key)) if selected_key else None
+        if selected_cluster is not None:
+            target = controller.target_for_cluster(selected_cluster)
+            current = controller.selected_target
+            if current is None or (
+                current.project_id,
+                current.cluster_name,
+                current.location,
+            ) != (target.project_id, target.cluster_name, target.location):
+                controller.select_target(target)
+            st.query_params["cluster"] = target.cluster_name
+            st.query_params["location"] = target.location
+
+        cluster_connect_clicked, cluster_secondary_clicked = (
+            _render_connection_actions(
+                "cluster_connection",
+                connected=cluster_connected,
+                connecting=cluster_connecting,
+                revalidating=cluster_refreshing and not cluster_connected,
+                blocked=controller.working and not cluster_connecting,
+                connect_disabled=selected_cluster is None,
+                can_disconnect=cluster_connected,
             )
-            st.caption("Revalidated every 10 minutes while this portal is open.")
-        else:
-            st.caption("Not connected")
-            if st.session_state.pop("connection_refresh_failed", False):
-                st.warning(
-                    "The saved connection failed revalidation. Reconnect to retry."
-                )
-            if report is not None:
-                runtime_check = next(
-                    (check for check in report.checks if check.key == "agent_runtime"),
-                    None,
-                )
-                if runtime_check and runtime_check.status != connections.CheckStatus.PASS:
-                    st.warning(runtime_check.summary)
-        persistence_error = st.session_state.get("connection_persistence_error")
-        if persistence_error:
-            st.warning(persistence_error)
-        action_error = st.session_state.pop("connection_action_error", None)
-        if action_error:
-            st.error(action_error)
+        )
+        if cluster_connect_clicked:
+            controller.connect_cluster(connection_executor())
+            st.rerun()
+        if cluster_secondary_clicked:
+            if cluster_connecting:
+                controller.abort()
+                st.toast("Cluster connection aborted.")
+            else:
+                controller.disconnect_cluster()
+                st.toast("Disconnected from cluster.")
+            st.rerun()
+        if cluster_refreshing and cluster_connected:
+            st.caption("Revalidating in the background. Disconnect remains available.")
+        elif cluster_refreshing:
+            st.caption("Revalidating the saved connection before enabling runtime access.")
+        if not cluster_connected and not cluster_keys:
+            st.info("No GKE clusters were found in this project.")
+        elif not cluster_connected and not any(
+            cluster.is_kube_agents_host for cluster in clusters
+        ):
+            st.caption("No kube-agents host label was found; choose the host cluster.")
+        elif not cluster_connected and len(
+            tuple(c for c in clusters if c.is_kube_agents_host)
+        ) > 1:
+            st.caption("Multiple host labels were found; choose the intended cluster.")
+        if controller.cluster.error and not cluster_connecting:
+            st.error(controller.cluster.error)
+
+    if controller.persistence_error:
+        st.warning(controller.persistence_error)

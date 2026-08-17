@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -267,6 +269,28 @@ func RunOperatorReconcile(
 	return trackerClient.GetObjects(), nil
 }
 
+// hashPlaceholder replaces content-hash annotation values in golden files.
+const hashPlaceholder = "<SHA256_FOR_TESTS>"
+
+// sha256Hex matches the hex encoding of a SHA-256 digest.
+var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// redactHashAnnotations replaces every `…-hash` annotation value with a
+// placeholder, asserting first that it looks like a SHA-256 digest. The digests
+// change whenever any rendered config does, so pinning them in the golden files
+// only produces churn; their shape is what the test cares about.
+func redactHashAnnotations(t *testing.T, annotations map[string]string) {
+	for key, value := range annotations {
+		if !strings.HasSuffix(key, "-hash") {
+			continue
+		}
+		if !sha256Hex.MatchString(value) {
+			t.Errorf("annotation %s = %q, want a 64-character hex SHA-256 digest", key, value)
+		}
+		annotations[key] = hashPlaceholder
+	}
+}
+
 // CleanAndMarshalResources cleans up volatile runtime fields and marshals objects to a multi-doc YAML string
 func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 	var renderedManifests []string
@@ -276,10 +300,17 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 		res.SetUID("")
 		res.SetCreationTimestamp(metav1.Time{})
 
-		// Omit the massive leader_elect.py script from golden files for readability
-		if cm, ok := res.(*corev1.ConfigMap); ok && cm.Data != nil {
-			if _, exists := cm.Data["leader_elect.py"]; exists {
-				cm.Data["leader_elect.py"] = "<OMITTED_FOR_TESTS>"
+		redactHashAnnotations(t, res.GetAnnotations())
+
+		switch obj := res.(type) {
+		case *appsv1.Deployment:
+			redactHashAnnotations(t, obj.Spec.Template.Annotations)
+		case *appsv1.StatefulSet:
+			redactHashAnnotations(t, obj.Spec.Template.Annotations)
+		case *corev1.ConfigMap:
+			// Omit the massive leader_elect.py script from golden files for readability
+			if _, exists := obj.Data["leader_elect.py"]; exists {
+				obj.Data["leader_elect.py"] = "<OMITTED_FOR_TESTS>"
 			}
 		}
 

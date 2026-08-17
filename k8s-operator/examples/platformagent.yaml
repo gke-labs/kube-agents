@@ -34,6 +34,15 @@ spec:
       apiServerSecretRef:
         name: "platformagent-secrets"
         key: "api-key"
+    # EventWatcher controls cluster event ingestion. Left unset — and therefore
+    # on — on purpose: the watcher is how a fleet notices its own incidents, so
+    # only an explicit false turns it off. That false is an emergency stop for an
+    # event storm, not a tuning knob: it stops new events from arriving (it does
+    # not touch cards already on the board), it rolls the pod, and nothing turns
+    # it back on. Throttle a merely busy board with tuning.maxInProgress instead.
+    # +optional
+    # eventWatcher:
+    #   enabled: false # RED BUTTON: no cluster event reaches the agent at all
     # Tuning bounds what the harness may consume. Left unset on purpose: the per-run
     # fields under it are a deployment trade, not a default the operator can pick for
     # you. `maxInProgress` is the exception — unset renders the operator's cap of 2,

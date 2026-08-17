@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 13: Verify PlatformAgent Rollout
+# 🤖 Step 14: Verify PlatformAgent Rollout
 # ==============================================================================
 # Final gate of the pipeline: waits for the agent Deployment to finish rolling
 # out and fails with diagnostics if it does not (override the timeout with

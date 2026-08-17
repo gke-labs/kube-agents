@@ -14,13 +14,20 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console.charts import activity_over_time, attribution_donut
-from admin_console.activity_scope import render_activity_scope
+from admin_console.connection_session import recover_app_shell
+from admin_console.activity_scope import (
+    load_activity_snapshot,
+    render_activity_load_more,
+    render_activity_scope,
+)
 from admin_console.domain import AttributionLevel, TriggerKind
 from admin_console.ui import render_telemetry_status, section_title, status_label
 
+recover_app_shell()
 st.title("Overview")
 provider = render_activity_scope()
-events = provider.list_activity()
+snapshot = load_activity_snapshot(provider)
+events = list(snapshot.events)
 interactions = {event.interaction_id for event in events}
 human_interactions = {
     event.interaction_id for event in events if event.trigger_kind == TriggerKind.HUMAN
@@ -43,7 +50,8 @@ linked = [
     if event.attribution in {AttributionLevel.EXPLICIT, AttributionLevel.INHERITED}
 ]
 
-snapshot = render_telemetry_status(provider)
+render_telemetry_status(snapshot)
+render_activity_load_more(provider)
 
 metric_columns = st.columns(5)
 metrics = (

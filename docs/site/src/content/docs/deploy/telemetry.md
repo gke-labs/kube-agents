@@ -20,7 +20,7 @@ For what's exported and how the agent surfaces it in Chat replies, see [Concepts
 
 ## GKE Managed Prometheus
 
-Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM and vLLM expose Prometheus `/metrics` endpoints (LiteLLM on port 8080, vLLM on port 8000); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml` and the vLLM example manifests under `examples/`).
+Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM, vLLM, and the Hindsight memory API expose Prometheus `/metrics` endpoints (LiteLLM on port 8080, vLLM on port 8000, Hindsight on port 8888); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`, the Hindsight one at `k8s-operator/config/integrations/hindsight/podmonitoring.yaml`, and the vLLM example manifests under `examples/`).
 
 ## Where token spend lives
 

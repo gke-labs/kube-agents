@@ -23,6 +23,8 @@ check_prereqs "gcloud" "kubectl" "make"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Operator Deployment"
+# This step deploys the operator image from this repo, so it needs a tag.
+REQUIRES_IMAGE_TAG=1
 load_state
 
 ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
@@ -68,7 +70,7 @@ execute_cert_manager() {
     print_info "Standard cluster detected. Installing standard cert-manager..."
   fi
 
-  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml || return 1
+  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml || return 1
 
   # Wait for the deployments to be created by the API server
   ensure_k8s_resource_exists "deployment/cert-manager-cainjector" "cert-manager" || return 1

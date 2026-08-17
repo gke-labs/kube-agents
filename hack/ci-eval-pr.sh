@@ -40,6 +40,13 @@ export CLUSTER_NAME="test-cluster"
 export TF_VAR_cluster_name="test-cluster"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
 
+# Stamp the run onto every labelable GCP resource the stacks create, alongside
+# the fixed managed-by label the cluster module applies. These say *which* run
+# left an orphan behind; managed-by is what the sweep matches on. Both are set
+# by Prow and empty when running locally, where the stacks fall back to "local".
+export TF_VAR_prow_build_id="${BUILD_ID:-}"
+export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
+
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
 export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"

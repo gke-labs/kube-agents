@@ -4,11 +4,20 @@
 {{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
 {{- end }}
 {{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
 {{- if not (hasKey $defaultModels $provider) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai — a typo here would otherwise fail only at runtime" $provider) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- $vertex := .Values.litellm.vertex | default dict }}
+{{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
+{{- $vertexProject := $vertex.projectId | default .Values.platformAgent.harness.projectId }}
+{{- $vertexLocation := $vertex.location | default .Values.platformAgent.harness.location }}
+{{- if eq $provider "vertex_ai" }}
+{{- if or (empty $vertexProject) (empty $vertexLocation) }}
+{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId and litellm.vertex.location (or platformAgent.harness.projectId/.location): Vertex AI is addressed as projects/<project>/locations/<location> and has no usable default." }}
+{{- end }}
+{{- end }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
 apiVersion: v1
 kind: ConfigMap
@@ -26,6 +35,25 @@ data:
           model: {{ printf "%s/%s" $provider $model }}
     litellm_settings:
       callbacks: {{ $callbacks }}
+{{- if eq $provider "vertex_ai" }}
+---
+{{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
+       the operator, but the gateway has no reconciler behind it, and a
+       serviceAccountName pointing at a missing KSA leaves the pods
+       unschedulable. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $vertexSA | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  {{- with $vertex.serviceAccountAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -53,6 +81,9 @@ spec:
         # Roll the pods when the rendered LiteLLM config changes.
         checksum/config: {{ printf "%s/%s/%s" $provider $model $callbacks | sha256sum }}
     spec:
+      {{- if eq $provider "vertex_ai" }}
+      serviceAccountName: {{ $vertexSA | quote }}
+      {{- end }}
       containers:
         - name: litellm-container
           image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
@@ -61,6 +92,12 @@ spec:
           resources:
             {{- toYaml .Values.litellm.resources | nindent 12 }}
           env:
+            {{- if eq $provider "vertex_ai" }}
+            - name: VERTEXAI_PROJECT
+              value: {{ $vertexProject | quote }}
+            - name: VERTEXAI_LOCATION
+              value: {{ $vertexLocation | quote }}
+            {{- end }}
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -187,6 +224,23 @@ spec:
             cidr: 169.254.20.10/32
         - ipBlock:
             cidr: 169.254.169.254/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The two peers
+        # below cover both shapes: the literal handles the classic service
+        # range, and the excepted block handles any VIP outside private space
+        # (34.118.224.0/20 today, whatever GKE allocates next). The except list
+        # mirrors the 443 rule, so port 53 reaches nothing internal that the
+        # 443 rule does not already deny.
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
     - ports:
         - port: 443
           protocol: TCP
@@ -201,6 +255,19 @@ spec:
         - port: 80
           protocol: TCP
       to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # The node DNATs 169.254.169.254:80 to the metadata daemon on port 988 before
+    # NetworkPolicy is evaluated, so the rule above is not on its own enough to admit a
+    # Workload Identity token fetch. 169.254.169.252 is the rewrite target on the
+    # iptables datapath; Dataplane V2 rewrites to the hosting node's internal IP, so add
+    # one /32 per node there.
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
         - ipBlock:
             cidr: 169.254.169.254/32
     - ports:

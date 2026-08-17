@@ -2,32 +2,57 @@
 #
 # This is the config.yaml for the front-door Chat Agent — the `default` Hermes
 # profile that receives all chat ingress. It is written to
-# /opt/chat-template/config.yaml at build time and is the BASE from which
-# docker-entrypoint.sh rebuilds the default profile home's config.yaml
-# ($HERMES_HOME/config.yaml) on every start.
+# /opt/chat-template/config.yaml at build time, and docker-entrypoint.sh seeds
+# the default profile home's config.yaml ($HERMES_HOME/config.yaml) from it on a
+# FRESH volume. After that the live file belongs to the running agent, with one
+# exception: step 2d back-fills, at every start, any key the live file does not
+# hold at all — the repair for a `save_config` that stripped a then-pinned leaf,
+# or a release that stopped pinning one. So ADDING a key here does reach an
+# existing install on its next roll; CHANGING one does not, because the live file
+# already holds it and the back-fill never overrules a value the agent has. A
+# changed value reaches a deployed agent only through the operator — the managed
+# scope or the overlay in (3) and (4) below — or by hand.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# THE LIVE FILE HAS THREE AUTHORS, and this is only one of them:
+# WHAT THE AGENT ACTUALLY LOADS IS FOUR THINGS, and this is only one of them:
 #
-#   1. this file, the base;
-#   2. the operator's render (k8s-operator renderConfigYAML), delivered as the
-#      ConfigMap key profile-default.overlay.yaml and merged on top;
-#   3. the running agent, which writes to its own config — /sethome records the
-#      home channel, the monitoring policy mints monitoring.install_id.
+#   1. this file, the base, seeded onto the PVC on a fresh volume and back-filled
+#      into it thereafter;
+#   2. the running agent's own writes to that PVC copy — /sethome records the
+#      home channel, the monitoring policy mints monitoring.install_id, slash
+#      commands save preferences;
+#   3. the operator's overlay for this profile (renderDefaultProfileOverlayYAML,
+#      ConfigMap key profile-default.overlay.yaml), merged INTO the PVC copy by
+#      entrypoint step 2.7 at startup. It carries the operator settings that stay
+#      mutable afterwards — an untargeted AgentPlugin's enablement and its
+#      non-gateway config, and spec.harness.tuning;
+#   4. the operator's render (k8s-operator renderConfigYAML), mounted read-only
+#      at /etc/hermes/config.yaml as Hermes' MANAGED SCOPE and overlaid, per leaf
+#      key, on top of 1+2+3 at every load.
 #
-# deploy/shared/default_profile_config.py reconciles the three with a three-way
-# merge: the operator wins any key it and the runtime both changed, the runtime
-# keeps its own edits everywhere else. The file is NOT mounted from the ConfigMap;
-# it was once, and that made it read-only, which is what made /sethome fail.
+# The managed scope wins, and it wins without touching the PVC: hermes merges it
+# in on load, strips its keys back out of anything the agent saves, and rejects
+# `hermes config set` against them. So the operator's model endpoint and platform
+# settings are immutable at runtime while the file itself stays writable. It was
+# once subPath-mounted over $HERMES_HOME/config.yaml instead, which made the file
+# read-only — that is what made /sethome fail (issue #658).
 #
-# Keep this file and renderConfigYAML in sync in BOTH directions. Lists are
-# unioned, so an entry dropped from one side survives in the other — removing a
-# toolset or plugin means removing it here AND there. The operator's
-# TestRenderConfigYAMLListsMatchChatConfig fails when the two diverge.
+# (3) and (4) do not overlap, and must not — a key the operator both pins and
+# merges would be written to the PVC and then overruled on load, so withdrawing
+# it from the CR would change nothing anyone could see.
+#
+# /etc/hermes is MACHINE-GLOBAL — one file
+# for every profile in the pod, not just this one — so it carries only what is
+# identical for every profile AND beyond the agent's own repair: `model`,
+# `platforms`, `approvals.cron_mode`, `display.platforms`. Everything
+# profile-shaped below — toolsets, plugins.enabled, mcp_servers, kanban, memory —
+# is this file's alone. Do not add any of it to renderConfigYAML: the merge is
+# per leaf key and lists REPLACE rather than union, so a list pinned there would
+# hand the platform specialist the front door's tools and vice versa.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
@@ -39,9 +64,10 @@
 #   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
 #     this chat thread and posts the specialist's progress back to it as each step
 #     completes, with no blocking timeout.
-#   - `multiuser_memory`: per-user memory writes. The Chat Agent is the ONLY place
-#     a human identity exists (agent._user_id comes from the gateway), so it is the
-#     only profile that can scope memory per user. See the `memory` note below.
+#   - `kube_agents_memory`: per-user + shared memory. The Chat Agent is the ONLY
+#     place a human identity exists (agent._user_id comes from the gateway), so
+#     it is the only profile that can scope memory per user. See the `memory`
+#     note below.
 # Enforcement layers:
 #   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` + `memory` (no
 #      `hermes-cli`/`hermes-api-server` base bundles, which would grant
@@ -59,24 +85,26 @@ model:
   default: model-default
   base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
   api_key: none
+  # The wire protocol a custom provider on this base_url resolves to anyway. Stated
+  # explicitly to match the operator's managed render, where its purpose is to pin the
+  # key so `/model … --global` cannot persist a different one.
+  api_mode: chat_completions
 
 # MCP Servers configuration. Routing/relay surface only.
 #
-# `args` must stay BYTE-IDENTICAL to renderConfigYAML's, which is why it is a
-# ${HERMES_HOME} placeholder and not a path. Lists are unioned by the merge (see
-# the header), and a command line is the one kind of list a union corrupts
-# rather than extends: two differing entries become two argv words, and python3
-# runs the first. Hardcoding /opt/data made them differ under a custom
+# `args` is a ${HERMES_HOME} placeholder rather than a path because this file is
+# the only thing that declares it: hardcoding /opt/data broke a custom
 # spec.harness.hermes.agentHome, where /opt/data/scripts/router_server.py does
 # not exist — the entrypoint copies /opt/defaults into the custom home — so the
 # router MCP died at startup and the Chat Agent had no roster to delegate
 # against.
 #
-# The placeholder is also what makes THIS file correct on its own, which it has
-# to be: the entrypoint seeds a fresh PVC straight from it, before the operator's
-# overlay is merged. HERMES_HOME is exported by docker-entrypoint.sh line 5 and
-# resolved in `args` by tools/mcp_tool.py `_interpolate_env_vars`, the same
-# expansion the `env` block below already depends on.
+# The operator renders no mcp_servers at all, deliberately: the managed scope is
+# machine-global and its merge REPLACES lists, so a command line pinned there
+# would be handed to every profile in the pod. HERMES_HOME is exported by
+# docker-entrypoint.sh line 5 and resolved in `args` by tools/mcp_tool.py
+# `_interpolate_env_vars`, the same expansion the `env` block below already
+# depends on.
 mcp_servers:
   router:
     command: "/opt/hermes/.venv/bin/python3"
@@ -93,25 +121,26 @@ mcp_servers:
 # ignores the MCP passthrough, which DOES load the router (verified). Router-only
 # is the intended state.
 #
-# `memory` here is a GATE for the multiuser_memory provider, not a tool grant.
+# `memory` here is a GATE for the memory provider, not a tool grant. The check
+# is provider-agnostic: it applies to whatever `memory.provider` names below.
 # The two things that read it:
 #   - hermes_cli.tools_config._get_platform_tools() resolves this list for the
 #     session's platform key, then subtracts `agent.disabled_toolsets` LAST.
 #     What survives becomes agent.enabled_toolsets.
 #   - agent_init then calls inject_memory_provider_tools(), which bails unless
 #     memory_provider_tools_enabled(agent.enabled_toolsets) sees "memory"
-#     (agent/memory_manager.py). That injection is the ONLY path by which
-#     `multiuser_memory` reaches the model.
+#     (agent/memory_manager.py). That injection is the ONLY path by which the
+#     provider's tools reach the model.
 # So `memory` must be listed HERE and must NOT be listed in disabled_toolsets.
 # Listing it in both nets to off — the subtraction wins, the gate fails, and the
-# provider loads but is never exposed (that is why /opt/data/memories stayed
-# empty). The denylist below has a matching note.
+# provider loads but is never exposed. The denylist below has a matching note.
 #
 # The price of leaving the toolset on is that the built-in `memory` tool also
-# appears alongside `multiuser_memory`. It is inert: `memory_enabled: false`
-# leaves agent._memory_store as None, and tools/memory_tool.py short-circuits on
-# a null store with "Memory is not available", touching no disk. SOUL.md §1.6
-# tells the agent to ignore it and write through `multiuser_memory`.
+# appears alongside the provider's `memory_retain`/`memory_recall`/
+# `memory_reflect` tools. It is inert:
+# `memory_enabled: false` leaves agent._memory_store as None, and
+# tools/memory_tool.py short-circuits on a null store with "Memory is not
+# available", touching no disk.
 platform_toolsets:
   cli:
     - mcp-router
@@ -170,11 +199,12 @@ kanban:
   # of cards spawns processes until the cgroup OOM killer takes them, which kills a
   # child rather than the container and so produces no restart and no event.
   #
-  # On an operator-managed install this line is overwritten: the operator renders
-  # the same value into its config ConfigMap and the entrypoint force-syncs that
-  # over this file. It is here for the install that runs the image without the
-  # operator, which would otherwise be the only one left uncapped. The operator's
-  # defaultKanbanMaxInProgress is authoritative; keep the two the same.
+  # This line is the default on every install. The operator does not pin it: its
+  # managed scope is machine-global and this is a front-door setting. An operator
+  # that wants a different cap sets spec.harness.tuning.maxInProgress, which the
+  # operator writes into profile-default.overlay.yaml and the entrypoint merges
+  # over this key at startup — so keep this value in step with
+  # defaultKanbanMaxInProgress in platformagent_manifests.go.
   max_in_progress: 2
 
 # Denylist applied last for every platform key — the authoritative guarantee that
@@ -206,9 +236,9 @@ agent:
     - todo
     # NOTE: `memory` is deliberately absent from this denylist. Adding it back
     # removes "memory" from agent.enabled_toolsets, which fails the gate in
-    # inject_memory_provider_tools() and silently kills `multiuser_memory` —
-    # the provider still loads and logs "registered (1 tools)", but the tool
-    # never reaches the model. See the platform_toolsets note above.
+    # inject_memory_provider_tools() and silently kills the memory provider —
+    # it still loads and logs that it registered its tools, but they never
+    # reach the model. See the platform_toolsets note above.
     - session_search
     - project
     - homeassistant
@@ -227,14 +257,14 @@ platforms:
   # Slack egress presentation. `enabled` is the operator's to set, from the CR's
   # spec.integration.slack.
   #
-  # This block is one of the two copies the header warns about, and the one that
-  # does NOT run on a deployed agent: the operator's rendered config.yaml is
-  # subPath-mounted straight over $HERMES_HOME/config.yaml, so the file below is
-  # what the adapter reads only where nothing mounts over it — a local `docker
-  # run`, or a profile started off the image alone. Setting `rich_blocks` here
-  # and nowhere else changes nothing in a cluster. Its twin is
-  # renderConfigYAML in k8s-operator/internal/controller/platformagent_manifests.go
-  # (search `Platforms.Slack.Extra`), pinned by TestBuildConfigMapSlackRichBlocks.
+  # `platforms` is the one subtree the operator also renders, so this block has a
+  # twin and the managed scope's copy is the one a deployed agent obeys: the
+  # overlay wins per leaf key at every load. Setting `rich_blocks` here and
+  # nowhere else therefore changes nothing in a cluster — it is read only where
+  # nothing mounts /etc/hermes, a local `docker run` or a profile started off the
+  # image alone. The twin is renderConfigYAML in
+  # k8s-operator/internal/controller/platformagent_manifests.go (search
+  # `Platforms.Slack.Extra`), pinned by TestBuildConfigMapSlackRichBlocks.
   # Change one, change both.
   slack:
     extra:
@@ -269,18 +299,66 @@ platforms:
       # both this renderer and format_message.
       rich_blocks: true
 
-# Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
-# `multiuser_memory` provider replaces it and is the ONLY memory on this profile.
-# It keys each user's notes off the gateway identity (agent._user_id, threaded in
-# by agent_init) and writes them to $HERMES_HOME/memories/users/<user>.md, with a
-# shared MEMORY.md alongside for org-wide facts. Both stores are hydrated into the
-# system prompt automatically each session by the provider's system_prompt_block(),
-# so the Chat Agent reads them without a tool call and only needs the tool to WRITE.
+# Memory. The built-in MEMORY.md/USER.md store stays off; the
+# `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)
+# replaces it and is the ONLY memory on this profile. It wraps one bundled
+# Hindsight instance talking HTTP to a self-hosted Hindsight API, and keeps every
+# user's memories in a single bank (`bank_id` in
+# $HERMES_HOME/hindsight/config.json), separated by a scope tag: `user:<id>`
+# taken from the gateway identity (agent._user_id, threaded in by agent_init) for
+# private facts, `scope:shared` for organisation-wide ones. Recall asks for the
+# current user's tag plus the shared tag and nothing else comes back.
 #
-# This is the only profile that gets the provider: specialists are spawned by the
-# kanban dispatcher and carry no human identity, so their writes would all land in
-# one anonymous bucket. Front door records the facts; SOUL.md §1.6 requires it to
-# resolve them into concrete values before delegating.
+# The wrapper exists because Hindsight cannot be configured to do this on its
+# own: `{user}` substitution is applied to `bank_id` and to no other setting, so
+# a configured `retain_tags: "user:{user_id}"` would tag every user with that
+# literal string. See docs/designs/memory.md for what the wrapper
+# pins and why each one is load-bearing.
+#
+# Personal memory runs in Hindsight's `hybrid` memory_mode: it recalls into the
+# prompt each turn and retains at session end on its own, so neither the persona
+# nor the operator has to instruct the model to use it. Shared memory is read the
+# same way but never auto-retains — everyone can see it, so it takes deliberate
+# writes only (`memory_retain` with scope "shared"). Recall depth for both is
+# `recall_budget` in the same config.json (low|mid|high; unset leaves Hindsight's
+# own default of mid).
+#
+# There is no bulk-load path into the shared corpus, by design: it fills from
+# conversation one deliberate write at a time, the same way personal memory
+# does. Nothing expires on its own,
+# and nothing prunes it either: agents/chat/scripts/memory_ttl_curator.py exists
+# for that but is shelved and on no schedule (see
+# docs/designs/memory.md).
+#
+# The bank's mission and its retain strategies — what it holds, and what is worth
+# extracting into it under each scope — are provisioned by the provider itself
+# when a session starts. Hindsight's `bank_mission` config key is read into an
+# attribute the plugin never uses, so a mission can only be set through the API;
+# doing it at session start means there is no install step, and a deleted bank or
+# a rebuilt Hindsight database comes back correctly on its own.
+#
+# This is the only profile that gets the provider in a WRITABLE form: specialists
+# are spawned by the kanban dispatcher and carry no human identity, so their writes
+# would all land in one anonymous bucket. The provider fails closed on exactly that
+# case — with no user_id there is no personal scope, and auto-retain is switched off
+# entirely. They do get the same provider under `read_only: true`, which is why
+# agents/platform/config.yaml names it too.
+#
+# `provider` here is the decision for THIS profile, and the only one it gets. The
+# operator renders no `memory` block into the managed scope — that scope is
+# machine-global, and a provider pinned there would be handed to every specialist
+# in the pod, including the ones that carry no human identity to scope a store by.
+# spec.harness.memory.provider still reaches the platform profile through its own
+# overlay; it no longer reaches the front door, so changing the store here means
+# changing this file and rebuilding. It names the file store, matching the CRD
+# default, so that a bare `hermes` run needs no service outside the pod. See
+# docs/designs/memory.md#choosing-a-provider.
+#
+# It also fails closed in shared Google Chat threads. build_session_key()
+# (gateway/session.py) omits the participant id inside a thread unless
+# `thread_sessions_per_user` is on, so everyone posting in a thread would share
+# one cached Agent and therefore one identity. The provider detects that and
+# serves shared memory only, so personal memory is DM-only by design.
 memory:
   memory_enabled: false
   user_profile_enabled: false

@@ -221,15 +221,32 @@ def _rotate(log_path: Path) -> None:
 # never consults ``config.yaml``. So the child needs these in its environment
 # or it has nowhere to post.
 #
-# Slack-only because the entry criterion is "the platform's home-channel var is
-# on the provider-env blocklist", not "the harness supports the platform". Of
-# the platforms shipped here, ``tools/environments/local.py`` blocks Slack's
-# (and Telegram's, Discord's and Signal's); ``GOOGLE_CHAT_HOME_CHANNEL`` is
-# absent from that list, so it survives ``build_subprocess_env`` and the child
-# inherits it with nothing to restore. Add a platform here when its var joins
-# the blocklist, not when the platform is enabled.
+# One entry per platform this image ships — ``hermes-agent[slack]`` and
+# ``hermes-agent[google_chat]`` in deploy/docker/Dockerfile.
+#
+# The criterion used to be "the platform's home-channel var is on Hermes'
+# provider-env blocklist", and it was both wrong about Google Chat and
+# unmaintainable. Wrong because that list is not the literal set in
+# ``tools/environments/local.py``: ``_build_provider_env_blocklist`` derives it
+# at import, and ``_inject_platform_plugin_env_vars`` files every variable a
+# bundled ``plugin.yaml`` declares under ``category: "messaging"`` by default,
+# which the blocklist then blocks wholesale — ignoring the ``password: false``
+# that ``plugins/platforms/google_chat/plugin.yaml`` sets on this very key. So
+# ``GOOGLE_CHAT_HOME_CHANNEL`` *is* stripped, grepping upstream for it finds
+# nothing, and named-profile cron delivered nowhere on a Google-Chat install.
+#
+# Unmaintainable because that set is computed inside a pinned base image
+# (``HERMES_AGENT_TAG``) from manifests this repository does not own: it can
+# change under a copy kept here with nothing on this side moving. Ship-list is
+# a criterion we control. Restoring a variable that was never stripped is a
+# no-op — it rewrites the same value — so an entry costs nothing if upstream
+# ever stops blocking it.
 HOME_TARGET_ENV_KEYS = {
     "slack": ("SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_THREAD_ID"),
+    "google_chat": (
+        "GOOGLE_CHAT_HOME_CHANNEL",
+        "GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID",
+    ),
 }
 
 
@@ -249,24 +266,69 @@ def _mapping(value: object) -> dict:
 def home_target_env(root_home: Path) -> dict[str, str]:
     """The home-target variables a cron child cannot inherit, re-read from disk.
 
-    ``SLACK_HOME_CHANNEL`` sits on Hermes' provider-env blocklist
-    (``tools/environments/local.py``), so ``build_subprocess_env`` strips it
-    from every ``no_agent`` script's environment — including this ticker's.
-    The value is therefore already gone by the time we spawn, and passing
-    ``os.environ`` through re-exports the hole: the child resolves
-    ``deliver=all`` to nothing and every job on a named profile records "no
-    delivery target resolved for deliver=all" while posting nowhere.
-    ``/sethome`` is not at fault; its value simply cannot cross the boundary.
+    Every ``*_HOME_CHANNEL`` sits on Hermes' provider-env blocklist, so
+    ``build_subprocess_env`` strips it from every ``no_agent`` script's
+    environment — including this ticker's. The value is therefore already gone
+    by the time we spawn, and passing ``os.environ`` through re-exports the
+    hole: the child resolves ``deliver=all`` to nothing and every job on a
+    named profile records "no delivery target resolved for deliver=all" while
+    posting nowhere. ``/sethome`` is not at fault; its value simply cannot
+    cross the boundary.
 
-    Read it back from the root profile's ``config.yaml`` — the file
-    ``/sethome`` writes — rather than from the environment it was scrubbed
-    from. A channel id is routing metadata, not a credential: it is on that
-    blocklist because Hermes manages it as config, alongside
-    ``SLACK_ALLOWED_USERS``. Restoring these two keys here leaves the blocklist
-    intact for everything it exists to protect — the tokens, the relay secret,
-    the provider API keys.
+    Read it back from ``config.yaml`` instead — a file on disk survives the
+    boundary the environment does not.
 
-    Both keys move together on purpose. ``SLACK_HOME_CHANNEL_THREAD_ID`` is
+    Deliberately says nothing about *who* writes that file. Whether the runtime
+    can write it has already flipped twice — mounted read-only over
+    ``$HERMES_HOME/config.yaml``, then merged into a writable PVC file by
+    ``docker-entrypoint.sh`` step 2d and ``default_profile_config.py``, with
+    issue #658 open against the arrangement — so a docstring that names either
+    one as the way things are will be wrong again on a date nobody can predict.
+    This function only requires that ``platforms.<platform>.home_channel`` be
+    on disk by the time it reads. It does not care which side put it there, and
+    should not be edited to.
+
+    That distinction matters because it decides who fills the key in:
+
+    * Writable: ``/sethome`` (``persist_home_channel``) does, and
+      ``adopt``/``_reconcile_dict`` keep it across a roll as undeclared runtime
+      state — so on an install where somebody has run it, this function alone
+      restores delivery.
+    * Read-only: ``/sethome`` cannot, and per #658 has never once succeeded on
+      an affected install, so nothing lands and the lookup below finds nothing.
+
+    Only the operator rendering a ``home_channel`` beside the ``enabled`` and
+    ``typing_status_text`` it already writes covers both, and covers the install
+    where nobody has typed ``/sethome`` at all. That is still missing.
+
+    Two things to get right if you write that, both worse than the bug this
+    function fixes. **The shape:** only ``chat_id`` is read here, but the whole
+    ``HomeChannel`` has to be written, because ``gateway/config.py``'s
+    ``HomeChannel.from_dict`` indexes ``data["platform"]`` and
+    ``data["chat_id"]`` directly — a block carrying the id alone raises
+    ``KeyError`` out of ``load_gateway_config`` and the scheduler gives up with
+    "failed to load gateway config" for *every* platform, not just the
+    malformed one. ``persist_home_channel`` writes
+    ``{platform: <name>, chat_id: <id>, name: "Home"}``. **The precedence**,
+    while the merged-writable arrangement is the one in force: rendering the
+    key at all moves it from undeclared to declared, and ``_reconcile_dict``'s
+    scalar rule then hands the baseline the win
+    (``if base_v is _ABSENT or theirs_v != base_v: continue``), so the first
+    roll after that silently discards whatever ``/sethome`` had set. Emit no
+    ``home_channel`` key when the CR field is empty — a pointer with
+    ``omitempty``, not a value type — or an unset field will clobber a working
+    channel with a blank one.
+
+    A channel id is routing metadata, not a credential. It is on that
+    blocklist because ``category: "messaging"`` is the default bucket for
+    plugin-declared variables and the blocklist blocks that bucket whole,
+    without consulting the ``password: false`` the manifest itself sets.
+    Restoring these keys leaves the blocklist intact for everything it exists
+    to protect — the tokens, the relay secret, the provider API keys — and for
+    ``*_ALLOWED_USERS``, which is an authorization list rather than a
+    destination and is deliberately not restored here.
+
+    Both keys of a pair move together on purpose. The ``*_THREAD_ID`` half is
     *not* on the blocklist and does survive the spawn, so restoring only the
     channel id would leave a stale inherited thread id pointing into a thread
     the new home knows nothing about.

@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+spec:
+  template:
+    spec:
+      serviceAccountName: ${LITELLM_KSA_NAME}
+      containers:
+        - name: litellm-container
+          env:
+            # Without these LiteLLM falls back to ADC — the node's project —
+            # and bills the wrong one, or 404s for a model served elsewhere.
+            - name: VERTEXAI_PROJECT
+              value: "${VERTEX_PROJECT_ID}"
+            - name: VERTEXAI_LOCATION
+              value: "${VERTEX_LOCATION}"

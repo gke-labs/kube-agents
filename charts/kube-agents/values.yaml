@@ -5,7 +5,7 @@ operator:
   # CREDENTIAL_PROXY_IMAGE / FLUENT_BIT_IMAGE:
   #   extraEnv:
   #     - name: FLUENT_BIT_IMAGE
-  #       value: registry.corp/mirror/fluent-bit:5.0.7
+  #       value: registry.corp/mirror/fluent-bit:5.1.0
   extraEnv: []
   image:
     repository: ghcr.io/gke-labs/kube-agents/k8s-operator
@@ -58,14 +58,26 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai (chatgpt needs the kustomize overlay and is
-  # rejected). The provider's API key must exist in the credentials Secret.
+  # gemini, anthropic, openai, vertex_ai (chatgpt needs the kustomize overlay and
+  # is rejected). The provider's API key must exist in the credentials Secret —
+  # except vertex_ai, which authenticates with Workload Identity instead.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
+  # modelProvider: vertex_ai only. The gateway calls
+  # projects/<projectId>/locations/<location> as a GSA reached through Workload
+  # Identity, so the chart always creates this KSA — no operator reconciles it.
+  vertex:
+    serviceAccountName: kubeagents-litellm
+    #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
+    serviceAccountAnnotations: {}
+    # Empty defaults to platformAgent.harness.projectId / .location; location
+    # must be a region (or "global"), so override it on a zonal cluster.
+    projectId: ""
+    location: ""
   image:
     repository: ghcr.io/berriai/litellm
-    tag: v1.92.0
+    tag: v1.96.2
     pullPolicy: IfNotPresent
   replicaCount: 2
   resources:

@@ -88,7 +88,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count).
 - **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); standard exclusions.
@@ -98,7 +98,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.2 Spot-only ComputeClass without on-demand safety floor (`ccc-no-ondemand-floor`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end, or a latency-sensitive inference workload is configured Spot-first.
 - **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`; workloads with explicit non-production/test opt-out.
@@ -108,7 +108,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.3 Large VM shape scarcity (>32 vCPU) without multi-family fallbacks (`ccc-large-vm-scarcity`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `kubectl --context <ctx> get deployments,statefulsets,computeclasses -n <ns> <name> -o yaml`
 - **Flag when:** A workload or ComputeClass requests very large VM sizes (>32 vCPUs, such as `m1-ultramem-160`, `c3-highcpu-88`, `a2-highgpu-8g`) from thin capacity pools without secondary fallback families or horizontal replica spreading.
 - **Do NOT flag:** Workloads requesting standard/horizontal shapes (<=32 vCPUs); stateful monolithic databases that explicitly declare multi-region failover.
@@ -118,7 +118,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.4 Excessive priority rules causing autoscaler backoff loops (`ccc-priority-starvation`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A `ComputeClass` contains more than 10 total priority rules (granular `machineType` rules or family entries), exceeding Flex Advisor combinations and triggering Cluster Autoscaler cooldown/backoff reset loops.
 - **Do NOT flag:** ComputeClasses using <= 5 broad `machineFamily` level definitions (e.g. `n4`, `c3`, `n2`).
@@ -128,7 +128,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.5 Mixed disk generations on PV-attached ComputeClasses (`ccc-mixed-disk-generations`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,statefulsets -n <ns> <name> -o yaml`
 - **Flag when:** A stateful workload using PersistentVolumes references a ComputeClass whose `priorities[]` mixes Gen 2 VMs (`n2`, `n2d`, `c2`) and Gen 4/Hyperdisk VMs (`c4`, `n4`, `c3`), causing PV attachment deadlocks upon failover.
 - **Do NOT flag:** Stateless workloads; ComputeClasses whose priorities are purely Gen 2 or purely Gen 4/Hyperdisk-compatible; clusters running GKE 1.35.3+ using the `dynamic-rwo` StorageClass.
@@ -138,7 +138,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.6 Incompatible machine families for Hyperdisk workloads (`ccc-hyperdisk-incompatible`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `kubectl --context <ctx> get storageclasses,computeclasses,deployments -n <ns> -o yaml`
 - **Flag when:** A workload using Hyperdisk storage (`hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`) uses a ComputeClass that falls back to older generation machine families (`c2`, `n2`, `e2`) that do not support Hyperdisk CSI drivers.
 - **Do NOT flag:** Workloads using standard Persistent Disk (`pd-standard`, `pd-ssd`); ComputeClasses falling back only to Hyperdisk-capable families (`c3`, `c4`, `n4`, `c3d`).
@@ -148,7 +148,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.7 Regional quota exhaustion risk across fleet (`quota-exhaustion-risk`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `gcloud compute regions describe <region> --project=<project> --format="json(quotas)"`
 - **Flag when:** Total requested GPU/TPU/CPU limits across all clusters in the same GCP project and region reach >=90% of the project's regional quota limit (e.g. demanding 32 L4 GPUs when regional quota is 24).
 - **Do NOT flag:** Projects where regional quota limit exceeds total fleet workload demand with >= 25% headroom.
@@ -158,7 +158,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json`
 - **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
@@ -168,7 +168,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.9 Single-zone node pools on Standard clusters (`single-zone-nodepool`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
 - **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or node pools near `autoscaling.maxNodeCount` ceilings.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); regional clusters with multi-zone node pools.
@@ -178,7 +178,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.10 Reservation bypass, unreachable zones, or unallocated capacity mismatch (`reservation-mismatch-risk`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `gcloud compute reservations list --project=<project> --format=json`
 - **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) Substantial reservation capacity is unallocated (`inUseCount << count`) while production workloads in the same region run unreserved. (Note: CUDs are financial commitments, not physical capacity reservations).
 - **Do NOT flag:** ComputeClasses with valid targeted reservation bindings; non-production workloads.
@@ -188,7 +188,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.11 Autoscaler out-of-resources leading indicators (`autoscaler-out-of-resources`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format="value(timestamp,resource.labels.cluster_name,jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[0].napFailureReasons[0].messageId)"`
 - **Flag when:** Cluster autoscaler visibility logs emit `scale.up.error.out.of.resources`, `scale.up.error.quota.exceeded`, or `scale.up.error.ip.space.exhausted` within the past 24 hours, indicating that scale-up attempts failed before fallback recovery.
 - **Do NOT flag:** Clusters with clean autoscaler visibility logs over 24h.
@@ -198,7 +198,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.12 Dangling, unlabelled, or invalid ComputeClass configurations (`dangling-compute-class`)
 
-- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-crd-fields.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml`
 - **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; or (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations.
 - **Do NOT flag:** Workloads referencing valid, reconciled ComputeClasses with matching node pool labels and tolerations.

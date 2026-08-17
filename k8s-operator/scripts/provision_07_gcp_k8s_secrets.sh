@@ -244,7 +244,9 @@ execute_k8s_secrets() {
     fi
   done
 
-  if [ "$MODEL_PROVIDER" = "gemini" ] && [ -z "${GEMINI_API_KEY:-}" ]; then
+  if [ "$MODEL_PROVIDER" = "vertex_ai" ]; then
+    print_info "Model provider is 'vertex_ai'; no model API key is needed (LiteLLM authenticates with Workload Identity)."
+  elif [ "$MODEL_PROVIDER" = "gemini" ] && [ -z "${GEMINI_API_KEY:-}" ]; then
     print_warning "GEMINI_API_KEY is empty. The platform agent will run but cannot authenticate with Gemini until updated."
   elif [ "$MODEL_PROVIDER" = "openai" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
     print_warning "OPENAI_API_KEY is empty. The platform agent will run but cannot authenticate with OpenAI until updated."

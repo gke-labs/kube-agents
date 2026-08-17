@@ -1,0 +1,74 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# No `namespace:` here on purpose. The provisioning step applies this with
+# `kubectl apply -n $NAMESPACE`, so the install honours the same namespace as
+# every other step, and every in-cluster address below is a short service name
+# that resolves wherever it lands.
+#
+# The agent side follows too: the operator derives the API's fully-qualified URL
+# from the agent's namespace and passes HINDSIGHT_API_URL, so nothing here is
+# pinned to kubeagents-system and no image rebuild is needed to install
+# elsewhere.
+
+resources:
+  - postgresql.yaml
+  - networkpolicy.yaml
+  - api.yaml
+  - podmonitoring.yaml
+
+# See config/default/kustomization.yaml for why includeSelectors stays false.
+#
+# `app.kubernetes.io/name` and `component` are already written by hand on each
+# object because the Deployment and StatefulSet selectors are built from them
+# and a selector is immutable — restating `name` here is therefore a no-op that
+# keeps this block identical in shape to the other integrations'. `component` is
+# the one key this directory sets that no other install path does: Hindsight is
+# a single integration with two unrelated workloads, so `name` alone cannot tell
+# the API from its database. See the site's Resource labels reference.
+#
+# includeTemplates must stay false here, unlike in the other integrations, and
+# the patches below are what replace it. It does not only label pod templates:
+# on a StatefulSet it also labels `spec.volumeClaimTemplates[].metadata`, which
+# is one of the fields the API server refuses to update after creation. A fresh
+# install would take it and every existing one would reject the whole object
+# with "updates to statefulset spec for fields other than 'replicas' ... are
+# forbidden", so the failure would only ever show up as a broken upgrade.
+# Patching the two pod templates directly gets the labels onto the pods — which
+# is the point, since that is what the `part-of=kube-agents` query selects on —
+# and leaves the claim template alone. Unlabelled PVCs are the documented
+# status quo across the project anyway.
+labels:
+  - includeSelectors: false
+    includeTemplates: false
+    pairs:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/instance: hindsight
+      app.kubernetes.io/part-of: kube-agents
+      app.kubernetes.io/managed-by: kustomize
+
+patches:
+  - patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: hindsight-api
+      spec:
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/instance: hindsight
+              app.kubernetes.io/part-of: kube-agents
+              app.kubernetes.io/managed-by: kustomize
+  - patch: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: hindsight-postgresql
+      spec:
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/instance: hindsight
+              app.kubernetes.io/part-of: kube-agents
+              app.kubernetes.io/managed-by: kustomize

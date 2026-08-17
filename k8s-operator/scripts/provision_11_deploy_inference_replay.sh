@@ -24,6 +24,8 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
+# This step deploys the replay proxy image from this repo, so it needs a tag.
+REQUIRES_IMAGE_TAG=1
 load_state
 
 # ─── Opt-In Gate ──────────────────────────────────────────────────────────────

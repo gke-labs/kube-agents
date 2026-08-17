@@ -23,7 +23,7 @@
 #     python3 scripts/check_image_layers.py
 #
 ARG HERMES_AGENT_TAG
-ARG ENVOY_VERSION=v1.38.0
+ARG ENVOY_VERSION=v1.39.0
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 
 # Every binary in the final image must match the architecture the image ships
@@ -40,7 +40,7 @@ FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 # $BUILDPLATFORM keeps the Go toolchain running natively on the build host; it
 # cross-compiles to TARGETARCH, the architecture of the image being produced.
 # The :-amd64 fallback only fires on builders that don't populate TARGETARCH.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS watcher-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS watcher-builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /workspace
@@ -112,9 +112,17 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # claim to completion — p50 264s and p90 1102s of nothing on the live board —
 # which is the single biggest reason delegation feels slower than doing the work
 # in the thread. kanban_heartbeat(note=...) already writes the note; the
-# notifier just never delivered that kind. Two anchored edits, so the surgery
+# notifier just never delivered that kind. Three anchored edits, so the surgery
 # lives in an applier script. See the module docstring in
 # deploy/docker/patches/kanban_progress_lines.py.
+# The third edit is what keeps the fix from becoming its own nuisance: the notes
+# roll into ONE message per card, edited in place, so a five-milestone card pings
+# the space once instead of five times and the completion is the notification.
+# Every failure mode of that is silent -- an unresolved import, an adapter that
+# stopped overriding edit_message, a render budget that crossed the adapter's
+# text cap all degrade to one-message-per-note, which is exactly what shipped
+# before and so looks like nothing is wrong. verify_kanban_progress_lines.py
+# therefore drives the patched runtime rather than grepping it.
 # The _WAKE_KINDS grep below pins upstream's tuple as it stands AT THIS POINT in
 # the build, and nothing more: apply_kanban_notifier.py replaces that whole line
 # further down this stage, so the tuple does not exist in the shipped image. The
@@ -126,19 +134,23 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # base-image bump changes the text apply_kanban_notifier.py anchors on, which is
 # a clearer error than that applier's own anchor miss.
 COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
-COPY deploy/docker/patches/apply_kanban_progress_lines.py /tmp/apply_kanban_progress_lines.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_progress_lines.py /opt/hermes && \
+# Applier and verifier share one COPY into a directory, for the same reason the
+# kanban_notifier pair below does: this stage is the base for `credential-proxy`,
+# which has already hit Docker's layer-depth ceiling once (build f9f1747c,
+# 2026-08-07), so a new build gate does not buy a layer.
+COPY deploy/docker/patches/apply_kanban_progress_lines.py \
+     deploy/docker/patches/verify_kanban_progress_lines.py \
+     /tmp/kanban-progress/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
     grep -q '"block_loop_detected", "heartbeat")' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q '_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")' /opt/hermes/gateway/kanban_watchers.py && \
     /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
-from gateway.kanban_progress_lines import progress_note; \
-exit(1) if progress_note(None) or progress_note({}) or progress_note({'note': '  '}) else None; \
-exit(1) if progress_note({'note': 'scanned 3 of 7'}) != 'scanned 3 of 7' else None; \
-exit(1) if len(progress_note({'note': 'word ' * 500})) > 300 else None" && \
-    rm /tmp/apply_kanban_progress_lines.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/verify_kanban_progress_lines.py && \
+    rm -rf /tmp/kanban-progress
 
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
@@ -397,6 +409,36 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/channel-directory/verify_channel_directory_threads.py && \
     rm -rf /tmp/channel-directory
+
+# Slack: let bold and italic survive an inline code span in Block Kit output.
+# `_inline_elements` tokenized inline code by *splitting* the run on it and
+# handing each gap to the emphasis scan separately, so a `**` that opened before
+# a code span and closed after it could never pair -- both delimiters reached
+# Slack as literal asterisks. Card t_549d081c posted
+# "**`adam-new-cluster`** (us-east4) -> ..." into a user's thread that way. Only
+# the rich_text path is affected (list items, quotes, table cells): section
+# blocks go through the adapter's format_message, which protects inline code
+# before converting bold, so the identical markdown rendered correctly in a
+# paragraph and wrongly in a list item.
+#
+# A grep guard cannot catch this class of bug. All four anchors can match and
+# the renderer still emit a literal "**" -- a sentinel that is never restored, a
+# style dict that comes back empty, an emphasis rule that stops pairing across
+# the mask -- and every one of those failures looks exactly like a report that
+# happened to contain no bolded code. verify_slack_code_emphasis.py therefore
+# drives the real patched render_blocks over the reported line and asserts on
+# the elements it returns.
+# See the module docstring in deploy/docker/patches/apply_slack_code_emphasis.py.
+COPY deploy/docker/patches/apply_slack_code_emphasis.py \
+     deploy/docker/patches/verify_slack_code_emphasis.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/slack-code-emphasis/
+RUN /opt/hermes/.venv/bin/python3 /tmp/slack-code-emphasis/apply_slack_code_emphasis.py /opt/hermes && \
+    grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
+    ! grep -q "inline code is opaque" /opt/hermes/plugins/platforms/slack/block_kit.py && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/slack-code-emphasis/verify_slack_code_emphasis.py && \
+    rm -rf /tmp/slack-code-emphasis
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
 # every lifecycle tool with _check_kanban_mode, which is true for any profile
@@ -944,8 +986,10 @@ COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
 # 2 bulk-copies /opt/defaults onto the PVC with `cp -ru`, and this is the one file there
 # the running agent writes to — `/sethome`'s home channel, the monitoring install id,
 # saved slash-command preferences. An mtime-driven copy racing an image roll would
-# discard all of it. Step 2d rebuilds config.yaml from this template plus the operator's
-# overlay plus the runtime's own edits, and it is the only writer.
+# discard all of it. Step 2d copies this template onto a FRESH volume only, and thereafter
+# only back-fills keys the live file has lost; the running agent is otherwise the file's
+# sole writer, and the operator's settings reach it as a read-only managed-scope overlay
+# at /etc/hermes rather than by rewriting it.
 COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
 RUN rm -f /opt/defaults/config.yaml
 
@@ -954,9 +998,9 @@ RUN rm -f /opt/defaults/config.yaml
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 COPY agents/chat/scripts/ /opt/defaults/scripts/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
-# One COPY for the four, not four: `credential-proxy` builds FROM this stage and the
+# One COPY for the three, not three: `credential-proxy` builds FROM this stage and the
 # chain is bounded at 128 layers — see the layer-budget note at the top of the file.
-# They share a destination anyway, which default_profile_config.py requires.
+# They share a destination anyway.
 #
 #   profile_overlay.py         merges the operator's per-profile config overlays at
 #                              startup (entrypoint step 2.7). Shipped as a file rather
@@ -966,11 +1010,6 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 #                              profile homes (entrypoint step 2.65, and
 #                              cluster_agent_profile.py for profiles scaffolded later) —
 #                              see tests/test_profile_plugins.py.
-#   default_profile_config.py  rebuilds the DEFAULT profile's config.yaml at startup
-#                              (entrypoint step 2d) — see
-#                              tests/test_default_profile_config.py. Imports merge() from
-#                              profile_overlay.py, which is why the two must land in the
-#                              same directory.
 #   otel_config.py             points the hermes_otel plugin at the collector the operator
 #                              resolved (entrypoint step 4, and cluster_agent_profile.py
 #                              for profiles scaffolded later). The plugin does not read
@@ -979,7 +1018,6 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 #                              tests/test_otel_config.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
-     deploy/shared/default_profile_config.py \
      deploy/shared/otel_config.py \
      /opt/defaults/scripts/
 
@@ -991,6 +1029,12 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
+# The specialist's Hindsight connection file. Profile-scoped: a kanban worker
+# runs with HERMES_HOME pointed at profiles/platform, and the plugin resolves
+# $HERMES_HOME/hindsight/config.json, so the default profile's copy is not
+# visible from here. Image-owned and force-synced by the entrypoint, for the
+# reason in step 2a.
+COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into
@@ -1028,8 +1072,12 @@ assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r'
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Shared plugins available to all profiles (memory backend used by the Chat Agent).
+# Plugins land in the shared plugin root regardless of which profile owns them —
+# /opt/hermes/plugins is the only path Hermes resolves them from. The source
+# directory records ownership: kube_agents_memory needs the user identity that
+# only chat ingress carries, so it lives with the Chat Agent.
 COPY agents/platform/plugins/ /opt/hermes/plugins/
+COPY agents/chat/plugins/ /opt/hermes/plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import subprocess
-import threading
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
+from admin_console.kube_access import (
+    GKEKubeAccess,
+    KubeCommandResult as ChatCommandResult,
+    kube_failure_guidance,
+)
 from admin_console.project_config import (
     DeploymentTarget,
     is_valid_cluster_name,
@@ -179,14 +181,6 @@ else:
 '''
 
 
-@dataclass(frozen=True)
-class ChatCommandResult:
-    returncode: int
-    stdout: str = ""
-    stderr: str = ""
-    timed_out: bool = False
-
-
 class ChatKubeRunner(Protocol):
     def run(
         self,
@@ -199,6 +193,16 @@ class ChatKubeRunner(Protocol):
 
 
 class KubectlChatRunner:
+    """Chat adapter over the portal's shared GKE access component."""
+
+    def __init__(
+        self,
+        target: DeploymentTarget,
+        *,
+        access: GKEKubeAccess | None = None,
+    ) -> None:
+        self.access = access or GKEKubeAccess(target)
+
     def run(
         self,
         arguments: list[str],
@@ -207,82 +211,11 @@ class KubectlChatRunner:
         timeout: int = 620,
         line_callback: Callable[[str], None] | None = None,
     ) -> ChatCommandResult:
-        environment = os.environ.copy()
-        account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "").strip()
-        if account:
-            environment["CLOUDSDK_CORE_ACCOUNT"] = account
-        if line_callback is None:
-            try:
-                completed = subprocess.run(
-                    ["kubectl", *arguments],
-                    input=input_text,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=environment,
-                )
-            except subprocess.TimeoutExpired:
-                return ChatCommandResult(124, timed_out=True)
-            except OSError as exc:
-                return ChatCommandResult(127, stderr=type(exc).__name__)
-            return ChatCommandResult(
-                completed.returncode,
-                completed.stdout,
-                completed.stderr,
-            )
-
-        try:
-            process = subprocess.Popen(
-                ["kubectl", *arguments],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=environment,
-            )
-        except OSError as exc:
-            return ChatCommandResult(127, stderr=type(exc).__name__)
-
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
-
-        def drain_stdout() -> None:
-            assert process.stdout is not None
-            for line in process.stdout:
-                stdout_lines.append(line)
-                line_callback(line.rstrip("\r\n"))
-
-        def drain_stderr() -> None:
-            assert process.stderr is not None
-            stderr_lines.extend(process.stderr)
-
-        stdout_thread = threading.Thread(target=drain_stdout, daemon=True)
-        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-        stdout_thread.start()
-        stderr_thread.start()
-        assert process.stdin is not None
-        try:
-            process.stdin.write(input_text)
-            process.stdin.close()
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            stdout_thread.join(timeout=1)
-            stderr_thread.join(timeout=1)
-            return ChatCommandResult(
-                124,
-                "".join(stdout_lines),
-                "".join(stderr_lines),
-                timed_out=True,
-            )
-        stdout_thread.join(timeout=1)
-        stderr_thread.join(timeout=1)
-        return ChatCommandResult(
-            process.returncode,
-            "".join(stdout_lines),
-            "".join(stderr_lines),
+        return self.access.run(
+            arguments,
+            input_text=input_text,
+            timeout=timeout,
+            line_callback=line_callback,
         )
 
 
@@ -322,7 +255,7 @@ class AgentChatProvider:
         ):
             raise ValueError("invalid agent chat target")
         self.target = target
-        self.runner = runner or KubectlChatRunner()
+        self.runner = runner or KubectlChatRunner(target)
         self.context = f"gke_{target.project_id}_{target.location}_{target.cluster_name}"
 
     def _base(self) -> list[str]:
@@ -361,12 +294,19 @@ class AgentChatProvider:
     @staticmethod
     def _json(result: ChatCommandResult, component: str) -> dict:
         if result.returncode != 0:
-            if result.timed_out:
-                guidance = "The run exceeded the portal timeout. Check Activity Explorer before retrying."
-            elif "forbidden" in result.stderr.lower():
-                guidance = "Request pods/exec access to the selected gateway namespace."
-            else:
-                guidance = "Check the selected gateway pod and agent API health."
+            guidance = kube_failure_guidance(result)
+            if not guidance:
+                if result.timed_out:
+                    guidance = (
+                        "The run exceeded the portal timeout. Check Activity Explorer "
+                        "before retrying."
+                    )
+                elif "forbidden" in result.stderr.lower():
+                    guidance = (
+                        "Request pods/exec access to the selected gateway namespace."
+                    )
+                else:
+                    guidance = "Check the selected gateway pod and agent API health."
             raise AgentChatError(f"{component} failed.", guidance)
         try:
             payload = json.loads(result.stdout)

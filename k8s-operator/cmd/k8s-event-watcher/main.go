@@ -52,14 +52,19 @@ type flags struct {
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
-	inCluster         bool
-	kubeconfig        string
-	profilesDir       string
-	clusterName       string
-	logLevel          string
-	dryRun            bool
-	metricsAddr       string
-	snapshotInterval  time.Duration
+	backoffMinCount   int
+	// imagePullTransientMinCount gates only the self-clearing half of the
+	// image-pull family; see filter.go.
+	imagePullTransientMinCount int
+
+	inCluster        bool
+	kubeconfig       string
+	profilesDir      string
+	clusterName      string
+	logLevel         string
+	dryRun           bool
+	metricsAddr      string
+	snapshotInterval time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -85,6 +90,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
 	fs.StringVar(&f.dedupPersist, "dedup-persist", "", "Optional path to persist dedup cache across sidecar restart.")
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
+	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event.")
+	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
@@ -512,27 +519,33 @@ func readClusterIdentity(path string) (*clusterIdentity, error) {
 // mutable. A lock here would have served only to make one cluster's slow daemon
 // round-trip stall every other cluster.
 type dispatcher struct {
-	filter    *filter
-	dedup     *dedupCache
-	injector  *injector
-	metrics   *metrics
-	mode      string // "per-incident" or "shared"
-	targetSid string // for shared mode
-	dryRun    bool
+	filter *filter
+	dedup  *dedupCache
+	// pullClasses carries the cause of an image-pull failure from the event that
+	// names it to the causeless back-off event that follows. Per-cluster like
+	// dedup, so one cluster churning through pods cannot evict another's entries
+	// out of the shared bound.
+	pullClasses *pullClassMemo
+	injector    *injector
+	metrics     *metrics
+	mode        string // "per-incident" or "shared"
+	targetSid   string // for shared mode
+	dryRun      bool
 }
 
 // newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
 // injector, and metrics are shared across every cluster — they are stateless
-// or goroutine-safe — while dedup is per-cluster.
+// or goroutine-safe — while dedup and the pull-class memo are per-cluster.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
 	return &dispatcher{
-		filter:    filter,
-		dedup:     dedup,
-		injector:  inj,
-		metrics:   m,
-		mode:      f.mode,
-		targetSid: f.targetSession,
-		dryRun:    f.dryRun,
+		filter:      filter,
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
+		injector:    inj,
+		metrics:     m,
+		mode:        f.mode,
+		targetSid:   f.targetSession,
+		dryRun:      f.dryRun,
 	}
 }
 
@@ -552,7 +565,23 @@ func dedupPersistPath(base, cluster string) string {
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
-	if !d.filter.Accept(ev) {
+	// Resolved before the filter, deliberately. kubelet splits an image-pull
+	// incident across four events and only one of them names the cause; that one is
+	// reason=Failed, which the shipped default --reason list does not carry. The
+	// informer applies no reason pre-filter, so the cause-bearing event still
+	// reaches this line even when the allow-list is about to drop it — and the
+	// memo is what lets the causeless back-off that follows inherit its class and
+	// its error text. Classifying inside the filter would see only the events that
+	// got that far, and would run after the gate that needs the answer.
+	if canonicalizeReason(ev.Key.Reason, ev.Message) == "ImagePullBackOff" {
+		res := d.pullClasses.Resolve(ev.Key.UID, ev.Message)
+		ev.PullClass = res.Class
+		if res.Cause != ev.Message {
+			ev.PullCause = res.Cause
+		}
+	}
+	if gate := d.filter.Decide(ev); gate != gateAccepted {
+		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
@@ -591,6 +620,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Container:    ev.Container,
 		UID:          ev.Key.UID,
 		Message:      ev.Message,
+		PullCause:    ev.PullCause,
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
@@ -670,7 +700,11 @@ func realMain(argv []string) error {
 	}
 
 	// Build components.
-	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount)
+	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), filterThresholds{
+		unhealthyMinCount:          f.unhealthyMinCount,
+		backoffMinCount:            f.backoffMinCount,
+		imagePullTransientMinCount: f.imagePullTransientMinCount,
+	})
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()

@@ -312,33 +312,7 @@ status: {}
 apiVersion: v1
 data:
   leader_elect.py: <OMITTED_FOR_TESTS>
-  profile-default.overlay.yaml: |
-    agent:
-      disabled_toolsets:
-      - terminal
-      - file
-      - skills
-      - code_execution
-      - delegation
-      - browser
-      - computer_use
-      - cronjob
-      - web
-      - search
-      - x_search
-      - vision
-      - video
-      - image_gen
-      - video_gen
-      - tts
-      - todo
-      - session_search
-      - project
-      - homeassistant
-      - discord
-      - discord_admin
-      - spotify
-      environment_probe: false
+  managed-config.yaml: |
     approvals:
       cron_mode: approve
     display:
@@ -349,48 +323,13 @@ data:
           long_running_notifications: true
           memory_notifications: "off"
           tool_progress: "off"
-    kanban:
-      auto_subscribe_on_create: true
-      dispatch_in_gateway: true
-      dispatch_interval_seconds: 5
-      max_in_progress: 2
-      wake_on_events:
-      - gave_up
-      - crashed
-      - timed_out
-      - blocked
-    leader_election:
-      enabled: false
-    mcp_servers:
-      router:
-        args:
-        - ${HERMES_HOME}/scripts/router_server.py
-        command: /opt/hermes/.venv/bin/python3
-        env:
-          HERMES_HOME: ${HERMES_HOME}
-    memory:
-      memory_enabled: false
-      provider: multiuser_memory
-      user_profile_enabled: false
     model:
       api_key: none
+      api_mode: chat_completions
       base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
       default: model-default
       model: model-default
       provider: custom
-    platform_toolsets:
-      api_server:
-      - mcp-router
-      - kanban
-      - memory
-      cli:
-      - mcp-router
-      - kanban
-      - memory
-      google_chat:
-      - mcp-router
-      - kanban
-      - memory
     platforms:
       google_chat:
         enabled: true
@@ -399,23 +338,17 @@ data:
         enabled: false
         extra:
           rich_blocks: true
-    plugins:
-      enabled:
-      - hermes_otel
-      - session_store
-      - session_otel_bridge
-      - tool_call_audit
-      - incident_context
-      - bootstrap_onboarding
-      - legacy_slash_commands
-      - agent_roster
-    terminal:
-      backend: local
-      cwd: /opt/data
-    toolsets:
-    - kanban
-    web:
-      backend: ddgs
+  managed.env: |
+    GOOGLE_CHAT_RELAY_URL=http://127.0.0.1:8765
+    GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
+    GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+    GOOGLE_CHAT_ALLOWED_USERS=
+    GOOGLE_CHAT_ALLOW_ALL_USERS=true
+    GATEWAY_ALLOWED_USERS=
+    GATEWAY_ALLOW_ALL_USERS=false
+  profile-platform.overlay.yaml: |
+    memory:
+      provider: ""
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -584,10 +517,10 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 550310a3ab2c9e35816fa1a8be64e68cc87377afc9609c0aa8a604e2b778c341
-        kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
-        kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
-        kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
+        kubeagents.x-k8s.io/config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
       creationTimestamp: null
       labels:
         app: platformagent-gateway
@@ -656,12 +589,18 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
               value: "true"
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
             - name: CREDENTIAL_PROXY_URL
               value: http://127.0.0.1:8765
             - name: PATH
               value: /opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH
               value: /opt/defaults/scripts
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
+            - name: MEMORY_PROVIDER
+              value: multiuser_memory
             - name: AGENT_SHARED_STATE_SETUP
               value: owner
             - name: API_SERVER_MODEL_NAME
@@ -690,6 +629,9 @@ spec:
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
             - mountPath: /opt/agent-config
               name: platform-agent-config-vol
               readOnly: true
@@ -706,6 +648,8 @@ spec:
           env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
             - name: HOME
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
@@ -735,16 +679,16 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: profile-default.overlay.yaml
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.0.7
+          image: fluent/fluent-bit:5.1.0
           name: fluent-bit
           resources:
             limits:
@@ -834,6 +778,8 @@ spec:
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
               value: cluster-a
+            - name: EVENT_WATCHER_ENABLED
+              value: "true"
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
@@ -942,6 +888,15 @@ spec:
             defaultMode: 493
             name: platformagent-config
           name: platform-agent-config-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: managed-config.yaml
+                path: config.yaml
+              - key: managed.env
+                path: .env
+            name: platformagent-config
+          name: platform-agent-managed-vol
         - configMap:
             defaultMode: 420
             name: platformagent-fluent-bit-config
@@ -1086,6 +1041,8 @@ spec:
         - port: 988
           protocol: TCP
       to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
         - ipBlock:
             cidr: 169.254.169.254/32
     - ports:

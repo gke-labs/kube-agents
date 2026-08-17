@@ -16,7 +16,15 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 import streamlit as st
 
+from admin_console.connection_session import recover_app_shell
 from admin_console.connection_gate import require_connection
+from admin_console.cron_view import (
+    ACTIVE_STATUSES,
+    CronExecutionGroup,
+    FAILED_STATUSES,
+    SUCCESS_STATUSES,
+    group_cron_executions,
+)
 from admin_console.agent_runtime import (
     CronSnapshot,
     AgentCronExecution,
@@ -26,10 +34,10 @@ from admin_console.agent_runtime import (
 )
 from admin_console.ui import AGENT_SELECTOR_HELP
 
-ACTIVE_STATUSES = {"claimed", "dispatching", "pending", "running", "started"}
-SUCCESS_STATUSES = {"completed", "ok", "success", "succeeded"}
 HISTORY_WINDOWS = {"24h": 1, "7d": 7, "30d": 30}
 INTERVAL_CADENCE = re.compile(r"^every\s+(\d+)m$", re.IGNORECASE)
+
+recover_app_shell()
 
 
 def query_value(name: str, default: str = "") -> str:
@@ -69,6 +77,97 @@ def execution_state(status: str) -> str:
     if normalized in SUCCESS_STATUSES:
         return "Succeeded"
     return "Failed" if normalized in {"error", "failed", "crashed"} else status.title()
+
+
+def execution_history_item(execution: AgentCronExecution) -> str:
+    """Render one safe, compact execution entry inside its job row."""
+    started = timestamp(execution.started_at or execution.claimed_at)
+    trigger = "Manual" if execution.source == "direct" else execution.source
+    summary = " · ".join(
+        (
+            started,
+            execution_state(execution.status),
+            trigger,
+            duration(execution),
+            execution.profile,
+        )
+    )
+    escaped_error = html.escape(execution.error).replace("\r\n", "\n").replace(
+        "\r", "\n"
+    )
+    error = (
+        "<div class='ka-cron-error'>"
+        f"{escaped_error.replace(chr(10), '<br>')}</div>"
+        if execution.error
+        else ""
+    )
+    return f"<li>{html.escape(summary)}{error}</li>"
+
+
+def render_execution_groups(groups: tuple[CronExecutionGroup, ...]) -> None:
+    """Render one expandable HTML table with history nested in each job row."""
+    rows = []
+    for group in groups:
+        run_count = len(group.executions)
+        run_label = f"{run_count} {'run' if run_count == 1 else 'runs'}"
+        history = "".join(
+            execution_history_item(execution) for execution in group.executions
+        )
+        latest_start = timestamp(
+            group.latest.started_at or group.latest.claimed_at
+        )
+        rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(group.title)}</strong></td>"
+            "<td><details class='ka-cron-history'>"
+            f"<summary>{run_label}</summary>"
+            f"<ul>{history}</ul></details></td>"
+            f"<td>{group.active}</td>"
+            f"<td>{group.succeeded}</td>"
+            f"<td>{group.failed}</td>"
+            f"<td>{html.escape(execution_state(group.latest.status))}</td>"
+            f"<td>{html.escape(latest_start)}</td>"
+            f"<td>{html.escape(', '.join(group.profiles))}</td>"
+            "</tr>"
+        )
+    st.html(
+        """
+        <style>
+        .ka-cron-table-wrap { overflow-x: auto; }
+        .ka-cron-table {
+          border-collapse: separate; border-spacing: 0; min-width: 900px;
+          width: 100%;
+        }
+        .ka-cron-table th, .ka-cron-table td {
+          border-bottom: 1px solid var(--ka-border); padding: 10px 12px;
+          text-align: left; vertical-align: top;
+        }
+        .ka-cron-table th {
+          color: var(--ka-muted); font-size: .75rem; font-weight: 650;
+        }
+        .ka-cron-history summary {
+          color: var(--ka-accent); cursor: pointer; font-weight: 650;
+          white-space: nowrap;
+        }
+        .ka-cron-history ul {
+          color: var(--ka-text); margin: 10px 0 2px; min-width: 410px;
+          padding-left: 18px;
+        }
+        .ka-cron-history li { margin: 7px 0; }
+        .ka-cron-error { color: #ff8b96; font-size: .78rem; margin-top: 2px; }
+        </style>
+        <div class="ka-cron-table-wrap">
+          <table class="ka-cron-table">
+            <thead><tr>
+              <th>Job</th><th>Executions</th><th>Active</th>
+              <th>Succeeded</th><th>Failed</th><th>Latest result</th>
+              <th>Latest start</th><th>Profiles</th>
+            </tr></thead>
+            <tbody>
+        """
+        + "".join(rows)
+        + "</tbody></table></div>",
+    )
 
 
 def scheduler_label(job: AgentCronJob) -> str:
@@ -361,7 +460,7 @@ enabled = [job for job in snapshot.jobs if job.enabled]
 failed = [
     item
     for item in executions
-    if item.status.lower() in {"error", "failed", "crashed"}
+    if item.status.lower() in FAILED_STATUSES
 ]
 unscheduled = [job for job in enabled if job.scheduler != "active"]
 
@@ -381,22 +480,9 @@ if snapshot.jobs_truncated or snapshot.executions_truncated:
     st.warning("The bounded read limit was reached; this view is incomplete.")
 
 st.subheader("Active and recent executions")
-execution_rows = []
-for execution in executions:
-    job = jobs_by_key.get((execution.profile, execution.job_id))
-    execution_rows.append(
-        {
-            "State": execution_state(execution.status),
-            "Job": job.name if job else execution.job_id or "Unknown job",
-            "Profile": execution.profile,
-            "Trigger": "Manual" if execution.source == "direct" else execution.source,
-            "Started": timestamp(execution.started_at or execution.claimed_at),
-            "Duration": duration(execution),
-            "Error": execution.error,
-        }
-    )
-if execution_rows:
-    st.dataframe(execution_rows, hide_index=True, width="stretch")
+execution_groups = group_cron_executions(executions, jobs_by_key)
+if execution_groups:
+    render_execution_groups(execution_groups)
 else:
     st.info(f"No active or recent executions in the last {selected_window}.")
 

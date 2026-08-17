@@ -24,6 +24,12 @@ variable "deletion_protection" {
   default     = true
 }
 
+variable "resource_labels" {
+  description = "GCP resource labels to apply to the cluster. Set kube-agents-host=true when the cluster hosts kube-agents."
+  type        = map(string)
+  default     = {}
+}
+
 variable "release_channel" {
   description = "GKE release channel for the cluster"
   type        = string

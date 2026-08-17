@@ -13,12 +13,15 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 import streamlit as st
 
+from admin_console.connection_session import recover_app_shell
 from admin_console.connection_gate import require_connection
 from admin_console.agent_runtime import AgentRuntimeError, AgentRuntimeProvider
 from admin_console.ui import AGENT_SELECTOR_HELP, paginated_selectable_table
 
 ACTIVE_STATUSES = {"todo", "ready", "running"}
 ATTENTION_STATUSES = {"blocked", "failed", "crashed", "cancelled"}
+
+recover_app_shell()
 
 
 def query_value(name: str) -> str:

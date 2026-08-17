@@ -315,9 +315,9 @@ each scope mapped to its own Qdrant collection / access-controlled key, never a 
 (a cross-scope read would be an isolation escape, [03](03-security-model.md)) — and TTL entries
 (default ~30–90 days) that graduate durable observations to OKF via a human-reviewed PR.
 
-**Session state (existing, `multiuser_memory`):** `session_db.sqlite` keyed by
-platform/space/thread; per-user memory in `memories/users/<safe_user_id>.md`; shared SOPs in
-`memories/MEMORY.md`. Per-user isolation by runtime `user_id`. This stays as-is; do **not** move it
+**Session state (existing, `kube_agents_memory`):** `session_db.sqlite` keyed by
+platform/space/thread; per-user memory in one Hindsight bank, isolated by a `user:<id>` scope tag
+derived from the runtime `user_id`. This stays as-is; do **not** move it
 into OKF or mem0. The gateway also uses these keys (`thread_id` / `chat_id`) for **routing thread
 affinity** — a thread stays bound to the agent it was first routed to (§2b) until re-addressed.
 

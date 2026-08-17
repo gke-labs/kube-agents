@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from html import escape
 
 import plotly.graph_objects as go
 
+from admin_console.causal_flow import CausalSource
 from admin_console.domain import ActivityEvent
 from admin_console.ui import ATTRIBUTION_COLORS, STATUS_COLORS, TRIGGER_COLORS
 
@@ -102,29 +104,87 @@ def attribution_donut(events: list[ActivityEvent]) -> go.Figure:
 
 
 def causality_sankey(events: list[ActivityEvent]) -> go.Figure:
-    """Aggregate trigger → agent → action → outcome edges."""
+    """Aggregate raw OTel origin → agent → action → outcome edges."""
     labels: list[str] = []
     colors: list[str] = []
+    node_details: list[str] = []
     index: dict[tuple[str, str], int] = {}
 
-    def node(stage: str, label: str, color: str) -> int:
-        key = (stage, label)
+    def node(
+        stage: str,
+        label: str,
+        color: str,
+        detail: str = "",
+        identity: str = "",
+    ) -> int:
+        key = (stage, identity or label)
         if key not in index:
             index[key] = len(labels)
             labels.append(label)
             colors.append(color)
+            node_details.append(detail or label)
         return index[key]
 
-    edge_counts: Counter[tuple[int, int]] = Counter()
-    for event in events:
-        trigger_label = (
-            event.user_id or event.trigger_kind.value.replace("_", " ").title()
-        )
-        trigger_color = TRIGGER_COLORS[event.trigger_kind]
-        action_label = event.tool_name or event.action_type.replace("_", " ").title()
-        outcome_label = event.status.title()
+    sources = [CausalSource.from_event(event) for event in events]
+    source_sessions: dict[str, set[str]] = defaultdict(set)
+    source_evidence: dict[str, dict[tuple[str, str], set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    for source in sources:
+        if source.session_id:
+            source_sessions[source.key].add(source.session_id)
+        for evidence in source.evidence:
+            source_evidence[source.key][
+                (evidence.scope, evidence.field)
+            ].add(evidence.value)
 
-        trigger = node("trigger", trigger_label, trigger_color)
+    edge_counts: Counter[tuple[int, int]] = Counter()
+    for event, source in zip(events, sources, strict=True):
+        session_count = len(source_sessions[source.key])
+        session_label = "session" if session_count == 1 else "sessions"
+        source_descriptor = "cron"
+        if source.source_type != "cron":
+            source_descriptor = (
+                source.primary.field if source.primary else "source unavailable"
+            )
+        source_label = (
+            f"{escape(source.source_id)} ({source_descriptor} · "
+            f"{session_count} {session_label})"
+        )
+        source_detail_parts = [
+            f"source.type={escape(source.source_type)}",
+            f"source.id={escape(source.source_id)}",
+        ]
+        source_detail_parts.append(f"distinct sessions={session_count}")
+        for (scope, field), raw_values in sorted(
+            source_evidence[source.key].items()
+        ):
+            values = sorted(raw_values)
+            sample = ", ".join(escape(value) for value in values[:5])
+            suffix = "" if len(values) <= 5 else f" (+{len(values) - 5} more)"
+            source_detail_parts.append(
+                f"raw {scope} {field}={sample}{suffix}"
+            )
+        trigger_color = TRIGGER_COLORS[event.trigger_kind]
+        action_label = (
+            event.tool_name
+            or ("LLM call" if event.action_type == "model" else "")
+            or (
+                event.action_name
+                if event.action_type in {"skill", "approval"}
+                else ""
+            )
+            or event.action_type.replace("_", " ").title()
+        )
+        outcome_label = event.status.replace("_", " ").title()
+
+        trigger = node(
+            "trigger",
+            source_label,
+            trigger_color,
+            "<br>".join(source_detail_parts),
+            source.key,
+        )
         agent = node("agent", event.agent_name, "#7C9CFF")
         action = node("action", action_label, "#B58CFF")
         outcome = node(
@@ -146,9 +206,11 @@ def causality_sankey(events: list[ActivityEvent]) -> go.Figure:
             node={
                 "label": labels,
                 "color": colors,
+                "customdata": node_details,
                 "pad": 20,
                 "thickness": 14,
                 "line": {"color": "#26344c", "width": 1},
+                "hovertemplate": "%{customdata}<extra></extra>",
             },
             link={
                 "source": sources,

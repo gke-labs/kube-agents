@@ -1,0 +1,5 @@
+{
+  "mode": "local_external",
+  "memory_mode": "hybrid",
+  "recall_budget": "mid"
+}

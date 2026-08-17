@@ -53,10 +53,14 @@ class TestRedactText(unittest.TestCase):
         self.assertIn("Bearer [REDACTED_SECRET]", result)
 
     def test_basic_auth_keeps_the_scheme(self):
-        # base64 of `admin:hunter2`, i.e. the credential shape a `curl -u` in a
-        # tool argument leaves behind.
+        # The header a `curl -u` in a tool argument leaves behind. Deliberately
+        # not a `user:pass` base64 payload — it decodes to
+        # "not-a-real-credential" — so secret scanners do not flag the fixture.
+        # The redactor keys off the `Basic` prefix and the base64 alphabet,
+        # never the payload's contents.
         result = self.assertRedacted(
-            "Authorization: Basic YWRtaW46aHVudGVyMg==", "YWRtaW46aHVudGVyMg"
+            "Authorization: Basic bm90LWEtcmVhbC1jcmVkZW50aWFs",
+            "bm90LWEtcmVhbC1jcmVkZW50aWFs",
         )
         self.assertIn("Basic [REDACTED_SECRET]", result)
 

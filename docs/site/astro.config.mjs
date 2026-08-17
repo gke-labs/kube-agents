@@ -33,14 +33,14 @@ export default defineConfig({
         baseUrl:
           'https://github.com/gke-labs/kube-agents/edit/main/docs/site/',
       },
-      // Pin light theme before first paint. Belt-and-braces with the
+      // Pin dark theme before first paint. Belt-and-braces with the
       // theme.css overrides that already apply under both
       // [data-theme='light'] and [data-theme='dark'].
       head: [
         {
           tag: 'script',
           attrs: { 'is:inline': true },
-          content: "document.documentElement.dataset.theme = 'light';",
+          content: "document.documentElement.dataset.theme = 'dark';",
         },
         // Client-side Mermaid renderer. Upgrades ```mermaid code blocks
         // to SVG diagrams and tucks the source in a <details> block.
@@ -56,8 +56,33 @@ export default defineConfig({
       // Palette + typography live in one file so the whole visual
       // system is swappable.
       customCss: ['./src/styles/theme.css'],
-      // Empty component override drops the dark-mode toggle from the
-      // navbar. Light-only site (matches core-agent).
+      // Night Owl is the closest bundled syntax theme to the sampled
+      // terminal palette (navy ground; cyan / violet / coral / amber
+      // tokens). Surfaces are pinned to this site's own navy so a code
+      // block reads as an inset buffer rather than a foreign panel.
+      expressiveCode: {
+        themes: ['night-owl'],
+        styleOverrides: {
+          codeBackground: '#0b1322',
+          borderColor: '#2b3650',
+          // Expressive Code already gives an overflowing block a
+          // permanent scrollbar rather than an overlay one; these only
+          // move it off Night Owl's blue (#084d8180) onto the site's
+          // teal, so it reads as part of the block's frame. The table
+          // rule in theme.css matches these two values.
+          scrollbarThumbColor: '#2090af80',
+          scrollbarThumbHoverColor: '#2acacacc',
+          frames: {
+            editorTabBarBackground: '#0a1120',
+            editorActiveTabBackground: '#0b1322',
+            terminalBackground: '#0b1322',
+            terminalTitlebarBackground: '#0a1120',
+          },
+        },
+      },
+      // Empty component override drops the theme toggle from the
+      // navbar: the palette is a single dark terminal scheme, so
+      // there is no second theme to switch to.
       components: {
         ThemeSelect: './src/components/ThemeSelect.astro',
         ThemeProvider: './src/components/ThemeProvider.astro',

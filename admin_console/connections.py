@@ -11,6 +11,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+from threading import Event
 from typing import Protocol
 
 from admin_console.project_config import DeploymentTarget, is_valid_project_id
@@ -39,6 +40,26 @@ class CommandResult:
 
 class CommandRunner(Protocol):
     def run(self, arguments: list[str], *, timeout: int = 15) -> CommandResult: ...
+
+
+class ConnectionChecksCancelled(RuntimeError):
+    """Stop a detached connection probe between bounded external calls."""
+
+
+class CancelAwareRunner:
+    """Stop submitting commands after the UI detaches a connection attempt."""
+
+    def __init__(self, runner: CommandRunner, cancelled: Event) -> None:
+        self.runner = runner
+        self.cancelled = cancelled
+
+    def run(self, arguments: list[str], *, timeout: int = 15) -> CommandResult:
+        if self.cancelled.is_set():
+            raise ConnectionChecksCancelled()
+        result = self.runner.run(arguments, timeout=timeout)
+        if self.cancelled.is_set():
+            raise ConnectionChecksCancelled()
+        return result
 
 
 class GcloudRunner:
@@ -118,12 +139,23 @@ class ConnectionReport:
 
 
 def connection_is_ready(report: ConnectionReport) -> bool:
-    """Return whether a report proves the portal's required read paths."""
+    """Return whether the selected cluster runtime is reachable.
+
+    Telemetry checks remain visible diagnostics, but a Logging or Trace outage
+    must not lock runtime-backed Chat, Kanban, or Cron pages.
+    """
     checks = {check.key: check.status for check in report.checks}
     required = {"cli_auth", "project", "gke", "agent_runtime"}
+    return all(checks.get(key) == CheckStatus.PASS for key in required)
+
+
+def project_connection_is_ready(report: ConnectionReport) -> bool:
+    """Return whether project access and GKE discovery are usable."""
+    checks = {check.key: check.status for check in report.checks}
     return (
-        all(checks.get(key) == CheckStatus.PASS for key in required)
-        and report.failed == 0
+        checks.get("cli_auth") == CheckStatus.PASS
+        and checks.get("project") == CheckStatus.PASS
+        and checks.get("gke") in {CheckStatus.PASS, CheckStatus.WARNING}
     )
 
 
@@ -271,12 +303,16 @@ def run_connection_checks(
     runner: CommandRunner | None = None,
     include_trace_probe: bool = True,
     include_agent_runtime_probe: bool = False,
+    include_telemetry_probes: bool = True,
+    cancel_event: Event | None = None,
 ) -> ConnectionReport:
     """Run bounded, read-only diagnostics for one selected project."""
     if not is_valid_project_id(project_id):
         raise ValueError("invalid Google Cloud project ID")
     account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "")
     runner = runner or GcloudRunner(account)
+    if cancel_event is not None:
+        runner = CancelAwareRunner(runner, cancel_event)
     checks: list[ConnectionCheck] = []
 
     cli_result = runner.run(["auth", "print-access-token"])
@@ -552,6 +588,8 @@ def run_connection_checks(
             )
 
             try:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ConnectionChecksCancelled()
                 runtime_provider = AgentRuntimeProvider(runtime_target)
                 agents = runtime_provider.list_agents()
                 if not agents:
@@ -577,6 +615,8 @@ def run_connection_checks(
                             f"session(s) from {agents[0]}.",
                         )
                     )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ConnectionChecksCancelled()
             except AgentRuntimeError as exc:
                 checks.append(
                     ConnectionCheck(
@@ -587,6 +627,14 @@ def run_connection_checks(
                         exc.guidance,
                     )
                 )
+
+    if not include_telemetry_probes:
+        return ConnectionReport(
+            project_id,
+            datetime.now(timezone.utc),
+            tuple(checks),
+            clusters,
+        )
 
     namespace = (
         expected_target.namespace

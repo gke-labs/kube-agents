@@ -47,6 +47,13 @@ Once the CR is gone, the operator's finalizer first removes the cluster-scoped R
 
 ## Full teardown
 
+The shell teardown is for environments created by `k8s-operator/scripts/provision.sh`. For the
+Terraform full-install example, follow its
+[Terraform teardown procedure](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install#teardown)
+instead. In particular, do not run `teardown_08_deploy_platform_agent.sh` against a
+Terraform-managed cluster: it removes the `kube-agents-host` label that Terraform owns and creates
+plan drift.
+
 ```bash
 cd k8s-operator/scripts
 ./teardown.sh
@@ -64,7 +71,7 @@ You can also run individual `teardown_NN_*.sh` scripts to remove one layer at a 
 | `teardown_11_deploy_inference_replay.sh` | Inference-replay proxy + PVC; restores original LiteLLM Service                            |
 | `teardown_10_deploy_github_minter.sh`    | Minty deployment, GSAs, KMS resources                                                      |
 | `teardown_09_deploy_litellm.sh`          | LiteLLM Gateway                                                                            |
-| `teardown_08_deploy_platform_agent.sh`   | `PlatformAgent` CR and rendered manifests                                                  |
+| `teardown_08_deploy_platform_agent.sh`   | `PlatformAgent` CR, script-managed host-discovery label, and rendered manifest             |
 | `teardown_07_gcp_k8s_secrets.sh`         | Kubernetes secrets in the target namespace                                                 |
 | `teardown_06_slack.sh`                   | Slack tokens and state                                                                     |
 | `teardown_05_gcp_gchat.sh`               | Google Chat Pub/Sub topic + subscription                                                   |

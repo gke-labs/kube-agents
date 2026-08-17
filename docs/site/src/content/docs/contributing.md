@@ -17,6 +17,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 ## PR hygiene (from `AGENTS.md`)
 
+- **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and gives agents the exact commands.
 - **Scope.** Keep changes scoped to the request. Don't bundle unrelated formatting changes.
 - **Structure.** Maintain the shape and intent of agent configuration files. Don't restructure `agents/platform/` for cosmetic reasons in an unrelated PR.
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).
@@ -94,12 +95,13 @@ All submissions, including from project members, require review through GitHub p
 
 Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. It introduces itself in a comment on every pull request it picks up; that comment states its current contract, so trust it over this page if the two ever differ.
 
-- **It starts on its own** when a pull request is `opened`, `reopened`, or marked ready for review. It typically posts a couple of minutes later.
-- **Pushing more commits does not re-trigger it.** To ask for a fresh review of the current commit, comment `/review` on a line of its own. Owners, members, and collaborators can trigger it.
-- **Reading the result.** 👀 means the review started, a posted review means it finished. Findings are inline comments badged 🔴 High, 🟠 Medium, or 🟡 Low; findings about code outside the diff are listed in the summary body. "No findings" is the common outcome and is a real result — a 👀 with nothing following it is a bug in the bot.
-- **Opting out.** The `agent:ignore` label excludes a pull request from review and outranks `/review`.
+- **It starts on its own** when a pull request is `opened`, `reopened`, or marked ready for review. The 👀 appears within seconds; the review itself lands about 9 minutes later on average, and up to 45 on a very large diff. A draft is not in the queue at all until you mark it ready.
+- **Pushing more commits does not re-trigger it.** To ask for a fresh review of the current commit, comment `/review` on a line of its own — a strict read of only what the bot is certain of, or `/review all` for one as wide as its first review. Owners, members, and collaborators can trigger it. A re-read takes about as long as the first.
+- **Reading the result.** 👀 means the review started, a posted review means it finished. Findings are inline comments badged 🔴 High, 🟠 Medium, or 🟡 Low; findings about code outside the diff are listed in the summary body. "No findings" is a real result, not silence — about two in five reviews come back clean. A 👀 with nothing following it 30 minutes later is a bug in the bot; `/review all` is the retry that matches the width of the review you lost.
+- **Opting out.** The `agent:ignore` label excludes a pull request from review and outranks both commands.
+- **Resolving the threads is part of the work.** `main` will not merge while any conversation is open, whether the bot or a human started it, and an open thread keeps the pull request counted as its author's outstanding work. Whoever is confident a thread is addressed — author or reviewer — replies saying what changed, then resolves it. Threads that are still a judgment call stay open for the person who raised them.
 
-AI agents working in this repository have a further obligation: after opening a pull request they should offer to wait for this review and then walk its findings with you before changing any code. See [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md).
+AI agents working in this repository have a further obligation: after opening a pull request they should offer to wait for this review and then walk its findings with you before changing any code, and they resolve the threads they have addressed. See [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md).
 
 ## Where to file issues
 

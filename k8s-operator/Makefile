@@ -121,21 +121,36 @@ deploy: kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/c
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
+LITELLM_VARS = $$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME
+LITELLM_VERTEX_VARS = $(LITELLM_VARS) $$PROJECT_ID $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$VERTEX_PROJECT_ID $$VERTEX_LOCATION
+
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
-		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
-		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
+
+.PHONY: deploy-hindsight
+deploy-hindsight: kustomize ## Deploy the Hindsight memory store.
+	$(KUSTOMIZE) build config/integrations/hindsight | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+
+.PHONY: undeploy-hindsight
+undeploy-hindsight: kustomize ## Undeploy the Hindsight memory store (keeps its PVC).
+	$(KUSTOMIZE) build config/integrations/hindsight | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
@@ -286,15 +301,25 @@ gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disa
 	@chmod +x scripts/*.sh
 	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
 
-.PHONY: gcp-provision-13-verify-rollout
-gcp-provision-13-verify-rollout: ## Step 13: Verify the PlatformAgent Deployment rollout.
+.PHONY: gcp-provision-13-hindsight
+gcp-provision-13-hindsight: ## Step 13: Deploy Hindsight memory store.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_13_verify_agent_rollout.sh $(ARGS)
+	@./scripts/provision_13_deploy_hindsight.sh $(ARGS)
+
+.PHONY: gcp-provision-14-verify-rollout
+gcp-provision-14-verify-rollout: ## Step 14: Verify the PlatformAgent Deployment rollout.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_14_verify_agent_rollout.sh $(ARGS)
 
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
+
+.PHONY: gcp-teardown-13-hindsight
+gcp-teardown-13-hindsight: ## Teardown Step 13: Undeploy Hindsight memory store.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_13_deploy_hindsight.sh $(ARGS)
 
 .PHONY: gcp-teardown-12-gke-backup-plan
 gcp-teardown-12-gke-backup-plan: ## Teardown Step 12: Delete GKE Backup Plan and snapshots.

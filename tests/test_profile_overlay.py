@@ -183,9 +183,10 @@ class OverlayMergeTest(unittest.TestCase):
 
     def test_main_refuses_a_traversing_profile_dir(self):
         # profiles/.. resolves to the agent home, whose config.yaml is the default
-        # profile's — rebuilt by default_profile_config.py, which carries the runtime's
-        # own edits across. apply_overlay's last-applied bookkeeping knows nothing about
-        # those, so it must never be pointed there.
+        # profile's. That file does take an overlay, but only when the caller says so
+        # with --profile-name default; arriving there by a ConfigMap key that happened
+        # to resolve to ".." would apply the wrong profile's overlay to the running
+        # agent's own config.
         err = io.StringIO()
         with redirect_stderr(err):
             rc = po.main(["--profile-dir", str(self.tmp / "profiles" / "..")])
@@ -286,6 +287,105 @@ class OverlayResolutionTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.config()["plugins"]["enabled"], ["hermes_otel", "clusterone"])
         self.assertEqual(self.config()["agent"]["max_turns"], 150)
+
+
+class DefaultProfileTest(unittest.TestCase):
+    """The front door, reached by --profile-name rather than by directory name.
+
+    Its home IS $HERMES_HOME, so the directory is called "data" and the name cannot be
+    read off it. It is also the one profile whose config.yaml the running agent writes
+    to — /sethome, the install id, saved preferences — which is why the operator sends
+    it only the narrow set it owns and the merge has to leave everything else alone.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.overlay_dir = self.tmp / "agent-config"
+        self.overlay_dir.mkdir()
+        # $HERMES_HOME itself, not a directory under profiles/.
+        self.home = self.tmp / "data"
+        write(
+            self.home / "config.yaml",
+            {
+                "plugins": {"enabled": ["hermes_otel"]},
+                "kanban": {"max_in_progress": 2},
+                "platforms": {"google_chat": {"home_channel": "spaces/AAA"}},
+            },
+        )
+
+    def write_default(self, data):
+        write(self.overlay_dir / "profile-default.overlay.yaml", data)
+
+    def config(self):
+        return read(self.home / "config.yaml")
+
+    def run_main(self):
+        return po.main(
+            [
+                "--profile-dir", str(self.home),
+                "--profile-name", "default",
+                "--overlay-dir", str(self.overlay_dir),
+            ]
+        )
+
+    def test_default_overlay_merges_into_the_agent_home(self):
+        self.write_default(
+            {
+                "plugins": {"enabled": ["adapter"]},
+                "approvals": {"e2e_test_setting": {"enabled": True}},
+                "kanban": {"max_in_progress": 8},
+            }
+        )
+        self.assertEqual(self.run_main(), 0)
+        cfg = self.config()
+        self.assertEqual(cfg["plugins"]["enabled"], ["hermes_otel", "adapter"])
+        self.assertEqual(cfg["approvals"], {"e2e_test_setting": {"enabled": True}})
+        self.assertEqual(cfg["kanban"]["max_in_progress"], 8)
+
+    def test_the_agents_own_keys_survive(self):
+        """/sethome's home_channel is the whole reason this file stays writable."""
+        self.write_default({"plugins": {"enabled": ["adapter"]}})
+        self.run_main()
+        self.assertEqual(
+            self.config()["platforms"]["google_chat"]["home_channel"], "spaces/AAA"
+        )
+
+    def test_withdrawing_the_overlay_reverts_the_front_door(self):
+        self.write_default({"plugins": {"enabled": ["adapter"]}, "kanban": {"max_in_progress": 8}})
+        self.run_main()
+
+        (self.overlay_dir / "profile-default.overlay.yaml").unlink()
+        self.assertEqual(self.run_main(), 0)
+
+        cfg = self.config()
+        self.assertEqual(cfg["plugins"]["enabled"], ["hermes_otel"], "plugin must be disabled again")
+        self.assertEqual(cfg["kanban"]["max_in_progress"], 2, "the image's cap must come back")
+        self.assertFalse((self.home / po.STATE_FILENAME).exists())
+
+    def test_no_cluster_class_overlay_reaches_the_front_door(self):
+        """`tuning.cluster` is for cluster profiles; the name must not match it."""
+        write(self.overlay_dir / po.CLUSTER_CLASS_OVERLAY, {"agent": {"max_turns": 150}})
+        self.run_main()
+        self.assertNotIn("agent", self.config())
+
+    def test_a_named_profiles_overlay_is_not_applied_here(self):
+        write(self.overlay_dir / "profile-platform.overlay.yaml", {"agent": {"max_turns": 150}})
+        self.run_main()
+        self.assertNotIn("agent", self.config())
+
+    def test_the_name_is_still_required_to_be_default(self):
+        """--profile-name is a narrow escape hatch, not a way past validation."""
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = po.main(["--profile-dir", str(self.home), "--profile-name", "../evil"])
+        self.assertEqual(rc, 2)
+        self.assertIn("not a valid profile name", err.getvalue())
+
+    def test_sync_profile_still_refuses_the_default_profile(self):
+        """The sweep over profiles/ must never pick the front door up by accident."""
+        with self.assertRaises(ValueError):
+            po.sync_profile(self.tmp / "profiles" / "default", self.overlay_dir)
 
 
 class ProfileNameValidationTest(unittest.TestCase):

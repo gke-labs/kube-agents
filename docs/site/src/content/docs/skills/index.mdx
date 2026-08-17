@@ -91,7 +91,7 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | Skill | Description |
 | ----- | ----------- |
 | [`gke-manifest-generation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-manifest-generation/SKILL.md) | Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning (use gke-cluster-creation). |
-| [`submit-suggestion`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/submit-suggestion/SKILL.md) | Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. |
+| [`submit-suggestion`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/submit-suggestion/SKILL.md) | Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself. |
 
 ### Meta
 

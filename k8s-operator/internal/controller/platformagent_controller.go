@@ -31,6 +31,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -57,9 +59,32 @@ const (
 	minIPv6CIDRPrefix      = 48
 	maxCIDRsPerAnnotation  = 50
 
+	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
+	// Identity tokens. It is only ever the pre-DNAT destination.
+	metadataLinkLocalIP = "169.254.169.254"
+	// metadataDaemonIP is where GKE's node-local metadata daemon actually listens, on
+	// TCP 988. On the iptables datapath the node rewrites 169.254.169.254:80 to
+	// 169.254.169.252:988 in nat PREROUTING — before NetworkPolicy is evaluated — so a
+	// policy that permits only the link-local address drops every token fetch. Dataplane
+	// V2 performs the same rewrite but targets the hosting node's internal IP instead,
+	// which is why reconcileNetworkPolicy also feeds the live node IPs in.
+	metadataDaemonIP = "169.254.169.252"
+
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
+
+	// The condition reporting that cluster event ingestion has been switched off
+	// on the spec. It is written only in that state — see updateStatusReady.
+	eventWatcherConditionType  = "EventWatcher"
+	eventWatcherDisabledReason = "DisabledBySpec"
+	// Long, because the reader of `kubectl describe` is the person who has to
+	// decide whether this is still wanted. It has to say what stopped, that
+	// nothing will turn it back on, and how to turn it back on.
+	eventWatcherDisabledMessage = "Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. " +
+		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
+		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
+		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
 )
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
@@ -625,8 +650,26 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 		}
 	}
 
+	// Discover node internal IPs for metadata server egress on Dataplane V2.
+	// GKE Dataplane V2 DNAT's 169.254.169.254 to the node IP before policy evaluation.
+	// Read Nodes through the cache, not APIReader: SetupWithManager watches Nodes so the
+	// informer is running anyway, and a live cluster-wide List here would fetch every
+	// Node — Status.Images included — on every reconcile of every agent.
+	var metadataNodeIPs []string
+	var nodeList corev1.NodeList
+	if err := r.Client.List(ctx, &nodeList); err != nil {
+		return fmt.Errorf("failed to list nodes for metadata server DNAT targets: %w", err)
+	}
+	for i := range nodeList.Items {
+		for _, addr := range nodeList.Items[i].Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP && net.ParseIP(addr.Address) != nil {
+				metadataNodeIPs = append(metadataNodeIPs, addr.Address)
+			}
+		}
+	}
+
 	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
-	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint)
+	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint, metadataNodeIPs)
 	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
 	}
@@ -906,6 +949,25 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 	}
 
+	// Cluster event ingestion, reported only while it is switched off. A
+	// permanently-present condition would have to read True on every healthy
+	// install, and True here could only ever mean "the operator asked for a
+	// watcher" — it is not a liveness check, and a watcher that dies leaves the
+	// pod Ready with nothing to show for it. Claiming otherwise on every CR is
+	// worse than saying nothing, so the condition exists only in the state that
+	// is genuinely worth reporting: somebody pressed the emergency stop.
+	eventWatcherOn := eventWatcherEnabled(agent)
+	existingWatcherCond := meta.FindStatusCondition(agent.Status.Conditions, eventWatcherConditionType)
+	// Message is compared alongside Status and Reason, as the Ready and Degraded
+	// terms below do. Reason is a constant here, so the only way the text can
+	// differ is a release that rewords eventWatcherDisabledMessage — and that
+	// message is the recovery instruction a reader gets from `kubectl describe`.
+	// Leaving it out would freeze the previous release's wording on every
+	// install still holding the stop, since nothing else about them changes.
+	eventWatcherUnchanged := (eventWatcherOn && existingWatcherCond == nil) ||
+		(!eventWatcherOn && existingWatcherCond != nil && existingWatcherCond.Status == metav1.ConditionFalse &&
+			existingWatcherCond.Reason == eventWatcherDisabledReason && existingWatcherCond.Message == eventWatcherDisabledMessage)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) ||
@@ -921,6 +983,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		degradedUnchanged &&
+		eventWatcherUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return newPhase, nil
 	}
@@ -958,6 +1021,18 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
 	} else {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, "Degraded")
+	}
+
+	if eventWatcherOn {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, eventWatcherConditionType)
+	} else {
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:               eventWatcherConditionType,
+			Status:             metav1.ConditionFalse,
+			Reason:             eventWatcherDisabledReason,
+			Message:            eventWatcherDisabledMessage,
+			LastTransitionTime: now,
+		})
 	}
 
 	return newPhase, r.Status().Update(ctx, agent)
@@ -1107,6 +1182,42 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return bld.
+		Watches(
+			// The metadata egress rules carry one /32 per node, so a node joining or
+			// leaving invalidates the policy. Without this the set would only be
+			// refreshed by an unrelated event or the 10-hour informer resync, and an
+			// agent scheduled onto an unrepresented node loses Workload Identity.
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
+				var list agentv1alpha1.PlatformAgentList
+				if err := mgr.GetClient().List(ctx, &list); err != nil {
+					return nil
+				}
+				reqs := make([]reconcile.Request, 0, len(list.Items))
+				for i := range list.Items {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: list.Items[i].Namespace,
+							Name:      list.Items[i].Name,
+						},
+					})
+				}
+				return reqs
+			}),
+			// Kubelet rewrites Node status constantly — conditions, capacity, the image
+			// list. Only an address change can alter the policy, so everything else is
+			// filtered out rather than allowed to storm the queue.
+			builder.WithPredicates(predicate.Funcs{
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					oldNode, okOld := e.ObjectOld.(*corev1.Node)
+					newNode, okNew := e.ObjectNew.(*corev1.Node)
+					if !okOld || !okNew {
+						return true
+					}
+					return !equality.Semantic.DeepEqual(oldNode.Status.Addresses, newNode.Status.Addresses)
+				},
+			}),
+		).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

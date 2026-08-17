@@ -118,6 +118,28 @@ cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${p
 
 
 
+# Clean up the LiteLLM Vertex GSA. Unconditional, like every other teardown
+# here: MODEL_PROVIDER may have been switched away from vertex_ai since the GSA
+# was created, and cleanup_agent_iam is a no-op when the GSA does not exist.
+# The cross-project grant has to go first: deleting a GSA rewrites its bindings
+# elsewhere to "deleted:serviceAccount:...?uid=", which no longer matches the
+# member this revokes, so the binding would outlive the identity.
+if [ -n "${VERTEX_PROJECT_ID:-}" ] && [ "${VERTEX_PROJECT_ID}" != "${PROJECT_ID}" ]; then
+  litellm_gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    echo -e "  ${C_GREEN}[DRY-RUN] Would remove roles/aiplatform.user for ${LITELLM_GSA_NAME} on ${VERTEX_PROJECT_ID}.${C_RESET}"
+  else
+    echo -e "  ${C_CYAN}ℹ Removing roles/aiplatform.user for ${LITELLM_GSA_NAME} on ${VERTEX_PROJECT_ID}...${C_RESET}"
+    gcloud projects remove-iam-policy-binding "${VERTEX_PROJECT_ID}" \
+        --member="serviceAccount:${litellm_gsa_email}" \
+        --role="roles/aiplatform.user" \
+        --quiet 2>/dev/null || true
+  fi
+fi
+# roles/aiplatform.user is passed positionally so it is also revoked from
+# PROJECT_ID, before the GSA itself is deleted.
+cleanup_agent_iam "${LITELLM_KSA_NAME}" "${LITELLM_GSA_NAME}" "roles/aiplatform.user"
+
 # Clean up GitHub Token Minter GSA
 cleanup_agent_iam "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"
 

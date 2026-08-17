@@ -45,6 +45,11 @@ if [ "${DRY_RUN:-0}" -eq 1 ]; then
   echo -e "  ${C_GREEN}[DRY-RUN] Would undeploy LiteLLM Gateway in namespace '${NAMESPACE}'.${C_RESET}"
 else
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
+  # Mirror provision_09: the vertex_ai overlay renders a ServiceAccount whose name
+  # comes from these, and an unsubstituted name would delete nothing.
+  export PROJECT_ID LITELLM_KSA_NAME LITELLM_GSA_NAME
+  export VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-$PROJECT_ID}"
+  export VERTEX_LOCATION="${VERTEX_LOCATION:-$REGION}"
   make -C "${OPERATOR_DIR}" undeploy-litellm || true
   echo -e "  ${C_GREEN}✓ LiteLLM Gateway undeploy command completed.${C_RESET}"
 fi

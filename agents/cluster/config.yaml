@@ -65,7 +65,7 @@ platform_toolsets:
     - mcp-developer_knowledge
     - mcp-gke
 
-# No memory provider. `multiuser_memory` scopes its store by the gateway identity
+# No memory provider. Per-user memory scopes its store by the gateway identity
 # (agent._user_id), and a Cluster Agent is only ever spawned by the kanban
 # dispatcher, which carries no human identity — so its writes would all collapse
 # into one anonymous bucket. Per-user memory lives on the Chat Agent only (see

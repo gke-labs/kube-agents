@@ -8,9 +8,14 @@ Most agent products are reactive: you ask, they answer. `kube-agents` is designe
 ## The hands-free loop
 
 ```text
-Cron tick  →  Governance SOP  →  Platform Agent investigates  →  fleet-audit / submit-suggestion
-                                                              →  Minty mints GitHub token
-                                                              →  Ledger issue or pull request opened
+Cron tick
+    ↓
+Governance SOP
+    ↓
+Platform Agent investigates
+    ├──  fleet-audit / submit-suggestion
+    ├──  Minty mints GitHub token
+    └──  Ledger issue or pull request opened
 ```
 
 Every step is real code shipping in the repo. The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance); the [`submit-suggestion`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion) skill wraps the git flow; [Minty](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github) brokers short-lived tokens.

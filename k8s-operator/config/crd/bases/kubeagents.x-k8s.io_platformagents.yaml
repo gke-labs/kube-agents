@@ -8144,6 +8144,40 @@ spec:
                         ClusterName is the logical name of the cluster (either
                         where the agent is running or the target cluster).
                       type: string
+                    eventWatcher:
+                      description: |-
+                        EventWatcher configures cluster event ingestion — the k8s-event-watcher that
+                        turns cluster warnings into autonomous triage sessions. Its `enabled: false`
+                        is the emergency stop for an event storm.
+                      properties:
+                        enabled:
+                          default: true
+                          description: |-
+                            Enabled controls whether the watcher is started at all. Absent means started:
+                            the watcher is how a fleet notices its own incidents, so only an explicit
+                            false turns it off.
+
+                            This is an emergency stop, not a tuning knob. It exists for the case where
+                            events arrive faster than the agent can triage them — a fleet-wide rollout
+                            gone wrong, a node pool flapping — and the cheapest way to get the agent back
+                            is to cut the inflow rather than to chase the cards it has already been given.
+                            It is all-or-nothing across every watched cluster: the watcher's reason and
+                            namespace filters are fixed by the sidecar's entrypoint and not exposed here,
+                            so there is no way to silence one noisy namespace through this field.
+
+                            Three consequences to know before pressing it:
+
+                              - It rolls the pod. The value reaches the sidecar as an environment variable,
+                                so changing it rewrites the pod template. During a storm that restart is
+                                usually wanted anyway — it is also what ends the sessions already running.
+                              - It stops the inflow only. Kanban cards and sessions created from events
+                                already delivered keep running and still have to be dealt with on the board.
+                              - Nothing turns it back on. An install left with the watcher off has no
+                                incident detection at all while the container stays Ready, which is why the
+                                operator reports the off state as an `EventWatcher` condition on the CR
+                                instead of letting it sit unremarked in the spec.
+                          type: boolean
+                      type: object
                     hermes:
                       description:
                         Hermes configures the internal event-routing or agent
@@ -8266,9 +8300,27 @@ spec:
                           type: boolean
                         provider:
                           default: multiuser_memory
-                          description:
-                            Provider specifies the memory provider implementation
-                            (e.g. "multiuser_memory").
+                          description: |-
+                            Provider selects the memory provider plugin. Two ship in the agent image:
+                            "multiuser_memory" — the default, for small or personal deployments — keeps a
+                            per-user Markdown file inside the pod and needs nothing else running, at the
+                            price of loading the whole store into the model's context on every turn, and
+                            "kube_agents_memory" — for enterprise deployments — gives ranked recall backed
+                            by the in-cluster Hindsight service and its Postgres database. Any other
+                            plugin Hermes ships may be named here too.
+
+                            The file store is the default because it is what this API shipped before
+                            "kube_agents_memory" existed. A CR written against the older schema omits this
+                            field, and taking the default must leave that agent with the store it already
+                            has rather than pointing it at a Hindsight service nobody deployed.
+
+                            Use "none" for no external provider at all. That is not the same as leaving
+                            this field empty: an absent field takes the default below, so "none" is the
+                            only way to express the choice. The operator translates it to the empty
+                            string Hermes itself uses.
+
+                            Only a Hindsight-backed provider reaches the specialist profiles, and only
+                            read-only; see memoryOverlay in the controller for why.
                           type: string
                         userProfileEnabled:
                           default: false

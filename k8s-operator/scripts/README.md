@@ -112,12 +112,13 @@ Generated from each script's own comment banner.
 | 5 | [`provision_05_gcp_gchat.sh`](provision_05_gcp_gchat.sh) | **Google Chat & Pub/Sub Setup** — Configures the Google Chat backend: Pub/Sub routing, the Agent's Service Account, and grants the Service Account permission to read incoming chat messages. Also enables the Workspace Add-ons and Chat APIs and provisions their service identities — without the Chat API identity, Google Chat fails silently. |
 | 6 | [`provision_06_slack.sh`](provision_06_slack.sh) | **Slack Integration Setup** — Configures Slack bot tokens, app tokens, and home channel settings. |
 | 7 | [`provision_07_gcp_k8s_secrets.sh`](provision_07_gcp_k8s_secrets.sh) | **GKE Kubernetes Secrets Setup** — Idempotent setup script to validate and configure Kubernetes secrets directly. Requires CMEK database encryption unless ALLOW_UNENCRYPTED_SECRETS=true is set. |
-| 8 | [`provision_08_deploy_platform_agent.sh`](provision_08_deploy_platform_agent.sh) | **Deploy PlatformAgent Custom Resource Manifest** — Idempotent script that connects to GKE, renders the platform-agent.yaml template, deploys it to the cluster, and fails unless the operator reconciles the change into the agent Deployment (override the wait budget with AGENT_READY_TIMEOUT, default 600s). Whether the Deployment then rolls out is verified by step 13, after the agent's dependencies exist. |
+| 8 | [`provision_08_deploy_platform_agent.sh`](provision_08_deploy_platform_agent.sh) | **Deploy PlatformAgent Custom Resource Manifest** — Idempotent script that connects to GKE, renders the platform-agent.yaml template, deploys it to the cluster, labels the host cluster for discovery, and fails unless the operator reconciles the change into the agent Deployment (override the wait budget with AGENT_READY_TIMEOUT, default 600s). Whether the Deployment then rolls out is verified by step 13, after the agent's dependencies exist. |
 | 9 | [`provision_09_deploy_litellm.sh`](provision_09_deploy_litellm.sh) | **Deploy LiteLLM Gateway** — Idempotent script that connects to GKE and deploys the LiteLLM Gateway. |
 | 10 | [`provision_10_deploy_github_minter.sh`](provision_10_deploy_github_minter.sh) | **Deploy GitHub Token Minter** — Idempotent script that deploys the GitHub Token Minter. Runs only when GITHUB_ORG, GITHUB_REPO, and GITHUB_APP_ID are all set; skipped otherwise. |
 | 11 | [`provision_11_deploy_inference_replay.sh`](provision_11_deploy_inference_replay.sh) | **Deploy Inference Replay Proxy (optional)** — Idempotent script that deploys the Inference Replay proxy in front of the LiteLLM gateway. Skipped unless INFERENCE_REPLAY_ENABLED=true. The proxy intercepts the `litellm` Service so agents need no configuration changes. With REPLAY_MODE=off (default) it is a pure pass-through; flip the `inference-replay-config` ConfigMap to `on` to start recording/replaying. |
 | 12 | [`provision_12_gke_backup_plan.sh`](provision_12_gke_backup_plan.sh) | **GKE Backup Plan (optional)** — Sets up Google Cloud Backup for GKE BackupPlan for automated cluster and persistent volume snapshots. Skipped unless ENABLE_GKE_BACKUP_PLAN=true. Note: If BACKUP_CRON_SCHEDULE or BACKUP_RETAIN_DAYS are modified after initial provisioning, re-running this script automatically reconciles the existing backup plan in-place using 'gcloud beta container backup-restore backup-plans update'. Cost: Incurs charges based on the number of GKE pods backed up and persistent volume snapshot storage used. Defaults to ENABLE_GKE_BACKUP_PLAN=false. Security: Backups include Kubernetes Secrets and persistent volume data, so GCP IAM policies should restrict backup/restore permissions to authorized admins. |
-| 13 | [`provision_13_verify_agent_rollout.sh`](provision_13_verify_agent_rollout.sh) | **Verify PlatformAgent Rollout** — Final gate of the pipeline: waits for the agent Deployment to finish rolling out and fails with diagnostics if it does not (override the timeout with AGENT_READY_TIMEOUT, default 600s). Runs last because the agent's model backend — the litellm Service — only exists after step 9, so step 8 cannot verify readiness itself. |
+| 13 | [`provision_13_deploy_hindsight.sh`](provision_13_deploy_hindsight.sh) | **Deploy Hindsight Memory Store** — Idempotent script that connects to GKE and deploys Hindsight — the API server and the Postgres/pgvector database behind the Chat Agent's long-term memory. Requires step 9, since Hindsight sends its extraction and consolidation calls through the LiteLLM gateway. Skipped unless the install asked for it: MEMORY_PROVIDER must name a Hindsight-backed provider, so an install that chose `multiuser_memory` or `none` runs no database. |
+| 14 | [`provision_14_verify_agent_rollout.sh`](provision_14_verify_agent_rollout.sh) | **Verify PlatformAgent Rollout** — Final gate of the pipeline: waits for the agent Deployment to finish rolling out and fails with diagnostics if it does not (override the timeout with AGENT_READY_TIMEOUT, default 600s). Runs last because the agent's model backend — the litellm Service — only exists after step 9, so step 8 cannot verify readiness itself. |
 
 ### Teardown steps
 
@@ -130,11 +131,12 @@ Generated from each script's own comment banner.
 | 5 | [`teardown_05_gcp_gchat.sh`](teardown_05_gcp_gchat.sh) | **Teardown Google Chat & Pub/Sub Setup** — Idempotent script to clean up GChat Pub/Sub Topic/Subscription and the Bot GSA. |
 | 6 | [`teardown_06_slack.sh`](teardown_06_slack.sh) | **Teardown Slack Integration Setup** — Idempotent script to clean up Slack integration state and tokens. |
 | 7 | [`teardown_07_gcp_k8s_secrets.sh`](teardown_07_gcp_k8s_secrets.sh) | **Teardown GKE Secrets** — Idempotent script to clean up Kubernetes secrets and sanitize local state. |
-| 8 | [`teardown_08_deploy_platform_agent.sh`](teardown_08_deploy_platform_agent.sh) | **Teardown PlatformAgent Custom Resource** — Idempotent script to clean up the applied PlatformAgent Custom Resource (CR) and delete the local generated manifest file. |
+| 8 | [`teardown_08_deploy_platform_agent.sh`](teardown_08_deploy_platform_agent.sh) | **Teardown PlatformAgent Custom Resource** — Idempotent script to clean up the applied PlatformAgent Custom Resource (CR), remove the host-discovery label, and delete the local generated manifest file. |
 | 9 | [`teardown_09_deploy_litellm.sh`](teardown_09_deploy_litellm.sh) | **Teardown LiteLLM Gateway** — Idempotent script to undeploy the LiteLLM gateway. |
 | 10 | [`teardown_10_deploy_github_minter.sh`](teardown_10_deploy_github_minter.sh) | **Teardown GitHub Token Minter** — Idempotent script to clean up the GitHub Token Minter. |
 | 11 | [`teardown_11_deploy_inference_replay.sh`](teardown_11_deploy_inference_replay.sh) | **Teardown Inference Replay Proxy** — Idempotent script to undeploy the Inference Replay proxy and restore the original LiteLLM Service. Safe to run even when the proxy was never deployed. |
 | 12 | [`teardown_12_gke_backup_plan.sh`](teardown_12_gke_backup_plan.sh) | **Teardown GKE Backup Plan** — Idempotent script to delete the Google Cloud Backup for GKE BackupPlan. Safely deletes any remaining backup snapshots in background batches before removing the BackupPlan. Safe to run even if the backup plan was never created. Set PRESERVE_BACKUPS=true to preserve existing BackupPlan and snapshots during teardown (defaults to false). |
+| 13 | [`teardown_13_deploy_hindsight.sh`](teardown_13_deploy_hindsight.sh) | **Teardown Hindsight Memory Store** — Idempotent script to undeploy the Hindsight API and its Postgres database. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: provisioning-steps -->
@@ -164,6 +166,12 @@ To run a dry-run check (simulates commands without modifying cloud resources):
 ```bash
 ./provision.sh --dry-run
 ```
+
+After the `PlatformAgent` resource is applied, provisioning labels its GKE cluster
+`kube-agents-host=true` so the admin portal can discover the host. Label registration is advisory:
+if it fails, provisioning continues and the portal can still connect through manual cluster
+selection. The in-repository runtime receives its host identity from the configured
+`PlatformAgent` cluster name rather than discovering it by label.
 
 ### Run Teardown Pipeline
 
