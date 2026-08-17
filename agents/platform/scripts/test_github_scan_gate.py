@@ -30,6 +30,7 @@ import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -206,6 +207,61 @@ class IssuesSweepTest(unittest.TestCase):
             second = gate.sweep_issues().cards[0]
         self.assertNotEqual(first.idempotency_key, second.idempotency_key)
         self.assertNotIn("/", first.idempotency_key)
+
+
+class CardBucketTest(unittest.TestCase):
+    """The idempotency key must expire, or a stuck issue wedges the watcher.
+
+    The board matches a repeat key against non-archived rows whatever their
+    state, so a *finished* card answers it forever and nothing here archives
+    cards. A worker that ends its turn before the skill's Step 2 — which Step 1
+    prescribes on an ``ERROR`` status — leaves the issue with no ``status:``
+    label, so the poll keeps returning it and the key keeps suppressing it. The
+    poll returns only the lowest-numbered unaddressed issue, so that also hides
+    every higher-numbered one.
+    """
+
+    PAYLOAD = {
+        "status": "FOUND",
+        "repository": "o/r",
+        "issue_number": 7,
+        "title": "t",
+    }
+
+    def test_the_same_hour_does_not_refile(self):
+        early = datetime(2026, 8, 17, 14, 0, tzinfo=timezone.utc)
+        late = datetime(2026, 8, 17, 14, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            gate._issue_card(self.PAYLOAD, now=early).idempotency_key,
+            gate._issue_card(self.PAYLOAD, now=late).idempotency_key,
+        )
+
+    def test_the_next_hour_refiles(self):
+        before = datetime(2026, 8, 17, 14, 59, tzinfo=timezone.utc)
+        after = datetime(2026, 8, 17, 15, 0, tzinfo=timezone.utc)
+        self.assertNotEqual(
+            gate._issue_card(self.PAYLOAD, now=before).idempotency_key,
+            gate._issue_card(self.PAYLOAD, now=after).idempotency_key,
+        )
+
+    def test_the_repository_and_number_still_scope_the_key(self):
+        """Bucketing must not have replaced the other two scopes."""
+        now = datetime(2026, 8, 17, 14, 0, tzinfo=timezone.utc)
+        key = gate._issue_card(self.PAYLOAD, now=now).idempotency_key
+        other_repo = gate._issue_card(
+            {**self.PAYLOAD, "repository": "other/repo"}, now=now
+        ).idempotency_key
+        other_number = gate._issue_card(
+            {**self.PAYLOAD, "issue_number": 8}, now=now
+        ).idempotency_key
+        self.assertNotEqual(key, other_repo)
+        self.assertNotEqual(key, other_number)
+
+    def test_the_default_clock_is_utc_not_local(self):
+        """A local-time bucket would shift under the pod's TZ."""
+        card = gate._issue_card(self.PAYLOAD)
+        expected = datetime.now(timezone.utc).strftime(gate.CARD_BUCKET_FORMAT)
+        self.assertTrue(card.idempotency_key.endswith(expected))
 
 
 class RunResolverPollTest(unittest.TestCase):

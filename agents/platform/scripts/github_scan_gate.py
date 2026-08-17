@@ -56,6 +56,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
@@ -188,17 +189,27 @@ def run_resolver_poll() -> dict:
     return payload
 
 
-def _issue_card(payload: dict) -> Card:
+#: Idempotency-key granularity. Long enough that a worker still working an
+#: issue is never handed a second card — `claim` happens in the skill's Step 2,
+#: within a minute or two of dispatch — and short enough that a wedged issue
+#: costs an hour of blindness rather than forever.
+CARD_BUCKET_FORMAT = "%Y%m%dT%H"
+
+
+def _issue_card(payload: dict, now: datetime | None = None) -> Card:
     """The card that hands one issue to the Platform Agent.
 
     The body carries the issue number and nothing else the worker could act on
     directly. It re-runs ``poll`` itself in Step 1 — re-reading GitHub is
     cheaper than trusting a card that may have been sitting on the board while
     somebody closed the issue.
+
+    ``now`` is injected so the bucketing below is testable.
     """
     number = payload["issue_number"]
     repo = payload.get("repository", "")
     title = payload.get("title", "") or f"issue #{number}"
+    bucket = (now or datetime.now(timezone.utc)).strftime(CARD_BUCKET_FORMAT)
     return Card(
         title=f"Triage and resolve {repo}#{number}: {title}"[:200],
         body=(
@@ -212,11 +223,29 @@ def _issue_card(payload: dict) -> Card:
         ),
         # Scoped to the repository as well as the number, because a deployment
         # can be repointed at a different repo and #12 is not #12 everywhere.
-        # This is the whole duplicate-card guarantee: the board dedupes against
-        # non-archived rows, which covers the window between filing a card and
-        # the worker running `claim` — the moment the issue picks up
-        # `status:in-progress` and drops out of the poll's search entirely.
-        idempotency_key=f"issue-resolve-{_slug(repo)}-{number}",
+        #
+        # And scoped to an hour, because the board's dedupe cannot be the
+        # durable guarantee. It matches non-archived rows regardless of their
+        # state, so a *finished* card answers its key forever, and nothing here
+        # archives cards. A worker that ends its turn before the skill's Step 2
+        # therefore latches the key permanently — and the skill has an ordinary
+        # path that does exactly that: Step 1 says to alert the room and
+        # terminate on an `ERROR` status. The issue keeps no `status:` label, so
+        # `handle_poll` keeps returning it; because it returns only the
+        # lowest-numbered unaddressed issue, every higher-numbered one goes
+        # unseen too, and `file_card` cannot tell a create from a dedupe hit, so
+        # every subsequent tick looks like a clean run. The old `*/30` prompt
+        # job had no cross-tick state to wedge; the key is what introduced it.
+        #
+        # The durable claim is the `status:in-progress` label on GitHub, which
+        # survives a reset volume and is what drops the issue out of the poll.
+        # The key only has to cover the window between filing and `claim`, so an
+        # hour of it is enough. Buckets are wall-clock aligned, so a card filed
+        # at 10:59 is retried at 11:00 rather than an hour later; that costs one
+        # redundant card, and the body above already tells the worker to re-poll
+        # rather than trust the card, so the second worker finds the issue
+        # claimed or gone and stops.
+        idempotency_key=f"issue-resolve-{_slug(repo)}-{number}-{bucket}",
     )
 
 
