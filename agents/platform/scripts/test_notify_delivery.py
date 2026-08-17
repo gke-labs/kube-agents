@@ -100,6 +100,49 @@ class TestResolveThread(unittest.TestCase):
             self.assertEqual(notify_delivery.resolve_thread("", ["slack"]), (None, None, None))
         urlopen.assert_not_called()
 
+    def test_the_recorded_platform_outranks_the_installs_enabled_set(self):
+        # A row that names its platform is never second-guessed: on a
+        # both-platforms install the enabled set has no majority to appeal to.
+        with patch("notify_delivery.urllib.request.urlopen",
+                   return_value=self._metadata(
+                       {"chat_id": "C1", "thread_id": "1712.99", "platform": "slack"})):
+            _, _, target = notify_delivery.resolve_thread("k8s-evt-1", ["slack", "google_chat"])
+        self.assertEqual(target, "slack:C1:1712.99")
+
+
+class TestPlatformOfThread(unittest.TestCase):
+    """The guess for rows written before `platform` was recorded.
+
+    Sending a thread to the wrong platform does not degrade to the home
+    channel — `hermes send` rejects the target outright and the report is not
+    delivered at all, which is issue #630's failure mode wearing a different
+    hat.
+    """
+
+    def test_a_google_chat_resource_path_is_recognised_even_when_slack_is_on(self):
+        # The regression: an install with both platforms enabled preferred
+        # slack, and `slack:spaces/…:spaces/…/threads/…` was refused.
+        self.assertEqual(
+            notify_delivery._platform_of_thread(
+                "spaces/AAQA123/threads/xYz", ["slack", "google_chat"]),
+            "google_chat",
+        )
+
+    def test_a_slack_timestamp_falls_through_to_the_enabled_set(self):
+        self.assertEqual(
+            notify_delivery._platform_of_thread("1712345678.000100", ["slack", "google_chat"]),
+            "slack",
+        )
+
+    def test_a_slack_only_install_with_no_thread_stays_on_slack(self):
+        self.assertEqual(notify_delivery._platform_of_thread(None, ["slack"]), "slack")
+
+    def test_a_google_chat_only_install_never_guesses_slack(self):
+        self.assertEqual(
+            notify_delivery._platform_of_thread("1712345678.000100", ["google_chat"]),
+            "google_chat",
+        )
+
 
 class TestDeliverNotification(unittest.TestCase):
 

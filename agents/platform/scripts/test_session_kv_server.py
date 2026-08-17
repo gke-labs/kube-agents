@@ -380,6 +380,65 @@ class TestPlaintextIdentityPurge(unittest.TestCase):
         self.assertEqual(self._read("modern-1")["user_email_hash"], "deadbeef")
 
 
+class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
+    """The row has to say which platform its thread lives on.
+
+    A thread belongs to exactly one, and a reply sent to the other is not
+    degraded but refused: `hermes send --to slack:spaces/…:spaces/…/threads/…`
+    resolves nothing and the report is never delivered. Before this field was
+    written, `notify_delivery.resolve_thread` had to infer the platform from
+    the install's enabled set, and an install with both enabled picked Slack
+    for every Google Chat thread.
+    """
+
+    def setUp(self):
+        import sqlite3
+
+        self._saved = {k: os.environ.get(k) for k in ("SLACK_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL")}
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                ("k8s-evt-abc123", json.dumps({"origin": "k8s-watcher"})),
+            )
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def _read(self):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-abc123",)
+            ).fetchone()
+        return json.loads(row[0])
+
+    def test_a_google_chat_thread_is_recorded_as_google_chat(self):
+        session_kv_server._register_session_routing(
+            "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
+        row = self._read()
+        self.assertEqual(row["platform"], "google_chat")
+        self.assertEqual(row["thread_id"], "spaces/AAQA123/threads/xYz")
+        # The space is the thread's own prefix, not the home channel.
+        self.assertEqual(row["chat_id"], "spaces/AAQA123")
+
+    def test_a_slack_thread_is_recorded_as_slack(self):
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        session_kv_server._register_session_routing(
+            "k8s-evt-abc123", "slack", "1712345678.000100")
+        row = self._read()
+        self.assertEqual(row["platform"], "slack")
+        self.assertEqual(row["chat_id"], "C0123456789")
+
+    def test_the_rest_of_the_row_is_preserved(self):
+        session_kv_server._register_session_routing(
+            "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
+        self.assertEqual(self._read()["origin"], "k8s-watcher")
+
+
 class TestAlertDailyQuota(unittest.TestCase):
     """The per-severity daily ceiling enforced in /sessions/{id}/inject."""
 
@@ -682,9 +741,12 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
 
     def test_template_uses_only_the_three_permitted_sections(self):
         # The template says "formatted exactly like this", so it outranks the
-        # persona for this path. SOUL.md section 7 permits exactly three `##`
-        # sections; a fourth labelled block here would override that policy
-        # silently rather than extend it, and the two briefs would contradict.
+        # persona for this path. The Platform Agent's SOUL.md section 7 permits
+        # exactly three `##` sections; a fourth labelled block here would
+        # override that policy silently rather than extend it, and the two
+        # briefs would contradict. The Cluster Agent this is usually routed to
+        # has no such section, so the template is the only statement of the
+        # shape it ever sees — one more reason it must not drift.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -711,7 +773,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         query = session_kv_server._build_agent_query("test-session", payload)
-        body = query.split("## What to do", 1)[1].split("**GitOps PR Instructions", 1)[0]
+        body = query.split("## What to do", 1)[1].split("**What happens if the user replies", 1)[0]
         self.assertIn("apply Option A", body)
         self.assertIn("Recommended: Option", body)
         # It shares a bullet list with the Options now that the separate `👉`
@@ -722,6 +784,131 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             if line.startswith("- **To authorize:**")
         )
         self.assertNotRegex(authorize, r"\*\*Option [A-Z]")
+
+
+class TestTriageDeliveryInstruction(unittest.TestCase):
+    """The one instruction issue #630 turned on: post the report, unconditionally.
+
+    It lives in the card body rather than in the turn, because the turn is read
+    by the front door and the card is read by the agent that does the work.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+
+    def body(self):
+        return session_kv_server._triage_task_body("k8s-evt-abc123", self.PAYLOAD)
+
+    def test_the_call_is_demanded_not_offered(self):
+        # The old wording put MUST on the argument -- "when calling your
+        # send_notification tool ... you MUST pass this exact session ID" --
+        # which reads as a condition on making the call at all. The agent
+        # summarised it back as "pass session_id if notification tools are
+        # used", finished its analysis, called nothing, and the RCA was lost.
+        body = self.body()
+        self.assertIn("send_notification(session_id='k8s-evt-abc123'", body)
+        self.assertIn("is the delivery, and it is not optional", body)
+        # Nothing anywhere may make the call itself sound optional.
+        for hedge in ("if you have", "if notification", "if available", "If you have access"):
+            self.assertNotIn(hedge, body)
+
+    def test_it_says_why_completing_the_card_is_not_delivering_the_report(self):
+        # The reason has to travel with the instruction: an agent whose whole
+        # persona says "the card is the channel" will rationally skip an extra
+        # tool call unless told why this card is the exception.
+        body = self.body()
+        self.assertIn("arrived over the API", body)
+        self.assertIn("no chat thread is subscribed to its completion", body)
+
+    def test_both_terminal_calls_are_named_and_ordered(self):
+        # kanban_complete alone loses the report; send_notification alone
+        # leaves the card running until its claim expires.
+        body = self.body()
+        self.assertIn("kanban_complete", body)
+        self.assertLess(
+            body.index("send_notification(session_id="),
+            body.index("kanban_complete(result="),
+            "the delivery must be demanded before the completion",
+        )
+
+    def test_the_report_may_not_be_delegated(self):
+        # Delegation is the specific failure mode: the instruction did not
+        # survive being compressed into a task for another agent, and the agent
+        # it landed on had no egress of its own.
+        self.assertIn("Do not delegate the diagnosis or the posting", self.body())
+
+
+class TestFrontDoorDelegation(unittest.TestCase):
+    """The turn itself, which is always read by the `default` profile.
+
+    `_create_gateway_session` cannot pick a profile -- Hermes selects one by URL
+    prefix under `gateway.multiplex_profiles`, not by a body key -- so this text
+    is addressed to a router with no cluster access and one delegation tool.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+
+    def query(self):
+        return session_kv_server._build_agent_query("k8s-evt-abc123", self.PAYLOAD)
+
+    def test_it_asks_for_one_card_on_the_failing_cluster_s_agent(self):
+        query = self.query()
+        self.assertIn("kanban_create", query)
+        self.assertIn("`cluster-*` agent scoped to **prod-us-central1**", query)
+
+    def test_it_forbids_the_improvisations_that_lost_the_report(self):
+        # Observed live on 2026-08-17: the front door summarised the brief into
+        # the cluster card, then filed a second card asking the Platform Agent
+        # to post the report, then leaked a "test notification" probe into the
+        # user's incident thread from a third.
+        query = self.query()
+        self.assertIn("copied verbatim", query)
+        self.assertIn("do not file a second card", query)
+
+    def test_the_card_body_is_carried_whole_and_marked_off(self):
+        # The brief is a payload for another agent, not instructions for this
+        # one. Markers are what let the router copy it without reading it as
+        # its own task.
+        query = self.query()
+        body = session_kv_server._triage_task_body("k8s-evt-abc123", self.PAYLOAD)
+        between = query.split("--- BEGIN TASK BODY (copy verbatim) ---\n", 1)[1]
+        between = between.split("\n--- END TASK BODY ---", 1)[0]
+        self.assertEqual(between, body)
+
+    def test_the_turn_does_not_ask_the_front_door_to_diagnose(self):
+        # It holds no cluster tools at all, so an instruction it cannot follow
+        # is an invitation to invent an answer.
+        self.assertIn("Do not diagnose the event", self.query())
+
+
+class TestGatewaySessionBody(unittest.TestCase):
+
+    def test_no_profile_key_is_sent(self):
+        # The gateway takes the profile from a `/p/<profile>/` URL prefix, and
+        # only when `gateway.multiplex_profiles` is on. A `profile` key in this
+        # body is accepted with a 201 and dropped -- which read as success for
+        # a whole release while every triage ran on the default profile.
+        with patch("session_kv_server.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = MagicMock(status=200)
+            ok = session_kv_server._create_gateway_session(
+                "http://127.0.0.1:8642", "k8s-evt-abc123", {"Content-Type": "application/json"}
+            )
+        self.assertTrue(ok)
+        body = json.loads(urlopen.call_args[0][0].data.decode("utf-8"))
+        self.assertEqual(set(body), {"session_id", "title"})
 
 
 if __name__ == "__main__":

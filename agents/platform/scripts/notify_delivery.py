@@ -10,11 +10,13 @@
 #     (agents/platform/scripts/notify_server.py).
 #
 # A Cluster Agent needs it because it is now the agent that triages a Kubernetes
-# event on its own cluster: session_kv_server creates the triage session on that
-# cluster's profile, so the agent that writes the RCA is the agent that has to
-# post it. Before this, a Cluster Agent's toolset was two read-only remote MCP
-# proxies and nothing else — it produced a diagnosis with no way to deliver it,
-# and every RCA it wrote was dropped. See issue #630.
+# event on its own cluster: the event wakes the front door, which delegates the
+# whole diagnosis to that cluster's agent as one kanban card, and the card's
+# requester is an `api_server` session with no chat thread subscribed to it. So
+# the agent that writes the RCA is the only one positioned to deliver it, and
+# `kanban_complete` is not a delivery. Before this, a Cluster Agent's toolset was
+# two read-only remote MCP proxies and nothing else — it produced a diagnosis
+# with no way to post it, and every RCA it wrote was dropped. See issue #630.
 #
 # Giving a Cluster Agent platform_control instead would have handed a
 # deliberately read-only profile the whole provisioning surface. One tool on a
@@ -120,10 +122,30 @@ def resolve_thread(session_id: str, platforms: list[str]) -> tuple[str | None, s
     # "k8s-watcher" is the event watcher naming itself as the session's origin,
     # not a chat platform anyone can be messaged on.
     if not platform or platform == "k8s-watcher":
-        platform = "slack" if "slack" in platforms else "google_chat"
+        platform = _platform_of_thread(thread_id, platforms)
     if not (chat_id and thread_id):
         return None, None, None
     return chat_id, thread_id, f"{platform}:{chat_id}:{thread_id}"
+
+
+def _platform_of_thread(thread_id: str | None, platforms: list[str]) -> str:
+    """Which platform a recorded thread belongs to, when the row does not say.
+
+    `_register_session_routing` records `platform` now, but rows written before
+    it did still exist and this is the only thing standing between them and the
+    wrong platform. A thread belongs to exactly one, and sending it to another
+    does not fall back to anything — `hermes send` rejects the target outright
+    (`Could not resolve 'spaces/…:spaces/…/threads/…' on slack`) and the report
+    is simply not delivered.
+
+    A Google Chat thread id is a resource path (`spaces/<id>/threads/<id>`),
+    which no Slack channel or message timestamp looks like, so the shape is a
+    reliable tell where the install's enabled set is not: an install with both
+    platforms on has no majority to appeal to.
+    """
+    if thread_id and thread_id.startswith("spaces/"):
+        return "google_chat"
+    return "slack" if "slack" in platforms else "google_chat"
 
 
 def store_incident(chat_id: str, thread_id: str, message: str) -> None:

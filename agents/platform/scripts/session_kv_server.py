@@ -459,7 +459,17 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
 
 
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
-    """Save thread configurations in session_metadata SQLite table."""
+    """Save thread configurations in session_metadata SQLite table.
+
+    `platform` is recorded alongside the thread because a thread belongs to
+    exactly one chat platform and the reply has to go back to that one. Without
+    it, `notify_delivery.resolve_thread` has to guess from the install's enabled
+    set, and on an install with both platforms enabled it guessed Slack for a
+    Google Chat thread: `hermes send` was handed
+    `slack:spaces/…:spaces/…/threads/…` and refused it, so the RCA was not
+    delivered at all. Rows written before this field existed still fall through
+    to that guess — see the shape-sniffing fallback in `resolve_thread`.
+    """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             with conn:
@@ -470,6 +480,7 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                 if row:
                     meta = json.loads(row[0])
                     meta["thread_id"] = thread_id
+                    meta["platform"] = platform
                     if platform == "slack":
                         meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
                     else:
@@ -485,11 +496,20 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
 
 
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
-    """POST request to local gateway API to initialize the troubleshooting session ID."""
+    """POST request to local gateway API to initialize the troubleshooting session ID.
+
+    The session lands on the gateway's default profile — the Chat Agent — and
+    there is no way to ask for another one here. Hermes selects a profile by URL
+    prefix (`/p/<profile>/api/sessions`), only when `gateway.multiplex_profiles`
+    is enabled, and only against that profile's own `API_SERVER_KEY`; a `profile`
+    key in this body is accepted with a 201 and dropped. See
+    `_build_agent_query`, which delegates from the front door instead.
+    """
+    body: Dict[str, Any] = {"session_id": session_id, "title": f"Triage {session_id}"}
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions",
-            data=json.dumps({"session_id": session_id, "title": f"Triage {session_id}"}).encode("utf-8"),
+            data=json.dumps(body).encode("utf-8"),
             headers=headers,
             method="POST"
         )
@@ -504,17 +524,30 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     return False
 
 
-def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
-    """Format a detailed Markdown diagnostic query for the Platform Agent.
+def _triage_task_body(session_id: str, payload: Dict[str, Any]) -> str:
+    """The kanban card body the front door files for the failing cluster's agent.
+
+    Written to be copied verbatim rather than summarised, because the summary is
+    where issue #630 happened: the front door paraphrased the request into a
+    card, the session id and the obligation to post did not survive the
+    paraphrase, and the Cluster Agent completed a card whose result reached
+    nobody. It is a card completion, not a chat reply, and the requester here is
+    an `api_server` session with no chat thread subscribed to it — so
+    `kanban_complete` alone delivers the report precisely nowhere. Hence the two
+    terminal calls this body demands, in that order.
 
     The report template below is a second instruction channel alongside the
     persona, and says "formatted exactly like this" — so it wins any
-    disagreement with SOUL.md §7, which governs the same output. Keep the two
-    in step: §7 permits exactly the three ``##`` sections this template uses,
-    and a fourth labelled block added here silently overrides the policy rather
-    than extending it. The GitOps call-to-action lives inside **What to do**
-    because it is an action, and because §7 rule 3 cuts trailing lines that
-    read as an offer rather than a finding. It shares a list with the Option
+    disagreement with the Platform Agent's SOUL.md §7 (Incident Triage
+    Communication Policy), which governs the same output. Keep the two in step:
+    §7 permits exactly the three ``##`` sections this template uses, and a
+    fourth labelled block added here silently overrides the policy rather than
+    extending it. The template states that shape itself rather than citing the
+    section, because the reader is a Cluster Agent, whose persona has no §7 —
+    the delegation to that persona is what makes the citation unresolvable for
+    the agent being asked to obey it. The GitOps call-to-action lives inside
+    **What to do** because it is an action, and because §7 rule 3 cuts trailing
+    lines that read as an offer rather than a finding. It shares a list with the Option
     bullets now that the old ``👉`` block is gone, so it carries a
     ``To authorize:`` label and the instruction above the template says it is
     not an option — without both, the fourth bullet reads as Option C.
@@ -547,15 +580,24 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
         f"- **Event Reason:** {event_reason}\n"
         f"- **Warning Message:** {message}\n\n"
-        f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
+        f"**Finish with two calls, in this order.** First "
+        f"`send_notification(session_id='{session_id}', message=<your completed report>)`, then "
+        f"`kanban_complete(result=<the same report>, summary=<one line>)`.\n\n"
+        f"The `send_notification` call is the delivery, and it is not optional. This card was filed on behalf of session "
+        f"'{session_id}', which arrived over the API rather than over chat, so no chat thread is subscribed to its completion: "
+        f"a card you complete without posting sends your report nowhere at all. That is what issue #630 was. "
+        f"The session id is what threads the report under the alert it answers; get it wrong and the report posts to the home channel, "
+        f"where nobody can tell which incident it explains.\n\n"
+        f"**Do this yourself. Do not delegate the diagnosis or the posting to another agent, and do not open child cards for it** — "
+        f"you are the agent scoped to the cluster that is failing, and the obligation to post does not survive being summarised into a task for someone else.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
         f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
         f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"The last bullet under '## What to do' is the call to action, not another option: keep its 'To authorize:' label, never give it an Option letter, and never count it when you number the options.\n\n"
-        f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this — "
-        f"the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth:\n\n"
+        f"Format the report you pass to `send_notification`, and to `kanban_complete`'s `result`, exactly like this — "
+        f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
         f"<Short 1-sentence description of the problem>\n\n"
         f"## Why\n\n"
@@ -568,11 +610,57 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
         f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
         f"---"
-        f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
-        f"If the user replies to the thread with 'apply' or 'apply Option <letter>':\n"
-        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
-        f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
-        f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
+        f"\n\n**What happens if the user replies 'apply':**\n"
+        f"The reply lands as ordinary chat ingress, on the front door rather than in this session, and is carried out by the agent that holds the GitOps write path — "
+        f"a bare 'apply' (or 'apply recommended') meaning the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. "
+        f"Your job is to make that possible: name the manifest change each option needs precisely enough that another agent can open the Pull Request from your report alone. "
+        f"Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+        f"(no `kubectl scale`, `patch`, or `apply`)."
+    )
+
+
+def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
+    """The turn sent to the gateway, which is always the Chat Agent's.
+
+    `_create_gateway_session` cannot choose a profile, so the reader is the
+    `default` front door: an agent with no cluster access and no chat egress of
+    its own, whose one job and one tool is `kanban_create`. Everything here is
+    therefore addressed to a router, and the diagnostic brief travels through it
+    as an opaque payload between markers rather than as instructions the router
+    is meant to act on. The rules are numbered and short because the failure this
+    replaces was not a refusal — it was a helpful front door improvising: on
+    2026-08-17 it summarised the brief into one card for the Cluster Agent,
+    dropped the posting obligation on the way, filed a second card asking the
+    Platform Agent to post instead, and leaked a "This is a test notification"
+    probe into the user's incident thread from a third.
+    """
+    event_reason = payload.get("reason") or "Unknown"
+    namespace = payload.get("namespace") or "default"
+    object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
+    object_name = payload.get("name") or ""
+    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+
+    return (
+        f"A Kubernetes Warning event needs triage on GKE cluster '{cluster_name}'. "
+        f"The alert is already posted in the user's chat thread; your job is to route the diagnosis and nothing else.\n\n"
+        f"Make exactly one `kanban_create` call:\n\n"
+        f"- `assignee`: the `cluster-*` agent scoped to **{cluster_name}** — take its exact name from your "
+        f"`[SPECIALIST AGENTS AVAILABLE NOW]` block, and call `list_agents` once to refresh if none is listed for that cluster.\n"
+        f"- `title`: `Triage {namespace}/{object_kind}/{object_name} ({event_reason}) on {cluster_name}`\n"
+        f"- `body`: everything between the two markers below, **copied verbatim**.\n\n"
+        f"Three rules, and they are why this text spells the call out:\n\n"
+        f"1. **Copy the body exactly.** Do not summarise it, shorten it, reformat it, or restate it in your own words. "
+        f"It carries the session id and the instruction to post the report, and a paraphrase that drops either one is how "
+        f"issue #630 lost every RCA it lost.\n"
+        f"2. **One card, to the Cluster Agent.** Not `platform` — this is one named cluster's live runtime state, which is "
+        f"exactly what a Cluster Agent is for. Assign to `platform` only if that cluster genuinely has no agent after a "
+        f"`list_agents` refresh.\n"
+        f"3. **Do nothing else.** Do not diagnose the event, do not post anything to chat, and do not file a second card to "
+        f"have someone else post the report. The assignee has its own `send_notification` tool and the body tells it to use it; "
+        f"a card asking another agent to deliver the report is a bug, not a fallback.\n\n"
+        f"--- BEGIN TASK BODY (copy verbatim) ---\n"
+        f"{_triage_task_body(session_id, payload)}\n"
+        f"--- END TASK BODY ---"
     )
 
 
@@ -610,7 +698,9 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # 4. Instantiate the session in Platform Gateway
+    # 4. Instantiate the session in Platform Gateway. It lands on the default
+    #    profile — the front door — which delegates it to the failing cluster's
+    #    own agent; see _build_agent_query.
     session_created = _create_gateway_session(api_url, session_id, headers)
     if not session_created:
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
