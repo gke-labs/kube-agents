@@ -702,17 +702,25 @@ if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -f "$TARGET_DIR/profiles/platform/profile.
         --plugins /opt/defaults/plugins \
         --description "$PLATFORM_DESC" || echo "WARN: platform profile scaffold failed; continuing" >&2
 fi
-# Point the platform profile's home-relative `scripts/` at the shared scripts dir
+# Point each specialist profile's home-relative `scripts/` at the shared scripts dir
 # (executable scripts are shared across profiles, not copied per-profile). Self-heal
-# on every start. Cluster agents use absolute /opt/data/scripts paths and need no link.
+# on every start.
 # Requires evidence that the directory is a profile at all — profile.yaml from `hermes
 # profile create`, or a config.yaml from a profile built before that marker existed.
 # Putting a symlink inside a bare mount point would leave content that the skeleton
 # cleanup then refuses to remove, wedging the scaffold; gating on the marker ALONE would
 # instead strip a legacy profile of its scripts link, which nothing else restores.
-if { [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] || [ -f "$TARGET_DIR/profiles/platform/config.yaml" ]; } \
-    && [ -d "$TARGET_DIR/scripts" ]; then
-    ln -sfn "$TARGET_DIR/scripts" "$TARGET_DIR/profiles/platform/scripts" 2>/dev/null || true
+#
+# The cluster-* profiles are in scope because their `notify` MCP server is launched as
+# `${HERMES_HOME}/scripts/notify_server.py`, and a worker spawned as `hermes -p <name>`
+# rewrites HERMES_HOME to the profile home. cluster_agent_profile.py makes the same link
+# for a profile it scaffolds; this covers the ones already on the PVC from an earlier
+# image, which nothing else revisits.
+if [ -d "$TARGET_DIR/scripts" ]; then
+    for profile_home in "$TARGET_DIR/profiles/platform" "$TARGET_DIR"/profiles/cluster-*; do
+        { [ -f "$profile_home/profile.yaml" ] || [ -f "$profile_home/config.yaml" ]; } || continue
+        ln -sfn "$TARGET_DIR/scripts" "$profile_home/scripts" 2>/dev/null || true
+    done
 fi
 
 # 2.6 Force-sync the image-managed persona and config files of the specialist

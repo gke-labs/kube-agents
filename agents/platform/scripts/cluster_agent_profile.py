@@ -142,6 +142,42 @@ def _pin_kubeconfig_env(home: Path, kubeconfig: Path) -> None:
     env_path.write_text("".join(kept) + f"KUBECONFIG={kubeconfig}\n", encoding="utf-8")
 
 
+def _link_shared_scripts(home: Path, name: str) -> None:
+    """Point this profile's home-relative ``scripts/`` at the shared scripts dir.
+
+    The executable scripts are shared across profiles, not copied per-profile:
+    docker-entrypoint.sh syncs the image's ``/opt/defaults/scripts`` into
+    ``$HERMES_HOME/scripts`` once, then symlinks that directory into the platform
+    profile's home. This does the same for a cluster profile, and it is what makes
+    the ``notify`` MCP server's ``${HERMES_HOME}/scripts/notify_server.py`` argv
+    resolve.
+
+    It is needed because HERMES_HOME is not one path. The gateway process runs with
+    HERMES_HOME at the data root, where ``scripts/`` sits directly; a worker launched
+    as ``hermes -p <name>`` runs with HERMES_HOME rewritten to this profile home,
+    where without this link there is no ``scripts/`` at all — and the argv Hermes
+    interpolates would name a file that does not exist. A cluster profile only ever
+    reached scripts through absolute ``/opt/data/scripts`` paths in its persona prose
+    before it had an MCP server of its own.
+
+    Idempotent (``symlink_to`` after an unlink), and never fatal: a Cluster Agent
+    without the link still diagnoses, it just cannot post its own triage report.
+    """
+    shared = HERMES_HOME / "scripts"
+    link = home / "scripts"
+    if not shared.is_dir() or shared.resolve() == link.resolve():
+        return
+    try:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            else:
+                return  # a real directory here is not ours to replace
+        link.symlink_to(shared, target_is_directory=True)
+    except OSError as e:  # noqa: BLE001 - the profile is still usable without it
+        log(f"{name}: linking {link} -> {shared} failed ({e}); send_notification will not start")
+
+
 def _pin_otel_endpoint(home: Path, name: str) -> None:
     """Point this profile's hermes_otel copy at the collector the operator resolved.
 
@@ -194,6 +230,10 @@ def create_profile(project: str, cluster: str, location: str) -> str:
 
     # 2a. Repoint the plugin copy the overlay just made at the resolved collector.
     _pin_otel_endpoint(home, name)
+
+    # 2a-bis. Link the shared scripts dir into the profile home, so the `notify`
+    #         MCP server's argv resolves under either meaning of HERMES_HOME.
+    _link_shared_scripts(home, name)
 
     # 2b. Stamp this cluster's identity into the profile config as structured identity
     #     metadata — never derived from the sanitized profile name.

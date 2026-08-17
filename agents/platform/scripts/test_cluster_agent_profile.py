@@ -323,6 +323,51 @@ class CreateProfileTest(unittest.TestCase):
 
         self.assertEqual(self.plugin_config()["backends"][0]["endpoint"], self.BAKED)
 
+    # --- shared scripts link ---
+    #
+    # The profile home needs a `scripts` symlink for its `notify` MCP server to start.
+    # Its argv is `${HERMES_HOME}/scripts/notify_server.py`, and HERMES_HOME means two
+    # different directories: the data root in the gateway process, this profile's home
+    # in a worker spawned as `hermes -p <name>`. The link is what makes the argv resolve
+    # under the second — and without the server there is no `send_notification`, which
+    # is the only way an event triage on this profile reaches a human (issue #630).
+    #
+    # docker-entrypoint.sh makes the same link for the profiles already on the PVC (see
+    # tests/test_docker_entrypoint.py); this is the half that covers a profile
+    # scaffolded hours after the pod started.
+
+    def shared_scripts(self):
+        d = self.home_root / "scripts"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "notify_server.py").write_text("# the one egress\n")
+        return d
+
+    def test_the_link_resolves_to_the_shared_scripts_dir(self):
+        self.shared_scripts()
+
+        self.create()
+
+        link = self.profile / "scripts"
+        self.assertTrue(link.is_symlink(), "a scaffolded profile must not be left without the link")
+        self.assertTrue((link / "notify_server.py").is_file())
+
+    def test_rescaffolding_does_not_nest_the_link(self):
+        self.shared_scripts()
+
+        self.create()
+        self.create()
+
+        link = self.profile / "scripts"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), (self.home_root / "scripts").resolve())
+
+    def test_a_missing_shared_dir_is_not_fatal(self):
+        # Nothing to link to happens on a host, in a test, and on any deployment
+        # whose entrypoint has not run — and a Cluster Agent that cannot post is
+        # still a Cluster Agent that can diagnose.
+        self.assertEqual(self.create(), self.name)
+        self.assertFalse((self.profile / "scripts").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,15 +1,23 @@
-"""Contract tests for the Platform Agent's effective MCP configuration.
+"""Contract tests for the effective MCP configuration of every local profile.
 
 Run: python3 -m unittest agents.platform.scripts.test_mcp_env_contract
 
-Every assertion here is made against the MERGED config — what actually lands at
-/opt/platform-template/config.yaml — not against either source file, because
-neither file alone is what the agent reads. deploy/docker/Dockerfile builds it
-by running deploy/docker/merge_configs.py over deploy/shared/defaults/config.yaml
-(base) and agents/platform/config.yaml (overlay), and that merge unions lists
-rather than replacing them. A toolset entry deleted from the overlay and left in
-the base survives; a test that read only the overlay would call that a pass.
-The real merge() is imported rather than reimplemented for the same reason.
+For the Platform Agent, every assertion is made against the MERGED config — what
+actually lands at /opt/platform-template/config.yaml — not against either source
+file, because neither file alone is what the agent reads.
+deploy/docker/Dockerfile builds it by running deploy/docker/merge_configs.py over
+deploy/shared/defaults/config.yaml (base) and agents/platform/config.yaml
+(overlay), and that merge unions lists rather than replacing them. A toolset
+entry deleted from the overlay and left in the base survives; a test that read
+only the overlay would call that a pass. The real merge() is imported rather
+than reimplemented for the same reason.
+
+The Cluster Agent template is the opposite case and needs no merge: it is copied
+verbatim into /opt/cluster-template and from there into each scaffolded profile
+home, so agents/cluster/config.yaml IS the effective config. It gets the same
+checks because it now declares a local Python MCP server of its own — the
+single-tool `notify` egress that lets a Cluster Agent post the event triage it
+was asked for (issue #630).
 """
 
 import ast
@@ -28,6 +36,7 @@ from merge_configs import merge  # noqa: E402
 
 BASE_CONFIG = REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml"
 OVERLAY_CONFIG = REPO_ROOT / "agents" / "platform" / "config.yaml"
+CLUSTER_CONFIG = REPO_ROOT / "agents" / "cluster" / "config.yaml"
 
 TOOLSET_SURFACES = ("cli", "api_server")
 
@@ -37,6 +46,11 @@ def merged_config():
     base = yaml.safe_load(BASE_CONFIG.read_text()) or {}
     overlay = yaml.safe_load(OVERLAY_CONFIG.read_text()) or {}
     return merge(base, overlay)
+
+
+def cluster_config():
+    """A Cluster Agent profile's config.yaml — copied verbatim, never merged."""
+    return yaml.safe_load(CLUSTER_CONFIG.read_text()) or {}
 
 
 def env_names_bound_from_the_environment(source: str):
@@ -91,11 +105,18 @@ def env_names_bound_from_the_environment(source: str):
     return names
 
 
-class ToolsetsMatchServersTest(unittest.TestCase):
-    """A toolset entry and its server declaration have to move together."""
+class ToolsetsMatchServersMixin:
+    """A toolset entry and its server declaration have to move together.
+
+    Both profiles hand-list `platform_toolsets` to work around the upstream
+    loader's prefix mapping, so both can drift the same way.
+    """
+
+    def config(self):
+        raise NotImplementedError
 
     def setUp(self):
-        self.merged = merged_config()
+        self.merged = self.config()
 
     def test_every_mcp_toolset_entry_has_a_declared_server(self):
         # The failure this catches: deleting an mcp_servers block but leaving
@@ -134,6 +155,33 @@ class ToolsetsMatchServersTest(unittest.TestCase):
             for s in TOOLSET_SURFACES
         )
         self.assertEqual(cli, api)
+
+
+class PlatformToolsetsMatchServersTest(ToolsetsMatchServersMixin, unittest.TestCase):
+
+    def config(self):
+        return merged_config()
+
+
+class ClusterToolsetsMatchServersTest(ToolsetsMatchServersMixin, unittest.TestCase):
+
+    def config(self):
+        return cluster_config()
+
+    def test_the_read_only_surface_is_not_widened_beyond_notify(self):
+        # The whole argument for giving a read-only profile an egress at all is
+        # that the grant is one tool on a server that exposes only that tool.
+        # platform_control would have been the easy way to get `hermes send` and
+        # would have brought provisioning and Config Connector with it.
+        self.assertNotIn("platform_control", self.merged["mcp_servers"])
+        for surface in TOOLSET_SURFACES:
+            self.assertNotIn("mcp-platform_control", self.merged["platform_toolsets"][surface])
+
+    def test_the_api_server_surface_exposes_notify(self):
+        # An event triage arrives over the REST gateway, not the CLI, so this is
+        # the surface that decides whether the report can be posted. Listing it
+        # only under `cli` would leave #630 exactly as it was.
+        self.assertIn("mcp-notify", self.merged["platform_toolsets"]["api_server"])
 
 
 class AgentCommonIsNotMountedTest(unittest.TestCase):
@@ -213,10 +261,9 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
     # declaration. Kept explicit rather than folded into each block's `env:`.
     ALLOWLIST_PASSTHROUGH = frozenset({"HERMES_HOME", "HOME", "LC_CTYPE", "PATH"})
 
-    def test_each_local_python_server_declares_what_it_reads(self):
-        merged = merged_config()
-        checked = 0
-        for name, block in merged.get("mcp_servers", {}).items():
+    def _check(self, config, label, expected):
+        checked = []
+        for name, block in config.get("mcp_servers", {}).items():
             if not str(block.get("command", "")).endswith("python3"):
                 continue
             script = SCRIPTS_DIR / Path(block["args"][0]).name
@@ -228,13 +275,43 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
                     var,
                     declared,
                     f"{script.name} consumes the value of {var}, but the "
-                    f"{name} mcp_servers block does not declare it — the child "
-                    f"never receives it, so the read always yields the default",
+                    f"{name} mcp_servers block in {label} does not declare it — "
+                    f"the child never receives it, so the read always yields "
+                    f"the default",
                 )
-            checked += 1
+            checked.append(name)
         # A guard that passes because it examined nothing is not a passing
-        # guard: platform_control is a local Python server and must be seen.
-        self.assertGreater(checked, 0, "no local Python MCP server was examined")
+        # guard, and each profile has exactly one local Python server to see.
+        self.assertEqual(sorted(checked), expected, f"wrong servers examined in {label}")
+
+    def test_the_platform_profile_declares_what_it_reads(self):
+        self._check(merged_config(), "the merged platform config", ["platform_control"])
+
+    def test_the_cluster_profile_declares_what_it_reads(self):
+        self._check(cluster_config(), "agents/cluster/config.yaml", ["notify"])
+
+    def test_both_profiles_declare_what_the_shared_delivery_module_reads(self):
+        # send_notification's implementation lives in notify_delivery.py, which
+        # both servers import — so neither server SCRIPT contains the env reads
+        # that decide where the report lands, and the per-script check above
+        # cannot see them. It is the same failure either way: an undeclared
+        # home-channel variable reads back empty in the child and the report
+        # goes nowhere.
+        shared = env_names_bound_from_the_environment(
+            (SCRIPTS_DIR / "notify_delivery.py").read_text()
+        )
+        self.assertTrue(shared, "notify_delivery.py binds no env — has it moved?")
+        for config, label, server in (
+            (merged_config(), "the merged platform config", "platform_control"),
+            (cluster_config(), "agents/cluster/config.yaml", "notify"),
+        ):
+            declared = set(config["mcp_servers"][server].get("env", {})) | self.ALLOWLIST_PASSTHROUGH
+            for var in shared:
+                self.assertIn(
+                    var, declared,
+                    f"notify_delivery.py consumes {var}, but the {server} block "
+                    f"in {label} does not declare it",
+                )
 
 
 if __name__ == "__main__":

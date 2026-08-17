@@ -456,6 +456,116 @@ def _extract_shell_function(name):
     raise AssertionError(f"{name}() is never closed in {_ENTRYPOINT}")
 
 
+def _extract_shell_block(opener):
+    """Return a top-level `if ...; then ... fi` block, matched on its opener line.
+
+    Same bargain as `_extract_shell_function` for a step that is written inline rather
+    than as a function. Relies on the `fi` sitting in column zero, which is only true
+    of a top-level block — the point of insisting on exactly one opener.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    openers = [i for i, line in enumerate(lines) if line == opener]
+    if len(openers) != 1:
+        raise AssertionError(f"expected one {opener!r} in {_ENTRYPOINT}, found {len(openers)}")
+    start = openers[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == "fi":
+            return "\n".join(lines[start : end + 1]) + "\n"
+    raise AssertionError(f"{opener!r} is never closed in {_ENTRYPOINT}")
+
+
+class SharedScriptsLinkTest(unittest.TestCase):
+    """Every specialist profile home needs a `scripts` symlink, not just `platform`.
+
+    The executable scripts live once at $TARGET_DIR/scripts and are reached from a
+    profile through this link. It is load-bearing for the cluster profiles now that
+    they declare an MCP server of their own: the `notify` server is launched as
+    `${HERMES_HOME}/scripts/notify_server.py`, and a worker spawned as
+    `hermes -p <name>` runs with HERMES_HOME rewritten to the profile home. Without
+    the link that argv names a file that does not exist, the server never starts, and
+    the Cluster Agent silently loses the one tool that can deliver its triage report
+    (issue #630).
+
+    cluster_agent_profile.py makes the link for a profile it scaffolds; this step is
+    what reaches the profiles already on the PVC from an earlier image.
+    """
+
+    BLOCK = 'if [ -d "$TARGET_DIR/scripts" ]; then'
+
+    def _link(self, target_dir):
+        script = f'TARGET_DIR="{target_dir}"\n' + _extract_shell_block(self.BLOCK)
+        return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60)
+
+    def _profile(self, target_dir, name, marker="profile.yaml"):
+        home = pathlib.Path(target_dir) / "profiles" / name
+        home.mkdir(parents=True, exist_ok=True)
+        if marker:
+            (home / marker).write_text(f"name: {name}\n", encoding="utf-8")
+        return home
+
+    def test_platform_and_every_cluster_profile_are_linked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = pathlib.Path(tmp) / "scripts"
+            shared.mkdir()
+            (shared / "notify_server.py").write_text("# the one egress\n", encoding="utf-8")
+            homes = [
+                self._profile(tmp, "platform"),
+                self._profile(tmp, "cluster-proj-a-us-central1"),
+                # A profile from before `hermes profile create` wrote profile.yaml.
+                self._profile(tmp, "cluster-proj-b-us-east1", marker="config.yaml"),
+            ]
+
+            proc = self._link(tmp)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for home in homes:
+                link = home / "scripts"
+                self.assertTrue(link.is_symlink(), f"{home.name} was left without a scripts link")
+                self.assertTrue(
+                    (link / "notify_server.py").is_file(),
+                    f"{home.name}'s scripts link does not resolve to the shared directory",
+                )
+
+    def test_a_bare_mount_point_is_left_alone(self):
+        # A directory under profiles/ is not evidence of a profile: the kubelet
+        # creates a mounted volume's mount point before this script runs. Planting a
+        # symlink inside one leaves content the skeleton cleanup then refuses to
+        # remove, which wedges the scaffold that would have made it a real profile.
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "scripts").mkdir()
+            bare = self._profile(tmp, "cluster-proj-c-us-west1", marker=None)
+
+            proc = self._link(tmp)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(list(bare.iterdir()), [], "the mount point must stay empty")
+
+    def test_no_cluster_profiles_yet_is_not_a_failure(self):
+        # The glob matches nothing on a fresh install, and `set -e` is in force.
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "scripts").mkdir()
+            self._profile(tmp, "platform")
+
+            script = f'set -e\nTARGET_DIR="{tmp}"\n' + _extract_shell_block(self.BLOCK) + "echo DONE\n"
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+
+    def test_relinking_an_existing_link_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "scripts").mkdir()
+            home = self._profile(tmp, "cluster-proj-d-europe-west1")
+
+            self.assertEqual(self._link(tmp).returncode, 0)
+            second = self._link(tmp)
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            link = home / "scripts"
+            self.assertTrue(link.is_symlink(), "the second pass must not nest a link inside the first")
+            self.assertEqual(link.resolve(), (pathlib.Path(tmp) / "scripts").resolve())
+
+
 class FreshVolumeDetectionTest(unittest.TestCase):
     """A fresh volume is not an absent file, and getting that wrong cost a whole install.
 

@@ -6,7 +6,8 @@
 # scripts/cluster_agent_profile.py, so it must be self-contained.
 #
 # Scoping vs the Platform Agent:
-#   - Only the read-only `gke` MCP + `developer_knowledge` are exposed.
+#   - Only the read-only `gke` MCP + `developer_knowledge` are exposed, plus the
+#     single-tool `notify` egress described below.
 #   - The `platform_control` (provisioning/Config-Connector) MCP server is
 #     intentionally omitted — a Cluster Agent diagnoses, it does not provision.
 #     Nor does it delegate, but nothing has to be withheld for that any more:
@@ -52,6 +53,45 @@ mcp_servers:
     lazy: true
     connect_timeout: 30
     timeout: 60
+  # Chat egress, and the one write this profile has. A Cluster Agent now triages
+  # the Kubernetes events on its own cluster — session_kv_server creates the
+  # triage session on this profile — so the agent that writes the RCA is the
+  # agent that has to post it. Without this the report is written and dropped
+  # (issue #630). One tool on a server that exposes only that tool, rather than
+  # platform_control, which would come with the whole provisioning surface.
+  notify:
+    command: "/opt/hermes/.venv/bin/python3"
+    # ${HERMES_HOME}, not a hardcoded /opt/data: the shared scripts directory is
+    # $HERMES_HOME/scripts and HERMES_HOME moves when the CR sets
+    # spec.harness.hermes.agentHome. Hardcoding it is what once left
+    # platform_control pointing at a file that does not exist; same argv shape,
+    # same reason. (The prose in SOUL.md/AGENTS.md still spells the default
+    # /opt/data/scripts path because those are instructions to a shell, not argv
+    # Hermes interpolates.)
+    #
+    # HERMES_HOME means the data root in the gateway process and this profile's
+    # own home in a worker spawned as `hermes -p <name>`. The argv has to resolve
+    # under both, so the profile home carries a `scripts` symlink to the shared
+    # directory — made by cluster_agent_profile.py at scaffold time and self-healed
+    # for older profiles by docker-entrypoint.sh, the same pair the platform
+    # profile has always had.
+    args:
+      - "${HERMES_HOME}/scripts/notify_server.py"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
+    # Hermes hands a stdio MCP child only a safe baseline (PATH, HOME, …) plus
+    # the keys named here (`_build_safe_env` in hermes tools/mcp_tool.py), so
+    # every variable send_notification reads has to be listed. Without
+    # SESSION_KV_API_KEY the thread lookup 401s and the report silently falls
+    # back to the home channel instead of threading under the alert; without the
+    # home-channel keys there is no fallback either and it goes nowhere.
+    env:
+      HERMES_HOME: "${HERMES_HOME}"
+      SESSION_KV_API_KEY: "${SESSION_KV_API_KEY}"
+      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
+      GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
+      SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
 
 # Explicitly list platform_toolsets (reserved Hermes key) to bypass the upstream
 # loader prefix-mapping bug. Scoped: no mcp-platform_control.
@@ -60,10 +100,12 @@ platform_toolsets:
     - hermes-cli
     - mcp-developer_knowledge
     - mcp-gke
+    - mcp-notify
   api_server:
     - hermes-api-server
     - mcp-developer_knowledge
     - mcp-gke
+    - mcp-notify
 
 # No memory provider. Per-user memory scopes its store by the gateway identity
 # (agent._user_id), and a Cluster Agent is only ever spawned by the kanban
