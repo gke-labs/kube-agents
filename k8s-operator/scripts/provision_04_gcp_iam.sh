@@ -212,18 +212,29 @@ get_platform_agent_roles() {
     "roles/iam.securityReviewer"
     "roles/mcp.toolUser"
   )
-  local gke_admin_roles=(
-    "roles/container.clusterAdmin"
-    "roles/container.admin"
-    "roles/compute.viewer"
-    "roles/monitoring.admin"
-    # The agent can query logs for diagnostics but must not administer the audit-log sink.
-    "roles/logging.viewer"
-    "roles/iam.serviceAccountUser"
-    "roles/iam.securityReviewer"
-    "roles/mcp.toolUser"
-  )
 
+  # There is deliberately no admin role bundle here. See the comment on
+  # init_var_platform_agent_permission_set in common.sh: an IAM grant of
+  # roles/container.admin authorizes the agent independently of its Kubernetes
+  # RBAC and hands it container.clusters.impersonate, which IAM has no
+  # resourceNames equivalent for. `custom` remains for operators who need
+  # broader roles and are willing to name them.
+  #
+  # This list still carries roles/container.viewer, and the Terraform module's
+  # equivalent drops it when a scoped service account pool is provisioned. That
+  # is not drift. The pool is Terraform-only, deliberately: it needs a list of
+  # the clusters to provision for, and this script installs against one cluster
+  # it is being pointed at interactively. There is nowhere here for that list to
+  # come from that would not be a worse version of a Terraform variable.
+  #
+  # The consequence is worth stating plainly, because it is not obvious and it
+  # bites at startup rather than at install time. A script-provisioned deployment
+  # has no pool, so the agent keeps the single wide identity, and the credential
+  # broker -- which arms the pool by default -- must be told so explicitly with
+  # CREDENTIAL_PROXY_SCOPED_SA_POOL=0. Without that the broker refuses to start
+  # rather than quietly falling back to the credential the pool exists to
+  # replace. `tests/test_agent_iam_ceiling.py` pins both lists against each
+  # other so this stays a documented difference rather than an accident.
   case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     read-only)
       echo "${read_only_roles[*]}"
@@ -236,15 +247,11 @@ get_platform_agent_roles() {
         echo "${custom_roles_str//,/ }"
       fi
       ;;
-    gke-admin)
-      echo "${gke_admin_roles[*]}"
-      ;;
     *)
       # Fail closed. init_var_platform_agent_permission_set rejects unknown
-      # values, so reaching here means the script was invoked with the variable
-      # pre-set (CI, a sourced vars.sh, a typo'd export). Granting admin on an
-      # unrecognized value would make a typo an escalation; warn on stderr
-      # (never stdout — the caller captures it) and use the least-privilege set.
+      # values — including the removed `gke-admin` — so reaching here means the
+      # function was called without that validation. Warn on stderr (never
+      # stdout — the caller captures it) and use the least-privilege set.
       print_warning "Unrecognized PLATFORM_AGENT_PERMISSION_SET '${PLATFORM_AGENT_PERMISSION_SET}'; falling back to read-only." >&2
       echo "${read_only_roles[*]}"
       ;;

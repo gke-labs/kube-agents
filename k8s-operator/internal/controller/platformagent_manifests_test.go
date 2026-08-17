@@ -73,6 +73,23 @@ func containerByName(t *testing.T, containers []corev1.Container, name string) c
 	return corev1.Container{}
 }
 
+// findContainer looks a container up by name across both lists.
+//
+// These assertions used to index by position (Containers[4]). The credential
+// proxy became a native sidecar on 2026-08-14 and moved from Containers into
+// InitContainers, which broke every positional reference at once. Name lookup
+// does not care which list a container lives in, or what order it appears in.
+func findContainer(spec corev1.PodSpec, name string) (corev1.Container, bool) {
+	for _, list := range [][]corev1.Container{spec.InitContainers, spec.Containers} {
+		for _, c := range list {
+			if c.Name == name {
+				return c, true
+			}
+		}
+	}
+	return corev1.Container{}, false
+}
+
 func TestBuildConfigMap(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -391,8 +408,8 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
 	}
 
-	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
-		t.Errorf("expected ShareProcessNamespace true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
+		t.Errorf("expected ShareProcessNamespace unset, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
 
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
@@ -405,8 +422,9 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected sandbox service account token automount to be disabled")
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 5 {
-		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	// 4, not 5: the credential proxy is a native sidecar and lives in InitContainers.
+	if len(dep.Spec.Template.Spec.Containers) != 4 {
+		t.Errorf("expected 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
 		dashboardC := containerByName(t, dep.Spec.Template.Spec.Containers, "platform-agent-dashboard")
 		if dashboardC.Name != "platform-agent-dashboard" {
@@ -475,9 +493,12 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("event-watcher should no longer be a standalone container")
 			}
 		}
-		proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
-		if proxyC.Name != "envoy-credential-proxy" {
-			t.Errorf("expected managed Envoy sidecar, got %s", proxyC.Name)
+		proxyC, proxyFound := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+		if !proxyFound {
+			t.Fatal("expected managed Envoy sidecar in either container list")
+		}
+		if proxyC.RestartPolicy == nil || *proxyC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			t.Errorf("credential proxy must be a native sidecar so it binds 8643 first")
 		}
 		// The watcher's loopback flags live in the entrypoint, not here — the
 		// container passes no arguments at all. Only the per-install cluster
@@ -514,8 +535,9 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 
-	if len(dep.Spec.Template.Spec.InitContainers) != 3 {
-		t.Errorf("expected managed cleanup plus 2 configured init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
+	// 4: managed cleanup, 2 configured, plus the credential proxy native sidecar.
+	if len(dep.Spec.Template.Spec.InitContainers) != 4 {
+		t.Errorf("expected cleanup + 2 configured + proxy sidecar, got %d", len(dep.Spec.Template.Spec.InitContainers))
 	} else {
 		cleanup := dep.Spec.Template.Spec.InitContainers[0]
 		if cleanup.Name != "sandbox-credential-cleanup" {
@@ -601,7 +623,10 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["CREDENTIAL_PROXY_URL"].Value != "http://127.0.0.1:8765" {
 		t.Errorf("expected localhost Envoy CREDENTIAL_PROXY_URL, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
 	}
-	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	proxyC, found := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	if !found {
+		t.Fatalf("credential proxy container not found in either container list")
+	}
 	proxyEnv := make(map[string]corev1.EnvVar)
 	for _, env := range proxyC.Env {
 		proxyEnv[env.Name] = env
@@ -654,8 +679,12 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("sandbox must not mount a ServiceAccount token: %#v", mount)
 		}
 	}
+	proxyContainer, proxyFound := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	if !proxyFound {
+		t.Fatal("credential proxy container not found in either container list")
+	}
 	proxyHasTokenMount := false
-	for _, mount := range proxyC.VolumeMounts {
+	for _, mount := range proxyContainer.VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" && mount.ReadOnly {
 			proxyHasTokenMount = true
 		}
@@ -865,11 +894,18 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			}
 
 			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
-			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
-				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+			// The dashboard used to be the reason the Pod shared a process
+			// namespace, which put the credential sidecar's environment in
+			// /proc for the sandbox to read. Enabling it must no longer do that.
+			if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
+				t.Errorf("expected ShareProcessNamespace to be unset with the dashboard enabled, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			if len(dep.Spec.Template.Spec.Containers) != 4 {
-				t.Fatalf("expected dashboard deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			// 3: the credential proxy is a native sidecar and lives in InitContainers.
+			if len(dep.Spec.Template.Spec.Containers) != 3 {
+				t.Fatalf("expected dashboard deployment to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			}
+			if _, ok := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy"); !ok {
+				t.Fatal("credential proxy sidecar missing")
 			}
 			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -879,9 +915,6 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			}
 			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
 				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
-			}
-			if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
-				t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
 			}
 
 			svc := buildPlatformService(agent)
@@ -922,17 +955,18 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	if len(dep.Spec.Template.Spec.Containers) != 3 {
-		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	// 2: the credential proxy is a native sidecar and lives in InitContainers.
+	if len(dep.Spec.Template.Spec.Containers) != 2 {
+		t.Fatalf("expected dashboard-disabled deployment to have 2 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	}
+	if _, ok := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy"); !ok {
+		t.Fatal("credential proxy sidecar missing")
 	}
 	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
 	}
 	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
 		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
-	}
-	if dep.Spec.Template.Spec.Containers[2].Name != "envoy-credential-proxy" {
-		t.Errorf("expected container 2 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
 
 	svc := buildPlatformService(agent)
@@ -1070,6 +1104,105 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	}
 	if !stateMounted {
 		t.Errorf("expected private proxy state volume mount, got %#v", container.VolumeMounts)
+	}
+	// The point of the constant is that it differs from the sandbox's. Checked
+	// here rather than through the rendered value, which cannot distinguish the
+	// two once they are equal.
+	if credentialProxyUID == sandboxUID {
+		t.Errorf("the credential sidecar UID must not be the sandbox UID %d", sandboxUID)
+	}
+	sc := container.SecurityContext
+	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != credentialProxyUID {
+		t.Fatalf("expected the credential sidecar to run as its own UID %d, got %#v", credentialProxyUID, sc)
+	}
+	if *sc.RunAsUser == sandboxUID {
+		t.Errorf("credential sidecar must not share the sandbox UID %d", sandboxUID)
+	}
+	// The shared group is what keeps the agent PVC writable from both sides
+	// once the users differ.
+	if sc.RunAsGroup == nil || *sc.RunAsGroup != agentFSGroup {
+		t.Errorf("expected the credential sidecar in the shared group %d, got %#v", agentFSGroup, sc.RunAsGroup)
+	}
+}
+
+// TestBuildPodTemplateSpecIsolatesTheSidecarUser covers the two Pod-level halves
+// of the credential boundary: the sandbox must not be able to read the sidecar's
+// process state, and the two must not run as one user.
+func TestBuildPodTemplateSpecIsolatesTheSidecarUser(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{DashboardEnabled: ptr.To(true)},
+			},
+		},
+	}
+
+	spec := buildPodTemplateSpec(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true}).Spec
+
+	if spec.ShareProcessNamespace != nil {
+		t.Errorf("expected no shared process namespace, got %v", *spec.ShareProcessNamespace)
+	}
+	podSC := spec.SecurityContext
+	if podSC == nil || podSC.RunAsUser == nil || *podSC.RunAsUser != sandboxUID {
+		t.Fatalf("expected the Pod default user to be the sandbox UID %d, got %#v", sandboxUID, podSC)
+	}
+	if podSC.FSGroup == nil || *podSC.FSGroup != agentFSGroup || podSC.RunAsGroup == nil || *podSC.RunAsGroup != agentFSGroup {
+		t.Errorf("expected the shared group %d as both fsGroup and runAsGroup, got %#v", agentFSGroup, podSC)
+	}
+
+	for _, container := range spec.Containers {
+		user := podSC.RunAsUser
+		if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
+			user = container.SecurityContext.RunAsUser
+		}
+		isProxy := container.Name == "envoy-credential-proxy"
+		if isProxy && *user != credentialProxyUID {
+			t.Errorf("expected the credential sidecar to run as %d, got %d", credentialProxyUID, *user)
+		}
+		if !isProxy && *user != sandboxUID {
+			t.Errorf("expected container %s to run as the sandbox UID %d, got %d", container.Name, sandboxUID, *user)
+		}
+	}
+}
+
+// TestTheProcessNamespaceIsUnsharedOnEverySpecShape covers the two spec shapes
+// nothing else reaches.
+//
+// ShareProcessNamespace used to be set on the dashboard branch, and the
+// existing assertions about its absence sit on specs that all configure the
+// harness: TestBuildDeployment, TestBuildDeployment_DashboardDisabled,
+// TestBuildPodTemplateSpecIsolatesTheSidecarUser, and all four golden
+// fixtures, which enable the dashboard. Two shapes had no assertion of their
+// own — the configuration a first-time user gets, a PlatformAgent with no
+// harness configuration at all, and the split-broker Pod, which only the
+// golden fixture covers and a fixture regeneration would wave through. Setting
+// the field on either branch alone leaves every one of those tests green;
+// verified by mutation. The field is unsettable anywhere in the operator
+// today, which makes this cheap insurance rather than a live risk.
+//
+// Dashboard-disabled is deliberately absent: TestBuildDeployment_DashboardDisabled
+// already asserts it, and a second copy would only look like coverage.
+func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
+	stock := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"no harness configuration at all", stock},
+		{"broker in its own Pod", splitBrokerAgent(true)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spec := buildPodTemplateSpec(testCase.agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true}).Spec
+			if spec.ShareProcessNamespace != nil {
+				t.Errorf("a shared process namespace puts the credential holder's /proc/<pid>/environ "+
+					"inside a directory the sandbox can read; got shareProcessNamespace=%v",
+					*spec.ShareProcessNamespace)
+			}
+		})
 	}
 }
 
@@ -1232,7 +1365,10 @@ func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
 	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
-	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	proxyC, proxyFound := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	if !proxyFound {
+		t.Fatal("credential proxy container not found in either container list")
+	}
 	for _, env := range proxyC.Env {
 		if env.Name != tokenEnv {
 			continue
@@ -4219,5 +4355,60 @@ func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
 	}
 	if !sawClusterName || !sawSessionKey {
 		t.Errorf("disabling the watcher must not strip its configuration, got %#v", off.Env)
+	}
+}
+
+// TestCredentialProxyBindsBeforeTheSandboxExists guards the port-preemption fix.
+//
+// The proxy owns 8643, which the Service targets, and it shares a network
+// namespace with the agent sandbox. As an ordinary container the two started in
+// parallel and raced for the bind: bind 0.0.0.0:8643 from the sandbox and the
+// proxy dies with EADDRINUSE into CrashLoopBackOff, leaving the agent holding
+// the port external traffic is routed to. Reproduced on a live cluster
+// 2026-08-10.
+//
+// A native sidecar -- an init container with restartPolicy: Always -- starts
+// before any app container, and the kubelet will not start app containers until
+// it reports ready. There is no start line for the agent to beat.
+//
+// Asserting the restart policy rather than list membership: an init container
+// WITHOUT it is an ordinary init container that the kubelet waits to exit, so a
+// long-running proxy there would hang the pod forever. Both halves are the fix.
+func TestCredentialProxyBindsBeforeTheSandboxExists(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{},
+	}
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	spec := dep.Spec.Template.Spec
+
+	proxy, found := findContainer(spec, "envoy-credential-proxy")
+	if !found {
+		t.Fatal("credential proxy container is missing entirely")
+	}
+
+	inInit := false
+	for _, c := range spec.InitContainers {
+		if c.Name == "envoy-credential-proxy" {
+			inInit = true
+		}
+	}
+	if !inInit {
+		t.Error("credential proxy is an ordinary container; it races the sandbox for port 8643")
+	}
+	if proxy.RestartPolicy == nil || *proxy.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Error("credential proxy lacks restartPolicy: Always, so it is not a native sidecar " +
+			"-- either it races the sandbox, or the kubelet waits forever for it to exit")
+	}
+
+	// The port it is racing for. If this moves, the test above stops meaning anything.
+	holds8643 := false
+	for _, p := range proxy.Ports {
+		if p.ContainerPort == 8643 {
+			holds8643 = true
+		}
+	}
+	if !holds8643 {
+		t.Error("credential proxy no longer declares 8643; re-check what the Service targets")
 	}
 }

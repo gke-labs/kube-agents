@@ -49,7 +49,7 @@ Preflight authorization requires an integration-specific implementation. Kuberne
 - Any configured approval requirement is enforced in addition to authorization.
 - Audit records distinguish reads from mutations.
 
-The current provisioner supports read-only, GKE administrator, and custom Google Cloud permission sets. Kubernetes target-resource inspection is read-only; the agent also has narrowly scoped write permissions for its own leader election. Provider-neutral permission profiles, mutation classification in audit records, and per-action approval policy remain deployment-specific.
+The current provisioner supports a read-only and a custom Google Cloud permission set; the GKE-administrator set was removed because an IAM grant of `roles/container.admin` authorizes the agent independently of its Kubernetes RBAC. Kubernetes target-resource inspection is read-only; the agent also has narrowly scoped write permissions for its own leader election. Provider-neutral permission profiles, mutation classification in audit records, and per-action approval policy remain deployment-specific.
 
 ### 4. Interaction and Shared State
 
@@ -75,7 +75,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee. The one operator-managed exception is `spec.security.splitCredentialBrokerPod: true`, which mounts a projected ServiceAccount token into the sandbox; see the discussion below.
 - Credentialed commands execute in the credential sidecar, not in the agent sandbox.
 - The credential sidecar receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
@@ -84,7 +84,19 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the sidecar for this reason.
 
-The sandbox and credential sidecar must not share a process namespace while the sidecar holds credentials. The current dashboard-enabled Pod configuration shares the process namespace and runs both containers as the same user, which may expose sidecar environment variables through `/proc`. This must be removed or otherwise isolated before the credential-isolation requirement is satisfied.
+The sandbox and credential sidecar must not share a process namespace, and must not run as the same user, while the sidecar holds credentials: either one exposes the sidecar's environment variables through `/proc`. The Pod does neither. `shareProcessNamespace` is unset in every configuration, including the dashboard-enabled one that previously set it, and the sidecar runs as a user of its own. The two containers do still share a Pod, and so a network namespace and one Pod identity; see the limitation in the design.
+<<<<<<< HEAD
+
+`spec.security.splitCredentialBrokerPod` removes that last sharing, and is off by default because it requires ReadWriteMany storage for the agent data volume — the broker executes commands in directories the agent creates there, so both Pods must mount the claim read-write at the same path, which a ReadWriteOnce persistent disk cannot do across nodes. Enabling it without that storage fails as a scheduling problem rather than a policy one: the broker Pod cannot attach the volume, never becomes a Service endpoint, and every proxied command reports the credential proxy as unavailable.
+
+When it is on, the broker call is authenticated: the agent presents an audience-bound projected ServiceAccount token and the broker verifies it with a `TokenReview`. Three properties do not follow. The two Pods share one ServiceAccount, because the Workload Identity binding names it, so the verified identity is per-ServiceAccount rather than per-Pod. The token crosses the cluster network in cleartext. And the token is mounted into the sandbox container, so it is short-lived, audience-bound and revocable but not non-exportable — the sandbox holds a credential where previously it held none. A loopback egress forwarder in the agent Pod, mirroring the `agent-api-proxy` container this change already adds, would restore that property and is deferred rather than ruled out.
+
+`spec.security.egressPolicy: Allowlist` is what the split then makes possible: a default-deny egress NetworkPolicy on the agent Pod, denying the link-local metadata server by not listing it. Without it the sandbox can mint the Workload Identity token directly and bypass the broker and every control in front of it, which is the isolation design's own stated assumption — that the agent does not deliberately ask — turned into an enforced boundary. It requires the split, because a NetworkPolicy selects Pods and not containers and the broker reaches the metadata server on purpose; the combination without it is refused with a `Degraded` status rather than rendered.
+
+**Both flags default off, so a stock install has neither property.** Two further conditions the operator cannot enforce: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and policies are additive, so any other policy selecting the agent Pod with wider egress reopens it. The control also removes the agent's web search, headless browser, two MCP servers and direct `github.com` access — deliberately, since unrestricted egress from a sandbox running a headless browser is the exfiltration path, but it is a cost to weigh rather than a free win.
+=======
+
+> > > > > > > 9108380 (fix(security): stop the sandbox sharing a process namespace and a UID)
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 
@@ -109,8 +121,8 @@ The selected configuration is accepted when:
 2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
 3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
 4. operator-managed persisted state is scoped to its `PlatformAgent`;
-5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds in the default sidecar layout. It does **not** hold under `spec.security.splitCredentialBrokerPod: true`, which mounts an audience-bound projected ServiceAccount token into the sandbox container so it can authenticate to the broker across the network — a deliberate trade described in section 6;
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 
-Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Criterion 5 is not satisfied while the sandbox shares a process namespace with the credential sidecar. Implementation status for the remaining criteria is stated in the corresponding sections above.
+Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Implementation status for the remaining criteria is stated in the corresponding sections above.

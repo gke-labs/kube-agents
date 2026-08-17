@@ -718,6 +718,45 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
+      initContainers:
+        - args:
+            - |-
+              rm -rf -- \
+                /workspace/home/.config/gcloud \
+                /workspace/home/.config/gh \
+                /workspace/home/.aws/credentials \
+                /workspace/home/.aws/cli/cache \
+                /workspace/home/.aws/sso/cache \
+                /workspace/home/.azure \
+                /workspace/home/.docker/config.json \
+                /workspace/home/.git-credentials \
+                /workspace/home/.hermes/.env \
+                /workspace/home/.kube/config \
+                /workspace/home/.netrc \
+                /workspace/home/.npmrc \
+                /workspace/home/.pypirc
+          command:
+            - sh
+            - -ec
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+          imagePullPolicy: IfNotPresent
+          name: sandbox-credential-cleanup
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /workspace
+              name: platform-agent-data-vol
         - command:
             - /usr/local/bin/start-services
           env:
@@ -737,11 +776,13 @@ spec:
               value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
+              value: "0"
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
-              value: cluster-internal-trusted
-            - name: API_SERVER_KEY
               value: cluster-internal-trusted
             - name: API_SERVER_EXTERNAL_KEY
               valueFrom:
@@ -798,6 +839,7 @@ spec:
                 - http://127.0.0.1:8765/healthz
             initialDelaySeconds: 5
             periodSeconds: 15
+          restartPolicy: Always
           resources:
             limits:
               cpu: "2"
@@ -812,6 +854,8 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: true
+            runAsGroup: 10000
+            runAsUser: 10001
           volumeMounts:
             - mountPath: /etc/credential-proxy/policy.json
               name: credential-proxy-policy
@@ -833,53 +877,14 @@ spec:
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
-      initContainers:
-        - args:
-            - |-
-              rm -rf -- \
-                /workspace/home/.config/gcloud \
-                /workspace/home/.config/gh \
-                /workspace/home/.aws/credentials \
-                /workspace/home/.aws/cli/cache \
-                /workspace/home/.aws/sso/cache \
-                /workspace/home/.azure \
-                /workspace/home/.docker/config.json \
-                /workspace/home/.git-credentials \
-                /workspace/home/.hermes/.env \
-                /workspace/home/.kube/config \
-                /workspace/home/.netrc \
-                /workspace/home/.npmrc \
-                /workspace/home/.pypirc
-          command:
-            - sh
-            - -ec
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: sandbox-credential-cleanup
-          resources:
-            limits:
-              cpu: 200m
-              memory: 256Mi
-            requests:
-              cpu: 100m
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-          volumeMounts:
-            - mountPath: /workspace
-              name: platform-agent-data-vol
       securityContext:
         fsGroup: 10000
+        runAsGroup: 10000
         runAsNonRoot: true
         runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
-      shareProcessNamespace: true
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:

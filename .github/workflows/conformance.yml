@@ -1,0 +1,61 @@
+name: Conformance
+
+# The security and permissions invariants, as executable assertions. One test
+# per invariant in the F10 requirements set, or a written reason the invariant
+# cannot be tested yet.
+#
+# **No paths filter, on purpose.** The filtered Python jobs here --
+# agent-startup-test.yml, and k8s-operator-test.yml on the Go side -- gate on
+# dorny/paths-filter, and for those it is the right trade: they assert
+# properties of one directory. (python-tests.yml is already unfiltered, and
+# says so.) This suite asserts properties of the repository — the Dockerfile's
+# build gate, the rendered operator manifests, the workflows in this directory,
+# the chart's RBAC, the upstream skill sync — so the filter
+# that covered it would be "almost everything", and the failure mode of getting
+# that list slightly wrong is a security control whose regression test silently
+# stops starting. That has already happened once here: the upstream-skill sync
+# tests sat outside every glob in `make test-python` and had never run.
+#
+# The suite is stdlib unittest plus PyYAML and finishes in under a second, so
+# running it on every pull request costs less than maintaining the list of when
+# not to.
+#
+# A failure is one of three things:
+#   * a control regressed — the usual case, fix the code
+#   * an artifact moved — the self-check goes red first and names it
+#   * an *unexpected success* — a recorded known violation has been fixed.
+#     Delete its @known_violation decorator and its precondition test.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: Security invariants
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # PyYAML only. The suite reads rendered manifests and chart templates as
+      # object sets rather than grepping them, and a regex over YAML is how an
+      # assertion ends up matching a comment.
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      # Bucket 1 only. Bucket 2 needs a cluster; its intended home is the rc
+      # pipeline, which does not run it yet.
+      - name: Run the conformance suite
+        run: python3 tests/conformance/run.py

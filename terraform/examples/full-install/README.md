@@ -93,12 +93,16 @@ default; source: `read_only_roles` in
 [`k8s-operator/scripts/provision_04_gcp_iam.sh`](../../../k8s-operator/scripts/provision_04_gcp_iam.sh)).
 
 To grant a different set, set `project_roles` explicitly in your
-`terraform.tfvars` — for the scripts' `gke-admin` equivalent, copy the
-`gke_admin_roles` list from `provision_04_gcp_iam.sh` rather than typing it
-from memory. `project_roles = []` grants nothing and leaves IAM to you (the
-agent fails every GCP call until an equivalent set exists). Deliberately no
-admin list is pre-staged in `terraform.tfvars.example` — widening access
-should be an explicit, reviewed choice.
+`terraform.tfvars`; this is the Terraform equivalent of the scripts' `custom`
+permission set. There is no admin list to copy — the scripts' `gke-admin` set
+was removed, because `roles/container.admin` authorizes the agent through IAM
+regardless of its Kubernetes RBAC and carries an unscopable
+`container.clusters.impersonate` (see
+[Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)).
+`project_roles = []` grants nothing and leaves IAM to you (the agent fails
+every GCP call until an equivalent set exists). Deliberately no admin list is
+pre-staged in `terraform.tfvars.example` — widening access should be an
+explicit, reviewed choice.
 
 ### Google Chat and GitHub integrations
 

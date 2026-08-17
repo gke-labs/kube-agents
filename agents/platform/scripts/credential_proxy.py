@@ -6,21 +6,25 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import hmac
 import http.client
 import io
 import json
 import logging
 import os
+import base64
 import queue
 import re
 import shlex
 import signal
 import shutil
 import socketserver
+import ssl
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -30,6 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import command_policy
+import scoped_sa_pool
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -62,6 +68,320 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
+
+
+# ---------------------------------------------------------------------------
+# Who is calling
+#
+# For as long as the broker ran as a sidecar, nothing on this path
+# authenticated anything.  What kept the credentials safe was geometry: Envoy
+# bound 127.0.0.1, so only the Pod could reach it, and the socket behind Envoy
+# was 0600 in an emptyDir that only this container mounted.  Both of those
+# properties are properties of *sharing a network namespace*, and both
+# evaporate the moment the broker becomes its own Pod.  So a split needs an
+# answer to "who is calling", and this is it.
+#
+# The answer is a Kubernetes ServiceAccount token, projected into the caller
+# with a dedicated audience, presented as a bearer token, and verified here
+# with a TokenReview against the API server.  Three reasons for that shape
+# rather than mTLS or a Unix socket per caller:
+#
+#   * It needs no PKI.  This repository has no cert-manager for workloads, no
+#     service mesh and no SPIFFE; mTLS would mean standing all of that up, or
+#     minting certificates in the operator, before a single request could be
+#     authenticated.  The projected token already exists in the cluster.
+#   * It needs no Envoy filter.  The Envoy config is baked into the image and
+#     loaded by absolute path, so an ext_authz or JWT filter is an image
+#     rebuild that cannot vary per agent.  A bearer header rides through the
+#     router filter untouched and is checked here, in code the operator can
+#     configure with an environment variable.
+#   * It forecloses nothing.  mTLS is a transport underneath this, not a
+#     replacement for it: adding a client certificate later leaves the request
+#     shape, the handler and this verifier intact, and gives ``Principal`` a
+#     second, stronger source for the same field.  gRPC carries bearer
+#     credentials in exactly the same ``authorization`` metadata key, so a
+#     later move to gRPC ports the identity model verbatim.  What it does
+#     foreclose is a Unix socket per caller — but a Unix socket needs a shared
+#     filesystem, which is the one thing splitting the Pods takes away.
+#
+# What it is honestly *not*: encryption.  The token crosses the cluster
+# network in cleartext, exactly as the github-token-minter call already does
+# (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
+# the namespace can replay it until it expires.  mTLS closes that, and the
+# NetworkPolicy work in the next task narrows who can open the connection at
+# all.  Neither is done here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
+
+
+class AuthenticationError(Exception):
+    """The caller could not be identified.
+
+    The message is for this process's log. It is deliberately never returned
+    to the client, which gets an undifferentiated 401 — telling an unidentified
+    caller *why* it failed tells it how to succeed.
+    """
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Who the broker believes is on the other end of a request.
+
+    ``workload`` is what the transport can prove today: the Kubernetes identity
+    of the ServiceAccount whose projected token authenticated the connection.
+
+    Read that literally — it is **per-ServiceAccount**, and weaker than
+    per-Pod. The agent Pod and the broker Pod run as the same ServiceAccount,
+    because the Workload Identity IAM binding names it and giving the agent one
+    of its own would take the broker's cloud credentials with it. So this field
+    excludes every other workload in the cluster and nothing finer: it cannot
+    distinguish the agent Pod from the broker Pod, let alone one session inside
+    the agent Pod from another. It answers "which ServiceAccount", not "which
+    Pod" and not "on whose behalf".
+
+    ``caller`` is the seam for slice 3, and it is deliberately a field on the
+    object rather than a second parameter threaded through the handler. When
+    the per-caller identity model is settled, the agent obtains a capability
+    token scoped to one session — minted by whatever authority slice 3 lands
+    on, and *attenuating*, so it can never name more authority than the
+    workload token it was exchanged for — and sends it alongside the workload
+    token. This class grows one more verification step that populates
+    ``caller`` from it, ``authenticate`` keeps its signature, and the policy
+    layer downstream reads ``principal.caller`` where it reads
+    ``principal.workload`` today. Nothing about the request shape, the
+    handler, or the operator's rendering has to change again.
+    ``caller`` stays None until then, and the invariant that matters (A3) is
+    that neither field is ever derived from the request body — from ``argv``,
+    from ``cwd``, from anything a model produced. Both come from a token the
+    API server verified.
+    """
+
+    workload: str
+    uid: str = ""
+    groups: tuple[str, ...] = ()
+    caller: str | None = None
+
+    def describe(self) -> str:
+        if self.caller:
+            return f"{self.workload} (caller {self.caller})"
+        return self.workload
+
+
+class NullAuthenticator:
+    """Accept every caller. Only sound behind a private Unix socket.
+
+    ``serve`` refuses to start this on a TCP listener, because on a TCP
+    listener "no authentication" means "the credentials belong to whoever
+    reaches the port".
+    """
+
+    authenticates = False
+
+    def authenticate(self, headers: Any) -> Principal:  # noqa: ARG002
+        return Principal(workload="unauthenticated")
+
+
+@dataclass
+class _CacheEntry:
+    expires_at: float
+    principal: Principal
+
+
+class ServiceAccountAuthenticator:
+    """Verify a projected ServiceAccount token with a Kubernetes TokenReview.
+
+    The audience is the whole point. A token projected with audience
+    ``kubeagents-credential-proxy`` is rejected by every other API-server-aware
+    service in the cluster, and the API server refuses to authenticate it here
+    unless the audience matches — so a token stolen from the agent cannot be
+    replayed against the Kubernetes API, and a token minted for anything else
+    cannot be replayed against the broker.
+    """
+
+    authenticates = True
+
+    def __init__(
+        self,
+        audience: str,
+        allowed_callers: frozenset[str],
+        api_host: str,
+        api_port: str,
+        ca_file: str,
+        token_file: str,
+        timeout_seconds: float = 10.0,
+        cache_seconds: float = 60.0,
+    ) -> None:
+        if not audience:
+            raise ValueError("an audience is required to authenticate callers")
+        if not allowed_callers:
+            raise ValueError("at least one allowed caller is required")
+        if not api_host:
+            raise ValueError("the Kubernetes API server address is not configured")
+        self.audience = audience
+        self.allowed_callers = allowed_callers
+        self.api_host = api_host
+        self.api_port = api_port
+        self.ca_file = ca_file
+        self.token_file = token_file
+        self.timeout_seconds = timeout_seconds
+        self.cache_seconds = cache_seconds
+        self._cache: dict[str, _CacheEntry] = {}
+        self._cache_lock = threading.Lock()
+
+    def authenticate(self, headers: Any) -> Principal:
+        header = headers.get("Authorization", "") or ""
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise AuthenticationError("no bearer token was presented")
+        token = token.strip()
+
+        cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cached = self._cached(cache_key)
+        if cached is not None:
+            return cached
+
+        principal = self._review(token)
+        self._remember(cache_key, principal)
+        return principal
+
+    def _cached(self, key: str) -> Principal | None:
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at <= now:
+                # Expired entries are dropped rather than served, so revoking a
+                # ServiceAccount takes effect within cache_seconds rather than
+                # for the lifetime of the process.
+                del self._cache[key]
+                return None
+            return entry.principal
+
+    def _remember(self, key: str, principal: Principal) -> None:
+        now = time.monotonic()
+        with self._cache_lock:
+            # Only successful reviews are cached, so a rejected token costs the
+            # API server one round trip every time it is retried.
+            self._cache = {
+                cached_key: entry
+                for cached_key, entry in self._cache.items()
+                if entry.expires_at > now
+            }
+            self._cache[key] = _CacheEntry(now + self.cache_seconds, principal)
+
+    def _own_token(self) -> str:
+        try:
+            return Path(self.token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise AuthenticationError(
+                f"this pod's own API server token is unreadable: {type(exc).__name__}"
+            ) from exc
+
+    def _review(self, token: str) -> Principal:
+        body = json.dumps(
+            {
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenReview",
+                "spec": {"token": token, "audiences": [self.audience]},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://{self.api_host}:{self.api_port}/apis/authentication.k8s.io/v1/tokenreviews",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self._own_token()}",
+            },
+            method="POST",
+        )
+        try:
+            # Inside the try: a missing or unreadable ca.crt raises
+            # FileNotFoundError here, and an OSError escaping this method is
+            # not an AuthenticationError — it would reach
+            # socketserver.handle_error as a traceback and a dropped
+            # connection, where the caller deserves a 401.
+            context = ssl.create_default_context(cafile=self.ca_file or None)
+            with urllib.request.urlopen(
+                request, timeout=self.timeout_seconds, context=context
+            ) as response:
+                review = json.load(response)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # A TokenReview that cannot be completed is a rejection, not an
+            # allow. An API server outage must not turn into an open broker.
+            raise AuthenticationError(
+                f"TokenReview could not be completed: {type(exc).__name__}"
+            ) from exc
+        return self._principal_from(review)
+
+    def _principal_from(self, review: Any) -> Principal:
+        status = review.get("status") if isinstance(review, dict) else None
+        if not isinstance(status, dict):
+            raise AuthenticationError("TokenReview returned no status")
+        if status.get("error"):
+            raise AuthenticationError("TokenReview reported an error")
+        if status.get("authenticated") is not True:
+            raise AuthenticationError("the presented token is not authenticated")
+        audiences = status.get("audiences") or []
+        if self.audience not in audiences:
+            # The API server echoes the audiences it actually validated. A token
+            # it authenticated for some other audience is not for us.
+            raise AuthenticationError("the presented token is for another audience")
+        user = status.get("user") or {}
+        username = user.get("username") or ""
+        if username not in self.allowed_callers:
+            raise AuthenticationError("the authenticated caller is not permitted")
+        groups = user.get("groups") or []
+        return Principal(
+            workload=username,
+            uid=str(user.get("uid") or ""),
+            groups=tuple(str(group) for group in groups if isinstance(group, str)),
+        )
+
+
+def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
+    """Build the caller authenticator the environment asks for.
+
+    ``none`` is the default so that the sidecar deployment, where the socket
+    and the loopback listener are the access control, is unchanged. ``serve``
+    is what makes that default safe: it refuses to serve on TCP with it.
+    """
+    mode = os.getenv("CREDENTIAL_PROXY_AUTH_MODE", "none").strip().lower()
+    if mode in {"", "none"}:
+        return NullAuthenticator()
+    if mode != "serviceaccount":
+        raise RuntimeError(
+            f"unsupported CREDENTIAL_PROXY_AUTH_MODE {mode!r}; expected 'none' or 'serviceaccount'"
+        )
+    allowed = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_ALLOWED_CALLERS", "").split(",")
+        if caller.strip()
+    )
+    if not allowed:
+        raise RuntimeError(
+            "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount requires "
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS to name at least one ServiceAccount"
+        )
+    return ServiceAccountAuthenticator(
+        audience=os.getenv(
+            "CREDENTIAL_PROXY_AUDIENCE", DEFAULT_CREDENTIAL_PROXY_AUDIENCE
+        ).strip(),
+        allowed_callers=allowed,
+        api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
+        api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
+        ca_file=os.getenv(
+            "CREDENTIAL_PROXY_KUBE_CA_FILE",
+            "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+        ).strip(),
+        token_file=os.getenv(
+            "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
+            "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        ).strip(),
+    )
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -739,6 +1059,445 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
 
+# Directory `core.hooksPath` is pinned to. It lives under the state dir, which
+# is a sidecar-only emptyDir, and is created empty and mode 0500 at startup.
+# A hook only runs if git finds an executable file of the right name in the
+# hooks directory, so an empty directory the agent cannot write is a hook
+# directory that can never fire. Pinning to a *nonexistent* path also works
+# today, but it would rest on that path staying absent, which is a weaker
+# claim than "exists, empty, and not writable by the agent".
+GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
+
+# Broker-owned git trees, under the state dir rather than the shared workspace.
+CONTENT_WORKSPACE_DIR = "content-workspaces"
+
+# Config keys forced onto every git invocation, as the `GIT_CONFIG_COUNT`
+# layer. That layer outranks system, global and repo-local config, which is
+# the point: the agent owns the working tree, so `.git/config` is a file it
+# can write, and every key below turns a string in that file into a command
+# the credential holder executes.
+#
+#   core.hooksPath   `.git/hooks/pre-commit` is executed by `git commit`, and
+#                    `git commit` is a verb the skills issue nine times.
+#                    Pinning the path also neutralises hooks installed into a
+#                    fresh clone through `init.templateDir`.
+#   core.fsmonitor   run by `git status`, i.e. by a read verb.
+#
+# **This list is known-incomplete and is not a boundary.** `filter.<name>.smudge`
+# and `alias.<name>` reach the same place and cannot be pinned, because the key
+# contains an arbitrary name and there is nothing to enumerate. They are open,
+# they are recorded as open, and the fix for the class is to stop executing
+# subprocesses in a directory the agent controls at all (content-passing).
+# What this buys is blast radius, not closure — do not read it as more.
+#
+# Only keys whose "off" value is a *working* value belong here. `diff.external`
+# was pinned to "" in an earlier revision and reverted: git does not read an
+# empty value as "no external diff", it tries to execute the empty string, so
+# every `git diff` died with `fatal: external diff died` — a read verb broken
+# by the hardening, reported in a way that reads as a broken image rather than
+# a refusal. There is no value that turns it off, and since anyone who can
+# write the `.git/config` that sets it can equally use the two unpinnable keys
+# above, the pin cost a working verb and removed no capability from an
+# attacker who has that write.
+#   commit.gpgsign   turns `git commit -m` — the argv the skills already send —
+#   gpg.program      into a run of whatever `gpg.program` names. Signing is a
+#   tag.gpgSign      program git executes, and both halves are settable from
+#                    `.git/config`. Note the failure shape: the payload runs and
+#                    *then* git exits 128, so a test asserting only a non-zero
+#                    exit would have called this working.
+#   help.autocorrect Without it the subcommand refusal list below is not a
+#                    control at all: set it in `.git/config` and `git bisct run`
+#                    resolves to `bisect run`, matching nothing on a list that
+#                    compares whole tokens. Pinned to 0 — never autocorrect —
+#                    which is also git's own default.
+GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.fsmonitor", "false"),
+    ("commit.gpgsign", "false"),
+    ("tag.gpgSign", "false"),
+    ("gpg.program", "false"),
+    ("help.autocorrect", "0"),
+)
+
+
+def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
+
+    git reads `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` for n in
+    `[0, GIT_CONFIG_COUNT)`. The two failure directions are not symmetric,
+    which is why the count is derived rather than written down: a count higher
+    than the pairs supplied is a hard failure on every git command (`error:
+    missing config key GIT_CONFIG_KEY_1`, exit 128), and a count *lower*
+    silently ignores the tail, disarming the last pin with nothing to see.
+    Building both from one sequence is what keeps them in step.
+    `[0, GIT_CONFIG_COUNT)`, and stops at the first index it cannot parse — so
+    the count has to match the pairs exactly or the tail is silently dropped.
+    Building it from one sequence is what keeps them in step.
+    """
+    environment = {"GIT_CONFIG_COUNT": str(len(pairs))}
+    for index, (key, value) in enumerate(pairs):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+# git global options that override something the proxy decided, refused in
+# argv. Each value says which control the flag defeats, because a refusal that
+# does not say what it protected gets read as an arbitrary restriction and
+# argued away.
+#
+# The first three are config and code injection, and they are the backup to the
+# environment hardening — except for hooks, where `-c` beats the
+# `GIT_CONFIG_COUNT` layer outright and this is the only control there is.
+#
+# The last two are containment, not configuration. `_execute` refuses a `cwd`
+# outside the shared workspace and `git_lease_violation` resolves `cwd` plus
+# every `-C`, but neither looks at `--git-dir`, so `git --git-dir=<elsewhere>
+# --work-tree=<elsewhere> commit` runs against a repository on the sidecar's
+# own filesystem from inside a perfectly valid lease. Verified: it reads and it
+# writes. `-C` stays allowed — the containment check already follows it, and
+# the skills use it.
+_GIT_REFUSED_ARGUMENTS = {
+    "-c": "sets configuration that outranks the proxy's own",
+    "--config-env": "sets configuration that outranks the proxy's own",
+    "--exec-path": "chooses where git looks for the program to run",
+    "--git-dir": "points git at a repository outside the shared workspace",
+    "--work-tree": "points git at a tree outside the shared workspace",
+    # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
+    # `config` is not a mutating verb so it needs no lease. Demonstrated: the
+    # agent writes `alias.zz = !<payload>` into the broker's own global config
+    # through the proxy, then runs `git zz`. Everything the forced-config layer
+    # does not pin is agent-settable at global scope this way, from outside any
+    # repository. Shipped code sets identity repository-locally and says so
+    # (`gitops_workspace.py:594`); `gh auth setup-git` writes the global file
+    # from inside the broker, which does not pass through this gate.
+    "--global": "writes git configuration the proxy pins for every command",
+    "--system": "writes git configuration the proxy pins for every command",
+    # `git config --file <path>` writes the same file `--global` names, just
+    # spelled explicitly, and the path is not a secret — `git config --list
+    # --show-origin` prints it. Refusing `--global` without this closed the
+    # front door and left the side one open. It is also an arbitrary INI write
+    # to any path: the containment check inspects `cwd`, not this.
+    "--file": "writes a git configuration file the proxy does not control",
+    # Flags that name a command directly, on a subcommand that is otherwise
+    # ordinary. These are the same category as the refused subcommands below —
+    # git running a string the caller chose — but they hide on verbs the
+    # product has no reason to refuse outright, so the flag is what gets
+    # refused rather than the verb.
+    #
+    #   --exec/-x   `git rebase -x <cmd> HEAD~1` runs <cmd> once per commit.
+    #               `rebase` *is* in GIT_MUTATING_SUBCOMMANDS, so it needs a
+    #               lease — which is not a barrier, since the agent creates its
+    #               own leases. Demonstrated through the executor, exit 0.
+    #   -O          `git grep -O<cmd>` runs <cmd> as the pager over the
+    #               matches. `grep` is a *read* verb, so unlike rebase this one
+    #               needs no lease and no file on the volume: one call, and the
+    #               value is attached to the flag rather than separated, which
+    #               is why the matcher below has to handle the attached form.
+    #
+    # `-x` and `-O` are refused wherever they appear, so `git clean -x` and
+    # `git cherry-pick -x` are refused too. Neither is in shipped code.
+    "--exec": "runs a command the caller names, once per commit",
+    "-x": "runs a command the caller names, once per commit",
+    "--open-files-in-pager": "runs a command the caller names over the matches",
+    "-O": "runs a command the caller names over the matches",
+    # Programs git runs on the far side of a transport. Blocked today only by
+    # GIT_ALLOW_PROTOCOL refusing `file` — the paired control fires as soon as
+    # the allowlist is widened — so these are here to make that widening safe
+    # rather than because they are reachable now.
+    # Their short forms are NOT here and this is the one deliberate gap in the
+    # list. `-u` is `--upload-pack` on `git clone` only; on other verbs the
+    # same two characters mean `--set-upstream` (`push`), `--update` (`add`)
+    # and `--update-head-ok` (`fetch`). No shipped skill issues any of them
+    # today — the pushes on file are `-f` and `--force-with-lease` — but this
+    # list is matched across the whole argv, so refusing `-u` would refuse all
+    # four spellings on every verb, to close a vector the protocol allowlist
+    # already holds shut. That trade is not worth making blind. The
+    # list: `clone -u <cmd>` is `--upload-pack`, but `-u` is also `git push -u`
+    # and `git add -u`, which the skills do issue, so refusing it would break
+    # shipped work to close a vector the protocol allowlist already holds. The
+    # consequence is precise — widen GIT_ALLOW_PROTOCOL to `file` and `clone -u`
+    # is arbitrary code execution again even though `--upload-pack` is refused.
+    # Do not widen it without revisiting this.
+    "--upload-pack": "names a program git runs for the remote end of a fetch",
+    "--receive-pack": "names a program git runs for the remote end of a push",
+}
+
+# Refused short options, matched anywhere inside a single-dash token. git lets
+# a short option carry its value attached (`-O/opt/data/payload`) and lets
+# several cluster into one argument (`-iO/opt/data/payload`, `-fx<cmd>`), so
+# matching the whole token against `-O` catches only the tidiest spelling of
+# the attack — `git grep -iO<cmd>` is one byte longer and was demonstrated
+# executing past a matcher that only handled the attached form.
+#
+# Any single-dash token containing one of these letters is refused, without
+# working out which letter consumes the value. Working that out means knowing
+# each subcommand's option table, and this file has already been wrong once
+# about agreeing with git's parser. The over-refusal is real but empty: the
+# only clustered short option in shipped git argv is `clean -fdq`
+# (`gitops_workspace.py:548`), and no shipped call attaches a value to a short
+# one. Checked against the tree, not against another comment — the first draft
+# of this note also claimed `git rm -rf`, which nothing issues.
+_GIT_REFUSED_SHORT = frozenset("cxO")
+
+# Short options whose meaning depends on the subcommand, refused only when that
+# subcommand appears in the argv. `git config -f <path>` is `--file`, but `-f`
+# on every other verb is `--force`, which the skills issue (`clean -fdq`,
+# `push -f`). Scoping by "the subcommand token is present anywhere" is coarse
+# on purpose — it does not require deciding where the options end, only that a
+# `git clean -f` whose pathspec happens to be the word `config` is refused.
+_GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
+    "config": (frozenset("f"), "writes a git configuration file the proxy does not control"),
+}
+
+# Subcommands whose entire purpose is to run a command the caller names. None
+# needs a config file, a shared-volume write or a lease, and none is in
+# `GIT_MUTATING_SUBCOMMANDS`. Demonstrated through the proxy from inside a
+# valid lease: `git bisect start HEAD HEAD~1` then `git bisect run <payload>`
+# executes <payload> in the credential container, as do
+# `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
+#
+# **This is a denylist over a set that is not closed, and it is the weakest
+# thing in this file.** git keeps a command in configuration for `difftool`,
+# `mergetool`, `web--browse`, `instaweb`, `help -w`, and the `p4`/`svn`
+# bridges, and a new one can arrive in any release. The structurally correct
+# fix is to allowlist the ~20 subcommands the product actually issues and fail
+# closed on the rest, which is a change to the denylist-not-allowlist decision
+# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
+# unknown *read* verb failing closed against a concurrency race, and was not
+# weighing it against arbitrary code execution. Revisit it with that evidence
+# rather than treating this list as sufficient.
+_GIT_REFUSED_SUBCOMMANDS = {
+    "bisect": "runs a command the caller names (`bisect run`)",
+    "difftool": "runs a command the caller names (`--extcmd`)",
+    "mergetool": "runs a command the caller names",
+    "filter-branch": "runs a command the caller names (`--tree-filter`)",
+    "send-email": "runs a command the caller names (`--smtp-server`)",
+    "instaweb": "starts a caller-named HTTP daemon",
+    "web--browse": "runs a caller-named browser command",
+    "p4": "bridges to a caller-named external tool",
+    "svn": "bridges to a caller-named external tool",
+    "fast-import": "runs caller-supplied stream commands",
+    # `git submodule foreach <cmd>` runs <cmd> in each initialised submodule.
+    # Demonstrated through the executor at exit 0 with a submodule present.
+    # `submodule` itself stays allowed — `submodule update` is a working-tree
+    # write the product does — so the refused token is the inner verb. It is
+    # matched wherever it appears, which also refuses a commit message that is
+    # the bare word `foreach`; that is the same trade the rest of this file
+    # makes.
+    "foreach": "runs a command the caller names in each submodule",
+}
+
+# Refused short options, matched anywhere inside a single-dash token. git lets
+# a short option carry its value attached (`-O/opt/data/payload`) and lets
+# several cluster into one argument (`-iO/opt/data/payload`, `-fx<cmd>`), so
+# matching the whole token against `-O` catches only the tidiest spelling of
+# the attack — `git grep -iO<cmd>` is one byte longer and was demonstrated
+# executing past a matcher that only handled the attached form.
+#
+# Any single-dash token containing one of these letters is refused, without
+# working out which letter consumes the value. Working that out means knowing
+# each subcommand's option table, and this file has already been wrong once
+# about agreeing with git's parser. The over-refusal is real but empty: the
+# only clustered short option in shipped git argv is `clean -fdq`
+# (`gitops_workspace.py:548`), and no shipped call attaches a value to a short
+# one. Checked against the tree, not against another comment — the first draft
+# of this note also claimed `git rm -rf`, which nothing issues.
+
+# Short options whose meaning depends on the subcommand, refused only when that
+# subcommand appears in the argv. `git config -f <path>` is `--file`, but `-f`
+# on every other verb is `--force`, which the skills issue (`clean -fdq`,
+# `push -f`). Scoping by "the subcommand token is present anywhere" is coarse
+# on purpose — it does not require deciding where the options end, only that a
+# `git clean -f` whose pathspec happens to be the word `config` is refused.
+
+# Subcommands whose entire purpose is to run a command the caller names. None
+# needs a config file, a shared-volume write or a lease, and none is in
+# `GIT_MUTATING_SUBCOMMANDS`. Demonstrated through the proxy from inside a
+# valid lease: `git bisect start HEAD HEAD~1` then `git bisect run <payload>`
+# executes <payload> in the credential container, as do
+# `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
+#
+# **This is a denylist over a set that is not closed, and it is the weakest
+# thing in this file.** git keeps a command in configuration for `difftool`,
+# `mergetool`, `web--browse`, `instaweb`, `help -w`, and the `p4`/`svn`
+# bridges, and a new one can arrive in any release. The structurally correct
+# fix is to allowlist the ~20 subcommands the product actually issues and fail
+# closed on the rest, which is a change to the denylist-not-allowlist decision
+# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
+# unknown *read* verb failing closed against a concurrency race, and was not
+# weighing it against arbitrary code execution. Revisit it with that evidence
+# rather than treating this list as sufficient.
+
+
+# The long options above, for the abbreviation match in `_git_refused_name`.
+_GIT_REFUSED_LONG = tuple(
+    name for name in _GIT_REFUSED_ARGUMENTS if name.startswith("--")
+)
+
+
+def _git_refused_name(argument: str) -> str:
+    """The refused option `argument` spells, or `argument` itself.
+
+    Three spellings beyond the plain one have to collapse to the same name,
+    because git accepts all of them and a checker that recognises fewer
+    spellings than the executor accepts is a parser differential — D15, and
+    the only kind of bug this project has shipped.
+
+    1. `--flag=value`, handled by splitting on the first `=`.
+    2. `-Ovalue` and `-iOvalue`, the attached and clustered short forms,
+       handled by `_GIT_REFUSED_SHORT` against every letter in the token.
+    3. **`--fl`, an abbreviation.** git's *subcommand* options go through
+       parse-options, which accepts any unambiguous prefix, so `git rebase
+       --exe <cmd>` and `git config --glo alias.zz '!<cmd>'` both run. Both
+       were demonstrated executing against a checker that matched the full
+       spelling only, the second of them reinstating a vector this file had
+       already closed. Note the asymmetry that makes this easy to miss: git's
+       *own* options — `--git-dir`, `--exec-path`, `--config-env` — are parsed
+       by hand in git.c with exact comparisons and are **not** abbreviable, so
+       testing only those spellings suggests the problem does not exist.
+
+    An argument is refused when it is a prefix of a refused option, which is
+    strictly more conservative than git: git takes a prefix only when it is
+    unambiguous among the options that subcommand defines, and this does not
+    know the subcommand. Deliberately so — deciding ambiguity here would mean
+    reimplementing parse-options and agreeing with it forever. The cost is
+    refusing `--g`, `--ex` and the like as literal arguments, which nothing
+    sends. Note the direction: `--oneline` is *not* refused, because it is not
+    a prefix of anything on the list; only `--o` and `--op` would be.
+    """
+    if argument.startswith("-") and not argument.startswith("--"):
+        refused = _GIT_REFUSED_SHORT.intersection(argument[1:])
+        if refused:
+            return f"-{sorted(refused)[0]}"
+    name = argument.split("=", 1)[0]
+    if name in _GIT_REFUSED_ARGUMENTS or not name.startswith("--"):
+        return name
+    if name == "--":
+        # The end-of-options separator, not an abbreviation of anything. It is
+        # a prefix of every long option, so without this it matches the first
+        # entry on the list and refuses `git add -- clusters/prod`, which the
+        # fleet-audit skill issues. Caught by the over-refusal test below it.
+        return name
+    return next(
+        (full for full in _GIT_REFUSED_LONG if full.startswith(name)), name
+    )
+# argv-level config and code injection, refused as a backup to the environment.
+#
+# `-c` and `--config-env` set config at a layer that outranks the
+# `GIT_CONFIG_COUNT` pins above — verified: `git -c core.hooksPath=<dir>` wins
+
+#
+# The first three are config and code injection, and they are the backup to the
+# environment hardening — except for hooks, where `-c` beats the
+# `GIT_CONFIG_COUNT` layer outright and this is the only control there is.
+#
+# The last two are containment, not configuration. `_execute` refuses a `cwd`
+# outside the shared workspace and `git_lease_violation` resolves `cwd` plus
+
+
+# The long options above, for the abbreviation match in `_git_refused_name`.
+
+
+def _git_refused_name(argument: str) -> str:
+    """The refused option `argument` spells, or `argument` itself.
+
+    Three spellings have to collapse to one name, because git accepts all
+    three and a checker that recognises fewer than git accepts is a parser
+    differential — D15, and the only kind of bug this project has shipped.
+
+    1. `--flag=value`, handled by splitting on the first `=`.
+    2. `-Ovalue` and `-iOvalue`, the attached and clustered short forms,
+       handled by `_GIT_REFUSED_SHORT` against every letter in the token.
+    3. **`--fl`, an abbreviation.** git's *subcommand* options go through
+       parse-options, which accepts any unambiguous prefix, so `git rebase
+       --exe <cmd>` and `git config --glo alias.zz '!<cmd>'` both run. Both
+       were demonstrated executing against a checker that matched the full
+       spelling only, the second of them reinstating a vector this file had
+       already closed. Note the asymmetry that makes this easy to miss: git's
+       *own* options — `--git-dir`, `--exec-path`, `--config-env` — are parsed
+       by hand in git.c with exact comparisons and are **not** abbreviable, so
+       testing only those spellings suggests the problem does not exist.
+
+    An argument is refused when it is a prefix of a refused option, which is
+    strictly more conservative than git: git takes a prefix only when it is
+    unambiguous among the options that subcommand defines, and this does not
+    know the subcommand. Deliberately so — deciding ambiguity here would mean
+    reimplementing parse-options and agreeing with it forever. The cost is
+    refusing `--g`, `--ex` and the like as literal arguments, which nothing
+    sends. Note the direction: `--oneline` is *not* refused, because it is not
+    a prefix of anything on the list; only `--o` and `--op` would be.
+    """
+    if argument.startswith("-") and not argument.startswith("--"):
+        refused = _GIT_REFUSED_SHORT.intersection(argument[1:])
+        if refused:
+            return f"-{sorted(refused)[0]}"
+    name = argument.split("=", 1)[0]
+    if name in _GIT_REFUSED_ARGUMENTS or not name.startswith("--"):
+        return name
+    if name == "--":
+        # The end-of-options separator, not an abbreviation of anything. It is
+        # a prefix of every long option, so without this it matches the first
+        # entry on the list and refuses `git add -- clusters/prod`, which the
+        # fleet-audit skill issues. Caught by the over-refusal test below it.
+        return name
+    return next(
+        (full for full in _GIT_REFUSED_LONG if full.startswith(name)), name
+    )
+
+
+def git_argument_violation(argv: list[str]) -> str | None:
+    """Why this git argv may not run, or None if it may.
+
+    Matched across the whole argv rather than only the global-option region
+    before the subcommand, which is the only place git honours these. That is
+    deliberate and it is the D15 rule: a check that has to agree with git about
+    where the options end is a *guess* about git's parser, and every Critical
+    this project has found was a checker and an executor parsing the same input
+    differently. Scanning everything cannot disagree with git about scope.
+    where the options end is a *guess* about git's parser, and the three
+    Criticals this project has found were all a checker and an executor parsing
+    the same argv differently. Scanning everything cannot disagree.
+
+    The cost is refusing a git command with a literal `-c` somewhere in its
+    arguments — a commit message, a pathspec. Nothing shipped does that, and a
+    false refusal is the direction C2 says to fail in.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return None
+    rest = argv[1:]
+    scoped: dict[str, str] = {}
+    for subcommand, (letters, why) in _GIT_REFUSED_SHORT_FOR_SUBCOMMAND.items():
+        if subcommand in rest:
+            scoped.update({f"-{letter}": why for letter in letters})
+    for argument in rest:
+        name = _git_refused_name(argument)
+        if name not in _GIT_REFUSED_ARGUMENTS and scoped:
+            # Same cluster rule as `_GIT_REFUSED_SHORT`, for the letters that
+            # are only refused because of the subcommand in this argv.
+            if argument.startswith("-") and not argument.startswith("--"):
+                name = next(
+                    (flag for flag in scoped if flag[1] in argument[1:]), name
+                )
+        reason = (
+            _GIT_REFUSED_ARGUMENTS.get(name)
+            or scoped.get(name)
+            or _GIT_REFUSED_SUBCOMMANDS.get(argument)
+        )
+        if reason is not None:
+            return (
+                f"`git {name}` is refused: it {reason}. The proxy runs git with "
+                "its transport allowlist, configuration files and hooks "
+                "directory pinned, because git takes both its transport and its "
+                "helper programs from configuration that lives on the volume "
+                "the agent writes — `-c protocol.ext.allow=always` re-enables "
+                "the `ext::` transport's arbitrary command execution, and `-c "
+                "core.hooksPath=` re-enables hooks. No skill needs any of these: "
+                "use `-C` to choose a directory inside a leased workspace, and "
+                "ask an operator for anything that has to change the proxy's own "
+                "configuration."
+            )
+    return None
+
 
 def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
     """The subcommand in `argv`, plus every directory its `-C` flags select.
@@ -766,11 +1525,45 @@ def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
     return None, directories
 
 
+def _within(root: Path, candidate: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def content_workspace_enabled() -> bool:
+    """Is broker-owned, content-passed git armed?
+
+    Off by default, and it stays off until the skills are migrated in a reviewed
+    change. Both halves run side by side in the meantime: `/v1/exec` keeps
+    accepting a directory from the agent exactly as it does today, so turning
+    this on adds a door rather than moving one. That is deliberate — the
+    mechanism lands, the migration is a separate diff, and neither has to be
+    reverted to fix the other.
+    """
+    return os.getenv("CREDENTIAL_PROXY_CONTENT_WORKSPACE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+# Distinguishes "the caller said None" from "the caller said nothing" for
+# `scoped_pool`. None is a real, meaningful value there — it is the ambient
+# credential — so a plain default of None would make an un-parameterised
+# construction silently opt out of the pool, which is the one behaviour this
+# slice cannot afford to reach by omission.
+_FROM_ENVIRONMENT = object()
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
 
     def __init__(
-        self, timeout_seconds: int, max_output_bytes: int, state_dir: str
+        self,
+        timeout_seconds: int,
+        max_output_bytes: int,
+        state_dir: str,
+        scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
@@ -798,6 +1591,42 @@ class CommandExecutor:
         # no window in which the document can change between validation and use,
         # because the agent never had a handle on the document at all.
         self.kubeconfig_dir = self.state_dir / "kubeconfigs"
+        self.git_hooks_dir = self.state_dir / GIT_HOOKS_DISABLED_DIR
+        # Where broker-owned git trees live when content-passing is armed.
+        # Under the state dir, never under `workspace_dir`: the state dir is the
+        # broker's own emptyDir and the workspace is the volume the agent
+        # writes. `ContentWorkspaceStore` re-proves that separation at
+        # construction and refuses to start if a future mount layout collapses
+        # it — see `content_workspace.assert_disjoint_roots`. None when the
+        # feature is off, which is what makes `execute_workspace_git`
+        # unreachable rather than merely unused.
+        # Resolved, like `workspace_dir` and unlike the other state paths: it is
+        # compared against a resolved `cwd` in `_execute`, and on a filesystem
+        # with a symlinked prefix an unresolved root never matches — the
+        # containment check would refuse every legitimate call and the feature
+        # would look broken rather than closed.
+        self.content_workspace_root = (
+            (self.state_dir / CONTENT_WORKSPACE_DIR).resolve()
+            if content_workspace_enabled()
+            else None
+        )
+        # git reads its global config from $HOME/.gitconfig, and $HOME is the
+        # sidecar-only state dir, so the agent cannot open the file directly.
+        # It can still *write* it through the proxy unless `git config
+        # --global` is refused, which is why that flag is on the refusal list —
+        # the mount geometry is not on its own a reason to trust this file.
+        # Naming the path explicitly means the location stays fixed if the
+        # mounts are ever rearranged — the same argument the KUBECTL_KUBERC
+        # line below makes, and the one slice 2b made about the broker's HOME.
+        # sidecar-only state dir, so the file is already out of the agent's
+        # reach. Naming it explicitly means that stays true if the mounts are
+        # ever rearranged — the same argument the KUBECTL_KUBERC line below
+        # makes, and the same one slice 2b had to make about the broker's HOME.
+        # It is deliberately not /dev/null: `gh auth setup-git` writes the
+        # GitHub credential helper into *this* file via `git config --global`,
+        # so pointing it at /dev/null does not harden anything, it just severs
+        # authenticated push and fetch.
+        self.git_config_global = self.home_dir / ".gitconfig"
         for path in (
             self.home_dir,
             self.workspace_dir,
@@ -807,8 +1636,21 @@ class CommandExecutor:
             self.local_state_dir,
             self.kube_dir,
             self.kubeconfig_dir,
+            self.git_hooks_dir,
+            *(
+                (self.content_workspace_root,)
+                if self.content_workspace_root is not None
+                else ()
+            ),
         ):
             path.mkdir(parents=True, exist_ok=True)
+        # Re-applied on every start rather than only at creation: the state dir
+        # is an emptyDir, but the mode is the whole control, so it is cheaper to
+        # assert it than to reason about who else may have touched it.
+        try:
+            self.git_hooks_dir.chmod(0o500)
+        except OSError:
+            LOGGER.warning("could not restrict %s", self.git_hooks_dir)
         # Serialises the `get-credentials` that fills a cache miss. Generation is
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
@@ -829,6 +1671,78 @@ class CommandExecutor:
             "GH_CONFIG_DIR": str(self.config_dir / "gh"),
             "KUBECONFIG": str(self.home_dir / ".kube" / "config"),
             "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
+            # kuberc carries per-command default options, including `as`, and it
+            # is on by default in kubectl v1.36.3. command_policy refuses the
+            # `--kuberc` flag, but kubectl also reads `$HOME/.kube/kuberc` with
+            # no flag at all -- verified to set Impersonate-User on an argv that
+            # contains nothing to refuse. That path is out of the agent's reach
+            # only because HOME points at the sidecar-only state dir rather than
+            # the shared PVC, which is deployment geometry and not a control.
+            # This turns the feature off outright so the property survives
+            # someone rearranging the mounts. Nothing here needs kuberc.
+            "KUBECTL_KUBERC": "false",
+            # git is the one allowed executable that takes both its transport
+            # and its hook programs from configuration, and two of the three
+            # config layers it reads are files the agent can write. Verified
+            # against git 2.55: `git -c protocol.ext.allow=always clone
+            # "ext::<cmd>"` executes <cmd> here, in the container holding the
+            # cloud credentials, and a `.git/hooks/pre-commit` in a leased
+            # workspace does the same on the next `git commit` with no unusual
+            # argv at all.
+            #
+            # GIT_ALLOW_PROTOCOL is the interesting one. It is not a default:
+            # when it is set, it outranks `protocol.<name>.allow` from every
+            # config layer *including* `-c` on the command line, which is what
+            # makes the environment the boundary here and leaves argv
+            # inspection as the backup check rather than the control.
+            #
+            # It is a colon-separated list, and the empty string is not
+            # "allow all" — it is a list containing one empty protocol name,
+            # so it allows nothing and breaks every clone. The value must stay
+            # non-empty. `https` alone is correct today because every URL the
+            # skills clone, fetch or push is https (gitops_workspace builds
+            # them from a fixed https prefix).
+            #
+            # It also refuses the `file` protocol, and that is load-bearing
+            # rather than incidental: `--upload-pack=<cmd>` and
+            # `--receive-pack=<cmd>` name a program git runs for a local-path
+            # remote, and the paired control says this variable is the only
+            # thing stopping them — widen it to `https:file` for a local-path
+            # clone and both become arbitrary code execution again. They are on
+            # the argv refusal list below so that widening is survivable, but
+            # anyone reaching for `https:file` should read that list first.
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(self.git_config_global),
+            # An editor is a command git runs, and `core.editor` is settable
+            # from the `.git/config` the agent can write. `git commit` with no
+            # `-m` and `git tag -a` with no `-m` both launch it — argv the
+            # skills nearly send already. These two variables outrank
+            # `core.editor`/`sequence.editor` from every config layer including
+            # `-c`, verified the same way GIT_ALLOW_PROTOCOL was, so this is a
+            # boundary rather than a pin. `false` rather than empty: git treats
+            # an unset editor as "fall back to vi", and an editor that exits
+            # non-zero is how a non-interactive container should fail. Nothing
+            # is lost — there is no terminal here, so a commit that needs an
+            # editor could never have succeeded.
+            "GIT_EDITOR": "false",
+            "GIT_SEQUENCE_EDITOR": "false",
+            # An editor is a command git runs, and `core.editor` is settable
+            # from the `.git/config` the agent can write. `git commit` with no
+            # `-m` and `git tag -a` with no `-m` both launch it — argv the
+            # skills nearly send already. These two variables outrank
+            # `core.editor`/`sequence.editor` from every config layer including
+            # `-c`, verified the same way GIT_ALLOW_PROTOCOL was, so this is a
+            # boundary rather than a pin. `false` rather than empty: git treats
+            # an unset editor as "fall back to vi", and an editor that exits
+            # non-zero is how a non-interactive container should fail. Nothing
+            # is lost — there is no terminal here, so a commit that needs an
+            # editor could never have succeeded.
+            "GIT_EDITOR": "false",
+            "GIT_SEQUENCE_EDITOR": "false",
+            **_git_forced_config_environment(
+                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
+            ),
         }
         # Forward only variables required by supported credential clients. Chat
         # tokens and proxy control variables must never enter an agent-selected
@@ -867,6 +1781,18 @@ class CommandExecutor:
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
+        # Built last: `build_pool` raises on a mapping that is armed and
+        # unusable, and failing here means the container never serves a request
+        # under the ambient credential while an operator believes it is scoped.
+        self.scoped_pool = (
+            scoped_sa_pool.build_pool()
+            if scoped_pool is _FROM_ENVIRONMENT
+            else scoped_pool
+        )
+        if self.scoped_pool is not None:
+            LOGGER.info(
+                "scoped service account pool armed scopes=%d", len(self.scoped_pool.scopes)
+            )
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -944,7 +1870,33 @@ class CommandExecutor:
         # over it in kubectl, so closing only the environment would leave the
         # flag as an open door.
         command = self._reroute_kubeconfig_flags(command)
-        kubeconfig_path = self._resolve_kubeconfig(kubeconfig) if kubeconfig else None
+        if kubeconfig:
+            kubeconfig_path = self._resolve_kubeconfig(kubeconfig)
+        elif self.scoped_pool is not None and executable == "kubectl":
+            # `KUBECONFIG` is in the base environment, so this branch is not
+            # "no cluster" — it is "the sidecar's default cluster", and it has to
+            # go through selection like any other.
+            #
+            # Only kubectl. gcloud names its target in argv rather than in a
+            # kubeconfig, and deciding scope from argv would put a parser where
+            # the boundary belongs — the mistake D1 and D15 are both about. So
+            # gcloud, git and gh keep running as the agent's own identity, and
+            # what bounds them is that identity's remaining IAM rather than
+            # anything decided here.
+            #
+            # Do not read that as "kubectl is the only way to reach a Kubernetes
+            # object." It is not, and the difference matters. The `gke` remote
+            # MCP server in every profile's config.yaml proxies to
+            # container.googleapis.com/mcp from the *agent* container, on the
+            # ambient Workload Identity credential, with no part of this file in
+            # the path. Nothing here scopes it and nothing here can.
+            #
+            # What scopes it is the size of the agent's own grant — which is why
+            # taking roles/container.viewer off that identity is not a tidy-up
+            # alongside this work but the half of it that covers this door.
+            kubeconfig_path = self._default_kubeconfig()
+        else:
+            kubeconfig_path = None
         return self._execute(
             command,
             stdin=stdin,
@@ -958,8 +1910,54 @@ class CommandExecutor:
         """Run a trusted, operator-defined helper that is not agent selectable."""
         return self._execute(argv, cwd=cwd)
 
+    def execute_workspace_git(self, argv: list[str], cwd: Path) -> ExecutionResult:
+        """git the broker issues on its own behalf, in a tree the agent cannot name.
+
+        A separate door from `/v1/exec`, and separate on purpose. The point of
+        content-passing is that the agent no longer spells `git` at all; if the
+        broker's own plumbing went through the agent-facing path, every
+        subcommand that plumbing needs would have to be permitted to the agent
+        too, and the allowlist D17 is about would land at eighteen entries
+        instead of none. Keeping the two apart is what makes the agent-facing
+        answer "git is not reachable" rather than "git is reachable, narrowly".
+
+        Three things are enforced here rather than assumed:
+
+        * the subcommand is one of the eleven this product issues, checked
+          against the argv as parsed rather than as composed, so a later edit
+          that threads a caller's string into one of these vectors is refused
+          instead of run;
+        * `-C` is refused outright — it is a working-directory redirect, and the
+          containment below is the only reason this path is safe;
+        * the working directory is inside the *content workspace* root, which
+          `assert_disjoint_roots` has already proven is not inside the volume
+          the agent writes to.
+        """
+        from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
+
+        if self.content_workspace_root is None:
+            raise RuntimeError("content workspace support is not enabled")
+        if not argv or argv[0] != "git":
+            raise ValueError("only git runs on the workspace path")
+        executable_path = self.executables.get("git")
+        if not executable_path:
+            raise RuntimeError("supported executable is unavailable: git")
+        subcommand, redirects = _git_plan(argv)
+        if redirects:
+            raise ValueError("`-C` is not accepted on the workspace path")
+        if subcommand not in WORKSPACE_GIT_SUBCOMMANDS:
+            raise ValueError(
+                f"`git {subcommand}` is not one of the subcommands the broker "
+                "issues on its own behalf"
+            )
+        return self._execute(
+            [executable_path, *argv[1:]],
+            cwd=str(cwd),
+            containment_root=self.content_workspace_root,
+        )
+
     def _within_workspace(self, candidate: Path) -> bool:
-        return candidate == self.workspace_dir or self.workspace_dir in candidate.parents
+        return _within(self.workspace_dir, candidate)
 
     def _lease_holder(self, candidate: Path) -> Path | None:
         """The nearest ancestor of `candidate` that holds a lease marker."""
@@ -1066,7 +2064,88 @@ class CommandExecutor:
         runs under, so it can only name clusters this identity could reach anyway.
         """
         requested = self._workspace_kubeconfig(kubeconfig)
-        return self._ensure_managed_kubeconfig(self._target_of(requested))
+        return self._kubeconfig_for(self._target_of(requested))
+
+    def _kubeconfig_for(self, target: ClusterTarget) -> Path:
+        """Swap the ambient credential for the one that only reads this cluster.
+
+        The managed kubeconfig authenticates with gke-gcloud-auth-plugin, which
+        resolves Application Default Credentials — the agent's own service
+        account, whose IAM reaches every cluster in the project. When the pool is
+        armed that is replaced by a token minted for the account this cluster
+        maps to, and a cluster with no account is refused rather than served by
+        the wide one.
+
+        Selection happens *before* `_ensure_managed_kubeconfig`, and the order is
+        the point. That call runs `gcloud container clusters get-credentials`
+        against the named cluster on the ambient identity; doing it first would
+        mean an unmapped cluster still produced a live call to GKE on the wide
+        credential before the refusal, and would make the refusal depend on that
+        call having succeeded. Refusing first costs nothing and keeps the two
+        independent.
+
+        The scoped file sits beside the managed one in the sidecar-only state
+        dir, and it is rewritten on every call rather than cached: the token
+        behind it rotates, and a file that outlives its token fails as an
+        authentication error somewhere far from here.
+        """
+        if self.scoped_pool is None:
+            return self._ensure_managed_kubeconfig(target)
+        token = self.scoped_pool.token_for(target.project, target.location, target.cluster)
+        managed = self._ensure_managed_kubeconfig(target)
+        scoped = self.kubeconfig_dir / f"{target.context_name}.scoped.yaml"
+        document = scoped_sa_pool.kubeconfig_with_token(
+            managed.read_text(encoding="utf-8"), token
+        )
+        scratch = self.kubeconfig_dir / f".scoped-{uuid.uuid4().hex}.yaml"
+        try:
+            # Created 0600 by the open itself. Writing then chmod-ing would leave
+            # a window in which a bearer token for a cloud identity is readable
+            # at whatever the umask allows — the same mistake the backend socket
+            # nearly shipped in slice 2b.
+            handle = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(document)
+            os.replace(scratch, scoped)
+        finally:
+            scratch.unlink(missing_ok=True)
+        return scoped
+
+    def _ambient_target(self) -> ClusterTarget | None:
+        """The cluster the sidecar's own kubeconfig points at, if any.
+
+        This is the file `bootstrap` asked gcloud to write, so reading it is not
+        the same act as reading one the agent handed over — nothing here is
+        caller-controlled. It matters because `KUBECONFIG` is set in the base
+        environment: a `kubectl` request that names no kubeconfig at all still
+        reaches a cluster, and if the pool did not cover that path it would be
+        the one door left open onto the ambient credential.
+        """
+        try:
+            text = Path(self.environment["KUBECONFIG"]).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return None
+        context = read_current_context(text)
+        return parse_gke_context(context) if context else None
+
+    def _default_kubeconfig(self) -> Path:
+        """The scoped stand-in for the environment's `KUBECONFIG`.
+
+        Refuses when the sidecar's own kubeconfig names no GKE cluster. That is
+        the fail-closed direction and it is deliberate: the alternative is
+        letting the request through on the base environment, which is exactly
+        the ambient credential the pool exists to stop handing out.
+        """
+        target = self._ambient_target()
+        if target is None:
+            raise scoped_sa_pool.PoolRefusal(
+                "the scoped service account pool is armed and this request names no"
+                " cluster; the sidecar's own kubeconfig does not identify a GKE"
+                " cluster either, so there is no scope to select an account for"
+            )
+        return self._kubeconfig_for(target)
 
     def _reroute_kubeconfig_flags(self, command: list[str]) -> list[str]:
         """Point any `--kubeconfig` in argv at the regenerated file.
@@ -1202,21 +2281,29 @@ class CommandExecutor:
         stdin: str | None = None,
         cwd: str | None = None,
         kubeconfig_path: Path | None = None,
+        containment_root: Path | None = None,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
         Callers hand this an absolute path the proxy itself owns; containment and
         regeneration happen in `execute` so that nothing reaching this point is
         still caller-controlled.
+
+        `containment_root` names which root the working directory must be inside
+        of. It defaults to the agent-shared workspace, which is every existing
+        caller. `execute_workspace_git` passes the broker-owned content
+        workspace root instead — the two roots are proven disjoint at startup,
+        so widening the check here cannot widen the other path.
         """
         started = time.monotonic()
-        timed_out = False
-        command_cwd = self.workspace_dir
+        root = containment_root or self.workspace_dir
+        command_cwd = root
         if cwd:
             requested_cwd = Path(cwd).resolve()
-            if not self._within_workspace(requested_cwd):
+            if not _within(root, requested_cwd):
                 raise ValueError("working directory is outside the shared workspace")
             command_cwd = requested_cwd
+        timed_out = False
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
             command_environment.update(self.git_identity)
@@ -1262,15 +2349,154 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
+def build_workspace_store(executor: CommandExecutor):
+    """The content-passing store, or None when the feature is off.
+
+    Returning None rather than an inert object is deliberate: the handler tests
+    `workspaces is None` to decide whether the routes exist at all, so "off"
+    means the endpoints are absent, not present-and-refusing. An absent endpoint
+    cannot be reached by a bug in a refusal.
+
+    A failure to construct — which today means only `assert_disjoint_roots`
+    refusing overlapping roots — is fatal rather than a downgrade to off. An
+    operator who asked for content-passing and silently got the directory path
+    back would believe they had a property they do not have.
+    """
+    if executor.content_workspace_root is None:
+        return None
+    from content_workspace import ContentWorkspaceStore
+
+    store = ContentWorkspaceStore(
+        executor.content_workspace_root,
+        executor.workspace_dir,
+        executor.execute_workspace_git,
+    )
+    LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
+    return store
+
+
+def read_only_enforced() -> bool:
+    """Is the read-only gate armed?
+
+    Defaults to on, and anything that is not exactly "false" leaves it on. A
+    typo in a ConfigMap should not quietly hand an agent write access.
+
+    This switch is deliberately not documented in the customer-facing reference.
+    It is global, unscoped and has no expiry: setting it disables the read-only
+    posture for every command, every agent and every cluster in the Pod, for as
+    long as the ConfigMap says so, and today there is no impersonation layer
+    underneath to catch what gets through (see command_policy's module
+    docstring). It exists so an operator can recover from a bad allowlist
+    without waiting on an image build, and it should be reverted in the same
+    change that adds the missing verb to command_policy.KUBECTL_READ_VERBS or
+    GCLOUD_READ_COMMANDS. Adding the verb is the fix; this is the outage
+    stopgap.
+    """
+    return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
+
+
+def _sanitize_for_logging(s: str) -> str:
+    """Strip control characters to prevent log forgery, with 64-char length cap.
+
+    Removes C0/C1 control characters, line/paragraph separators (Unicode), and
+    all characters that could be interpreted as line boundaries by consumers
+    (Python splitlines, JS /m, JSON parsers, etc). Also caps length to prevent
+    unbounded agent-controlled hint expansion.
+    """
+    import unicodedata
+
+    # Characters in Cc (control), Cf (format), Zl (line sep), Zp (para sep)
+    # will forge log lines in text-mode consumers.
+    filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))
+    # Cap at 64 chars (no real flag name exceeds this)
+    return filtered[:64]
+
+
+def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
+    """The blocked-response body for `argv`, or None if it may run.
+
+    Returns (response_dict, log_hint) for logging, or None if allowed.
+    log_hint is either verb_tuple or offending_flag, safe to log.
+    Split out from the handler so the decision is testable without standing up
+    a socket, and so the gate reads the class attribute rather than the
+    environment on every request.
+    """
+    if not CredentialProxyHandler.enforce_read_only:
+        return None
+    decision = command_policy.evaluate(argv)
+    if decision.allowed:
+        return None
+
+    # Choose what to log: resolved verb/command path, or the offending flag
+    log_hint = None
+    if decision.verb_tuple:
+        log_hint = ".".join(decision.verb_tuple)
+    elif decision.offending_flag:
+        log_hint = decision.offending_flag
+
+    return (
+        {
+            "status": "blocked",
+            "code": "SECURITY_POLICY_BLOCKED",
+            "rule": decision.rule_id,
+            "message": decision.message,
+        },
+        log_hint,
+    )
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
     max_request_bytes: int
     slack_max_request_bytes: int
+    enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
+    # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
+    # which is what lets a migrating client detect support by asking rather than
+    # by version-sniffing.
+    workspaces: object | None = None
+    # Replaced by serve(). The default keeps the sidecar deployment, where the
+    # Unix socket is the access control, behaving as it did before there was an
+    # authenticator at all.
+    authenticator: NullAuthenticator | ServiceAccountAuthenticator = NullAuthenticator()
+    # Set per request once the caller is identified; read by the policy layer.
+    principal: Principal | None = None
+
+    def _authenticated(self) -> Principal | None:
+        """Identify the caller, or answer 401 and return None.
+
+        Everything but /healthz goes through here. /healthz is the readiness
+        probe and reveals nothing, and the probe runs before any token would be
+        available; every other route on this listener either runs a
+        credentialed command or relays through a credentialed client.
+
+        Binding ``self.principal`` is this method's job rather than each
+        route's. The chat relays and the GitHub refresh spend the broker's
+        credentials just as ``/v1/exec`` does, so a seam that were populated on
+        only one of them would be a seam slice 3 has to fix before it can use
+        it: whoever adds a per-caller check would find the value present on the
+        route they tested and None on the two they did not.
+        """
+        try:
+            self.principal = self.authenticator.authenticate(self.headers)
+            return self.principal
+        except AuthenticationError as exc:
+            LOGGER.warning(
+                "rejected an unauthenticated request path=%s reason=%s",
+                _sanitize_for_logging(self.path),
+                exc,
+            )
+            self._json(
+                HTTPStatus.UNAUTHORIZED, {"error": "caller could not be authenticated"}
+            )
+            return None
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/healthz" and self._authenticated() is None:
+            return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
                 self._json(
@@ -1302,6 +2528,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"status": "ok"})
 
     def do_POST(self) -> None:  # noqa: N802
+        principal = self._authenticated()
+        if principal is None:
+            return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
             return
@@ -1310,6 +2539,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/github/refresh":
             self._handle_github_refresh()
+            return
+        if self.path.startswith("/v1/workspace/"):
+            self._handle_workspace_post()
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -1350,6 +2582,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         request_id = str(payload.get("requestId", ""))
+        # The principal reaches the decision point, rather than being checked at
+        # the door and thrown away. Every policy refusal below is currently a
+        # judgement about *what* was asked; slice 3's per-caller model is what
+        # lets them become judgements about who asked, and self.principal —
+        # bound for this route and for every other authenticated one by
+        # _authenticated — is the value they will read. Until then it is what
+        # the audit trail records.
+        LOGGER.info(
+            "exec request_id=%s principal=%s executable=%s",
+            request_id,
+            _sanitize_for_logging(principal.describe()),
+            argv[0],
+        )
         if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
@@ -1382,6 +2627,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Backup check only. The boundary for the `ext::` transport is
+        # GIT_ALLOW_PROTOCOL in the executor's environment, which git honours
+        # over anything argv can say; this refuses the flags that would
+        # otherwise re-enable git's hook execution, and it refuses them before
+        # the lease check because it does not depend on the working directory.
+        violation = git_argument_violation(argv)
+        if violation is not None:
+            LOGGER.warning("git argument refused request_id=%s", request_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "git.argument.refused",
+                    "message": violation,
+                },
+            )
+            return
+
         # Not a policy rule: the policy matches on argv alone, and this refusal
         # turns on the working directory as well.
         violation = self.executor.git_lease_violation(argv, cwd)
@@ -1400,10 +2664,46 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Runs after the credential denylist above, so rules like
+        # `kubernetes.token-disclosure` keep their own ids and messages rather
+        # than being reported as read-only refusals. For example, `kubectl create
+        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+        # be refused by the denylist with that rule id. If the gate ran first, it
+        # would refuse as `kubernetes.read-only`, losing the specific rule.
+        refusal_result = read_only_refusal(argv)
+        if refusal_result is not None:
+            refusal, log_hint = refusal_result
+            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
+            LOGGER.warning(
+                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
+            )
+            self._json(HTTPStatus.FORBIDDEN, refusal)
+            return
+
         try:
             result = self.executor.execute(
                 argv, stdin=stdin, cwd=cwd, kubeconfig=kubeconfig
             )
+        except scoped_sa_pool.PoolRefusal as exc:
+            # A refusal, not a fault and not a caller error: the request was
+            # well formed and the deployment holds no credential narrow enough
+            # to serve it. Answered with its own rule id so that an operator
+            # reading the logs sees an unprovisioned cluster rather than a
+            # generic policy block, and so that a test can assert on the reason
+            # rather than on a status code every other gate also returns.
+            LOGGER.warning(
+                "scoped service account refused request_id=%s reason=%s", request_id, exc
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "gcp.scoped-sa.unmapped-scope",
+                    "message": str(exc),
+                },
+            )
+            return
         except ValueError as exc:
             # Containment rejections (cwd or kubeconfig outside the workspace)
             # are caller errors, not proxy faults. Returning the reason keeps
@@ -1444,6 +2744,104 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "timedOut": result.timed_out,
             },
         )
+
+    def _handle_workspace_post(self) -> None:
+        """The content-passing routes: bytes in, bytes out, never a path.
+
+        Every response here is content or a name. Nothing returns a filesystem
+        path, because a path handed back is a directory the agent can be told to
+        `cd` into — which is precisely the arrangement this replaces. The
+        `handle` is a broker-minted opaque token, not a location.
+
+        These routes deliberately do **not** go through `Policy.blocked_by`,
+        `git_argument_violation` or `git_lease_violation`. Those three inspect an
+        argv the caller composed; here the caller composes no argv at all. The
+        equivalent controls are structural: `content_workspace.repo_relative`
+        decides what a path may name, `CommandExecutor.execute_workspace_git`
+        decides which git may run, and neither reads a caller string into a
+        command position.
+        """
+        import content_workspace
+
+        if self.workspaces is None:
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        route = self.path[len("/v1/workspace/") :]
+        try:
+            payload = self._read_json_body(
+                max_bytes=max(
+                    self.max_request_bytes,
+                    content_workspace.max_total_bytes() * 2,
+                )
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        try:
+            body = self._workspace_route(route, payload)
+        except content_workspace.ContentWorkspaceError as exc:
+            LOGGER.warning(
+                "workspace request refused route=%s code=%s", route, exc.code
+            )
+            self._json(
+                HTTPStatus(exc.status),
+                {"status": "blocked", "code": exc.code, "message": str(exc)},
+            )
+            return
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        except Exception as exc:
+            LOGGER.exception("workspace request failed route=%s type=%s", route, type(exc).__name__)
+            self._json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "credential proxy workspace operation failed"},
+            )
+            return
+        if body is None:
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        self._json(HTTPStatus.OK, body)
+
+    def _workspace_route(self, route: str, payload: dict) -> dict | None:
+        import content_workspace
+
+        store = self.workspaces
+        if route == "open":
+            workspace = store.open(payload.get("repo"), payload.get("base") or None)
+            return {
+                "handle": workspace.handle,
+                "repo": workspace.repo,
+                "base": workspace.base,
+                "baseSha": workspace.base_sha,
+            }
+        if route == "read":
+            content = store.read(payload.get("handle"), payload.get("path"))
+            return {
+                "path": payload.get("path"),
+                "contentBase64": base64.b64encode(content).decode("ascii"),
+                "size": len(content),
+            }
+        if route == "list":
+            return {
+                "entries": store.list(payload.get("handle"), payload.get("prefix") or None)
+            }
+        if route == "commit":
+            changes = content_workspace.parse_changes(payload.get("changes"))
+            return store.commit(
+                payload.get("handle"),
+                payload.get("branch"),
+                payload.get("message"),
+                changes,
+                expected_base_sha=payload.get("expectedBaseSha") or None,
+            )
+        if route == "push":
+            return store.push(payload.get("handle"), payload.get("branch"))
+        if route == "close":
+            store.close(payload.get("handle"))
+            return {"closed": True}
+        return None
 
     def _handle_github_refresh(self) -> None:
         try:
@@ -1616,7 +3014,85 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def start_agent_api_proxy() -> ThreadingHTTPServer:
+    """Bind the authenticated front door for the agent's own API.
+
+    This runs wherever the agent's API server is reachable on loopback. In the
+    sidecar deployment that is this same container; when the broker is split
+    into its own Pod it is a container in the *agent's* Pod, because 8642 binds
+    127.0.0.1 and is guarded by a fixed non-secret sentinel key. Moving this
+    across a network boundary would mean exposing that port and that sentinel
+    to the cluster network, so it does not move.
+    """
+    AgentAPIProxyHandler.external_key = os.getenv("API_SERVER_EXTERNAL_KEY", "").strip()
+    if not AgentAPIProxyHandler.external_key:
+        raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
+    AgentAPIProxyHandler.upstream_key = os.getenv(
+        "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
+    )
+    port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
+    LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
+    return server
+
+
+def reachable_off_pod(args: argparse.Namespace) -> bool:
+    """Can something outside this Pod open a connection to the broker?
+
+    Two ways in. The Python server can bind a TCP port itself, which is the
+    branch `--unix-socket` normally avoids. Or Envoy, which fronts the Unix
+    socket, can be told to listen on the Pod IP rather than loopback — and
+    then the Unix socket's 0600 mode protects nothing, because the connection
+    arrives through Envoy as Envoy's own user.
+    """
+    if not args.unix_socket:
+        return True
+    envoy_address = os.getenv("CREDENTIAL_PROXY_ENVOY_ADDRESS", "").strip()
+    return bool(envoy_address) and envoy_address not in {"127.0.0.1", "::1", "localhost"}
+
+
+def resolve_role() -> str:
+    """Which halves of this process to run.
+
+    ``combined`` is the sidecar deployment and the default: one container is
+    both the credential broker and the agent-API front door, because both ends
+    are on the same loopback. Splitting the broker into its own Pod splits
+    those two roles across two containers in two Pods.
+    """
+    role = os.getenv("CREDENTIAL_PROXY_ROLE", "combined").strip().lower() or "combined"
+    if role not in {"combined", "broker", "api-proxy"}:
+        raise RuntimeError(
+            f"unsupported CREDENTIAL_PROXY_ROLE {role!r}; "
+            "expected 'combined', 'broker' or 'api-proxy'"
+        )
+    return role
+
+
 def serve(args: argparse.Namespace) -> None:
+    role = resolve_role()
+    if role == "api-proxy":
+        start_agent_api_proxy().serve_forever()
+        return
+
+    # Decided before anything credentialed starts, so a misconfigured
+    # deployment fails at boot rather than on the first request.
+    CredentialProxyHandler.authenticator = build_authenticator()
+    if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
+        # A listener the cluster can reach, with no authentication, hands the
+        # credentials to whoever reaches the port. The sidecar deployment gets
+        # away without an authenticator because loopback plus a 0600 socket is
+        # the control; a reachable listener has no such fallback.
+        raise RuntimeError(
+            "refusing to serve the credential broker on a listener reachable from "
+            "outside this Pod with CREDENTIAL_PROXY_AUTH_MODE=none; set "
+            "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount, or keep Envoy on loopback "
+            "and the runtime on a Unix socket"
+        )
+    LOGGER.info(
+        "caller authentication mode=%s",
+        "serviceaccount" if CredentialProxyHandler.authenticator.authenticates else "none",
+    )
+
     CredentialProxyHandler.policy = Policy.load(args.policy)
     executor = CommandExecutor(
         timeout_seconds=args.timeout_seconds,
@@ -1625,7 +3101,10 @@ def serve(args: argparse.Namespace) -> None:
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    CredentialProxyHandler.workspaces = build_workspace_store(executor)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
+    CredentialProxyHandler.enforce_read_only = read_only_enforced()
+    LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
@@ -1665,23 +3144,25 @@ def serve(args: argparse.Namespace) -> None:
                     )
 
         threading.Thread(target=initialize_slack_relay, daemon=True).start()
-    AgentAPIProxyHandler.external_key = os.getenv("API_SERVER_EXTERNAL_KEY", "").strip()
-    if not AgentAPIProxyHandler.external_key:
-        raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
-    AgentAPIProxyHandler.upstream_key = os.getenv(
-        "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
-    )
-    api_server = ThreadingHTTPServer(
-        ("0.0.0.0", int(os.getenv("AGENT_API_PROXY_PORT", "8643"))),
-        AgentAPIProxyHandler,
-    )
-    threading.Thread(target=api_server.serve_forever, daemon=True).start()
-    LOGGER.info("authenticated PlatformAgent API proxy listening on port 8643")
+    if role == "combined":
+        api_server = start_agent_api_proxy()
+        threading.Thread(target=api_server.serve_forever, daemon=True).start()
     if args.unix_socket:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         socket_path.unlink(missing_ok=True)
-        server = ThreadingUnixHTTPServer(str(socket_path), CredentialProxyHandler)
+        # Nothing behind this socket authenticates its callers: reaching it is
+        # reaching the credentials, past Envoy and past the whole command policy.
+        # The mount keeps it in this container, and the mode is the second lock —
+        # 0600, so it stays connectable only by this container's own user however
+        # wide the sidecar's umask is set for the shared workspace. Applied as a
+        # umask rather than a chmod after the fact so there is no window in which
+        # the bound socket is more permissive than this.
+        previous_umask = os.umask(0o177)
+        try:
+            server = ThreadingUnixHTTPServer(str(socket_path), CredentialProxyHandler)
+        finally:
+            os.umask(previous_umask)
         LOGGER.info("credential proxy listening on unix socket %s", socket_path)
     else:
         server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)

@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python test-python-deps conformance validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -106,7 +106,8 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
-	$(wildcard scripts/test_*.py)))
+	$(wildcard scripts/test_*.py) \
+	$(wildcard tests/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
@@ -115,6 +116,19 @@ PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicor
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
+
+# One command for "is this branch landable": everything a PR must pass, ordered
+# so the cheapest check fails first.
+#
+# Added because the answer used to be three commands nobody could remember, and
+# a handoff doc had to carry the recipe. If you add a suite, add it here.
+verify: ## Run everything a PR must pass: go build, go vet, go test, python tests.
+	@echo "==> go build"; cd k8s-operator && go build ./...
+	@echo "==> go vet";   cd k8s-operator && go vet ./...
+	@echo "==> go test";  cd k8s-operator && go test ./...
+	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
+	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> verify OK"
 
 test-python: ## Run the Python unit tests outside k8s-operator/.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
@@ -178,6 +192,17 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 # repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
+
+# The security invariants, as executable assertions. Deliberately not folded
+# into test-python: that target's globs cover agents/, deploy/docker/patches/
+# and scripts/, not tests/, and a conformance suite whose CI entry depends on
+# someone remembering a glob is a conformance suite that stops running. It has
+# its own workflow (.github/workflows/conformance.yml) for the same reason.
+#
+# Bucket 2 -- the scenarios that need a cluster -- is excluded here rather than
+# skipped, because a skip and a pass look the same in a summary line.
+conformance: ## Run the security invariant conformance suite (bucket 1, no cluster)
+	@python3 tests/conformance/run.py
 
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the provisioning steps as

@@ -1,3 +1,5 @@
+import io
+import base64
 import json
 import os
 import queue
@@ -28,6 +30,7 @@ from credential_proxy import (
     _chat_error_fields,
     _slack_error_detail,
     _slack_error_fields,
+    git_argument_violation,
     is_valid_repository,
     parse_gke_context,
     read_current_context,
@@ -223,7 +226,10 @@ class GitLeaseGateTest(unittest.TestCase):
     def executor(self, **environment):
         with mock.patch.dict(os.environ, environment):
             return CommandExecutor(
-                timeout_seconds=5, max_output_bytes=1024, state_dir=self.temp_dir.name
+                timeout_seconds=5,
+                max_output_bytes=1024,
+                state_dir=self.temp_dir.name,
+                scoped_pool=None,
             )
 
     def leased(self, executor, lease="compliance-audit", repo="acme__fleet"):
@@ -428,6 +434,631 @@ class GitLeaseGateTest(unittest.TestCase):
         self.assertEqual(credential_proxy.GIT_LEASE_MARKER, gitops_workspace.LEASE_FILENAME)
 
 
+class GitHardeningTest(unittest.TestCase):
+    """git's own configuration, as a way into the container holding the creds.
+
+    Every test here drives *real git* and asserts what it did, never that a
+    variable is set. Asserting the variable would restate the code: the
+    question is whether git obeys it, and the only three things that answer
+    that are git, the attack, and a control.
+
+    Each hardening variable has at least one test here that turns red when the
+    variable is deleted from `CommandExecutor.environment`, checked by removing
+    each in turn and running the suite. Note that is a property of the *set*,
+    not of every test: `test_the_protocol_allowlist_refuses_nothing_it_should_allow`
+    guards the value rather than the variable and stays green if the variable
+    is deleted outright, which is what its sibling above it is for.
+    Each test is written so that deleting one hardening variable from
+    `CommandExecutor.environment` turns this test red and, as far as possible,
+    only this test. That property is the point of the file — it was checked by
+    removing each variable in turn and running the suite.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.marker = Path(self.temp_dir.name) / "EXECUTED"
+        self.payload = Path(self.temp_dir.name) / "payload.sh"
+        self.payload.write_text(
+            f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
+        )
+        self.payload.chmod(0o755)
+
+    def executor(self, max_output_bytes=1 << 16):
+        return CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=max_output_bytes,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+
+    def executed(self):
+        """Did the payload run? Consumes the marker so cases cannot bleed."""
+        hit = self.marker.exists()
+        self.marker.unlink(missing_ok=True)
+        return hit
+
+    def repository(self, executor, name="repo"):
+        """A git repository where the agent has one: inside the workspace."""
+        path = executor.workspace_dir / name
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
+        )
+        return path
+
+    def append_repository_config(self, repository, text):
+        """Write to `.git/config` — a file the agent shares a group with."""
+        config = repository / ".git" / "config"
+        config.write_text(config.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+    def test_the_ext_transport_cannot_execute_a_command(self):
+        # The finding. `ext::` hands the rest of the URL to a shell, and
+        # `-c protocol.ext.allow=always` is the agent turning it on. This runs
+        # through `execute`, which is *below* the argv refusal in the handler,
+        # so what it demonstrates is that the environment stops it on its own.
+        # That layering is deliberate: the parser must not be the boundary.
+        executor = self.executor()
+        result = executor.execute(
+            [
+                "git",
+                "-c",
+                "protocol.ext.allow=always",
+                "clone",
+                f"ext::{self.payload}",
+                str(executor.workspace_dir / "cloned"),
+            ],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertFalse(
+            self.executed(),
+            "ext:: executed a command inside the credential container",
+        )
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("not allowed", result.stderr)
+
+    def test_the_protocol_allowlist_refuses_nothing_it_should_allow(self):
+        # GIT_ALLOW_PROTOCOL is a colon-separated list, and the empty string is
+        # a list of one empty protocol name — it allows *nothing*, so setting it
+        # wrong bricks every clone rather than quietly permitting them. This is
+        # the test that dies if someone empties the value: the clone below fails
+        # either way (there is no network here), but only an empty allowlist
+        # makes it fail with "transport 'https' not allowed".
+        executor = self.executor()
+        result = executor.execute(
+            [
+                "git",
+                "clone",
+                "https://github.invalid/acme/fleet.git",
+                str(executor.workspace_dir / "https-clone"),
+            ],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertNotIn("transport 'https' not allowed", result.stderr)
+
+    def test_a_hook_in_the_repository_does_not_run(self):
+        # Reachable with no unusual argv at all: write the file, wait for any
+        # skill to commit. `git commit` appears nine times across the skills.
+        executor = self.executor()
+        repository = self.repository(executor)
+        hook = repository / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), ".git/hooks/pre-commit ran")
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_a_hooks_path_in_the_repository_config_is_overridden(self):
+        # The same attack one layer up, and the reason the pin has to be in the
+        # environment rather than written into a config file: the forced-config
+        # layer outranks `.git/config`, a file on the shared volume.
+        executor = self.executor()
+        repository = self.repository(executor)
+        hooks = Path(self.temp_dir.name) / "agent-hooks"
+        hooks.mkdir()
+        (hooks / "pre-commit").write_text(
+            f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
+        )
+        (hooks / "pre-commit").chmod(0o755)
+        self.append_repository_config(repository, f"\n[core]\n\thooksPath = {hooks}\n")
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "repository core.hooksPath ran a hook")
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_the_hooks_directory_is_empty_and_not_writable(self):
+        # `core.hooksPath` only disables hooks because there is nothing in the
+        # directory it names and nothing can be put there. Both halves are the
+        # control, so both are asserted.
+        executor = self.executor()
+        self.assertEqual([], list(executor.git_hooks_dir.iterdir()))
+        self.assertEqual(0o500, executor.git_hooks_dir.stat().st_mode & 0o777)
+
+    def test_a_system_config_is_ignored(self):
+        # GIT_CONFIG_NOSYSTEM. /etc/gitconfig is not writable from a test, so
+        # the system file is relocated with GIT_CONFIG_SYSTEM — which
+        # GIT_CONFIG_NOSYSTEM also suppresses, and which is exactly the claim:
+        # no system-scope file is read, wherever it is.
+        executor = self.executor()
+        system = Path(self.temp_dir.name) / "system-gitconfig"
+        system.write_text("[kubeagents]\n\tprobe = system\n", encoding="utf-8")
+        executor.environment["GIT_CONFIG_SYSTEM"] = str(system)
+        result = executor.execute(
+            ["git", "config", "--get", "kubeagents.probe"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("", result.stdout.strip())
+        self.assertEqual(1, result.exit_code)
+
+    def test_the_global_config_is_pinned_and_survives_a_moved_home(self):
+        # GIT_CONFIG_GLOBAL. The global file is out of the agent's reach today
+        # only because HOME is the sidecar-only state dir — deployment
+        # geometry, not a control. Naming the path keeps the property when the
+        # geometry moves, which is what this asserts: HOME is repointed at a
+        # directory holding a hostile .gitconfig and git must not read it.
+        executor = self.executor()
+        executor.git_config_global.write_text(
+            "[kubeagents]\n\tprobe = pinned\n", encoding="utf-8"
+        )
+        elsewhere = Path(self.temp_dir.name) / "moved-home"
+        elsewhere.mkdir()
+        (elsewhere / ".gitconfig").write_text(
+            "[kubeagents]\n\tprobe = agent-controlled\n", encoding="utf-8"
+        )
+        executor.environment["HOME"] = str(elsewhere)
+        result = executor.execute(
+            ["git", "config", "--get", "kubeagents.probe"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("pinned", result.stdout.strip())
+
+    def test_the_global_config_is_still_writable(self):
+        # The reason GIT_CONFIG_GLOBAL is not /dev/null. `gh auth setup-git`
+        # installs the GitHub credential helper by running `git config
+        # --global credential.helper …` in this same environment, so a global
+        # config that cannot be written is authenticated push and fetch gone.
+        # Hardening that breaks the product gets reverted, and then nothing is
+        # hardened.
+        executor = self.executor()
+        written = executor.execute(
+            ["git", "config", "--global", "credential.helper", "!gh auth git-credential"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual(0, written.exit_code, written.stderr)
+        read_back = executor.execute(
+            ["git", "config", "--get", "credential.helper"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("!gh auth git-credential", read_back.stdout.strip())
+
+    def test_an_fsmonitor_in_the_repository_config_does_not_run(self):
+        # core.fsmonitor is run by `git status` — a *read* verb, so the lease
+        # gate never sees it.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, f"\n[core]\n\tfsmonitor = {self.payload}\n"
+        )
+        executor.execute(["git", "status", "--porcelain"], cwd=str(repository))
+        self.assertFalse(self.executed(), "core.fsmonitor ran")
+
+    def dirty_repository(self, executor, name="repo"):
+        """A repository with one tracked file and an uncommitted change."""
+        repository = self.repository(executor, name)
+        tracked = repository / "manifest.yaml"
+        tracked.write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"], cwd=repository, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        tracked.write_text("replicas: 2\n", encoding="utf-8")
+        return repository
+
+    def test_every_forced_config_key_reaches_git(self):
+        # GIT_CONFIG_COUNT has to match the number of key/value pairs exactly:
+        # git reads indices below the count and silently ignores the rest, so a
+        # count that drifts low disarms the tail of the list with nothing
+        # failing. Asserting through `git config --get` means the count, the
+        # keys and the values are checked by the program that consumes them.
+        # The exit code is asserted as well as the value. `git config --get`
+        # prints an empty line for a key pinned to the empty string and also
+        # for a key that is not set at all, so a value-only assertion cannot
+        # tell "pinned" from "missing" and would stay green if a key name were
+        # misspelled. It exits 0 when the key is present and 1 when it is not.
+        executor = self.executor()
+        expected = {
+            "core.hooksPath": str(executor.git_hooks_dir),
+            "core.fsmonitor": "false",
+            "commit.gpgsign": "false",
+            "tag.gpgSign": "false",
+            "gpg.program": "false",
+            "help.autocorrect": "0",
+        }
+        for key, value in expected.items():
+            result = executor.execute(
+                ["git", "config", "--get", key], cwd=str(executor.workspace_dir)
+            )
+            self.assertEqual(0, result.exit_code, f"{key} never reached git")
+            self.assertEqual(value, result.stdout.strip(), f"{key} has the wrong value")
+            self.assertEqual(value, result.stdout.strip(), f"{key} did not reach git")
+        self.assertEqual(
+            str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
+        )
+
+    def test_an_editor_named_by_the_repository_config_does_not_run(self):
+        # `core.editor` is a command, and `.git/config` is a file the agent can
+        # write. `git commit` with no `-m` launches it — one flag away from the
+        # argv the skills send nine times. Demonstrated firing before
+        # GIT_EDITOR was set. The variable outranks the config layer, so this
+        # is a boundary and not a pin; `-c core.editor=` does not beat it.
+        executor = self.executor()
+        repository = self.dirty_repository(executor)
+        self.append_repository_config(
+            repository, f'\n[core]\n\teditor = {self.payload}\n'
+        )
+        result = executor.execute(
+            ["git", "commit", "--allow-empty"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "core.editor ran a command")
+        # The negative above is also true of a commit that died for an
+        # unrelated reason, so pin *why* it failed: git names the editor it
+        # ran, and it is the pinned one rather than the repository's.
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("editor 'false'", result.stderr.lower())
+        # And the positive beside it: the verb the skills actually issue still
+        # works with the editor neutralised.
+        self.assertEqual(
+            0,
+            executor.execute(
+                ["git", "commit", "--allow-empty", "-m", "real"], cwd=str(repository)
+            ).exit_code,
+        )
+
+    def test_a_sequence_editor_named_by_the_repository_config_does_not_run(self):
+        # `sequence.editor` is the second editor git runs, for `rebase -i`, and
+        # GIT_EDITOR does not cover it — it needs GIT_SEQUENCE_EDITOR of its
+        # own. Verified: with GIT_EDITOR set and this one unset, the payload
+        # runs and the rebase reports success, exit 0.
+        #
+        # The repository has to be *clean*. Written first against
+        # `dirty_repository`, this test passed and then survived deleting the
+        # variable it exists to guard: rebase refuses an unstaged change before
+        # it ever reaches the editor, so "the payload did not run" was true of
+        # `error: Please commit or stash them` — a control that is really an
+        # error path, the same failure this slice hit once already. The
+        # assertion on git's own message below is what pins the difference.
+        executor = self.executor()
+        repository = self.repository(executor)
+        (repository / "manifest.yaml").write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        self.append_repository_config(
+            repository, f'\n[sequence]\n\teditor = {self.payload}\n'
+        )
+        result = executor.execute(
+            ["git", "rebase", "--interactive", "--root"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "sequence.editor ran a command")
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("editor 'false'", result.stderr.lower())
+
+    def test_signing_cannot_run_a_program_named_by_the_repository(self):
+        # `gpg.program` is a command and `commit.gpgsign` decides whether git
+        # runs it — both settable in `.git/config`, and the trigger is `git
+        # commit -m`, the argv the fleet-audit skill already issues. Watch the
+        # failure shape: unpinned, the payload runs and git *then* exits 128,
+        # so an exit-code assertion alone would have called this working.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository,
+            f'\n[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = {self.payload}\n',
+        )
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "gpg.program ran")
+        # The positive beside the negative: the commit did not merely fail to
+        # sign, it succeeded.
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_a_misspelled_subcommand_is_not_autocorrected_past_the_refusal(self):
+        # Without `help.autocorrect` pinned, the subcommand refusal list is not
+        # a control: `[help] autocorrect = immediate` in the agent's own
+        # `.git/config` makes git resolve `bisct` to `bisect` and run it, while
+        # the refusal list — which compares whole tokens — sees a word that is
+        # on no list. Demonstrated at exit 0 before the pin.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, "\n[help]\n\tautocorrect = immediate\n"
+        )
+        self.assertIsNone(git_argument_violation(["git", "bisct", "run", "x"]))
+        result = executor.execute(
+            ["git", "bisct", "run", str(self.payload)], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "an autocorrected bisect ran a command")
+        self.assertNotEqual(0, result.exit_code)
+
+    def test_writing_a_config_file_by_path_is_refused(self):
+        # `git config --file <path>` writes the same file `--global` names,
+        # spelled explicitly — and `git config --list --show-origin` prints
+        # that path, so it is not a secret. Refusing `--global` alone left this
+        # open, and it is the same three-call vector as 1.6: write an alias
+        # into the proxy's own global config, then run it.
+        executor = self.executor()
+        target = executor.git_config_global
+        for argv in (
+            ["git", "config", "--file", str(target), "alias.zz", "!sh"],
+            ["git", "config", f"--file={target}", "alias.zz", "!sh"],
+            ["git", "config", "-f", str(target), "alias.zz", "!sh"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # `-f` is only refused because `config` is in this argv. On every other
+        # verb it is `--force`, which the skills issue, so it stays allowed.
+        self.assertIsNone(git_argument_violation(["git", "clean", "-fdq"]))
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "-f", "origin", "audit"])
+        )
+
+    def test_a_subcommand_that_runs_a_command_is_refused(self):
+        # `git bisect run <cmd>` executes <cmd> in the credential container.
+        # Demonstrated through the proxy from inside a valid lease, in two
+        # calls, with no config file and no unusual flag: `bisect` is not a
+        # mutating verb so it needs no lease, and it is a C builtin so it
+        # cannot be absent from the image. `filter-branch --tree-filter` and
+        # `send-email --smtp-server=<path>` were demonstrated the same way.
+        for argv in (
+            ["git", "bisect", "run", "/opt/data/payload.sh"],
+            ["git", "difftool", "--extcmd=/opt/data/payload.sh", "HEAD~1", "HEAD"],
+            ["git", "filter-branch", "-f", "--tree-filter", "/opt/data/payload.sh"],
+            ["git", "send-email", "--smtp-server=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "mergetool"],
+            ["git", "instaweb"],
+            # `git submodule foreach <cmd>` runs <cmd> per submodule, at exit 0
+            # through the executor. `submodule` itself stays allowed, so the
+            # inner verb is what is refused.
+            ["git", "submodule", "foreach", "/opt/data/payload.sh"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_a_flag_that_runs_a_command_on_an_ordinary_verb_is_refused(self):
+        # The same category as the refused subcommands, hiding on verbs the
+        # product has no reason to refuse. Both of the first two were
+        # demonstrated executing through the real executor under the full
+        # environment hardening, at exit 0.
+        #
+        # `git grep -O<cmd>` is the sharpest of the two: `grep` is a read verb,
+        # so it needs no lease, and it needs nothing written to the volume.
+        # Its value is attached to the flag rather than separated, which is the
+        # case `split("=")` alone does not catch.
+        for argv in (
+            ["git", "rebase", "-x", "/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "--exec=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "grep", "-O/opt/data/payload.sh", "apiVersion"],
+            ["git", "grep", "--open-files-in-pager=/opt/data/payload.sh", "kind"],
+            # git lets short options cluster and carry an attached value, so
+            # the same attack one byte longer is a different token. Each of
+            # these was demonstrated executing at exit 0 against a matcher
+            # that handled only the tidy spelling above.
+            ["git", "grep", "-iO/opt/data/payload.sh", "apiversion"],
+            ["git", "grep", "-nO/opt/data/payload.sh", "apiVersion"],
+            ["git", "rebase", "-x/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "-fx/opt/data/payload.sh", "HEAD~1"],
+            # Reachable only if GIT_ALLOW_PROTOCOL is widened to allow `file`,
+            # which the paired control shows is the one thing stopping them.
+            ["git", "clone", "--upload-pack=/opt/data/payload.sh", "/tmp/r", "d"],
+            ["git", "fetch", "--upload-pack", "/opt/data/payload.sh", "origin"],
+            ["git", "push", "--receive-pack=/opt/data/payload.sh", "origin", "main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_writing_the_proxys_own_git_config_is_refused(self):
+        # `git config --global alias.zz '!<payload>'` followed by `git zz` was
+        # arbitrary code execution: `config` is not a mutating verb, so it
+        # needs no lease, and the file it writes is the one GIT_CONFIG_GLOBAL
+        # pins. Repository-local `git config` is what the skills use and stays
+        # allowed -- `gitops_workspace.configure_identity` sets user.name and
+        # user.email that way, deliberately.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--global", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--system", "core.pager", "sh"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.email", "a@b.invalid"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--get", "remote.origin.url"])
+        )
+
+    def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
+        # `_execute` refuses a cwd outside the shared workspace and the lease
+        # gate resolves cwd plus every `-C`, but neither looks at `--git-dir`.
+        # So this ran, from inside a valid lease, against a repository on the
+        # sidecar's own filesystem — verified before the refusal was added, as
+        # both a read and a commit. The containment check is on the working
+        # directory, so the flag that stops naming a repository by working
+        # directory has to be refused rather than resolved.
+        executor = self.executor()
+        outside = Path(self.temp_dir.name) / "sidecar-only"
+        outside.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=outside, check=True, capture_output=True
+        )
+        argv = [
+            "git",
+            f"--git-dir={outside / '.git'}",
+            f"--work-tree={outside}",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "escaped",
+        ]
+        self.assertIsNotNone(git_argument_violation(argv))
+        # And the control: the working-directory check alone does not catch it.
+        self.assertIsNone(executor.git_lease_violation(argv, str(self.leased(executor))))
+
+    def leased(self, executor, lease="t_card", repo="acme__fleet"):
+        holder = executor.workspace_dir / "gitops" / lease
+        (holder / repo).mkdir(parents=True, exist_ok=True)
+        (holder / ".lease").write_text(json.dumps({"lease": lease}), encoding="utf-8")
+        return holder / repo
+
+    def test_ordinary_git_still_works(self):
+        # The hardening is worth nothing if it is reverted next week because it
+        # broke the skills, so the paths they actually use are asserted green.
+        # `git diff` is in this list because it was not, and a pin that broke
+        # it shipped for one commit. `diff.external` was pinned to "" to stop
+        # a repository config naming an external diff program; git reads the
+        # empty value as a program to execute, so every `git diff` died with
+        # `fatal: external diff died`. The test that was supposed to cover it
+        # asserted only that the payload had not run, which is true of a
+        # command that fails before diffing anything — a control that passes
+        # for the wrong reason, and the fourth of those this slice produced.
+        # The pin is gone; this line is what would have caught it.
+        executor = self.executor()
+        repository = self.dirty_repository(executor)
+    def test_ordinary_git_still_works(self):
+        # The hardening is worth nothing if it is reverted next week because it
+        # broke the skills, so the paths they actually use are asserted green.
+        executor = self.executor()
+        repository = self.dirty_repository(executor)
+        for argv in (
+            ["git", "commit", "--allow-empty", "-m", "remediate netpol"],
+            ["git", "status", "--porcelain"],
+            ["git", "log", "--oneline"],
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "diff"],
+            ["git", "diff", "--cached", "--quiet"],
+            ["git", "config", "user.email", "audit@kube-agents.invalid"],
+        ):
+            result = executor.execute(argv, cwd=str(repository))
+            self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")
+
+
+class GitArgumentRefusalTest(unittest.TestCase):
+    """The backup check: argv that would override the environment.
+
+    `-c` sets configuration at a layer that outranks the forced-config
+    environment — verified against real git — so this is the only thing
+    standing between an agent and `-c core.hooksPath=…`. It is a backup for the
+    `ext::` transport, where GIT_ALLOW_PROTOCOL is the boundary, and the
+    control for hooks, where it is not.
+    """
+
+    def test_refuses_the_flags_that_override_the_environment(self):
+        for argv in (
+            ["git", "-c", "protocol.ext.allow=always", "clone", "ext::sh -c id", "d"],
+            ["git", "-c", "core.hooksPath=/opt/data/hooks", "commit", "-m", "x"],
+            ["git", "--config-env=core.hooksPath=EVIL", "commit", "-m", "x"],
+            ["git", "--exec-path=/opt/data/bin", "status"],
+            ["git", "--exec-path", "/opt/data/bin", "status"],
+            ["git", "--git-dir=/home/hermes/.git", "log"],
+            ["git", "--git-dir", "/home/hermes/.git", "log"],
+            ["git", "--work-tree=/home/hermes", "checkout", "--", "."],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_allows_the_git_the_skills_actually_run(self):
+        for argv in (
+            ["git", "clone", "--quiet", "https://github.com/acme/fleet.git", "d"],
+            ["git", "--literal-pathspecs", "add", "--", "clusters/prod"],
+            ["git", "commit", "-m", "remediate netpol"],
+            ["git", "push", "--force-with-lease", "origin", "fleet-audit/x"],
+            ["git", "-C", "/opt/data/gitops/t_card/acme__fleet", "status"],
+            ["git", "checkout", "--force", "-B", "audit", "origin/main"],
+            # `submodule update` is the guard on refusing `foreach`: the
+            # refusal has to land on the inner verb, because `submodule` itself
+            # is a working-tree write the product performs. Widening the
+            # refusal from `foreach` to `submodule` turns this line red.
+            ["git", "submodule", "update", "--init"],
+            # `-u` and `--oneline` are here because `-O` is matched as a
+            # prefix rather than as a whole argument. Neither is caught today;
+            # they are the regression guard on a future maintainer widening
+            # that prefix, which is the failure mode a prefix match invites.
+            ["git", "log", "--oneline", "-n", "5"],
+            ["git", "push", "-u", "origin", "fleet-audit/x"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_refuses_the_abbreviations_git_accepts(self):
+        # git's *subcommand* options are parsed by parse-options, which takes
+        # any unambiguous prefix. Every one of these was demonstrated running
+        # against a checker that matched the full spelling only, and the
+        # `config --glo` line is the sharp one: it wrote an alias into the
+        # broker's own global config and `git zz` then executed it, which is a
+        # vector this file had already closed and a release note would have
+        # said was fixed.
+        #
+        # git's own options are the asymmetry that hides this. `--git-dir`,
+        # `--exec-path` and `--config-env` are compared exactly in git.c and
+        # are not abbreviable, so a test written only against those spellings
+        # says the problem does not exist.
+        for argv in (
+            ["git", "config", "--glo", "alias.zz", "!/opt/data/payload.sh"],
+            ["git", "config", "--sys", "alias.zz", "!/opt/data/payload.sh"],
+            ["git", "rebase", "--exe", "/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "--ex=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "grep", "--open=/opt/data/payload.sh", "apiVersion"],
+            ["git", "clone", "--upload-pac", "/opt/data/payload.sh", "/tmp/r", "d"],
+            ["git", "push", "--receive-pac=/opt/data/payload.sh", "origin", "main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_an_abbreviation_match_does_not_swallow_unrelated_flags(self):
+        # The match is "the argument is a prefix of a refused option", not the
+        # reverse, so a longer flag that merely shares a first letter is
+        # untouched. Inverting the comparison would refuse every one of these
+        # and break the skills, which is the failure mode the rule invites.
+        for argv in (
+            ["git", "log", "--oneline"],              # vs --open-files-in-pager
+            ["git", "diff", "--cached"],              # vs --config-env
+            ["git", "add", "--update", "--", "x"],    # vs --upload-pack
+            ["git", "log", "--graph"],                # vs --git-dir
+            ["git", "push", "--set-upstream", "o", "b"],   # vs --system
+            ["git", "config", "--get", "remote.origin.url"],  # vs --git-dir
+            ["git", "clone", "--recurse-submodules", "u", "d"],  # vs --receive-pack
+            ["git", "commit", "--allow-empty", "-m", "x"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_scopes_itself_to_git(self):
+        # `-c` is a container selector for kubectl and must keep working.
+        self.assertIsNone(git_argument_violation(["kubectl", "logs", "-c", "istio"]))
+        self.assertIsNone(git_argument_violation(["gh", "pr", "view", "-c"]))
+
+    def test_matches_the_flag_wherever_it_appears(self):
+        # Scanned across the whole argv rather than only the region before the
+        # subcommand, where git honours it. Agreeing with git about where the
+        # options end would be a guess about git's parser, and every Critical
+        # this project has found was a checker and an executor disagreeing
+        # about exactly that. Refusing a literal `-c` argument is the price.
+        self.assertIsNotNone(git_argument_violation(["git", "commit", "-c", "HEAD"]))
+
+
 class GitLeaseGateWiringTest(unittest.TestCase):
     """The gate as the agent meets it — over HTTP, through /v1/exec."""
 
@@ -443,6 +1074,7 @@ class GitLeaseGateWiringTest(unittest.TestCase):
             timeout_seconds=5,
             max_output_bytes=4096,
             state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
         )
         CredentialProxyHandler.max_request_bytes = 65536
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
@@ -476,6 +1108,22 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual("git.workspace.lease", body["rule"])
         self.assertIn("audit_report.py start", body["message"])
 
+    def test_a_config_flag_comes_back_as_a_policy_block(self):
+        # Refused before the lease check, and with its own rule id: an agent
+        # that gets "take a lease" back for `git -c` would take a lease and try
+        # again, which is a refusal that teaches the wrong lesson.
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {
+                "argv": ["git", "-c", "protocol.ext.allow=always", "clone",
+                         "ext::sh -c id", "d"],
+                "cwd": str(workspace),
+            }
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.argument.refused", body["rule"])
+
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
             CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
@@ -508,6 +1156,7 @@ class CommandExecutorTest(unittest.TestCase):
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
             state_dir=self.temp_dir.name,
+            scoped_pool=None,
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
@@ -813,6 +1462,23 @@ class CommandExecutorTest(unittest.TestCase):
                 os.environ["SLACK_BOT_TOKEN"] = previous
         self.assertNotIn("SLACK_BOT_TOKEN", executor.environment)
         self.assertEqual(str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"])
+
+    def test_kuberc_is_disabled_for_proxied_commands(self):
+        # command_policy refuses the --kuberc flag, but kubectl v1.36.3 also
+        # reads $HOME/.kube/kuberc with no flag present, and a kuberc can carry
+        # an `as` default -- verified to set Impersonate-User on an argv holding
+        # nothing to refuse. HOME points at the sidecar-only state dir, so the
+        # agent cannot write that path today, but that is deployment geometry
+        # and it is not what this asserts. This asserts the feature is off, so
+        # the property survives someone rearranging the mounts.
+        executor = self.executor()
+        # .get rather than [] so removing the variable reads as a failure with
+        # the expected value in the diff, not as a KeyError in the error column.
+        self.assertEqual("false", executor.environment.get("KUBECTL_KUBERC"))
+        # And the geometry, separately, so a change to either is visible.
+        self.assertEqual(
+            str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"]
+        )
 
     def test_git_commands_carry_a_commit_identity(self):
         # The remediation Pull Request path commits through the proxy, and the
@@ -1557,6 +2223,1654 @@ class SlackRelayTest(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
         self.assertEqual({"error": "Slack operation failed"}, captured["payload"])
+
+
+class ReadOnlyGateTest(unittest.TestCase):
+    """The gate that makes the PR-only write rule mechanical.
+
+    The proxy refused credential disclosure long before it refused a mutation.
+    These cover the wiring: that the gate runs, that it runs after the existing
+    denylist so credential rules keep their own rule IDs, and that it can be
+    switched off without a new image.
+    """
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        CredentialProxyHandler.enforce_read_only = True
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _decide(self, argv):
+        """The blocked response the handler would send, or None if allowed."""
+        result = credential_proxy.read_only_refusal(argv)
+        return result[0] if result is not None else None
+
+    def test_a_read_passes_the_gate(self):
+        self.assertIsNone(self._decide(["kubectl", "get", "pods"]))
+
+    def test_a_mutation_is_refused(self):
+        refusal = self._decide(["kubectl", "delete", "ns", "prod"])
+        self.assertIsNotNone(refusal)
+        self.assertEqual("kubernetes.read-only", refusal["rule"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
+
+    def test_the_gate_can_be_switched_off(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertIsNone(self._decide(["kubectl", "delete", "ns", "prod"]))
+
+    def test_the_gate_is_on_by_default(self):
+        # A misread env var must not silently disarm the gate.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "banana"}):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "false"}):
+            self.assertFalse(credential_proxy.read_only_enforced())
+
+    def test_credentials_do_not_leak_to_logs(self):
+        # Verify that a token in argv does not get logged
+        result = credential_proxy.read_only_refusal(
+            ["kubectl", "--token=eyJhbGci.SECRET", "--as=admin", "get", "pods"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The log hint should be the --as flag, not a secret-containing argv element
+        self.assertEqual("--as", log_hint)
+        self.assertNotIn("SECRET", log_hint)
+        self.assertNotIn("eyJhbGci", log_hint)
+
+    def test_gcloud_positionals_do_not_leak_to_logs(self):
+        # Verify that positionals in gcloud don't get logged when capped at 3 words
+        # "compute disks describe" is allowlisted, but it accepts a disk name positional
+        # which should not appear in the log hint (capped at first 3 words)
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "describe", "SECRETDISKNAME", "--zone=us-central1-a"]
+        )
+        # This is allowed, so no refusal
+        self.assertIsNone(result)
+
+        # Test a mutation that WOULD refuse and check the hint cap
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The hint should cap at 3 words, excluding the credential positional
+        self.assertEqual("compute.disks.delete", log_hint)
+        self.assertNotIn("SECRETDISKNAME", log_hint)
+
+    # Every payload here sits in argv position 1, not position 5. The previous
+    # version of this test put the payload fifth, where the verb cap in
+    # command_policy.evaluate -- `verb_tuple=tuple(words[:3])` -- dropped it
+    # before the sanitizer ever saw it. All three assertions therefore held
+    # against any implementation at all, including `filtered = s`. The cap is
+    # what made the test vacuous, so the payload has to land inside it.
+    #
+    # It is genuinely reachable: gcloud group names are agent-chosen strings and
+    # the first three of them go into the log hint verbatim.
+    FORGERY_PAYLOADS = (
+        ("\n", "compute\n2026-08-06 WARNING command complete exit_code=0"),
+        ("\u2028", "compute\u20282026-08-06 WARNING exit_code=0"),   # LINE SEPARATOR, Zl
+        ("\x85", "compute\x852026-08-06 WARNING exit_code=0"),       # NEL, Cc
+        ("\r", "compute\r2026-08-06 WARNING exit_code=0"),
+        ("\u2029", "compute\u20292026-08-06 WARNING exit_code=0"),   # PARA SEPARATOR, Zp
+    )
+
+    def test_log_sanitization_removes_control_chars(self):
+        # Drive the real path rather than calling the filter directly: a forged
+        # log line only matters if the payload reaches the logger, and
+        # read_only_refusal builds the hint the handler passes to
+        # _sanitize_for_logging.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                result = credential_proxy.read_only_refusal(
+                    ["gcloud", payload, "instances", "delete", "prod"]
+                )
+                self.assertIsNotNone(result)
+                _, log_hint = result
+                # If this fails the rest of the test is asserting about a string
+                # that never held the payload, which is the bug being fixed.
+                self.assertIn(character, log_hint)
+                sanitized = credential_proxy._sanitize_for_logging(log_hint)
+                self.assertNotIn(character, sanitized)
+
+    def test_log_sanitization_leaves_a_single_line(self):
+        # The property that actually matters. str.splitlines breaks on the whole
+        # family a text log reader breaks on -- \n \r \v \f \x1c-\x1e \x85
+        # \u2028 \u2029 -- so one line out means one line in the log.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                sanitized = credential_proxy._sanitize_for_logging(payload)
+                self.assertEqual([sanitized], sanitized.splitlines())
+                self.assertNotIn(character, sanitized)
+
+    def test_the_forgery_payload_survives_the_verb_cap(self):
+        # Pins reachability itself, separately from the filter. If the hint ever
+        # stopped carrying agent-chosen text, the tests above would go quiet
+        # rather than fail, and the sanitizer would be unpinned again.
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute\ninjected", "instances", "delete", "prod"]
+        )
+        self.assertIsNotNone(result)
+        _, log_hint = result
+        self.assertEqual("compute\ninjected.instances.delete", log_hint)
+
+    def test_log_sanitization_has_length_cap(self):
+        # Verify that sanitizer caps at 64 chars to prevent unbounded expansion
+        long_flag = "--verylongflagname" + "x" * 100
+        sanitized = credential_proxy._sanitize_for_logging(long_flag)
+        self.assertLessEqual(len(sanitized), 64)
+        # Original should be truncated
+        self.assertNotEqual(sanitized, long_flag)
+
+
+class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
+    """`serve` is what copies the env var onto the handler.
+
+    `read_only_enforced()` and `read_only_refusal()` were both covered, and the
+    one line joining them was not: deleting
+    `CredentialProxyHandler.enforce_read_only = read_only_enforced()` from
+    `serve` left the whole suite green while the kill switch silently stopped
+    working in either direction. This starts the real `serve` with the network
+    parts stubbed and reads the attribute back off the class.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _serve_with(self, enforce_value):
+        owner = self
+        bound = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        # The deployed configuration always serves the broker on the Unix
+        # socket, and `serve` now refuses a TCP listener with no caller
+        # authentication, so the socket is what this drives.
+        args = types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            # Armed by default now, and this case drives `serve` for an
+            # unrelated property with no pool mapping mounted.
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+        }
+        if enforce_value is not None:
+            environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+        finally:
+            for server in bound:
+                server.server_close()
+        return CredentialProxyHandler.enforce_read_only
+
+    def test_serve_arms_the_gate_by_default(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with(None))
+
+    def test_serve_disarms_the_gate_when_the_env_var_says_false(self):
+        CredentialProxyHandler.enforce_read_only = True
+        self.assertFalse(self._serve_with("false"))
+
+    def test_serve_leaves_the_gate_armed_on_a_typo(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with("banana"))
+
+
+class ReadOnlyOverTheSocketTest(unittest.TestCase):
+    """A mutation must stop at the proxy socket, not merely at a decision function."""
+
+    def setUp(self):
+        self.executed = []
+        owner = self
+
+        class RecordingExecutor:
+            ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+            def git_lease_violation(self, argv, cwd):
+                return None
+
+            def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+                owner.executed.append(argv)
+                return credential_proxy.ExecutionResult(
+                    exit_code=0, stdout="", stderr="",
+                    duration_ms=0, truncated=False, timed_out=False,
+                )
+
+        self.original_executor = getattr(CredentialProxyHandler, 'executor', None)
+        self.original_policy = getattr(CredentialProxyHandler, 'policy', None)
+        self.original_enforce = getattr(CredentialProxyHandler, 'enforce_read_only', True)
+        CredentialProxyHandler.executor = RecordingExecutor()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        if self.original_executor is not None:
+            CredentialProxyHandler.executor = self.original_executor
+        if self.original_policy is not None:
+            CredentialProxyHandler.policy = self.original_policy
+        CredentialProxyHandler.enforce_read_only = self.original_enforce
+
+    def _post(self, argv):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps({"requestId": "t", "argv": argv, "cwd": "/tmp"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_a_read_reaches_the_executor(self):
+        """kubectl get pods (a read) should reach the executor and return 200."""
+        status, payload = self._post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executed)
+
+    def test_a_kubectl_mutation_never_reaches_the_executor(self):
+        """kubectl delete ns prod (a mutation) should be blocked before reaching executor."""
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("kubernetes.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_a_gcloud_mutation_never_reaches_the_executor(self):
+        """gcloud container clusters delete should be blocked before reaching executor."""
+        status, payload = self._post(["gcloud", "container", "clusters", "delete", "c"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("gcp.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_identity_flag_refusal_over_the_wire(self):
+        """kubectl --as=admin@corp.com get secrets should be blocked for impersonation."""
+        status, payload = self._post(["kubectl", "--as=admin@corp.com", "get", "secrets"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("identity.caller-supplied-impersonation", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_kill_switch_allows_mutation_through(self):
+        """With enforce_read_only = False, mutations should reach the executor."""
+        CredentialProxyHandler.enforce_read_only = False
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(200, status)
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual([["kubectl", "delete", "ns", "prod"]], self.executed)
+
+    def test_credential_denylist_takes_precedence_over_read_only(self):
+        """A rule from the credential denylist should report its own rule_id, not read-only.
+
+        The gate runs after policy.blocked_by, so credential rules like
+        kubernetes.token-disclosure keep their own rule ids rather than being
+        masked by a read-only refusal.
+        """
+        # Create a policy with a rule that blocks token disclosure
+        rules = [
+            credential_proxy.Rule(
+                rule_id="kubernetes.token-disclosure",
+                pattern=__import__('re').compile(r"create\s+token", __import__('re').IGNORECASE),
+                message="Token disclosure is not allowed"
+            )
+        ]
+        CredentialProxyHandler.policy = Policy(
+            rules=rules,
+            blocked_message="blocked"
+        )
+
+        # This command matches the denylist rule, not the read-only gate
+        status, payload = self._post(["kubectl", "create", "token", "sa"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        # Should report the denylist rule, not read-only
+        self.assertEqual("kubernetes.token-disclosure", payload["rule"])
+        self.assertEqual([], self.executed)
+
+
+class BackendSocketModeTest(unittest.TestCase):
+    """The backend socket must not inherit a permissive umask.
+
+    Nothing behind this socket authenticates its callers, so its mode is the
+    second lock after the mount. The sidecar's entrypoint now sets `umask 0002`
+    so that proxied commands leave group-writable files on the workspace the
+    agent shares — and a group-writable *socket* is a connectable socket for
+    anyone in the agent's group. `serve` therefore has to set the mode itself
+    rather than take whatever the process umask happens to be, which is what
+    this asserts by binding under the widest umask there is.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        # `serve` assigns these on the class; put them back for whatever runs
+        # next. Some are bare annotations until something sets them, so an
+        # unset one has to be unset again rather than restored.
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def test_the_backend_socket_is_not_group_or_world_connectable(self):
+        owner = self
+        bound = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "policy.json"
+            policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+            socket_path = Path(tmp) / "backend.sock"
+            args = types.SimpleNamespace(
+                policy=str(policy_path),
+                host="127.0.0.1",
+                port=0,
+                unix_socket=str(socket_path),
+                timeout_seconds=5,
+                max_request_bytes=1 << 20,
+                max_output_bytes=1 << 20,
+                state_dir=str(Path(tmp) / "state"),
+            )
+            previous_umask = os.umask(0o000)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "API_SERVER_EXTERNAL_KEY": "external",
+                        "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+                    },
+                    clear=True,
+                ), \
+                        mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                        mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                        mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                    with self.assertRaises(self._Stop):
+                        credential_proxy.serve(args)
+                # Read back before the outer restore: the process umask has to be
+                # the one it started with, because the same process goes on to run
+                # proxied commands that must leave group-writable files behind.
+                left_behind = os.umask(0o000)
+            finally:
+                os.umask(previous_umask)
+                for server in bound:
+                    server.server_close()
+
+            self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
+            mode = socket_path.stat().st_mode & 0o777
+            self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
+
+
+class ServiceAccountAuthenticatorTest(unittest.TestCase):
+    """The verifier itself: what it accepts, and everything it refuses."""
+
+    AUDIENCE = "kubeagents-credential-proxy"
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.own_token = Path(self.tmp.name) / "token"
+        self.own_token.write_text("broker-own-token", encoding="utf-8")
+        self.reviews = []
+
+    def _authenticator(self, **overrides):
+        kwargs = dict(
+            audience=self.AUDIENCE,
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file=str(self.own_token),
+            cache_seconds=0.0,
+        )
+        kwargs.update(overrides)
+        return credential_proxy.ServiceAccountAuthenticator(**kwargs)
+
+    def _with_review(self, authenticator, status):
+        """Replace the API round trip, keeping every check that reads it."""
+
+        def fake_review(token):
+            self.reviews.append(token)
+            return authenticator._principal_from({"status": status})
+
+        authenticator._review = fake_review
+        return authenticator
+
+    @staticmethod
+    def _headers(value):
+        return {"Authorization": value} if value is not None else {}
+
+    def _ok_status(self, **overrides):
+        status = {
+            "authenticated": True,
+            "audiences": [self.AUDIENCE],
+            "user": {
+                "username": self.CALLER,
+                "uid": "sa-uid",
+                "groups": ["system:serviceaccounts"],
+            },
+        }
+        status.update(overrides)
+        return status
+
+    def test_a_verified_token_yields_the_principal_from_the_review(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        principal = authenticator.authenticate(self._headers("Bearer agent-token"))
+        self.assertEqual(self.CALLER, principal.workload)
+        self.assertEqual("sa-uid", principal.uid)
+        self.assertIn("system:serviceaccounts", principal.groups)
+        # Slice 3 fills this; nothing today may invent it.
+        self.assertIsNone(principal.caller)
+        self.assertEqual(["agent-token"], self.reviews)
+
+    def test_no_header_is_rejected(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers(None))
+        self.assertEqual([], self.reviews, "an absent token must not reach the API server")
+
+    def test_a_non_bearer_scheme_is_rejected(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Basic YWJjOmRlZg=="))
+
+    def test_an_unauthenticated_review_is_rejected(self):
+        authenticator = self._with_review(
+            self._authenticator(), self._ok_status(authenticated=False)
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer forged"))
+
+    def test_a_token_for_another_audience_is_rejected(self):
+        # The audience is what stops a token minted for the Kubernetes API, or
+        # for any other service, being replayed at the broker.
+        authenticator = self._with_review(
+            self._authenticator(), self._ok_status(audiences=["https://kubernetes.default.svc"])
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer other-audience"))
+
+    def test_a_caller_outside_the_allowlist_is_rejected(self):
+        authenticator = self._with_review(
+            self._authenticator(),
+            self._ok_status(user={"username": "system:serviceaccount:default:someone-else"}),
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer wrong-sa"))
+
+    def test_an_api_server_error_is_a_rejection_not_an_allow(self):
+        authenticator = self._authenticator()
+
+        def explode(request, *args, **kwargs):
+            raise urllib.error.URLError("connection refused")
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", explode):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_the_review_asks_for_the_configured_audience(self):
+        authenticator = self._authenticator()
+        captured = {}
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, *args, **kwargs):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["authorization"] = request.get_header("Authorization")
+            return Response(json.dumps({"status": self._ok_status()}).encode("utf-8"))
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", fake_urlopen):
+            authenticator.authenticate(self._headers("Bearer agent-token"))
+
+        self.assertEqual(
+            "https://10.0.0.1:443/apis/authentication.k8s.io/v1/tokenreviews",
+            captured["url"],
+        )
+        self.assertEqual([self.AUDIENCE], captured["body"]["spec"]["audiences"])
+        self.assertEqual("agent-token", captured["body"]["spec"]["token"])
+        self.assertEqual("Bearer broker-own-token", captured["authorization"])
+
+    def test_a_verified_token_is_cached_rather_than_re_reviewed(self):
+        authenticator = self._with_review(
+            self._authenticator(cache_seconds=300.0), self._ok_status()
+        )
+        authenticator.authenticate(self._headers("Bearer agent-token"))
+        authenticator.authenticate(self._headers("Bearer agent-token"))
+        self.assertEqual(["agent-token"], self.reviews)
+
+    def test_a_rejected_token_is_never_cached(self):
+        authenticator = self._with_review(
+            self._authenticator(cache_seconds=300.0), self._ok_status(authenticated=False)
+        )
+        for _ in range(2):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                authenticator.authenticate(self._headers("Bearer forged"))
+        self.assertEqual(["forged", "forged"], self.reviews)
+
+
+class BuildAuthenticatorTest(unittest.TestCase):
+    def test_the_default_is_the_null_authenticator(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsInstance(
+                credential_proxy.build_authenticator(), credential_proxy.NullAuthenticator
+            )
+
+    def test_serviceaccount_mode_needs_an_allowlist(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.build_authenticator()
+
+    def test_serviceaccount_mode_needs_an_api_server(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(ValueError):
+                credential_proxy.build_authenticator()
+
+    def test_an_unknown_mode_is_refused_rather_than_ignored(self):
+        # A typo must not silently degrade to "no authentication".
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_AUTH_MODE": "servicaccount"}, clear=True
+        ):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.build_authenticator()
+
+    def test_serviceaccount_mode_builds_the_verifier(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent, ",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertIsInstance(authenticator, credential_proxy.ServiceAccountAuthenticator)
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent"}), authenticator.allowed_callers
+        )
+        self.assertEqual("kubeagents-credential-proxy", authenticator.audience)
+
+
+class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
+    """The listener that would hand the credentials to whoever reaches the port.
+
+    The TCP branch of `serve` has always been live code — it is unused only
+    because one environment variable is set. Splitting the broker into its own
+    Pod is what makes that branch the deployed one, so it must not be reachable
+    without an authenticator.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def _args(self, unix_socket=""):
+        return types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=unix_socket,
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+
+    def test_tcp_with_no_authentication_refuses_to_start(self):
+        class Bound(Exception):
+            """Raised if serve gets as far as binding anything at all."""
+
+        def refuse_to_bind(*args, **kwargs):
+            raise Bound
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {"API_SERVER_EXTERNAL_KEY": "external"}
+        # Everything that could listen is replaced, so removing the guard makes
+        # this test fail loudly instead of blocking on a real serve_forever.
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy.serve(self._args())
+        self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
+
+    def test_a_unix_socket_behind_a_networked_envoy_also_refuses(self):
+        # The deployed split keeps the Unix socket and moves Envoy's listener
+        # to the Pod IP. The socket's 0600 mode protects nothing then: the
+        # connection arrives through Envoy, as Envoy's own user.
+        class Bound(Exception):
+            pass
+
+        def refuse_to_bind(*args, **kwargs):
+            raise Bound
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_ENVOY_ADDRESS": "0.0.0.0",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy.serve(
+                    self._args(unix_socket=str(Path(self.tmp.name) / "backend.sock"))
+                )
+        self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
+
+    def test_a_unix_socket_behind_a_loopback_envoy_is_the_sidecar_and_is_allowed(self):
+        self.assertFalse(
+            credential_proxy.reachable_off_pod(self._args(unix_socket="/run/backend.sock"))
+        )
+
+    def test_tcp_with_an_authenticator_is_allowed(self):
+        owner = self
+
+        class _Stop(Exception):
+            pass
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.address = address
+
+            def serve_forever(self):
+                raise _Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+        }
+        original = CredentialProxyHandler.__dict__.get("authenticator")
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+                with self.assertRaises(_Stop):
+                    credential_proxy.serve(self._args())
+            self.assertIsInstance(
+                CredentialProxyHandler.authenticator,
+                credential_proxy.ServiceAccountAuthenticator,
+            )
+        finally:
+            if original is not None:
+                CredentialProxyHandler.authenticator = original
+        del owner
+
+
+class AuthenticationOverTheSocketTest(unittest.TestCase):
+    """An unauthenticated request must die at the socket, not at a function.
+
+    Deleting the `_authenticated()` call from `do_POST` leaves every unit test
+    of the verifier green while the broker answers anyone. This drives a real
+    HTTP server with a real authenticator wired onto the handler class.
+    """
+
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    class _RecordingExecutor:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def __init__(self):
+            self.executed = []
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+            self.executed.append(argv)
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                duration_ms=0, truncated=False, timed_out=False,
+            )
+
+    def setUp(self):
+        self.executor = self._RecordingExecutor()
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
+        ):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.executor = self.executor
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience="kubeagents-credential-proxy",
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+        caller = self.CALLER
+
+        def fake_review(token):
+            if token != "good-token":
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=caller, uid="sa-uid")
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _post(self, path="/v1/exec", token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            self.endpoint + path,
+            data=json.dumps(
+                {"requestId": "t", "argv": ["kubectl", "get", "pods"], "cwd": "/tmp"}
+            ).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_an_unauthenticated_exec_is_401_and_runs_nothing(self):
+        status, payload = self._post()
+        self.assertEqual(401, status)
+        self.assertEqual([], self.executor.executed)
+        # The 401 must not explain itself; that would be a hint sheet.
+        self.assertNotIn("audience", json.dumps(payload))
+
+    def test_a_forged_token_is_401_and_runs_nothing(self):
+        status, _ = self._post(token="forged")
+        self.assertEqual(401, status)
+        self.assertEqual([], self.executor.executed)
+
+    def test_a_verified_token_reaches_the_executor(self):
+        status, _ = self._post(token="good-token")
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executor.executed)
+
+    def test_the_github_refresh_route_is_authenticated_too(self):
+        status, _ = self._post(path="/v1/github/refresh")
+        self.assertEqual(401, status)
+
+    def test_the_chat_relay_route_is_authenticated_too(self):
+        status, _ = self._post(path="/v1/chat/events/ack")
+        self.assertEqual(401, status)
+
+    def test_healthz_stays_open_for_the_readiness_probe(self):
+        with urllib.request.urlopen(self.endpoint + "/healthz") as response:
+            self.assertEqual(200, response.status)
+
+    def test_an_unauthenticated_get_on_a_relay_route_is_401(self):
+        request = urllib.request.Request(self.endpoint + "/v1/chat/events", method="GET")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(401, raised.exception.code)
+
+
+class WorkspaceGitPathTest(unittest.TestCase):
+    """The broker's own git is a separate door from the agent's.
+
+    This is the property that decides how small D17's allowlist can be. If
+    broker-internal git shared `/v1/exec`, every subcommand the broker's
+    plumbing needs would have to be permitted to the agent as well. Each test
+    here pairs the refusal with the ordinary call it must not break.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def executor(self, enabled=True, **environment):
+        environment.setdefault(
+            "CREDENTIAL_PROXY_CONTENT_WORKSPACE", "1" if enabled else "0"
+        )
+        with mock.patch.dict(os.environ, environment):
+            return CommandExecutor(
+                timeout_seconds=10,
+                max_output_bytes=1 << 16,
+                state_dir=str(Path(self.temp_dir.name) / "state"),
+                scoped_pool=None,
+            )
+
+    def tree(self, executor, name="repo"):
+        path = executor.content_workspace_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
+        )
+        return path
+
+    def test_the_broker_root_is_not_inside_the_volume_the_agent_writes(self):
+        executor = self.executor()
+        self.assertFalse(
+            credential_proxy._within(
+                executor.workspace_dir, executor.content_workspace_root
+            ),
+            "the agent's volume must not contain the broker's trees",
+        )
+        self.assertFalse(
+            credential_proxy._within(
+                executor.content_workspace_root, executor.workspace_dir
+            )
+        )
+        # Paired: the root the broker does own is real and usable.
+        self.assertTrue(executor.content_workspace_root.parent.is_dir())
+
+    def test_only_the_subcommands_the_broker_issues_may_run(self):
+        executor = self.executor()
+        tree = self.tree(executor)
+        for argv in (
+            ["git", "bisect", "run", "/bin/sh"],
+            ["git", "config", "--get", "user.name"],
+            ["git", "submodule", "foreach", "id"],
+            ["git", "rebase", "-x", "id", "HEAD~1"],
+            ["git", "filter-branch", "--tree-filter", "id"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    executor.execute_workspace_git(argv, tree)
+
+        # Paired ordinary use: the eleven the product does issue still run, and
+        # produce git's real answer rather than a refusal.
+        result = executor.execute_workspace_git(["git", "rev-parse", "--is-inside-work-tree"], tree)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("true", result.stdout.strip())
+
+    def test_a_working_directory_redirect_is_refused(self):
+        executor = self.executor()
+        tree = self.tree(executor)
+        # `-C` is applied before the subcommand runs, so containment on `cwd`
+        # would be checking a directory the command does not use.
+        with self.assertRaises(ValueError):
+            executor.execute_workspace_git(
+                ["git", "-C", "/etc", "rev-parse", "--show-toplevel"], tree
+            )
+        # Paired: the same command with no redirect answers about the tree it
+        # was pointed at.
+        result = executor.execute_workspace_git(["git", "rev-parse", "--show-toplevel"], tree)
+        self.assertEqual(str(tree.resolve()), result.stdout.strip())
+
+    def test_the_broker_path_cannot_run_in_the_agents_volume(self):
+        executor = self.executor()
+        elsewhere = executor.workspace_dir / "gitops"
+        elsewhere.mkdir(parents=True, exist_ok=True)
+        for cwd in (elsewhere, Path("/etc"), executor.state_dir):
+            with self.subTest(cwd=cwd):
+                with self.assertRaises(ValueError):
+                    executor.execute_workspace_git(["git", "rev-parse", "HEAD"], cwd)
+
+        # Paired: inside the broker's own root it runs.
+        tree = self.tree(executor)
+        self.assertEqual(
+            0,
+            executor.execute_workspace_git(["git", "rev-parse", "--is-inside-work-tree"], tree).exit_code,
+        )
+
+    def test_the_agent_facing_path_cannot_reach_the_broker_root(self):
+        """Widening containment for the broker must not widen it for /v1/exec.
+
+        `_execute` grew a `containment_root` parameter for the workspace path.
+        If that parameter leaked into the agent-facing call, the agent could
+        name the broker's trees as a working directory and every property above
+        would be decoration.
+        """
+        executor = self.executor()
+        tree = self.tree(executor)
+        with self.assertRaises(ValueError):
+            executor.execute(["git", "status"], cwd=str(tree))
+        with self.assertRaises(ValueError):
+            executor.execute(["git", "status"], cwd=str(executor.content_workspace_root))
+
+        # Paired: the agent's own workspace is still accepted, unchanged.
+        inside = executor.workspace_dir / "gitops"
+        inside.mkdir(parents=True, exist_ok=True)
+        result = executor.execute(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(inside))
+        self.assertNotEqual(
+            0, result.exit_code, "not a repository, but it was allowed to try"
+        )
+
+    def test_the_path_does_not_exist_at_all_when_the_feature_is_off(self):
+        executor = self.executor(enabled=False)
+        self.assertIsNone(executor.content_workspace_root)
+        with self.assertRaises(RuntimeError):
+            executor.execute_workspace_git(["git", "rev-parse", "HEAD"], Path("/tmp"))
+        self.assertIsNone(credential_proxy.build_workspace_store(executor))
+
+        # Paired: with the flag on, the store is built and the routes exist.
+        armed = self.executor(enabled=True)
+        self.assertIsNotNone(credential_proxy.build_workspace_store(armed))
+
+    def test_the_routes_answer_over_a_socket_and_never_return_a_path(self):
+        """The protocol surface, end to end, not just the functions behind it.
+
+        Two properties that only exist at this layer: the routes are *absent*
+        when the feature is off -- indistinguishable from an older broker, which
+        is what lets a migrating client detect support by asking -- and no
+        response body carries a filesystem path. The second is the whole
+        invariant: a path handed back is a directory the agent can be told to
+        `cd` into, which is the arrangement content-passing replaces.
+        """
+        import content_workspace
+
+        executor = self.executor(enabled=True)
+        tree_root = executor.content_workspace_root
+        original = getattr(CredentialProxyHandler, "workspaces", None)
+        original_max = getattr(CredentialProxyHandler, "max_request_bytes", 1 << 20)
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def post(route, body):
+            request = urllib.request.Request(
+                f"{endpoint}/v1/workspace/{route}",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.load(exc)
+
+        # Off: the routes do not exist. Not "exist and refuse" -- absent, so a
+        # bug in a refusal cannot reach them.
+        CredentialProxyHandler.workspaces = None
+        self.addCleanup(setattr, CredentialProxyHandler, "workspaces", original)
+        self.addCleanup(setattr, CredentialProxyHandler, "max_request_bytes", original_max)
+        for route in ("open", "read", "list", "commit", "push", "close"):
+            with self.subTest(route=route, armed=False):
+                self.assertEqual(404, post(route, {})[0])
+
+        # On, with a store whose git is a local repository rather than GitHub.
+        seeded = tree_root / "seed"
+        seeded.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet", "--initial-branch=main", str(seeded)],
+            check=True,
+            capture_output=True,
+        )
+        (seeded / "manifests").mkdir(exist_ok=True)
+        (seeded / "manifests" / "app.yaml").write_text("kind: Service\n")
+        store = content_workspace.ContentWorkspaceStore(
+            tree_root, executor.workspace_dir, executor.execute_workspace_git
+        )
+        workspace = content_workspace.Workspace(
+            handle="c" * 32, repo="acme/fleet", tree=seeded, base="main", base_sha=""
+        )
+        store._workspaces[workspace.handle] = workspace
+        CredentialProxyHandler.workspaces = store
+
+        # Paired ordinary use: a read comes back as bytes.
+        status, body = post("read", {"handle": workspace.handle, "path": "manifests/app.yaml"})
+        self.assertEqual(200, status)
+        self.assertEqual(
+            b"kind: Service\n", base64.b64decode(body["contentBase64"])
+        )
+
+        status, listing = post("list", {"handle": workspace.handle})
+        self.assertEqual(200, status)
+        self.assertIn("manifests/app.yaml", [e["path"] for e in listing["entries"]])
+
+        # A refusal keeps its own code rather than reading as a proxy fault.
+        status, refused = post("read", {"handle": workspace.handle, "path": ".git/config"})
+        self.assertEqual(403, status)
+        self.assertEqual("workspace.path.refused", refused["code"])
+        self.assertEqual(404, post("read", {"handle": "z" * 32, "path": "a"})[0])
+        self.assertEqual(404, post("nonsense", {})[0])
+
+        # The invariant: nothing anywhere in a response is a path into the tree.
+        for payload in (body, listing, refused):
+            rendered = json.dumps(payload)
+            self.assertNotIn(str(tree_root), rendered)
+            self.assertNotIn(str(seeded), rendered)
+
+    def test_the_directory_path_keeps_working_while_the_flag_is_on(self):
+        """Land dark: the two mechanisms coexist, so neither blocks the other."""
+        executor = self.executor(enabled=True)
+        workspace = executor.workspace_dir / "gitops" / "lease"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / ".lease").write_text("{}", encoding="utf-8")
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "commit", "-m", "x"], str(workspace)),
+            "arming content-passing must not disturb the path the skills use today",
+        )
+
+
+class ScopedServiceAccountPathTest(unittest.TestCase):
+    """The pool as the broker actually reaches it, not as a unit.
+
+    `test_scoped_sa_pool.py` covers selection and refusal in isolation. What is
+    left, and what a mutation run showed the unit tests could not see, is the
+    join: that a proxied `kubectl` is really handed the scoped credential, and
+    that no path through `execute` reaches a cluster without going past
+    selection first. Both are asserted against a real subprocess reading a real
+    file, because the failure mode here is a command that runs perfectly well on
+    the wrong identity.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    MAPPED = "mapped-cluster"
+    UNMAPPED = "unmapped-cluster"
+    EMAIL = "ka-mapped-cluster-1a2b3c4d@kagents-dev.iam.gserviceaccount.com"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+
+    def pool(self, *, clusters=(MAPPED,)):
+        import scoped_sa_pool
+
+        members = scoped_sa_pool.parse_pool(
+            {
+                "version": 1,
+                "serviceAccounts": [
+                    {
+                        "projectId": self.PROJECT,
+                        "location": self.LOCATION,
+                        "clusterName": cluster,
+                        "serviceAccountEmail": self.EMAIL,
+                    }
+                    for cluster in clusters
+                ],
+            }
+        )
+
+        def minter(account, lifetime):
+            self.minted.append(account)
+            return f"TOKEN-{len(self.minted)}", 1_000_000.0
+
+        return scoped_sa_pool.ScopedServiceAccountPool(
+            members, minter=minter, clock=lambda: 0.0
+        )
+
+    def executor(self, scoped_pool):
+        executor = CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=scoped_pool,
+        )
+        self.fake_gcloud(executor)
+        self.fake_kubectl(executor)
+        return executor
+
+    def fake_gcloud(self, executor):
+        """A `get-credentials` that writes what the real one writes.
+
+        The exec stanza is the point: it is what makes the unmodified kubeconfig
+        authenticate as the ambient identity, so a test that omitted it would
+        pass whether or not the swap happened.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "gcloud"
+        stub.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/bash
+                set -u
+                project=""; location=""; cluster=""
+                for arg in "$@"; do
+                    case "$arg" in
+                        --project=*) project="${arg#--project=}" ;;
+                        --location=*) location="${arg#--location=}" ;;
+                        container|clusters|get-credentials|--*) ;;
+                        *) [ -n "$cluster" ] || cluster="$arg" ;;
+                    esac
+                done
+                ctx="gke_${project}_${location}_${cluster}"
+                cat > "$KUBECONFIG" <<YAML
+                apiVersion: v1
+                kind: Config
+                current-context: ${ctx}
+                clusters:
+                - name: ${ctx}
+                  cluster:
+                    server: https://198.51.100.1
+                contexts:
+                - name: ${ctx}
+                  context:
+                    cluster: ${ctx}
+                    user: ${ctx}
+                users:
+                - name: ${ctx}
+                  user:
+                    exec:
+                      apiVersion: client.authentication.k8s.io/v1beta1
+                      command: gke-gcloud-auth-plugin
+                YAML
+                """
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["gcloud"] = str(stub)
+        return executor
+
+    def fake_kubectl(self, executor):
+        """A kubectl that prints the kubeconfig it was actually given.
+
+        Reading the file back out of the subprocess is what makes this a test of
+        the join rather than of a helper: it fails if the credential is right in
+        `_scoped_kubeconfig` and never reaches the process.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(
+            '#!/bin/bash\necho "KUBECONFIG=$KUBECONFIG"\ncat "$KUBECONFIG"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def agent_kubeconfig(self, executor, cluster):
+        """The pin a Cluster Agent profile forwards: a name, not a credential."""
+        path = executor.workspace_dir / f"{cluster}-kubeconfig.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_a_read_against_a_mapped_cluster_runs_on_that_cluster_s_account(self):
+        """The ordinary read, and the assertion that it changed identity.
+
+        Both halves matter. Exit code 0 alone would pass with the ambient
+        credential; the token alone would pass on a broker that had stopped
+        working.
+        """
+        executor = self.executor(self.pool())
+        result = executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("token: TOKEN-1", result.stdout)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_the_exec_plugin_does_not_survive_into_the_subprocess(self):
+        """Otherwise the ambient identity is still one kubectl preference away."""
+        executor = self.executor(self.pool())
+        result = executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        self.assertNotIn("gke-gcloud-auth-plugin", result.stdout)
+        self.assertNotIn("exec:", result.stdout)
+
+    def test_an_unmapped_cluster_is_refused_and_nothing_runs(self):
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(
+                ["kubectl", "get", "pods"],
+                kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+            )
+        self.assertEqual([], self.minted)
+
+    def test_a_request_naming_no_kubeconfig_does_not_escape_onto_the_ambient_one(self):
+        """`KUBECONFIG` is in the base environment, so "no kubeconfig" is a cluster.
+
+        Without this branch a `kubectl get pods` with the field omitted runs
+        against the sidecar's own kubeconfig and its exec plugin — the ambient
+        identity, past the pool entirely. It is the one door the obvious
+        implementation leaves open, and it is invisible: the command works.
+        """
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(["kubectl", "get", "pods"])
+
+    def test_that_same_request_succeeds_once_the_default_cluster_is_in_the_pool(self):
+        """The refusal above must be about the mapping, not about the path."""
+        executor = self.executor(self.pool(clusters=(self.MAPPED,)))
+        managed = Path(executor.environment["KUBECONFIG"])
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        managed.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}\n",
+            encoding="utf-8",
+        )
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("token: TOKEN-1", result.stdout)
+
+    def test_the_kubeconfig_flag_goes_through_selection_too(self):
+        """`--kubeconfig` outranks the environment in kubectl.
+
+        Closing only the forwarded field would leave the flag as the way round
+        the pool, exactly as it was the way round `_resolve_kubeconfig`.
+        """
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(
+                [
+                    "kubectl",
+                    f"--kubeconfig={self.agent_kubeconfig(executor, self.UNMAPPED)}",
+                    "get",
+                    "pods",
+                ]
+            )
+
+    def test_the_scoped_kubeconfig_is_not_readable_by_the_agent(self):
+        """It holds a bearer token for a cloud identity.
+
+        Two properties, and the mode is the weaker one: the file is under the
+        sidecar-only state dir rather than the shared workspace, so the agent has
+        no path to it at all. The mode is asserted because the process umask is
+        0002 for the shared-volume writes, and a token file inheriting that would
+        be group-readable by the group the agent is in.
+        """
+        executor = self.executor(self.pool())
+        executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        scoped = list(executor.kubeconfig_dir.glob("*.scoped.yaml"))
+        self.assertEqual(1, len(scoped), f"expected one scoped kubeconfig, got {scoped}")
+        self.assertEqual(0o600, scoped[0].stat().st_mode & 0o777)
+        self.assertFalse(
+            str(scoped[0]).startswith(str(executor.workspace_dir)),
+            "the scoped kubeconfig is on the volume the agent writes",
+        )
+
+    def test_the_ambient_path_is_unchanged_when_the_pool_is_off(self):
+        """The rollback has to be a real rollback."""
+        executor = self.executor(None)
+        result = executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("gke-gcloud-auth-plugin", result.stdout)
+        self.assertEqual([], self.minted)
+
+    def test_git_and_gh_do_not_mint_a_cloud_token(self):
+        """They authenticate to GitHub. A GCP token for them would be pure blast radius."""
+        executor = self.executor(self.pool())
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        for name in ("git", "gh"):
+            stub = stub_dir / name
+            stub.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+            stub.chmod(0o755)
+            executor.executables[name] = str(stub)
+        executor.execute(["gh", "pr", "view", "1"])
+        self.assertEqual([], self.minted)
+
+    def test_an_unparameterised_executor_takes_the_pool_from_the_environment(self):
+        """The executor reads the pool from the environment, and this is that line.
+
+        Every other test in this class injects a pool, so deleting the
+        `build_pool()` call in `__init__` would leave them all green while a
+        deployed broker silently ran ambient.
+        """
+        pool_file = Path(self.temp_dir.name) / "pool.json"
+        pool_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "serviceAccounts": [
+                        {
+                            "projectId": self.PROJECT,
+                            "location": self.LOCATION,
+                            "clusterName": self.MAPPED,
+                            "serviceAccountEmail": self.EMAIL,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                # Armed explicitly since 2026-08-12. The flag defaults off while
+                # pool members hold no authority, so the environment this test
+                # is about has to be spelled out rather than assumed.
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL": "1",
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE": str(pool_file),
+            },
+        ):
+            executor = CommandExecutor(
+                timeout_seconds=5,
+                max_output_bytes=1024,
+                state_dir=str(Path(self.temp_dir.name) / "auto"),
+            )
+        self.assertIsNotNone(executor.scoped_pool)
+        self.assertEqual(
+            [f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/{self.MAPPED}"],
+            executor.scoped_pool.scopes,
+        )
+
+
+class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
+    """A refusal has to arrive as a refusal, over the wire.
+
+    Two separate claims live here. That an unmapped cluster is answered 403 with
+    its own rule id rather than as an unexplained 500 — an operator reading that
+    log has to be able to tell a missing pool entry from a broken broker. And
+    that nothing in the request body can choose the account, which is A3 stated
+    where it can actually be checked: at the edge, against a body an agent could
+    really send.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    MAPPED = "mapped-cluster"
+    EMAIL = "ka-mapped-cluster-1a2b3c4d@kagents-dev.iam.gserviceaccount.com"
+    WIDE = "kubeagents-platform-gsa@kagents-dev.iam.gserviceaccount.com"
+
+    def setUp(self):
+        import scoped_sa_pool
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+
+        def minter(account, lifetime):
+            self.minted.append(account)
+            return "TOKEN", 1_000_000.0
+
+        members = scoped_sa_pool.parse_pool(
+            {
+                "version": 1,
+                "serviceAccounts": [
+                    {
+                        "projectId": self.PROJECT,
+                        "location": self.LOCATION,
+                        "clusterName": self.MAPPED,
+                        "serviceAccountEmail": self.EMAIL,
+                    }
+                ],
+            }
+        )
+        pool = scoped_sa_pool.ScopedServiceAccountPool(
+            members, minter=minter, clock=lambda: 0.0
+        )
+
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+        self.saved = {
+            name: CredentialProxyHandler.__dict__.get(name)
+            for name in ("policy", "executor", "enforce_read_only", "max_request_bytes")
+        }
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=10,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=pool,
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = False
+        self.addCleanup(self._restore)
+
+        # Stubbed here rather than per-test. `execute` refuses an unavailable
+        # executable before it reaches the pool, so an unstubbed kubectl makes
+        # every refusal below pass for the wrong reason — a 500 that looks like
+        # a rejection if the assertion only checked "not 200".
+        self.stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        self.stub_dir.mkdir(parents=True, exist_ok=True)
+        kubectl = self.stub_dir / "kubectl"
+        kubectl.write_text('#!/bin/bash\ncat "$KUBECONFIG"\n', encoding="utf-8")
+        kubectl.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(kubectl)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def _restore(self):
+        for name, value in self.saved.items():
+            if value is None:
+                if name in CredentialProxyHandler.__dict__:
+                    delattr(CredentialProxyHandler, name)
+            else:
+                setattr(CredentialProxyHandler, name, value)
+
+    def kubeconfig_naming(self, cluster):
+        path = CredentialProxyHandler.executor.workspace_dir / f"{cluster}.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def post(self, body):
+        request = urllib.request.Request(
+            f"{self.base}/v1/exec",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_an_unmapped_cluster_is_answered_as_a_refusal_not_a_fault(self):
+        status, body = self.post(
+            {
+                "requestId": "r1",
+                "argv": ["kubectl", "get", "pods"],
+                "kubeconfig": self.kubeconfig_naming("nowhere-cluster"),
+            }
+        )
+        self.assertEqual(403, status, body)
+        self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"), body)
+        self.assertIn(
+            f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/nowhere-cluster",
+            body.get("message", ""),
+        )
+
+    def test_the_request_body_cannot_choose_the_account(self):
+        """A3 at the edge.
+
+        Every field an agent might reasonably try, sent alongside a kubeconfig
+        naming a cluster that has no pool entry. If any of them were read, the
+        answer would be a 200 or a mint of the wide account. The assertion is
+        that the refusal is unmoved and nothing was minted at all — a weaker
+        check on status alone would pass against a broker that honoured the
+        field and happened to fail later.
+        """
+        for field, value in (
+            ("serviceAccount", self.WIDE),
+            ("serviceAccountEmail", self.WIDE),
+            ("scope", f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/{self.MAPPED}"),
+            ("clusterName", self.MAPPED),
+            ("projectId", self.PROJECT),
+            ("impersonate", self.WIDE),
+            ("gsa", self.WIDE),
+        ):
+            with self.subTest(field=field):
+                self.minted.clear()
+                status, body = self.post(
+                    {
+                        "requestId": "r2",
+                        "argv": ["kubectl", "get", "pods"],
+                        "kubeconfig": self.kubeconfig_naming("nowhere-cluster"),
+                        field: value,
+                    }
+                )
+                self.assertEqual(403, status, body)
+                self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"), body)
+                self.assertEqual([], self.minted)
+
+    def test_a_body_naming_the_wide_account_still_mints_only_the_scoped_one(self):
+        """The positive half: a served request is served by the mapped account.
+
+        The refusal cases above would all pass on a broker that ignored the pool
+        and failed for some other reason, so this asserts the account actually
+        used on a request that succeeds.
+        """
+        gcloud = self.stub_dir / "gcloud"
+        gcloud.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/bash
+                ctx="gke_kagents-dev_us-east4_mapped-cluster"
+                printf 'apiVersion: v1\\nkind: Config\\ncurrent-context: %s\\nusers:\\n- name: %s\\n  user:\\n    exec:\\n      command: gke-gcloud-auth-plugin\\n' "$ctx" "$ctx" > "$KUBECONFIG"
+                """
+            ),
+            encoding="utf-8",
+        )
+        gcloud.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(gcloud)
+
+        status, body = self.post(
+            {
+                "requestId": "r3",
+                "argv": ["kubectl", "get", "pods"],
+                "kubeconfig": self.kubeconfig_naming(self.MAPPED),
+                "serviceAccount": self.WIDE,
+            }
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual(0, body["exitCode"], body)
+        self.assertIn("token: TOKEN", body["stdout"])
+        self.assertEqual([self.EMAIL], self.minted)
 
 
 if __name__ == "__main__":

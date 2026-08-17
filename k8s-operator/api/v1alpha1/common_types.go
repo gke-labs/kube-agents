@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -416,6 +417,262 @@ type SecuritySpec struct {
 	// ServiceAccountAnnotations specifies custom annotations to apply to the generated ServiceAccount.
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
+
+	// ScopedServiceAccounts maps each GKE cluster the agent may read to the
+	// Google service account that reads it. The credential broker mints a
+	// short-lived token for the account a request's cluster maps to, instead of
+	// using the agent's own identity — which, holding a project-level
+	// roles/container.viewer, can read objects in every cluster in the project.
+	//
+	// Each account is provisioned by Terraform, never by this operator: C5
+	// bounds what a controller may grant, and minting cloud principals inside
+	// the loop that is supposed to bound the agent would put the grant on the
+	// wrong side of the boundary.
+	//
+	// As of 2026-08-12 the accounts hold no IAM grant. They were scoped by an
+	// IAM Condition on the cluster's resource.name, and that was measured to
+	// grant nothing for Kubernetes object operations; removing the condition
+	// without removing the grant would have given every account project-wide
+	// container.viewer. Authority arrives with per-cluster RBAC — see D3 — and
+	// until it does the pool is off by default.
+	//
+	// A cluster absent from this list is REFUSED, not served by a wider
+	// credential. That is the point of the field, and it is also the first thing
+	// an operator will hit: adding a cluster to the fleet without adding it here
+	// produces a refusal naming the missing scope.
+	//
+	// Leaving the list empty keeps the previous behaviour — one identity for
+	// every cluster — and renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the
+	// mode a deployment is in can be read off the Deployment rather than
+	// inferred from what is absent.
+	// +optional
+	ScopedServiceAccounts []ScopedServiceAccount `json:"scopedServiceAccounts,omitempty"`
+
+	// SplitCredentialBrokerPod moves the credential broker out of the agent Pod
+	// into a Deployment and Service of its own, so that a compromised agent no
+	// longer shares a network namespace with the process holding the cloud
+	// credentials.
+	//
+	// REQUIRES ReadWriteMany storage for the agent data volume, and defaults to
+	// false for that reason. The broker runs proxied commands with a working
+	// directory the agent created on the shared data PVC, so both Pods must
+	// mount that PVC read-write at the same path and see the same files there.
+	// The default GKE persistent disk is ReadWriteOnce, which cannot do that
+	// across two Pods on different nodes; the cluster needs Filestore or GCS
+	// Fuse (storage class "standard-rwx" or equivalent) before this is enabled.
+	//
+	// Without it the failure is a scheduling one, not a policy one. The broker
+	// Pod cannot attach the volume, stays Pending with a Multi-Attach error,
+	// and never becomes a Service endpoint — so every proxied command reports
+	// "credential proxy unavailable: [Errno 111] Connection refused", the same
+	// symptom an unhealthy sidecar produces. If the scheduler happens to place
+	// both Pods on one node it will instead appear to work, which makes the
+	// misconfiguration intermittent and worth ruling out first.
+	// directory the agent created on the shared data PVC and rejects any
+	// working directory outside it, so both Pods must mount that PVC read-write
+	// at the same path. The default GKE persistent disk is ReadWriteOnce, which
+	// cannot do that across two Pods; the cluster needs Filestore or GCS Fuse
+	// (storage class "standard-rwx" or equivalent) before this is enabled.
+	// Turning it on without ReadWriteMany storage does not degrade the agent —
+	// every proxied command fails.
+	//
+	// Two further caveats. The agent Pod and the broker Pod share one
+	// ServiceAccount, because the Workload Identity IAM binding names it, so
+	// the identity the broker verifies is per-ServiceAccount rather than
+	// per-Pod. And the bearer token the agent presents crosses the cluster
+	// network in cleartext.
+	// +optional
+	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+
+	// EgressPolicy selects the NetworkPolicy the operator renders for the agent
+	// Pod. "None" (the default) renders nothing.
+	//
+	// "Allowlist" renders a default-deny egress policy that permits only the
+	// destinations the agent legitimately needs, which denies the link-local
+	// metadata server — 169.254.169.254, where anything that can make an HTTP
+	// request can mint the node or Workload Identity service account's tokens —
+	// by simply not listing it.
+	//
+	// REQUIRES splitCredentialBrokerPod: true. This is not a stylistic pairing,
+	// it is the whole reason the split exists. Containers in one Pod share a
+	// network namespace, and the credential broker reaches the metadata server
+	// on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
+	// cannot deny the metadata server to the agent container while allowing it
+	// to the broker container beside it. With the broker still a sidecar, this
+	// policy would take the broker's credentials away and every proxied
+	// command would fail. The operator therefore refuses to render it in that
+	// configuration and reports Degraded rather than breaking the agent — so
+	// the default install, which has the split off, is NOT protected from the
+	// metadata server. See docs/site reference/credential-isolation.md.
+	//
+	// Three further conditions the operator cannot check for you.
+	//
+	//   - The policy does nothing at all on a cluster whose CNI does not
+	//     enforce NetworkPolicy (GKE Standard without network policy enabled);
+	//     Autopilot and GKE Dataplane V2 always enforce.
+	//   - NetworkPolicies are additive, so any other policy in the namespace
+	//     that selects this Pod and permits wider egress re-opens what this
+	//     one closes.
+	//   - NodeLocal DNSCache, if the cluster runs it, may lose DNS entirely.
+	//     It runs hostNetwork, so on Cilium and Dataplane V2 its traffic
+	//     carries a host or remote-node identity, which neither the
+	//     k8s-app: node-local-dns Pod selector nor the 169.254.20.10/32 CIDR
+	//     peer in the rendered DNS rule is guaranteed to match. Both work on
+	//     an iptables dataplane, which is why both are rendered. This is the
+	//     only one of the three that can take the agent down rather than
+	//     quietly weaken it — every allowlisted destination is reached by
+	//     name, so no DNS means no egress at all. Check
+	//     `kubectl -n kube-system get ds node-local-dns` and confirm
+	//     resolution from the agent container after enabling.
+	//
+	// WHAT IT BREAKS, and this is not a short list. The allowlist covers DNS,
+	// the credential broker, LiteLLM, the managed OpenTelemetry collector, and
+	// whatever egressAllowlist adds. Everything else the agent container
+	// reaches on its own goes away:
+	//
+	//   - the "web" toolset (DuckDuckGo) and the "browser" toolset (headless
+	//     Chromium), both of which the platform and cluster-* profiles enable;
+	//   - the MCP servers that call container.googleapis.com and
+	//     developerknowledge.googleapis.com;
+	//   - github.com reached directly from the sandbox;
+	//   - the GKE metadata lookups in cluster_agent_reconcile.py, which fail
+	//     soft — set RECONCILE_PROJECT and RECONCILE_EXCLUDE to restore what
+	//     they were for.
+	//
+	// Those are not accidental casualties. A headless browser with
+	// unrestricted egress is the exfiltration path, so the capabilities this
+	// removes are the same ones that make the control worth having. Restore
+	// individual destinations with egressAllowlist.extraRules — noting that
+	// NetworkPolicy matches addresses, never DNS names, so restoring a hosted
+	// service means naming its address ranges.
+	//
+	// Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
+	// that call the broker, and the broker is on the allowlist.
+	//
+	// TURNING THIS OFF DOES NOT DELETE THE POLICY, and reverting both flags
+	// together will break the agent. An egress policy is a guardrail, and the
+	// operator will not remove a guardrail it may not have created, so setting
+	// this back to "None" leaves <name>-sandbox-metadata-deny in place. That
+	// is fail-closed and harmless on its own — but it is not harmless
+	// alongside splitCredentialBrokerPod: false.
+	//
+	// The trap is that reverting the split alone is refused (see above), so
+	// the natural way out is to turn both off in one edit. Do that and the
+	// broker becomes a sidecar again, inside the very Pod the leftover policy
+	// selects, and the policy does not list the metadata server.
+	//
+	// What you see is a crashlooping agent, not a quietly broken one. The Pod
+	// template changed, and the deployment strategy is Recreate at the default
+	// single replica, so the old Pod goes away first. The new sidecar runs
+	// CREDENTIAL_PROXY_BOOTSTRAP_COMMAND before it serves anything — a gcloud
+	// container clusters get-credentials, rendered whenever spec.harness names
+	// a project, location and cluster, which the Helm chart requires — and
+	// that command needs the metadata server and container.googleapis.com,
+	// both of which the leftover policy denies. The bootstrap raises, the
+	// runtime exits, the sidecar entrypoint's `wait -n` takes the container
+	// with it, and the Pod enters CrashLoopBackOff. ReadyReplicas stays 0, so
+	// the agent reports phase Provisioning with Ready=False and "Waiting for
+	// deployment replicas to be ready".
+	//
+	// That status is accurate but says nothing about a NetworkPolicy. The
+	// sidecar log is where the cause is: gcloud failing to reach the metadata
+	// server. Check for a leftover <name>-sandbox-metadata-deny before
+	// diagnosing anything else.
+	//
+	// (An agent whose spec.harness omits those cluster fields has no bootstrap
+	// command, so its sidecar starts cleanly and the Pod does report Ready
+	// while every proxied command fails at the network. That configuration is
+	// reachable by hand, not through the chart.)
+	//
+	// Revert in three steps instead, which never leaves a broker inside a
+	// policy that denies it:
+	//
+	//   1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
+	//   2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
+	//      (safe now — with the field off the operator will not re-apply it,
+	//      whereas deleting it while the field is still "Allowlist" only
+	//      earns it back on the next reconcile);
+	//   3. set splitCredentialBrokerPod: false.
+	// +kubebuilder:validation:Enum=None;Allowlist
+	// +optional
+	EgressPolicy string `json:"egressPolicy,omitempty"`
+
+	// EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.
+	// Ignored for any other egressPolicy value.
+	// +optional
+	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+}
+
+// ScopedServiceAccount binds one GKE cluster to the Google service account
+// permitted to read it.
+//
+// The three cluster fields are a tuple rather than a name because they compose
+// into the GKE resource name — projects/P/locations/L/clusters/C — which is the
+// key the credential broker looks the account up by, and the key Terraform
+// files the account under. Keying on the cluster name alone would let a second
+// project reusing a name be served by the first project's account.
+//
+// The patterns are GKE's own name rules, and they are enforced here rather than
+// only in the broker because a separator or a quote in one of them would
+// produce a key that silently matches nothing.
+type ScopedServiceAccount struct {
+	// ProjectID is the project the cluster lives in, which need not be the
+	// project the agent runs in.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ProjectID string `json:"projectId"`
+
+	// Location is the cluster's region or zone.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	Location string `json:"location"`
+
+	// ClusterName is the GKE cluster's name.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ClusterName string `json:"clusterName"`
+
+	// ServiceAccountEmail is the account scoped to this cluster. Terraform's
+	// `scoped_service_accounts` output is the source of these values.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$`
+	ServiceAccountEmail string `json:"serviceAccountEmail"`
+}
+
+// EgressAllowlistSpec supplies the parts of the agent Pod's egress allowlist
+// that the operator cannot derive from the PlatformAgent itself.
+type EgressAllowlistSpec struct {
+	// ControlPlaneCIDRs are the address ranges of the Kubernetes API server,
+	// permitted on port 443.
+	//
+	// Refused, with the same Degraded report extraRules gets, if a range
+	// contains a metadata server address or is broader than /16 (/32 for
+	// IPv6). A GKE control plane is a /28 or a single address, so a wider
+	// range is an internet rule in a field named for the control plane — and
+	// this policy is an exfiltration control as well as a metadata one.
+	//
+	// The operator cannot derive this and NetworkPolicy has no selector for it:
+	// on GKE the control plane is outside the cluster, at a private /28 you
+	// chose at creation time or at a public address, and the in-cluster
+	// "kubernetes" Service is translated to that address before policy is
+	// evaluated. Leaving this empty is allowed and is the stricter choice, but
+	// it costs the event-watcher sidecar its API-server connection, so cluster
+	// events stop reaching the agent. Find the range with
+	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+	// +optional
+	ControlPlaneCIDRs []string `json:"controlPlaneCIDRs,omitempty"`
+
+	// ExtraRules are appended verbatim to the rendered policy, for
+	// destinations a plugin or a custom sidecar needs.
+	//
+	// A rule that would re-permit the metadata server is not rendered — an
+	// escape hatch that can reopen the escape is not one. It is also not
+	// silently skipped: the agent goes Degraded with reason
+	// EgressAllowlistRefused, naming the rule and why, and is not reconciled
+	// until the spec is fixed. A dropped rule that left the agent Ready would
+	// mean an unreachable destination with nothing in kubectl describe to
+	// explain it.
+	// +optional
+	ExtraRules []networkingv1.NetworkPolicyEgressRule `json:"extraRules,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

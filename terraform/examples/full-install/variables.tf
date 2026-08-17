@@ -50,9 +50,34 @@ variable "namespace" {
 }
 
 variable "project_roles" {
-  description = "Project-level IAM roles granted to the agent's service account. Leave null to use the kube-agents-iam module's default read-only permission set; set to [] to grant nothing and manage roles externally."
+  description = "Project-level IAM roles granted to the agent's service account. Leave null to use the kube-agents-iam module's default read-only permission set; set to [] to grant nothing and manage roles externally. Note that the module's default narrows when scoped_clusters is non-empty -- see that variable."
   type        = list(string)
   default     = null
+}
+
+variable "scoped_clusters" {
+  description = <<-EOT
+    GKE clusters to provision a scoped reader service account for. Leave null to
+    scope the pool to the one cluster this example provisions, which is what
+    makes a default install run on per-cluster credentials rather than on a
+    single identity that can read every cluster in the project. Set [] to
+    provision no pool and keep the previous single-identity behaviour.
+
+    Two things follow from a non-empty list, and both are intended. The agent's
+    own service account drops roles/container.viewer, so it can enumerate
+    clusters and fetch credentials but cannot read anything inside one. And the
+    credential broker is handed the resulting mapping and armed, so a request
+    naming a cluster that is not in this list is refused rather than served by a
+    wider credential.
+
+    Adding a cluster from another project is a row here; nothing else changes.
+  EOT
+  type = list(object({
+    project_id   = string
+    location     = string
+    cluster_name = string
+  }))
+  default = null
 }
 
 variable "image_tag" {

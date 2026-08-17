@@ -66,6 +66,8 @@ kube-agents/
 ├── scripts/release/                               Release Candidate automation scripts README
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
+├── tests/conformance/                             security-invariant conformance
+│                                                  suite README
 └── tests/e2e/                                     Google Chat E2E suite README
 ```
 
@@ -152,6 +154,8 @@ identifier appears, add its source here.
 | Per-profile Hindsight recall settings the agent uses | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
+| Credential-proxy refusal rule ids, refused flags, forced git config | `agents/platform/scripts/credential_proxy.py` |
+| Command-policy allowlisted verbs and denied `kubectl`/`gcloud` flags | `agents/platform/scripts/command_policy.py` |
 
 ## 3. Documentation eras and status
 
@@ -260,6 +264,7 @@ pull request:
 | `docs/architecture/06-api-and-data-contracts.md` | End-state spec | Exact interfaces to implement: tier-discriminated `Agent` CRD, pre-created read-only identity contract, GitOps repo layout, OKF schema, review-gate contract. | CR shape, cardinality, identity contract, naming conventions | End-state; the CR shape is labeled illustrative |
 | `docs/architecture/07-implementation-roadmap.md` | End-state spec | Phased sequence from the current state (direct-mutation agents, `PlatformAgent` only) to the three read-only personas, with acceptance criteria per phase. | Delta table, phases, definition of done | End-state; sequencing only |
 | `docs/architecture/08-agent-runtime-and-identity.md` | End-state spec | Simplest v1 runtime: a thin controller reconciles the `Agent` CRD into one isolated Hermes pod per agent bound to one pre-created read-only service account. | Runtime, identity referencing (never minting), deferred hardening | End-state; deliberately simplicity-over-defense-in-depth |
+| `docs/architecture/09-capability-envelope.md` | End-state spec | How a request's authority travels between agents once they are separate workloads: the gateway mints a capability in NATS KV, hops attenuate by writing narrower children, the broker verifies the chain. | Capability lifecycle, attenuation, per-hop enforcement, no cryptographic keys | End-state; design only, not built |
 | `docs/designs/agent-communication.md` | Feature design | How the Platform Agent and per-cluster subagents exchange information: a file-based typed handover channel plus optional kanban delegation. | Blackboard model, record envelope, `write_handover` tool | Design of record; NOT yet implemented (banner in file) |
 | `docs/designs/admin-console.md` | Feature design | Product and implementation design for the Kube Agents Console, including its shared FastAPI chat abstraction, Streamlit composition, authenticated interaction API, activity, connection, and Kanban read models. | Admin UX, asynchronous interactions, API contract, correlation, security boundaries | Local implementation; shared proxy API and production hardening planned |
 | `docs/designs/audit-logging-user-attribution.md` | Feature design | Closes the gap where audit logs identify the agent SA but not the requesting human, by carrying requester and trace/session IDs through existing telemetry. | Attribution contract per plane, correlation recipes, trust model | Draft, P0; per-plane implemented-vs-planned split declared inline |
@@ -332,7 +337,7 @@ only what the title does not say.
 | Path | Category | Purpose and summary | Key topics | Audience / notes |
 | --- | --- | --- | --- | --- |
 | `examples/gitops-repo/README.md` | Example | Top of the reference GitOps repository template customers fork as their source of truth: layout map and the propose/apply/review-gate/version-pin contracts (agents propose via PR; only customer CI/CD applies). | Repo layout, guarded paths, version pins | Implements the `docs/architecture/` contracts |
-| `examples/gitops-repo/*/**` sub-docs | Example | Short uniform READMEs and knowledge entries for each template directory: branch-protection ruleset, workflows (actuation pipeline), per-cluster agents/namespaces/provisioning, fleet, OKF knowledge index + sample cluster blueprint, and admission policy (`vap-agent-readonly`). Densely cross-reference the architecture specs by section. | Per-directory contracts, OKF taxonomy, admission policy | Template consumers; tied to the END-STATE spec set |
+| `examples/gitops-repo/*/**` sub-docs | Example | Short uniform READMEs and knowledge entries for each template directory: branch-protection ruleset, workflows (actuation pipeline), per-cluster agents/namespaces/provisioning, fleet, OKF knowledge index + sample cluster blueprint, and admission policy (`kube-agents-agent-readonly`, sourced from `k8s-operator/config/admission/agent-rbac-policy.yaml`). Densely cross-reference the architecture specs by section. | Per-directory contracts, OKF taxonomy, admission policy | Template consumers; tied to the END-STATE spec set |
 | `examples/inference-replay/README.md` | Example | Deploying the Inference Replay proxy that intercepts the LiteLLM service and serves cached LLM responses from a PVC-backed store. | Context-aware hashing, off/on modes | Developers wanting cheap deterministic iteration |
 | `examples/litellm-chatgpt-subscription/README.md` | Example | LiteLLM proxy backed by a consumer ChatGPT subscription via the OAuth device-code flow. | Device flow, PVC token persistence | Users without API keys |
 | `examples/litellm-gemini/README.md` | Example | LiteLLM proxy configured for Gemini models: secret, manifests, metric verification. | API-key secret, PodMonitoring | Cluster operators |
@@ -359,6 +364,7 @@ only what the title does not say.
 | `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set; mutually exclusive with `provision_04_gcp_iam.sh`. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
 | `terraform/modules/chat-pubsub/README.md` | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM; mutually exclusive with `provision_05_gcp_gchat.sh`. | Chat Pub/Sub, service identities, IAM | Infrastructure engineers |
 | `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (PEM import stays with `provision_10_deploy_github_minter.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
+| `tests/conformance/README.md` | Component README | The deterministic conformance suite: one assertion per security invariant, the bucket it falls in, and the historical attack it would have caught. Records the twelve invariants the product currently violates as expected failures. | Invariant coverage, buckets, mutation results | Security reviewers; `tests/e2e/README.md` covers the cluster-bound suite |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
 
 ## 5. Keeping this map fresh

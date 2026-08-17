@@ -63,6 +63,20 @@ Before pushing, run the checks CI enforces:
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
 
+- **Python unit tests** (the `Python Tests` CI job runs this on every PR):
+
+  ```bash
+  make test-python
+  ```
+
+- **Security invariant conformance** (the `Conformance` CI job runs this on every PR, with no paths filter):
+
+  ```bash
+  make conformance   # tests/conformance/, no cluster, under a second
+  ```
+
+  See [`tests/conformance/README.md`](https://github.com/gke-labs/kube-agents/blob/main/tests/conformance/README.md) for what each assertion covers and which invariants are recorded as known violations.
+
 - **Docs build** (if you touched `docs/site/`):
 
   ```bash

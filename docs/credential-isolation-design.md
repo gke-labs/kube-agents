@@ -33,18 +33,28 @@ The credential sidecar receives secret environment variables, credential state,
 and its identity token. It also receives a second, separately-audienced
 Kubernetes-API token, CA, and namespace projection, which the event watcher it
 hosts uses to reach the management cluster. Neither token is mounted in the
-agent or dashboard containers. The credential sidecar also authenticates callers of the
+agent or dashboard containers. (`spec.security.splitCredentialBrokerPod: true`
+is the exception, and the only one: it mounts a third, audience-bound token
+into the agent container so the agent can authenticate to the broker across
+the network. Every unqualified "the sandbox holds no token" claim below
+describes the sidecar layout.) The credential sidecar also authenticates callers of the
 PlatformAgent API before forwarding requests with a non-secret internal
 sentinel. Pod-wide automatic KSA token mounting is disabled.
 
 ### Guarantee
 
-The operator does not place managed credentials in the sandbox container's:
+In the sidecar layout the operator does not place managed credentials in the
+sandbox container's:
 
 - environment;
 - root filesystem;
 - persistent agent volume; or
 - mounted ServiceAccount token path.
+
+The last of those four is given up under
+`spec.security.splitCredentialBrokerPod: true`, which mounts a projected
+ServiceAccount token in the sandbox deliberately; the other three hold in both
+layouts.
 
 `spec.deployment.env` is applied to the credential sidecar because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
@@ -66,6 +76,15 @@ cannot block metadata for one container while allowing it for another.
 This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
+
+That assumption is no longer the only thing available, but it is still what the
+default install runs on. `spec.security.splitCredentialBrokerPod` moves the
+broker into a Pod of its own, and `spec.security.egressPolicy: Allowlist` then
+renders a default-deny egress NetworkPolicy on the agent Pod that denies the
+metadata server by not listing it. Both default to false, the second is refused
+outright without the first, and neither does anything on a cluster whose CNI
+does not enforce NetworkPolicy. See
+[Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 ## Scope
 
@@ -172,6 +191,10 @@ to a per-process random salt with one warning.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential sidecar.
+The table above describes the sidecar layout; under
+`spec.security.splitCredentialBrokerPod: true` a token with the same audience
+is also mounted read-only in the sandbox, because that is how the agent
+authenticates to a broker that is no longer on loopback.
 The event watcher has a separate one-hour token with the Kubernetes API's
 default audience, plus the cluster CA and Pod namespace, mounted at the
 conventional in-cluster path in the same credential sidecar. Two differently
@@ -212,6 +235,232 @@ of the argument vector and permits flags before or between subcommands. This is
 an interim policy mechanism, not a general shell parser. If the policy grows
 beyond these narrowly defined commands, it should use tool-specific argument
 parsers over the structured argument vector.
+
+### git configuration
+
+A kubeconfig is not the only executable configuration the agent can author.
+`git` selects both its transport and several helper programs from configuration
+files, and it reads those from the shared workspace volume as well as from the
+credential runtime's own home directory. Left at its defaults, a `git` the
+sandbox requested can therefore name a program for the credential runtime to
+execute, without the argument vector containing anything the deny policy would
+match — the argv is only ever `git commit`.
+
+The runtime consequently overrides those defaults for every command it runs,
+through the environment rather than through a configuration file, so that the
+settings cannot be edited by anything holding the volume:
+
+- the transport allowlist is restricted to `https`, which git honors above the
+  equivalent setting from every configuration file, including one supplied on
+  the command line;
+- the system configuration file is suppressed and the global configuration file
+  is pinned to a path inside the runtime's private `emptyDir`. It is pinned
+  rather than disabled because `gh auth setup-git` installs the GitHub
+  credential helper by writing that file;
+- the hooks directory is pinned to an empty, non-writable directory, which also
+  neutralizes hooks installed into a fresh clone from a template directory;
+- the filesystem monitor, which names a program and is invoked by a read-only
+  verb, is disabled;
+- commit and tag signing are disabled, and the signing program is set to a
+  command that fails. Signing runs a program named in configuration, and the
+  trigger is an ordinary `git commit` — like the hooks pin above it, and like
+  the filesystem monitor on a read-only verb, its absence is reachable with no
+  unusual argument at all;
+  trigger is an ordinary `git commit`, so this is the one pin whose absence is
+  reachable without any unusual argument at all;
+- subcommand autocorrection is disabled. This one is not defence in depth but a
+  precondition for the refusal list below: with autocorrection enabled from a
+  repository's configuration, a misspelled subcommand resolves to the real one,
+  and a list that compares whole tokens matches nothing; and
+- both editors git launches — the message editor and the rebase sequence editor
+  — are set to a command that does nothing and fails. They are set through the
+  environment for the same reason as the transport allowlist: those two
+  variables outrank the equivalent configuration setting from every file and
+  from the command line. Nothing is lost, because the runtime has no terminal
+  and so a command that needs an editor could never have succeeded.
+
+Only settings whose disabled value is a working value are pinned this way. There
+is no value of `diff.external` that means "no external diff" — git executes an
+empty value — so pinning it replaces one code-execution setting with a `git diff`
+that always fails, and it is deliberately not pinned.
+
+The runtime additionally refuses, in the argument vector, the global options that
+would undo the above: `-c` and `--config-env`, which set configuration ranking
+above the pinned values; `--exec-path`, which selects the directory git executes
+`git-<subcommand>` from; `--git-dir` and `--work-tree`, which identify a
+repository directly and so bypass the containment check applied to the request's
+working directory; and `--global`, `--system` and `--file`, which write the
+configuration files being pinned. `--file` names its target explicitly and the
+target is not a secret — `git config --list --show-origin` prints it — so
+refusing the first two without the third would have closed nothing; it is also
+an unrestricted write to any path, since the containment check inspects the
+request's working directory and not this. Its short spelling `-f` is refused
+only when `config` appears in the same argument vector, because on every other
+subcommand `-f` is `--force`, which the skills issue. `-C` remains accepted
+because the containment check resolves
+it, and repository-local `git config` remains accepted because that is how a
+clone's commit identity is set. Also refused are the subcommands whose function
+is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
+(`--extcmd`), `mergetool`, `filter-branch` (`--tree-filter`), `send-email`
+(`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, the `p4` and `svn`
+bridges, and `submodule foreach`.
+
+The same category appears as options on subcommands the product has no reason to
+refuse outright, so those options are refused instead: `--exec` and `-x`, which
+run a caller-named command once per commit during a rebase; `-O` and
+`--open-files-in-pager`, which run one over the matches of a search — reachable
+by a read-only verb, needing neither a lease nor a file on the volume; and
+`--upload-pack` and `--receive-pack`, which name a program to run for the remote
+end of a transfer. The last two are unreachable while the transport allowlist
+excludes local paths, and are refused so that widening the allowlist does not
+silently reintroduce them. `--upload-pack` has a short spelling and it is
+deliberately not refused: `-u` means `--upload-pack` on `git clone`, but the
+same two characters mean `--set-upstream`, `--update` and `--update-head-ok` on
+other subcommands, and refusing it would refuse all four everywhere.
+(`--receive-pack` has no short form.)
+
+Every entry is matched against the whole argument vector rather than only the
+region where git would honour it; against any abbreviation of it that git would
+accept, since git's subcommand options take unambiguous prefixes; and, for short
+options, anywhere inside a cluster, since git lets short options group into one
+argument and carry a value attached to the last of them. Each of those three is
+a spelling git honours, and a checker that recognises fewer spellings than the
+executor accepts is the one defect this codebase keeps producing. Deciding where
+a subcommand's options end, or which prefixes it leaves unambiguous, would mean
+agreeing with git's parser indefinitely; the checker is instead strictly more
+conservative than git. The cost is a refusal the argument's position would
+otherwise excuse — a commit message that is the bare word `foreach`, or
+`git clean -x` — which is the direction this is meant to fail in.
+
+Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
+`git.argument.refused`. No shipped skill uses any of them; every skill clone,
+fetch and push uses an `https` URL built from a fixed prefix.
+
+**Limitation.** Two gaps remain and both are consequences of the same thing —
+the runtime executing inside a directory the sandbox owns.
+
+The pins do not extend to configuration stored in a repository's own
+`.git/config`, which the sandbox authors and which git consults for settings that
+name a program to run. Some such settings can be pinned and are; others take an
+arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`) and
+therefore cannot be enumerated at all.
+
+That file reaches the credential as well as the program search. A credential
+helper configured there is itself a command, and it runs for any host the
+installed GitHub helper declines to answer for — so it both executes and is
+handed the credential being requested; a URL rewrite configured there changes
+which host a fetch or push contacts, and the transport allowlist does not help
+because the substituted host is `https` too. Neither is closed today. The
+credential-helper half is closable — resetting the helper list in the pinned
+layer and reinstating the runtime's own helper immediately after it discards a
+repository's helper while leaving authenticated push working — but that couples
+the runtime to the value `gh auth setup-git` writes, and it has not been done.
+
+The refused-subcommand list is likewise a denylist over a set that is not closed:
+git holds a command in configuration for several tools, and a future release may
+add another. Allowlisting the subcommands the product issues, and failing closed
+on the rest, is the structurally correct form and is the recommended follow-up.
+
+Reducing both is the motivation for having the runtime receive file content from
+the sandbox rather than operate inside a directory the sandbox controls; until
+that lands, a cloned working tree is sandbox-controlled input and not a trust
+boundary.
+neutralizes hooks installed into a fresh clone from a template directory; and
+
+- the filesystem monitor, which names a program and is invoked by a read-only
+  verb, is disabled; and
+- both editors git launches — the message editor and the rebase sequence editor
+  — are set to a command that does nothing and fails. They are set through the
+  environment for the same reason as the transport allowlist: those two
+  variables outrank the equivalent configuration setting from every file and
+  from the command line. Nothing is lost, because the runtime has no terminal
+  and so a command that needs an editor could never have succeeded.
+
+Only settings whose disabled value is a working value are pinned this way. There
+is no value of `diff.external` that means "no external diff" — git executes an
+empty value — so pinning it replaces one code-execution setting with a `git diff`
+that always fails, and it is deliberately not pinned.
+
+The runtime additionally refuses, in the argument vector, the global options that
+would undo the above: `-c` and `--config-env`, which set configuration ranking
+above the pinned values; `--exec-path`, which selects the directory git executes
+`git-<subcommand>` from; `--git-dir` and `--work-tree`, which identify a
+repository directly and so bypass the containment check applied to the request's
+working directory; and `--global`, `--system` and `--file`, which write the
+configuration files being pinned. `--file` names its target explicitly and the
+target is not a secret — `git config --list --show-origin` prints it — so
+refusing the first two without the third would have closed nothing; it is also
+an unrestricted write to any path, since the containment check inspects the
+request's working directory and not this. Its short spelling `-f` is refused
+only when `config` appears in the same argument vector, because on every other
+subcommand `-f` is `--force`, which the skills issue. `-C` remains accepted
+because the containment check resolves
+it, and repository-local `git config` remains accepted because that is how a
+clone's commit identity is set. Also refused are the subcommands whose function
+is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
+(`--extcmd`), `mergetool`, `filter-branch` (`--tree-filter`), `send-email`
+(`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, the `p4` and `svn`
+bridges, and `submodule foreach`.
+
+The same category appears as options on subcommands the product has no reason to
+refuse outright, so those options are refused instead: `--exec` and `-x`, which
+run a caller-named command once per commit during a rebase; `-O` and
+`--open-files-in-pager`, which run one over the matches of a search — reachable
+by a read-only verb, needing neither a lease nor a file on the volume; and
+`--upload-pack` and `--receive-pack`, which name a program to run for the remote
+end of a transfer. The last two are unreachable while the transport allowlist
+excludes local paths, and are refused so that widening the allowlist does not
+silently reintroduce them. Their short spelling is deliberately not refused:
+`-u` means `--upload-pack` on `git clone`, but the same two characters mean
+`--set-upstream`, `--update` and `--update-head-ok` on other subcommands, and
+refusing it would refuse all four everywhere.
+
+Every entry is matched against the whole argument vector rather than only the
+region where git would honour it; against any abbreviation of it that git would
+accept, since git's subcommand options take unambiguous prefixes; and, for short
+options, anywhere inside a cluster, since git lets short options group into one
+argument and carry a value attached to the last of them. Each of those three is
+a spelling git honours, and a checker that recognises fewer spellings than the
+executor accepts is the one defect this codebase keeps producing. Deciding where
+a subcommand's options end, or which prefixes it leaves unambiguous, would mean
+agreeing with git's parser indefinitely; the checker is instead strictly more
+conservative than git. The cost is a refusal the argument's position would
+otherwise excuse — a commit message that is the bare word `foreach`, or
+`git clean -x` — which is the direction this is meant to fail in.
+
+Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
+`git.argument.refused`. No shipped skill uses any of them; every skill clone,
+fetch and push uses an `https` URL built from a fixed prefix.
+
+**Limitation.** Two gaps remain and both are consequences of the same thing —
+the runtime executing inside a directory the sandbox owns.
+
+The pins do not extend to configuration stored in a repository's own
+`.git/config`, which the sandbox authors and which git consults for settings that
+name a program to run. Some such settings can be pinned and are; others take an
+arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`) and
+therefore cannot be enumerated at all.
+
+That file reaches the credential as well as the program search. A credential
+helper configured there is itself a command, and it runs for any host the
+installed GitHub helper declines to answer for — so it both executes and is
+handed the credential being requested; a URL rewrite configured there changes
+which host a fetch or push contacts, and the transport allowlist does not help
+because the substituted host is `https` too. Neither is closed today. The
+credential-helper half is closable — resetting the helper list in the pinned
+layer and reinstating the runtime's own helper immediately after it discards a
+repository's helper while leaving authenticated push working — but that couples
+the runtime to the value `gh auth setup-git` writes, and it has not been done.
+
+The refused-subcommand list is likewise a denylist over a set that is not closed:
+git holds a command in configuration for several tools, and a future release may
+add another. Allowlisting the subcommands the product issues, and failing closed
+on the rest, is the structurally correct form and is the recommended follow-up.
+
+Reducing both is the motivation for having the runtime receive file content from
+the sandbox rather than operate inside a directory the sandbox controls; until
+that lands, a cloned working tree is sandbox-controlled input and not a trust
+boundary.
 
 ### Agent-supplied kubeconfigs
 
@@ -312,11 +561,23 @@ only command output, never a mounted Git credential file.
 - `automountServiceAccountToken: false` applies to the Pod.
 - Two separately projected ServiceAccount token volumes are mounted only by the
   credential sidecar — its own, and the event watcher's; neither is mounted by
-  the agent or dashboard containers.
+  the agent or dashboard containers. Under `spec.security.splitCredentialBrokerPod: true`
+  the agent container does mount one — the broker-audience token it presents
+  to the broker Service.
 - Secret and credential-state volumes are mounted only by the credential
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
   privilege escalation, and use the runtime-default seccomp profile.
+- The Pod never sets `shareProcessNamespace`, and the two containers run as
+  different users: the sandbox as UID 10000, the `hermes` user the agent image's
+  files belong to, and the sidecar as UID 10001. Neither `/proc` nor a file mode
+  hands the sandbox the sidecar's environment.
+- Both keep GID 10000, which is also the Pod `fsGroup`. The workspace PVC is
+  mounted in both and each writes files the other has to change — the sandbox
+  creates the leased GitOps directory the sidecar clones into, the sidecar writes
+  the kubeconfig pin into a profile home the sandbox created — so both
+  entrypoints run with `umask 0002`. Files that predate the UID split are made
+  group-writable by the kubelet's `fsGroup` pass at every mount.
 - The credential sidecar root filesystem is read-only; writable state uses
   bounded `emptyDir` volumes.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
@@ -325,21 +586,32 @@ only command output, never a mounted Git credential file.
 
 ## Deployment and Migration
 
-The operator always creates the sandbox and Envoy credential sidecar together
-in the existing `<agent>-gateway` Deployment and retains the existing
-`<agent>-data` PVC. Before the sandbox starts, a managed init container removes
-legacy gcloud, GitHub, Git, Kubernetes, AWS, Azure, Docker, npm, and Python
-credential files from that PVC. This preserves agent state without carrying
-credentials forward from an older deployment. It deletes operator-owned
-resources from the abandoned two-Pod design:
+The operator creates the sandbox and Envoy credential sidecar together in the
+existing `<agent>-gateway` Deployment and retains the existing `<agent>-data`
+PVC — unless `spec.security.splitCredentialBrokerPod` is enabled, in which case
+the credential runtime is rendered as its own `<agent>-credential-proxy`
+Deployment and Service instead of as a sidecar. Before the sandbox starts, a
+managed init container removes legacy gcloud, GitHub, Git, Kubernetes, AWS,
+Azure, Docker, npm, and Python credential files from that PVC. This preserves
+agent state without carrying credentials forward from an older deployment. It
+deletes operator-owned resources from the abandoned two-Pod design:
 
-- `<agent>-credential-proxy` Deployment;
-- `<agent>-sandbox` Deployment;
-- `<agent>-credential-proxy` Service;
-- `<agent>-sandbox` ServiceAccount; and
-- `<agent>-sandbox-metadata-deny` NetworkPolicy.
+- `<agent>-sandbox` Deployment; and
+- `<agent>-sandbox` ServiceAccount.
 
 Deletion refuses to remove resources not owned by the PlatformAgent.
+
+Three names that used to be on that list are no longer deleted, and the
+difference is load-bearing. `<agent>-credential-proxy` Deployment and Service
+are not legacy any more: they are exactly what the operator renders under
+`splitCredentialBrokerPod: true`, and it owns them in both directions —
+applied while the flag is on, deleted when it goes off.
+`<agent>-sandbox-metadata-deny` NetworkPolicy is left alone deliberately. It is
+a guardrail rather than a workload, and invariant C5 forbids this controller
+deleting a guardrail it did not create, so a cluster operator who applies that
+policy by hand can rely on it surviving a reconcile. A stale NetworkPolicy
+fails closed; a stale Deployment does not, which is why the two are treated
+differently.
 
 The credential-sidecar image contains Envoy, the real credential-aware CLIs,
 and the credential runtime. The sandbox image contains only the wrappers for
@@ -374,13 +646,18 @@ per-container network identity.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
-   volume, or ServiceAccount token mount, and no Secret-backed env other than
-   the two pod-scoped Session KV values named above — the assertion enumerates
-   them, so a third one cannot be added without amending this list;
+   volume, and no Secret-backed env other than the two pod-scoped Session KV
+   values named above — the assertion enumerates them, so a third one cannot
+   be added without amending this list. In the sidecar layout it also has no
+   ServiceAccount token mount; under `splitCredentialBrokerPod: true` it
+   mounts exactly one token, the broker-audience projection, and still none
+   of the rest;
 2. only the credential sidecar mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;
-4. wrapper URLs resolve to `127.0.0.1:8765`;
+4. wrapper URLs resolve to `127.0.0.1:8765` in the sidecar layout, and to
+   `http://<agent>-credential-proxy.<namespace>.svc.cluster.local:8765` when
+   `splitCredentialBrokerPod` is enabled;
 5. Envoy can reach the Unix-socket backend and `/healthz` reflects both;
 6. unsupported executables, raw shell requests, and blocked disclosure commands
    fail closed;
@@ -388,7 +665,13 @@ CI and deployment tests should assert that:
    with no `exec`, `server`, `proxy-url`, or `tokenFile` value from the supplied
    document reaching it, whether it arrives through `KUBECONFIG` or
    `--kubeconfig`;
-8. the old proxy Deployment and Service are absent after reconciliation;
+8. the `<agent>-credential-proxy` Deployment and Service are absent after
+   reconciliation in the sidecar layout, and present under
+   `splitCredentialBrokerPod: true` — the name is reconciled in both
+   directions, not unconditionally removed. The `<agent>-sandbox`
+   Deployment and ServiceAccount are absent in every configuration, and
+   `<agent>-sandbox-metadata-deny` survives a reconcile that does not create
+   it;
 9. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
 10. Pod readiness fails when either Envoy or the credential runtime fails.

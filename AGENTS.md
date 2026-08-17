@@ -14,6 +14,11 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
+- `tests/`: Test suites that have no other home. `conformance/` asserts the security
+  and permissions invariants without a cluster and runs on every PR; `e2e/` needs one.
+- `hack/`: Repository tooling. Chart sync and the terminology check are invoked from the
+  Makefile; the conformance mutation harness is run directly, because it edits tracked
+  files in place and so is deliberately not wired into a target or into CI.
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
     user-facing docs.

@@ -15,6 +15,19 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 try:
     import mcp.server.fastmcp
 except Exception:
+    import importlib
+
+    def _stub_if_missing(name, module):
+        # Stub only a module that really cannot be imported. These entries
+        # outlive this file: unittest discovery imports every test module into
+        # one process, and a fake pydantic left here (a ModuleType bearing
+        # nothing but Field) is what fastapi finds when test_session_kv_server
+        # imports it later in the same run.
+        try:
+            importlib.import_module(name)
+        except Exception:
+            sys.modules[name] = module
+
     mcp_module = types.ModuleType("mcp")
     mcp_module.__path__ = []
     mcp_server = types.ModuleType("mcp.server")
@@ -25,12 +38,10 @@ except Exception:
     )
     pydantic = types.ModuleType("pydantic")
     pydantic.Field = lambda *a, **k: None
-    sys.modules.update({
-        "mcp": mcp_module,
-        "mcp.server": mcp_server,
-        "mcp.server.fastmcp": fastmcp,
-        "pydantic": pydantic,
-    })
+    _stub_if_missing("mcp", mcp_module)
+    _stub_if_missing("mcp.server", mcp_server)
+    _stub_if_missing("mcp.server.fastmcp", fastmcp)
+    _stub_if_missing("pydantic", pydantic)
 
 import platform_mcp_server
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
