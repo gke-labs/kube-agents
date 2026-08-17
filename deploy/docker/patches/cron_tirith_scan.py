@@ -64,14 +64,22 @@ Nor should the example be read as saying that turn is still covered here. Issue
 triage is no longer a cron turn: ``github-repo-watcher`` is a ``no_agent``
 poller that files a kanban card, so the model reads the issue text inside a
 *worker* run, and a worker run is deliberately not a cron run
-(``tools/cron_run_scope.py``; ``kanban_worker_tools.py``). Read literally, the
-upstream arm above then falls straight through to ``return {"approved": True}``
-with no content scan and no pattern check — which would be true of every kanban
-worker in this deployment, not just this one. That reading is from the source
-quoted above rather than from a running pod, so it is stated as the open
-question it is, and settled by live validation rather than by this comment. It
-is out of scope for this patch either way: the wiring here is anchored on the
-cron arm, and covering worker runs means widening the gate, not this module.
+(``tools/cron_run_scope.py``; ``kanban_worker_tools.py``). Read from the source
+quoted above and nothing else, the upstream arm looks like it falls straight
+through to ``return {"approved": True}`` for that worker, with no content scan
+and no pattern check. Measured in the pod, it does not: a worker is spawned as a
+``hermes -p <profile> chat -q`` subprocess, which enters ``cli.py``'s ``main()``
+and sets ``HERMES_INTERACTIVE=1`` unconditionally, so ``_is_interactive_cli()``
+is true and the same scan runs on the *interactive* arm instead. With no TTY the
+approval prompt that arm raises defaults to a refusal, which makes a worker
+stricter than the cron run that filed its card rather than looser.
+
+So the coverage this module restores to the cron arm is not lost when triage
+moves to a card; it is reached by the other arm. One state does reach the
+unscanned fall-through — no ``HERMES_INTERACTIVE``, no cron marker, no gateway
+platform — and no session type has been found that lands there. Covering it, if
+one ever is, means a ``pre_tool_call`` plugin hook above the approval layer
+rather than more anchored wiring here.
 
 What this patch does
 --------------------
