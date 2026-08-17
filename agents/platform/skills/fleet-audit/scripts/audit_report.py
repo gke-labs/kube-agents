@@ -45,9 +45,13 @@ from typing import NamedTuple
 # copied per-profile). The import itself is lazy so `--dry-run` works on a dev
 # machine with no sandbox. The third entry is the same directory in a source
 # checkout, where nothing has been staged into /opt.
-sys.path.append("/opt/defaults/scripts")
-sys.path.append("/opt/data/scripts")
-sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
+for _scripts_dir in [
+    os.path.join("/opt", "defaults", "scripts"),
+    os.path.join("/opt", "data", "scripts"),
+    str(Path(__file__).resolve().parents[3] / "scripts"),
+]:
+    if os.path.exists(_scripts_dir) and _scripts_dir not in sys.path:
+        sys.path.append(_scripts_dir)
 
 # --------------------------------------------------------------------------- #
 # Constants

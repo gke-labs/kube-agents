@@ -52,8 +52,9 @@ DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
 # test_agent_common_server.py.
 
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a subprocess env with HOME redirected to /tmp for GKE container compatibility."""
-    return {**os.environ, "HOME": "/tmp", **(extra or {})}
+    """Env for subprocesses: HOME -> /tmp (writable creds) and HERMES_HOME pinned."""
+    hermes_home = os.environ.get("HERMES_HOME", "/opt/data")
+    return {**os.environ, "HOME": "/tmp", "HERMES_HOME": hermes_home, **(extra or {})}
 
 
 

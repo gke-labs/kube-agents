@@ -26,10 +26,13 @@ import sys
 from pathlib import Path
 
 # Append global scripts path to allow importing the shared helpers
-sys.path.append("/opt/defaults/scripts")
-sys.path.append("/opt/data/scripts")
-# The same directory in a source checkout, where nothing is staged into /opt.
-sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
+for _scripts_dir in [
+    os.path.join("/opt", "defaults", "scripts"),
+    os.path.join("/opt", "data", "scripts"),
+    str(Path(__file__).resolve().parents[3] / "scripts"),
+]:
+    if os.path.exists(_scripts_dir) and _scripts_dir not in sys.path:
+        sys.path.append(_scripts_dir)
 
 import gitops_workspace
 from github_token_refresh import refresh_git_credentials, log
@@ -165,12 +168,21 @@ def handle_submit(args) -> int:
 
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    title = _normalize_text(args.title)
+    body = _normalize_text(args.body)
+    pr_url = create_pull_request(branch, title, body, workspace, repo, base)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
     print(pr_url)
     return 0
+
+
+def _normalize_text(text: str) -> str:
+    """Unescape literal CLI escape sequences (like \\n or \\r\\n) into real whitespace."""
+    if not text:
+        return text
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
 
 
 def push_branch(branch_name: str, workspace: str) -> None:

@@ -68,6 +68,9 @@ mcp_servers:
       # container (platformagent_manifests.go), so only the allowlist was
       # missing. test_mcp_env_contract.py is what catches this class of gap.
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
+      SLACK_RELAY_URL: "${SLACK_RELAY_URL}"
+      SLACK_ALLOW_ALL_USERS: "${SLACK_ALLOW_ALL_USERS}"
+      PYTHONPATH: "${PYTHONPATH}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       # The bearer token for the loopback Session KV server on 8699. The
       # allowlist above is the whole environment this subprocess gets, so
@@ -150,6 +153,12 @@ platform_toolsets:
 # any other tools.
 toolsets:
   - kanban
+
+platforms:
+  slack:
+    enabled: true
+    extra:
+      rich_blocks: true
 
 # Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
 # audits outgrow: the cost audit runs ten checks against every cluster and the

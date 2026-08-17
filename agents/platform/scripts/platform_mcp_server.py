@@ -665,7 +665,7 @@ def send_notification(message: str, session_id: str = "") -> str:
             pass
 
         if not platforms_found:
-            if os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_HOME_CHANNEL"):
+            if os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_HOME_CHANNEL") or os.environ.get("SLACK_RELAY_URL"):
                 platforms_found.append("slack")
             if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
                 platforms_found.append("google_chat")
