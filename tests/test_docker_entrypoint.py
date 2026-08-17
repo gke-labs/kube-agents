@@ -566,6 +566,103 @@ class SharedScriptsLinkTest(unittest.TestCase):
             self.assertEqual(link.resolve(), (pathlib.Path(tmp) / "scripts").resolve())
 
 
+class ClusterProfileSelfHealTest(unittest.TestCase):
+    """Step 2.6's cluster loop must reach the config of every profile already on the PVC.
+
+    Personas ARE force-synced and cluster `config.yaml` deliberately is not — it carries
+    the `cluster_identity` stamp. So an upgrade hands an existing cluster profile a
+    SOUL.md telling it it MUST call `send_notification` while its config still declares
+    no `notify` server to call it from, and the agent writes its triage and drops it
+    (issue #630, with the fix installed). This asserts the wiring end to end: the loop
+    finds the profiles, passes each one the image's template, and the backfill lands.
+
+    The heal's own behaviour — additive only, idempotent, identity untouched — is
+    covered in tests/test_cluster_config_heal.py; this is about the call site.
+    """
+
+    BLOCK = 'if [ -d "$CLUSTER_TEMPLATE" ]; then'
+
+    TEMPLATE = {
+        "mcp_servers": {"notify": {"command": "notify_server.py"}},
+        "platform_toolsets": {"cli": ["mcp-gke", "mcp-notify"]},
+    }
+    STALE = {
+        "mcp_servers": {"gke": {"command": "gke-mcp"}},
+        "platform_toolsets": {"cli": ["mcp-gke"]},
+        "cluster_identity": {"project": "p", "cluster": "c", "location": "us-central1"},
+    }
+
+    def _run(self, tmp):
+        tmp = pathlib.Path(tmp)
+        # A python the block can reach at the path it hardcodes, and a no-op stand-in
+        # for the skills sync defined further up the entrypoint. Everything else in the
+        # loop is `cp` against the template dir.
+        venv = tmp / "install" / ".venv" / "bin"
+        venv.mkdir(parents=True, exist_ok=True)
+        (venv / "python3").symlink_to(sys.executable)
+        prelude = (
+            "set -e\n"
+            "sync_profile_skills() { :; }\n"
+            f'TARGET_DIR="{tmp}"\n'
+            f'INSTALL_DIR="{tmp / "install"}"\n'
+            f'CLUSTER_TEMPLATE="{tmp / "cluster-template"}"\n'
+            'CLUSTER_CONFIG_HEAL_SCRIPT="'
+            f'{_REPO / "deploy" / "shared" / "cluster_config_heal.py"}"\n'
+        )
+        script = prelude + _extract_shell_block(self.BLOCK) + "echo DONE\n"
+        return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60)
+
+    def _setup(self, tmp, profiles):
+        tmp = pathlib.Path(tmp)
+        template = tmp / "cluster-template"
+        template.mkdir(parents=True, exist_ok=True)
+        (template / "config.yaml").write_text(yaml.safe_dump(self.TEMPLATE), encoding="utf-8")
+        (template / "SOUL.md").write_text("MUST call send_notification\n", encoding="utf-8")
+        for name in profiles:
+            home = tmp / "profiles" / name
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "config.yaml").write_text(yaml.safe_dump(self.STALE), encoding="utf-8")
+        return template
+
+    def test_every_stale_cluster_profile_gains_the_notify_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            names = ["cluster-p-a-us-central1", "cluster-p-b-us-east1"]
+            self._setup(tmp, names)
+
+            proc = self._run(tmp)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for name in names:
+                config = yaml.safe_load(
+                    (pathlib.Path(tmp) / "profiles" / name / "config.yaml").read_text()
+                )
+                self.assertIn("notify", config["mcp_servers"], f"{name} kept no egress")
+                self.assertIn("mcp-notify", config["platform_toolsets"]["cli"])
+                # The whole reason this is a merge and not a re-sync.
+                self.assertEqual(config["cluster_identity"], self.STALE["cluster_identity"])
+                # And the force-synced half still happens.
+                self.assertTrue((pathlib.Path(tmp) / "profiles" / name / "SOUL.md").is_file())
+
+    def test_a_missing_heal_script_is_not_fatal(self):
+        # An older PVC, or an image built without it. The loop's other work — the
+        # personas — must still land, and `set -e` is in force.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._setup(tmp, ["cluster-p-a-us-central1"])
+            prelude = (
+                "set -e\n"
+                "sync_profile_skills() { :; }\n"
+                f'TARGET_DIR="{tmp}"\n'
+                f'INSTALL_DIR="{tmp}/install"\n'
+                f'CLUSTER_TEMPLATE="{tmp}/cluster-template"\n'
+                f'CLUSTER_CONFIG_HEAL_SCRIPT="{tmp}/gone.py"\n'
+            )
+            script = prelude + _extract_shell_block(self.BLOCK) + "echo DONE\n"
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+
+
 class FreshVolumeDetectionTest(unittest.TestCase):
     """A fresh volume is not an absent file, and getting that wrong cost a whole install.
 

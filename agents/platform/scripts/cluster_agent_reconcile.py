@@ -16,7 +16,8 @@
 #
 # The management cluster used to be excluded, identified via the GKE metadata server. It is
 # not any more, because an event on that cluster now needs an agent scoped to it like every
-# other cluster's does: the triage session is created on the cluster's own profile
+# other cluster's does: the triage session runs on the Chat Agent, whose one instruction is
+# to delegate it to the profile scoped to the cluster that raised the event
 # (session_kv_server.trigger_agent_troubleshooter), so a cluster without a profile is a
 # cluster whose alerts have nobody to answer them. Two consequences worth knowing:
 #   • the event watcher must not then watch that cluster twice, once through --in-cluster and

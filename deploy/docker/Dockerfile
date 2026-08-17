@@ -1081,7 +1081,7 @@ RUN rm -f /opt/defaults/config.yaml
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 COPY agents/chat/scripts/ /opt/defaults/scripts/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
-# One COPY for the three, not three: `credential-proxy` builds FROM this stage and the
+# One COPY for the four, not four: `credential-proxy` builds FROM this stage and the
 # chain is bounded at 128 layers — see the layer-budget note at the top of the file.
 # They share a destination anyway.
 #
@@ -1099,9 +1099,16 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 #                              OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint
 #                              baked above is the only one that ever takes effect — see
 #                              tests/test_otel_config.py.
+#   cluster_config_heal.py     backfills image-owned MCP servers into cluster profiles
+#                              already on the PVC (entrypoint step 2.6). Their config.yaml
+#                              is the one image-managed file NOT force-synced — it carries
+#                              the cluster_identity stamp — so a server added to the
+#                              template otherwise reaches only profiles scaffolded after
+#                              the upgrade. See tests/test_cluster_config_heal.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
+     deploy/shared/cluster_config_heal.py \
      /opt/defaults/scripts/
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---

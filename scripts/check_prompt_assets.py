@@ -117,6 +117,7 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("scripts/profile_overlay.py", "deploy/shared/profile_overlay.py"),
     ("scripts/profile_plugins.py", "deploy/shared/profile_plugins.py"),
     ("scripts/otel_config.py", "deploy/shared/otel_config.py"),
+    ("scripts/cluster_config_heal.py", "deploy/shared/cluster_config_heal.py"),
 )
 
 # What a specialist profile home actually contains, which is not the whole of

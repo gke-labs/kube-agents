@@ -977,6 +977,11 @@ fi
 # the helper defined just above, and one targeted config repair. Kept after 2.6a only
 # because it is the caller — everything here belongs to 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
+# Prefer the IMAGE copy over the PVC copy, for the reason step 2.7 documents: a PVC copy
+# can outlive the image it came from, and what this decides is what a cluster agent can
+# and cannot call.
+CLUSTER_CONFIG_HEAL_SCRIPT="/opt/defaults/scripts/cluster_config_heal.py"
+[ -f "$CLUSTER_CONFIG_HEAL_SCRIPT" ] || CLUSTER_CONFIG_HEAL_SCRIPT="$TARGET_DIR/scripts/cluster_config_heal.py"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
@@ -1002,6 +1007,19 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         if [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
                 || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
+        fi
+        # The other half of the same problem, in the other direction: a config that is
+        # not force-synced does not just keep keys the template dropped, it also misses
+        # servers the template gained. The personas above ARE force-synced, so an
+        # upgrade can hand an existing cluster profile a SOUL.md telling it it MUST call
+        # send_notification while its config still has no `notify` server to call it
+        # from — the agent writes the report and drops it, which is #630 with the fix
+        # installed. Additive, per-server, and a no-op once healed; see
+        # deploy/shared/cluster_config_heal.py for why it is not a config re-sync.
+        if [ -f "$CLUSTER_CONFIG_HEAL_SCRIPT" ] && [ -w "$d/config.yaml" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_CONFIG_HEAL_SCRIPT" \
+                --profile-dir "$d" --template "$CLUSTER_TEMPLATE/config.yaml" \
+                || echo "WARN: failed to backfill MCP servers into $d/config.yaml; this cluster agent may be missing send_notification" >&2
         fi
     done
 fi
