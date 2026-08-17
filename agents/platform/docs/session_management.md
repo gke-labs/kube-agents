@@ -206,8 +206,9 @@ send prescribe opposite remedies: raise the ceiling, or fix the chat credentials
 no longer draws that distinction — it reports neither class and counts both only to withhold the
 all-clear — so this column is the sole record that a delivery failed anywhere in the system. No
 metric counts them; the SOP's "What this recap does not report" says so, and says what to query
-instead. Like `cluster`, it postdates the original columns, so `init_db` adds it with an `ALTER` and
-the recap selects it only when `PRAGMA table_info` says it is there.
+instead. Like `cluster`, it postdates the first draft of this table, and the recap selects it only
+when `PRAGMA table_info` says it is there — see "A pre-release table, and no migration" below for
+why that tolerance is in the reader and not in `init_db`.
 
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
 before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
@@ -220,9 +221,9 @@ log is where it surfaces.
 
 `cluster` is recorded because one session KV database backs every cluster profile in the pod, the
 same reason the ceiling is fleet-wide. Without it the recap cannot tell two same-named workloads in
-two clusters apart. It postdates the other columns, so `init_db` adds it to an existing table with
-an `ALTER` and the recap selects it only when `PRAGMA table_info` says it is there. Rows expire on
-the same 14-day TTL as the rest of the database:
+two clusters apart. It postdates the other columns, and the recap selects it only when
+`PRAGMA table_info` says it is there. Rows expire on the same 14-day TTL as the rest of the
+database:
 
 ```sql
 CREATE TABLE intercepted_events(
@@ -240,6 +241,30 @@ CREATE TABLE intercepted_events(
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+##### A pre-release table, and no migration
+
+`init_db` runs `CREATE TABLE IF NOT EXISTS` and nothing else: there is no `ALTER TABLE` for
+`cluster` or `delivery_error` anywhere in the tree. The table has never been in a release, so the
+only databases carrying an earlier shape are dev installs that ran an intermediate commit of the
+change that introduced it, and a migration maintained for a shape no user has is machinery that
+outlives its reason.
+
+**If you have such an install, drop the table before rolling the image.** `CREATE TABLE IF NOT
+EXISTS` is a no-op against it, so the columns never appear, and the failure is silent in the
+direction that matters: `mark_delivery_failed` raises `no such column: delivery_error`, the blanket
+`except Exception` around it swallows that, and the row keeps `notified = 1`. The recap then counts
+an alert nobody received as one that reached chat — the exact false reassurance `delivery_error`
+exists to remove.
+
+```bash
+sqlite3 "$SESSION_KV_DB_PATH" 'DROP TABLE IF EXISTS intercepted_events;'
+```
+
+`init_db` recreates it on the next start. The cost is at most a day of recap data, since the recap
+reads a 24-hour window (72 on a Monday). The reader's `PRAGMA table_info` tolerance is a separate
+thing and stays: it keeps a recap running against a ledger written by an older _session server_ in
+the same pod during a rollout, which is a skew a drop cannot fix.
 
 #### `alert_quota`
 

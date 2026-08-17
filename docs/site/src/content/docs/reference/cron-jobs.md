@@ -11,7 +11,7 @@ Two files define the scheduled jobs, one per profile, and which one an entry bel
 
 `agents/platform/cron/jobs.json` is the Platform Agent's roster, and carries the seven governance watchdogs plus `github-repo-watcher`, a `no_agent` poller that runs no model. `profile-cron-tick` is what makes it live: each watchdog is a real cron run in its own process, with that profile's persona, toolsets, `skills`, `model` and `max_turns`. No id may appear on both rosters — two rosters both carrying one is that audit running twice per schedule, concurrently with itself.
 
-It also carries `eod-event-watcher-daily-report`, the one entry on it that prompts no model: a `no_agent` script that renders the k8s-event-watcher recap straight from the session ledger and delivers its stdout verbatim. It sits on this roster despite needing none of the profile's toolsets because what it reads belongs to the Platform Agent: the session database. Scripts are shared rather than per-profile (the entrypoint links `profiles/platform/scripts` at the shared directory), so `script` resolves here exactly as it does on the Chat Agent's roster.
+`eod-event-watcher-daily-report` is the roster's second `no_agent` entry: a script that renders the k8s-event-watcher recap straight from the session ledger and delivers its stdout verbatim. It sits here despite needing none of the profile's toolsets because what it reads belongs to the Platform Agent: the session database. Scripts are shared rather than per-profile (the entrypoint links `profiles/platform/scripts` at the shared directory), so `script` resolves here exactly as it does on the Chat Agent's roster.
 
 ## The shipping jobs
 

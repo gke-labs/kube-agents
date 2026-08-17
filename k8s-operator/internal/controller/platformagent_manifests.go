@@ -2375,10 +2375,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// destinations qualify, and so do the alert ceilings — they bound how many
 	// notifications the session server posts in a day and nothing else. A
 	// path, a credential or an image reference would not.
+	//
+	// The two EOD_* names are the end-of-day recap's only tunables. They
+	// narrow what its listing prints and reach nothing else — not what the
+	// notifier forwards, not what the recap is willing to claim about the
+	// day. A value that is not a namespace list or an integer is warned about
+	// on stderr and ignored, so the worst an arbitrary one can do is leave
+	// the defaults in place.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
+		"EOD_EXCLUDE_NAMESPACES":      {},
+		"EOD_MIN_EVENT_COUNT":         {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},

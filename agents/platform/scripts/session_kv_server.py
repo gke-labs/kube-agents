@@ -325,11 +325,15 @@ def init_db() -> None:
                 )
                 """
             )
-            # No ALTER TABLE migration accompanies the two columns added to this
-            # table during review: it is introduced by this change and has never
-            # been in a release, so the only databases carrying an older shape
-            # are pre-release dev installs. `DROP TABLE intercepted_events` on
-            # one of those is the fix, and costs a day of recap data.
+            # No ALTER TABLE migration accompanies the `cluster` and
+            # `delivery_error` columns: this table has never been in a release,
+            # so the only databases carrying an older shape are pre-release dev
+            # installs. `DROP TABLE intercepted_events` on one of those is the
+            # fix, and costs a day of recap data. Skipping the drop is silent
+            # in the direction that matters — `mark_delivery_failed` raises
+            # `no such column`, its own blanket except swallows that, and the
+            # row keeps `notified = 1`. `session_management.md`, "A pre-release
+            # table, and no migration", is the operator-facing version.
             #
             # The recap queries one day at a time; without this it is a full
             # scan of a table that grows with every event in the retention

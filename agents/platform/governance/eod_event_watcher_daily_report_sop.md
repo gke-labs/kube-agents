@@ -167,13 +167,35 @@ different session database, and `--cluster-name` overrides the name resolved fro
 `GKE_CLUSTER_NAME`. With no `--db`, the script reads `SESSION_KV_DB_PATH` — the same variable
 `session_kv_server.py` and the operator use — before falling back to the packaged path.
 
-The two filters are environment variables on the agent container, set the way the alert ceiling's
-`ALERT_DAILY_LIMIT_*` are:
+The two filters are environment variables on the agent container:
 
 | Variable                 | Default                                   | Effect                                                      |
 | ------------------------ | ----------------------------------------- | ----------------------------------------------------------- |
 | `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing.           |
 | `EOD_MIN_EVENT_COUNT`    | `1`                                       | Groups below it are dropped from the listing, not the veto. |
 
-Both are read on every run, so `kubectl set env` takes effect on the next tick with no restart. A
-value that will not parse warns on stderr and falls back to the default rather than failing the run.
+Set them the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR,
+under `spec.deployment.env`:
+
+```yaml
+spec:
+  deployment:
+    env:
+      - name: EOD_EXCLUDE_NAMESPACES
+        value: kube-system,kube-public,kube-node-lease,istio-system
+      - name: EOD_MIN_EVENT_COUNT
+        value: "5"
+```
+
+**The CR is the only route that works, and this is why.** Environment on that container is rendered
+by the operator and filtered through `safeSandboxEnvOverrides`, an allowlist — a name that is not on
+it is dropped with no error, no event and no status condition, so the edit appears to succeed and
+changes nothing. Both `EOD_*` names are on it. Editing the Deployment with `kubectl set env` is not
+a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
+Deployment from the CR and reverts it.
+
+Applying the CR change rolls the pod, and the next tick after it comes up uses the new values. The
+script re-reads both on every run, so nothing further is needed once the pod is up. A value that
+will not parse warns on stderr and falls back to the default rather than failing the run — which
+matters here, because this job's stdout is the chat message and a traceback would be a missing
+recap.
