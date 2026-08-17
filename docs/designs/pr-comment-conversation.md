@@ -110,20 +110,31 @@ and nothing is lost by cutting over: both poll the same repository through the s
 poll`, and the new job runs three times as often. Issues move from every 30 minutes to every 10 —
 better responsiveness, now free, because the cost is API calls rather than tokens.
 
-### A consequence to know rather than discover
+### A consequence that turned out not to be one
 
 A card is dispatched to a kanban worker, and a worker run is deliberately **not** a cron run
 (`deploy/docker/patches/cron_run_scope.py`). Anything keyed on cron context therefore does not reach
 the work the card produces — including `approvals.cron_mode` and the Tirith content scan that
-`deploy/docker/patches/cron_tirith_scan.py` restores to the cron path. That patch's motivating
-example was precisely this issue-triage turn, whose input is text written by anyone with a GitHub
-account.
+`deploy/docker/patches/cron_tirith_scan.py` splices inside `if _is_cron_approval_context():`. That
+patch's motivating example was precisely this issue-triage turn, whose input is text written by
+anyone with a GitHub account.
 
-Read literally, the upstream approval gate then falls through to `approved: True` for a worker run
-with no content scan and no pattern check — which would be true of every kanban worker in this
-deployment, not just this one. That reading is from source, not from a running pod. It is recorded
-as the open question it is, settled by live validation, and out of scope for the watcher change
-either way: covering worker runs means widening the approval gate, not editing a poller.
+Read from source alone, the approval gate looks like it falls through to `approved: True` for a
+worker run, with no content scan and no pattern check. Measured in the pod, it does not. A kanban
+worker is not an embedded session: `hermes_cli/kanban_db.py`'s `_default_spawn` launches it as a
+`hermes -p <profile> chat -q` subprocess, which enters `cli.py main()`, which sets
+`HERMES_INTERACTIVE=1` unconditionally. `_is_interactive_cli()` is therefore true for every worker,
+`check_all_command_guards` takes the interactive branch, and Tirith runs there. With no TTY the
+approval prompt defaults to Deny, so a worker is _more_ restrictive than a cron run, not less. Both
+a homograph command and a plain-ASCII `curl … | sh` are blocked under `HERMES_INTERACTIVE=1` and
+under `HERMES_CRON_SESSION=1`; a benign command is approved under both.
+
+What remains is a third state — no `HERMES_INTERACTIVE`, no cron marker, no gateway platform — which
+does reach the unscanned branch. No session type has been identified that lands there. If one is
+ever found, the route to covering it is `ctx.register_hook("pre_tool_call", …)`, dispatched from
+`model_tools.py` above the approval layer and not gated on session context, rather than a
+nineteenth anchored substitution in `deploy/docker/patches/`. Note that the hook dispatch swallows
+exceptions and is fail-open, so such a hook must catch internally and decide explicitly.
 
 ## 3. The forge provider
 
