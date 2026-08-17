@@ -325,23 +325,12 @@ def init_db() -> None:
                 )
                 """
             )
-            # `cluster` was added after the table shipped in a pre-release
-            # image, and CREATE TABLE IF NOT EXISTS does not alter an existing
-            # one. Guarded by a table_info read rather than by catching the
-            # duplicate-column error, so a genuine failure is not swallowed.
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
-            if "cluster" not in columns:
-                conn.execute(
-                    "ALTER TABLE intercepted_events ADD COLUMN cluster TEXT NOT NULL DEFAULT ''"
-                )
-            # Same story as `cluster`, and the same guard. Empty means "no
-            # delivery failure recorded", which is also what every row written
-            # before this column existed says — the honest reading, since
-            # nothing observed those deliveries either way.
-            if "delivery_error" not in columns:
-                conn.execute(
-                    "ALTER TABLE intercepted_events ADD COLUMN delivery_error TEXT NOT NULL DEFAULT ''"
-                )
+            # No ALTER TABLE migration accompanies the two columns added to this
+            # table during review: it is introduced by this change and has never
+            # been in a release, so the only databases carrying an older shape
+            # are pre-release dev installs. `DROP TABLE intercepted_events` on
+            # one of those is the fix, and costs a day of recap data.
+            #
             # The recap queries one day at a time; without this it is a full
             # scan of a table that grows with every event in the retention
             # window.

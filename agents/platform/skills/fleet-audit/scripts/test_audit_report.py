@@ -1683,9 +1683,9 @@ class TestAuditCatalogue(unittest.TestCase):
         the expected set: it prompts no model, so none of the above applies to
         it and it has no stream in `AUDITS` to pair with. It is on this roster
         for what it reads, not for what it runs — `eod-event-watcher-daily-report`
-        renders the event-watcher recap from this profile's session database and
-        `governance/eod_report_config.yaml`. The equality still binds every
-        entry that does prompt a model, which is the case this test exists for.
+        renders the event-watcher recap from this profile's session database.
+        The equality still binds every entry that does prompt a model, which is
+        the case this test exists for.
 
         Excluded from one equality, pinned by another. `github-repo-watcher`
         was named in the expected set before this roster carried a second

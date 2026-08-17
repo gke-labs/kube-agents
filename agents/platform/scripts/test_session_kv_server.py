@@ -800,35 +800,6 @@ class TestPlaintextIdentityPurge(unittest.TestCase):
         session_kv_server.init_db()
         self.assertEqual(self._read("modern-1")["user_email_hash"], "deadbeef")
 
-    def test_the_ledger_gains_its_cluster_column_on_an_existing_database(self):
-        """`CREATE TABLE IF NOT EXISTS` does not alter a table that is already there.
-
-        The ledger shipped in a pre-release image without `cluster`, so a pod
-        upgraded in place has the old shape on its PVC. Without the ALTER every
-        insert would fail against it and the recap would report an empty day.
-        """
-        import sqlite3
-        with sqlite3.connect(temp_db_path) as conn:
-            conn.execute("DROP TABLE IF EXISTS intercepted_events")
-            conn.execute(
-                "CREATE TABLE intercepted_events ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT, workload TEXT, "
-                "object_kind TEXT, reason TEXT, message TEXT, severity TEXT, "
-                "occurrences INTEGER, notified INTEGER, created_at TIMESTAMP)"
-            )
-        session_kv_server.init_db()
-
-        session_kv_server.record_intercepted_event(
-            cluster="cluster-c", namespace="prod", workload="api", object_kind="Pod",
-            reason="OOMKilled", message="m", severity="Critical", occurrences=1,
-            notified=False,
-        )
-        with sqlite3.connect(temp_db_path) as conn:
-            rows = conn.execute(
-                "SELECT cluster FROM intercepted_events WHERE workload = 'api'"
-            ).fetchall()
-        self.assertEqual(rows, [("cluster-c",)])
-
 
 class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
     """The row has to say which platform its thread lives on.

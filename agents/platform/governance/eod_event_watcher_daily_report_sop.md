@@ -20,8 +20,7 @@ drop it. Nothing rewrites that output, so the script emits a bullet list rather 
 table, which wraps badly in chat viewports.
 
 `profile-cron-tick` ticks the roster once a minute with `HERMES_HOME` set to this profile's home,
-which is how the script finds the session database and `eod_report_config.yaml` without absolute
-paths, and restores the home-channel routing a `no_agent` child would otherwise lose. The script
+and restores the home-channel routing a `no_agent` child would otherwise lose. The script
 itself is shared, not per-profile — the entrypoint links `profiles/platform/scripts` at the shared
 scripts directory. It needs no cluster access.
 
@@ -102,13 +101,9 @@ rejects `NodeNotReady`, `NetworkNotReady`, `FailedScheduling` and `Evicted` at t
 read their absence from a recap as their absence from the fleet. See the Severity Gate section of
 [`../docs/session_management.md`](../docs/session_management.md).
 
-The listing is fixed to `Info` in `LISTED_SEVERITIES` in `eod_report_generator.py`; there is no
-configuration key. `filters.include_severities` was that key and was removed rather than left on a
-default — widening it bought a digest of the day's already-delivered alerts, and it still did not
-reach the two classes chat never received, because those are an outcome and not a severity. A config
-that still carries the key is not silently overruled: it gets a stderr warning, naming the
-severities asked for when the value was wider than `Info` and calling the key obsolete when it was
-not, and the Info-only listing either way. Delete the key.
+The listing is fixed to `Info` in `LISTED_SEVERITIES` in `eod_report_generator.py`, and nothing
+widens it. Widening it would buy a digest of the day's already-delivered alerts, and it still would
+not reach the two classes chat never received, because those are an outcome and not a severity.
 
 Three properties of the listing follow from what a suppressed event is:
 
@@ -152,14 +147,14 @@ Neither filter reaches those counts. `min_event_count` applies to the listing on
 does apply it measures the withheld rows rather than the group's total: a group is one
 cluster/namespace/workload/reason/severity key and may hold rows with different outcomes, so a
 workload with one withheld alert and nine delivered ones would otherwise clear a threshold of five
-on the strength of nine events that were not withheld. `filters.exclude_namespaces` removes a
+on the strength of nine events that were not withheld. `EOD_EXCLUDE_NAMESPACES` removes a
 namespace from the workload breakdown, the headline counts and the closing informational total, but
 not from the veto — `kube-system` ships in the exclusion list and the watcher forwards it anyway, so
 applied to the veto a control-plane delivery failure would drop out of it and the recap would end
 the day green over it. Excluding a namespace narrows what the report _says_ and must not widen what
 it is willing to _claim_, so the row is flagged rather than skipped. Once the filter has removed
 anything, the ✅ all-clear and the 📉 closing total both carry "namespaces in
-`filters.exclude_namespaces` are outside this recap's scope".
+`EOD_EXCLUDE_NAMESPACES` are outside this recap's scope".
 
 ## Running it by hand
 
@@ -170,9 +165,15 @@ python3 /opt/data/scripts/eod_report_generator.py
 `--window-hours` widens or narrows the period (default 24, or 72 on a Monday), `--db` points at a
 different session database, and `--cluster-name` overrides the name resolved from
 `GKE_CLUSTER_NAME`. With no `--db`, the script reads `SESSION_KV_DB_PATH` — the same variable
-`session_kv_server.py` and the operator use — before falling back to the packaged path. Filters and
-section toggles live in `eod_report_config.yaml` beside this file.
+`session_kv_server.py` and the operator use — before falling back to the packaged path.
 
-A hand-run from a shell has no `HERMES_HOME` pointing at this profile, so the config is found by the
-absolute fallback (`$PLATFORM_AGENT_HOME/profiles/platform/governance/`) instead — the same file,
-reached the other way. `--config` overrides both.
+The two filters are environment variables on the agent container, set the way the alert ceiling's
+`ALERT_DAILY_LIMIT_*` are:
+
+| Variable                 | Default                                   | Effect                                                      |
+| ------------------------ | ----------------------------------------- | ----------------------------------------------------------- |
+| `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing.           |
+| `EOD_MIN_EVENT_COUNT`    | `1`                                       | Groups below it are dropped from the listing, not the veto. |
+
+Both are read on every run, so `kubectl set env` takes effect on the next tick with no restart. A
+value that will not parse warns on stderr and falls back to the default rather than failing the run.

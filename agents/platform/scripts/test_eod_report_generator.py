@@ -16,10 +16,9 @@
 """Unit tests for the deterministic k8s-event-watcher daily activity summary."""
 
 import datetime
-import importlib
 import io
 import os
-import pathlib
+import re
 import sqlite3
 import sys
 import tempfile
@@ -33,11 +32,81 @@ from eod_report_generator import (
     LISTED_SEVERITIES,
     filter_and_aggregate_events,
     generate_markdown_report,
-    load_config,
     load_intercepted_events,
 )
 
 
+def min_count(value):
+    """Raise the listing threshold for the duration of a `with` block.
+
+    The threshold is read from `EOD_MIN_EVENT_COUNT` at each call rather than
+    held in a config object, so a test that wants a different one patches the
+    environment the same way production sets it.
+    """
+    return mock.patch.dict(os.environ, {"EOD_MIN_EVENT_COUNT": str(value)})
+
+
+def exclude(*namespaces):
+    """Replace the excluded-namespace set for the duration of a `with` block."""
+    return mock.patch.dict(os.environ, {"EOD_EXCLUDE_NAMESPACES": ",".join(namespaces)})
+
+
+def recap(events, **kwargs):
+    """Aggregate `events` and render them, returning `(summary, report)`.
+
+    Every test that asserts on the rendered recap goes through here, so the
+    cluster name and date are fixed rather than reaching for the clock. Both
+    halves are returned because most assertions want to pin the number and the
+    line that prints it together.
+    """
+    kwargs.setdefault("cluster_name", "test-cluster")
+    kwargs.setdefault("report_date", "2026-08-14")
+    summary = filter_and_aggregate_events(events)
+    return summary, generate_markdown_report(summary, **kwargs)
+
+
+# `1. 🔹 *`ns/workload`* (`reason` • 4 events)`
+_ENTRY = re.compile(
+    r"^\d+\. "
+    + re.escape(eod_report_generator._LISTED_EMOJI)
+    + r" \*`(?P<label>[^`]+)`\* \(`(?P<reason>[^`]+)` • (?P<count>\d+) events?\)$"
+)
+
+
+def listing_of(report):
+    """The workload breakdown, parsed into dicts, or `[]` when the section is absent.
+
+    Asserting on the parsed section rather than on `assertIn("BackOff", report)`
+    is the difference between "this workload is in the listing" and "this string
+    is somewhere in the recap" — the latter also passes when the name only
+    appears in the headline, or in a heading, or in another workload's message.
+    """
+    heading = f"*{eod_report_generator._SECTION_HEADING}*"
+    lines = report.splitlines()
+    if heading not in lines:
+        return []
+    entries = []
+    for line in lines[lines.index(heading) + 1:]:
+        matched = _ENTRY.match(line)
+        if matched:
+            entries.append(
+                {
+                    "label": matched["label"],
+                    "reason": matched["reason"],
+                    "count": int(matched["count"]),
+                    "message": None,
+                }
+            )
+        elif line.startswith("    • *Issue:* ") and entries:
+            entries[-1]["message"] = line[len("    • *Issue:* "):]
+        elif not line or line.startswith("_"):
+            break
+    return entries
+
+
+def listed_labels(report):
+    """`namespace/workload` for each entry in the breakdown, in printed order."""
+    return [entry["label"] for entry in listing_of(report)]
 
 
 
@@ -77,29 +146,11 @@ def listed(**overrides):
 
 
 class TestEODWatcherRecap(unittest.TestCase):
+    """The listing is fixed to Info in `LISTED_SEVERITIES` and nothing widens it.
 
-    def setUp(self):
-        # Mirrors the shipped eod_report_config.yaml, which carries no severity
-        # key: the listing is fixed to Info in `LISTED_SEVERITIES` and no config
-        # can widen it. A test about grouping or formatting therefore seeds
-        # `listed()` rows rather than reaching for a config that would let
-        # `event()`'s default Critical through.
-        self.config = {
-            "version": "v1",
-            "filters": {
-                "min_event_count": 1,
-                "exclude_namespaces": ["kube-system"],
-            },
-            "sections": {
-                "telemetry_summary": True,
-                "workload_breakdown": True,
-                "suppressed_summary": True,
-            },
-        }
-    def sectioned(self, **sections):
-        """`self.config` with section toggles overridden. Severity is not overridable."""
-        return {**self.config, "sections": {**self.config["sections"], **sections}}
-
+    A test about grouping or formatting therefore seeds `listed()` rows rather
+    than `event()`, whose default Critical is never listed.
+    """
 
     def test_the_recap_lists_the_suppressed_event_and_not_the_alerted_one(self):
         """The inversion, stated directly: chat got the alert, the recap gets the rest.
@@ -112,7 +163,7 @@ class TestEODWatcherRecap(unittest.TestCase):
             event(),
             event(reason="BackOff", severity="Info", notified=False),
         ]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary, report = recap(events)
 
         self.assertEqual(summary["alerts_posted"], 1)
         self.assertEqual(summary["suppressed_info"], 1)
@@ -120,9 +171,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         # Both counted in the telemetry; only the suppressed one is listed.
         self.assertEqual(summary["unique_incidents"], 2)
         self.assertEqual([e["reason"] for e in summary["entries"]], ["BackOff"])
-
-        report = generate_markdown_report(summary, self.config)
-        self.assertIn("BackOff", report)
+        self.assertEqual([e["reason"] for e in listing_of(report)], ["BackOff"])
         self.assertNotIn("OOMKilled", report)
         # The alert is still accounted for as a number, so a digest of nothing
         # but routine cannot be mistaken for a fleet that had a quiet day.
@@ -143,7 +192,7 @@ class TestEODWatcherRecap(unittest.TestCase):
             event(workload="api", reason="BackOff", severity="Info", notified=False)
             for _ in range(40)
         ]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["unique_incidents"], 2)
         self.assertEqual([e["count"] for e in summary["entries"]], [40])
@@ -171,16 +220,16 @@ class TestEODWatcherRecap(unittest.TestCase):
         ] + [
             event(workload="checkout", reason="CrashLoopBackOff") for _ in range(4)
         ]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary, report = recap(events)
 
         self.assertEqual(
             sorted(e["workload"] for e in summary["entries"]),
             ["noisy-0", "noisy-1", "noisy-2"],
         )
-        report = generate_markdown_report(summary, self.config)
-        self.assertIn("noisy-0", report)
-        self.assertNotIn("payment-api", report)
-        self.assertNotIn("checkout", report)
+        self.assertEqual(
+            sorted(listed_labels(report)),
+            ["prod-api/noisy-0", "prod-api/noisy-1", "prod-api/noisy-2"],
+        )
 
     def test_the_entry_list_is_cut_at_ten_and_says_how_many_it_dropped(self):
         """Info churn is high-cardinality, so silent truncation loses most of it."""
@@ -188,36 +237,28 @@ class TestEODWatcherRecap(unittest.TestCase):
             event(workload=f"svc-{i:02d}", reason="BackOff", severity="Info", notified=False)
             for i in range(14)
         ]
-        summary = filter_and_aggregate_events(events, self.config)
-        report = generate_markdown_report(summary, self.config)
+        summary, report = recap(events)
 
         self.assertEqual(len(summary["entries"]), 14)
-        self.assertEqual(report.count("`BackOff`"), 10)
+        self.assertEqual(len(listing_of(report)), 10)
         self.assertIn("…and 4 further groups not listed.", report)
 
 
     def test_an_all_suppressed_day_is_the_populated_report_now(self):
         """Nine informational events used to be a blank recap; they are its body."""
-        summary = filter_and_aggregate_events(
-            [event(severity="Info", notified=False) for _ in range(9)], self.config
-        )
-        report = generate_markdown_report(summary, self.config)
+        summary, report = recap([event(severity="Info", notified=False) for _ in range(9)])
 
         self.assertEqual(len(summary["entries"]), 1)
         self.assertEqual(summary["entries"][0]["count"], 9)
-        self.assertIn("Informational Events Held Back from Chat", report)
+        self.assertEqual([e["count"] for e in listing_of(report)], [9])
         self.assertIn("*0 alerts* went to chat", report)
         self.assertIn("*9 informational events* held back from chat today", report)
 
     def test_the_held_back_total_survives_a_day_with_nothing_listable(self):
         """Zero listed groups must not mean zero accounting for what was held back."""
-        summary = filter_and_aggregate_events(
-            [event(severity="Info", notified=False)], {
-                **self.config,
-                "filters": {**self.config["filters"], "min_event_count": 999},
-            }
-        )
-        report = generate_markdown_report(summary, self.config)
+        with min_count(999):
+            summary = filter_and_aggregate_events([event(severity="Info", notified=False)])
+        report = generate_markdown_report(summary)
         self.assertIn("*1 informational event* held back from chat today", report)
         # And the all-clear must not appear two lines above that total, which
         # is the contradiction the `suppressed` term in its condition prevents.
@@ -236,14 +277,14 @@ class TestEODWatcherRecap(unittest.TestCase):
         events = [event() for _ in range(10)] + [
             event(notified=False) for _ in range(30)
         ]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["alerts_posted"], 10)
         self.assertEqual(summary["cap_dropped"], 30)
         self.assertEqual(summary["suppressed_info"], 0)
 
         report = generate_markdown_report(
-            summary, self.config, cluster_name="test-cluster"
+            summary, cluster_name="test-cluster"
         )
         self.assertIn("*0 informational events* held back from chat today", report)
 
@@ -259,9 +300,9 @@ class TestEODWatcherRecap(unittest.TestCase):
             event(workload="checkout", reason="CrashLoopBackOff", notified=False)
             for _ in range(12)
         ]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
         report = generate_markdown_report(
-            summary, self.config, cluster_name="test-cluster"
+            summary, cluster_name="test-cluster"
         )
 
         self.assertEqual(summary["cap_dropped"], 12)
@@ -279,9 +320,9 @@ class TestEODWatcherRecap(unittest.TestCase):
         green header over them is the same lie in one character.
         """
         events = [event(notified=False) for _ in range(30)]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
         report = generate_markdown_report(
-            summary, self.config, cluster_name="test-cluster"
+            summary, cluster_name="test-cluster"
         )
 
         self.assertEqual(summary["cap_dropped"], 30)
@@ -295,12 +336,10 @@ class TestEODWatcherRecap(unittest.TestCase):
         Gating the ✅ on `cap_dropped_entries` rather than the count would move
         the same denial behind the threshold.
         """
-        config = {**self.config, "filters": {**self.config["filters"], "min_event_count": 5}}
         events = [event(notified=False) for _ in range(2)]
-        summary = filter_and_aggregate_events(events, config)
-        report = generate_markdown_report(
-            summary, config, cluster_name="test-cluster"
-        )
+        with min_count(5):
+            summary = filter_and_aggregate_events(events)
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
 
         self.assertEqual(summary["cap_dropped"], 2)
         self.assertEqual(summary["cap_dropped_entries"], [])
@@ -315,13 +354,12 @@ class TestEODWatcherRecap(unittest.TestCase):
         read as a test of a branch it did not enter.
         """
         summary = filter_and_aggregate_events(
-            [event(notified=False) for _ in range(3)], self.config
+            [event(notified=False) for _ in range(3)]
         )
         self.assertEqual(summary["cap_dropped"], 3)
 
         report = generate_markdown_report(
             summary,
-            self.config,
             cluster_name="test-cluster",
             problems=["`/nope/session_kv.db` — no session KV database found"],
         )
@@ -336,25 +374,24 @@ class TestEODWatcherRecap(unittest.TestCase):
         clusters is one line with the counts added together, and the recap says
         one service failed twice as often as it did while the other is invisible.
         """
-        cfg = self.config
         events = [listed(cluster="cluster-a"), listed(cluster="cluster-b")]
-        summary = filter_and_aggregate_events(events, cfg)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["unique_incidents"], 2)
         self.assertEqual([e["count"] for e in summary["entries"]], [1, 1])
 
         # The report runs on one cluster but reports rows from several, so a
         # foreign cluster is named and the local one is left as it always was.
-        report = generate_markdown_report(
-            summary, cfg, cluster_name="cluster-a"
+        report = generate_markdown_report(summary, cluster_name="cluster-a")
+        self.assertEqual(
+            sorted(listed_labels(report)),
+            ["cluster-b:prod-api/payment-api", "prod-api/payment-api"],
         )
-        self.assertIn("cluster-b:prod-api/payment-api", report)
-        self.assertNotIn("cluster-a:prod-api/payment-api", report)
 
     def test_excluded_namespace_leaves_the_headline_counts(self):
         """The summary must describe the same scope the breakdown does."""
         events = [event()] + [event(namespace="kube-system") for _ in range(500)]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["total_occurrences"], 1)
         self.assertEqual(summary["unique_incidents"], 1)
@@ -362,9 +399,9 @@ class TestEODWatcherRecap(unittest.TestCase):
 
     def test_min_event_count_applies_to_the_grouped_total(self):
         """Twelve forwarded events for one workload clear a threshold of ten."""
-        cfg = {**self.config, "filters": {**self.config["filters"], "min_event_count": 10}}
         events = [listed() for _ in range(12)]
-        summary = filter_and_aggregate_events(events, cfg)
+        with min_count(10):
+            summary = filter_and_aggregate_events(events)
 
         self.assertEqual(len(summary["entries"]), 1)
         self.assertEqual(summary["entries"][0]["count"], 12)
@@ -380,7 +417,7 @@ class TestEODWatcherRecap(unittest.TestCase):
             listed(namespace="prod", workload="api-store", reason="CrashLoopBackOff"),
             listed(namespace="prod", workload="api-cache", reason="CrashLoopBackOff"),
         ]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(
             sorted(e["workload"] for e in summary["entries"]),
@@ -389,7 +426,7 @@ class TestEODWatcherRecap(unittest.TestCase):
 
     def test_rows_the_server_already_collapsed_group_together(self):
         events = [listed(workload="payment-api") for _ in range(2)]
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(len(summary["entries"]), 1)
         self.assertEqual(summary["entries"][0]["workload"], "payment-api")
@@ -397,25 +434,14 @@ class TestEODWatcherRecap(unittest.TestCase):
 
     def test_report_uses_chat_markup_not_markdown(self):
         """stdout is delivered verbatim to Chat/Slack, which render neither."""
-        summary = filter_and_aggregate_events(
-            [event()], self.config
-        )
-        report = generate_markdown_report(summary, self.config)
+        _, report = recap([event()])
 
         self.assertNotIn("**", report)
         self.assertNotIn("###", report)
 
-    def test_telemetry_summary_toggle_is_honoured(self):
-        cfg = {**self.config, "sections": {**self.config["sections"], "telemetry_summary": False}}
-        summary = filter_and_aggregate_events([event()], cfg)
-
-        self.assertNotIn("Forwarded", generate_markdown_report(summary, cfg))
-        self.assertIn("Forwarded", generate_markdown_report(summary, self.config))
-
     def test_no_noise_reduction_claim_is_printed(self):
         """Every ledger row is one forwarded incident; there is no ratio to report."""
-        summary = filter_and_aggregate_events([event() for _ in range(3)], self.config)
-        report = generate_markdown_report(summary, self.config)
+        summary, report = recap([event() for _ in range(3)])
 
         self.assertNotIn("noise reduction", report)
         self.assertNotIn("dedup_ratio", summary)
@@ -631,21 +657,14 @@ class TheAllClearClaimsOnlyWhatWasMeasured(unittest.TestCase):
     wording gave it a daily green light for as long as it stayed off.
     """
 
-    CONFIG = {"version": "v1", "filters": {}, "sections": {}}
-
-    def _render(self, summary):
-        return generate_markdown_report(
-            summary, self.CONFIG, cluster_name="prod", report_date="2026-08-14"
-        )
-
     def test_the_all_clear_does_not_assert_the_daemon_is_running(self):
-        report = self._render(filter_and_aggregate_events([], self.CONFIG))
+        _, report = recap([])
         self.assertIn("✅", report)
         self.assertNotIn("Watcher daemon active", report)
         self.assertNotIn("streaming GKE events", report)
 
     def test_it_says_what_it_actually_read_instead(self):
-        report = self._render(filter_and_aggregate_events([], self.CONFIG))
+        _, report = recap([])
         self.assertIn("reports the ledger, not the watcher", report)
 
     def test_a_day_whose_events_all_reached_chat_still_reads_true(self):
@@ -662,7 +681,7 @@ class TheAllClearClaimsOnlyWhatWasMeasured(unittest.TestCase):
                 "created_at": "2026-08-14 10:00:00",
             }
         ]
-        report = self._render(filter_and_aggregate_events(events, self.CONFIG))
+        _, report = recap(events)
         self.assertIn("Nothing was held back from chat", report)
         self.assertNotIn("No events reached the ledger", report)
 
@@ -677,8 +696,6 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
     the watcher had stopped is told in green that it is streaming fine.
     """
 
-    CONFIG = {"version": "v1", "filters": {}, "sections": {}}
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -690,10 +707,9 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
     def _render(self, db_path):
         problems = []
         events = load_intercepted_events(db_path, window_hours=24, problems=problems)
-        summary = filter_and_aggregate_events(events, self.CONFIG)
+        summary = filter_and_aggregate_events(events)
         return generate_markdown_report(
             summary,
-            self.CONFIG,
             cluster_name="prod",
             report_date="2026-08-14",
             problems=problems,
@@ -780,96 +796,6 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
         self.assertNotIn("could not read the event ledger", report)
 
 
-class TestConfigResolution(unittest.TestCase):
-    """The default search path must be where the image actually puts the file.
-
-    `agents/platform/governance/` is copied to /opt/platform-template/governance/
-    and scaffolded into $TARGET_DIR/profiles/platform by docker-entrypoint.sh, so
-    the deployed file lands under $PLATFORM_AGENT_HOME/profiles/platform. A path
-    that does not exist in the pod fails silently, which is the worst kind.
-    """
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-
-    def _reload_with_home(self, home):
-        # HERMES_HOME is cleared, not left ambient: it takes precedence over
-        # PLATFORM_AGENT_HOME and a value inherited from the developer's shell
-        # would decide what these tests are actually measuring.
-        with mock.patch.dict(os.environ, {"PLATFORM_AGENT_HOME": home}):
-            os.environ.pop("HERMES_HOME", None)
-            return importlib.reload(eod_report_generator)
-
-    def _reload_with_hermes_home(self, home):
-        with mock.patch.dict(os.environ, {"HERMES_HOME": home}):
-            return importlib.reload(eod_report_generator)
-
-    def test_profile_home_governance_is_searched_first(self):
-        """The job ticks on the platform roster, so $HERMES_HOME is its profile home.
-
-        `profile_cron_tick.py` sets it to the home it is ticking, which makes
-        `$HERMES_HOME/governance` the scaffolded directory itself — and unlike
-        the working directory, which the poller points at the credential
-        proxy's workspace root, it is not something the pod's layout can move.
-        """
-        mod = self._reload_with_hermes_home(self.tmp.name)
-
-        self.assertEqual(
-            mod.DEFAULT_CONFIG_PATHS[0],
-            os.path.join(self.tmp.name, "governance", "eod_report_config.yaml"),
-        )
-        # The absolute path stays reachable behind it: a hand-run has no
-        # HERMES_HOME pointing here and must still find the same file.
-        self.assertIn(
-            "profiles/platform/governance/eod_report_config.yaml",
-            "\n".join(mod.DEFAULT_CONFIG_PATHS[1:]),
-        )
-
-    @unittest.skipIf(eod_report_generator.yaml is None, "PyYAML is not installed")
-    def test_profile_home_governance_is_loaded(self):
-        gov = os.path.join(self.tmp.name, "governance")
-        os.makedirs(gov)
-        with open(os.path.join(gov, "eod_report_config.yaml"), "w") as fh:
-            fh.write("filters:\n  exclude_namespaces:\n    - from-hermes-home\n")
-
-        config = self._reload_with_hermes_home(self.tmp.name).load_config()
-
-        self.assertEqual(config["filters"]["exclude_namespaces"], ["from-hermes-home"])
-
-    def tearDown(self):
-        # Leave the module as the rest of the suite imported it.
-        importlib.reload(eod_report_generator)
-
-    def test_scaffolded_governance_path_is_searched(self):
-        gov = os.path.join(self.tmp.name, "profiles", "platform", "governance")
-        os.makedirs(gov)
-        with open(os.path.join(gov, "eod_report_config.yaml"), "w") as fh:
-            fh.write("filters:\n  exclude_namespaces:\n    - only-this-one\n")
-
-        mod = self._reload_with_home(self.tmp.name)
-        config = mod.load_config()
-
-        self.assertEqual(config["filters"]["exclude_namespaces"], ["only-this-one"])
-
-    def test_a_missing_config_says_so_on_stderr(self):
-        """Silence here reads as 'your settings applied'. It must not be silent."""
-        mod = self._reload_with_home(os.path.join(self.tmp.name, "empty"))
-        # Out of the checkout, so the repo-relative fallback cannot resolve
-        # either — a cron tick's working directory is not the repository root.
-        cwd = os.getcwd()
-        os.chdir(self.tmp.name)
-        self.addCleanup(os.chdir, cwd)
-
-        err = io.StringIO()
-        with mock.patch.object(mod.sys, "stderr", err):
-            config = mod.load_config()
-
-        self.assertIn("no eod_report_config.yaml found", err.getvalue())
-        # stdout is the chat message for this no_agent job — warnings stay off it.
-        self.assertEqual(config["filters"]["min_event_count"], 1)
-
-
 class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
     """`notified` is written before the post is attempted, so it can be wrong.
 
@@ -880,21 +806,6 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
     read, and — since the recap does not report undelivered alerts — must still
     stop the recap calling the day clean.
     """
-
-    def setUp(self):
-        # The shipped config, Info-only.
-        self.config = {
-            "version": "v1",
-            "filters": {
-                "min_event_count": 1,
-                "exclude_namespaces": ["kube-system"],
-            },
-            "sections": {
-                "telemetry_summary": True,
-                "workload_breakdown": True,
-                "suppressed_summary": True,
-            },
-        }
 
     def undelivered(self, **overrides):
         row = event(notified=True, delivery_error="no message id from 'google_chat'")
@@ -910,7 +821,7 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
         alert there tells the reader to go and find a message that was never
         sent.
         """
-        summary = filter_and_aggregate_events([self.undelivered()], self.config)
+        summary = filter_and_aggregate_events([self.undelivered()])
 
         self.assertEqual(summary["alerts_posted"], 0)
         self.assertEqual(summary["delivery_failed"], 1)
@@ -932,8 +843,7 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
         is where it is written down.
         """
         report = generate_markdown_report(
-            filter_and_aggregate_events([self.undelivered()], self.config),
-            self.config,
+            filter_and_aggregate_events([self.undelivered()]),
             cluster_name="test-cluster",
         )
 
@@ -950,8 +860,7 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
         denial of it — and 🟢 says the same thing in one character.
         """
         report = generate_markdown_report(
-            filter_and_aggregate_events([self.undelivered()], self.config),
-            self.config,
+            filter_and_aggregate_events([self.undelivered()]),
             cluster_name="test-cluster",
         )
 
@@ -965,25 +874,22 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
         One undelivered Critical is not churn. The aggregate keeps it whatever
         the threshold says, because it is what vetoes the all-clear.
         """
-        config = {
-            **self.config,
-            "filters": {**self.config["filters"], "min_event_count": 5},
-        }
-        summary = filter_and_aggregate_events([self.undelivered()], config)
+        with min_count(5):
+            summary = filter_and_aggregate_events([self.undelivered()])
 
         self.assertEqual(summary["delivery_failed"], 1)
         self.assertEqual(len(summary["delivery_failed_entries"]), 1)
-        report = generate_markdown_report(summary, config, cluster_name="test-cluster")
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
         self.assertNotIn("Nothing was held back from chat in this window", report)
 
     def test_a_delivered_alert_is_unaffected(self):
         """The control. Without it every assertion above passes on a no-op."""
-        summary = filter_and_aggregate_events([event(notified=True)], self.config)
+        summary = filter_and_aggregate_events([event(notified=True)])
 
         self.assertEqual(summary["alerts_posted"], 1)
         self.assertEqual(summary["delivery_failed"], 0)
         self.assertEqual(summary["delivery_failed_entries"], [])
-        report = generate_markdown_report(summary, self.config, cluster_name="test-cluster")
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
         self.assertNotIn("Alerts That Never Reached Chat", report)
         self.assertIn("*Alerts Raised:* 1", report)
         # Still a green day: one delivered alert is the system working.
@@ -1034,8 +940,8 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
 class TestTheHeaderGradesTheDayAndNotTheListing(unittest.TestCase):
     """The header must carry the worst thing the ledger saw, busy day or not.
 
-    Under the shipped Info-only config a single informational event fills
-    `entries`, so almost every real day takes the listing arm. A header graded
+    The listing is fixed to Info, so a single informational event fills
+    `entries` and almost every real day takes the listing arm. A header graded
     only on the quiet arm therefore opens 📊 on precisely the days that have
     something wrong.
 
@@ -1046,27 +952,13 @@ class TestTheHeaderGradesTheDayAndNotTheListing(unittest.TestCase):
     """
 
     def setUp(self):
-        self.config = {
-            "version": "v1",
-            "filters": {
-                "min_event_count": 1,
-                "exclude_namespaces": ["kube-system"],
-            },
-            "sections": {
-                "telemetry_summary": True,
-                "workload_breakdown": True,
-                "suppressed_summary": True,
-            },
-        }
         # The informational event that makes the day a listing day.
         self.routine = event(
             workload="log-shipper", reason="BackOff", severity="Info", notified=False
         )
 
-    def header(self, events, config=None, expect_listing=True):
-        cfg = config or self.config
-        summary = filter_and_aggregate_events(events, cfg)
-        report = generate_markdown_report(summary, cfg, cluster_name="test-cluster")
+    def header(self, events, expect_listing=True):
+        summary, report = recap(events)
         if expect_listing:
             self.assertTrue(summary["entries"], "the day must take the listing arm")
         return report.splitlines()[0]
@@ -1098,9 +990,8 @@ class TestTheHeaderGradesTheDayAndNotTheListing(unittest.TestCase):
         self.assertTrue(self.header([], expect_listing=False).startswith("🟢"))
 
     def test_an_unreadable_ledger_outranks_everything(self):
-        summary = filter_and_aggregate_events([self.routine], self.config)
-        report = generate_markdown_report(
-            summary, self.config, cluster_name="test-cluster",
+        _, report = recap(
+            [self.routine],
             problems=["`/nope/session_kv.db` — no session KV database found"],
         )
 
@@ -1118,27 +1009,13 @@ class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
     delivered.
     """
 
-    def setUp(self):
-        self.config = {
-            "version": "v1",
-            "filters": {
-                "min_event_count": 1,
-                "exclude_namespaces": ["kube-system"],
-            },
-            "sections": {
-                "telemetry_summary": True,
-                "workload_breakdown": True,
-                "suppressed_summary": True,
-            },
-        }
-
     def test_the_undelivered_subtotal_counts_only_the_undelivered_rows(self):
         # One failed post among nine that arrived. Same workload, reason and
         # severity, so the ledger rows land in one group.
         events = [event(notified=True) for _ in range(9)]
         events.append(event(notified=True, delivery_error="no message id from 'google_chat'"))
 
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["delivery_failed"], 1)
         self.assertEqual(len(summary["delivery_failed_entries"]), 1)
@@ -1157,7 +1034,7 @@ class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
         events = [event(notified=True) for _ in range(9)]
         events.append(event(notified=False))
 
-        summary = filter_and_aggregate_events(events, self.config)
+        summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["cap_dropped"], 1)
         self.assertEqual(len(summary["cap_dropped_entries"]), 1)
@@ -1170,97 +1047,52 @@ class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
         Against the group total, one withheld alert rides in on nine delivered
         events that are not withheld.
         """
-        config = {**self.config, "filters": {**self.config["filters"], "min_event_count": 5}}
         events = [event(notified=True) for _ in range(9)]
         events.append(event(notified=False))
 
-        summary = filter_and_aggregate_events(events, config)
+        with min_count(5):
+            summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["cap_dropped"], 1)
         self.assertEqual(summary["cap_dropped_entries"], [])
 
     def test_a_group_that_is_wholly_withheld_still_clears_the_threshold(self):
         """The control: the threshold must still admit a genuinely noisy group."""
-        config = {**self.config, "filters": {**self.config["filters"], "min_event_count": 5}}
-
-        summary = filter_and_aggregate_events(
-            [event(notified=False) for _ in range(6)], config
-        )
+        with min_count(5):
+            summary = filter_and_aggregate_events(
+                [event(notified=False) for _ in range(6)]
+            )
 
         self.assertEqual(len(summary["cap_dropped_entries"]), 1)
         self.assertEqual(summary["cap_dropped_entries"][0]["cap_dropped_count"], 6)
 
 
 class TestTheListingIsFixedToInfo(unittest.TestCase):
-    """No configuration widens the listing, and a config that tries is told so.
+    """Nothing widens the listing: it is a constant, not a knob.
 
-    `include_severities` was a key and is not one now. Removing a key without
-    saying so is the quiet half of this change: an operator who widened it is
-    reading a narrower report than the one they wrote, and nothing on the page
-    tells them which of the two they are looking at.
+    The recap's whole subject is the events chat was not told about, and those
+    are the informational ones. A Critical or a Warning either reached chat or
+    was withheld by the alert ceiling, and both of those are somebody else's
+    report.
     """
-
-    def setUp(self):
-        self.events = [
-            event(reason="OOMKilled", severity="Critical", notified=True),
-            event(reason="Unhealthy", severity="Warning", notified=True),
-            event(reason="BackOff", severity="Info", notified=False),
-        ]
-        self.sections = {
-            "telemetry_summary": True,
-            "workload_breakdown": True,
-            "suppressed_summary": True,
-        }
-
-    def aggregate(self, filters):
-        stderr = io.StringIO()
-        with mock.patch.object(sys, "stderr", stderr):
-            summary = filter_and_aggregate_events(
-                self.events, {"filters": filters, "sections": self.sections}
-            )
-        return summary, stderr.getvalue()
-
-    def test_a_widened_config_still_lists_only_the_informational_event(self):
-        summary, _ = self.aggregate(
-            {"min_event_count": 1, "include_severities": ["Info", "Warning", "Critical"]}
-        )
-
-        self.assertEqual([e["reason"] for e in summary["entries"]], ["BackOff"])
-
-    def test_a_widened_config_says_it_was_not_honoured(self):
-        """The finding an operator can act on: what they asked for, and what they got."""
-        _, warning = self.aggregate(
-            {"min_event_count": 1, "include_severities": ["Info", "Warning", "Critical"]}
-        )
-
-        self.assertIn("no longer honoured", warning)
-        self.assertIn("'Critical'", warning)
-        self.assertIn("'Warning'", warning)
-        self.assertIn("informational events only", warning)
-
-    def test_a_leftover_info_only_key_is_called_obsolete_and_not_disobeyed(self):
-        """Same listing either way, so the wording must not imply a lost setting."""
-        summary, warning = self.aggregate(
-            {"min_event_count": 1, "include_severities": ["Info"]}
-        )
-
-        self.assertEqual([e["reason"] for e in summary["entries"]], ["BackOff"])
-        self.assertIn("obsolete", warning)
-        self.assertNotIn("no longer honoured", warning)
-
-    def test_a_config_without_the_key_says_nothing(self):
-        """The control. The shipped config has no such key and must run silent."""
-        summary, warning = self.aggregate({"min_event_count": 1})
-
-        self.assertEqual([e["reason"] for e in summary["entries"]], ["BackOff"])
-        self.assertEqual(warning, "")
 
     def test_the_listing_is_info_and_nothing_else(self):
         self.assertEqual(set(LISTED_SEVERITIES), {"Info"})
 
+    def test_only_the_informational_event_is_listed(self):
+        events = [
+            event(reason="OOMKilled", severity="Critical", notified=True),
+            event(reason="Unhealthy", severity="Warning", notified=True),
+            event(reason="BackOff", severity="Info", notified=False),
+        ]
+
+        summary = filter_and_aggregate_events(events)
+
+        self.assertEqual([e["reason"] for e in summary["entries"]], ["BackOff"])
+
 
 class TestTheNamespaceFilterDoesNotReachTheVeto(unittest.TestCase):
-    """`exclude_namespaces` is a noise filter, and stops where the noise does.
+    """`EOD_EXCLUDE_NAMESPACES` is a noise filter, and stops where the noise does.
 
     `kube-system` ships excluded and the watcher forwards it anyway. The recap
     does not report withheld or undelivered alerts from anywhere — but it must
@@ -1269,26 +1101,7 @@ class TestTheNamespaceFilterDoesNotReachTheVeto(unittest.TestCase):
     control-plane delivery failure end the day green.
     """
 
-    def setUp(self):
-        self.config = {
-            "version": "v1",
-            "filters": {
-                "min_event_count": 1,
-                "exclude_namespaces": ["kube-system"],
-            },
-            "sections": {
-                "telemetry_summary": True,
-                "workload_breakdown": True,
-                "suppressed_summary": True,
-            },
-        }
-
-    def report(self, events, config=None):
-        config = config or self.config
-        summary = filter_and_aggregate_events(events, config)
-        return summary, generate_markdown_report(
-            summary, config, cluster_name="test-cluster"
-        )
+    report = staticmethod(recap)
 
     def test_an_undelivered_alert_in_an_excluded_namespace_still_vetoes(self):
         summary, report = self.report(
@@ -1340,6 +1153,7 @@ class TestTheNamespaceFilterDoesNotReachTheVeto(unittest.TestCase):
         self.assertEqual(summary["suppressed_info"], 0)
         self.assertEqual(summary["entries"], [])
         self.assertEqual(summary["unique_incidents"], 0)
+        self.assertEqual(listing_of(report), [])
         self.assertNotIn("kube-proxy", report)
 
     def test_the_closing_lines_admit_the_filter_narrowed_them(self):
@@ -1377,20 +1191,7 @@ class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):
     a row, which is what made it easy to miss.
     """
 
-    CONFIG = {
-        "filters": {"min_event_count": 1, "exclude_namespaces": []},
-        "sections": {
-            "telemetry_summary": True,
-            "workload_breakdown": True,
-            "suppressed_summary": True,
-        },
-    }
-
-    def report(self, events):
-        summary = filter_and_aggregate_events(events, self.CONFIG)
-        return summary, generate_markdown_report(
-            summary, self.CONFIG, cluster_name="prod", report_date="2026-08-17"
-        )
+    report = staticmethod(recap)
 
     def test_an_informational_row_that_reached_chat_is_not_listed(self):
         summary, report = self.report([event(severity="Info", notified=True) for _ in range(3)])
@@ -1398,7 +1199,7 @@ class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):
         self.assertEqual(summary["entries"], [])
         self.assertEqual(summary["suppressed_info"], 0)
         self.assertEqual(summary["alerts_posted"], 3)
-        self.assertNotIn("Held Back from Chat*", report)
+        self.assertEqual(listing_of(report), [])
         self.assertIn("*0 informational events* held back", report)
 
     def test_the_listing_and_the_closing_total_report_the_same_rows(self):
@@ -1414,7 +1215,7 @@ class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):
 
         self.assertEqual(len(summary["entries"]), 1)
         self.assertEqual(summary["entries"][0]["count"], summary["suppressed_info"])
-        self.assertIn("• 1 event)", report)
+        self.assertEqual([e["count"] for e in listing_of(report)], [1])
         self.assertIn("*1 informational event* held back", report)
 
     def test_the_ordinary_day_is_unchanged(self):
@@ -1423,74 +1224,55 @@ class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):
 
         self.assertEqual(len(summary["entries"]), 1)
         self.assertEqual(summary["entries"][0]["count"], 3)
-        self.assertIn("Held Back from Chat*", report)
+        self.assertEqual([e["count"] for e in listing_of(report)], [3])
         self.assertIn("*3 informational events* held back", report)
 
 
-class TestAKeyWithNoValueKeepsItsDefault(unittest.TestCase):
-    """A well-formed edit must not stop the recap arriving.
+class TestTheEnvironmentKnobsFailSoft(unittest.TestCase):
+    """A malformed knob must not stop the recap arriving.
 
-    YAML maps a key written with no value to None, and the merge in
-    `load_config` assigned that over the built-in default. `set(None)` then
-    raised in the aggregator, `main()` caught nothing, and this job's stdout
-    *is* the chat message — so the recap vanished every weekday with the
-    traceback going only to the container log. The trigger is the obvious way
-    to stop excluding namespaces: comment the three list items out.
+    This job runs `no_agent`: its stdout *is* the chat message, so an exception
+    anywhere in the render is a weekday with no recap and a traceback nobody
+    reads in the container log. Both knobs are read from the environment on
+    every call, so a typo in `kubectl set env` is the realistic trigger.
     """
 
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
+    def render(self):
+        return recap([event(severity="Info", notified=False)])[1]
 
-    def config_from(self, text):
-        path = os.path.join(self.tmp.name, "eod_report_config.yaml")
-        pathlib.Path(path).write_text(text, encoding="utf-8")
+    def test_the_defaults_are_the_three_system_namespaces(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                eod_report_generator.excluded_namespaces(),
+                frozenset({"kube-system", "kube-public", "kube-node-lease"}),
+            )
+            self.assertEqual(eod_report_generator.min_event_count(), 1)
+
+    def test_an_empty_exclusion_list_excludes_nothing(self):
+        """`""` means "exclude nothing", which is not the same as saying nothing."""
+        with exclude(""):
+            self.assertEqual(eod_report_generator.excluded_namespaces(), frozenset())
+
+    def test_a_non_integer_threshold_warns_and_falls_back(self):
         stderr = io.StringIO()
-        with mock.patch.object(sys, "stderr", stderr):
-            cfg = load_config(path)
-        return cfg, stderr.getvalue()
+        with mock.patch.dict(os.environ, {"EOD_MIN_EVENT_COUNT": "ten"}), \
+                mock.patch.object(eod_report_generator.sys, "stderr", stderr):
+            self.assertEqual(eod_report_generator.min_event_count(), 1)
+            report = self.render()
 
-    def render(self, cfg):
-        summary = filter_and_aggregate_events(
-            [event(severity="Info", notified=False)], cfg
-        )
-        return generate_markdown_report(summary, cfg, cluster_name="prod")
+        self.assertIn("EOD_MIN_EVENT_COUNT", stderr.getvalue())
+        # The warning goes to stderr and the recap still reaches chat.
+        self.assertIn("Daily Activity Recap", report)
 
-    def test_a_bare_exclude_namespaces_keeps_the_default_list(self):
-        cfg, _ = self.config_from(
-            "version: v1\nfilters:\n  min_event_count: 1\n  exclude_namespaces:\n"
-        )
+    def test_a_threshold_below_one_is_clamped(self):
+        with min_count(0):
+            self.assertEqual(eod_report_generator.min_event_count(), 1)
 
-        self.assertEqual(
-            cfg["filters"]["exclude_namespaces"],
-            ["kube-system", "kube-public", "kube-node-lease"],
-        )
-        self.assertIn("Daily Activity Recap", self.render(cfg))
-
-    def test_every_emptied_key_still_renders(self):
-        """Each of these was a different traceback before, and all reached chat as silence."""
-        for label, text in (
-            ("filters", "version: v1\nfilters:\n"),
-            ("sections", "version: v1\nsections:\n"),
-            ("min_event_count", "version: v1\nfilters:\n  min_event_count:\n"),
-        ):
-            with self.subTest(emptied=label):
-                cfg, _ = self.config_from(text)
-                self.assertIn("Daily Activity Recap", self.render(cfg))
-
-    def test_an_explicit_empty_list_still_overrides_the_default(self):
-        """`None` means "said nothing"; `[]` means "exclude nothing". Not the same."""
-        cfg, _ = self.config_from(
-            "version: v1\nfilters:\n  exclude_namespaces: []\n"
-        )
-
-        self.assertEqual(cfg["filters"]["exclude_namespaces"], [])
-
-    def test_an_empty_file_is_named_rather_than_reported_missing(self):
-        """The fall-through warning lists every path searched, including this one."""
-        _, warnings = self.config_from("")
-
-        self.assertIn("is empty or is not a YAML mapping", warnings)
+    def test_whitespace_around_a_namespace_is_ignored(self):
+        with mock.patch.dict(os.environ, {"EOD_EXCLUDE_NAMESPACES": " prod , , staging "}):
+            self.assertEqual(
+                eod_report_generator.excluded_namespaces(), frozenset({"prod", "staging"})
+            )
 
 
 if __name__ == "__main__":

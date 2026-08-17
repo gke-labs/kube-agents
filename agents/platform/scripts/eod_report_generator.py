@@ -17,42 +17,61 @@
 
 import argparse
 import datetime
-import json
 import os
 import re
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-try:
-    import yaml
-except ImportError:
-    yaml = None
+from typing import Any, Dict, FrozenSet, List, Optional
 
 
-# The governance directory reaches the pod one way only: docker-entrypoint.sh
-# step 2.6 scaffolds /opt/platform-template/governance/ into
-# $TARGET_DIR/profiles/platform. There is no /opt/data/governance and no
-# /opt/defaults/governance.
-#
-# HERMES_HOME first, because `profile_cron_tick.py` sets it to the profile home
-# it is ticking, making `$HERMES_HOME/governance` the scaffolded directory
-# itself. The absolute path is the fallback a hand-run from outside the profile
-# resolves.
-AGENT_HOME = os.getenv("PLATFORM_AGENT_HOME", "/opt/data")
-HERMES_HOME = os.getenv("HERMES_HOME", "")
+DEFAULT_EXCLUDE_NAMESPACES = frozenset({"kube-system", "kube-public", "kube-node-lease"})
 
-DEFAULT_CONFIG_PATHS = [
-    path
-    for path in (
-        f"{HERMES_HOME}/governance/eod_report_config.yaml" if HERMES_HOME else "",
-        f"{AGENT_HOME}/profiles/platform/governance/eod_report_config.yaml",
-        # For a hand-run from a checkout, where none of the above exists.
-        "agents/platform/governance/eod_report_config.yaml",
-    )
-    if path
-]
+
+def excluded_namespaces() -> FrozenSet[str]:
+    """Namespaces kept out of the breakdown and the headline counts.
+
+    An environment knob rather than a YAML file, matching how every other
+    threshold in this feature is tuned — `ALERT_DAILY_LIMIT_*` in
+    `session_kv_server.py`, `WATCHER_*` on the sidecar. A file needs a search
+    path, a parser and an answer for every way it can be half-written, and each
+    of those three was load-bearing enough to carry its own tests; an
+    environment variable is one `getenv` and is settable on a running pod with
+    `kubectl set env`, which the file never was.
+
+    Resolved per call rather than at import so a test, or a cron tick with a
+    patched environment, sees the current value. An empty value excludes
+    nothing, which is the one setting the file could not express without
+    tripping over its own `None` handling.
+
+    This is a noise filter and it stops there: excluded rows still count
+    towards the all-clear veto in `filter_and_aggregate_events`, so silencing a
+    namespace cannot make a bad day read as a quiet one.
+    """
+    raw = os.getenv("EOD_EXCLUDE_NAMESPACES")
+    if raw is None:
+        return DEFAULT_EXCLUDE_NAMESPACES
+    return frozenset(ns.strip() for ns in raw.split(",") if ns.strip())
+
+
+def min_event_count() -> int:
+    """Group-level threshold below which a workload is not listed.
+
+    Applied after grouping, not per row: it is a threshold on how much noise a
+    workload made today, so a workload that tripped ten times is over a
+    threshold of three even though no single row is. A non-integer or negative
+    value falls back to the default rather than failing the run, because this
+    job's stdout is the chat message and a traceback reaches nobody.
+    """
+    raw = os.getenv("EOD_MIN_EVENT_COUNT")
+    if not raw:
+        return 1
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        sys.stderr.write(f"Warning: EOD_MIN_EVENT_COUNT={raw!r} is not an integer; using 1\n")
+        return 1
+
 
 def default_db_paths() -> List[str]:
     """Where to look for the session KV database, most authoritative first.
@@ -117,98 +136,12 @@ def default_window_hours(now: Optional[datetime.datetime] = None) -> int:
     return WEEKEND_WINDOW_HOURS if now.weekday() == 0 else DEFAULT_WINDOW_HOURS
 
 
-def resolve_cluster_name(cli_cluster: Optional[str] = None, config: Optional[Dict[str, Any]] = None) -> str:
-    """Resolves the active cluster name using GKE_CLUSTER_NAME environment variable or config."""
+def resolve_cluster_name(cli_cluster: Optional[str] = None) -> str:
+    """Resolves the active cluster name from `--cluster-name` or the environment."""
     if cli_cluster:
         return cli_cluster
 
-    if config:
-        cfg_name = config.get("cluster_name") or config.get("filters", {}).get("cluster_name")
-        if cfg_name:
-            return cfg_name
-
     return os.getenv("GKE_CLUSTER_NAME") or os.getenv("CLUSTER_NAME") or "kubernetes-cluster"
-
-
-def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Loads the YAML configuration with fallback defaults."""
-    default_config: Dict[str, Any] = {
-        "version": "v1",
-        "filters": {
-            "min_event_count": 1,
-            "exclude_namespaces": ["kube-system", "kube-public", "kube-node-lease"],
-        },
-        "sections": {
-            "telemetry_summary": True,
-            "workload_breakdown": True,
-        },
-    }
-
-    candidates = [config_path] if config_path else DEFAULT_CONFIG_PATHS
-    for path_str in candidates:
-        if not path_str:
-            continue
-        p = Path(path_str)
-        if p.exists():
-            try:
-                content = p.read_text(encoding="utf-8")
-                if yaml:
-                    loaded = yaml.safe_load(content)
-                elif path_str.endswith((".yaml", ".yml")):
-                    raise ImportError("PyYAML is required to parse YAML configuration files. Please install 'pyyaml'.")
-                else:
-                    loaded = json.loads(content)
-
-                if isinstance(loaded, dict):
-                    # A key written with no value parses as `None`, and that is
-                    # what the obvious edit produces: commenting out the three
-                    # items under `exclude_namespaces:` — the natural way to
-                    # stop excluding namespaces — leaves the key behind with
-                    # nothing under it. Assigned over the default, that `None`
-                    # reaches `set(...)` in filter_and_aggregate_events as a
-                    # TypeError, and emptying `filters:` or `sections:` the same
-                    # way gives an AttributeError earlier still. Nothing catches
-                    # either: this job runs `no_agent`, so its stdout *is* the
-                    # chat message, and the recap simply stops arriving every
-                    # weekday with the traceback going only to the container
-                    # log — the silent failure the 🔴 read-failure card exists to
-                    # prevent, reached through a well-formed file.
-                    #
-                    # A key with no value says nothing about the setting, so it
-                    # keeps the default. Both levels, because `filters:` merges
-                    # as a dict and would otherwise pass its `None` members
-                    # through.
-                    for k, v in loaded.items():
-                        if v is None:
-                            continue
-                        if isinstance(v, dict) and isinstance(default_config.get(k), dict):
-                            default_config[k].update({ik: iv for ik, iv in v.items() if iv is not None})
-                        else:
-                            default_config[k] = v
-                    return default_config
-
-                # An empty file parses to None and a stray list to a list.
-                # Without this the loop falls through to the "no config found"
-                # warning below, which names every path it searched — including
-                # this one, which exists and was read successfully.
-                sys.stderr.write(
-                    f"Warning: {path_str} is empty or is not a YAML mapping "
-                    f"({type(loaded).__name__}); using built-in defaults.\n"
-                )
-            except Exception as e:
-                sys.stderr.write(f"Warning: Failed to load config from {path_str}: {e}\n")
-
-    # Falling through is not benign: the operator's exclude_namespaces and
-    # section toggles are silently not in force, and because the shipped YAML
-    # currently repeats these defaults value for value, an edit to it would
-    # produce a byte-identical report with nothing saying why. Say so — on
-    # stderr, because this job's stdout is delivered verbatim as the chat
-    # message.
-    sys.stderr.write(
-        "Warning: no eod_report_config.yaml found on "
-        f"{', '.join(str(c) for c in candidates if c)}; using built-in defaults\n"
-    )
-    return default_config
 
 
 def load_intercepted_events(
@@ -340,15 +273,8 @@ def sanitize_chat_message(message: str) -> str:
 # Warning was posted to chat the moment it happened, so listing it here repeats
 # what the on-call already read and acted on; informational events are the only
 # class the severity gate holds back, which makes them the only class a daily
-# digest tells anyone something new about.
-#
-# Fixed rather than a defaulted `include_severities` key, which is what this
-# was. Widening it bought a digest of already-delivered alerts that reads as
-# new, and it never reached the two classes chat genuinely missed — alerts the
-# daily ceiling withheld and alerts whose delivery failed — because those are
-# not a severity selection but a separate outcome the recap declines to report
-# at all. A knob whose only setting was the wrong one is not a knob. SOP:
-# "What this recap does not report".
+# digest tells anyone something new about. See the SOP, "What this recap does
+# not report", for where the other grades are covered.
 LISTED_SEVERITIES = frozenset({"Info"})
 
 # One emoji rather than a severity map, because only one grade can reach the
@@ -357,50 +283,24 @@ LISTED_SEVERITIES = frozenset({"Info"})
 # the digest exactly the false alarm the gate exists to prevent.
 _LISTED_EMOJI = "🔹"
 _SECTION_HEADING = "🔕 Informational Events Held Back from Chat"
-# Ten, not the five an alert list used. That five was sized against the risk of
-# a routine BackOff pushing the day's real OOMKilled off the list; an Info-only
-# list has no warning to protect, and routine churn is precisely what the
-# reader came for. The overflow is counted on a trailing line either way.
+# The overflow past this is counted on a trailing line, never dropped silently.
 _ENTRY_LIMIT = 10
 
 
-def filter_and_aggregate_events(
-    events: List[Dict[str, Any]],
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
+def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Deterministically groups and summarizes what k8s-event-watcher forwarded.
 
     The headline counts and the workload breakdown are derived from the same
     filtered rows, so they describe one scope: an excluded namespace is absent
-    from both, not from one. `cap_dropped` and `delivery_failed` — the two
-    outcomes no toggle switches off — are counted over every row instead, so a
-    withheld or undelivered alert is reported wherever it happened. Anything
-    the namespace filter removed is totalled in `excluded_occurrences`, which is
-    what lets the report say it covered part of the fleet.
+    from both, not from one. `cap_dropped` and `delivery_failed` are counted
+    over every row instead, so a withheld or undelivered alert is reported
+    wherever it happened. Anything the namespace filter removed is totalled in
+    `excluded_occurrences`, which is what lets the report say it covered part
+    of the fleet.
     """
 
-    filters = config.get("filters", {})
-    min_count = int(filters.get("min_event_count", 1))
-    exclude_ns = set(filters.get("exclude_namespaces", []))
-    # `include_severities` was a configuration key and is not one any more. An
-    # install that still carries it gets told so on stderr rather than having it
-    # silently ignored, because the two readings of a stale key are opposite:
-    # somebody who wrote `["Info"]` loses nothing, and somebody who widened it is
-    # reading a narrower report than the one they configured.
-    if "include_severities" in filters:
-        configured = {str(s) for s in filters.get("include_severities") or [] if str(s).strip()}
-        if configured - LISTED_SEVERITIES:
-            sys.stderr.write(
-                "Warning: filters.include_severities in eod_report_config.yaml is no longer "
-                f"honoured — {sorted(configured)} requested, but this recap lists "
-                "informational events only. Remove the key; the SOP section 'What this "
-                "recap does not report' says where the other severities are covered.\n"
-            )
-        else:
-            sys.stderr.write(
-                "Warning: filters.include_severities in eod_report_config.yaml is obsolete and "
-                "ignored; the listing is fixed to informational events. Remove the key.\n"
-            )
+    min_count = min_event_count()
+    exclude_ns = excluded_namespaces()
 
     total_occurrences = 0
     forwarded = 0
@@ -415,7 +315,7 @@ def filter_and_aggregate_events(
         ns = event.get("namespace", "")
         reason = event.get("reason", "Unknown")
 
-        # A flag, not a `continue`. `exclude_namespaces` is a noise filter on the
+        # A flag, not a `continue`. `EOD_EXCLUDE_NAMESPACES` is a noise filter on the
         # breakdown and the headline counts; the `cap_dropped` and `delivery_failed`
         # tallies are counted over every row regardless, because they are what
         # vetoes the ✅ all-clear. kube-system ships excluded and the watcher
@@ -561,7 +461,7 @@ def filter_and_aggregate_events(
     # workloads, and so restoring a listing is a rendering change and not a
     # re-derivation.
     #
-    # `exclude_namespaces` deliberately does not apply to either: that filter drops
+    # `EOD_EXCLUDE_NAMESPACES` deliberately does not apply to either: that filter drops
     # routine churn from the breakdown, and an alert nobody received is not churn.
     #
     # Thresholded on `cap_dropped_count`, not on `count`: against the group total a
@@ -630,7 +530,6 @@ def _workload_label(entry: Dict[str, Any], cluster_name: str) -> str:
 
 def generate_markdown_report(
     summary: Dict[str, Any],
-    config: Dict[str, Any],
     cluster_name: Optional[str] = None,
     report_date: Optional[str] = None,
     problems: Optional[List[str]] = None,
@@ -643,12 +542,11 @@ def generate_markdown_report(
     wording is the one an operator will believe.
     """
     if not cluster_name:
-        cluster_name = resolve_cluster_name(config=config)
+        cluster_name = resolve_cluster_name()
 
     if not report_date:
         report_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
-    sections = config.get("sections", {})
     entries = summary.get("entries", [])
     entry_count = len(entries)
 
@@ -659,7 +557,7 @@ def generate_markdown_report(
     # of kube-system churn — true of what it counted, false as the reader will
     # read it.
     scope_note = (
-        " Namespaces in `filters.exclude_namespaces` are outside this recap's scope."
+        " Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope."
         if summary.get("excluded_occurrences")
         else ""
     )
@@ -683,15 +581,12 @@ def generate_markdown_report(
     # asterisks and have no headings at all. `**bold**` and `### Heading` reach
     # the reader as literal asterisks and hashes.
     lines: List[str] = []
-    # The header grades what the day contained, not whether there was anything to
-    # list — computed inside the quiet arm, where it started, the busy arm opened
-    # 📊 unconditionally, and one informational event is enough to take that arm.
-    #
-    # 🟢 is gated on `all_clear`, the same condition as the ✅ below, and not on
-    # `entry_count`: green is an assertion that the day was clean, so a day with no
-    # informational events but 30 ceiling-withheld Criticals must not take it. It
-    # falls to 📊 — neutral, which is honest, where green would not be. SOP: "What
-    # the header emoji grades".
+    # The header grades what the day contained, not whether there was anything
+    # to list, so 🟢 is gated on `all_clear` — the same condition as the ✅ below
+    # — and not on `entry_count`. Green asserts the day was clean, so a day with
+    # no informational events but 30 ceiling-withheld Criticals must not take
+    # it; it falls to 📊, neutral, which is honest where green would not be.
+    # SOP: "What the header emoji grades".
     if problems:
         header_emoji = "🔴"
     elif entry_count > 0 or not all_clear:
@@ -701,41 +596,38 @@ def generate_markdown_report(
     lines.append(f"{header_emoji} *k8s-event-watcher Daily Activity Recap* — `{cluster_name}` ({report_date})")
 
     if entry_count > 0:
-        if sections.get("telemetry_summary", True):
-            # The alert count is a count, not a listing: it says the watcher
-            # paged someone today, without repeating what chat already
-            # delivered.
-            lines.append(
-                f"_Forwarded *{_plural(summary['total_occurrences'], 'event')}* across "
-                f"*{_plural(summary['unique_incidents'], 'workload/reason group')}*. "
-                f"*{_plural(summary['alerts_posted'], 'alert')}* went to chat as it happened "
-                f"and {'is' if summary['alerts_posted'] == 1 else 'are'} not repeated here."
-                + scope_note
-                + "_"
-            )
+        # The alert count is a count, not a listing: it says the watcher paged
+        # someone today, without repeating what chat already delivered.
+        lines.append(
+            f"_Forwarded *{_plural(summary['total_occurrences'], 'event')}* across "
+            f"*{_plural(summary['unique_incidents'], 'workload/reason group')}*. "
+            f"*{_plural(summary['alerts_posted'], 'alert')}* went to chat as it happened "
+            f"and {'is' if summary['alerts_posted'] == 1 else 'are'} not repeated here."
+            + scope_note
+            + "_"
+        )
         lines.append("")
 
-        if sections.get("workload_breakdown", True):
-            lines.append(f"*{_SECTION_HEADING}*")
-            for idx, e in enumerate(entries[:_ENTRY_LIMIT], start=1):
-                lines.append(
-                    f"{idx}. {_LISTED_EMOJI} "
-                    f"*`{_workload_label(e, cluster_name)}`* "
-                    f"(`{e['reason']}` • {_plural(e['count'], 'event')})"
-                )
-                if e.get("message"):
-                    lines.append(f"    • *Issue:* {e['message']}")
-            remaining = len(entries) - _ENTRY_LIMIT
-            if remaining > 0:
-                lines.append(f"_…and {_plural(remaining, 'further group')} not listed._")
-            lines.append("")
+        lines.append(f"*{_SECTION_HEADING}*")
+        for idx, e in enumerate(entries[:_ENTRY_LIMIT], start=1):
+            lines.append(
+                f"{idx}. {_LISTED_EMOJI} "
+                f"*`{_workload_label(e, cluster_name)}`* "
+                f"(`{e['reason']}` • {_plural(e['count'], 'event')})"
+            )
+            if e.get("message"):
+                lines.append(f"    • *Issue:* {e['message']}")
+        remaining = len(entries) - _ENTRY_LIMIT
+        if remaining > 0:
+            lines.append(f"_…and {_plural(remaining, 'further group')} not listed._")
+        lines.append("")
 
     else:
         # From the summary, not hardcoded to zero: "no incidents to list" is not
         # "no events seen", and a day whose entire traffic was suppressed lands
         # here. Withheld on a read failure, where the same three zeroes are the
         # absence of a measurement rather than a measurement of zero.
-        if sections.get("telemetry_summary", True) and not problems:
+        if not problems:
             lines.append(f"• *Events Forwarded:* {summary['total_occurrences']}")
             lines.append(f"• *Workload/Reason Groups:* {summary['unique_incidents']}")
             lines.append(f"• *Alerts Raised:* {summary['alerts_posted']}")
@@ -779,10 +671,10 @@ def generate_markdown_report(
     # listing above already covers: that listing is cut at `_ENTRY_LIMIT` and
     # this is the total across all of them, and on a quiet day it is the only
     # line separating a fleet with nothing to say from a watcher that has
-    # stopped forwarding. Counts events graded Info only — cap-dropped
-    # Criticals were once added here, which read as routine churn on a day of
-    # alerts nobody received. Dropped on a read failure with the other counts.
-    if sections.get("suppressed_summary", True) and not problems:
+    # stopped forwarding. Counts events graded Info only: adding cap-dropped
+    # Criticals here would report a day of alerts nobody received as routine
+    # churn. Dropped on a read failure with the other counts.
+    if not problems:
         while lines and not lines[-1]:
             lines.pop()
         lines.append("")
@@ -796,7 +688,6 @@ def generate_markdown_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deterministic k8s-event-watcher Daily Activity Recap")
-    parser.add_argument("--config", help="Path to eod_report_config.yaml")
     parser.add_argument("--db", help="Path to session_kv.db")
     parser.add_argument("--cluster-name", help="Cluster name override")
     parser.add_argument(
@@ -812,15 +703,12 @@ def main() -> None:
 
     window_hours = args.window_hours if args.window_hours is not None else default_window_hours()
 
-    cfg = load_config(args.config)
     problems: List[str] = []
     events = load_intercepted_events(args.db, window_hours=window_hours, problems=problems)
-    cluster = resolve_cluster_name(args.cluster_name, cfg)
+    cluster = resolve_cluster_name(args.cluster_name)
 
-    summary = filter_and_aggregate_events(events, cfg)
-    report = generate_markdown_report(
-        summary, cfg, cluster_name=cluster, problems=problems
-    )
+    summary = filter_and_aggregate_events(events)
+    report = generate_markdown_report(summary, cluster_name=cluster, problems=problems)
     print(report)
 
 
