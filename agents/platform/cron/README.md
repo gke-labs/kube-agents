@@ -38,8 +38,9 @@ is a `no_agent` script that costs nothing when idle and files a card when it
 finds something. It keeps `deliver: "all"` for itself, so a sweep that cannot run
 still says so.
 
-Adding a sweep is a registration in `github_scan_gate.py`'s `SWEEPS`, not a new
-cron entry. The consequences of dispatching through a card are in
+Adding a sweep is one line in `github_scan_gate.py`'s `SWEEPS` registry —
+`SWEEP_ORDER` is derived from it, so there is no second list to keep in step —
+not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 

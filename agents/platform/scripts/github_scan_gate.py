@@ -58,8 +58,10 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Which sweeps run, and in what order. The env var below selects a subset.
-SWEEP_ORDER = ("issues",)
+# Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
+# `SWEEPS` registry near the bottom of this file rather than written out twice.
+# Two hand-maintained lists is a sweep that is registered but never runs, and
+# an operator who names it in the env var below being told it does not exist.
 
 # Comma-separated sweep names. Unset means all of them.
 SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
@@ -218,7 +220,16 @@ def _issue_card(payload: dict) -> Card:
     )
 
 
-def sweep_issues() -> SweepResult:
+def sweep_issues(dry_run: bool = False) -> SweepResult:
+    if dry_run:
+        # `resolver.py poll` performs its own stale-label sweep as a side
+        # effect, and it has no dry-run of its own, so this one cannot promise
+        # a read-only pass over the issues. Said out loud rather than quietly
+        # relabelling issues under a flag whose name promises it will not.
+        sys.stderr.write(
+            "github_scan_gate: --dry-run note — the issues sweep runs "
+            "`resolver.py poll`, whose stale-label sweep still writes to GitHub\n"
+        )
     payload = run_resolver_poll()
     status = payload.get("status")
 
@@ -249,6 +260,10 @@ def sweep_issues() -> SweepResult:
 SWEEPS = {
     "issues": sweep_issues,
 }
+
+# Insertion order is run order, so this is the registry read one way rather
+# than a second list to keep in step with it. Adding a sweep is one line above.
+SWEEP_ORDER: tuple[str, ...] = tuple(SWEEPS)
 
 
 # --------------------------------------------------------------------------
@@ -323,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for name in sweeps:
         try:
-            result = SWEEPS[name]()
+            result = SWEEPS[name](dry_run)
         except Exception as e:  # noqa: BLE001 - one blind sweep must not blind the rest
             warnings.append(
                 f"⚠️ **GitHub repo watcher — `{name}` sweep failed:** "

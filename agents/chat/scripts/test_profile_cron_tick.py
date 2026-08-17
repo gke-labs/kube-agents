@@ -35,6 +35,7 @@ import profile_cron_tick as pct  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 ROOT_ROSTER = REPO / "agents" / "chat" / "defaults" / "cron" / "jobs.json"
+PLATFORM_ROSTER = REPO / "agents" / "platform" / "cron" / "jobs.json"
 # Both directories are copied into /opt/defaults/scripts by the Dockerfile, and
 # the entrypoint force-syncs that onto $HERMES_HOME/scripts — the one directory
 # the scheduler will run a `no_agent` script from.
@@ -584,15 +585,35 @@ class ShippedRosterTest(unittest.TestCase):
         )
 
     def test_every_no_agent_job_names_a_script_the_image_carries(self):
-        for entry in self.jobs:
-            if not entry.get("no_agent"):
-                continue
-            name = entry.get("script")
-            self.assertTrue(name, f"{entry.get('id')}: no_agent with no script never runs")
-            self.assertTrue(
-                any((d / name).is_file() for d in SCRIPT_DIRS),
-                f"{entry.get('id')}: {name} is in neither directory copied to $HERMES_HOME/scripts",
-            )
+        """Both rosters, because both now carry `no_agent` entries.
+
+        This used to read the Chat Agent's roster alone, which was true of the
+        day it was written and stopped being true the moment the Platform
+        Agent's roster grew one. A renamed script on the roster this test does
+        not load is green here and "Script not found" once every ten minutes in
+        production, inside a job whose whole point is that a quiet tick is
+        normal.
+        """
+        rosters = {
+            "chat": json.loads(ROOT_ROSTER.read_text(encoding="utf-8"))["jobs"],
+            "platform": json.loads(PLATFORM_ROSTER.read_text(encoding="utf-8"))["jobs"],
+        }
+        checked = 0
+        for roster, entries in rosters.items():
+            for entry in entries:
+                if not entry.get("no_agent"):
+                    continue
+                checked += 1
+                name = entry.get("script")
+                self.assertTrue(
+                    name, f"{roster}/{entry.get('id')}: no_agent with no script never runs"
+                )
+                self.assertTrue(
+                    any((d / name).is_file() for d in SCRIPT_DIRS),
+                    f"{roster}/{entry.get('id')}: {name} is in neither directory "
+                    "copied to $HERMES_HOME/scripts",
+                )
+        self.assertTrue(checked, "no no_agent job on either roster — the test found nothing")
 
 
 class HomeTargetEnvTest(unittest.TestCase):

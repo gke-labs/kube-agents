@@ -23,6 +23,7 @@ have traded a token saving for a single point of failure.
 """
 
 import importlib
+import inspect
 import io
 import json
 import subprocess
@@ -44,6 +45,50 @@ def _completed(stdout: str, returncode: int = 0, stderr: str = ""):
         stdout=stdout,
         stderr=stderr,
     )
+
+
+class SweepRegistryTest(unittest.TestCase):
+    def test_every_registered_sweep_is_runnable(self):
+        """`SWEEP_ORDER` and `SWEEPS` cannot drift apart.
+
+        They used to be two hand-written lists. A sweep added to only the
+        registry never runs, and `GITHUB_WATCHER_SWEEPS` then reports the
+        operator's correct name as an unknown sweep — pointing them at their
+        own env var rather than at the missing line. Deriving one from the
+        other makes that unrepresentable; this asserts the derivation stays.
+        """
+        self.assertEqual(set(gate.SWEEP_ORDER), set(gate.SWEEPS))
+        self.assertEqual(len(gate.SWEEP_ORDER), len(gate.SWEEPS))
+
+    def test_a_sweep_receives_the_dry_run_flag(self):
+        """`--dry-run` has to reach the sweep, not just the card filing.
+
+        The issues sweep is the one that cannot honour it — `resolver.py poll`
+        writes its stale-label sweep to GitHub either way — and it says so on
+        stderr. Calling the sweep with no argument silently swallowed that
+        caveat, leaving `--dry-run` looking read-only when it is not.
+        """
+        seen = []
+        with mock.patch.dict(
+            gate.SWEEPS, {"issues": lambda dry_run=False: seen.append(dry_run) or gate.SweepResult()},
+            clear=True,
+        ), mock.patch.object(gate, "SWEEP_ORDER", ("issues",)):
+            gate.main(["--dry-run"])
+            gate.main([])
+        self.assertEqual(seen, [True, False])
+
+    def test_every_registered_sweep_accepts_the_flag(self):
+        """Against the real callables, which the stub above cannot check.
+
+        `main` passes `dry_run` positionally. A sweep declared without the
+        parameter raises `TypeError`, and the deliberately broad `except` turns
+        that into a `⚠️` line — so the job would announce itself broken every
+        ten minutes and never poll, while every test that drives `SWEEPS`
+        through a stub carried on passing.
+        """
+        for name, sweep in gate.SWEEPS.items():
+            with self.subTest(sweep=name):
+                inspect.signature(sweep).bind(False)
 
 
 class SelectedSweepsTest(unittest.TestCase):
@@ -222,7 +267,7 @@ class MainTest(unittest.TestCase):
 
     def test_idle_tick_prints_nothing(self):
         """The property the whole job exists for: silence costs nothing."""
-        rc, out, filed = self._run({"issues": lambda: gate.SweepResult()})
+        rc, out, filed = self._run({"issues": lambda dry_run=False: gate.SweepResult()})
         self.assertEqual(rc, 0)
         self.assertEqual(out, "")
         self.assertEqual(filed, [])
@@ -231,7 +276,7 @@ class MainTest(unittest.TestCase):
         """Work is handed to a worker, not announced. The card is the message."""
         card = gate.Card(title="t", body="b", idempotency_key="k")
         rc, out, filed = self._run(
-            {"issues": lambda: gate.SweepResult(cards=[card])}
+            {"issues": lambda dry_run=False: gate.SweepResult(cards=[card])}
         )
         self.assertEqual(rc, 0)
         self.assertEqual(out, "")
@@ -239,7 +284,7 @@ class MainTest(unittest.TestCase):
 
     def test_warnings_reach_stdout(self):
         rc, out, _ = self._run(
-            {"issues": lambda: gate.SweepResult(warnings=["⚠️ broken"])}
+            {"issues": lambda dry_run=False: gate.SweepResult(warnings=["⚠️ broken"])}
         )
         self.assertEqual(rc, 0)
         self.assertIn("⚠️ broken", out)
@@ -247,12 +292,12 @@ class MainTest(unittest.TestCase):
     def test_a_raising_sweep_does_not_stop_its_sibling(self):
         """Sweep isolation — what two separate cron jobs used to give for free."""
 
-        def boom():
+        def boom(dry_run=False):
             raise RuntimeError("kaboom")
 
         card = gate.Card(title="t", body="b", idempotency_key="k")
         rc, out, filed = self._run(
-            {"broken": boom, "working": lambda: gate.SweepResult(cards=[card])}
+            {"broken": boom, "working": lambda dry_run=False: gate.SweepResult(cards=[card])}
         )
         self.assertEqual(rc, 0)
         self.assertEqual(filed, [card])
@@ -260,7 +305,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("`broken` sweep failed", out)
 
     def test_a_raising_sweep_is_reported_not_swallowed(self):
-        def boom():
+        def boom(dry_run=False):
             raise RuntimeError("kaboom")
 
         rc, out, filed = self._run({"broken": boom})
@@ -274,8 +319,8 @@ class MainTest(unittest.TestCase):
         unwanted = gate.Card(title="unwanted", body="b", idempotency_key="k2")
         rc, out, filed = self._run(
             {
-                "issues": lambda: gate.SweepResult(cards=[wanted]),
-                "pr_comments": lambda: gate.SweepResult(cards=[unwanted]),
+                "issues": lambda dry_run=False: gate.SweepResult(cards=[wanted]),
+                "pr_comments": lambda dry_run=False: gate.SweepResult(cards=[unwanted]),
             },
             env={gate.SWEEPS_ENV: "issues"},
         )
@@ -286,7 +331,7 @@ class MainTest(unittest.TestCase):
     def test_dry_run_files_nothing(self):
         card = gate.Card(title="t", body="b", idempotency_key="k")
         rc, out, filed = self._run(
-            {"issues": lambda: gate.SweepResult(cards=[card])}, argv=["--dry-run"]
+            {"issues": lambda dry_run=False: gate.SweepResult(cards=[card])}, argv=["--dry-run"]
         )
         self.assertEqual(rc, 0)
         self.assertEqual(filed, [])
