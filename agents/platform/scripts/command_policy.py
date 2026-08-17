@@ -280,6 +280,12 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "get"),
         ("config", "get-value"),
         ("config", "list"),
+        # `beta` is a word like any other here, so a beta path has to be
+        # listed on its own -- the GA entry above it grants nothing. These two
+        # are the stockout SOP's capacity forecast; the data has no GA
+        # spelling yet.
+        ("beta", "compute", "advice", "calendar-mode"),
+        ("beta", "compute", "advice", "capacity-history"),
         ("compute", "addresses", "describe"),
         ("compute", "addresses", "list"),
         ("compute", "backend-services", "list"),
@@ -287,7 +293,16 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "disks", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
+        # The daily `stockout-prevention` cron reads these three and nothing
+        # else can stand in for them: reservations list is the committed
+        # capacity, regions describe is the quota headroom, machine-types
+        # list is what the region can actually place. Missing, the job runs,
+        # reports, and silently skips most of its twelve checks -- a clean
+        # capacity report the agent never gathered is worse than a failed one.
+        ("compute", "machine-types", "list"),
+        ("compute", "regions", "describe"),
         ("compute", "regions", "list"),
+        ("compute", "reservations", "list"),
         ("compute", "snapshots", "describe"),
         ("compute", "snapshots", "list"),
         ("compute", "target-pools", "list"),
@@ -338,6 +353,15 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
 _GCLOUD_BOOLEAN_FLAGS = frozenset(
     {
         "--quiet", "-q", "--version", "-v", "--help", "-h",
+        # get-credentials endpoint selectors. Both are boolean, and both are
+        # missing here until something refuses a cluster nobody could reach
+        # any other way: an unlisted flag makes the whole command unreadable,
+        # so `get-credentials --dns-endpoint` is refused as gcp.unreadable-
+        # command before the allowlist entry for it is ever consulted. DNS
+        # endpoints are how the shipped gke-networking skill reaches a
+        # control plane without a public IP, which is exactly the cluster
+        # where there is no fallback spelling.
+        "--dns-endpoint", "--internal-ip",
     }
 )
 
@@ -539,6 +563,15 @@ def _kubectl_has_kuberc(argv: list[str]) -> str | None:
     return None
 
 
+# Boolean shorthands kubectl registers on the verbs the skills use: -A
+# (--all-namespaces), -R (--recursive), -w (--watch) on `get`; -f (--follow),
+# -p (--previous) on `logs`; -i/-t (--stdin/--tty) on `exec` and `run`; -q and
+# -h. Only these continue a shorthand-cluster walk -- see the note in
+# _kubectl_refuses_identity_change for why an unknown letter has to end it
+# rather than be assumed boolean.
+_KUBECTL_BOOLEAN_SHORTHANDS = frozenset("ARwfpitqh")
+
+
 def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
     """Return the offending identity or credential-redirection flag, or None.
 
@@ -594,20 +627,30 @@ def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
         #
         if token.startswith("-s") and token != "-s":
             return "-s"
-        # Shorthand cluster: `-As http://host`. Only single-dash tokens that are
-        # not `--` long flags can cluster, and `-s...` is already handled above,
-        # so what reaches here is a cluster whose first character is not `s`.
-        # Any `s` later in the run is the server flag as soon as every character
-        # before it is a boolean -- and since a value-taking shorthand ends the
-        # walk, an `s` preceded only by other letters is refused rather than
-        # guessed at. Erring toward refusal is the C2 direction.
-        if (
-            len(token) > 2
-            and token.startswith("-")
-            and not token.startswith("--")
-            and "s" in token[1:]
-        ):
-            return "-s"
+        # Shorthand cluster: `-As http://host`. Only single-dash tokens cluster,
+        # and `-s...` is handled above, so what reaches here starts with some
+        # other letter.
+        #
+        # The walk has to stop at the first value-taking shorthand, because
+        # everything after it is that flag's value rather than more flags. An
+        # earlier revision of this clause tested `"s" in token[1:]` instead and
+        # refused `kubectl get pods -ojson` -- `-o` takes a value, `json`
+        # contains an `s`, and the read the skills issue constantly came back
+        # as an identity-change refusal. `-owide` passed, which is what made it
+        # look fine. Substring is not the rule; the walk is.
+        #
+        # Only characters known to be boolean continue the walk, so an unknown
+        # or value-taking shorthand ends it and the rest is treated as a value.
+        # That errs toward permitting an odd cluster rather than refusing a
+        # read, which is the right direction here: the exfiltration this guards
+        # needs `s` to be *parsed* as --server, and it can only be parsed that
+        # way when every character before it is a boolean.
+        if len(token) > 2 and token.startswith("-") and not token.startswith("--"):
+            for character in token[1:]:
+                if character == "s":
+                    return "-s"
+                if character not in _KUBECTL_BOOLEAN_SHORTHANDS:
+                    break
     return None
 
 

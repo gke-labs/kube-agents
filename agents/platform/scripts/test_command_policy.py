@@ -350,6 +350,26 @@ class KubectlIdentityFlagTest(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_an_s_inside_a_shorthand_value_is_not_the_server_flag(self):
+        # The case the first version of the cluster rule got wrong, and the
+        # reason this test exists separately from the one above: that test only
+        # covered *long* flags containing an s, so a rule that scanned every
+        # short token for one passed it while refusing `kubectl get pods
+        # -ojson` in production. `-o` takes a value, so pflag stops the
+        # shorthand walk there and `json` is data -- the `s` in it was never a
+        # flag. `-owide` has no `s` and passed either way, which is what made
+        # the broken rule look correct.
+        for argv, desc in (
+            (["kubectl", "get", "pods", "-ojson"], "-ojson, the common read"),
+            (["kubectl", "get", "pods", "-o", "json"], "detached -o json"),
+            (["kubectl", "get", "pods", "-ojsonpath={.items[0]}"], "-o jsonpath"),
+            (["kubectl", "get", "pods", "-lapp=search"], "-l selector whose value has an s"),
+            (["kubectl", "get", "pods", "-nkube-system"], "-n namespace whose value has an s"),
+            (["kubectl", "logs", "mypod", "-cistio-proxy"], "-c container whose value has an s"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
     def test_attached_shorthand_server_is_refused(self):
         # pflag accepts a shorthand's value attached to it, so `-shttp://host`
         # is `--server http://host` with no `=` to partition on -- the token's
@@ -839,3 +859,60 @@ class GcloudReadOnlyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
+    """Refusals that are outages rather than controls.
+
+    Every case here is a command the shipped configuration issues on its own,
+    with no attacker and no unusual invocation. The gate defaults to enforcing,
+    so an allowlist that omits one of these does not degrade -- it takes the
+    feature away, and does it on a schedule nobody is watching.
+    """
+
+    def test_the_daily_stockout_cron_can_run_its_reads(self):
+        # agents/platform/cron/jobs.json schedules `stockout-prevention` daily
+        # and enabled, pointing at governance/stockout_prevention_sop.md with
+        # "execute it exactly". These are the commands that SOP issues. Four of
+        # them were refused when the allowlist first shipped, which would have
+        # left the cron reporting a fleet it never measured.
+        for argv, desc in (
+            (["gcloud", "compute", "reservations", "list"], "committed capacity"),
+            (["gcloud", "compute", "regions", "describe", "us-central1"], "quota headroom"),
+            (["gcloud", "compute", "machine-types", "list", "--filter=x"], "placeable shapes"),
+            (["gcloud", "beta", "compute", "advice", "capacity-history"], "capacity forecast"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode"], "calendar mode"),
+            (["gcloud", "container", "clusters", "list"], "the fleet"),
+            (["gcloud", "container", "node-pools", "list", "--cluster=c", "--region=us-central1"], "node pools"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_get_credentials_works_on_a_dns_endpoint_cluster(self):
+        # gke-networking/SKILL.md:50 tells the agent to use --dns-endpoint, and
+        # on a control plane with no public IP there is no other spelling. An
+        # unlisted flag is not merely unmatched: _gcloud_words_and_flag returns
+        # no words at all, so the command is refused as unreadable before the
+        # get-credentials entry that permits it is consulted.
+        for argv, desc in (
+            (["gcloud", "container", "clusters", "get-credentials", "c",
+              "--region=us-central1", "--dns-endpoint"], "--dns-endpoint"),
+            (["gcloud", "container", "clusters", "get-credentials", "c",
+              "--zone", "us-central1-a", "--internal-ip"], "--internal-ip"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_listing_a_beta_read_does_not_open_the_beta_tree(self):
+        # The `beta` entries are full paths, not a prefix. Asserting the
+        # writes next to them stay refused is the point: a rule that granted
+        # `beta` as a group would trade a cron job for the entire surface.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "instances", "delete", "x"], "beta instance delete"),
+            (["gcloud", "beta", "compute", "advice", "create"], "beta advice write"),
+            (["gcloud", "beta", "container", "clusters", "delete", "c"], "beta cluster delete"),
+            (["gcloud", "compute", "reservations", "create", "r"], "reservation create"),
+            (["gcloud", "compute", "reservations", "delete", "r"], "reservation delete"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)

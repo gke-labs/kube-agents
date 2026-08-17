@@ -4234,3 +4234,33 @@ func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
 		t.Errorf("disabling the watcher must not strip its configuration, got %#v", off.Env)
 	}
 }
+
+// The read-only kill switch. Unlike the two above it is not appended by
+// buildCredentialProxySidecar afterwards, so an unreserved name here does not
+// duplicate or lose a race — it is simply accepted, and the proxy reads the
+// user's value. `CREDENTIAL_PROXY_ENFORCE_READ_ONLY: "false"` under
+// spec.deployment.env turned off every refusal in the policy: all commands,
+// all agents, all clusters in the Pod, no expiry, and nothing in the CR that
+// reads like a security change. Whoever can edit the PlatformAgent is often
+// exactly who the policy is meant to constrain, so the switch cannot be theirs.
+//
+// Asserting absence rather than a value is deliberate: the proxy defaults to
+// enforcing when the variable is unset, so dropping the entry is the fix, and
+// an operator-set "true" would be indistinguishable from the merge having
+// silently passed the user's own "true" through.
+func TestDeploymentEnvCannotDisableReadOnlyEnforcement(t *testing.T) {
+	for _, userValue := range []string{"false", "0", "no", "true"} {
+		t.Run(userValue, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_ENFORCE_READ_ONLY", Value: userValue}},
+			}
+
+			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+				if e.Name == "CREDENTIAL_PROXY_ENFORCE_READ_ONLY" {
+					t.Fatalf("spec.deployment.env set the read-only kill switch to %q; it must be dropped as reserved", e.Value)
+				}
+			}
+		})
+	}
+}
