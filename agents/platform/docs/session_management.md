@@ -8,9 +8,9 @@ This document details the architecture and workflow for routing GKE Kubernetes w
 
 AI agent execution is typically stateless and triggered on-demand. To support proactive GKE warning troubleshooting, we run a local stateful proxy server called `session_kv_server.py` (the REST Bridge) on the Platform Agent host on `127.0.0.1:8699`.
 
-This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Platform Agent Gateway** (running the LLM reasoning turns).
+This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The turn it starts runs on the gateway's default profile — the **Chat Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because it has exactly three callers and all of them share this Pod's network namespace: the event watcher in the credential-proxy container, the Platform MCP server, and the `incident_context` plugin. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher in the credential-proxy container, the Platform MCP server, the Cluster Agents' `notify` MCP server, and the `incident_context` plugin. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -19,6 +19,17 @@ It binds loopback rather than `0.0.0.0` because it has exactly three callers and
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
 5. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
+6. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and tells that agent how to deliver the report it writes.
+
+### Triage Routing
+
+The session lands on the front door and cannot land anywhere else. Hermes selects a profile by URL prefix (`POST /p/<profile>/api/sessions`), only when `gateway.multiplex_profiles` is enabled — it is off by default and this install does not set it — and only against that profile's own `API_SERVER_KEY`. A `profile` key in the request body is accepted with a `201` and dropped, so it looks like routing and is not. Routing is therefore a prompt, not a parameter.
+
+`_build_agent_query` writes that prompt for the front door, and it is addressed to a router rather than to a diagnostician: make exactly one `kanban_create` call, assign it to the `cluster-*` agent scoped to the event's cluster, and copy the body between two markers verbatim. `_triage_task_body` builds that body — the event details, the report template, and the delivery instruction — and it is the front door's job to move it across unread. Everything in that design is a response to the front door being helpful: given the brief as instructions rather than as cargo, it summarised, dropped the session id and the obligation to post on the way, and filed extra cards asking other agents to deliver the report.
+
+The Cluster Agent's report reaches a human only through its own `send_notification` tool. The card was filed on behalf of an `api_server` session with no chat thread subscribed to it, so `kanban_complete` delivers the result to nobody: the body therefore demands two terminal calls in order, `send_notification` first and `kanban_complete` second, and forbids handing either to another agent or a child card. An instruction that read as conditional, delegated on to an agent that had no egress of its own, is how issue #630 lost most of the reports the fleet produced.
+
+The session id is the thread key. `send_notification` resolves it against `session_metadata`, which records the `platform` alongside the `thread_id` — a thread belongs to exactly one chat platform, and a report addressed to the other is not degraded to the home channel but refused outright by `hermes send`.
 
 ### Daily Alert Ceiling
 
@@ -68,7 +79,8 @@ sequenceDiagram
     participant Watcher as k8s-event-watcher
     participant Proxy as session_kv_server (Port 8699)
     participant Gateway as Hermes Gateway (Port 8642)
-    participant Agent as Platform Agent LLM
+    participant Front as Chat Agent (default profile)
+    participant Agent as Cluster Agent for the event's cluster
     participant Chat as Google Chat / Slack
     participant Plugin as incident_context Plugin
 
@@ -78,10 +90,17 @@ sequenceDiagram
     Proxy-->>Watcher: Returns sessionID: k8s-evt-abc123
     Watcher->>Proxy: POST /sessions/k8s-evt-abc123/inject (Payload: Event details)
     Proxy->>Proxy: Spend one of today's alerts for this severity (silently drops if the ceiling is reached)
-    Proxy->>Chat: Post Alert & Triage Report (N options, one marked Recommended)
-    Note over Proxy: Store triage report in db (incidents table)
-    Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Start Troubleshooter)
-    Gateway->>Agent: Wake up troubleshooter agent
+    Proxy->>Chat: Post the alert (no diagnosis yet) and record its thread and platform
+    Proxy->>Gateway: POST /api/sessions (session k8s-evt-abc123; lands on the default profile)
+    Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Route this triage)
+    Gateway->>Front: Wake up the front door
+    Front->>Agent: kanban_create(assignee=cluster-proj-x-loc, body=the brief, verbatim)
+    Agent->>Agent: Diagnose (read-only), write the report
+    Note over Agent: send_notification(session_id=k8s-evt-abc123, message=report)
+    Agent->>Proxy: GET /v1/sessions/k8s-evt-abc123/metadata (which thread?)
+    Agent->>Chat: hermes send to that thread (home channel if unresolved)
+    Agent->>Proxy: POST /v1/incidents (store the report for the follow-up turn)
+    Agent->>Agent: kanban_complete(result=the same report) — bookkeeping, delivers to nobody
 
     Note over K8s, Watcher: Phase 2: Event Deduplication
     K8s->>Watcher: (Duplicate Warning Event occurs)

@@ -193,9 +193,21 @@ that table into a corpus, and they are small changes to a table we already write
 
 **Every domain writes its judgment prompt.**
 
-The watcher sends JSON. `_build_agent_query()` (`session_kv_server.py:245`) turns it into one string,
-and that string decides how the whole interaction behaves. Every new domain writes one of these, next
-to its skill. Abridged, as it runs today:
+The watcher sends JSON. `session_kv_server.py` turns it into one string, and that string decides how
+the whole interaction behaves. Every new domain writes one of these, next to its skill.
+
+It is two strings, in fact, because the reader of the first is not the agent that does the work.
+`_create_gateway_session` cannot choose a profile — Hermes selects one by URL prefix under
+`gateway.multiplex_profiles`, which is off, and a `profile` key in the body is accepted and dropped —
+so the turn always lands on the front door. `_build_agent_query()` therefore addresses a router:
+one `kanban_create` to the `cluster-*` agent scoped to the event's cluster, with the diagnostic brief
+copied between two markers **verbatim**, and nothing else — no diagnosis, no posting, no second card
+asking someone else to post. That last clause is not hypothetical tidiness; a front door handed the
+brief as instructions rather than as cargo summarised it, dropped the session id and the obligation to
+post, and filed extra cards to have other agents deliver the report.
+
+`_triage_task_body()` builds what travels between the markers, and it is the string above's real
+payload. Abridged, as it runs today:
 
 ```
 Analyze the following Kubernetes event warning on GKE cluster '{cluster}'
@@ -206,8 +218,18 @@ for the active session '{session_id}'.
 • *Event Reason:* {reason}
 • *Warning Message:* {message}
 
-When done, post your final diagnostic report ... formatted exactly like this —
-the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth:
+**Finish with two calls, in this order.** First `send_notification(session_id='{session_id}',
+message=<your completed report>)`, then `kanban_complete(result=<the same report>, ...)`.
+
+The `send_notification` call is the delivery, and it is not optional. This card was filed on
+behalf of session '{session_id}', which arrived over the API rather than over chat, so no chat
+thread is subscribed to its completion ...
+
+**Do this yourself. Do not delegate the diagnosis or the posting to another agent, and do not
+open child cards for it** ...
+
+Format the report you pass to `send_notification`, and to `kanban_complete`'s `result`, exactly
+like this — these three `##` sections are the only ones, and there is no fourth:
 
 ## What's wrong
 <1-sentence description of the problem>
@@ -221,31 +243,44 @@ the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth
 - ✅ **Recommended: Option <letter>** — <why this is the safer choice>
 - **To authorize:** reply **'apply'** ... or name one directly with **'apply Option A'** / **'apply Option B'**
 
-**GitOps PR Instructions (for subsequent turns):**
-1. You are explicitly authorized to create a branch, modify manifests, commit, push, open a PR.
-3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
+**What happens if the user replies 'apply':**
+The reply lands as ordinary chat ingress, on the front door rather than in this session, and is
+carried out by the agent that holds the GitOps write path ... the fix ships as a Pull Request
+against the GitOps repository, and nothing is written to the live cluster directly.
 ```
 
-**What that one string pins down** — three design decisions, not formatting preferences:
+**What that one string pins down** — four design decisions, not formatting preferences:
 
+- **The delivery** — the work runs on a kanban card whose requester is an API session with no chat
+  thread subscribed to it, so completing the card displays the report to nobody. It exists for a human
+  only if the agent calls `send_notification` with this session id. The prompt therefore states that
+  obligation unconditionally, orders it before `kanban_complete`, and forbids delegating it: an
+  instruction that read as conditional, handed on to an agent with no egress of its own, is how issue
+  #630 lost most of the reports the fleet produced.
 - **The report shape** — a fixed layout the reader learns once. Consistency across domains is what makes
   the output skimmable at 3am. It is not an independent choice: "formatted exactly like this" outranks
-  the persona, so a shape here that disagrees with SOUL.md §7 does not extend that policy, it silently
-  replaces it. A new domain's template starts from §7's three sections.
+  the persona, so a shape here that disagrees with the Platform Agent's SOUL.md §7 does not extend that
+  policy, it silently replaces it. A new domain's template starts from §7's three sections. The template
+  spells that shape out rather than citing the section, because the agent reading it is a Cluster Agent,
+  whose persona has no §7.
 - **The approval interaction** — the exact words that turn a suggestion into an authorized action, and
   the fact that a reply is required at all. It now shares a bullet list with the fix options, so it is
   labelled `To authorize:` and the instruction above the template says it is not an option; a bare
   fourth bullet in a lettered list reads as Option C.
-- **The write boundary** — the agent may open a PR; it may not touch the live cluster. This is the
-  safety property of the whole architecture, and it is stated in the prompt.
+- **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
+  triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
+  the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
+  precisely enough to act on from the report alone. This is the safety property of the whole
+  architecture, and it is stated in the prompt.
 
 A domain also registers a **skill** in the catalog (`agents/platform/skills/`), which supplies the
 diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status → namespace events →
-container logs → service and NetworkPolicy checks → propose a GitOps correction. `SOUL.md` §7 requires
-the agent to query the catalog and load the matching domain skill before diagnosing, and §8 imposes a
-communication policy on the result: a three-part layout, a jargon translation table (`OOMKilled` →
-"the application ran out of allocated memory"), and a pre-report self-audit that demands quoted command
-output, resource names, and UTC timestamps.
+container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
+the triage requires the agent to query the catalog and load the matching domain skill before diagnosing
+(Cluster Agent `SOUL.md` §3) and to pass a pre-report self-audit demanding quoted command output,
+resource names, and UTC timestamps (§4). The communication policy on the result — the three-part layout
+and a jargon translation table (`OOMKilled` → "the application ran out of allocated memory") — is
+Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 
 **So a new domain supplies two things: a skill and a judgment prompt.** The skill is _how to investigate_;
 the prompt is _what to decide and how to say it_.
@@ -303,10 +338,13 @@ The GKE-events path is live end to end:
   `CrashLoopBackOff`, `FailedScheduling`, `Evicted`, ~12 reasons total), with namespace deny/allow rules
   and a flapping guard.
 - **Dedup** — a 24h rolling window collapses repeats and related reasons into one incident.
-- **Session + routing** — one session per incident, SQLite-backed, posted to the right chat thread, with
-  the triage report stored for follow-up replies.
-- **Judgment** — the Platform Agent loads the matching skill, diagnoses root cause, and posts a
-  plain-language triage with two GitOps fix options.
+- **Session + routing** — one session per incident, SQLite-backed, posted to the right chat thread and
+  recorded with the platform that thread lives on, with the triage report stored for follow-up replies.
+  The turn wakes the front door, which delegates the diagnosis as one kanban card to the Cluster Agent
+  of the cluster that raised the event.
+- **Judgment** — that cluster's Cluster Agent loads the matching skill, diagnoses root cause, and posts a
+  plain-language triage with as many GitOps fix options as the root cause warrants, through its
+  `send_notification` tool.
 - **Human-in-the-loop** — an engineer approves in-thread; nothing reaches production without it.
 - **Remediation** — the approved fix ships as a GitOps PR.
 
