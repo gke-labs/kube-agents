@@ -60,6 +60,7 @@ refresh is a single edit.
 | [`agents/platform/scripts/platform_mcp_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/platform_mcp_server.py)                                     | The second, racing KV-server launcher                            |
 | [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)                                         | The process S4 adopts; cited in 3.8A only                        |
 | [`deploy/shared/entrypoint_gate_check.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/entrypoint_gate_check.sh)                                                     | Asserts port 8699 is released; changes at S4                     |
+| [`k8s-operator/config/integrations/hindsight/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/hindsight)                                            | The memory service, deployed separately — 3.2 and 3.8A           |
 
 ## 1. What exists today
 
@@ -604,6 +605,23 @@ doing its job. Collapsing the two — treating any stopped process as equivalent
 fail-open dependency turns into an outage, which is a mistake this design made in an earlier
 draft and 3.4 now avoids explicitly.
 
+#### What is deliberately not in the table
+
+The table holds **long-lived processes inside this container**. Three things that arrived with the
+Hindsight memory provider look adjacent and are each excluded for a different reason — worth
+stating, because "why isn't memory in here?" is the obvious question a reader now has:
+
+| Thing                       | Why it is not a table entry                                                                                                                                                                                                                                                                                                  |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hindsight itself**        | Not in this container, or any container of this pod. It is a separate in-cluster Deployment reached over a Service — the operator hands the gateway `http://hindsight-api.<ns>.svc.cluster.local:8888` ([`platformagent_manifests.go:1627`][platformagent_manifests-go-1627]). A remote dependency, not a supervised process |
+| **The memory migration**    | One-shot. It runs once per boot and exits, so there is nothing to keep running. It is in 1.2 rather than here, because what matters about it is that the supervisor _inherits_ it (3.7)                                                                                                                                      |
+| **`memory_ttl_curator.py`** | Not scheduled by anything — its own header says so, and it is run by hand through `kubectl exec`. Periodic work belongs in Hermes cron or an operator action, not in a supervisor whose job is keeping services up                                                                                                           |
+
+The last row is a boundary worth defending rather than an accident. A supervisor that also runs
+periodic jobs becomes a cron daemon with a lease, and every job added to it tightens the shutdown
+budget of 3.5 for no availability benefit. **The table should only ever grow for something that
+must be running for the container to do its job.**
+
 Both replica counts collapse to one tree, differing only in the supervisor's mode:
 
 ```text
@@ -842,6 +860,19 @@ thing today is `POST /v1/responses` ([`hack/ci-deploy.sh:140`][ci-deploy-sh-140]
 expensive to run every 10 s. **This is a known and accepted limitation of S2**, not something the
 probe silently covers; it is listed as an open question in 8.
 
+**And the gap widens as the gateway grows dependencies it reaches over the network.** The memory
+provider is the current example: recall and retention go to `hindsight-api` in another pod
+([`platformagent_manifests.go:1627`][platformagent_manifests-go-1627]), so a gateway whose
+Hindsight is unreachable is degraded in a way neither a PID nor a TCP accept can detect.
+
+The tempting response — have the probe check the gateway's dependencies too — is the same mistake
+3.4 already rejected once, one level out. A pod marked NotReady because a _remote_ service is down
+removes the only endpoint there is and converts someone else's outage into this agent's outage,
+while the agent could still answer everything that does not need memory. **Dependency health
+belongs in `degraded`, never in `ready`** — the same rule the optional-process row follows, for
+the same reason. What reports it is a matter for whoever owns the dependency; this design only
+fixes where the answer may and may not be written.
+
 ```yaml
 readinessProbe:
   exec: { command: ["/opt/hermes/bin/supervisor-ready"] }
@@ -973,6 +1004,25 @@ sooner, and a _new_ leader also detects an expired lease sooner.
 
 The guarantee this buys is narrow and should be stated as such: **in the absence of a partition,
 the outgoing leader has stopped its processes before any other pod can acquire the lease.**
+
+#### The margin is spent by the third process, and there is a candidate
+
+Six seconds sounds comfortable and is not. The shutdown term is `10 s × len(table)`, so a third
+entry takes it to 30 s against a 30 s lease and the startup assertion refuses to boot — measured,
+not predicted (E6 in 6.0). **This design ships with the margin nearly consumed**, and that is a
+deliberate consequence of preferring a 10 s clean shutdown over a shorter one.
+
+It is worth naming the concrete candidate rather than leaving it abstract.
+`agents/chat/scripts/memory_ttl_curator.py` exists, prunes the Hindsight bank, and is explicitly
+unscheduled — "nothing schedules this yet. Running it is an operator action." The obvious way to
+schedule it is a periodic worker, and the obvious place to put a periodic worker is next to the
+other supervised processes. 3.2 says not to, and this is the arithmetic behind that: adding it
+would fail the assertion at startup, and the fix would be to weaken one of the lease parameters
+to buy room for a job that does not need to be running continuously at all.
+
+If a third **service** is ever genuinely required, the inequality has to be re-solved rather than
+nudged — most cheaply by shortening the grace of the process that provably does not need 10 s,
+which is a measurement rather than a guess.
 
 ### 3.6 What the Lease does not do
 
@@ -1158,6 +1208,22 @@ simply not started.
 mounted at `$HERMES_HOME`, and would re-run the entrypoint's tree build. That is not fatal;
 `envoy-credential-proxy` already mounts the data volume at `homeDir`. It is a duplicated cost
 rather than an impossibility.
+
+**A third placement now has a precedent, and it is worth naming.** Between this design's first
+draft and now, the repository grew a stateful backing service — Hindsight — and put it neither in
+the agent pod nor under a supervisor. It is its own Deployment with its own Postgres
+(`k8s-operator/config/integrations/hindsight/`), reached over a Service. So "run it as a separate
+in-cluster service" is demonstrably available here, and the Session KV server could in principle
+follow it.
+
+That option is declined, but not by this design: it is
+[`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
+§8's "no external database" call, made on the grounds that leader-gated SQLite meets the
+requirement and a second datastore is a dependency and an IAM surface for days of routing rows.
+Hindsight is a fair counter-argument to the feasibility half of that — an in-cluster Postgres is
+evidently deployable here — and it should be weighed there rather than assumed away. What it does
+not change is anything in this section: if the KV server stays a SQLite file on the shared volume,
+reasons 1 and 2 above still decide where it runs.
 
 **When to revisit.** Reasons 2 and 3 both descend from the single-writer requirement, which comes
 from [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
@@ -1440,12 +1506,12 @@ today.
 Decisions this design deliberately leaves open, recorded so they are made rather than defaulted
 into.
 
-| #   | Question                                                                                                                                                                                                                                                                                                       | Bears on |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
-| Q1  | **`tini` as PID 1, or hand-rolled reaping?** 3.7 shows the reap loop is twelve lines and has one subtle failure (consuming a supervised process's exit status) that no test would obviously catch. `tini -- python3 leader_elect.py` is complementary, not competing. Cost is an image dependency.             | S1       |
-| Q2  | **How does the probe learn the gateway is _serving_, not merely listening?** The TCP connect in 3.4 is strictly better than a PID check and strictly weaker than a health check. Closing it needs a cheap route on the gateway; `POST /v1/responses` is a model call and far too expensive at probe frequency. | S2, S2b  |
-| Q3  | **Is 5-in-5-minutes the right cap, given the kubelet's own backoff sits underneath it?** For a required process the supervisor exiting hands over to `CrashLoopBackOff`, so the two compose. The cap may be redundant for required processes and only genuinely load-bearing for optional ones.                | S2       |
-| Q4  | **Should the readiness script live in the image or the ConfigMap?** It versions with the embedded `leader_elect.py`, so they must move together; the ConfigMap already carries one file for exactly that reason.                                                                                               | S2       |
+| #   | Question                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Bears on |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| Q1  | **`tini` as PID 1, or hand-rolled reaping?** 3.7 shows the reap loop is twelve lines and has one subtle failure (consuming a supervised process's exit status) that no test would obviously catch. `tini -- python3 leader_elect.py` is complementary, not competing. Cost is an image dependency.                                                                                                                                                                                       | S1       |
+| Q2  | **How does the probe learn the gateway is _serving_, not merely listening?** The TCP connect in 3.4 is strictly better than a PID check and strictly weaker than a health check. Closing it needs a cheap route on the gateway; `POST /v1/responses` is a model call and far too expensive at probe frequency. Note the answer must distinguish the gateway's own health from its dependencies': 3.4 fixes that a remote service being down may set `degraded` but never `ready: false`. | S2, S2b  |
+| Q3  | **Is 5-in-5-minutes the right cap, given the kubelet's own backoff sits underneath it?** For a required process the supervisor exiting hands over to `CrashLoopBackOff`, so the two compose. The cap may be redundant for required processes and only genuinely load-bearing for optional ones.                                                                                                                                                                                          | S2       |
+| Q4  | **Should the readiness script live in the image or the ConfigMap?** It versions with the embedded `leader_elect.py`, so they must move together; the ConfigMap already carries one file for exactly that reason.                                                                                                                                                                                                                                                                         | S2       |
 
 Q1 and Q3 are cheap to settle during implementation. Q2 is the one that should not be quietly
 dropped: it is the difference between a probe that detects a stopped process and one that detects
@@ -1487,6 +1553,7 @@ a broken one, and the design currently only claims the former.
 [platform_mcp_server-py-744-785]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/agents/platform/scripts/platform_mcp_server.py#L744-L785
 [platformagent_controller-go-841-855]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/k8s-operator/internal/controller/platformagent_controller.go#L841-L855
 [platformagent_manifests-go-1560-1575]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/k8s-operator/internal/controller/platformagent_manifests.go#L1560-L1575
+[platformagent_manifests-go-1627]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/k8s-operator/internal/controller/platformagent_manifests.go#L1627
 [platformagent_manifests-go-1818-1819]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/k8s-operator/internal/controller/platformagent_manifests.go#L1818-L1819
 [platformagent_manifests-go-185]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/k8s-operator/internal/controller/platformagent_manifests.go#L185
 [platformagent_manifests-go-1972-1979]: https://github.com/gke-labs/kube-agents/blob/d44ea2187557eafb592f4ddb32f84582f0ec71d8/k8s-operator/internal/controller/platformagent_manifests.go#L1972-L1979
