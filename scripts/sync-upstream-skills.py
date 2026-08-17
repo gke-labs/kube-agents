@@ -47,7 +47,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \\
 
 The command is idempotent, so it is safe to re-run. This gives the new cluster an agent
 immediately. (The `cluster-agent-reconcile` cron would also pick it up on its next run — it
-manages every cluster in the project except the management cluster — so no labeling is required.)
+manages every cluster in the project, so no labeling is required.)
 
 ## Cluster Agent Profile Teardown
 
