@@ -1216,23 +1216,90 @@ the agent pod nor under a supervisor. It is its own Deployment with its own Post
 in-cluster service" is demonstrably available here, and the Session KV server could in principle
 follow it.
 
-That option is declined, but not by this design: it is
+That option is declined by
 [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
-§8's "no external database" call, made on the grounds that leader-gated SQLite meets the
-requirement and a second datastore is a dependency and an IAM surface for days of routing rows.
-Hindsight is a fair counter-argument to the feasibility half of that — an in-cluster Postgres is
-evidently deployable here — and it should be weighed there rather than assumed away. What it does
-not change is anything in this section: if the KV server stays a SQLite file on the shared volume,
-reasons 1 and 2 above still decide where it runs.
+§8 rather than here, and it changes nothing in this section as long as the store stays a SQLite
+file on the shared volume: reasons 1 and 2 above still decide where the server runs. It matters
+because of what it would do if it were ever taken up — worked out under **The Postgres scenario**
+below.
 
 **When to revisit.** Reasons 2 and 3 both descend from the single-writer requirement, which comes
 from [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
-§4 and is not yet in force. **If that design is abandoned, this one should be re-scoped rather
-than shipped as written**: without exclusive access there is no handover to sequence and no
-reason to gate on the leader, and a plain sidecar container becomes the better answer to "the KV
-server has no owner." What would remain worth doing is P3 and P4 — the crash-path cleanup and a
-readiness probe on the gateway container — which are defects in the leader election itself and
-are independent of where the KV server runs. 5 keeps S1–S2 separable for that reason.
+§4 and is not yet in force. **If that requirement goes away, this design should be re-scoped
+rather than shipped as written**: without exclusive access there is no handover to sequence and
+no reason to gate on the leader, and a plain sidecar container becomes the better answer to "the
+KV server has no owner."
+
+The likeliest way for it to go away is not abandonment but **relocation**, so it is worth working
+out in advance.
+
+##### The Postgres scenario
+
+Suppose the Session KV store moved from SQLite-on-a-volume to the in-cluster Postgres that already
+backs Hindsight. Most of this design would not simplify — it would **stop having a reason to
+exist**, because nearly all of it hangs off one link in a chain:
+
+```text
+  SQLite on an RWX volume cannot do multi-writer            (session-kv R3)
+    └─> the KV server must be the single writer
+          └─> so it must be leader-gated
+                └─> so the lease holder must start and stop it
+                      └─> so it must be a supervised process
+                            ├─> a supervisor at every replica count   P1, P2
+                            ├─> a process table with ordering         3.2
+                            ├─> a summed shutdown budget              3.2, 3.7
+                            └─> the lease inequality                  3.5, P5
+                                  └─> 30 s lease -> +15 s blackhole
+```
+
+Postgres cuts the first link, and everything under it goes. Nor is the file lock the only thing:
+with a real database nothing else needs the leader either — an outbox drains with
+`SELECT … FOR UPDATE SKIP LOCKED`, retention GC is an idempotent `DELETE`, and event dedup is a
+unique index, which
+[`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
+§4.3 already names as the real authority.
+
+| Would collapse                                  | Would survive                                                         |
+| ----------------------------------------------- | --------------------------------------------------------------------- |
+| P1, P2 and the two modes — nothing to supervise | **P3** — the crash path leaks the label and the lease                 |
+| 3.2's process table, criticality, ordering      | **P4** — the gateway container still has no probe                     |
+| 3.3's restart policy and required-vs-optional   | **3.7's reaping** — the entrypoint's migration job orphans regardless |
+| 3.5's retiming, **and the +15 s blackhole**     |                                                                       |
+| Reasons 2 and 3 of this section                 |                                                                       |
+
+What would be left is perhaps a quarter of this document: route the crash path through
+`release_lease_and_exit`, reap orphans as PID 1, keep a much smaller status file so the probe can
+tell a follower from a broken leader, and add the exec probe. **And S3 would disappear rather than
+ship**, so the failover blackhole would not grow at all.
+
+**This design does not make that call**, and should not: it is a storage decision belonging to
+§8 of the KV decomposition. Three things are worth handing over with it, because they are not in
+that document today.
+
+- **The recorded justification answers a different question.** §8 declines _Cloud SQL_ — "a
+  dependency and an IAM surface". In-cluster Postgres has no IAM surface, and on a stock install
+  the dependency is already deployed. Whatever the answer is, that reasoning needs rewriting.
+- **The dependency is conditional, and this would make it unconditional.** Hindsight's Postgres
+  "deploys nothing at all unless the install asked for this store"; an install choosing the
+  file-based provider or no memory runs no database. Putting sessions there makes Postgres
+  mandatory for everyone, and the escape hatch — keep SQLite as a fallback — means maintaining two
+  backends, which is worse than either.
+- **It is not obviously the more available option, on the path where that matters most.** That
+  Postgres is a single-replica StatefulSet, so this trades a file on a PVC for one pod plus a
+  network hop — on the alert-and-triage path, which is precisely what has to keep working during a
+  cluster incident.
+
+There is also a security question that belongs to whoever makes the call rather than here. That
+database runs `POSTGRES_HOST_AUTH_METHOD=trust` with no password, protected by a ClusterIP and a
+NetworkPolicy the integration's own README notes is enforced only on Dataplane V2 or
+`--enable-network-policy` clusters — "everywhere else the object applies cleanly and does
+nothing." The README justifies that by the data being memories held by "pods that are already
+trusted" with them. Session metadata is a different question: S5 and #616 went to the trouble of
+pseudonymising chat identifiers under a salt, and moving them into a trust-auth database would
+want checking against that work rather than inheriting its threat model by default.
+
+Whatever is decided, 5 keeps S1–S2 separable so that P3 and P4 — defects in the leader election
+itself, independent of where the KV server ends up — can ship either way.
 
 #### B. Adopt a general init system as PID 1
 
@@ -1506,16 +1573,20 @@ today.
 Decisions this design deliberately leaves open, recorded so they are made rather than defaulted
 into.
 
-| #   | Question                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Bears on |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
-| Q1  | **`tini` as PID 1, or hand-rolled reaping?** 3.7 shows the reap loop is twelve lines and has one subtle failure (consuming a supervised process's exit status) that no test would obviously catch. `tini -- python3 leader_elect.py` is complementary, not competing. Cost is an image dependency.                                                                                                                                                                                       | S1       |
-| Q2  | **How does the probe learn the gateway is _serving_, not merely listening?** The TCP connect in 3.4 is strictly better than a PID check and strictly weaker than a health check. Closing it needs a cheap route on the gateway; `POST /v1/responses` is a model call and far too expensive at probe frequency. Note the answer must distinguish the gateway's own health from its dependencies': 3.4 fixes that a remote service being down may set `degraded` but never `ready: false`. | S2, S2b  |
-| Q3  | **Is 5-in-5-minutes the right cap, given the kubelet's own backoff sits underneath it?** For a required process the supervisor exiting hands over to `CrashLoopBackOff`, so the two compose. The cap may be redundant for required processes and only genuinely load-bearing for optional ones.                                                                                                                                                                                          | S2       |
-| Q4  | **Should the readiness script live in the image or the ConfigMap?** It versions with the embedded `leader_elect.py`, so they must move together; the ConfigMap already carries one file for exactly that reason.                                                                                                                                                                                                                                                                         | S2       |
+| #   | Question                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Bears on  |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| Q1  | **`tini` as PID 1, or hand-rolled reaping?** 3.7 shows the reap loop is twelve lines and has one subtle failure (consuming a supervised process's exit status) that no test would obviously catch. `tini -- python3 leader_elect.py` is complementary, not competing. Cost is an image dependency.                                                                                                                                                                                       | S1        |
+| Q2  | **How does the probe learn the gateway is _serving_, not merely listening?** The TCP connect in 3.4 is strictly better than a PID check and strictly weaker than a health check. Closing it needs a cheap route on the gateway; `POST /v1/responses` is a model call and far too expensive at probe frequency. Note the answer must distinguish the gateway's own health from its dependencies': 3.4 fixes that a remote service being down may set `degraded` but never `ready: false`. | S2, S2b   |
+| Q3  | **Is 5-in-5-minutes the right cap, given the kubelet's own backoff sits underneath it?** For a required process the supervisor exiting hands over to `CrashLoopBackOff`, so the two compose. The cap may be redundant for required processes and only genuinely load-bearing for optional ones.                                                                                                                                                                                          | S2        |
+| Q5  | **Does the Session KV store stay a file, or move to the in-cluster Postgres?** Not this design's call — it belongs to `session-kv-decomposition.md` §8 — but it decides this design's _scope_, not just a detail of it: 3.8A's Postgres scenario works out what collapses. Worth settling before S1 rather than after, because building a supervisor and then removing the reason for it is the expensive order.                                                                         | all of it |
+| Q4  | **Should the readiness script live in the image or the ConfigMap?** It versions with the embedded `leader_elect.py`, so they must move together; the ConfigMap already carries one file for exactly that reason.                                                                                                                                                                                                                                                                         | S2        |
 
 Q1 and Q3 are cheap to settle during implementation. Q2 is the one that should not be quietly
 dropped: it is the difference between a probe that detects a stopped process and one that detects
 a broken one, and the design currently only claims the former.
+
+Q5 is different in kind from the rest, and is the one to answer first. The others tune this
+design; Q5 decides how much of it is needed at all.
 
 <!-- Source links, line-anchored and pinned to the commit these line numbers
      were read from (d44ea21). Re-pin here when the numbers are refreshed. -->
