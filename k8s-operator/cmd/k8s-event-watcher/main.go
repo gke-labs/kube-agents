@@ -316,9 +316,9 @@ type profileConfig struct {
 // Any other read error — permissions, I/O — is not something a restart will
 // fix, so those degrade rather than crashloop forever.
 //
-// Finding none is not an error either. A single-cluster install has no Cluster
-// Agent profiles at all — reconcile only creates them for clusters other than
-// the management one — so an empty result is a normal steady state, not a
+// Finding none is not an error either. A freshly installed harness has no
+// Cluster Agent profiles until the first cluster-agent-reconcile tick creates
+// them, so an empty result is a normal startup state rather than a
 // misconfiguration. The caller decides whether the combined watch set is empty.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
 	entries, err := os.ReadDir(dir)
@@ -863,13 +863,23 @@ func realMain(argv []string) error {
 //     Absent --profiles-dir this is the only source, which is the original
 //     single-cluster behavior.
 //
-// The operator passes both. The management cluster never gets a Cluster Agent
-// profile — cluster_agent_reconcile.py excludes it, and prunes one if it ever
-// appears — but it runs the platform agent itself, so watching only the
-// profiles would silently stop monitoring the very cluster whose failure
-// breaks everything else.
+// The operator passes both, and the management cluster is reached through both:
+// it runs the platform agent, so --in-cluster covers it from the first second of
+// a fresh install, and cluster_agent_reconcile.py now also gives it a Cluster
+// Agent profile like every other cluster in the project.
+//
+// Which means the two sources overlap, and the overlap has to be resolved here.
+// Each watched cluster gets its OWN dedup cache (see the loop in run), and
+// EventKey is (UID, reason) with no cluster in it, so two entries for one
+// cluster are not deduplicated anywhere downstream: the same pod crash would
+// raise two alerts, open two sessions, and burn two slots of the daily ceiling.
+// The profile entry wins, because it carries the project/location/cluster
+// identity that the payload is stamped with and that the triage session is
+// routed by; the direct entry knows only a name. Dropping the direct entry
+// costs nothing — it is the same cluster, reached with a different credential.
 func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, error) {
 	var clusters []targetCluster
+	profileNames := make(map[string]string) // cluster name -> profile it came from
 
 	if f.profilesDir != "" {
 		discovered, err := discoverClusterProfiles(ctx, f.profilesDir, m)
@@ -877,9 +887,12 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			return nil, err
 		}
 		if len(discovered) == 0 {
-			// Normal for a single-cluster install: reconcile only creates
-			// profiles for clusters other than the management one.
+			// Normal before the first reconcile tick of a fresh install, and
+			// the reason --in-cluster is still passed at all.
 			log.Printf("k8s-event-watcher: no Cluster Agent profiles in %s (nothing to fan out to yet)", f.profilesDir)
+		}
+		for _, tc := range discovered {
+			profileNames[tc.Name] = tc.Profile
 		}
 		clusters = append(clusters, discovered...)
 	}
@@ -887,15 +900,24 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 	// Add the directly-reachable cluster when asked for explicitly, or when
 	// --profiles-dir was not given at all (the single-cluster default).
 	if f.profilesDir == "" || f.inCluster || f.kubeconfig != "" {
-		client, err := buildKubeClient(f)
-		if err != nil {
-			return nil, err
+		// Matched on the bare name because that is all the direct entry has —
+		// --in-cluster reads no cluster_identity. Two same-named clusters in
+		// different locations would therefore hide this one, but only in the
+		// window before reconcile has given the management cluster its own
+		// profile, and the log line below says which profile absorbed it.
+		if profile, dup := profileNames[f.clusterName]; dup {
+			log.Printf("k8s-event-watcher: %s is already watched through profile %s; not watching it a second time directly (that would raise two alerts per event)", f.clusterName, profile)
+		} else {
+			client, err := buildKubeClient(f)
+			if err != nil {
+				return nil, err
+			}
+			clusters = append(clusters, targetCluster{
+				Name:    f.clusterName,
+				Profile: "direct",
+				Client:  client,
+			})
 		}
-		clusters = append(clusters, targetCluster{
-			Name:    f.clusterName,
-			Profile: "direct",
-			Client:  client,
-		})
 	}
 
 	if len(clusters) == 0 {

@@ -386,6 +386,68 @@ func TestDiscoverClusterProfiles_UnreadableDirIsNotFatal(t *testing.T) {
 	}
 }
 
+// The management cluster is reached twice: --in-cluster covers it from the
+// first second of a fresh install, and cluster_agent_reconcile.py now also gives
+// it a Cluster Agent profile. Watching it through both would raise two alerts
+// per event — each watched cluster has its own dedup cache and EventKey carries
+// no cluster — so the profile entry has to absorb the direct one.
+func TestBuildWatchSet_DirectClusterIsDroppedWhenAProfileCoversIt(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	f := &flags{
+		profilesDir: dir,
+		inCluster:   true,
+		clusterName: "mgmt",
+	}
+	clusters, err := buildWatchSet(context.Background(), f, newMetrics())
+	if err != nil {
+		t.Fatalf("buildWatchSet: %v", err)
+	}
+	if got, want := len(clusters), 2; got != want {
+		t.Fatalf("got %d watched clusters, want %d (the direct entry duplicates the mgmt profile)", got, want)
+	}
+	for _, c := range clusters {
+		if c.Profile == "direct" {
+			t.Errorf("mgmt is already watched through a profile; a direct entry doubles every alert on it")
+		}
+	}
+}
+
+// The other half of the same rule: before reconcile has created the management
+// cluster's profile, --in-cluster is the only thing watching it, so the direct
+// entry must survive.
+func TestBuildWatchSet_DirectClusterSurvivesWhenNoProfileCoversIt(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	if err := os.WriteFile(kubeconfig,
+		[]byte(minimalKubeconfig("https://example.invalid", gkeContext("projA", "mgmt", "us-central1"))), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+
+	f := &flags{
+		profilesDir: dir,
+		kubeconfig:  kubeconfig,
+		clusterName: "mgmt",
+	}
+	clusters, err := buildWatchSet(context.Background(), f, newMetrics())
+	if err != nil {
+		t.Fatalf("buildWatchSet: %v", err)
+	}
+	var direct int
+	for _, c := range clusters {
+		if c.Profile == "direct" {
+			direct++
+		}
+	}
+	if direct != 1 {
+		t.Fatalf("got %d direct entries in %d clusters, want 1 — nothing else is watching mgmt", direct, len(clusters))
+	}
+}
+
 func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 	cases := []struct {
 		name    string
