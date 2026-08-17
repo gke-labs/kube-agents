@@ -195,8 +195,16 @@ unmarked.
 
 ### Step 5: Complete the card
 
-Complete the kanban card with a one-line summary of what you answered or
-changed, and the pull request link in the result.
+Call `kanban_complete(result=..., summary=...)` — the pull request link and what
+you answered or changed in `result`, a one-line status in `summary`. If you could
+not finish, `kanban_block(kind=...)` with the reason instead.
+
+**End every run with one of those two, whatever the outcome**, including the runs
+with nothing to report — a trigger that turned out to be already answered, or a
+request you refused. A worker that just stops exits rc=0, is reaped as a
+`protocol_violation`, and burns one of the card's attempts. Never answer
+`[SILENT]` here: that is for a cron turn suppressing chat noise, and this skill
+has no cron caller. The card is the channel.
 
 ## Scope
 
