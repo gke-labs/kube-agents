@@ -173,6 +173,28 @@ def strip_inline_code(text: str) -> str:
     return INLINE_CODE_RE.sub(" ", text or "")
 
 
+#: A Markdown block quote: up to three spaces of indent, then `>`. The same
+#: three-space bound a fence opener gets, and for the same CommonMark reason.
+BLOCK_QUOTE_RE = re.compile(r"^ {0,3}>.*$", re.MULTILINE)
+
+
+def strip_block_quotes(text: str) -> str:
+    """Drop quoted lines, so repeating a request is not making one.
+
+    GitHub's "Quote reply" button copies the comment being replied to into the
+    new body as a block quote. A reviewer agreeing with someone else's
+    `@<agent>` therefore ships that mention again, under a fresh node id and
+    with no marker on it — and idempotency is keyed on the quoting comment, not
+    on the request inside it, so the agent answers the same ask once per person
+    who quotes it.
+
+    Quoted lines are dropped rather than blanked, so a reviewer's own words
+    around the quote still count. What is excluded is somebody else's
+    utterance, not the whole comment that carries it.
+    """
+    return BLOCK_QUOTE_RE.sub("", text or "")
+
+
 def mention_re(login: str) -> re.Pattern:
     """`@<login>` as a whole handle, with GitHub's optional `[bot]` suffix.
 
@@ -197,7 +219,7 @@ def find_trigger(body: str, self_login: str, node_id: str, author: str):
     A command wins over a mention when both are present: the reviewer typed a
     request, and the request is the more specific thing to act on.
     """
-    text = strip_fenced_blocks(normalise_newlines(body))
+    text = strip_block_quotes(strip_fenced_blocks(normalise_newlines(body)))
 
     matches = SLASH_RE.findall(text)
     if matches:

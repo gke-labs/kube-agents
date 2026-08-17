@@ -1011,6 +1011,34 @@ class PermissionUnknownTest(unittest.TestCase):
         lookups = [c for c in fake.calls if "collaborators/maintainer" in " ".join(c)]
         self.assertEqual(len(lookups), 1)
 
+    def test_a_bot_login_is_percent_encoded_into_the_path(self):
+        """`[` and `]` are not path characters, and an App comments as `x[bot]`.
+
+        Unencoded the request is malformed rather than a 404, so the answer is
+        neither yes nor no: every allowlisted bot caches as unknown and is
+        asked again on the next tick, forever.
+        """
+        rows = json.dumps(
+            [
+                {
+                    "id": 1,
+                    "node_id": "IC_b",
+                    "user": {"login": "helper[bot]"},
+                    "body": "/agent go",
+                    "created_at": "2026-08-12T10:00:00Z",
+                }
+            ]
+        )
+        fake = FakeGh(
+            {
+                "issues/12/comments": (0, rows, ""),
+                "collaborators/helper%5Bbot%5D/permission": permission("write"),
+            }
+        )
+        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+        comments = forge.GitHubProvider(run=fake).list_comments(REPO, pr)
+        self.assertTrue(comments[0].can_write)
+
 
 class ProviderForTest(unittest.TestCase):
     def test_github_host_selects_the_github_provider(self):

@@ -72,6 +72,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
@@ -91,10 +92,13 @@ GH_TIMEOUT_S = 60
 #: `gh pr list --limit`, which truncates at its ceiling and says nothing.
 PR_PAGE_SIZE = 100
 
-#: The branch prefix `submit_suggestion.check_branch` and
-#: `audit_report.group_branch_for` both write. One of the three things that make
-#: a pull request the agent's own — see `is_agent_pull_request`, which is where
-#: the other two are, and why a prefix alone is not enough.
+#: The branch prefix the agent's own pull requests carry. Only one place writes
+#: it in code — `audit_report.group_branch_for` — and `submit-suggestion`'s
+#: SKILL.md instructs the model to use it, which `submit_suggestion.check_branch`
+#: does not enforce: that function rejects an empty or protected branch name and
+#: nothing else. So this is a convention held up by a prompt, which is exactly
+#: why a prefix alone is not enough to call a pull request the agent's — see
+#: `is_agent_pull_request` for the two checks that actually carry the weight.
 AGENT_BRANCH_PREFIX = "platform-agent/"
 
 #: A label that opts a pull request out of every sweep, matching the convention
@@ -561,14 +565,23 @@ class GitHubProvider:
         network blip would refuse a maintainer permanently, and they would have
         to notice and re-comment. So the unknown gets its own value and the
         caller waits for the next tick.
+
+        The login is percent-encoded into the path. A GitHub App comments as
+        `<name>[bot]`, and `[`/`]` are not path characters — unencoded that is a
+        malformed URL rather than a 404, so the failure is not "no such
+        collaborator", every allowlisted bot caches as `None`, and the sweep
+        re-asks the same unanswerable question on every tick.
         """
         if not login:
             return False
         key = normalise_login(login)
         if key in self._permission_cache:
             return self._permission_cache[key]
+        quoted = urllib.parse.quote(login, safe="")
         try:
-            data = self._call(["api", f"repos/{repo}/collaborators/{login}/permission"])
+            data = self._call(
+                ["api", f"repos/{repo}/collaborators/{quoted}/permission"]
+            )
         except ForgeError as error:
             status = HTTP_STATUS_RE.search(error.value or "")
             if not status or status.group(1) != "404":

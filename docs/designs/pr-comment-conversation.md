@@ -277,9 +277,10 @@ reusing its repo resolution, its preflight, its per-sweep isolation, and its car
 deterministic lives here, so an idle tick still costs no model at all.
 
 - **Scope.** Open pull requests that satisfy all three of: authored by the account the credential
-  authenticates as, a head branch starting with `platform-agent/` — the convention shared by
-  `submit_suggestion.check_branch` and `audit_report.group_branch_for` — and a head that lives in
-  the configured repository rather than a fork. Minus any carrying `agent:ignore`.
+  authenticates as, a head branch starting with `platform-agent/` — written in code only by
+  `audit_report.group_branch_for`, and instructed rather than enforced for `submit-suggestion`,
+  whose `check_branch` rejects an empty or protected branch name and nothing more — and a head that
+  lives in the configured repository rather than a fork. Minus any carrying `agent:ignore`.
 
   The plan scoped on the branch prefix alone, which is attacker-chosen: anyone may fork the
   repository, push `platform-agent/anything`, and open a pull request from it. Every comment on that
@@ -293,9 +294,13 @@ deterministic lives here, so an idle tick still costs no model at all.
   own author login, which is circular (§3). If the credential cannot name itself the sweep does not
   run at all: with no viewer there is no way to tell the agent's own marker from a pasted one, and
   the `⚠️` line says so.
-- **Wake rule.** Explicit address only, applied after `strip_fenced_blocks`: `^[ \t]*/agent\b(.*)$`
-  (multiline) or a bare `@<self-login>`. Human-to-human review chatter does not spend a turn, and a
-  quoted or mid-sentence occurrence does not fire.
+- **Wake rule.** Explicit address only, applied after `strip_fenced_blocks` and
+  `strip_block_quotes`: `^[ \t]*/agent\b(.*)$` (multiline) or a bare `@<self-login>`.
+  Human-to-human review chatter does not spend a turn, and a fenced, block-quoted or mid-sentence
+  occurrence does not fire. The block-quote rule is what makes GitHub's "Quote reply" safe:
+  idempotency is keyed on the comment carrying the trigger, so a quoted request is a new node id
+  with no marker on it, and without the strip the agent answers one ask once per person who agrees
+  with it by quoting it. Only the quoted lines are dropped, so the quoter's own words still count.
 - **Trust gate.** `can_write` only, which under GitHub means a real collaborator-permission lookup
   rather than the comment's `author_association` — see §3 for the App-token blindness that forced
   that. Anything else gets one refusal comment posted by the gate itself — refusing needs no
@@ -423,6 +428,13 @@ prompt:
    signal is the deployment. Being unable to do the work is a fine outcome and says so in the reply;
    claiming to have done it is not.
 
+   The two are separate flags with separate `dest`s, which is not a detail. Sharing one made
+   `--no-change` mean `--verify-commit ""` — and therefore made `--verify-commit ""` mean
+   `--no-change`, so an unset shell variable or a `--jq` that matched nothing satisfied
+   `required=True`, skipped every check and posted the claim. An empty sha is now rejected outright:
+   every other malformed value already failed loudly, and that one failed silently in the unsafe
+   direction.
+
    The check is deliberately narrow. It settles the part a script can settle — whether the named
    commit is on the pull request — and does not attempt to judge whether the commit does what the
    reply says. `--no-change` is not verifiable at all, and is not pretended to be: what it buys is
@@ -473,7 +485,11 @@ Three details are deliberate:
   answer confidently from a conversation it half saw.
 - **The comment cap drops the oldest**, the opposite of the sweep's oldest-first rule for triggers.
   A trigger queue must not starve its head; a transcript is a story whose recent end explains the
-  request being answered now.
+  request being answered now. **The requests themselves are pinned past the cap**, because those two
+  rules point at the same comment: on a thread longer than the cap, the oldest unanswered trigger —
+  the one the sweep just handed over — is the first thing the window throws away. For a bare
+  `@mention` the card carries no copy of the request either, so the worker would be asked to answer
+  words that appear nowhere in its context. Pinning costs at most `PR_AGENT_MAX_PER_TICK` rows.
 
 This widens what reaches the model — a comment from an account with no write access is now in the
 prompt even though it can never be acted on. That is the point, and it is why SKILL.md states in the

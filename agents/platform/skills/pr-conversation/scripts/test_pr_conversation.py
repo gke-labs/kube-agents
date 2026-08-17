@@ -422,6 +422,30 @@ class ConversationContextTest(_Harness):
         # drops the oldest here and the oldest-first rule applies to triggers.
         self.assertEqual(thread["comments"][-1]["comment_id"], "IC_TRIG")
 
+    def test_the_request_being_answered_survives_the_cap(self):
+        """The two rules point opposite ways, and the request loses without this.
+
+        The sweep hands over the *oldest* unanswered trigger; the cap drops the
+        *oldest* comments. On a thread past the cap that is the same comment.
+        A bare `@mention` carries no request text in the card either, so the
+        worker would be asked to answer words it has nowhere to read.
+        """
+        comments = [make_comment("IC_TRIG", "/agent x", created_at="2026-08-11T00:00:00Z")]
+        comments += [
+            make_comment(
+                f"IC_{n:03d}", f"turn {n}", created_at=f"2026-08-12T{n // 60:02d}:{n % 60:02d}:00Z"
+            )
+            for n in range(helper.CONTEXT_MAX_COMMENTS + 5)
+        ]
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        thread = self.poll_threads(provider)["conversations"][0]
+        ids = [row["comment_id"] for row in thread["comments"]]
+        self.assertEqual(ids[0], "IC_TRIG")
+        self.assertTrue(thread["comments"][0]["is_request"])
+        # Pinned on top of the window, and only the unpinned remainder is lost.
+        self.assertEqual(len(ids), helper.CONTEXT_MAX_COMMENTS + 1)
+        self.assertEqual(thread["omitted_earlier"], 5)
+
     def test_a_thread_within_the_cap_says_nothing_about_omissions(self):
         provider = FakeProvider(
             prs=[make_pr()], comments={12: [make_comment("IC_1", "/agent x")]}
@@ -795,6 +819,21 @@ class ClaimVerificationTest(_Harness):
         with self.assertRaises(SystemExit):
             self._reply(provider)
         self.assertEqual(provider.posted, [])
+
+    def test_an_empty_sha_is_not_a_declaration_of_no_change(self):
+        """The one malformed sha that could fail in the unsafe direction.
+
+        `--verify-commit "$SHA"` with `SHA` unset, or fed a `--jq` that matched
+        nothing, is `--verify-commit ""`. Every other bad value is rejected
+        loudly; this one has to be as well, rather than reading as "nothing
+        changed" and posting the claim unchecked.
+        """
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", "")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("empty", err.getvalue())
 
 
 if __name__ == "__main__":

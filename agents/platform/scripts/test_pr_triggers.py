@@ -103,6 +103,27 @@ class FindTriggerTest(unittest.TestCase):
     def test_a_mention_inside_a_fenced_block_does_not_fire(self):
         self.assertIsNone(self._find(f"```\n@{SELF} do it\n```"))
 
+    def test_a_quoted_mention_does_not_fire(self):
+        """GitHub's "Quote reply" copies the mention into the reply verbatim.
+
+        Idempotency is keyed on the quoting comment, which is new and carries
+        no marker — so without this the agent answers one ask once per person
+        who agrees with it by quoting it.
+        """
+        self.assertIsNone(self._find(f"> @{SELF} please look\n\n+1"))
+
+    def test_a_quoted_command_does_not_fire(self):
+        self.assertIsNone(self._find("> /agent bump to 4\n\nagreed"))
+
+    def test_an_indented_quote_marker_still_quotes(self):
+        """Up to three spaces, the same bound a fence opener gets."""
+        self.assertIsNone(self._find("   > /agent bump to 4"))
+
+    def test_the_quoters_own_request_still_fires(self):
+        """Quoted lines are dropped, not the whole comment that carries them."""
+        trigger = self._find(f"> @{SELF} please look\n\n/agent bump to 4")
+        self.assertEqual(trigger.request, "bump to 4")
+
     def test_a_command_wins_over_a_mention_in_the_same_comment(self):
         trigger = self._find(f"@{SELF}\n/agent bump to 4")
         self.assertEqual(trigger.kind, "slash")

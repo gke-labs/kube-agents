@@ -15,7 +15,10 @@ call. The work the model did was to notice there was no work.
 So the poll runs here instead — a ``no_agent`` script, a plain subprocess with
 no model attached — and the model is woken only for a repository that actually
 has something waiting, by filing a kanban card assigned to ``platform``. An
-idle tick costs one ``gh`` call and writes nothing at all.
+idle tick costs a handful of ``gh`` calls — a few more once the pull-request
+sweep has open pull requests to read the comments of — and writes nothing at
+all. What it does not cost is a model turn, which is the whole point: API
+calls are cheap and a turn on an empty repository is not.
 
 Why a card rather than the cron job the watchdogs use
 -----------------------------------------------------

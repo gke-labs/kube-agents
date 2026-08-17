@@ -194,11 +194,25 @@ def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
     sweep's oldest-first rule for triggers. A trigger is a queue and starving
     its head is unfair; a transcript is a story and its recent end is the part
     that explains the request being answered now.
+
+    The requests themselves are exempt from the cap, and that exemption is the
+    difference between a thin transcript and an unanswerable one. The two rules
+    point opposite ways: the sweep hands the worker the *oldest* unanswered
+    trigger, and the cap drops the *oldest* comments — so on a thread past the
+    cap the comment being answered is the first thing thrown away. For a
+    `mention` trigger `Trigger.request` is empty by construction, so the card
+    carries no copy of it either, and the worker would be asked to answer a
+    request whose text appears nowhere in its context. Pinning costs at most
+    `PR_AGENT_MAX_PER_TICK` extra rows.
     """
     ordered = sorted(comments, key=lambda c: (c.created_at, c.node_id))
-    omitted_earlier = max(0, len(ordered) - CONTEXT_MAX_COMMENTS)
+    wanted = set(request_ids or ())
+    recent = ordered[max(0, len(ordered) - CONTEXT_MAX_COMMENTS) :]
+    kept_ids = {c.node_id for c in recent} | wanted
+    kept = [c for c in ordered if c.node_id in kept_ids]
+    omitted_earlier = len(ordered) - len(kept)
     rows = []
-    for comment in ordered[omitted_earlier:]:
+    for comment in kept:
         body, truncated = _context_body(comment.body)
         row = {
             "comment_id": comment.node_id,
@@ -295,7 +309,7 @@ def handle_poll(args) -> int:
 SHA_MIN_LEN = 7
 
 
-def _check_claim(provider, repo: str, pr, sha: str) -> None:
+def _check_claim(provider, repo: str, pr, sha: str, no_change: bool) -> None:
     """Refuse to post a claim to have amended the branch until it is true.
 
     A reply saying "I have bumped the replica count to 2" is checkable, and
@@ -311,9 +325,23 @@ def _check_claim(provider, repo: str, pr, sha: str) -> None:
     second is not verifiable here and is not pretended to be; what it buys is
     that a false claim now has to survive the model asserting the opposite one
     line above it, and it leaves that assertion in the command history.
+
+    The two worlds are two flags, not one value. They shared a `dest` once, so
+    `--no-change` was `--verify-commit ""` — and therefore `--verify-commit ""`
+    was `--no-change`: an empty shell variable, or a `--jq` that returned
+    nothing because the branch had no commits yet, satisfied `required=True`,
+    skipped every check, and posted the claim. Every other malformed sha fails
+    loudly; that one input failed silently, in the unsafe direction, which is
+    the one shape this whole check exists to make impossible.
     """
-    if not sha:
+    if no_change:
         return
+    if not sha.strip():
+        _fail(
+            "--verify-commit was given an empty value. Pass the sha of the commit "
+            "this reply claims to have made, or --no-change if it made none. An "
+            "empty sha is not a claim that nothing changed."
+        )
     wanted = sha.strip().lower()
     if len(wanted) < SHA_MIN_LEN:
         _fail(
@@ -371,7 +399,14 @@ def _post(args, marker_kind: str) -> int:
             )
         )
 
-    _check_claim(provider, repo, pr, getattr(args, "verify_commit", ""))
+    _check_claim(
+        provider,
+        repo,
+        pr,
+        getattr(args, "verify_commit", ""),
+        # `refuse` never claims a change, so it is not asked and never posts one.
+        getattr(args, "no_change", marker_kind == pr_triggers.REFUSED_MARKER),
+    )
 
     body = _confined_body(args.body_file).rstrip()
     stamped = f"{body}\n\n{pr_triggers.marker(args.comment_id, marker_kind)}\n"
@@ -454,9 +489,12 @@ def build_parser() -> argparse.ArgumentParser:
             )
             claim.add_argument(
                 "--no-change",
-                dest="verify_commit",
-                action="store_const",
-                const="",
+                # Its own `dest`, deliberately. Sharing one with
+                # `--verify-commit` made the two flags the same value, so an
+                # empty sha silently became "nothing changed" — see
+                # `_check_claim`.
+                dest="no_change",
+                action="store_true",
                 help="this reply changed nothing on the branch",
             )
         cmd.set_defaults(func=func)
