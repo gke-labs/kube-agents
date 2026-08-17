@@ -16,16 +16,19 @@ python3 run_experiments.py          # all of them, ~25s
 python3 run_experiments.py E1 E6    # a subset
 ```
 
-Standard library only, no cluster, no dependencies. Every experiment **asserts**, so a non-zero
-exit means a claim in the design has stopped holding — which is the point of keeping it.
+Standard library only and no cluster. `E7` additionally needs a Go toolchain to render the
+operator's manifests, and skips itself if `go` is absent. Every experiment **asserts**, so a
+non-zero exit means a claim in the design has stopped holding — which is the point of keeping it,
+and what re-ran the suite after merging `d44ea21` (42 commits) and confirmed nothing had rotted.
 
 ## What is here
 
-| File                 | What it is                                                                                                                                  |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `supervisor.py`      | The supervisor of §3.2–3.7: process table with criticality, backoff and cap, status file, one reaper. Section numbers are in the docstrings |
-| `probe.py`           | The readiness probe of §3.4 — reads the status file, fails on staleness as well as on content                                               |
-| `run_experiments.py` | The experiments, with assertions                                                                                                            |
+| File                      | What it is                                                                                                                                     |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `supervisor.py`           | The supervisor of §3.2–3.7: process table with criticality, backoff and cap, status file, one reaper. Section numbers are in the docstrings    |
+| `probe.py`                | The readiness probe of §3.4 — reads the status file, fails on staleness as well as on content                                                  |
+| `run_experiments.py`      | The experiments, with assertions                                                                                                               |
+| `manifest_claims_test.go` | E7's checks. Copied into `k8s-operator/internal/controller/` by the runner, executed, and removed — it is **not** part of the operator's suite |
 
 Leader election is stubbed to the presence of a file, so this runs without an API server.
 Everything else is the real shape. The timing constants are scaled down (2 s grace rather than
@@ -34,15 +37,17 @@ back to the design's figures before asserting.
 
 ## What the experiments establish
 
-| #     | Claim                                                            | Note                                                                 |
-| ----- | ---------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `E1`  | `waitpid(-1)` rewrites a crash into a clean exit                 | **Falsified the design.** See below                                  |
-| `E1b` | One reaper dispatching by pid preserves exit statuses            | The fix `E1` forced                                                  |
-| `E2`  | An `httpGet` probe cannot reach a server bound to `127.0.0.1`    | Why §3.4 uses an `exec` probe                                        |
-| `E4`  | The restart cap diverges on criticality; cleanup tells the truth | **Surfaced the stale-`ready:true`-on-exit gap**                      |
-| `E4c` | A wedged loop is detected via `updated_at`                       | A hung supervisor must not report healthy                            |
-| `E5`  | Shutdown is the sum over the table                               | 3 processes overrun the 30 s default `terminationGracePeriodSeconds` |
-| `E6`  | Every margin in §3.5 reproduces                                  | Including a third process failing the startup assertion              |
+| #     | Claim                                                            | Note                                                                                         |
+| ----- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `E1`  | `waitpid(-1)` rewrites a crash into a clean exit                 | **Falsified the design.** See below                                                          |
+| `E1b` | One reaper dispatching by pid preserves exit statuses            | The fix `E1` forced                                                                          |
+| `E2`  | An `httpGet` probe cannot reach a server bound to `127.0.0.1`    | Why §3.4 uses an `exec` probe                                                                |
+| `E4`  | The restart cap diverges on criticality; cleanup tells the truth | **Surfaced the stale-`ready:true`-on-exit gap**                                              |
+| `E4c` | A wedged loop is detected via `updated_at`                       | A hung supervisor must not report healthy                                                    |
+| `E5`  | Shutdown is the sum over the table                               | 3 processes overrun the 30 s default `terminationGracePeriodSeconds`                         |
+| `E6`  | Every margin in §3.5 reproduces                                  | Including a third process failing the startup assertion                                      |
+| `E7`  | Eleven manifest-level claims, against rendered output            | Uses the operator's own `buildDeployment` / `buildNetworkPolicy` / `buildPlatformLeaderRole` |
+| `E8`  | An entrypoint background job reparents to the supervisor         | The Hindsight migration: one zombie per boot without §3.7's reaper                           |
 
 ### The three the design got wrong
 
@@ -59,7 +64,8 @@ back to the design's figures before asserting.
 
 ## E3 — the rounding check, in Go
 
-Not run from `run_experiments.py`, because it needs the operator's Go module and its vendored
+Superseded by `E7`'s `TestClaimC6SurgeRounding`, which the runner executes automatically; kept
+here as the minimal standalone recipe. It needs the operator's Go module and its vendored
 `k8s.io/apimachinery`. It evaluates `defaultSurgePercent` through
 `intstr.GetScaledValueFromIntOrPercent`, the function the Deployment controller itself calls, so
 the answer is Kubernetes' rather than an approximation of it.

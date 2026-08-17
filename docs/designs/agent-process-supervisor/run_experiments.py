@@ -296,7 +296,74 @@ def e6():
     record("E6", "every margin in design 3.5 reproduces; a third process fails the assertion", "HOLDS", detail)
 
 
-EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E4": e4, "E4c": e4c, "E5": e5, "E6": e6}
+
+# ---------------------------------------------------------------- E7
+def e7():
+    """Manifest-level claims, checked against real rendered operator output."""
+    import shutil
+    repo = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+    mod = os.path.join(repo, "k8s-operator")
+    if shutil.which("go") is None:
+        record("E7", "manifest claims (skipped: no Go toolchain)", "HOLDS", "install Go to run this one")
+        return
+    src = os.path.join(HERE, "manifest_claims_test.go")
+    dst = os.path.join(mod, "internal", "controller", "zz_e7_claims_test.go")
+    shutil.copyfile(src, dst)
+    try:
+        r = subprocess.run(["go", "test", "./internal/controller/", "-run", "TestClaim", "-v"],
+                           cwd=mod, capture_output=True, text=True)
+    finally:
+        os.remove(dst)
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip().startswith("[C")]
+    falsified = [l for l in lines if "FALSIFIED" in l]
+    assert r.returncode == 0 and not falsified, (
+        "manifest claims falsified:\n" + "\n".join(falsified or [r.stdout[-800:]])
+    )
+    record("E7", f"{len(lines)} manifest claims hold against real rendered output", "HOLDS",
+           "\n".join(lines))
+
+
+# ---------------------------------------------------------------- E8
+def e8():
+    """The entrypoint backgrounds a job and then execs: it reparents to the supervisor.
+
+    docker-entrypoint.sh backgrounds the Hindsight memory migration and then
+    exec's the supervisor, so that subshell's parent becomes PID 1 -- a process
+    the supervisor never started. Without 3.7's reaper it is a zombie.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        entry = os.path.join(d, "entrypoint.sh")
+        sup = os.path.join(d, "sup.py")
+        open(entry, "w").write(
+            "#!/bin/sh\n( sleep 0.5; exit 0 ) &\nexec python3 \"$1\" \"$2\"\n")
+        open(sup, "w").write(
+            "import os,subprocess,sys,time\n"
+            "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(3)'])\n"
+            "reap = sys.argv[1]=='reaper'\n"
+            "for _ in range(6):\n"
+            "    p.poll()\n"
+            "    if reap:\n"
+            "        while True:\n"
+            "            try: pid,_=os.waitpid(-1,os.WNOHANG)\n"
+            "            except ChildProcessError: break\n"
+            "            if pid==0: break\n"
+            "    time.sleep(0.4)\n"
+            "z=[l for l in os.popen('ps -o pid=,stat= -x').read().splitlines()\n"
+            "   if len(l.split())>1 and 'Z' in l.split()[1]]\n"
+            "print('ZOMBIES', len(z))\n")
+        def zombies(mode):
+            out = subprocess.run(["sh", entry, sup, mode], capture_output=True, text=True).stdout
+            return int([l for l in out.split("\n") if l.startswith("ZOMBIES")][0].split()[1])
+        today, fixed = zombies("today"), zombies("reaper")
+
+    assert today >= 1, "expected the backgrounded job to zombie under today's supervisor"
+    assert fixed == 0, "the 3.7 reaper should leave no zombie"
+    record("E8", "an entrypoint background job reparents to the supervisor and zombies without 3.7", "HOLDS",
+           f"today's shape (Popen + poll only): {today} zombie(s)\n"
+           f"with the 3.7 reaper:                {fixed} zombie(s)")
+
+
+EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E4": e4, "E4c": e4c, "E5": e5, "E6": e6, "E7": e7, "E8": e8}
 
 
 def main(argv):
