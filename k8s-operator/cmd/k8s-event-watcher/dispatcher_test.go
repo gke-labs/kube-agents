@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -272,6 +273,261 @@ func TestDispatcherRollsBackDedupOnQuotaSuppression(t *testing.T) {
 	}
 	if createCount != 2 {
 		t.Errorf("got %d create-session calls; want 2", createCount)
+	}
+}
+
+// TestDispatcherKeepsDedupOnPolicyFilter is the other half of the test above,
+// and the reason the two statuses are spelled differently. A ceiling drop is
+// transient and reopens; an Info grade is not, and will grade the same way on
+// every future sighting. If this path rolled the entry back too, a workload
+// emitting a routine Normal-type event would be re-offered at its own repeat
+// cadence forever — one session and one inject per sighting, for an alert that
+// was never going to be sent.
+func TestDispatcherKeepsDedupOnPolicyFilter(t *testing.T) {
+	const sessionID = "session-1"
+	var createCount, injectCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			createCount++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+			return
+		}
+		injectCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"filtered"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     newMetrics(),
+		mode:        "per-incident",
+	}
+
+	// An image-pull back-off, which is both the routine Info event this path
+	// exists for and one the crash-loop debounce above deliberately exempts —
+	// `canonicalizeReason` splits it out of the crash-loop family on the
+	// message, so it reaches the dispatcher on its first sighting with
+	// Count unset. Change that message and this test starts measuring the
+	// filter instead of the dispatcher.
+	//
+	// Type has to be set, and set to exactly what kubelet emits here.
+	// reopenPolicyFiltered treats anything that is not literally "Normal" as a
+	// possible Warning and lets it re-open the incident, so leaving Type unset
+	// would measure that escape hatch instead of the entry surviving.
+	ev := TriageEvent{
+		Key:       EventKey{UID: "pod-1", Reason: "BackOff"},
+		Cluster:   "test-cluster",
+		Namespace: "default",
+		Name:      "billing-service",
+		LastSeen:  time.Now(),
+		Message:   "Back-off pulling image",
+		Type:      "Normal",
+	}
+
+	disp.Dispatch(context.Background(), ev)
+	if dedup.Len() != 1 {
+		t.Fatalf("a policy-filtered event left %d dedup entries; want 1 (the incident stays open)", dedup.Len())
+	}
+
+	ev.LastSeen = ev.LastSeen.Add(5 * time.Minute)
+	disp.Dispatch(context.Background(), ev)
+	if injectCount != 1 {
+		t.Errorf("got %d inject calls; want 1 (the second sighting was deduped locally)", injectCount)
+	}
+	if createCount != 1 {
+		t.Errorf("got %d create-session calls; want 1", createCount)
+	}
+}
+
+// TestDispatcherReopensPolicyFilteredKeyForWarning is the limit on the test
+// above. Keeping the dedup entry is right for the event that was graded, and
+// the entry is not keyed on that event: canonicalizeReason folds kubelet's
+// Normal-type `BackOff` ("Back-off pulling image"), `ErrImagePull` and the
+// Warning-type `Failed` beside them onto the single key
+// (uid, "ImagePullBackOff").
+//
+// So a bad image tag can put the routine member of the family in front, and
+// every Warning behind it then takes dedupDuplicate. Case 3 slides LastSeen on
+// each of those sightings, so the window never expires while the pull keeps
+// failing and the alert never comes at all. The first Warning must get through.
+func TestDispatcherReopensPolicyFilteredKeyForWarning(t *testing.T) {
+	// Reasons the daemon graded Info and asked us to hold back, in arrival
+	// order — the Normal-type back-off is deliberately first.
+	var injected []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-1"})
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var env injectMessageRequest
+		_ = json.Unmarshal(body, &env) // the wire body is {"message": "<json>"}
+		var p InjectPayload
+		_ = json.Unmarshal([]byte(env.Message), &p)
+		w.WriteHeader(http.StatusOK)
+		// Stands in for session_kv_server.get_severity_details: a Normal-type
+		// event whose reason is not in ALWAYS_ALERT_REASONS grades Info.
+		if p.Type == "Normal" {
+			_, _ = w.Write([]byte(`{"status":"filtered"}`))
+			return
+		}
+		injected = append(injected, p.Reason)
+		_, _ = w.Write([]byte(`{"status":"injected"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     newMetrics(),
+		mode:        "per-incident",
+	}
+
+	base := time.Now()
+	disp.Dispatch(context.Background(), TriageEvent{
+		Key: EventKey{UID: "pod-1", Reason: "BackOff"}, Type: "Normal",
+		Cluster: "test-cluster", Namespace: "prod", Name: "api",
+		Message: `Back-off pulling image "repo/api:typo"`, LastSeen: base, Count: 1,
+	})
+	if dedup.Len() != 1 {
+		t.Fatalf("the policy-filtered event left %d dedup entries; want 1", dedup.Len())
+	}
+
+	// The three Warning-typed members of the same family, all of which
+	// canonicalize onto the key the back-off above is holding.
+	for i, ev := range []TriageEvent{
+		{Key: EventKey{UID: "pod-1", Reason: "Failed"},
+			Message: `Failed to pull image "repo/api:typo": not found`},
+		{Key: EventKey{UID: "pod-1", Reason: "ErrImagePull"},
+			Message: "rpc error: code = NotFound"},
+		{Key: EventKey{UID: "pod-1", Reason: "Failed"},
+			Message: "Error: ImagePullBackOff"},
+	} {
+		ev.Type, ev.Cluster, ev.Namespace, ev.Name, ev.Count = "Warning", "test-cluster", "prod", "api", 5
+		ev.LastSeen = base.Add(time.Duration(i+1) * 10 * time.Minute)
+		disp.Dispatch(context.Background(), ev)
+	}
+
+	// Exactly one: the first Warning re-opens the incident, and the two behind
+	// it are then ordinary duplicates of a real, announced alert. More than one
+	// would mean the escape hatch fires per sighting rather than per window.
+	if len(injected) != 1 {
+		t.Errorf("got %d Warning image-pull events through to the daemon (%v); want exactly 1 — "+
+			"0 means the policy-filtered BackOff is still swallowing the whole family",
+			len(injected), injected)
+	}
+}
+
+// TestDispatcherReopenedPayloadCountsFromOne pins the number the reopen puts on
+// the wire, which is not the number Observe returned.
+//
+// Observe reports the count of the entry it just replaced: every sighting in the
+// canonical family, nearly all of which were deduped locally and reached nobody.
+// Injecting that writes it to `occurrences` in the ledger, and the recap sums
+// that column into "Forwarded N events" and ranks its incident list by it — so a
+// workload with two forwarded events would outrank one with nine, on the strength
+// of sightings nobody was ever told about.
+func TestDispatcherReopenedPayloadCountsFromOne(t *testing.T) {
+	var counts []int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-1"})
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var env injectMessageRequest
+		_ = json.Unmarshal(body, &env)
+		var p InjectPayload
+		_ = json.Unmarshal([]byte(env.Message), &p)
+		w.WriteHeader(http.StatusOK)
+		if p.Type == "Normal" {
+			_, _ = w.Write([]byte(`{"status":"filtered"}`))
+			return
+		}
+		counts = append(counts, p.Count)
+		_, _ = w.Write([]byte(`{"status":"injected"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     newMetrics(),
+		mode:        "per-incident",
+	}
+
+	// A bad image tag: one Normal BackOff opens the incident and is graded
+	// Info, then eight more sightings pile onto the same entry unseen.
+	base := time.Now()
+	for i := 0; i < 9; i++ {
+		disp.Dispatch(context.Background(), TriageEvent{
+			Key: EventKey{UID: "pod-1", Reason: "BackOff"}, Type: "Normal",
+			Cluster: "test-cluster", Namespace: "prod", Name: "api",
+			Message:  `Back-off pulling image "repo/api:typo"`,
+			LastSeen: base.Add(time.Duration(i) * time.Minute), Count: 1,
+		})
+	}
+	disp.Dispatch(context.Background(), TriageEvent{
+		Key: EventKey{UID: "pod-1", Reason: "ErrImagePull"}, Type: "Warning",
+		Cluster: "test-cluster", Namespace: "prod", Name: "api",
+		Message: "rpc error: code = NotFound", LastSeen: base.Add(30 * time.Minute), Count: 1,
+	})
+
+	// 10, not 9: the reopening event's own Observe increments the outgoing
+	// entry once more before the reopen replaces it.
+	if len(counts) != 1 || counts[0] != 1 {
+		t.Errorf("reopened payload carried counts %v; want [1] — 10 means the whole "+
+			"canonical family's sightings were injected as this event's occurrences", counts)
 	}
 }
 

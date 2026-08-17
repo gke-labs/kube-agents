@@ -125,13 +125,41 @@ type injectResponse struct {
 // the body is where the difference is stated.
 const injectStatusSuppressed = "suppressed"
 
+// injectStatusFiltered is the daemon's word for "accepted, and then dropped on
+// purpose" — the event graded Info, so it was recorded in the daily recap
+// instead of being announced. Unlike injectStatusSuppressed this is not a
+// transient condition: the same event will grade Info again on its next
+// sighting, so the dedup entry stays and the incident is not reopened.
+// Rolling it back would re-offer routine churn at the event's own repeat
+// cadence for as long as the workload keeps emitting.
+//
+// The two skew directions are not equally safe. A daemon predating this status
+// answers "suppressed" for both, which reads as a ceiling drop and reopens: one
+// redundant session, no silence.
+//
+// A watcher predating it is the harmful direction. It reads "filtered" as
+// delivered and keeps the entry, but it has no MarkPolicyFiltered, so the entry
+// carries no flag and ReopenIfPolicyFiltered can never fire for it. The key is
+// canonical, so it is then held on behalf of the family's one Info member and
+// every Warning behind it takes Case 3 in Observe, sliding LastSeen on each
+// sighting — at the deployed 24h window a failing image pull keeps its own
+// entry alive and never alerts.
+//
+// An ordinary install cannot reach that: resolveCredentialProxyImage derives the
+// sidecar image from the agent image's registry and tag, and the daemon and the
+// watcher are containers of one gateway pod, so a pod is all-old or all-new. It
+// takes an install that overrides the pairing — CREDENTIAL_PROXY_IMAGE pinned to
+// an older tag, or a digest-pinned agent image, where the sidecar falls back to
+// .Tag or latest and the two can drift.
+const injectStatusFiltered = "filtered"
+
 // Inject posts the triage event details to the specified session's queue.
 //
 // Returns the daemon's status string alongside the error, because a 2xx does
-// not by itself mean anyone was told — see injectStatusSuppressed. An empty
-// or unparseable body reads as delivered: a daemon predating this field is
-// one that always delivers, and guessing "dropped" would reopen every
-// incident on every sighting.
+// not by itself mean anyone was told — see injectStatusSuppressed and
+// injectStatusFiltered. An empty or unparseable body reads as delivered: a
+// daemon predating this field is one that always delivers, and guessing
+// "dropped" would reopen every incident on every sighting.
 func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
 	if sessionID == "" {
 		return "", errors.New("injector: Inject: sessionID is required")

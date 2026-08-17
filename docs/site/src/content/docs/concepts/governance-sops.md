@@ -61,6 +61,8 @@ It deliberately does **not** evaluate the model. Prompt-injection resistance, ja
 
 `inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.raw.md` once and then returns `[SILENT]` forever after. Its companion `inventory_prioritize_sop.md` runs as a separate card on the same one-shot path, ranking those findings into the short `/opt/data/INVENTORY.md` that reaches the user.
 
+`eod_event_watcher_daily_report_sop.md` is not a fleet audit either, and it is the one SOP here that no agent ever reads. It documents `eod_report_generator.py`, a `no_agent` script that renders the k8s-event-watcher recap deterministically from the session ledger; the file exists so the behaviour has an owner next to the SOPs it sits beside, not to instruct a model.
+
 ## How SOPs work
 
 Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The seven audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.

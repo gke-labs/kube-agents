@@ -1,0 +1,39 @@
+# Configuration for End-of-Day (EOD) Event Watcher Daily Report
+version: v1
+
+# 1. Event Filtering & Scope
+filters:
+  # Minimum consecutive repeat count before a warning is highlighted
+  min_event_count: 1
+
+  # Namespaces kept out of the workload breakdown and the headline counts. It is
+  # a noise filter, so it stops there: events from these namespaces still count
+  # towards whether the recap may print its ✅ all-clear, so excluding a namespace
+  # cannot make a bad day read as a quiet one.
+  exclude_namespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+
+  # There is deliberately no severity key here. The report lists informational
+  # events and nothing else, fixed in `LISTED_SEVERITIES` in
+  # eod_report_generator.py.
+  #
+  # `include_severities` used to live at this spot. Widening it added
+  # already-delivered Criticals and Warnings to the breakdown, where they read as
+  # new work on a page the on-call scans for things they have not seen; and it
+  # never reached the two classes chat genuinely missed — alerts the daily ceiling
+  # withheld, and alerts whose delivery failed — because those are an outcome, not
+  # a severity. A config still carrying the key gets a warning on stderr and the
+  # Info-only listing. See the SOP, "What this recap does not report", for where
+  # the other severities are covered.
+
+# 2. Report Content & Section Toggles
+sections:
+  telemetry_summary: true # Headline counts: events forwarded, groups, alerts sent to chat
+  workload_breakdown: true # Affected workloads and per-group event counts
+  suppressed_summary: true # Total count of informational events held back from chat
+  # There is no `action_items` key. The recap lists events nobody was alerted
+  # to, so no triage session ran on them and there is no remediation text to
+  # print. A section that is empty by construction is a promise the report
+  # cannot keep.

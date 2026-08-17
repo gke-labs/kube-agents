@@ -113,6 +113,59 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Normal events -> Info
         self.assertEqual(get_severity_details("Normal", "Scheduled"), ("🔵", "Info"))
 
+    def test_no_always_alert_reason_can_be_labelled_info(self):
+        """The suppression gate is `severity_label == "Info"` and nothing else.
+
+        That is only safe while no reason in ALWAYS_ALERT_REASONS can arrive at
+        it labelled Info — one that could would be silently dropped, which is
+        the bug the list exists to prevent. The gate carries no second check of
+        its own, so the property is asserted here rather than described in a
+        comment there.
+        """
+        for reason in session_kv_server.ALWAYS_ALERT_REASONS:
+            for event_type in ("Normal", "Warning", "", "Unknown"):
+                with self.subTest(reason=reason, event_type=event_type):
+                    _, label = get_severity_details(event_type, reason)
+                    self.assertNotEqual(
+                        label,
+                        "Info",
+                        f"{reason} typed {event_type!r} would be suppressed by the gate",
+                    )
+                    self.assertIn(
+                        label,
+                        session_kv_server.ALERT_DAILY_LIMITS,
+                        f"{reason} bills a severity with no ceiling",
+                    )
+
+    def test_always_alert_reasons_bill_the_bucket_they_are_meant_to(self):
+        """Pin which bucket each reason draws on.
+
+        The split falls out of whether the reason happens to contain one of the
+        blocker keywords, which makes it easy to change by accident: adding
+        `"node"` to that list, say, would move a node loss from Warning to
+        Critical and quietly triple its daily allowance. Naming the expected
+        mapping makes that a failing test rather than a surprise in chat.
+        """
+        expected = {
+            "FailedToDrainNode": ("🔴", "Critical"),
+            "FailedScheduling": ("🔴", "Critical"),
+            "Evicted": ("🔴", "Critical"),
+            "NodeNotReady": ("🟡", "Warning"),
+            "NetworkNotReady": ("🟡", "Warning"),
+        }
+        self.assertEqual(
+            set(expected),
+            set(session_kv_server.ALWAYS_ALERT_REASONS),
+            "a reason was added to or removed from the list without deciding "
+            "which ceiling it spends",
+        )
+        for reason, graded in expected.items():
+            with self.subTest(reason=reason):
+                # Both typings, because the point of the list is that the type
+                # is not consulted for these.
+                self.assertEqual(get_severity_details("Normal", reason), graded)
+                self.assertEqual(get_severity_details("Warning", reason), graded)
+
 
 class TestSessionKvServerApi(unittest.TestCase):
 
@@ -218,8 +271,357 @@ class TestSessionKvServerApi(unittest.TestCase):
             self.assertEqual(res[0], "fresh-report")
 
 
+class TestInterceptedEventLedger(unittest.TestCase):
+    """Info events are held back from chat but still recorded for the daily recap."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        # Both routes this class exercises sit behind verify_api_key, which
+        # fails closed with 503 when the key is unset. Set here rather than
+        # relied on from a sibling class: unittest orders classes by dir(),
+        # this one sorts first, and the class that does set it pops it again in
+        # tearDown.
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _inject(self, session_id, **payload_overrides):
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "prod-api",
+            "kind_of_object": "Pod",
+            "name": "payment-api-64d8988cb7-r76jr",
+            "message": "Memory cgroup out of memory",
+            "count": 4,
+            "type": "Warning",
+        }
+        payload.update(payload_overrides)
+        return self.client.post(
+            f"/sessions/{session_id}/inject",
+            json={"message": json.dumps(payload)},
+        )
+
+    def _rows(self, workload):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT namespace, workload, reason, severity, occurrences, notified "
+                "FROM intercepted_events WHERE workload = ?",
+                (workload,),
+            ).fetchall()
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_warning_event_alerts_and_is_recorded(self, mock_trigger):
+        resp = self._inject("sess-warn", name="warn-api-64d8988cb7-r76jr")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "injected")
+
+        rows = self._rows("warn-api")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], "Critical")
+        self.assertEqual(rows[0][4], 4)
+        self.assertEqual(rows[0][5], 1)  # notified
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_info_event_is_recorded_but_not_alerted(self, mock_trigger):
+        resp = self._inject(
+            "sess-info",
+            name="info-api-64d8988cb7-r76jr",
+            reason="Pulled",
+            type="Normal",
+        )
+        self.assertEqual(resp.status_code, 200)
+        # "filtered", deliberately not the "suppressed" the daily ceiling
+        # answers with: the watcher rolls its dedup entry back on "suppressed"
+        # so the workload is re-offered once the ceiling resets, and an Info
+        # grade will not change on the next sighting. See
+        # test_the_gate_and_the_ceiling_do_not_answer_with_the_same_word.
+        self.assertEqual(resp.json()["status"], "filtered")
+
+        # No chat post and no triage session: that is the suppression.
+        mock_trigger.assert_not_called()
+
+        # But the recap can still count it.
+        rows = self._rows("info-api")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], "Info")
+        self.assertEqual(rows[0][5], 0)  # not notified
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_the_ledger_records_which_cluster_the_event_came_from(self, mock_trigger):
+        """One database serves every cluster profile, so the row has to say which.
+
+        Dropping `cluster` on the floor is what lets the recap merge a
+        `prod-api/payment-api` on one cluster with the same-named workload on
+        another, and report the sum against whichever cluster the job runs on.
+        """
+        resp = self._inject(
+            "sess-cluster",
+            name="multi-api-64d8988cb7-r76jr",
+            cluster="cluster-b",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            rows = conn.execute(
+                "SELECT cluster FROM intercepted_events WHERE workload = ?",
+                ("multi-api",),
+            ).fetchall()
+        self.assertEqual(rows, [("cluster-b",)])
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_payload_without_a_cluster_falls_back_to_this_pods_own(self, mock_trigger):
+        """A watcher older than the field must not file its events under ''.
+
+        Every row of an unnamed cluster groups together in the recap, so the
+        skew would merge exactly the workloads the field exists to separate.
+        This pod's own cluster is the right guess: it is where all but a
+        vanishing minority of forwarded events come from.
+        """
+        with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "this-pods-cluster"}):
+            resp = self._inject("sess-no-cluster", name="legacy-api-64d8988cb7-r76jr")
+        self.assertEqual(resp.status_code, 200)
+
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            rows = conn.execute(
+                "SELECT cluster FROM intercepted_events WHERE workload = ?",
+                ("legacy-api",),
+            ).fetchall()
+        self.assertEqual(rows, [("this-pods-cluster",)])
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_normal_typed_node_failure_still_alerts(self, mock_trigger):
+        """kubelet types NodeNotReady `Normal`; suppressing it would mute a node loss.
+
+        It reaches chat because it is graded on the reason and comes back
+        Warning, not because the gate makes an exception for it.
+        """
+        resp = self._inject(
+            "sess-node",
+            name="gke-pool-a-1a2b3c",
+            kind_of_object="Node",
+            reason="NodeNotReady",
+            message="Node gke-pool-a-1a2b3c status is now: NodeNotReady",
+            type="Normal",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "injected")
+        mock_trigger.assert_called_once()
+
+        rows = self._rows("gke-pool-a-1a2b3c")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], "Warning")  # graded on the reason, not the type
+        self.assertEqual(rows[0][5], 1)  # notified
+
+    def _clear_quota(self):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+
+    def _quota_rows(self):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT severity, sent, suppressed FROM alert_quota ORDER BY severity"
+            ).fetchall()
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_suppressed_info_does_not_spend_the_info_budget(self, mock_trigger):
+        """A budget counts alerts sent, so a suppressed event must not spend one.
+
+        The quota is claimed after the gate and only for events that are going
+        to post. Claiming first would bill the Info bucket for churn nobody
+        received and leave `GET /v1/alert-quota` overstating the day.
+
+        This no longer guards against starving a node loss — those reasons are
+        graded Warning and Critical now, so they do not share a bucket with
+        churn at all. What it still guards is the accounting.
+        """
+        self._clear_quota()
+        for i in range(3):
+            resp = self._inject(
+                "sess-churn",
+                name=f"churn-api-64d8988cb7-r76j{i}",
+                reason="BackOff",
+                type="Normal",
+            )
+            self.assertEqual(resp.json()["status"], "filtered")
+        mock_trigger.assert_not_called()
+        self.assertEqual(
+            self._quota_rows(),
+            [],
+            "a suppressed event claimed quota; the gate must come first",
+        )
+
+        resp = self._inject(
+            "sess-churn-node",
+            name="gke-pool-b-4d5e6f",
+            kind_of_object="Node",
+            reason="NodeNotReady",
+            type="Normal",
+        )
+        self.assertEqual(resp.json()["status"], "injected")
+        mock_trigger.assert_called_once()
+        self.assertEqual(
+            self._quota_rows(),
+            [("Warning", 1, 0)],
+            "the node loss must bill Warning, not the Info bucket it used to",
+        )
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_cap_dropped_alert_is_still_recorded(self, mock_trigger):
+        """Nothing about a cap-dropped alert reaches chat, so the recap must hold it."""
+        self._clear_quota()
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Critical": 1}):
+            self.assertEqual(self._inject("sess-cap", name="cap-api-1").json()["status"], "injected")
+            body = self._inject("sess-cap", name="cap-api-2").json()
+        self.assertEqual(body["status"], "suppressed")
+        self.assertEqual(body["severity"], "Critical")
+
+        self.assertEqual(self._rows("cap-api-1")[0][5], 1)  # notified
+        rows = self._rows("cap-api-2")
+        self.assertEqual(len(rows), 1, "a cap-dropped alert must still reach the ledger")
+        self.assertEqual(rows[0][5], 0)  # not notified
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_the_gate_and_the_ceiling_do_not_answer_with_the_same_word(self, mock_trigger):
+        """Both drop the alert; only one of them wants the incident reopened.
+
+        The watcher reads `status` and nothing else, and on "suppressed" it
+        calls `dedupCache.Forget` — right for a ceiling that resets at 00:00
+        UTC, wrong for a policy grade that will come out the same on the next
+        sighting. If both paths said "suppressed" the watcher would reopen
+        every quiet workload at its own repeat cadence, spending a session, an
+        inject and a ledger row per sighting on an event nobody was ever going
+        to be told about. The Go side pins the other half of this in
+        `TestDispatcherKeepsDedupOnPolicyFilter`.
+        """
+        self._clear_quota()
+        gate = self._inject("sess-word", name="word-api-1", reason="Pulled", type="Normal").json()
+        # 1 rather than 0: a limit of 0 means uncapped, so the second alert is
+        # the one the ceiling refuses.
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Critical": 1}):
+            self._inject("sess-word", name="word-api-0")
+            ceiling = self._inject("sess-word", name="word-api-2").json()
+
+        self.assertEqual(gate["status"], "filtered")
+        self.assertEqual(ceiling["status"], "suppressed")
+        self.assertNotEqual(
+            gate["status"],
+            ceiling["status"],
+            "the watcher discriminates on `status` alone; sharing a word makes the two indistinguishable",
+        )
+        # Both still reached the ledger, which is what the recap reads.
+        self.assertEqual(self._rows("word-api-1")[0][5], 0)
+        self.assertEqual(self._rows("word-api-2")[0][5], 0)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_ledger_rows_expire_with_the_ttl(self, mock_trigger):
+        import sqlite3
+        from datetime import datetime, timedelta
+
+        old_time = (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(namespace, workload, reason, severity, occurrences, notified, created_at) "
+                    "VALUES ('old-ns', 'stale-workload', 'BackOff', 'Info', 1, 0, ?)",
+                    (old_time,),
+                )
+
+        self.assertEqual(self.client.post("/sessions").status_code, 201)
+        self.assertEqual(self._rows("stale-workload"), [])
 
 
+
+
+class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
+    """`notified` is an intent when it is written and an observation afterwards.
+
+    The row goes in before the post is attempted, because the send runs in a
+    background task and a row written after it would be lost outright if the
+    process died mid-flight. That ordering is only safe if a failed send comes
+    back and says so — otherwise the daily recap reads the intent as delivery,
+    counts the alert as one the on-call has already seen, and (under its
+    Info-only default) leaves the workload out of the body on the strength of
+    it. Broken chat delivery is the one condition in which the recap is the
+    only surviving channel.
+    """
+
+    def _row(self, row_id):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT notified, delivery_error FROM intercepted_events WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+
+    def _record(self):
+        return session_kv_server.record_intercepted_event(
+            cluster="c", namespace="prod", workload="api", object_kind="Pod",
+            reason="OOMKilled", message="m", severity="Critical",
+            occurrences=1, notified=True,
+        )
+
+    def test_the_insert_returns_the_row_it_wrote(self):
+        """Without an id there is nothing to correct later."""
+        row_id = self._record()
+        self.assertIsNotNone(row_id)
+        self.assertEqual(self._row(row_id), (1, ""))
+
+    def test_a_failed_post_clears_notified_and_records_why(self):
+        row_id = self._record()
+        session_kv_server.mark_delivery_failed(row_id, "no message id from 'google_chat'")
+        self.assertEqual(self._row(row_id), (0, "no message id from 'google_chat'"))
+
+    def test_a_missing_row_id_is_a_no_op_rather_than_a_raise(self):
+        """This runs inside the background task that also starts triage.
+
+        A bookkeeping correction that raises would abandon the troubleshooting
+        turn behind it, which is a worse outcome than an uncorrected row.
+        """
+        session_kv_server.mark_delivery_failed(None, "whatever")
+
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_post_initial_alert", return_value=None)
+    def test_the_troubleshooter_marks_the_row_when_the_post_fails(self, *_):
+        row_id = self._record()
+        session_kv_server.trigger_agent_troubleshooter("sess-x", "msg", {}, row_id)
+        self.assertEqual(self._row(row_id)[0], 0)
+
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_a_successful_post_leaves_the_row_alone(self, *_):
+        """The control: without it the assertions above pass on a no-op."""
+        row_id = self._record()
+        session_kv_server.trigger_agent_troubleshooter("sess-y", "msg", {}, row_id)
+        self.assertEqual(self._row(row_id), (1, ""))
+
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=False)
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_a_failed_triage_session_is_not_a_failed_delivery(self, *_):
+        """Deliberately narrower than "anything downstream went wrong".
+
+        If the post succeeded, chat has the alert; a gateway session that then
+        fails to open means the follow-up never came, not that the reader was
+        never told. Marking the row here would put a delivered Critical in the
+        undelivered list and send someone to check credentials that work.
+        """
+        row_id = self._record()
+        session_kv_server.trigger_agent_troubleshooter("sess-z", "msg", {}, row_id)
+        self.assertEqual(self._row(row_id), (1, ""))
 
 
 class TestSessionKvServerAuth(unittest.TestCase):
@@ -398,6 +800,35 @@ class TestPlaintextIdentityPurge(unittest.TestCase):
         session_kv_server.init_db()
         self.assertEqual(self._read("modern-1")["user_email_hash"], "deadbeef")
 
+    def test_the_ledger_gains_its_cluster_column_on_an_existing_database(self):
+        """`CREATE TABLE IF NOT EXISTS` does not alter a table that is already there.
+
+        The ledger shipped in a pre-release image without `cluster`, so a pod
+        upgraded in place has the old shape on its PVC. Without the ALTER every
+        insert would fail against it and the recap would report an empty day.
+        """
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS intercepted_events")
+            conn.execute(
+                "CREATE TABLE intercepted_events ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT, workload TEXT, "
+                "object_kind TEXT, reason TEXT, message TEXT, severity TEXT, "
+                "occurrences INTEGER, notified INTEGER, created_at TIMESTAMP)"
+            )
+        session_kv_server.init_db()
+
+        session_kv_server.record_intercepted_event(
+            cluster="cluster-c", namespace="prod", workload="api", object_kind="Pod",
+            reason="OOMKilled", message="m", severity="Critical", occurrences=1,
+            notified=False,
+        )
+        with sqlite3.connect(temp_db_path) as conn:
+            rows = conn.execute(
+                "SELECT cluster FROM intercepted_events WHERE workload = 'api'"
+            ).fetchall()
+        self.assertEqual(rows, [("cluster-c",)])
+
 
 class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
     """The row has to say which platform its thread lives on.
@@ -517,11 +948,26 @@ class TestAlertDailyQuota(unittest.TestCase):
                 self.assertTrue(allowed)
                 self.assertEqual(suppressed, 0)
 
+    def test_a_missing_severity_is_uncapped(self):
+        # The hazard the Info row exists to avoid, pinned rather than asserted
+        # in a comment: a severity absent from ALERT_DAILY_LIMITS is not denied,
+        # it is allowed through without a ceiling — the same `limit <= 0` branch
+        # a limit of 0 takes. Deleting the row therefore does not leave a
+        # default behind for a narrowed gate to land on.
+        limits = dict(session_kv_server.ALERT_DAILY_LIMITS)
+        limits.pop("Info")
+        with patch.object(session_kv_server, "ALERT_DAILY_LIMITS", limits):
+            for _ in range(20):
+                allowed, suppressed = session_kv_server._claim_alert_quota("Info")
+                self.assertTrue(allowed, "a missing severity fails open, not closed")
+                self.assertEqual(suppressed, 0)
+
     def test_info_severity_is_capped(self):
-        # Info is a real arrival, not a theoretical one: nothing on the path
-        # from the kubelet filters on Event.Type, so an allowlisted reason
-        # emitted as `type: Normal` — BackOff during image-pull back-off, say —
-        # is classified Info here. It gets a ceiling like everything else.
+        # The gate drops every Info event before it can claim, so nothing bills
+        # this bucket in practice. The entry stays because deleting it would not
+        # leave a default: the miss is allowed through uncapped, per
+        # test_a_missing_severity_is_uncapped, so a narrowed gate would flood
+        # chat rather than meet a ceiling anyone chose.
         self.assertIn("Info", session_kv_server.ALERT_DAILY_LIMITS)
         with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Info": 1}):
             allowed, _ = session_kv_server._claim_alert_quota("Info")

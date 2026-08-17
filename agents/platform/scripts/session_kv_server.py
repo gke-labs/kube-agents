@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from contextlib import closing
 
 import logging
@@ -252,18 +252,9 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 # answer; they just have to ask.
 #
 # Severities come from get_severity_details, and every one of them is capped.
-# Info is not a hypothetical: nothing between the kubelet and this function
-# filters on Event.Type. The watcher's filter matches reason, namespace and
-# repeat count only, and its informer runs without a field selector, so an
-# allowlisted reason arriving as `type: Normal` is forwarded like any other,
-# classified Info here, and — left out of this dict — would post to chat and
-# start an agent turn outside every ceiling. `BackOff` is on the watcher's
-# default reason list and the kubelet emits it as Normal for image-pull
-# back-off, which is exactly the storm the cap exists for.
-#
-# Covering all three also means the `.get(severity, 0)` default in
-# _claim_alert_quota is now reached only by a severity this module cannot
-# produce, rather than by a routine one.
+# Covering all three means the `.get(severity, 0)` default in
+# _claim_alert_quota is reached only by a severity this module cannot produce,
+# rather than by a routine one.
 #
 # Counts are fleet-wide rather than per-cluster, matching the ceiling as
 # specified. The trade-off is that one collapsing cluster can exhaust the day's
@@ -271,7 +262,13 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 ALERT_DAILY_LIMITS = {
     "Critical": _alert_daily_limit("ALERT_DAILY_LIMIT_CRITICAL", 10),
     "Warning": _alert_daily_limit("ALERT_DAILY_LIMIT_WARNING", 5),
-    # Capped, not exempt: see above — Normal-type events land here.
+    # Unreachable, and kept anyway. Every Info event is dropped by the gate in
+    # inject_message before it can claim, so nothing bills this bucket today.
+    # Deleting it would not leave a default behind: a `.get(severity, 0)` miss
+    # takes the same `limit <= 0` branch a limit of 0 takes and is allowed
+    # through uncapped. So narrowing that gate afterwards would put an unbounded
+    # Info stream into chat — the flood the ceiling exists to bound — rather
+    # than a ceiling anyone chose. test_a_missing_severity_is_uncapped pins it.
     "Info": _alert_daily_limit("ALERT_DAILY_LIMIT_INFO", 5),
 }
 
@@ -303,6 +300,55 @@ def init_db() -> None:
                 )
                 """
             )
+            # Every event the watcher forwards, whether or not it was announced
+            # in chat. This is the only durable record of one: the watcher's
+            # dedup snapshot is a rolling window of *active* incidents keyed by
+            # (uid, reason), it carries no namespace or workload name, and its
+            # `count` resets whenever a window rolls over — so it cannot answer
+            # "what happened today". `notified` is what lets the daily recap
+            # report suppressed Info events as a number instead of losing them.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intercepted_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
+                    namespace   TEXT NOT NULL DEFAULT '',
+                    workload    TEXT NOT NULL DEFAULT '',
+                    object_kind TEXT NOT NULL DEFAULT '',
+                    reason      TEXT NOT NULL DEFAULT '',
+                    message     TEXT NOT NULL DEFAULT '',
+                    severity    TEXT NOT NULL DEFAULT '',
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    notified    INTEGER NOT NULL DEFAULT 0,
+                    delivery_error TEXT NOT NULL DEFAULT '',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            # `cluster` was added after the table shipped in a pre-release
+            # image, and CREATE TABLE IF NOT EXISTS does not alter an existing
+            # one. Guarded by a table_info read rather than by catching the
+            # duplicate-column error, so a genuine failure is not swallowed.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
+            if "cluster" not in columns:
+                conn.execute(
+                    "ALTER TABLE intercepted_events ADD COLUMN cluster TEXT NOT NULL DEFAULT ''"
+                )
+            # Same story as `cluster`, and the same guard. Empty means "no
+            # delivery failure recorded", which is also what every row written
+            # before this column existed says — the honest reading, since
+            # nothing observed those deliveries either way.
+            if "delivery_error" not in columns:
+                conn.execute(
+                    "ALTER TABLE intercepted_events ADD COLUMN delivery_error TEXT NOT NULL DEFAULT ''"
+                )
+            # The recap queries one day at a time; without this it is a full
+            # scan of a table that grows with every event in the retention
+            # window.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_created_at "
+                "ON intercepted_events (created_at)"
+            )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
             # the session server goes down with its container, and an in-memory
@@ -325,22 +371,100 @@ def init_db() -> None:
             _purge_plaintext_identities(conn)
 
 
-
-
-
-
 def cleanup_old_records(conn: sqlite3.Connection) -> None:
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
+        conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
         # Spent quota is only meaningful for the day it belongs to; the history
         # is kept the same 14 days as everything else so an operator asked
         # "what did we drop last week" still has an answer.
         conn.execute("DELETE FROM alert_quota WHERE day < date('now', ?)", (param,))
     except Exception as exc:
         logger.error(f"Failed to clean up old DB records: {exc}")
+
+
+def record_intercepted_event(
+    cluster: str,
+    namespace: str,
+    workload: str,
+    object_kind: str,
+    reason: str,
+    message: str,
+    severity: str,
+    occurrences: int,
+    notified: bool,
+) -> Optional[int]:
+    """Append one forwarded event to the ledger the daily recap reads.
+
+    `cluster` is recorded because this server is shared: one session KV
+    database backs every cluster profile in the pod, which is the same reason
+    the daily ceiling is fleet-wide. Without it the recap cannot tell two
+    same-named workloads in two clusters apart, and would merge `prod/api` on
+    one cluster with `prod/api` on another into a single line.
+
+    Best-effort on purpose. This runs on the path that announces a live
+    incident, and a recap that misses a row is a smaller failure than an alert
+    that never reaches chat because the bookkeeping raised.
+
+    Returns the row id so the delivery attempt can correct `notified` when the
+    post fails, or None when the write itself did not land. `notified=True`
+    here is an *intent* — the row is written before anything is sent, because
+    the send happens in a background task and a row written afterwards would be
+    lost entirely if the process died mid-flight. `mark_delivery_failed` is what
+    turns that intent back into an observation.
+    """
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                cursor = conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(cluster, namespace, workload, object_kind, reason, message, severity, occurrences, notified) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        cluster,
+                        namespace,
+                        workload,
+                        object_kind,
+                        reason,
+                        message,
+                        severity,
+                        int(occurrences),
+                        1 if notified else 0,
+                    ),
+                )
+                return cursor.lastrowid
+    except Exception as exc:
+        logger.error(f"Failed to record intercepted event for {namespace}/{workload}: {exc}")
+    return None
+
+
+def mark_delivery_failed(event_row_id: Optional[int], detail: str) -> None:
+    """Correct a ledger row whose alert was never delivered to chat.
+
+    Without this the recap reads `notified = 1` as "chat has already seen it",
+    counts the row into `alerts_posted`, and — under the default Info-only
+    selection — leaves the workload out of the body on the strength of that.
+    A broken chat platform is the one condition in which the recap is the only
+    surviving channel, so it is the one condition in which it must not claim
+    the alert was already read.
+
+    Best-effort for the same reason as the insert: a failed correction must not
+    raise into the background task and abandon the triage turn that follows it.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET notified = 0, delivery_error = ? WHERE id = ?",
+                    (detail[:500], int(event_row_id)),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to record delivery failure for ledger row {event_row_id}: {exc}")
 
 
 @app.get("/healthz")
@@ -397,19 +521,49 @@ def clean_event_message(message: str) -> str:
     return msg
 
 
+# Reasons whose `Event.Type` is not to be trusted. kubelet records node
+# readiness transitions as *Normal* events
+# (`recordNodeStatusEvent(v1.EventTypeNormal, events.NodeNotReady)`), and the
+# node-lifecycle controller records the same transition the same way — so
+# grading on the type alone files a node going NotReady under Info, which is
+# the one severity the suppression gate drops. These reasons are on the
+# watcher's default list precisely because someone wants to hear about them now
+# now rather than in the daily recap.
+#
+# get_severity_details grades these on the reason and ignores the type, so they
+# can never come back Info and the gate needs no exception of its own. The gate
+# depends on that invariant, so it is pinned by
+# test_no_always_alert_reason_can_be_labelled_info rather than by this comment.
+ALWAYS_ALERT_REASONS = frozenset(
+    {
+        "NodeNotReady",
+        "NetworkNotReady",
+        "FailedToDrainNode",
+        "FailedScheduling",
+        "Evicted",
+    }
+)
+
+
 def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
     event_lower = event_type.lower()
     reason_lower = reason.lower()
-    
+
+    # For these reasons the type says Normal and means nothing; the reason is
+    # the reliable signal. Grade them as a Warning-typed event would be graded
+    # — the same keyword list below, the same two outcomes — rather than
+    # letting the type demote a node loss to Info. See ALWAYS_ALERT_REASONS.
+    type_is_unreliable = reason in ALWAYS_ALERT_REASONS
+
     # Blocker if it blocks drain, eviction, or scheduling
     is_blocker = (
-        event_lower == "warning" and 
-        any(x in reason_lower for x in ("drain", "evict", "schedul", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
+        (event_lower == "warning" or type_is_unreliable)
+        and any(x in reason_lower for x in ("drain", "evict", "schedul", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
     )
-    
+
     if is_blocker:
         return "🔴", "Critical"
-    elif event_lower == "warning":
+    elif event_lower == "warning" or type_is_unreliable:
         return "🟡", "Warning"
     else:
         return "🔵", "Info"
@@ -755,10 +909,15 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
         logger.error(f"Failed to call gateway API chat execution: {exc}")
 
 
-def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
+def trigger_agent_troubleshooter(
+    session_id: str,
+    alert_msg: str,
+    payload: Dict[str, Any],
+    event_row_id: Optional[int] = None,
+) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
     active_platform = get_active_platform()
-    
+
     # 1. Post initial warning notification to Google Chat or Slack
     thread_id = _post_initial_alert(active_platform, alert_msg)
     
@@ -768,6 +927,28 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     #    deploy/docker/patches/kanban_event_routing.py).
     if thread_id:
         _register_session_routing(session_id, active_platform, thread_id)
+    else:
+        # The ledger row already says this alert was announced; it was written
+        # before the post was attempted. Correct it now, or the daily recap
+        # counts a message nobody received into "went to chat as it happened"
+        # and drops the workload from the body.
+        #
+        # Only this branch. A failure further down means chat *did* get the
+        # alert and the triage turn did not start, which is a different defect
+        # and leaves `notified` correctly set: the reader saw the alert, just
+        # never the follow-up. `_post_initial_alert` also lands here when the
+        # send succeeded but returned no parseable `message_id`, so the record
+        # says the delivery is unconfirmed rather than certainly lost — the
+        # honest reading, and the safe direction for a report whose failure
+        # mode is false reassurance.
+        mark_delivery_failed(
+            event_row_id,
+            f"no message id from '{active_platform}'; see the session server log",
+        )
+        logger.error(
+            f"Alert for session {session_id} was not delivered to '{active_platform}'; "
+            "the daily recap will report it as undelivered"
+        )
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -1285,8 +1466,34 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     message = payload.get("message") or ""
     count = payload.get("count") if payload.get("count") is not None else 1
     event_type = payload.get("type") or "Warning"
+    # Falls back to this pod's own cluster the way _build_agent_query does, so
+    # a payload from an older watcher lands under a name rather than under ''.
+    event_cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
 
     severity_emoji, severity_label = get_severity_details(event_type, event_reason)
+
+    clean_name = clean_workload_name(object_kind, object_name)
+    clean_reason = clean_reason_label(event_reason)
+    clean_msg = clean_event_message(message)
+
+    # Info means Kubernetes did not consider the event a warning and nothing in
+    # ALWAYS_ALERT_REASONS overrode it. The watcher filters on `reason` alone
+    # and never on `Event.Type`, so a Normal-type event whose reason is on its
+    # list arrives here like any other — and used to cost a chat post and a
+    # full triage session each. Neither is worth spending on routine image-pull
+    # churn: the post is noise in the middle of someone's day, and the triage
+    # is an agent turn spent on a non-problem.
+    #
+    # The node-level exception lives in get_severity_details, not here. Those
+    # reasons are graded on the reason rather than the type and so never reach
+    # this line as Info, which is why this is a plain severity test with no
+    # second list to keep in sync.
+    #
+    # Suppressed here rather than in the watcher so the event is still counted.
+    # The ledger row below is written either way, so the daily recap can report
+    # what was held back; dropping these at the source would make them
+    # invisible to it. See the "Suppressed" line in eod_report_generator.py.
+    suppressed = severity_label == "Info"
 
     # The daily ceiling is enforced here rather than at /sessions because
     # severity is not known until the payload arrives, and here is the single
@@ -1294,6 +1501,61 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     # session row created for an alert that never posts; those age out under
     # CLEANUP_TTL_DAYS like any other.
     #
+    # Claimed *after* the gate above, and only when something is actually going
+    # to be posted: a budget is a count of alerts sent, so an event that was
+    # never going to post must not spend one. Claiming first would bill the
+    # Info bucket for every suppressed image-pull `BackOff` and leave
+    # `GET /v1/alert-quota` reporting a day's worth of alerts nobody received.
+    #
+    # It used to matter more than bookkeeping. While node-level reasons were
+    # graded Info, churn and node loss drew on the same budget, and claiming
+    # first meant five suppressed `BackOff`s could exhaust
+    # `ALERT_DAILY_LIMIT_INFO` and cap-drop a `NodeNotReady`. Grading those
+    # reasons on the reason instead moved them to Warning and Critical, so the
+    # starvation is gone by construction — this ordering is now the accounting
+    # argument alone, which is still reason enough to keep it.
+    quota_denied = False
+    suppressed_today = 0
+    if not suppressed:
+        allowed, suppressed_today = _claim_alert_quota(severity_label)
+        quota_denied = not allowed
+
+    # One ledger row per forwarded event, whatever became of it, with
+    # `notified` carrying the outcome — that invariant is what lets the daily
+    # recap report a suppressed event as a number rather than lose it. A
+    # cap-dropped alert is written here too: it is the case the recap most
+    # needs to show, since nothing about it reaches chat at all.
+    event_row_id = record_intercepted_event(
+        cluster=event_cluster,
+        namespace=namespace,
+        workload=clean_name,
+        object_kind=object_kind,
+        reason=event_reason,
+        message=clean_msg,
+        severity=severity_label,
+        occurrences=count,
+        notified=not (suppressed or quota_denied),
+    )
+
+    if suppressed:
+        # "filtered", deliberately not the "suppressed" the ceiling answers
+        # below. The watcher rolls back its dedup entry for a "suppressed" so
+        # the workload is re-offered, which is right for a ceiling that resets
+        # at 00:00 UTC and wrong for this: an Info event will still be Info on
+        # its next sighting, so rolling back would re-offer the same routine
+        # churn at the event's own repeat cadence — a session, an inject and a
+        # ledger row every kubelet resync, all day, for every quiet workload.
+        # A watcher predating this status also keeps the entry, but it cannot
+        # flag it, so it can never re-open the entry either — see the skew
+        # paragraph in k8s-operator/cmd/k8s-event-watcher/README.md, which owns
+        # that contract. The operator pins both images to one tag on one pod, so
+        # only an override produces that pairing.
+        logger.info(
+            f"Suppressed {severity_label} event {event_reason} for {namespace}/{clean_name} "
+            f"(no chat alert, no triage session); it will appear in the daily recap"
+        )
+        return {"status": "filtered"}
+
     # The reply is 200 with status "suppressed", not an error code, and the
     # difference matters at both ends. The watcher reads the status and drops
     # its dedup entry, so the workload is re-offered on its next sighting
@@ -1304,18 +1566,13 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     # row behind. Answering 200 rather than 4xx/5xx keeps those attempts out of
     # the watcher's inject-error metric, which is there to say the daemon is
     # broken; refusing an alert over a configured ceiling is it working.
-    allowed, suppressed_today = _claim_alert_quota(severity_label)
-    if not allowed:
+    if quota_denied:
         logger.warning(
             f"Suppressed {severity_label} alert for {namespace}/{object_kind}/{object_name} "
             f"({event_reason}): daily limit of {ALERT_DAILY_LIMITS[severity_label]} reached, "
             f"{suppressed_today} suppressed today"
         )
         return {"status": "suppressed", "severity": severity_label, "suppressed_today": str(suppressed_today)}
-
-    clean_name = clean_workload_name(object_kind, object_name)
-    clean_reason = clean_reason_label(event_reason)
-    clean_msg = clean_event_message(message)
 
     # Construct a pretty notification alert. Standard markdown, not Slack
     # mrkdwn: SlackAdapter.format_message runs over everything on its way out,
@@ -1327,10 +1584,10 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
         f"{severity_emoji} **{severity_label}:** {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
         f"🌱 _Digging down to the root cause..._"
     )
-    
+
     # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload)
-    
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload, event_row_id)
+
     return {"status": "injected"}
 
 

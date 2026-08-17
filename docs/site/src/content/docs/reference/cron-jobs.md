@@ -11,6 +11,8 @@ Two files define the scheduled jobs, one per profile, and which one an entry bel
 
 `agents/platform/cron/jobs.json` is the Platform Agent's roster, and carries the seven governance watchdogs plus `github-repo-watcher`, a `no_agent` poller that runs no model. `profile-cron-tick` is what makes it live: each watchdog is a real cron run in its own process, with that profile's persona, toolsets, `skills`, `model` and `max_turns`. No id may appear on both rosters — two rosters both carrying one is that audit running twice per schedule, concurrently with itself.
 
+It also carries `eod-event-watcher-daily-report`, the one entry on it that prompts no model: a `no_agent` script that renders the k8s-event-watcher recap straight from the session ledger and delivers its stdout verbatim. It sits on this roster despite needing none of the profile's toolsets because everything it reads belongs to the Platform Agent — the session database, and `governance/eod_report_config.yaml`, which `profile_cron_tick.py` puts on `$HERMES_HOME` for it. Scripts are shared rather than per-profile (the entrypoint links `profiles/platform/scripts` at the shared directory), so `script` resolves here exactly as it does on the Chat Agent's roster.
+
 ## The shipping jobs
 
 Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json). Retired ids are omitted: an id on its way out ships switched off for a release before it is deleted, and a disabled entry on the Platform Agent's roster is left out of this table rather than listed as a job an operator could reach. See [The retired jobs](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs).
@@ -34,6 +36,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `stockout-prevention` | Platform Agent | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention... |
 | `gcp-networking-fabric-audit` | Platform Agent | `0 8 * * *` | — | yes | Run the daily GCP networking fabric and VPC IPAM audit. Read the SOP at 'governance/gcp_networking_fabric_s... |
 | `github-repo-watcher` | Platform Agent | `*/10 * * * *` | Every 10 minutes | yes | `github_scan_gate.py` |
+| `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: cron-jobs -->

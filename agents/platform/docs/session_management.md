@@ -18,9 +18,10 @@ It binds loopback rather than `0.0.0.0` because it has exactly three callers and
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
-5. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
-6. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports` and gives the Chat Agent one turn to present it, so a scheduled finding lands in a thread the Chat Agent can answer follow-up questions about. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
-7. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
+5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. Informational events are held back from chat and reported as a count by the daily recap.
+6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
+7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports` and gives the Chat Agent one turn to present it, so a scheduled finding lands in a thread the Chat Agent can answer follow-up questions about. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
+8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
 
 ### Triage Routing
 
@@ -38,7 +39,7 @@ The session id is therefore the thread key, and `session_metadata` records the `
 
 Deduplication bounds how often _one_ failure is reported. It does nothing about many _distinct_ failures at once — a node draining or a namespace collapsing produces a hundred unrelated pods, each a legitimately new incident. The ceiling is the backstop for that case.
 
-`inject_message` classifies severity (`get_severity_details`) and then spends one of that severity's daily allowance before anything is posted or any agent turn is started. This is the only place both actions pass through, and severity is not known any earlier — `POST /sessions` carries no payload.
+`inject_message` classifies severity (`get_severity_details`), applies the [severity gate](#severity-gate), and then spends one of that severity's daily allowance before anything is posted or any agent turn is started. This is the only place both actions pass through, and severity is not known any earlier — `POST /sessions` carries no payload.
 
 | Severity   | Env var                      | Default |
 | ---------- | ---------------------------- | ------- |
@@ -46,7 +47,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 | `Warning`  | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
 | `Info`     | `ALERT_DAILY_LIMIT_INFO`     | `5`     |
 
-`Info` is capped alongside the others because it genuinely arrives. Nothing on the path from the kubelet to `inject_message` filters on `Event.Type`: the watcher's filter matches reason, namespace and repeat count, its informer carries no field selector, and the type is passed through in the payload. An allowlisted reason emitted as `type: Normal` is therefore classified `Info` here — `BackOff` is on the watcher's default reason list and the kubelet emits it as `Normal` for image-pull back-off, so an image-pull storm produces exactly that. Setting a limit to `0` turns that severity's cap off entirely.
+`Info` events do arrive — nothing on the path from the kubelet to `inject_message` filters on `Event.Type`, and `BackOff` is on the watcher's default reason list emitted as `type: Normal` for image-pull back-off — but none of them ever bills this bucket, because the [severity gate](#severity-gate) drops every `Info` event before the claim. The `Info` row is kept regardless: deleting it would turn the entry into a `.get(severity, 0)` miss, and `_claim_alert_quota` treats that miss exactly as it treats a limit of `0` — allowed through, uncapped. Narrowing that gate afterwards would therefore send an unbounded `Info` stream to chat rather than restore a ceiling. Setting a limit to `0` turns that severity's cap off entirely, by the same branch.
 
 All three are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped:
 
@@ -65,9 +66,10 @@ Behaviour worth knowing before relying on it:
 - **Suppression is silent.** Nothing is posted to say the ceiling was reached — announcing it would spend a message to say no more messages are coming. The consequence is that once the cap bites, a quiet channel no longer distinguishes "nothing is wrong" from "the budget is spent", so the accounting lives outside chat: every suppressed alert is counted in `alert_quota`, logged at `WARNING` with the workload it dropped, and readable from `GET /v1/alert-quota`.
 - **The counter is fleet-wide,** not per cluster. One collapsing cluster can therefore exhaust the day's budget for every other cluster.
 - **It fails open.** If the quota table cannot be read or written, the alert goes through. A ceiling is a comfort feature and must never be the reason an incident is withheld.
-- **The suppressed alert is still acknowledged** to the watcher with `200 {"status": "suppressed"}`. A failure response would leave the watcher's dedup entry unbound, so the same workload would be re-reported on its next sighting — a suppressed alert would cost more API calls than a delivered one.
+- **The suppressed alert is still acknowledged** to the watcher with `200 {"status": "suppressed"}`, rather than an error code. A 4xx or 5xx would land in `k8s_event_watcher_inject_errors_total`, which exists to say the daemon is broken; refusing an alert over a configured ceiling is it working. The watcher reads the body, drops its dedup entry and re-offers the workload on its next sighting — deliberately, because the entry's window is 24h and this ceiling resets at 00:00 UTC, so keeping it would mute the workload long after the reason for it expired. The price is a session row per re-offer until the day rolls over.
 - **The budget survives restarts,** because it is on the `system-metadata` PVC rather than in memory. A crash-looping session server would otherwise hand out a fresh day's quota on every restart, which is precisely the condition the cap exists for.
 - **The day boundary is UTC midnight,** not the operator's local midnight.
+- **The severity gate runs first, and only alerts that survive it are billed.** A budget is a count of alerts sent, so an event that was never going to be posted must not spend one. Claiming first would bill the `Info` bucket for every suppressed image-pull `BackOff` and leave `GET /v1/alert-quota` reporting a day's worth of alerts nobody received. It cannot starve a node-level alert of its budget — `ALWAYS_ALERT_REASONS` are graded `Warning` or `Critical` and draw on a different bucket — so this ordering is bookkeeping, not a safety property.
 
 ---
 
@@ -102,6 +104,7 @@ sequenceDiagram
     Proxy-->>Watcher: Returns sessionID: k8s-evt-abc123
     Watcher->>Proxy: POST /sessions/k8s-evt-abc123/inject (Payload: Event details)
     Proxy->>Proxy: Spend one of today's alerts for this severity (silently drops if the ceiling is reached)
+    Note over Proxy: Record the event in db (intercepted_events table, notified = 1)
     Proxy->>Chat: Post the alert (no diagnosis yet)
     Proxy->>Proxy: Record the alert's platform/chat_id/thread_id under k8s-evt-abc123
     Proxy->>Gateway: POST /api/sessions (session k8s-evt-abc123; lands on the default profile)
@@ -112,6 +115,13 @@ sequenceDiagram
     Agent->>Agent: Diagnose (read-only), write the report
     Agent->>Agent: kanban_complete(result=the full report)
     Notifier->>Chat: Post the card's result under the alert's thread
+
+    Note over K8s, Proxy: Phase 1b: Informational Events Stop Here
+    K8s->>Watcher: Normal-type event with a watched Reason (e.g. image-pull BackOff)
+    Watcher->>Proxy: POST /sessions/k8s-evt-def456/inject (Payload: Event details)
+    Note over Proxy: Record with notified = 0, return {"status": "filtered"}
+    Note over Proxy, Chat: No alert, no triage session — counted in the daily recap
+    Note over Watcher: Keeps its dedup entry: "filtered" is a policy grade, not a ceiling
 
     Note over K8s, Watcher: Phase 2: Event Deduplication
     K8s->>Watcher: (Duplicate Warning Event occurs)
@@ -169,6 +179,68 @@ CREATE TABLE incidents(
 );
 ```
 
+#### `intercepted_events`
+
+One row per event the watcher forwards, whether or not it was announced in chat. `notified` is what
+lets the `eod-event-watcher-daily-report` cron job report suppressed informational events as a
+number instead of losing them; the watcher's own dedup snapshot cannot substitute, because it is a
+rolling window of _active_ incidents keyed by `(uid, reason)`, carries no namespace or workload
+name, and resets each entry's `count` when its window rolls over.
+
+`notified = 0` covers three unrelated outcomes and the recap must not conflate them. The [severity
+gate](#severity-gate) holds back events Kubernetes itself graded informational, and those are the
+recap's subject — reported as a count. An alert the [daily ceiling](#daily-alert-ceiling) dropped
+carries the same flag but was graded `Critical` or `Warning` and was on its way to chat, so the
+recap reads `severity` to tell the two apart. It does not report those: they are outside its scope,
+and counting them as informational would inflate the one number it exists to publish. It does count
+them privately, because a day that withheld alerts may not be reported as a clean one — the SOP's
+"What this recap does not report" owns that contract.
+
+The third is `delivery_error`, and it exists because `notified` is an _intent_ at the moment it is
+written. The row goes in before the chat post is attempted: the send runs in a background task, so a
+row written afterwards would be lost outright if the process died mid-flight. A send that then fails
+comes back and clears the flag, recording why in `delivery_error` — without that correction the row
+reads as delivered, and the recap prints its ✅ all-clear over a day an alert never reached anyone.
+It is a separate column rather than a fourth `severity` reading because a ceiling drop and a failed
+send prescribe opposite remedies: raise the ceiling, or fix the chat credentials. The recap itself
+no longer draws that distinction — it reports neither class and counts both only to withhold the
+all-clear — so this column is the sole record that a delivery failed anywhere in the system. No
+metric counts them; the SOP's "What this recap does not report" says so, and says what to query
+instead. Like `cluster`, it postdates the original columns, so `init_db` adds it with an `ALTER` and
+the recap selects it only when `PRAGMA table_info` says it is there.
+
+It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
+before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
+marks the delivery failure and then continues into `_create_gateway_session` and `_start_agent_turn`,
+so a triage session **does** run for every undelivered alert — it only skips
+`_register_session_routing` on that branch, leaving the turn with no thread to reply into even
+though `_build_agent_query` instructs the model to thread its findings. The turn still writes its
+`incidents` row; it just reaches nobody through chat. Nothing announces that session, so the session
+log is where it surfaces.
+
+`cluster` is recorded because one session KV database backs every cluster profile in the pod, the
+same reason the ceiling is fleet-wide. Without it the recap cannot tell two same-named workloads in
+two clusters apart. It postdates the other columns, so `init_db` adds it to an existing table with
+an `ALTER` and the recap selects it only when `PRAGMA table_info` says it is there. Rows expire on
+the same 14-day TTL as the rest of the database:
+
+```sql
+CREATE TABLE intercepted_events(
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  cluster     TEXT NOT NULL DEFAULT '',
+  namespace   TEXT NOT NULL DEFAULT '',
+  workload    TEXT NOT NULL DEFAULT '',
+  object_kind TEXT NOT NULL DEFAULT '',
+  reason      TEXT NOT NULL DEFAULT '',
+  message     TEXT NOT NULL DEFAULT '',
+  severity    TEXT NOT NULL DEFAULT '',
+  occurrences INTEGER NOT NULL DEFAULT 1,
+  notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back
+  delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
 #### `alert_quota`
 
 Tracks how much of each severity's daily allowance has been spent, and how many alerts the ceiling dropped:
@@ -184,6 +256,83 @@ CREATE TABLE alert_quota(
 ```
 
 Rows age out with everything else after `SESSION_KV_CLEANUP_TTL_DAYS`, so roughly two weeks of history is available to answer "what did we drop last week".
+
+---
+
+## Severity Gate
+
+`get_severity_details` classifies an injected event from its Kubernetes `Event.Type` and `Reason`:
+a `Warning` whose reason blocks drain, eviction, or scheduling is `Critical`, any other `Warning` is
+`Warning`, and everything else is `Info`. The watcher filters on `Reason` alone and never on
+`Event.Type` (`k8s-operator/cmd/k8s-event-watcher/filter.go`), so `Normal`-type events do arrive
+here — image-pull `BackOff` being the routine one.
+
+`Info` events are recorded and then dropped: no chat post, no troubleshooter session, and `inject`
+returns HTTP 200 with `{"status": "filtered"}`. The 200 is deliberate — a non-2xx counts as an
+`injectErrors` failure, so returning one would make a suppressed event look like a broken bridge on
+the watcher's metrics.
+
+The word in the body is deliberate too, and is not the `"suppressed"` the daily ceiling answers with
+above. The watcher discriminates on that string and nothing else: on `"suppressed"` it drops its
+dedup entry so the workload is re-offered, which is right for a ceiling that resets at 00:00 UTC and
+wrong here. An `Info` grade is a property of the event, not of the day — the next sighting would
+grade the same way — so sharing the word would re-offer every quiet workload at its own repeat
+cadence, spending a session, an inject and a ledger row per sighting on an alert nobody was ever
+going to receive. On `"filtered"` the watcher keeps the entry and counts
+`k8s_event_watcher_events_policy_filtered_total`. Version skew between the two images is not equally
+safe in both directions. An older daemon says `"suppressed"` for both, which reopens: one redundant
+session, no silence. An older watcher is the harmful direction — it reads the unknown status as
+delivered and keeps the entry, but it cannot flag it, so the re-open described in the next paragraph
+can never fire and the family's `Warning` members stay deduped behind the entry for as long as they
+keep arriving. An ordinary install does not produce that pairing, because the sidecar image is
+derived from the agent image's registry and tag and the two run as containers of one pod; it takes
+an override — `CREDENTIAL_PROXY_IMAGE` pinned to an older tag, or a digest-pinned agent image whose
+sidecar falls back to a mutable tag. `k8s-operator/cmd/k8s-event-watcher/README.md` owns that
+contract in full. The pair is pinned by
+`test_the_gate_and_the_ceiling_do_not_answer_with_the_same_word` and by
+`TestDispatcherKeepsDedupOnPolicyFilter`.
+
+Keeping the entry needs one qualification, because the entry is not keyed on the event that was
+graded. The watcher's key is `(uid, canonical reason)`, and `canonicalizeReason` folds a whole
+failure family onto one of them: kubelet's `Normal`-type `BackOff` ("Back-off pulling image"), the
+`ErrImagePull` beside it, and the `Warning`-type `Failed` that follows are one incident. A bad image
+tag can therefore put the routine member in front, and every `Warning` behind it would be deduped
+against an entry held on behalf of an event nobody was told about — permanently, since each sighting
+slides the window forward. So the watcher lets the first event that is not typed `Normal` re-open
+the incident, once per window, counted in `k8s_event_watcher_events_policy_reopened_total` and
+pinned by `TestDispatcherReopensPolicyFilteredKeyForWarning`. That re-opened event arrives with
+`count = 1` rather than the family's accumulated count, so `occurrences` keeps meaning "sightings
+this row stands for" — the invariant the recap relies on when it sums the column into "Forwarded
+_N_ events" and ranks its incident list by it. `TestDispatcherReopenedPayloadCountsFromOne` pins
+that number.
+
+For the reasons in `ALWAYS_ALERT_REASONS` the `Event.Type` is not to be trusted, so
+`get_severity_details` ignores it and grades on the reason alone. Kubernetes types several failures
+the watcher forwards as `Normal`: kubelet records node readiness transitions with
+`recordNodeStatusEvent(v1.EventTypeNormal, events.NodeNotReady)`, and the node-lifecycle controller
+records the same transition the same way. Grading on the type would file a node going `NotReady`
+under `Info` — one of the watcher's default reasons precisely because it warrants waking someone —
+and leave it to surface as a number in the next daily recap. Those reasons are therefore graded as
+the same keyword list would grade a `Warning`-typed event, which fixes their severity regardless of
+how the event was typed:
+
+| Reason                                             | Severity   |
+| -------------------------------------------------- | ---------- |
+| `FailedToDrainNode`, `FailedScheduling`, `Evicted` | `Critical` |
+| `NodeNotReady`, `NetworkNotReady`                  | `Warning`  |
+
+Which of them a given install can actually see is a separate question, decided upstream by the
+watcher's `--reason` gate, and the two lists barely overlap. `defaultReasons` in `filter.go` carries
+four of the five and not `FailedToDrainNode`; the `--reason` list the operator passes in
+deploy/shared/start-services.sh carries `FailedToDrainNode` and none of the other four. So as
+deployed, `NodeNotReady` is graded `Warning` by a code path no event reaches — the table above is
+the grading rule, not a claim about what arrives.
+
+The gate itself is then a plain `severity == "Info"` test with no second list to keep in sync: an
+`ALWAYS_ALERT_REASONS` event can never reach it labelled `Info`. That invariant is what the gate
+depends on, so it is pinned by `test_no_always_alert_reason_can_be_labelled_info` rather than by
+prose. The label also decides which daily ceiling the alert draws on, which is why a node loss is
+billed to `Warning` and not to the informational bucket it is nothing like.
 
 ---
 
