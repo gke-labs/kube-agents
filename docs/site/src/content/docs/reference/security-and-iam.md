@@ -51,7 +51,7 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 
 ## GCP IAM permission sets
 
-`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`):
+`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`). All three entry points choose from the same sets, and `read-only` is the default in each: the provisioner prompts for it; the zero-friction installer asks the same question — or takes `--permission-set` / `--custom-roles` — before writing `vars.sh`; and the Terraform composition takes the same three values in a `permission_set` variable in `terraform.tfvars`, with `custom` requiring a `project_roles` list (setting `project_roles` explicitly overrides `permission_set` either way).
 
 | Permission set | `PLATFORM_AGENT_PERMISSION_SET` | Use it when                                                    |
 | -------------- | ------------------------------- | -------------------------------------------------------------- |
@@ -64,6 +64,7 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 The **gke-admin** set binds:
 
 - `roles/container.clusterAdmin`, `roles/container.admin` — full GKE control.
+- `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
 - `roles/monitoring.admin` — manage monitoring configuration.
 - `roles/logging.viewer` — read logs only (the agent must **not** administer the audit-log sink).
 - `roles/iam.serviceAccountUser` — act as service accounts when running jobs.
@@ -73,6 +74,7 @@ The **gke-admin** set binds:
 The default **read-only** set swaps the admin roles for viewers:
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
+- `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
 - `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, `roles/mcp.toolUser` — unchanged.
 
@@ -82,27 +84,31 @@ The **custom** set binds exactly the roles listed in `PLATFORM_AGENT_CUSTOM_ROLE
 
 Independently of the GCP permission set, the operator grants the agent KSA a **read-only** footprint on the Kubernetes API, plus one namespaced housekeeping Role. It creates three bindings (see [`platformagent_manifests.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests.go)):
 
-| Binding                                  | Role                         | Grants                                                                                                                                     |
-| ---------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `kubeagents:viewer:<namespace>:<name>`   | standard `view` ClusterRole  | Read access to most namespaced resources — **excluding Secrets**.                                                                          |
-| `kubeagents:explorer:<namespace>:<name>` | custom `kubeagents:explorer` | `get`/`list` on `nodes`, `pods`, `namespaces`, and CRDs.                                                                                   |
-| `kubeagents:leader:<namespace>:<name>`   | custom namespaced Role       | Housekeeping in the agent's **own namespace only**: write on `coordination.k8s.io` `leases` (leader election) and `get`/`patch` on `pods`. |
+| Binding                                 | Role                       | Grants                                                                                                                                                      |
+| --------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents:minimal:<namespace>:<name>` | custom minimal ClusterRole | Cluster-wide read access (`get`/`list`/`watch`) to audit resources (nodes, pods, deployments, configmaps, services, etc.) — **excluding Secrets and RBAC**. |
+| `kubeagents:local:<namespace>:<name>`   | custom namespaced Role     | Read access (`get`/`list`/`watch`) to `PlatformAgent` CRs in the agent's **own namespace only**.                                                            |
+| `kubeagents:leader:<namespace>:<name>`  | custom namespaced Role     | Housekeeping in the agent's **own namespace only**: write on `coordination.k8s.io` `leases` (leader election) and `get`/`patch` on `pods`.                  |
 
-For the default CR (`platform-agent` in `kubeagents-system`) the bindings resolve to `kubeagents:viewer:kubeagents-system:platform-agent`, `kubeagents:explorer:kubeagents-system:platform-agent`, and `kubeagents:leader:kubeagents-system:platform-agent`.
+For the default CR (`platform-agent` in `kubeagents-system`) the bindings resolve to `kubeagents:minimal:kubeagents-system:platform-agent`, `kubeagents:local:kubeagents-system:platform-agent`, and `kubeagents:leader:kubeagents-system:platform-agent`.
 
-The `viewer` and `explorer` roles carry no write verb (`create`, `update`, `patch`, `delete`) and cannot read Secrets. The only write grant anywhere is the `leader` Role, and it is confined to the agent's own namespace — leader-election `leases`, plus `get`/`patch` on `pods` there. The agent cannot modify Deployments, Services, or namespaces, and it cannot read Secret values — if a resource it proposes needs a Secret, it references the Secret by name rather than reading its contents.
+The Kubernetes `minimal` and `local` roles carry no write verbs (`create`, `update`, `patch`, `delete`) and grant no read access to Secrets or cluster RBAC. (The GCP IAM `read-only` permission set independently provides cluster-viewer read via Cloud IAM for audits connecting through `gcloud container clusters get-credentials`.) The only write grant anywhere in Kubernetes RBAC is the `leader` Role, and it is confined to the agent's own namespace — leader-election `leases`, plus `get`/`patch` on `pods` there. The agent cannot modify Deployments, Services, or namespaces, and it cannot read Secret values — if a resource it proposes needs a Secret, it references the Secret by name rather than reading its contents.
 
 Verify the bindings on a running cluster:
 
 ```bash
-kubectl describe clusterrolebinding kubeagents:viewer:kubeagents-system:platform-agent
-kubectl describe clusterrolebinding kubeagents:explorer:kubeagents-system:platform-agent
+kubectl describe clusterrolebinding kubeagents:minimal:kubeagents-system:platform-agent
+kubectl describe rolebinding -n kubeagents-system kubeagents:local:kubeagents-system:platform-agent
 kubectl describe rolebinding -n kubeagents-system kubeagents:leader:kubeagents-system:platform-agent
 ```
 
 ### The operator controller is a separate identity
 
 Everything above describes the _agent_. The controller-manager that reconciles `PlatformAgent` CRs runs under its own KSA, `kubeagents-controller` (the kustomize `namePrefix: kubeagents-` applied to the base `controller` ServiceAccount), and its Kubernetes permissions are the Kubebuilder-generated ClusterRole in [`k8s-operator/config/rbac/role.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/rbac/role.yaml) (regenerated with `make manifests`): write access to the object kinds it reconciles for the agent pod — Deployments/StatefulSets, ServiceAccounts, Services, ConfigMaps, PVCs, NetworkPolicies, and the agent RBAC objects above — plus read-only access to what it merely watches (nodes, namespaces, CRDs, RuntimeClasses). Unlike the agent, the controller has no GCP identity: no provisioning step creates a controller GSA or Workload Identity binding for it (the `CONTROLLER_GSA_NAME` default in `scripts/common.sh` is consumed only by the teardown scripts, which clean up older installs that did bind one).
+
+### The Vertex AI gateway is a separate identity
+
+With `MODEL_PROVIDER=vertex_ai` the LiteLLM gateway gets its own KSA (`kubeagents-litellm`) bound to its own GSA (`kubeagents-litellm-gsa`), holding exactly one role — `roles/aiplatform.user` on the serving project — and nothing else. It is deliberately not the agent's identity: the gateway is a network-exposed proxy that forwards attacker-influenceable prompt content, so it is scoped to calling models and cannot touch GKE, logging, or the GitOps path. `provision_04_gcp_iam.sh` creates the GSA and its Workload Identity binding, and `provision_09_deploy_litellm.sh` creates the annotated KSA; `teardown_04_gcp_iam.sh` removes the GSA unconditionally, so switching away from `vertex_ai` and tearing down leaves no orphan. The other providers give the gateway no GCP identity at all — it authenticates with an API key from `platform-agent-secrets`.
 
 ## Configuring read-only (auditing) mode
 
@@ -113,6 +119,12 @@ Everything above describes the _agent_. The controller-manager that reconciles `
   ```bash
   cd k8s-operator/scripts
   PLATFORM_AGENT_PERMISSION_SET=read-only ./provision_04_gcp_iam.sh
+  ```
+
+- **With the zero-friction installer** — accept the default option in its permission-set menu, or pass it explicitly:
+
+  ```bash
+  ./install.sh --permission-set=read-only
   ```
 
 - **On an existing GSA provisioned with `gke-admin`** — swap the admin roles for viewers by hand:
@@ -136,7 +148,7 @@ Everything above describes the _agent_. The controller-manager that reconciles `
 
   Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
 
-The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed.
+The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 
 ## Secure write path: GitOps
 
@@ -155,8 +167,14 @@ The agent never has direct write access to running infrastructure — see [Decla
 
 - **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; it opens PRs. See [Platform Agent](/kube-agents/concepts/platform-agent/).
 - **No credentials in the sandbox.** API keys, chat tokens, and ServiceAccount tokens live only in the Envoy credential-proxy sidecar; the agent container gets wrapper CLIs that forward through a policy-enforced local proxy. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+- **Network isolation and egress boundaries.** The Platform Agent is protected by restrictive Kubernetes `NetworkPolicy` manifests ([`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) in Kustomize mode, or `*-gateway-netpol` via the operator):
+  - **Ingress:** Restricted to essential Hermes API (`8642`), Envoy Credential Proxy API (`8643`), and conditionally dashboard (`9119`) ports from pods within the agent's own namespace (`podSelector: {}`).
+  - **Egress (Internal Services):** DNS on TCP/UDP port `53` to CoreDNS/NodeLocal DNS pods, the classic Service-CIDR ClusterIP (`10.96.0.10/32`), and any address outside the private ranges the external `443` rule denies — a static manifest cannot know which ClusterIP a cluster's service range yields (newer GKE clusters allocate from public space, e.g. `34.118.224.0/20`), while the operator-generated policy resolves the actual cluster DNS ClusterIP instead. Also allowlisted: the GCP Workload Identity metadata server (`169.254.169.254/32` on TCP ports `80` and `8080`), GKE Workload Identity daemon (TCP port `988` to `169.254.169.254/32`, `169.254.169.252/32`, and — under the operator — one `/32` per cluster node, because the node rewrites the metadata destination before `NetworkPolicy` is evaluated; see [Kustomize deployment](/kube-agents/deploy/kustomize/#configuring-networkpolicy-for-gke-private-clusters-dataplane-v2--custom-cidrs)), LiteLLM Gateway and Standalone Replay pods (`app: litellm` and `app: standalone-replay` on TCP ports `80`, `4000`, and `8080`), vLLM inference servers (`app: gemma-server` on TCP ports `80` and `8000`), GitHub Token Minter pods (`app: github-token-minter` on TCP port `8080`), and GKE Managed OpenTelemetry collector pods (`gke-managed-otel` on TCP ports `4317`/`4318`).
+  - **Egress (Control Plane, Fleet & External):** Allowlisted to the internal Kubernetes Control Plane API server (`10.96.0.1/32` and resolved control plane endpoints on TCP ports `443`/`6443`/`8443`, as well as remote private fleet cluster CIDRs and PSC endpoints configured via `kubeagents.x-k8s.io/apiserver-cidr` / `kubeagents.x-k8s.io/custom-egress-cidrs`), and external HTTPS destinations (`0.0.0.0/0` and `::/0` on TCP port `443` excluding private subnets `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `100.64.0.0/10` to block internal lateral movement).
+  - **Defense-in-Depth Layering:** Environments requiring stricter egress control over HTTPS (`443`) should combine this with Private Google Access / VPC Service Controls CIDR blocks or FQDN-based egress filtering (e.g., `FQDNNetworkPolicy` on Dataplane V2).
 - **One agent per project.** The admission webhook rejects a second `PlatformAgent` CR, so a cluster can't accumulate agents with overlapping scope. See [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.
+- **Unattended runs waive the prompt, not the checks — and the scan has gaps.** `approvals.cron_mode: approve` skips the interactive approval prompt for scheduled runs, because no human is at the keyboard to answer it. The hardline floor (`rm -rf /`, `mkfs`, fork bombs, and nine more), the sudo-stdin guard, and any `approvals.deny` globs still apply, and commands still go through the Tirith content scan unless `approvals.cron_scan: false` opts the profile out. [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) is canonical for how that scan behaves and what it catches; what belongs on this page is what it does **not** reach. A pure-ASCII lookalike TLD and terminal escape injection get through both layers. And `execute_code` is auto-approved under `cron_mode: approve` without a content scan at all — Tirith reads POSIX shell, so handing it a Python script would produce noise rather than a verdict — which leaves a scheduled Platform Agent run able to reach `subprocess` unscanned (`deploy/docker/patches/cron_tirith_scan.py`); closing that needs a different scanner, not this one. The Chat Agent cannot take that route: `code_execution` is in its `disabled_toolsets`.
 - **Bounded recovery.** The agent retries a blocker through its recovery ladder (roughly five iterations or ~10 minutes) before escalating to a human instead of looping indefinitely.
 - **Read-only log access by default.** Provisioning grants the agent `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. `provision_04_gcp_iam.sh` also actively reconciles away any legacy `roles/logging.admin` grant on the GSA unless a custom role set explicitly requests it. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
 - **`AgentPlugin` create/update is an administrative privilege.** Treat the permission to create an `AgentPlugin` as equivalent to running code inside the agent pod, because that is what it does. The plugin's OCI image is mounted into the agent container and Hermes imports it, so the plugin executes with the agent's ServiceAccount, its Workload Identity binding, and its access to the credential proxy. The controls below constrain what a plugin can declare _in the CR_; none of them sandbox the plugin code itself. Restrict `agentplugins` RBAC to the same set of principals you would trust to change the agent's container image.
@@ -168,7 +186,25 @@ The agent never has direct write access to running infrastructure — see [Decla
   - **Config subtree allowlisting.** Only the top-level keys `approvals`, `platforms`, and `platform_toolsets` are merged from `spec.config`; every other key is dropped and logged. This keeps a plugin out of `agent` (including `agent.disabled_toolsets`), `leader_election`, `logging`, and `plugins`. It does **not** make the merge safe in general — see the two caveats below.
   - **Caveat: allowlisted subtrees still carry security weight.** `approvals` governs approval gating and `platform_toolsets` gates which toolsets a platform surface exposes. A plugin may set values under both. Allowlisting bounds _where_ a plugin can write, not _how much authority_ it can grant itself.
   - **Caveat: list merges are additive.** When a plugin supplies a list under an allowlisted key, its entries are unioned into the operator's list rather than replacing it. A plugin can therefore add a toolset to `platform_toolsets` but cannot remove one the operator configured.
-  - **`spec.env` overrides operator-set variables.** Plugin-supplied environment variables take precedence over variables of the same name set by the operator, and secret references resolve against any Secret in the agent's namespace. The one exception is `CREDENTIAL_PROXY_URL`, which the operator appends after the merge so a plugin cannot redirect the credential proxy. Secrets referenced this way land in the agent container's environment: this is a supported way to supply a plugin its own API token, not a preservation of the credential-proxy boundary, which only covers the credentials the proxy itself brokers. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+  - **`spec.env` overrides operator-set variables.** Plugin-supplied environment variables take precedence over variables of the same name set by the operator, and secret references resolve against any Secret in the agent's namespace. Four names are exceptions: the operator appends `CREDENTIAL_PROXY_URL`, `AGENT_SHARED_STATE_SETUP`, `PATH`, and `PYTHONPATH` _after_ the merge, so a plugin's copy of any of them loses. The first keeps a plugin from redirecting the credential proxy; the second keeps it from switching off the container-startup setup that populates `$HERMES_HOME` (see [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)), which would surface as plugins mounted but never enabled, far from the plugin that caused it. Secrets referenced this way land in the agent container's environment: this is a supported way to supply a plugin its own API token, not a preservation of the credential-proxy boundary, which only covers the credentials the proxy itself brokers. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+
+## Secrets Encryption & Local State Security
+
+### GKE etcd Database Encryption (CMEK)
+
+The provisioning pipeline (`provision_01_gcp_cluster.sh` and `provision_07_gcp_k8s_secrets.sh`) enforces Customer-Managed Encryption Keys (CMEK) for GKE database encryption:
+
+- **Automated Cloud KMS Setup**: A dedicated Cloud KMS keyring (`GKE_DB_KMS_KEYRING`) and crypto key (`GKE_DB_KMS_KEY`) are automatically created and granted `roles/cloudkms.cryptoKeyEncrypterDecrypter` for the GKE service agent (`container.googleapis.com`).
+- **Pre-flight Encryption Gate**: `provision_07_gcp_k8s_secrets.sh` verifies that GKE etcd encryption is active (`ENCRYPTED` or `ALL_OBJECTS_ENCRYPTION_ENABLED`) before writing any Kubernetes secrets (`platform-agent-secrets`).
+- **`ALLOW_UNENCRYPTED_SECRETS` Override**: When provisioning on existing clusters or local test environments where CMEK is disabled, export `ALLOW_UNENCRYPTED_SECRETS=true` to bypass the mandatory encryption gate.
+
+### Local State Security (`vars.sh`)
+
+Local configuration and state saved during installer execution (`k8s-operator/scripts/vars.sh`) are hardened as follows:
+
+- **File Permissions**: State files are created with strict POSIX permissions (`umask 077` and `chmod 600`), preventing non-owner access.
+- **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials entered during provisioning are stored in `vars.sh` for non-interactive re-runs. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
+- **Interactive Teardown Confirmation**: During standalone teardown (`teardown_07_gcp_k8s_secrets.sh`), secret sanitization is interactive so users can choose whether to keep or wipe credentials when retaining local state (orchestrated `teardown.sh` sanitizes credentials automatically).
 
 ## Where to go next
 

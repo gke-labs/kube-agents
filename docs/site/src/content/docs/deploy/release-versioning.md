@@ -5,23 +5,23 @@ sidebar:
   order: 4
 ---
 
-`kube-agents` follows strict [Semantic Versioning 2.0.0](https://semver.org/) (`vMAJOR.MINOR.PATCH`) for production releases across Docker images, OCI Helm charts, and Terraform modules.
+`kube-agents` follows strict [Semantic Versioning 2.0.0](https://semver.org/) (`MAJOR.MINOR.PATCH`) for production releases across Docker images, OCI Helm charts, and Terraform modules.
 
 ## Promotion from Release Candidate (RC) to SemVer
 
 1. **RC Testing**: Pre-release builds are validated by the automated RC pipeline —
    [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release) is the canonical reference for how `rc_YYMMDDHHMM_<short_sha>` builds are created, tested end-to-end, and tagged `*_validated` on success.
-2. **SemVer Publication**: Tagging a validated commit with `vX.Y.Z` triggers GitHub Actions to publish immutable artifacts (example for `v1.2.0`):
-   - **GHCR Images**: `ghcr.io/gke-labs/kube-agents/platform-agent:v1.2.0`
+2. **SemVer Publication**: Tagging a validated commit with `X.Y.Z` triggers GitHub Actions to publish immutable artifacts (example for `1.2.0`):
+   - **GHCR Images**: `ghcr.io/gke-labs/kube-agents/platform-agent:1.2.0`
    - **OCI Helm Charts**: `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:1.2.0`
-   - **Terraform Modules**: Sourced via Git tag reference `?ref=v1.2.0`
+   - **Terraform Modules**: Sourced via Git tag reference `?ref=1.2.0`
 
 ## Helm Chart Versioning
 
 The chart `version` tracks the application `appVersion`: the release workflow packages the
-chart with `version` set to the git tag (minus the `v` prefix) and `appVersion` set to the
-tag itself, so every chart release corresponds to exactly one application release. There is
-no chart-only release train — a chart-template fix ships with the next `vX.Y.Z` tag.
+chart with both `version` and `appVersion` set to the exact SemVer release tag `X.Y.Z`, so every
+chart release corresponds to exactly one application release. There is no chart-only release
+train — a chart-template fix ships with the next `X.Y.Z` tag.
 
 ## Pinning Terraform Module Versions in GitOps
 
@@ -29,7 +29,7 @@ When forking the GitOps reference repository (`examples/gitops-repo/`), source T
 
 ```hcl
 module "gke_cluster" {
-  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=v1.2.0"
+  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=1.2.0"
   project_id   = var.project_id
   cluster_name = "production-host-01"
   location     = "us-central1"

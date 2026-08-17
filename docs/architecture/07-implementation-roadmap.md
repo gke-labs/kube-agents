@@ -79,13 +79,14 @@ acceptance criteria pass.
   build if Scion's K8s mode is not ready. Pre-create the platform read-only KSA/RBAC/WI (applied by CI)
   and reference it via the CR's `serviceAccountName`, **unifying the canonical `<tier>-agent` KSA** the
   pre-created view/explorer manifests bind to; make the agent read-only by editing the operator's
-  **`renderConfigYAML()`** — the runtime-authoritative config; the baked `agents/platform/config.yaml` is
-  shadowed at runtime — so no cluster-creating tool reaches it and the `gke` MCP is describe/list only
+  **`renderConfigYAML()`** **and** the baked configs it is merged with at startup — `platform_toolsets`
+  lists are unioned, so one side alone is not enough — so no cluster-creating tool reaches it and the
+  `gke` MCP is describe/list only
   ([06](06-api-and-data-contracts.md) §9), and **retire the `gke-cluster-creator` skill's `create_cluster`
   call**; **scope the cloud GSA to viewer-only IAM** — the real cloud-write delta, since the agent's K8s
   RBAC is **already read-only** (runtime-minted `view` + a get/list "explorer" `ClusterRole`, no write
-  verbs to strip) — and remove the dead `kubectl` apply/delete helpers; mount the config ConfigMap
-  `readOnly: true`; **stop runtime-minting** that `view`/explorer RBAC (move it into the pre-created
+  verbs to strip) — and remove the dead `kubectl` apply/delete helpers; **stop runtime-minting** that
+  `view`/explorer RBAC (move it into the pre-created
   manifests above) and **drop the controller's RBAC-granting kubebuilder markers**
   (`clusterroles`/`clusterrolebindings` create/bind) so it mints no RBAC
   ([08](08-agent-runtime-and-identity.md) §4); add the CRD's `iac.format` field (default `kcc`,

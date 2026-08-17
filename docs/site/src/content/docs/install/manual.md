@@ -28,8 +28,8 @@ platform/
 ├── CAPABILITIES.md          # one-line routing description for the front door
 ├── config.yaml              # MCP servers, toolsets, plugins
 ├── skills/                  # SKILL.md bundles
-├── governance/              # SOPs invoked by cron jobs
-├── cron/jobs.json           # scheduled autonomous jobs
+├── governance/              # SOPs the scheduled governance jobs point at
+├── cron/jobs.json           # empty — the schedules live on the Chat Agent
 ├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
@@ -49,10 +49,10 @@ Configure your harness to register a new agent named `platform`:
 
 ## Step 3: Enable the scheduled watchdogs
 
-The Platform Agent runs its routine maintenance and drift detection as autonomous governance jobs on cron schedules. These are defined in `cron/jobs.json`; each job fires a pre-authored prompt that points the agent at a [governance SOP](/kube-agents/concepts/governance-sops/) under `governance/`.
+The Platform Agent runs its routine maintenance and drift detection as autonomous governance jobs on cron schedules. They live in the workspace you just copied, at `agents/platform/cron/jobs.json`, and each carries a pre-authored `prompt` that points at a [governance SOP](/kube-agents/concepts/governance-sops/) under the Platform Agent's `governance/`.
 
-- If your harness has native cron support (Hermes does), the jobs in `cron/jobs.json` register automatically once the workspace is loaded — no extra configuration is needed.
-- Otherwise, wire each job into your scheduler by hand: for every entry in `cron/jobs.json`, create a recurring task that targets the `platform` agent using the job's `schedule.expr` (a standard 5-field cron expression) and sends its `prompt` verbatim.
+- If your harness has native cron support (Hermes does), the jobs register automatically once the workspace is loaded — no extra configuration is needed. Ticking is a property of the profile that owns the running gateway, so a second job, `profile-cron-tick` on the Chat Agent's roster (`agents/chat/defaults/cron/jobs.json`), is what advances this profile's schedule; it ships with that workspace.
+- Otherwise, wire each job into your scheduler by hand: for every entry in `agents/platform/cron/jobs.json`, create a recurring task on the job's `schedule.expr` (a standard 5-field cron expression) that sends the job's `prompt` verbatim to the `platform` agent.
 
 See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) for the full, annotated job list.
 

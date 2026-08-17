@@ -52,14 +52,19 @@ type flags struct {
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
-	inCluster         bool
-	kubeconfig        string
-	profilesDir       string
-	clusterName       string
-	logLevel          string
-	dryRun            bool
-	metricsAddr       string
-	snapshotInterval  time.Duration
+	backoffMinCount   int
+	// imagePullTransientMinCount gates only the self-clearing half of the
+	// image-pull family; see filter.go.
+	imagePullTransientMinCount int
+
+	inCluster        bool
+	kubeconfig       string
+	profilesDir      string
+	clusterName      string
+	logLevel         string
+	dryRun           bool
+	metricsAddr      string
+	snapshotInterval time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -85,6 +90,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
 	fs.StringVar(&f.dedupPersist, "dedup-persist", "", "Optional path to persist dedup cache across sidecar restart.")
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
+	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event.")
+	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
@@ -366,7 +373,7 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 			continue
 		}
 
-		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		cfg, err := clientConfigForProfile(kubeconfig, *identity)
 		if err != nil {
 			skip("kubeconfig %s: %v", kubeconfig, err)
 			continue
@@ -392,6 +399,53 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 		clusters = append(clusters, tc)
 	}
 	return clusters, nil
+}
+
+// clientConfigForProfile builds a rest.Config from a profile's kubeconfig and
+// refuses anything that does not demonstrably point at the cluster the profile
+// claims to be.
+//
+// It exists because clientcmd.BuildConfigFromFlags cannot be trusted to fail
+// here. Given an *empty* kubeconfig it does not return an error: the deferred
+// loader treats an empty config as "nothing was specified" and silently falls
+// back to the in-cluster config. A profile whose credential fetch died before
+// writing anything therefore produced a working client — pointed at the
+// management cluster, the one cluster it certainly was not describing.
+//
+// Nothing downstream could notice. The cluster label comes from
+// cluster_identity, not from the connection, so that profile was watched under
+// its own name while reading another cluster's events. Observed in autopush:
+// two watchers on the management cluster, every event reported twice, one copy
+// naming a cluster where nothing had happened. A corrupt kubeconfig fails
+// loudly and always did; an empty one was the gap.
+//
+// So the context is resolved explicitly, and checked against the identity. GKE
+// context names are gke_<project>_<location>_<cluster>, which is the same shape
+// the credential proxy already requires of any kubeconfig the agent supplies
+// (see docs/credential-isolation-design.md), so this adds no new convention. It
+// also catches a kubeconfig that accumulated several clusters' contexts and is
+// pointing at the wrong one — merged kubeconfigs are how profiles go wrong in
+// practice, since `gcloud container clusters get-credentials` appends.
+func clientConfigForProfile(kubeconfig string, identity clusterIdentity) (*rest.Config, error) {
+	apiCfg, err := clientcmd.LoadFromFile(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	if apiCfg.CurrentContext == "" {
+		return nil, errors.New("kubeconfig has no current-context (it is empty or was never written); refusing to fall back to the in-cluster config, which would silently watch the wrong cluster")
+	}
+	want := fmt.Sprintf("gke_%s_%s_%s", identity.Project, identity.Location, identity.Cluster)
+	if apiCfg.CurrentContext != want {
+		return nil, fmt.Errorf("kubeconfig current-context is %q but this profile describes %q; it points at a different cluster than it claims",
+			apiCfg.CurrentContext, want)
+	}
+	// NewNonInteractiveClientConfig, not the deferred loader: this one reports an
+	// unusable config as an error instead of reaching for the in-cluster config.
+	cfg, err := clientcmd.NewNonInteractiveClientConfig(*apiCfg, apiCfg.CurrentContext, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("build client config for context %q: %w", apiCfg.CurrentContext, err)
+	}
+	return cfg, nil
 }
 
 // gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
@@ -465,27 +519,33 @@ func readClusterIdentity(path string) (*clusterIdentity, error) {
 // mutable. A lock here would have served only to make one cluster's slow daemon
 // round-trip stall every other cluster.
 type dispatcher struct {
-	filter    *filter
-	dedup     *dedupCache
-	injector  *injector
-	metrics   *metrics
-	mode      string // "per-incident" or "shared"
-	targetSid string // for shared mode
-	dryRun    bool
+	filter *filter
+	dedup  *dedupCache
+	// pullClasses carries the cause of an image-pull failure from the event that
+	// names it to the causeless back-off event that follows. Per-cluster like
+	// dedup, so one cluster churning through pods cannot evict another's entries
+	// out of the shared bound.
+	pullClasses *pullClassMemo
+	injector    *injector
+	metrics     *metrics
+	mode        string // "per-incident" or "shared"
+	targetSid   string // for shared mode
+	dryRun      bool
 }
 
 // newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
 // injector, and metrics are shared across every cluster — they are stateless
-// or goroutine-safe — while dedup is per-cluster.
+// or goroutine-safe — while dedup and the pull-class memo are per-cluster.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
 	return &dispatcher{
-		filter:    filter,
-		dedup:     dedup,
-		injector:  inj,
-		metrics:   m,
-		mode:      f.mode,
-		targetSid: f.targetSession,
-		dryRun:    f.dryRun,
+		filter:      filter,
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
+		injector:    inj,
+		metrics:     m,
+		mode:        f.mode,
+		targetSid:   f.targetSession,
+		dryRun:      f.dryRun,
 	}
 }
 
@@ -505,7 +565,23 @@ func dedupPersistPath(base, cluster string) string {
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
-	if !d.filter.Accept(ev) {
+	// Resolved before the filter, deliberately. kubelet splits an image-pull
+	// incident across four events and only one of them names the cause; that one is
+	// reason=Failed, which the shipped default --reason list does not carry. The
+	// informer applies no reason pre-filter, so the cause-bearing event still
+	// reaches this line even when the allow-list is about to drop it — and the
+	// memo is what lets the causeless back-off that follows inherit its class and
+	// its error text. Classifying inside the filter would see only the events that
+	// got that far, and would run after the gate that needs the answer.
+	if canonicalizeReason(ev.Key.Reason, ev.Message) == "ImagePullBackOff" {
+		res := d.pullClasses.Resolve(ev.Key.UID, ev.Message)
+		ev.PullClass = res.Class
+		if res.Cause != ev.Message {
+			ev.PullCause = res.Cause
+		}
+	}
+	if gate := d.filter.Decide(ev); gate != gateAccepted {
+		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
@@ -521,6 +597,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
+			// Roll back the entry Observe just wrote. Nobody was told
+			// about this failure, so the next sighting must be free to
+			// open the incident rather than be suppressed against an
+			// alert that never went out. See dedupCache.Forget.
+			d.dedup.Forget(ev.Key, ev.Message)
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
 			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "error").Inc()
 			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "session_create").Inc()
@@ -539,6 +620,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Container:    ev.Container,
 		UID:          ev.Key.UID,
 		Message:      ev.Message,
+		PullCause:    ev.PullCause,
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
@@ -560,9 +642,28 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
-	if err := d.injector.Inject(ctx, sid, payload); err != nil {
+	status, err := d.injector.Inject(ctx, sid, payload)
+	if err != nil {
+		// Same rollback as the CreateSession path above. A session may
+		// have been created for this attempt and is now orphaned; it
+		// ages out on the daemon's own TTL, and leaving the failure
+		// permanently unreportable would be the worse trade.
+		d.dedup.Forget(ev.Key, ev.Message)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
+		return
+	}
+	if status == injectStatusSuppressed {
+		// 2xx, and nobody was told: the daemon spent the day's ceiling
+		// for this severity and dropped the alert. Rolled back for the
+		// same reason as an error — the dedup entry exists to stop a
+		// second copy of a delivered alert, and nothing was delivered.
+		// The ceiling resets at 00:00 UTC while this entry would
+		// otherwise outlive the reset by most of a day.
+		d.dedup.Forget(ev.Key, ev.Message)
+		d.metrics.eventsQuotaSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("quota-suppressed %s pod=%s/%s (sid=%s) — daemon dropped the alert, incident reopened",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
@@ -599,7 +700,11 @@ func realMain(argv []string) error {
 	}
 
 	// Build components.
-	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount)
+	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), filterThresholds{
+		unhealthyMinCount:          f.unhealthyMinCount,
+		backoffMinCount:            f.backoffMinCount,
+		imagePullTransientMinCount: f.imagePullTransientMinCount,
+	})
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()

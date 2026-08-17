@@ -1,0 +1,5 @@
+name: gkestockoutinvestigator
+version: 0.1.0
+kind: standalone
+description: GKE Stockout Investigator skills plugin
+provides_skills: [gke-stockout-investigator]

@@ -16,11 +16,17 @@ spec:
     metadata:
       labels:
         app: litellm
+      annotations:
+        # The ConfigMap's generated name hashes the *un-substituted* template, so
+        # it is identical for every provider and a model switch leaves the running
+        # pods serving the old one. Stamping the resolved provider/model here makes
+        # the pod template itself change, which is what triggers the rollout.
+        kubeagents.x-k8s.io/model-config: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
     spec:
       containers:
         - name: litellm-container
-          image: ghcr.io/berriai/litellm:v1.92.0
-          args: ["--config", "/app/config.yaml"]
+          image: ghcr.io/berriai/litellm:v1.96.2
+          args: ["--config", "/app/config.yaml", "--port", "8080"]
           resources:
             requests:
               cpu: "100m"
@@ -58,7 +64,32 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: litellm
           ports:
-            - containerPort: 4000
+            - containerPort: 8080
+          # Mirrors charts/kube-agents/templates/litellm.yaml, which carries the
+          # rationale: with no probes the Service advertises an endpoint ~50s
+          # before uvicorn binds :8080, and the agent's first task after a cold
+          # boot dies on `[Errno 111] Connection refused`.
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: config-volume
               mountPath: /app/config.yaml

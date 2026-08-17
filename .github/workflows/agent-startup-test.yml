@@ -31,7 +31,7 @@ jobs:
 
       - name: Detect changes
         id: filter
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             startup:
@@ -42,6 +42,10 @@ jobs:
               - "agents/platform/scripts/profile_scaffold.py"
               - "agents/platform/scripts/cluster_agent_profile.py"
               - "tests/test_*.py"
+              # tests/test_operator_makefile.py asserts on the recipes this
+              # Makefile prints; a Makefile-only change must run it or the
+              # deploy contract it guards can revert unnoticed.
+              - "k8s-operator/Makefile"
               - ".github/workflows/agent-startup-test.yml"
 
       - name: Set up Python

@@ -84,9 +84,7 @@ func newDedupCache(window time.Duration, persistPath string) (*dedupCache, error
 		persistPath: persistPath,
 	}
 	if persistPath != "" {
-		if err := c.restore(); err != nil {
-			return nil, fmt.Errorf("dedup: restore from %s: %w", persistPath, err)
-		}
+		c.restore()
 	}
 	return c, nil
 }
@@ -189,6 +187,39 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 	}
 }
 
+// Forget drops the entry for a key, so the next sighting of the same
+// failure is classified as a new incident rather than suppressed.
+//
+// This exists for one caller: the dispatch path, when the daemon did
+// not accept the alert the entry was created for — a failed
+// CreateSession, a non-2xx inject, or a 2xx inject the daemon reports
+// as suppressed against its daily ceiling. It is not a claim that the
+// alert reached a human; the daemon answers the inject before it posts
+// to chat, so a failure after that point is beyond what any caller here
+// can observe. Observe writes the entry before CreateSession or Inject
+// is attempted, and nothing else
+// removes entries — evictIfFull is capacity-driven and there is no
+// expiry sweep — so without this an entry created for an alert that
+// never went out stays live, and every later sighting of that failure
+// takes Case 3 and slides LastSeen forward. Case 2 is then the only
+// escape, and it needs a quiet gap longer than the whole window, which
+// a steadily-failing workload never produces. The result is a failure
+// that is silently suppressed for as long as it keeps failing.
+//
+// The cost of forgetting is that a daemon outage is retried at the
+// event's own repeat cadence rather than once, which is the intended
+// trade: an alert nobody received is not a duplicate.
+//
+// Canonicalizes the reason exactly as Observe and BindSession do, so a
+// caller can pass the wire-level reason. No-op if the entry is already
+// gone.
+func (c *dedupCache) Forget(key EventKey, message string) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
 // evictIfFull is called under lock. If the cache is at capacity,
 // evicts the LRU entry (lowest LastSeen). Bounded O(N) scan; called
 // only on new-incident cache-miss paths so amortized cost is fine.
@@ -253,20 +284,33 @@ func (c *dedupCache) Snapshot() error {
 }
 
 // restore reads persistPath (if it exists) and hydrates the cache.
-// Missing file is not an error — first-time startup has nothing to
-// restore. Called by newDedupCache during construction.
-func (c *dedupCache) restore() error {
+// Called by newDedupCache during construction.
+//
+// No read failure is fatal. A missing file is the normal first startup, and
+// anything else — EIO on a network-backed volume, a restored PVC whose
+// ownership no longer matches, a UID change on an image bump — costs at most
+// one replay of the events still inside the API server's TTL. The alternative
+// is worse: the caller treats a construction error as "this cluster will NOT
+// be watched", and because restore runs once at process start, a transient
+// read error would silently take that cluster out until someone restarts the
+// pod. Other clusters keep the process alive, so nothing would exit and no
+// supervisor alert would fire. Corrupt JSON below is tolerated for the same
+// reason; an unreadable file is not a stronger signal than an unparseable one.
+//
+// It returns nothing for that reason: there is no failure a caller could act
+// on, and an error return here previously meant dropping the cluster.
+func (c *dedupCache) restore() {
 	data, err := os.ReadFile(c.persistPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil // first startup; nothing to restore
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("dedup: read %s (starting fresh, incidents inside the dedup window may be re-reported): %v", c.persistPath, err)
 		}
-		return fmt.Errorf("dedup: read %s: %w", c.persistPath, err)
+		return
 	}
 	var snapshot map[string]dedupEntry
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		log.Printf("dedup: unmarshal snapshot (starting fresh): %v", err)
-		return nil
+		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -278,7 +322,6 @@ func (c *dedupCache) restore() error {
 		e := entry
 		c.entries[key] = &e
 	}
-	return nil
 }
 
 // serializeKey / deserializeKey encode an EventKey for use as a

@@ -79,7 +79,7 @@ artifact; **it integrates with the customer's existing CI/CD and IaC rather than
 | Agent lifecycle                | **kube-agents controller** (`k8s-operator/`, extended)                                         | reconciles each `Agent` CR (Hermes harness) into an isolated pod; sets per-pod SA / namespace / runtimeClass on **Scion**'s verified model |
 | Curated shared knowledge       | **OKF** (markdown+frontmatter in git)                                                          | ad-hoc wikis / tribal knowledge                                                                                                            |
 | Semantic recall                | **mem0** (Qdrant) — _deferred post-v1_                                                         | —                                                                                                                                          |
-| Session / runtime state        | **`session_db.sqlite` + `multiuser_memory`**                                                   | —                                                                                                                                          |
+| Session / runtime state        | **`session_db.sqlite` + `kube_agents_memory`**                                                 | —                                                                                                                                          |
 | Cross-agent coordination       | **shared state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No direct agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3)                                     |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
@@ -208,17 +208,19 @@ polling to notice things. Proactivity is driven, in order of preference:
    bounds worst-case detection latency. It is the last resort, not the primary mechanism, because a poll
    lags a fast-moving problem and burns cycles when nothing changed.
 
-The Platform Agent already ships **10 governance jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs
-in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
-migrate to event triggers rather than new poll loops:
+The harness ships a roster of governance jobs mapped to SOPs in `agents/platform/governance/` — the
+watchdog triggers live in the Platform Agent's own cron store (`agents/platform/cron/jobs.json`), which
+is advanced by the `profile-cron-tick` job on the Chat Agent's roster (`agents/chat/defaults/cron/jobs.json`),
+the only profile whose gateway ticks; these are the cron (scheduled-push) tier, and
+reactive concerns should migrate to event triggers rather than new poll loops. The current roster and
+its cadences are generated onto
+[the cron-jobs reference page](../site/src/content/docs/reference/cron-jobs.md) —
+restating them here is how the count goes stale, which it had (this section claimed eleven jobs against
+a file holding seven).
 
-| Cadence      | Jobs (examples)                                                         |
-| ------------ | ----------------------------------------------------------------------- |
-| Hourly       | Policy propagation, global capacity orchestration                       |
-| Every 30 min | GitHub issue resolver                                                   |
-| Daily        | Blueprint sync, cost analysis, security patch scan, obtainability audit |
-| Weekly       | Compliance audit, standardization validator                             |
-| Monthly      | Lifecycle / deprecation manager                                         |
+Target cadence tiers, which the roster is expected to fill out: hourly for policy propagation and global
+capacity orchestration, every 30 minutes for issue triage, daily for the compliance and security audits,
+weekly for cost and consistency sweeps, and monthly for lifecycle/deprecation.
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the
@@ -240,7 +242,7 @@ subsets:
 
 | Tier                           | Proactive jobs (scoped to its authority; event-triggered, cron, or heartbeat-swept)                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                             | —                                                                                                                             |
+| **Platform** (fleet)           | Every governance job above                                                                                                                                                                               | —                                                                                                                             |
 | **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); deploy/drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
 | **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                              | Everything cluster- and fleet-level                                                                                           |
 

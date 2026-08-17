@@ -136,11 +136,46 @@ spec:
             cidr: 169.254.20.10/32
         - ipBlock:
             cidr: 169.254.169.254/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The two peers
+        # below cover both shapes: the literal handles the classic service
+        # range, and the excepted block handles any VIP outside private space
+        # (34.118.224.0/20 today, whatever GKE allocates next).
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
       ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
+    # Allow GCP Workload Identity / Metadata Server.
+    # The minter dials 169.254.169.254:80, but the node DNATs that to the metadata
+    # daemon on port 988 before NetworkPolicy is evaluated: 169.254.169.252 on the
+    # iptables datapath, the hosting node's internal IP on Dataplane V2. Permitting
+    # only the link-local address drops every token fetch. On Dataplane V2, add one
+    # /32 per node to the port-988 rule.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 988
     # Allow HTTPS outbound connection to GitHub and KMS APIs
     - to:
         - ipBlock:

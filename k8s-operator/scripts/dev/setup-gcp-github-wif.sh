@@ -1,26 +1,45 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# 1. Check for required environment variables
+POOL_NAME="github-pool"
+PROVIDER_NAME="github-deploy-provider"
+
+# 1. Parse optional CLI flags and environment variables
+IS_ADMIN="${ADMIN:-false}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --admin)
+      IS_ADMIN=true
+      shift
+      ;;
+    -*)
+      echo "Error: Unknown option '$1'." >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: Unexpected argument '$1'." >&2
+      exit 1
+      ;;
+  esac
+done
+
+# 2. Check for required environment variables
 MISSING_VAR=false
-if [ -z "$PROJECT_ID" ]; then
-  PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
+if [ -z "${PROJECT_ID:-}" ]; then
+  PROJECT_ID=$(gcloud config get-value project 2>/dev/null || echo "")
   if [ -z "$PROJECT_ID" ]; then
     echo "Error: PROJECT_ID environment variable is not set and no default project found in gcloud config."
     MISSING_VAR=true
   fi
 fi
-if [ -z "$SA_NAME" ]; then
+if [ -z "${SA_NAME:-}" ]; then
   echo "Error: SA_NAME environment variable is not set."
   MISSING_VAR=true
 fi
-if [ -z "$GITHUB_REPO" ]; then
+if [ -z "${GITHUB_REPO:-}" ]; then
   echo "Error: GITHUB_REPO environment variable is not set."
   MISSING_VAR=true
 fi
-
-POOL_NAME="github-pool"
-PROVIDER_NAME="github-deploy-provider"
 
 if [ "$MISSING_VAR" = true ]; then
   echo ""
@@ -28,14 +47,20 @@ if [ "$MISSING_VAR" = true ]; then
   echo 'export PROJECT_ID="your-gcp-project-id"'
   echo 'export SA_NAME="github-actions-sa"'
   echo 'export GITHUB_REPO="your-github-username/your-repo-name"'
+  echo 'Optionally pass --admin to grant full autonomous E2E lifecycle roles.'
   exit 1
 fi
 
-# 2. Prompt user for confirmation
+# 3. Prompt user for confirmation
 echo "The script will perform the setup for GitHub Actions WIF in the following project: $PROJECT_ID"
+if [ "$IS_ADMIN" = true ]; then
+  echo "Mode: ADMIN (Includes extended IAM roles for teardown.sh + provision.sh cycles)"
+else
+  echo "Mode: STANDARD (Base roles only. Use --admin for autonomous E2E pipeline support)"
+fi
 echo ""
 
-read -p "Do you want to proceed? (y/N): " confirm
+read -r -p "Do you want to proceed? (y/N): " confirm || confirm="n"
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
   echo "Setup aborted by user."
   exit 1
@@ -44,14 +69,13 @@ fi
 echo ""
 echo "Starting GCP Setup..."
 
-
-
 # Enable necessary services (optional but helpful)
 echo "Ensuring required APIs are enabled..."
 gcloud services enable iamcredentials.googleapis.com \
   cloudresourcemanager.googleapis.com \
   container.googleapis.com \
   storage.googleapis.com \
+  pubsub.googleapis.com \
   --project="${PROJECT_ID}"
 
 # 3. Create Service Account
@@ -62,7 +86,30 @@ gcloud iam service-accounts create "${SA_NAME}" \
 
 # 4. Grant necessary permissions
 echo "Granting necessary roles to the Service Account..."
-for role in roles/cloudkms.admin roles/container.admin roles/serviceusage.serviceUsageAdmin roles/serviceusage.serviceUsageConsumer; do
+# Base roles required for standard CI deployments:
+ROLES=(
+  "roles/cloudkms.admin"
+  "roles/container.admin"
+  "roles/serviceusage.serviceUsageAdmin"
+  "roles/serviceusage.serviceUsageConsumer"
+)
+
+# Extended roles required for full autonomous E2E lifecycle (teardown.sh + provision.sh):
+if [ "$IS_ADMIN" = true ]; then
+  echo "Admin mode selected. Adding extended lifecycle administration roles..."
+  ROLES+=(
+    # Required by provision_04_gcp_iam.sh & teardown_04_gcp_iam.sh to create and manage Service Accounts
+    "roles/iam.serviceAccountAdmin"
+
+    # Required by provision_04_gcp_iam.sh & teardown_04_gcp_iam.sh to bind/unbind IAM policies on GCP resources
+    "roles/resourcemanager.projectIamAdmin"
+
+    # Required by provision_05_gcp_gchat.sh & teardown_05 for Google Chat Pub/Sub topic and subscription management
+    "roles/pubsub.admin"
+  )
+fi
+
+for role in "${ROLES[@]}"; do
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="$role" >/dev/null

@@ -21,8 +21,8 @@ init_var "SLACK_ENABLED" "false" "Enable Slack integration? (true/false)"
 
 if ! is_truthy "${SLACK_ENABLED}"; then
   print_info "Slack integration is disabled. Skipping Slack token setup."
-  save_var "SLACK_BOT_TOKEN" ""
-  save_var "SLACK_APP_TOKEN" ""
+  save_secret_var "SLACK_BOT_TOKEN" ""
+  save_secret_var "SLACK_APP_TOKEN" ""
   save_var "SLACK_ALLOWED_USERS" ""
   save_var "SLACK_HOME_CHANNEL" ""
   save_var "SLACK_HOME_CHANNEL_NAME" ""
@@ -58,7 +58,9 @@ loop_add_tokens() {
 }
 
 # --- SLACK_BOT_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+# Never prompt when the caller already supplied the configuration (install.sh
+# sets NO_CONFIRM=1); keep whatever it passed, empty or not.
+if is_non_interactive; then
   export SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
 else
   if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
@@ -92,10 +94,10 @@ fi
 if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
   print_warning "SLACK_BOT_TOKEN is empty. Slack integration may not work properly until provided."
 fi
-save_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
+save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
 
 # --- SLACK_APP_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+if is_non_interactive; then
   export SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 else
   if [ -n "${SLACK_APP_TOKEN:-}" ]; then
@@ -121,7 +123,7 @@ fi
 if [ -z "${SLACK_APP_TOKEN:-}" ]; then
   print_warning "SLACK_APP_TOKEN is empty. Slack integration may not work properly until provided."
 fi
-save_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
+save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
 
 init_var "SLACK_ALLOWED_USERS" "" "Enter Allowed Slack User IDs (comma separated). Leaving empty allows all users."
 

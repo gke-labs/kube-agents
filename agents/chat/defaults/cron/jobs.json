@@ -1,6 +1,20 @@
 {
   "jobs": [
     {
+      "id": "profile-cron-tick",
+      "name": "Named-Profile Cron Ticker",
+      "schedule": {
+        "kind": "cron",
+        "expr": "* * * * *",
+        "display": "* * * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "profile_cron_tick.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
       "id": "cluster-agent-reconcile",
       "name": "Cluster Agent Reconcile",
       "schedule": {
@@ -18,14 +32,13 @@
       "id": "bootstrap-inventory-scan",
       "name": "First-Time Environment Discovery & Inventory Scan",
       "schedule": {
-        "kind": "interval",
-        "minutes": 1,
-        "display": "every 1m"
+        "kind": "cron",
+        "expr": "* * * * *",
+        "display": "* * * * *"
       },
       "prompt": "",
       "no_agent": true,
       "script": "bootstrap_scan_gate.py",
-      "skills": [],
       "enabled": true,
       "deliver": "local"
     },
@@ -33,14 +46,13 @@
       "id": "bootstrap-inventory-delivery",
       "name": "First-Time Onboarding Inventory Chat Delivery",
       "schedule": {
-        "kind": "interval",
-        "minutes": 1,
-        "display": "every 1m"
+        "kind": "cron",
+        "expr": "* * * * *",
+        "display": "* * * * *"
       },
       "prompt": "",
       "no_agent": true,
       "script": "bootstrap_delivery.py",
-      "skills": [],
       "enabled": true,
       "deliver": "local"
     }

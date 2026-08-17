@@ -219,32 +219,46 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 }
 
 func TestResolveResources(t *testing.T) {
-	// 1. Default resources
+	// 1. Default resources — sized for kanban fan-out (see resolveResources).
 	defaults := resolveResources(nil)
+	cpuReq := defaults.Requests[corev1.ResourceCPU]
+	memReq := defaults.Requests[corev1.ResourceMemory]
+	if cpuReq.Cmp(resource.MustParse("1")) != 0 || memReq.Cmp(resource.MustParse("2Gi")) != 0 {
+		t.Errorf("unexpected default requests: %v", defaults.Requests)
+	}
 	cpuLim := defaults.Limits[corev1.ResourceCPU]
 	memLim := defaults.Limits[corev1.ResourceMemory]
-	if cpuLim.Cmp(resource.MustParse("2")) != 0 || memLim.Cmp(resource.MustParse("4Gi")) != 0 {
-		t.Errorf("unexpected default resources: %v", defaults)
+	if cpuLim.Cmp(resource.MustParse("3")) != 0 || memLim.Cmp(resource.MustParse("8Gi")) != 0 {
+		t.Errorf("unexpected default limits: %v", defaults.Limits)
 	}
 
-	// 2. Custom resources override
+	// A CPU limit above what a node can actually hand out is not headroom, it
+	// is a number that reads like headroom. The reference gVisor pool
+	// (e2-standard-4) advertises 3920m allocatable, so anything at or above 4
+	// cores is unreachable in the deployment this default is tuned for.
+	if cpuLim.MilliValue() > 3920 {
+		t.Errorf("default CPU limit %s exceeds the 3920m allocatable on the reference node pool", cpuLim.String())
+	}
+
+	// 2. Custom resources override. Deliberately not the defaults, so this
+	// still fails if the override path is dropped and defaults are returned.
 	customDep := &agentv1alpha1.DeploymentSpec{
 		Resources: &corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("1"),
+				corev1.ResourceCPU:    resource.MustParse("250m"),
 				corev1.ResourceMemory: resource.MustParse("3Gi"),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("4"),
-				corev1.ResourceMemory: resource.MustParse("8Gi"),
+				corev1.ResourceCPU:    resource.MustParse("1500m"),
+				corev1.ResourceMemory: resource.MustParse("6Gi"),
 			},
 		},
 	}
 	res := resolveResources(customDep)
 	resCpuReq := res.Requests[corev1.ResourceCPU]
 	resCpuLim := res.Limits[corev1.ResourceCPU]
-	if resCpuReq.String() != "1" || resCpuLim.String() != "4" {
-		t.Errorf("expected custom resources 1 CPU / 4 CPU limit, got %v", res)
+	if resCpuReq.String() != "250m" || resCpuLim.String() != "1500m" {
+		t.Errorf("expected custom resources 250m request / 1500m limit, got %v", res)
 	}
 }
 
@@ -368,7 +382,7 @@ func TestWithCommonLabels(t *testing.T) {
 }
 
 // TestVersionedDefaultImage pins the wiring that lets a release build change the
-// default agent image tag via -ldflags "-X ...DefaultPlatformAgentVersion=vX.Y.Z":
+// default agent image tag via -ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z":
 // overriding the variable must flow through defaultPlatformAgentImage() and the
 // credential-proxy sidecar derivation. Overriding (rather than asserting against
 // the current value) is what makes the test non-tautological — a hardcoded
@@ -378,17 +392,17 @@ func TestVersionedDefaultImage(t *testing.T) {
 	t.Setenv(credentialProxyImageEnvVar, "")
 
 	orig := DefaultPlatformAgentVersion
-	DefaultPlatformAgentVersion = "v9.9.9-test"
+	DefaultPlatformAgentVersion = "9.9.9-test"
 	t.Cleanup(func() { DefaultPlatformAgentVersion = orig })
 
-	want := "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9-test"
+	want := "ghcr.io/gke-labs/kube-agents/platform-agent:9.9.9-test"
 	if got := defaultPlatformAgentImage(); got != want {
 		t.Errorf("defaultPlatformAgentImage() = %q, want %q — the injected version must flow through at call time", got, want)
 	}
 
 	// The credential-proxy sidecar must carry the same tag as the defaulted
 	// agent image, so a versioned release rolls both together.
-	wantSidecar := "ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9-test"
+	wantSidecar := "ghcr.io/gke-labs/kube-agents/credential-proxy:9.9.9-test"
 	if got := resolveCredentialProxyImage(nil); got != wantSidecar {
 		t.Errorf("resolveCredentialProxyImage(nil) = %q, want %q", got, wantSidecar)
 	}

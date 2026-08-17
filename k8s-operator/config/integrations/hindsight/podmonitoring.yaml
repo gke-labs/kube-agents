@@ -1,0 +1,25 @@
+# Scraped by GKE Managed Prometheus, the same way the LiteLLM gateway is.
+#
+# The API serves Prometheus text on its ordinary HTTP port — there is no
+# separate metrics listener — so the selector has to pin the `api` component.
+# The Postgres StatefulSet exports nothing (the `ankane/pgvector` image ships no
+# exporter) and would be scraped for 404s if the selector matched it too.
+#
+# The metric worth watching is `hindsight_operation_duration_seconds`: recall is
+# dominated by the cross-encoder reranker and that histogram is the only view of
+# it that does not require reading pod logs (see docs/designs/memory.md, "What a
+# recall costs"). `hindsight_llm_calls_total` and `hindsight_llm_tokens_*` cover
+# extraction and consolidation, which bill through LiteLLM.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: hindsight-monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -99,14 +100,59 @@ class OverlayTemplateTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ps.overlay_template(self.home, self.template.parent / "absent", None, ITEMS)
 
+    def plugins_dir(self):
+        plugins = Path(self.temp_dir.name) / "plugins"
+        write(plugins / "hermes_otel" / "hooks.py", "image hook")
+        return plugins
+
+    def test_plugins_are_overlaid_and_plugin_runtime_state_survives(self):
+        # The entrypoint passes --plugins on the force-sync path too, not only
+        # on first scaffold, so an added or repaired plugin reaches a profile
+        # that already exists. That is safe only because this copy adds and
+        # overwrites without pruning: hermes_otel writes its event database
+        # inside its own plugin directory, and the image ships no such file.
+        write(self.home / "plugins" / "hermes_otel" / "live.db", "1028 events")
+        ps.overlay_template(self.home, self.template, self.plugins_dir(), ITEMS)
+        self.assertEqual("image hook", (self.home / "plugins" / "hermes_otel" / "hooks.py").read_text())
+        self.assertEqual("1028 events", (self.home / "plugins" / "hermes_otel" / "live.db").read_text())
+
+    def test_a_failed_plugin_copy_warns_and_leaves_the_rest_of_the_overlay_standing(self):
+        # Two containers of the same pod ran this concurrently against one RWO
+        # volume and both aborted here with shutil.Error, each naming different
+        # files. The entrypoint serialises them now, but the persona, config,
+        # skills, cron and governance above have already landed by this point,
+        # and raising made the caller report the whole scaffold as failed.
+        plugins = self.plugins_dir()
+        real_copytree = shutil.copytree
+
+        # `*args` because copytree recurses through the module global, which is
+        # the name being patched — the inner calls arrive fully positional.
+        def explode_only_on_plugins(src, dst, *args, **kwargs):
+            if Path(src) == plugins:
+                raise shutil.Error([(str(src), str(dst), "[Errno 2] No such file or directory")])
+            return real_copytree(src, dst, *args, **kwargs)
+
+        stderr = io.StringIO()
+        with unittest.mock.patch.object(ps.shutil, "copytree", explode_only_on_plugins):
+            with redirect_stderr(stderr):
+                ps.overlay_template(self.home, self.template, plugins, ITEMS)
+
+        self.assertIn("WARN", stderr.getvalue())
+        self.assertIn("plugins", stderr.getvalue())
+        self.assertEqual("image persona", (self.home / "SOUL.md").read_text())
+        self.assertEqual("image skill", (self.home / "skills" / "fleet-audit" / "SKILL.md").read_text())
+        self.assertEqual(["audit"], [j["id"] for j in self.jobs_on_disk()])
+
 
 class CronStoreMergeTest(unittest.TestCase):
     """cron/jobs.json is image-owned configuration and runtime state at once.
 
-    A plain copytree took both. Every restart wiped each job's run history, so a
-    daily audit that had already fired at 06:20 fired again after a rollout, and
-    a job the operator had added to the store simply disappeared. These pin the
-    per-key rule the merge replaced it with.
+    A plain copytree took both, on every restart: a job the operator had added
+    to the store simply disappeared, and each job's run history went with it.
+    Losing `last_run_at` re-fires a one-shot — that field is its already-ran
+    guard — while a recurring job fails the other way, its wiped `next_run_at`
+    recomputed from now so a merely-late audit is skipped rather than caught
+    up. These pin the per-key rule the merge replaced it with.
     """
 
     def setUp(self):
@@ -152,8 +198,11 @@ class CronStoreMergeTest(unittest.TestCase):
         # here can tell an operator's own job from one this release deleted,
         # and the overlay does not prune. Removing an entry from the shipped
         # jobs.json therefore does not stop it firing on a cluster that already
-        # has it. Shipping it with `enabled: false` does — which is why the
-        # five retired watchdogs are still listed in agents/platform/cron/.
+        # has it. Shipping it with `enabled: false` does, so retiring a
+        # watchdog takes two steps: ship it disabled, let every live cluster
+        # merge that state, and only then drop the entry — from that point the
+        # volume's own copy keeps it off with no help from the image. That is
+        # the path the five retired watchdogs took out of agents/platform/cron/.
         merged = self.overlay([job("audit")], [job("audit"), job("withdrawn")])
         self.assertEqual(["audit", "withdrawn"], [j["id"] for j in merged])
 
@@ -186,6 +235,51 @@ class CronStoreMergeTest(unittest.TestCase):
         store = json.loads((self.home / "cron" / "jobs.json").read_text())
         self.assertEqual(2, store["version"])
         self.assertEqual({"tick": 9}, store["scheduler_state"])
+
+    def test_a_named_id_list_leaves_every_other_shipped_job_to_the_volume(self):
+        # What the default profile's merge needs. Two jobs on that roster
+        # remove themselves once first-run onboarding is delivered
+        # (`bootstrap_delivery.py` calls `remove_job`), so an unfiltered merge
+        # would put them back on the next restart — polling every minute
+        # forever to no-op on a marker. Only the named id is forced.
+        write(
+            self.template / "cron" / "jobs.json",
+            json.dumps({"jobs": [job("profile-cron-tick"), job("bootstrap-inventory-scan")]}),
+        )
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("reconcile")]}))
+        ps.overlay_template(self.home, self.template, None, ("cron",), ("profile-cron-tick",))
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(["profile-cron-tick", "reconcile"], [j["id"] for j in merged])
+
+    def test_a_named_id_still_takes_the_image_definition_and_keeps_its_state(self):
+        write(
+            self.template / "cron" / "jobs.json",
+            json.dumps({"jobs": [job("profile-cron-tick", prompt="new")]}),
+        )
+        write(
+            self.home / "cron" / "jobs.json",
+            json.dumps(
+                {"jobs": [job("profile-cron-tick", prompt="old", last_run="2026-08-05T00:00:00Z")]}
+            ),
+        )
+        ps.overlay_template(self.home, self.template, None, ("cron",), ("profile-cron-tick",))
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual("new", merged[0]["prompt"])
+        self.assertEqual("2026-08-05T00:00:00Z", merged[0]["last_run"])
+
+    def test_an_empty_id_list_forces_nothing(self):
+        # `--cron-jobs ""` reaches overlay_template as None, not (), so the
+        # empty tuple can only come from a caller that means it: force no job.
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("only-here")]}))
+        ps.overlay_template(self.home, self.template, None, ("cron",), ())
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(["only-here"], [j["id"] for j in merged])
+
+    def test_no_id_list_merges_the_whole_shipped_roster(self):
+        # The platform profile's path, unchanged: it passes no filter.
+        merged = self.overlay([job("audit"), job("drift")], [job("audit")])
+        self.assertEqual(["audit", "drift"], [j["id"] for j in merged])
 
     def test_the_merge_is_skipped_when_cron_is_not_being_overlaid(self):
         # `--items` without `cron` means the caller is not touching the cron

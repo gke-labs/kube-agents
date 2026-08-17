@@ -30,8 +30,8 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 init_var_model_provider
 
 
@@ -56,6 +56,11 @@ verify_litellm() {
 execute_litellm() {
   print_info "Deploying LiteLLM Gateway into GKE..."
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
+  # Only the vertex_ai overlay reads these; exporting them unconditionally keeps
+  # the make target's substitution list a single, stable set.
+  export PROJECT_ID LITELLM_KSA_NAME LITELLM_GSA_NAME
+  export VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-$PROJECT_ID}"
+  export VERTEX_LOCATION="${VERTEX_LOCATION:-$REGION}"
   make -C "${OPERATOR_DIR}" deploy-litellm || return 1
 }
 

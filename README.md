@@ -14,17 +14,43 @@
 
 📗 **Full documentation: [gke-labs.github.io/kube-agents](https://gke-labs.github.io/kube-agents/)**
 
+[![An SRE types "@kube-agents run a full self-health check across the fleet" into a Google Chat room. The agent replies in a thread and streams its report back section by section: fleet and cluster state, agent and sidecar health, the active cron audit schedule, and a closing summary of warnings and failures.](.github/assets/chat-demo.webp)](https://gke-labs.github.io/kube-agents/)
+
+_An SRE asks for a fleet self-health check; the agent answers in the thread. An illustrative replay — the names and figures are examples. It runs live at the top of the [documentation site](https://gke-labs.github.io/kube-agents/)._
+
 ---
 
 ## ⚡ Try it now
 
-The fastest way in: clone this repository into your agent harness's workspace and delegate the setup itself to an agent:
+The fastest, zero-friction way to install `kube-agents` in **Google Cloud Shell** or your terminal:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
+```
+
+_(Or via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+
+This interactive installer guides you through GCP authentication, project selection, GKE Standard cluster setup, chat integrations (Google Chat & Slack), and LLM model provider credentials.
+
+### 🤖 AI Agent & Automation Usage
+
+AI Agents and CI/CD pipelines can invoke `install.sh` non-interactively using CLI flags or `--dry-run` inspection:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+  --non-interactive \
+  --project-id="my-gcp-project" \
+  --cluster-name="platform-agent" \
+  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
+  --model-provider="gemini" \
+  --permission-set="read-only"
+```
+
+Or delegate setup directly to your AI coding agent:
 
 ```text
 "Using kube-agents/INSTALL.md provision k8s agentic harness and create platform agent"
 ```
-
-[INSTALL.md](INSTALL.md) is written so that an AI agent with file access and shell tools can follow it end-to-end — and the same guide works step-by-step for humans.
 
 Prefer the scripted path? From an authenticated `gcloud`:
 
@@ -44,7 +70,7 @@ The harness runs co-located agents in a single operator-deployed pod: the **Chat
 - 🧬 **A persona** — [`agents/platform/SOUL.md`](agents/platform/SOUL.md) defines its identity, its _Automation First_ rule (no manual cluster mutations; changes flow through declarative, PR-based workflows), and its _Least Privilege_ constraint.
 - 📚 **Governance playbooks** — SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, and lifecycle management.
 - 🛠️ **Skills** — task-focused `SKILL.md` bundles under [`agents/platform/skills/`](agents/platform/skills/): cluster creation, app onboarding, cost analysis, backup & DR, and manifest generation. Single-cluster runtime skills — workload troubleshooting, observability, autoscaling, storage — belong to the Cluster Agent in [`agents/cluster/skills/`](agents/cluster/skills/). See the [skill catalog](https://gke-labs.github.io/kube-agents/skills/).
-- ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/platform/cron/jobs.json`](agents/platform/cron/jobs.json) that keep the fleet honest without human prompting. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
+- ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/platform/cron/jobs.json`](agents/platform/cron/jobs.json) that keep the fleet honest without human prompting. Ticking belongs to the Chat Agent's gateway, the only running one, so a job on its roster advances the Platform Agent's schedule once a minute. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
 
 The runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
 
@@ -56,6 +82,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 
 - **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
 - **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
+- **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
 - **Kernel-level sandboxing** — agent workloads can run under a gVisor RuntimeClass (GKE Sandbox).
 - **GitOps-only mutations** — infrastructure changes are proposed as pull requests for human review.
 
@@ -88,7 +115,7 @@ flowchart TB
     end
 
     subgraph integration["🔀 Integration & Routing Layer"]
-        LLM["LiteLLM Gateway<br/>Gemini · OpenAI · Anthropic"]
+        LLM["LiteLLM Gateway<br/>Gemini · Vertex AI · OpenAI · Anthropic"]
         CHAT["Messaging bridges<br/>Google Chat (Pub/Sub) · Slack (Socket Mode)"]
         GH["Minty — GitHub App<br/>token minter (KMS)"]
     end

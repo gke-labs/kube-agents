@@ -27,7 +27,8 @@ value is only touched if it still equals what we wrote, so an operator, a human,
 later image, or another startup step that has since changed it wins.
 
 Usage:
-    profile_overlay.py --profile-dir DIR [--overlay FILE ...] [--overlay-dir DIR]
+    profile_overlay.py --profile-dir DIR [--profile-name NAME]
+                       [--overlay FILE ...] [--overlay-dir DIR]
 
 Omitting both (or naming files that do not exist) unapplies the previous overlay and
 writes nothing new, which is what "the overlay was removed" has to mean.
@@ -64,8 +65,20 @@ CLUSTER_CLASS_OVERLAY = "profileclass-cluster" + OVERLAY_SUFFIX
 DEFAULT_OVERLAY_DIR = "/opt/agent-config"
 
 
+# The front door. It has no directory under $HERMES_HOME/profiles — its home IS
+# $HERMES_HOME — so the entrypoint passes it by --profile-name rather than letting the
+# name be read off the directory (which would be "data").
+DEFAULT_PROFILE_NAME = "default"
+
+
 def valid_profile_name(name: str) -> bool:
-    return bool(name) and name != "default" and PROFILE_NAME_RE.fullmatch(name) is not None
+    """True for a NAMED profile, i.e. one with a directory under profiles/.
+
+    "default" is deliberately excluded: nothing may scaffold profiles/default, and an
+    AgentPlugin naming it is rejected at admission. The front door is reached through
+    --profile-name instead, which accepts it by name and nothing else.
+    """
+    return bool(name) and name != DEFAULT_PROFILE_NAME and PROFILE_NAME_RE.fullmatch(name) is not None
 
 
 def overlays_for(name: str, overlay_dir) -> list[pathlib.Path]:
@@ -297,6 +310,10 @@ def sync_profile(profile_dir, overlay_dir=DEFAULT_OVERLAY_DIR) -> str:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile-dir", required=True)
+    ap.add_argument("--profile-name", default=None,
+                    help="Profile the directory belongs to, when it cannot be read off "
+                         f"the directory name. Only {DEFAULT_PROFILE_NAME!r} needs this: "
+                         "its home is $HERMES_HOME itself.")
     ap.add_argument("--overlay", action="append", default=None,
                     help="Overlay file to merge. Repeatable; later files win.")
     ap.add_argument("--overlay-dir", default=None,
@@ -307,8 +324,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     profile_dir = pathlib.Path(args.profile_dir)
-    name = profile_dir.name
-    if not valid_profile_name(name):
+    name = args.profile_name or profile_dir.name
+    if name != DEFAULT_PROFILE_NAME and not valid_profile_name(name):
         print(f"refusing to touch profile directory {name!r}: not a valid profile name", file=sys.stderr)
         return 2
 

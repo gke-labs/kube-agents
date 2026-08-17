@@ -26,10 +26,17 @@ Every install path sets `name`, `instance`, `part-of`, and `managed-by`:
 | LiteLLM integration                                     | `litellm`                                           | `litellm`                     | `kube-agents` | `kustomize`                |
 | GitHub token minter                                     | `github-token-minter`                               | `github-token-minter`         | `kube-agents` | `kustomize`                |
 | Inference replay                                        | `inference-replay`                                  | `inference-replay`            | `kube-agents` | `kustomize`                |
+| Hindsight memory store                                  | `hindsight`                                         | `hindsight`                   | `kube-agents` | `kustomize`                |
 | Provisioned Secrets (`provision_07_gcp_k8s_secrets.sh`) | `platform-agent`                                    | `${NAMESPACE}-platform-agent` | `kube-agents` | `provisioner`              |
 
-`component` is set by nothing: the object's own `name` already says what it is, and a second
-key that has to stay consistent with the first is a key that eventually disagrees with it.
+`component` is set by one source only, Hindsight, and everywhere else by nothing: the object's own
+`name` already says what it is, and a second key that has to stay consistent with the first is a key
+that eventually disagrees with it. Hindsight is the exception because it is one integration with two
+unrelated workloads — an API server and its Postgres database — so `name` alone cannot tell them
+apart. Its objects carry `app.kubernetes.io/component: api` or `postgresql`, and those values are
+load-bearing rather than decorative: the Deployment and StatefulSet selectors, the `NetworkPolicy`
+that lets only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
+database are all built from them. Do not add `component` anywhere else on the strength of this.
 
 `version` is set only by the Helm chart, which fills it from `Chart.AppVersion` — a chart release
 is pinned to exactly one application release, so there is a correct value to write. See
@@ -65,7 +72,7 @@ kustomization sets the four keys itself.
 
 ## Upgrade notes
 
-Two constraints shape how the labels are applied, and both matter when upgrading an existing
+Three constraints shape how the labels are applied, and all three matter when upgrading an existing
 install:
 
 - **Selectors are never touched.** Deployment and StatefulSet `spec.selector` is immutable, so
@@ -75,11 +82,23 @@ install:
   selector.
 - **Pod templates do get the labels**, which changes the pod template hash and therefore causes
   **one rollout** of the agent Deployment the first time you upgrade to a version that includes
-  them. This is expected and happens once.
+  them. This is expected and happens once. The same applies to an existing Hindsight install, where
+  it restarts both the API and the Postgres pod — the database lives on
+  `data-hindsight-postgresql-0`, which the restart does not touch, so no memories are lost, but
+  memory is briefly unavailable while Postgres and the API's models reload.
+- **`volumeClaimTemplates` are never touched either**, and this one is a trap rather than a choice.
+  Kustomize's `includeTemplates: true` does not label only pod templates: on a StatefulSet it also
+  labels `spec.volumeClaimTemplates[].metadata`, which is among the fields the API server refuses
+  to update after creation. The object is then rejected whole, with
+  `updates to statefulset spec for fields other than 'replicas' ... are forbidden`. A fresh install
+  accepts it and only upgrades break, so it is invisible until someone has one. The Hindsight
+  kustomization — the only one here with a StatefulSet — therefore sets `includeTemplates: false`
+  and patches the two pod templates directly instead.
 
 PersistentVolumeClaims are created once and never updated by the controller, so claims that
 existed before the upgrade stay unlabelled until they are recreated. They will not appear in the
-`-l app.kubernetes.io/part-of=kube-agents` query above.
+`-l app.kubernetes.io/part-of=kube-agents` query above. The constraint above means Hindsight's
+claim stays unlabelled permanently, not just until recreation.
 
 ## Query recipes
 
@@ -101,7 +120,7 @@ Just the integrations:
 
 ```bash
 kubectl get all -A \
-  -l 'app.kubernetes.io/part-of=kube-agents,app.kubernetes.io/name in (litellm,github-token-minter,inference-replay)'
+  -l 'app.kubernetes.io/part-of=kube-agents,app.kubernetes.io/name in (litellm,github-token-minter,inference-replay,hindsight)'
 ```
 
 Cluster-scoped RBAC the project owns — the objects most easily orphaned, since a namespaced

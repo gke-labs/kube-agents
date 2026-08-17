@@ -1,0 +1,31 @@
+# The database takes no password (see postgresql.yaml), so this is what keeps it
+# private: only the Hindsight API pod may open a connection to it. Ingress only —
+# Postgres makes no outbound calls, and restricting egress it does not use would
+# buy nothing while adding DNS rules to keep correct.
+#
+# GKE enforces this only on clusters with network policy enabled. Where it is
+# not, the object applies cleanly and does nothing, which is why the database is
+# also on a ClusterIP service with no external route.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hindsight-postgresql
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: postgresql
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hindsight
+              app.kubernetes.io/component: api
+      ports:
+        - port: 5432
+          protocol: TCP

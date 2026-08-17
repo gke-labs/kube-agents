@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review.
+description: Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -13,7 +13,32 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 - **Configuration Upgrades:** Triggered when upgrading version configurations, security patches, or network policies.
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
 
-_Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through this secure PR suggestion skill._
+_Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through a secure PR path — this skill, or the **fleet-audit** skill for fixes of its findings (below)._
+
+## When NOT to Use
+
+- **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
+  security patch, a policy update — which is exactly why this warning exists. If
+  the change addresses a fleet-audit finding (it carries a finding id, or an
+  `[audit]` ledger issue lists that exact deviation as a finding), the
+  **fleet-audit** skill opens that pull request itself, through its `remediate`
+  subcommand — see `skills/fleet-audit/SKILL.md` for the invocation. That path
+  keys the branch on the files the fix touches, so a rerun cannot open a
+  duplicate: a live PR is left untouched rather than force-pushed over, and one
+  the harness withdrew as stale is re-proposed on the same branch. It applies
+  the audit labels, links the ledger, and closes the PR when the finding stops
+  reproducing. A PR opened through _this_ skill gets none of that — nothing
+  dedupes it and nothing ever closes it, which is how one workload's findings
+  once became five near-duplicate PRs.
+
+  Two cautions when you take that path. `remediate` consumes the findings
+  document the audit run wrote (`start` prints its path); if it no longer
+  exists, stop and say the fix should be requested as `/remediate <finding-id>`
+  on the ledger — do **not** run `start` yourself to mint a fresh document (it
+  scrubs that stream's workspace, possibly under a scheduled run), and never
+  hand-write one. And a change a user asked for on its own terms is not an
+  audit fix, even when the same file appears in a ledger — this section is
+  about fixes _of findings_, not about files findings happen to mention.
 
 ## Execution Instructions
 

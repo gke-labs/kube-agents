@@ -45,7 +45,7 @@ def main() -> int:
 
     import tools.cronjob_tools as ct
     import tools.kanban_tools as kt
-    from tools.cron_run_scope import cron_run_scope
+    from tools.cron_run_scope import cron_run_scope, current_cron_job
 
     # --- outside a cron run: the worker keeps its ambient card --------------
     check("worker default task", kt._default_task_id(None), CALLER_CARD)
@@ -55,6 +55,20 @@ def main() -> int:
         bool(kt._enforce_worker_task_ownership("t_other")),
         True,
     )
+
+    # --- upstream's delegate_task guard must survive the patch --------------
+    # v2026.8.3 added an _is_delegated_child_context() early return to
+    # _default_task_id. The patch rewrites that whole function, so the guard can
+    # be dropped on a base-image bump without any anchor failing — an earlier
+    # revision of the patch did exactly that. Assert the behaviour, not the line.
+    _real_delegated = kt._is_delegated_child_context
+    kt._is_delegated_child_context = lambda: True
+    try:
+        check("delegated child has no ambient card", kt._default_task_id(None), None)
+        check("delegated child may still name a task", kt._default_task_id("t_x"), "t_x")
+    finally:
+        kt._is_delegated_child_context = _real_delegated
+    check("ambient card back after delegation", kt._default_task_id(None), CALLER_CARD)
 
     # --- inside a cron run: the caller's card is out of reach ---------------
     with cron_run_scope(JOB_ID):
@@ -82,7 +96,7 @@ def main() -> int:
             outcome["response"] = f"Audit complete. Ledger updated at {LEDGER_URL}"
             outcome["output_file"] = OUTPUT_FILE
             outcome["delivery_error"] = "platform 'slack' not configured/enabled"
-        seen["inside_scope"] = bool(os.environ.get("HERMES_KANBAN_CRON_RUN"))
+        seen["inside_scope"] = current_cron_job()
         return True
 
     sched.run_one_job = fake_run_one_job
@@ -90,7 +104,7 @@ def main() -> int:
     ct.get_job = lambda jid: {"id": jid, "last_status": "ok", "last_error": None}
 
     exec_result = ct._execute_job_now({"id": JOB_ID})
-    check("run_one_job ran inside the scope", seen.get("inside_scope"), True)
+    check("run_one_job ran inside the scope", seen.get("inside_scope"), JOB_ID)
     check(
         "report reached the caller",
         exec_result.get("response"),
@@ -98,7 +112,17 @@ def main() -> int:
     )
     check("output file reached the caller", bool(exec_result.get("output_file")), True)
     check("delivery error reached the caller", bool(exec_result.get("delivery_error")), True)
-    check("marker cleared after the run", os.environ.get("HERMES_KANBAN_CRON_RUN"), None)
+    check("marker cleared after the run", current_cron_job(), "")
+    # The scope holds the marker in a ContextVar only. os.environ is
+    # process-global and a cron run is not: writing it there bled into
+    # unrelated worker threads, was inherited for life by workers the
+    # dispatcher spawned mid-run, and leaked permanently when two runs
+    # overlapped without nesting. See tools/cron_run_scope.py.
+    check(
+        "and the scope never wrote it to the process environment",
+        os.environ.get("HERMES_KANBAN_CRON_RUN"),
+        None,
+    )
 
     # --- the run action still produces valid JSON ---------------------------
     # The regression: a Path here made json.dumps raise and the caller got an

@@ -1,0 +1,878 @@
+---
+// A scripted replay of a real ChatOps exchange: someone asks in a chat
+// space, the agent opens a thread on the message and posts a fleet
+// health report. It exists to answer "what does this thing actually do"
+// above the fold, without the reader having to install anything.
+//
+// The whole transcript is in the markup, not built by the script. Three
+// reasons: Astro's scoped styles only reach elements that exist at build
+// time, the panel stays readable with JavaScript off or still loading,
+// and assistive technology gets a complete document rather than a
+// half-played animation. The script only adds a class that hides the
+// steps and then reveals them in order.
+//
+// Names are illustrative. Nothing here calls a real cluster.
+
+// `public/agent-icon.png` rather than an imported asset: it is a fixed
+// 128px bitmap shown at 30px, so there is nothing for Astro's image
+// pipeline to do. Trailing slash trimmed because BASE_URL carries one
+// in some Astro versions and not others.
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const agentIcon = `${base}/agent-icon.png`;
+---
+
+<figure class="ka-chat not-content" aria-label="Example: the agent reporting a fleet health check in a chat thread">
+  <div class="ka-chat__frame">
+    <div class="ka-chat__titlebar">
+      <span class="ka-chat__dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="ka-chat__space">#sre-platform</span>
+      <span class="ka-chat__hint">Google Chat</span>
+    </div>
+
+    <div class="ka-chat__scroll" data-scroll>
+      <!-- The prompt that starts it all. -->
+      <div class="ka-msg" data-step="0">
+        <div class="ka-avatar ka-avatar--human" aria-hidden="true">LP</div>
+        <div class="ka-msg__body">
+          <div class="ka-msg__meta"><b>Louis P.</b><time>09:41</time></div>
+          <p class="ka-msg__text">
+            <span class="ka-mention">@kube-agents</span>
+            <span data-type>run a full self-health check across the fleet</span><span
+              class="ka-caret"
+              data-caret
+              aria-hidden="true"></span>
+          </p>
+        </div>
+      </div>
+
+      <div class="ka-thread-start" data-step="1">
+        <span class="ka-thread-start__line" aria-hidden="true"></span>
+        kube-agents started a thread
+      </div>
+
+      <!-- Everything below is the agent's threaded reply. -->
+      <div class="ka-thread">
+        <div class="ka-msg ka-msg--agent" data-step="2">
+          <img
+            class="ka-avatar ka-avatar--agent"
+            src={agentIcon}
+            alt=""
+            width="30"
+            height="30"
+            loading="lazy"
+            decoding="async"
+          />
+          <div class="ka-msg__body">
+            <div class="ka-msg__meta">
+              <b>kube-agents</b><span class="ka-badge">APP</span><time>09:41</time>
+            </div>
+
+            <div class="ka-typing" data-typing aria-hidden="true">
+              <i></i><i></i><i></i>
+            </div>
+
+            <div class="ka-report" data-report>
+              <p class="ka-report__lede" data-step="3">
+                Performed a comprehensive self-health check and platform diagnostic audit. All
+                active clusters, agent profiles, platform components, and background daemons are
+                fully operational and healthy, with zero active failures or degraded states
+                detected.
+              </p>
+
+              <section data-step="4">
+                <h4>Executive Summary</h4>
+                <ul>
+                  <li>
+                    All <b>4 GKE clusters</b> in project <code>acme-platform</code> are in the{" "}
+                    <code>RUNNING</code> state.
+                  </li>
+                  <li>
+                    The <b>Platform Agent</b> pod (<code>platform-agent-gateway</code>) is fully
+                    operational with zero restarts, under gVisor runtime separation.
+                  </li>
+                  <li>
+                    All <b>4 Cluster Agent profiles</b> are active, registered, and have completed
+                    every historical security, RBAC, and workload audit.
+                  </li>
+                  <li>
+                    <b>Platform integrations</b> — LiteLLM, Managed Service for Prometheus, and
+                    Managed OpenTelemetry — are verified and operational.
+                  </li>
+                  <li>
+                    The <b>cron scheduler</b> is active, managing all daily and weekly fleet-wide
+                    compliance, reliability, security, and cost audits.
+                  </li>
+                </ul>
+              </section>
+
+              <section data-step="5">
+                <h4>GKE clusters state</h4>
+                <div class="ka-tablewrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Cluster</th><th>Location</th><th>Status</th><th>Version</th><th>Nodes</th
+                        ><th>Autopilot</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td><code>platform-agent-host</code></td><td>us-east4</td><td
+                          ><span class="ka-pill ka-pill--ok">RUNNING</span></td
+                        ><td><code>1.35.6-gke.125</code></td><td>6</td><td class="ka-dim"
+                          >Disabled</td
+                        >
+                      </tr>
+                      <tr>
+                        <td><code>checkout-prod</code></td><td>us-east4</td><td
+                          ><span class="ka-pill ka-pill--ok">RUNNING</span></td
+                        ><td><code>1.35.6-gke.125</code></td><td>3</td><td>Enabled</td>
+                      </tr>
+                      <tr>
+                        <td><code>acme-gitops</code></td><td>us-east4</td><td
+                          ><span class="ka-pill ka-pill--ok">RUNNING</span></td
+                        ><td><code>1.35.6-gke.125</code></td><td>3</td><td>Enabled</td>
+                      </tr>
+                      <tr>
+                        <td><code>ml-serving-test</code></td><td>us-east4</td><td
+                          ><span class="ka-pill ka-pill--ok">RUNNING</span></td
+                        ><td><code>1.35.6-gke.125</code></td><td>3</td><td>Enabled</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section data-step="6">
+                <h4>Agent &amp; component health</h4>
+                <p class="ka-report__note">
+                  All microservices, controllers, and proxy sidecars are healthy and responsive.
+                </p>
+                <ul class="ka-tight">
+                  <li>
+                    <code>platform-agent-gateway</code> — <span class="ka-pill ka-pill--ok"
+                      >Running</span
+                    > 0 restarts, age 9h · CPU <code>222m/3</code> · memory <code>1.23Gi/8Gi</code>
+                  </li>
+                  <li>Runtime class <code>gvisor</code> — sandboxing active and enforced.</li>
+                  <li>
+                    Sidecars: <code>platform-agent</code>, <code>platform-agent-dashboard</code>,{" "}
+                    <code>fluent-bit</code>, <code>envoy-credential-proxy</code> — all{" "}
+                    <span class="ka-pill ka-pill--ok">Running</span>
+                  </li>
+                  <li>
+                    4 Cluster Agent profiles — <span class="ka-pill ka-pill--ok">Healthy</span>, all
+                    audits completed.
+                  </li>
+                </ul>
+              </section>
+
+              <section data-step="7">
+                <h4>Scheduler &amp; active cron jobs</h4>
+                <div class="ka-tablewrap">
+                  <table>
+                    <thead>
+                      <tr><th>Job</th><th>Schedule</th><th>Last run</th><th>Status</th></tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>Security &amp; RBAC posture audit</td><td><code>20 6 * * *</code></td><td
+                          class="ka-dim">06:28</td
+                        ><td><span class="ka-pill ka-pill--ok">ok</span></td>
+                      </tr>
+                      <tr>
+                        <td>Workload reliability audit</td><td><code>50 6 * * *</code></td><td
+                          class="ka-dim">07:09</td
+                        ><td><span class="ka-pill ka-pill--ok">ok</span></td>
+                      </tr>
+                      <tr>
+                        <td>Fleet waste audit</td><td><code>50 7 * * 1</code></td><td class="ka-dim"
+                          >07:39</td
+                        ><td><span class="ka-pill ka-pill--ok">ok</span></td>
+                      </tr>
+                      <tr>
+                        <td>AI workload security audit</td><td><code>50 8 * * *</code></td><td
+                          class="ka-dim">08:56</td
+                        ><td><span class="ka-pill ka-pill--ok">ok</span></td>
+                      </tr>
+                      <tr>
+                        <td class="ka-dim" colspan="4">+ 3 more scheduled audits, all healthy</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section data-step="8">
+                <h4>Active warnings &amp; system audits</h4>
+                <ul class="ka-tight">
+                  <li>
+                    <b>Zero failures or errors</b> across <code>logs/errors.log</code> and{" "}
+                    <code>cron/executions.db</code>.
+                  </li>
+                </ul>
+              </section>
+
+              <p class="ka-report__foot" data-step="9">
+                No remediation required. Next scheduled audit: <b>upgrade &amp; patch readiness</b>,
+                today at 07:20.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ka-chat__footer">
+      <button type="button" class="ka-replay" data-replay>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+          <path
+            d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7Z"
+          ></path>
+        </svg>
+        Replay
+      </button>
+      <span class="ka-chat__caption">An illustrative replay. Names and figures are examples.</span>
+    </div>
+  </div>
+</figure>
+
+<style>
+  .ka-chat {
+    margin: 0 0 2.5rem;
+  }
+
+  .ka-chat__frame {
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 12px;
+    background: #0b1322;
+    overflow: hidden;
+    box-shadow: 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+  }
+
+  /* --- window chrome --- */
+  .ka-chat__titlebar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.55rem 0.85rem;
+    background: var(--sl-color-bg-nav);
+    border-bottom: 1px solid var(--sl-color-hairline);
+    font-size: 0.8125rem;
+  }
+  .ka-chat__dots {
+    display: flex;
+    gap: 0.35rem;
+  }
+  .ka-chat__dots i {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--sl-color-gray-5);
+  }
+  .ka-chat__dots i:first-child {
+    background: #fb7081;
+  }
+  .ka-chat__dots i:nth-child(2) {
+    background: #fcc140;
+  }
+  .ka-chat__dots i:last-child {
+    background: #58c660;
+  }
+  .ka-chat__space {
+    font-family: var(--sl-font-system-mono);
+    color: var(--sl-color-gray-1);
+    font-weight: 600;
+  }
+  .ka-chat__hint {
+    margin-inline-start: auto;
+    color: var(--sl-color-gray-3);
+    font-size: 0.75rem;
+  }
+
+  /* --- transcript --- */
+  .ka-chat__scroll {
+    max-height: 30rem;
+    /* Deliberately left to chain (no `overscroll-behavior: contain`).
+       Playback parks the panel at its scroll end, so a reader who has
+       just watched the replay is already against the stop; containing
+       the overscroll there swallows the gesture and the page reads as
+       frozen until the pointer is moved off the panel. On a phone the
+       panel is 92% of the viewport width, so "off the panel" is a 17px
+       strip. Measured over CDP: four wheel ticks on the panel moved the
+       page 0px contained and 360px chaining. */
+    overflow-y: auto;
+    padding: 1rem 1.1rem 1.25rem;
+    scrollbar-width: thin;
+    scrollbar-color: #2090af80 transparent;
+  }
+  .ka-chat__scroll::-webkit-scrollbar {
+    width: 0.75rem;
+  }
+  .ka-chat__scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .ka-chat__scroll::-webkit-scrollbar-thumb {
+    background-color: #2090af80;
+    border: 4px solid transparent;
+    background-clip: content-box;
+    border-radius: 10px;
+  }
+  .ka-chat__scroll::-webkit-scrollbar-thumb:hover {
+    background-color: #2acacacc;
+  }
+
+  .ka-msg {
+    display: flex;
+    gap: 0.7rem;
+    align-items: flex-start;
+  }
+  .ka-avatar {
+    flex: none;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    font-size: 0.7rem;
+    font-weight: 700;
+    font-family: var(--sl-font-system-mono);
+    letter-spacing: -0.02em;
+  }
+  .ka-avatar--human {
+    background: var(--sl-color-gray-6);
+    color: var(--sl-color-gray-1);
+  }
+  /* The bot's own artwork already carries a dark ground, so it needs no
+   * fill behind it — only the same rounded corner the initials get. */
+  .ka-avatar--agent {
+    object-fit: cover;
+  }
+  .ka-msg__body {
+    min-width: 0;
+    flex: 1;
+  }
+  .ka-msg__meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8125rem;
+    color: var(--sl-color-gray-3);
+    margin-bottom: 0.15rem;
+  }
+  .ka-msg__meta b {
+    color: var(--sl-color-white);
+  }
+  .ka-msg__meta time {
+    font-size: 0.7rem;
+  }
+  .ka-badge {
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    padding: 0.05rem 0.3rem;
+    border-radius: 4px;
+    background: var(--sl-color-accent-low);
+    color: var(--sl-color-accent-high);
+  }
+  .ka-msg__text {
+    margin: 0;
+    color: var(--sl-color-gray-1);
+    font-size: 0.9375rem;
+  }
+  /* The tinted chip's own padding eats the space that follows it in the
+   * markup, so the mention runs straight into the next word. Put the gap
+   * back outside the chip, where the tint cannot swallow it. */
+  .ka-mention {
+    color: var(--ka-cyan);
+    background: rgba(42, 202, 202, 0.12);
+    border-radius: 4px;
+    padding: 0 0.2rem;
+    margin-inline-end: 0.3em;
+  }
+
+  /* Blinking caret while the prompt is being typed. */
+  .ka-caret {
+    display: none;
+    width: 2px;
+    height: 1em;
+    margin-inline-start: 1px;
+    vertical-align: text-bottom;
+    background: var(--ka-cyan);
+    animation: ka-blink 1s steps(2, start) infinite;
+  }
+  .ka-chat[data-playing] .ka-caret {
+    display: inline-block;
+  }
+  @keyframes ka-blink {
+    to {
+      visibility: hidden;
+    }
+  }
+
+  .ka-thread-start {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 0 0.35rem 2.6rem;
+    font-size: 0.75rem;
+    color: var(--sl-color-gray-3);
+  }
+  .ka-thread-start__line {
+    width: 1.1rem;
+    height: 0.6rem;
+    border-inline-start: 1px solid var(--sl-color-gray-5);
+    border-block-end: 1px solid var(--sl-color-gray-5);
+    border-end-start-radius: 5px;
+  }
+
+  /* The threaded reply is indented and hangs off a rule, the way the
+   * sidebar's nested lists do. */
+  .ka-thread {
+    margin-inline-start: 1rem;
+    padding-inline-start: 1rem;
+    border-inline-start: 1px solid var(--sl-color-hairline);
+  }
+
+  /* --- typing indicator --- */
+  .ka-typing {
+    display: none;
+    gap: 0.25rem;
+    padding: 0.5rem 0;
+  }
+  .ka-typing i {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--sl-color-gray-4);
+    animation: ka-bounce 1.2s infinite ease-in-out;
+  }
+  .ka-typing i:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .ka-typing i:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+  .ka-typing[data-on] {
+    display: flex;
+  }
+  @keyframes ka-bounce {
+    0%,
+    60%,
+    100% {
+      opacity: 0.35;
+      transform: translateY(0);
+    }
+    30% {
+      opacity: 1;
+      transform: translateY(-3px);
+    }
+  }
+
+  /* --- report body --- */
+  .ka-report {
+    font-size: 0.875rem;
+    color: var(--sl-color-gray-1);
+    line-height: 1.55;
+  }
+  .ka-report > * + * {
+    margin-top: 0.9rem;
+  }
+  .ka-report p {
+    margin: 0;
+  }
+  .ka-report__lede {
+    color: var(--sl-color-gray-2);
+  }
+  .ka-report__note {
+    color: var(--sl-color-gray-3);
+    margin-bottom: 0.4rem !important;
+  }
+  .ka-report__foot {
+    border-top: 1px solid var(--sl-color-hairline-light);
+    padding-top: 0.7rem;
+    color: var(--sl-color-gray-3);
+  }
+  .ka-report h4 {
+    margin: 0 0 0.4rem;
+    font-size: 0.8125rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ka-cyan);
+  }
+  .ka-report ul {
+    margin: 0;
+    padding-inline-start: 1.1rem;
+    list-style: none;
+  }
+  .ka-report li {
+    position: relative;
+    margin-block: 0.3rem;
+  }
+  .ka-report li::before {
+    content: '';
+    position: absolute;
+    inset-inline-start: -0.85rem;
+    top: 0.6em;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--ka-cyan);
+  }
+  .ka-report ul.ka-tight li {
+    margin-block: 0.2rem;
+  }
+  .ka-report code {
+    font-family: var(--sl-font-system-mono);
+    font-size: 0.8em;
+    background: var(--sl-color-bg-inline-code);
+    color: var(--ka-violet);
+    border-radius: 4px;
+    padding: 0.05rem 0.3rem;
+    white-space: nowrap;
+  }
+  .ka-dim {
+    color: var(--sl-color-gray-3);
+  }
+
+  .ka-pill {
+    display: inline-block;
+    font-family: var(--sl-font-system-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.05rem 0.35rem;
+    border-radius: 4px;
+  }
+  .ka-pill--ok {
+    background: rgba(88, 198, 96, 0.16);
+    color: var(--ka-green-bright);
+  }
+
+  .ka-tablewrap {
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #2090af80 transparent;
+  }
+  .ka-tablewrap::-webkit-scrollbar {
+    height: 0.6rem;
+  }
+  .ka-tablewrap::-webkit-scrollbar-thumb {
+    background-color: #2090af80;
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 10px;
+  }
+  .ka-report table {
+    border-collapse: collapse;
+    width: max-content;
+    min-width: 100%;
+    font-size: 0.8125rem;
+  }
+  .ka-report th {
+    text-align: left;
+    font-weight: 600;
+    color: var(--ka-cyan-bright);
+    border-bottom: 1px solid var(--ka-cyan);
+    padding: 0.3rem 0.7rem 0.3rem 0;
+    white-space: nowrap;
+  }
+  .ka-report td {
+    border-bottom: 1px solid var(--sl-color-hairline-light);
+    padding: 0.35rem 0.7rem 0.35rem 0;
+    vertical-align: middle;
+  }
+  .ka-report tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  /* --- footer --- */
+  .ka-chat__footer {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0.85rem;
+    border-top: 1px solid var(--sl-color-hairline);
+    background: var(--sl-color-bg-nav);
+  }
+  .ka-replay {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font: inherit;
+    font-size: 0.75rem;
+    color: var(--sl-color-gray-2);
+    background: var(--sl-color-gray-6);
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 6px;
+    padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  .ka-replay:hover {
+    color: var(--sl-color-accent-high);
+    border-color: var(--sl-color-accent);
+  }
+  .ka-chat__caption {
+    font-size: 0.7rem;
+    color: var(--sl-color-gray-3);
+  }
+
+  /* --- reveal ---
+   * Only applied once the script has taken over, so the panel is fully
+   * readable when it never runs. */
+  .ka-chat[data-scripted] [data-step] {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  .ka-chat[data-scripted] [data-step].is-in {
+    opacity: 1;
+    transform: none;
+    transition:
+      opacity 0.34s ease,
+      transform 0.34s ease;
+  }
+
+  @media (max-width: 50rem) {
+    .ka-chat__scroll {
+      max-height: 24rem;
+      padding: 0.85rem;
+    }
+    .ka-report {
+      font-size: 0.8125rem;
+    }
+    .ka-thread {
+      margin-inline-start: 0.25rem;
+      padding-inline-start: 0.7rem;
+    }
+  }
+
+  /* Motion is the whole point of this panel, so when it is not wanted
+   * the panel simply presents finished rather than degrading to a
+   * shorter animation. */
+  @media (prefers-reduced-motion: reduce) {
+    .ka-chat[data-scripted] [data-step] {
+      opacity: 1;
+      transform: none;
+      transition: none;
+    }
+    .ka-caret,
+    .ka-typing i {
+      animation: none;
+    }
+  }
+</style>
+
+<script>
+  // Plays the transcript once when it scrolls into view, and again on
+  // demand. Everything it touches already exists in the document; the
+  // script adds `data-scripted`, which is what switches the reveal
+  // styles on, so a failure here leaves the panel readable.
+  const root = document.querySelector('.ka-chat');
+
+  if (root) {
+    const scroller = root.querySelector('[data-scroll]');
+    const steps = Array.from(root.querySelectorAll('[data-step]')).sort(
+      (a, b) => Number(a.dataset.step) - Number(b.dataset.step),
+    );
+    const typeTarget = root.querySelector('[data-type]');
+    const typing = root.querySelector('[data-typing]');
+    const replay = root.querySelector('[data-replay]');
+    const prompt = typeTarget.textContent || '';
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+    let run = 0; // bumped on replay so a stale run stops touching the DOM
+
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    function reset() {
+      root.setAttribute('data-scripted', '');
+      steps.forEach((s) => s.classList.remove('is-in'));
+      typing.removeAttribute('data-on');
+      typeTarget.textContent = '';
+      scroller.scrollTop = 0;
+    }
+
+    // Where the panel has to sit for the block that just appeared to be
+    // inside it, the way a chat client follows a live thread.
+    //
+    // Aiming at `scrollHeight` instead — which is what this used to do —
+    // is wrong here: the whole transcript is in the DOM from the start
+    // and a hidden step still takes up its space, so the panel's scroll
+    // height is the *finished* height on the very first frame. Scrolling
+    // there jumps past everything not yet revealed and parks the reader
+    // in front of a blank panel until the text catches up.
+    //
+    // Only ever moves forward, and only the panel — never the page.
+    //
+    // Planned in one go rather than a section at a time, because evening
+    // out the last move needs to know what the moves before it were.
+    const GUTTER = 14;
+    function planScroll(list) {
+      const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const s = scroller.getBoundingClientRect();
+      const base = scroller.scrollTop;
+
+      // `stop` is where the panel has to be for a section to be readable;
+      // `limit` is the furthest it may go while that section is still
+      // worth looking at, which is its top on the panel's top edge.
+      const stop = [];
+      const limit = [];
+      let prev = base;
+      for (const el of list) {
+        const r = el.getBoundingClientRect();
+        const top = base + (r.top - s.top);
+        const bottom = base + (r.bottom - s.top);
+        // A section taller than the panel is aligned to its top; there is
+        // no reading position that shows all of it, and its first line is
+        // the useful one.
+        const wanted =
+          r.height > scroller.clientHeight - GUTTER
+            ? top - GUTTER
+            : bottom - scroller.clientHeight + GUTTER;
+        prev = Math.max(prev, Math.min(max, wanted));
+        stop.push(prev);
+        limit.push(Math.min(max, Math.max(prev, top)));
+      }
+
+      // Those stops are a lower bound the panel cannot go under without
+      // hiding the section that just landed, and they already run ahead
+      // of an evenly spaced walk, so the distances cannot be equalised by
+      // moving earlier. What can be fixed is the tail: the last sections
+      // are a line or two each, which left the sequence ending on a 63px
+      // shuffle and a 31px twitch. Absorb any move shorter than half the
+      // average into the one before it, which is free whenever the panel
+      // can travel that far and still leave the earlier section on
+      // screen. Merging forward only ever lengthens a move, so a single
+      // backward pass cannot leave a new short one behind.
+      const moves = stop.map((t, i) => t - (i ? stop[i - 1] : base)).filter((d) => d > 1);
+      const floor = moves.length ? (moves.reduce((a, b) => a + b, 0) / moves.length) * 0.5 : 0;
+      for (let i = stop.length - 1; i > 0; i--) {
+        const d = stop[i] - stop[i - 1];
+        if (d > 1 && d < floor && stop[i] <= limit[i - 1]) stop[i - 1] = stop[i];
+      }
+      return stop;
+    }
+
+    // Glide there at a fixed speed rather than in a fixed time.
+    //
+    // How far each section has to move is set by how tall it is, and
+    // cannot be evened out without leaving part of it off the panel. So
+    // the quantity to hold equal is the speed, not the distance:
+    // `behavior: 'smooth'` takes roughly the same time whatever the gap,
+    // which flung the tall cron table past and then crawled the one-line
+    // footer — one cadence reading as a lurch followed by a nudge. With
+    // the duration scaled to the distance, every move shares an
+    // acceleration, a peak velocity, and a feel.
+    const SPEED = 0.32; // px per ms
+    function glide(to, id) {
+      const from = scroller.scrollTop;
+      const dist = to - from;
+      if (reduced.matches || dist < 2) {
+        scroller.scrollTop = to;
+        return Promise.resolve();
+      }
+      // The floor only catches the last nudge to the footer, which at
+      // full speed would be over in six frames; the ceiling never binds
+      // at this transcript's length.
+      const ms = Math.min(1200, Math.max(120, dist / SPEED));
+      return new Promise((done) => {
+        let t0 = null;
+        const frame = (now) => {
+          if (id !== run) return done();
+          if (t0 === null) t0 = now;
+          const p = Math.min(1, (now - t0) / ms);
+          // Smoothstep, so nothing starts or stops with a jolt.
+          scroller.scrollTop = from + dist * p * p * (3 - 2 * p);
+          if (p < 1) requestAnimationFrame(frame);
+          else done();
+        };
+        requestAnimationFrame(frame);
+      });
+    }
+
+    async function play() {
+      const id = ++run;
+      const alive = () => id === run;
+
+      if (reduced.matches) {
+        // Present the finished state, no motion.
+        typeTarget.textContent = prompt;
+        steps.forEach((s) => s.classList.add('is-in'));
+        return;
+      }
+
+      reset();
+      root.setAttribute('data-playing', '');
+      replay.disabled = true;
+
+      steps[0]?.classList.add('is-in');
+      await wait(320);
+
+      // Type the prompt a character at a time.
+      for (let i = 1; i <= prompt.length; i++) {
+        if (!alive()) return;
+        typeTarget.textContent = prompt.slice(0, i);
+        await wait(18);
+      }
+      if (!alive()) return;
+      root.removeAttribute('data-playing');
+      await wait(420);
+
+      // Thread opens, agent thinks.
+      steps[1]?.classList.add('is-in');
+      await wait(360);
+      if (!alive()) return;
+      steps[2]?.classList.add('is-in');
+      typing.setAttribute('data-on', '');
+      await wait(1400);
+      if (!alive()) return;
+      typing.removeAttribute('data-on');
+
+      // Report lands section by section. The opening sections fit
+      // without moving the panel, which leaves the reader a beat to take
+      // in the lede and watch the reply start before anything scrolls.
+      const report = steps.slice(3);
+      const plan = planScroll(report);
+      for (let i = 0; i < report.length; i++) {
+        if (!alive()) return;
+        report[i].classList.add('is-in');
+        const to = Math.max(scroller.scrollTop, plan[i]);
+        const moved = to - scroller.scrollTop > 1;
+        await glide(to, id);
+        if (!alive()) return;
+        // A section that scrolled has already had its glide as a pause,
+        // so it needs only a beat on top; one that did not is still
+        // whole on screen and is held in proportion to its length.
+        const h = Math.round(report[i].getBoundingClientRect().height);
+        await wait(moved ? Math.min(660, 300 + h * 0.6) : Math.min(900, 420 + h * 1.3));
+      }
+      if (!alive()) return;
+      // Settle exactly at the end rather than wherever the last glide
+      // happened to be interrupted.
+      scroller.scrollTop = Math.max(scroller.scrollTop, plan[plan.length - 1]);
+      replay.disabled = false;
+    }
+
+    replay.addEventListener('click', () => void play());
+
+    // Hold until it is actually on screen, so the reader does not
+    // arrive after the interesting part.
+    if ('IntersectionObserver' in window) {
+      reset();
+      const io = new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (e.isIntersecting) {
+              io.disconnect();
+              void play();
+            }
+          }
+        },
+        { threshold: 0.25 },
+      );
+      io.observe(root);
+    } else {
+      void play();
+    }
+  }
+</script>

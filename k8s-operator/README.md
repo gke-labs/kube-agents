@@ -12,7 +12,7 @@ The operator is built using the Kubebuilder framework and is written in Go.
 
 Before building or deploying the operator, ensure you have the following installed:
 
-- [Go](https://go.dev/doc/install) (version 1.25+)
+- [Go](https://go.dev/doc/install) (version 1.26+)
 - [Docker](https://docs.docker.com/get-docker/) or Podman (for building container images)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) (configured to access your Kubernetes/GKE cluster)
 - Access to a running Kubernetes/GKE cluster
@@ -58,6 +58,8 @@ graph TD
     A --> J[provision_09_deploy_litellm.sh]
     A --> K[provision_10_deploy_github_minter.sh]
     A --> L[provision_11_deploy_inference_replay.sh]
+    A --> M[provision_12_gke_backup_plan.sh]
+    A --> N[provision_14_verify_agent_rollout.sh]
 ```
 
 Every step is documented once, in **[scripts/README.md](scripts/README.md)** — the canonical
@@ -102,18 +104,19 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_11_deploy_inference_replay.sh]
-    A --> C[teardown_10_deploy_github_minter.sh]
-    A --> D[teardown_09_deploy_litellm.sh]
-    A --> E[teardown_08_deploy_platform_agent.sh]
-    A --> F[teardown_07_gcp_k8s_secrets.sh]
-    A --> G[teardown_06_slack.sh]
-    A --> H[teardown_05_gcp_gchat.sh]
-    A --> I[teardown_04_gcp_iam.sh]
-    A --> J[teardown_03_gcp_gke_operator.sh]
-    A --> K[teardown_02_gvisor_nodepool.sh]
-    A --> L[dev/teardown_dev_01_gcp_artifact_registry.sh]
-    A --> M[teardown_01_gcp_cluster.sh]
+    A[teardown.sh] --> B[teardown_12_gke_backup_plan.sh]
+    A --> C[teardown_11_deploy_inference_replay.sh]
+    A --> D[teardown_10_deploy_github_minter.sh]
+    A --> E[teardown_09_deploy_litellm.sh]
+    A --> F[teardown_08_deploy_platform_agent.sh]
+    A --> G[teardown_07_gcp_k8s_secrets.sh]
+    A --> H[teardown_06_slack.sh]
+    A --> I[teardown_05_gcp_gchat.sh]
+    A --> J[teardown_04_gcp_iam.sh]
+    A --> K[teardown_03_gcp_gke_operator.sh]
+    A --> L[teardown_02_gvisor_nodepool.sh]
+    A --> M[dev/teardown_dev_01_gcp_artifact_registry.sh]
+    A --> N[teardown_01_gcp_cluster.sh]
 ```
 
 Each teardown step mirrors its provisioning counterpart and is documented in
@@ -171,7 +174,7 @@ make install
 ```
 
 > [!NOTE]
-> This command uses `controller-gen` to generate the CRD manifests from Go structs and applies them to the cluster via `kustomize`.
+> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. How the build targets and CI keep generated output in sync is covered in the [operator development guide](../docs/site/src/content/docs/operator/development.md).
 
 ### Step 3: Run the Operator Locally
 
@@ -189,6 +192,8 @@ ENABLE_WEBHOOKS=false go run ./cmd/main.go
 
 > [!TIP]
 > This compiles and runs the entry point [main.go](cmd/main.go) with webhooks disabled. The process runs in the foreground, prints reconciliation logs, and watches for custom resource events in the cluster.
+
+When webhooks are enabled, the server binds `10250` rather than Kubebuilder's usual `9443`: it is one of only two ports GKE's automatic control-plane-to-node firewall rule permits, so a private cluster reaches the webhook without a hand-added VPC rule. Where 10250 is not the reachable port, `--webhook-port`, the manager `containerPort`, and the Service `targetPort` have to be changed together — the flag alone moves the listener and leaves the Service dialing a dead port, which fail-closed admission turns into a wedged cluster. The rationale, the Kustomize patch that moves all three, the drift guard across them, and the recovery steps for an unreachable webhook are in [Admission webhooks](../docs/site/src/content/docs/operator/index.md#admission-webhooks).
 
 ### Step 4: Apply Sample Custom Resources
 
@@ -321,6 +326,8 @@ Before deploying the GitHub integration, ensure you have:
 Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the provisioning scripts use (see [`scripts/common.sh`](scripts/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
 
 `KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
+
+`GITHUB_ORG` must name a GitHub organization, not a user: the Minter resolves installations at `/orgs/{org}/installation`, which returns 404 for personal accounts. This path bypasses the provisioning scripts that check for it — see [`config/integrations/github/README.md`](config/integrations/github/README.md).
 
 ```bash
 # 1. Define the GCP and GitHub parameter variables:

@@ -1,0 +1,122 @@
+# CI-only build of all three images in a single Cloud Build.
+#
+# Why this exists next to cloudbuild.yaml rather than replacing it: that config
+# builds exactly one --target and is called with a different one by
+# .github/workflows/docker-publish-gcp.yml and
+# k8s-operator/scripts/dev/dev_rebuild_agent.sh. Only hack/ci-deploy.sh needs
+# all three at once, so the multi-image shape lives here and the single-target
+# contract those two depend on stays untouched.
+#
+# What this buys, and why one build instead of three submits: credential-proxy
+# is `FROM platform AS credential-proxy` and adds an envoy binary, two configs
+# and one apt/gh-CLI layer. As its own submit it lands on a fresh worker with a
+# cold daemon, so it rebuilds the whole agent-base/platform chain before it can
+# run any of those five instructions. Built on the same worker right after
+# platform, they are already in the daemon's cache and only the delta runs
+# (gke-labs/kube-agents#635).
+steps:
+  # Only platform's cache is seeded. credential-proxy's own :latest is not
+  # pulled: the step below builds directly on top of the platform image this
+  # build just produced, so its five remaining instructions are cheap, and
+  # pulling the whole image to save them would cost far more than it saves.
+  - id: warm-cache
+    name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - "docker pull $_PLATFORM_LATEST || true"
+
+  - id: platform
+    name: "gcr.io/cloud-builders/docker"
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      # Deployment targets are always amd64 GKE nodes; the multi-arch bases
+      # otherwise resolve to the build host (#560).
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_PLATFORM_URI"
+      - "-t"
+      - "$_PLATFORM_LATEST"
+      - "--cache-from"
+      - "$_PLATFORM_LATEST"
+      - "-f"
+      - "deploy/docker/Dockerfile"
+      - "--target"
+      - "platform"
+      - "--build-arg"
+      - "BUILDKIT_INLINE_CACHE=1"
+      - "--build-arg"
+      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
+      - "."
+
+  # No --cache-from and no waitFor: this runs straight after platform on the
+  # same worker, which is the entire point of collapsing the submits.
+  - id: credential-proxy
+    name: "gcr.io/cloud-builders/docker"
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_PROXY_URI"
+      - "-t"
+      - "$_PROXY_LATEST"
+      - "-f"
+      - "deploy/docker/Dockerfile"
+      - "--target"
+      - "credential-proxy"
+      - "--build-arg"
+      - "BUILDKIT_INLINE_CACHE=1"
+      - "--build-arg"
+      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
+      - "."
+
+  # k8s-operator/Dockerfile shares no stage with the agent images, so it starts
+  # immediately instead of queueing behind them. It is much the shorter build
+  # and finishes well inside theirs, so it costs no wall clock of its own.
+  - id: operator
+    name: "gcr.io/cloud-builders/docker"
+    waitFor: ["-"]
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_OPERATOR_URI"
+      - "-f"
+      - "k8s-operator/Dockerfile"
+      - "k8s-operator"
+
+images:
+  - "$_PLATFORM_URI"
+  - "$_PLATFORM_LATEST"
+  - "$_PROXY_URI"
+  - "$_PROXY_LATEST"
+  - "$_OPERATOR_URI"
+
+# No `options.machineType` here on purpose. The operator step only genuinely
+# overlaps the agent builds if the worker has cores to spare, but a private
+# worker pool defines its own machine and cannot be told one, so the two
+# settings are mutually exclusive. hack/ci-deploy.sh passes --machine-type only
+# when no pool is configured, which keeps that exclusion structural rather than
+# a comment someone has to notice.
+
+# Stated rather than inherited: this is now one build doing the work of three,
+# so the ceiling should be visible here instead of depending on whatever
+# `gcloud builds submit` defaults to.
+timeout: 3600s
+
+substitutions:
+  _PLATFORM_URI: ""
+  _PLATFORM_LATEST: ""
+  _PROXY_URI: ""
+  _PROXY_LATEST: ""
+  _OPERATOR_URI: ""
+  _HERMES_AGENT_TAG: ""

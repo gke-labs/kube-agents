@@ -238,7 +238,7 @@ Run `./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → the final response is **exactly** `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
-- **An on-demand run is never silent.** If a person dispatched this job — from a kanban card, from chat, from `cronjob(action='run')` — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
+- **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
 
 What to report in each case:
 
@@ -249,7 +249,7 @@ What to report in each case:
 
 ## Red Lines
 
-- **Read-only, always.** Never delete, cordon, drain, patch, scale, or apply anything. Every command in this SOP is a read verb. This is the most dangerous of the five audits to get wrong: **a false positive here can lead a human to delete a disk holding real data.**
+- **Read-only, always.** Never delete, cordon, drain, patch, scale, or apply anything. Every command in this SOP is a read verb. This is the most dangerous of the six audits to get wrong: **a false positive here can lead a human to delete a disk holding real data.**
 - Never emit a manifest that deletes a PV, PVC, namespace, disk, snapshot, or address. Deletion remediations are `kind: manual` or `kind: gcloud` only, always with an explicit verify-before-deleting caution and a snapshot-first step wherever data is involved. A manifest is now one merge away from `main` — a `critical` one opens its own pull request without a human asking — so this line matters more than it did, not less.
 - Never state a dollar amount, a monthly saving, a percentage saving, or a price. You have no pricing data, and a fabricated figure is worse than no figure.
 - Never emit a finding without a literal, reproducible `evidence.command`. Drop it instead.

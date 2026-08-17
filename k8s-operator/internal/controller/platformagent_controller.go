@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,16 +31,20 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -48,13 +53,52 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-const platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+const (
+	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+	minIPv4CIDRPrefix      = 12
+	minIPv6CIDRPrefix      = 48
+	maxCIDRsPerAnnotation  = 50
+
+	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
+	// Identity tokens. It is only ever the pre-DNAT destination.
+	metadataLinkLocalIP = "169.254.169.254"
+	// metadataDaemonIP is where GKE's node-local metadata daemon actually listens, on
+	// TCP 988. On the iptables datapath the node rewrites 169.254.169.254:80 to
+	// 169.254.169.252:988 in nat PREROUTING — before NetworkPolicy is evaluated — so a
+	// policy that permits only the link-local address drops every token fetch. Dataplane
+	// V2 performs the same rewrite but targets the hosting node's internal IP instead,
+	// which is why reconcileNetworkPolicy also feeds the live node IPs in.
+	metadataDaemonIP = "169.254.169.252"
+
+	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
+	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
+	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
+
+	// The condition reporting that cluster event ingestion has been switched off
+	// on the spec. It is written only in that state — see updateStatusReady.
+	eventWatcherConditionType  = "EventWatcher"
+	eventWatcherDisabledReason = "DisabledBySpec"
+	// Long, because the reader of `kubectl describe` is the person who has to
+	// decide whether this is still wanted. It has to say what stopped, that
+	// nothing will turn it back on, and how to turn it back on.
+	eventWatcherDisabledMessage = "Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. " +
+		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
+		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
+		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
+)
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	DiscoveryClient discovery.DiscoveryInterface
+
+	// APIReader reads straight from the API server, bypassing the manager's cache.
+	// Collector discovery looks at Services in namespaces this operator otherwise never
+	// touches, and a cached read there would have the manager start — and keep — an
+	// informer watching every Service in the cluster, to serve a handful of reads an
+	// hour. Nil falls back to the cached client, which is what tests supply.
+	APIReader client.Reader
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -63,22 +107,49 @@ type PlatformAgentReconciler struct {
 	imageVolumeMu       sync.Mutex
 	imageVolumeResolved bool
 	clusterImageVolumes bool
+
+	// APIServerIP configures the Kubernetes API server control-plane egress CIDR
+	// for generated NetworkPolicy manifests.
+	APIServerIP string
+
+	// APIServerCIDROverride configures static CIDR overrides for the Kubernetes API server
+	// (e.g. from KUBERNETES_API_SERVER_CIDR).
+	APIServerCIDROverride string
+
+	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
+	// is one collector per cluster, not one per agent. Unlike the ImageVolume
+	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
+	// time. See discoveredOTLPEndpoint for the "" / not-determined distinction.
+	// otelProbedAt is when a probe was last attempted, successful or not. It exists
+	// only to rate-limit retries: an inconclusive probe caches nothing, so without a
+	// floor an API outage has every reconcile of every agent re-run the whole sweep.
+	otelMu         sync.Mutex
+	otelResolved   bool
+	otelEndpoint   string
+	otelResolvedAt time.Time
+	otelProbedAt   time.Time
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;resourcequotas;limitranges;endpoints;pods/log,verbs=get;list;watch
+// +kubebuilder:rbac:groups=metrics.k8s.io,resources=nodes;pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=view,verbs=bind
-// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -180,7 +251,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins); err != nil {
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -188,12 +260,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileService(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Reconcile NetworkPolicy
+	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// 9. Update status phase to Ready
-	phase, err := r.updateStatusReady(ctx, instance)
+	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -203,6 +279,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Falling through to the bare default is the one telemetry outcome that can improve
+	// without anything else changing — someone installs a collector and nothing about
+	// this agent is touched. Reconciles are event-driven and can be quiet for hours, so
+	// nudge the probe rather than wait for an unrelated event. Every other source is
+	// explicit or already found something, and needs no polling.
+	if otlpSource == otlpSourceDefault {
+		return ctrl.Result{RequeueAfter: otelRediscoverAfter}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -231,38 +316,7 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-		explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-
-		// Delete Viewer ClusterRoleBinding
-		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerRBACName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crbViewer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRoleBinding
-		crbExplorer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: explorerRBACName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crbExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRole
-		crExplorer := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: explorerRBACName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-
-		// Delete Leader RoleBinding
-		rbLeader := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, rbLeader)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Leader Role
-		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
+		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -405,9 +459,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
+
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint}
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -418,7 +474,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
+		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -430,7 +486,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
+	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -465,51 +521,352 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	svc := buildPlatformService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
-		return err
+		return fmt.Errorf("failed to set controller reference on Service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
-	return r.applyManaged(ctx, agent, svc)
+	if err := r.applyManaged(ctx, agent, svc); err != nil {
+		return fmt.Errorf("failed to apply Service %s/%s: %w", svc.Namespace, svc.Name, err)
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string) error {
+	dnsClusterIP := "10.96.0.10"
+	var kubeDnsSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "kube-system", Name: "kube-dns"}, &kubeDnsSvc); err == nil {
+		if ip := strings.TrimSpace(kubeDnsSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			dnsClusterIP = ip
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover kube-dns ClusterIP; defaulting to 10.96.0.10", "error", err)
+	}
+
+	var apiTargets []string
+	if r.APIServerIP != "" {
+		apiTargets = append(apiTargets, r.APIServerIP)
+	}
+
+	var k8sSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
+		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			apiTargets = append(apiTargets, ip)
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
+	}
+
+	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
+	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
+	endpointsReader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		endpointsReader = r.APIReader
+	}
+
+	var k8sEndpoints corev1.Endpoints
+	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
+		for _, subset := range k8sEndpoints.Subsets {
+			for _, addr := range subset.Addresses {
+				if addr.IP != "" {
+					apiTargets = append(apiTargets, addr.IP)
+				}
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
+	}
+
+	parseCIDRTarget := func(annotationName, raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if strings.Contains(raw, "/") {
+			_, ipNet, err := net.ParseCIDR(raw)
+			if err != nil {
+				logf.FromContext(ctx).Info("Ignoring malformed CIDR in annotation", "annotation", annotationName, "cidr", raw, "error", err)
+				return
+			}
+			ones, bits := ipNet.Mask.Size()
+			if (bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix) {
+				logf.FromContext(ctx).Info("Rejecting overly broad CIDR in annotation (must be >= /12 for IPv4, >= /48 for IPv6)", "annotation", annotationName, "cidr", raw)
+				return
+			}
+			apiTargets = append(apiTargets, ipNet.String())
+			return
+		}
+		trimmed := strings.Trim(raw, "[]")
+		if ip := net.ParseIP(trimmed); ip == nil {
+			logf.FromContext(ctx).Info("Ignoring invalid IP address in annotation", "annotation", annotationName, "ip", raw)
+			return
+		}
+		apiTargets = append(apiTargets, trimmed)
+	}
+
+	appendCIDRs := func(sourceName, rawList string) {
+		if rawList == "" {
+			return
+		}
+		cidrs := strings.Split(rawList, ",")
+		if len(cidrs) > maxCIDRsPerAnnotation {
+			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
+			cidrs = cidrs[:maxCIDRsPerAnnotation]
+		}
+		for _, cidr := range cidrs {
+			parseCIDRTarget(sourceName, cidr)
+		}
+	}
+
+	if agent.Annotations != nil {
+		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
+		appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
+	}
+	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+
+	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
+	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
+	if fqdnEnabled {
+		fqdnNetpol := buildFQDNNetworkPolicy(agent)
+		if err := ctrl.SetControllerReference(agent, fqdnNetpol, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+		if err := r.applyManaged(ctx, agent, fqdnNetpol); err != nil {
+			if isCRDNotInstalledError(err) {
+				logf.FromContext(ctx).Info("FQDNNetworkPolicy CRD (networking.gke.io/v1alpha1) not present in cluster; keeping blanket external egress rule", "error", err)
+				fqdnEnabled = false
+			} else {
+				return fmt.Errorf("failed to apply FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+			}
+		}
+	} else {
+		fqdnNetpol := &unstructured.Unstructured{}
+		fqdnNetpol.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "networking.gke.io",
+			Version: "v1alpha1",
+			Kind:    "FQDNNetworkPolicy",
+		})
+		fqdnNetpol.SetName(agent.Name + "-fqdn-netpol")
+		fqdnNetpol.SetNamespace(agent.Namespace)
+		if err := r.Delete(ctx, fqdnNetpol); err != nil && !isCRDNotInstalledError(err) {
+			return fmt.Errorf("failed to clean up disabled FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+	}
+
+	// Discover node internal IPs for metadata server egress on Dataplane V2.
+	// GKE Dataplane V2 DNAT's 169.254.169.254 to the node IP before policy evaluation.
+	// Read Nodes through the cache, not APIReader: SetupWithManager watches Nodes so the
+	// informer is running anyway, and a live cluster-wide List here would fetch every
+	// Node — Status.Images included — on every reconcile of every agent.
+	var metadataNodeIPs []string
+	var nodeList corev1.NodeList
+	if err := r.Client.List(ctx, &nodeList); err != nil {
+		return fmt.Errorf("failed to list nodes for metadata server DNAT targets: %w", err)
+	}
+	for i := range nodeList.Items {
+		for _, addr := range nodeList.Items[i].Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP && net.ParseIP(addr.Address) != nil {
+				metadataNodeIPs = append(metadataNodeIPs, addr.Address)
+			}
+		}
+	}
+
+	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
+	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint, metadataNodeIPs)
+	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
+	}
+	if err := r.applyManaged(ctx, agent, netpol); err != nil {
+		return fmt.Errorf("failed to apply NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
+	}
+
+	return nil
+}
+
+// cleanupAgentRBAC dynamically purges un-wanted or all RBAC resources for a PlatformAgent.
+// When deleteAll is true (called during finalization), all RBAC resources are deleted.
+// When deleteAll is false (called during reconcile), active canonical bindings (minimal, local, leader) are preserved.
+func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent, deleteAll bool) error {
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
+	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
+	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
+	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+
+	// 1. Fast, dynamic cleanup of ClusterRoleBindings using targeted label selectors (current and legacy instance labels)
+	var labeledClusterRoleBindings rbacv1.ClusterRoleBindingList
+	if err := r.List(ctx, &labeledClusterRoleBindings, client.MatchingLabels{
+		"kubeagents.x-k8s.io/agent-name":      agent.Name,
+		"kubeagents.x-k8s.io/agent-namespace": agent.Namespace,
+	}); err != nil {
+		return fmt.Errorf("failed to list labeled ClusterRoleBindings: %w", err)
+	}
+	for i := range labeledClusterRoleBindings.Items {
+		crb := &labeledClusterRoleBindings.Items[i]
+		if !deleteAll && crb.Name == minimalBindingName {
+			continue
+		}
+		if (strings.HasPrefix(crb.Name, "kubeagents:") || strings.HasPrefix(crb.Name, "kubeagents-")) && crb.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, crb)); err != nil {
+				return fmt.Errorf("failed to clean up legacy ClusterRoleBinding %s: %w", crb.Name, err)
+			}
+		}
+	}
+
+	instLabel := instanceLabel(agent.Namespace, agent.Name)
+	var legacyLabeledCRBs rbacv1.ClusterRoleBindingList
+	if err := r.List(ctx, &legacyLabeledCRBs, client.MatchingLabels{
+		"app.kubernetes.io/instance": instLabel,
+		"app.kubernetes.io/part-of":  "kube-agents",
+	}); err != nil {
+		return fmt.Errorf("failed to list legacy labeled ClusterRoleBindings: %w", err)
+	}
+	for i := range legacyLabeledCRBs.Items {
+		crb := &legacyLabeledCRBs.Items[i]
+		if !deleteAll && crb.Name == minimalBindingName {
+			continue
+		}
+		if (strings.HasPrefix(crb.Name, "kubeagents:") || strings.HasPrefix(crb.Name, "kubeagents-")) && crb.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, crb)); err != nil {
+				return fmt.Errorf("failed to clean up legacy ClusterRoleBinding %s: %w", crb.Name, err)
+			}
+		}
+	}
+
+	// 2. Dynamic cleanup of ClusterRoles using label selector
+	var legacyClusterRoles rbacv1.ClusterRoleList
+	if err := r.List(ctx, &legacyClusterRoles, client.MatchingLabels{
+		"app.kubernetes.io/instance": instLabel,
+		"app.kubernetes.io/part-of":  "kube-agents",
+	}); err != nil {
+		return fmt.Errorf("failed to list legacy ClusterRoles: %w", err)
+	}
+	for i := range legacyClusterRoles.Items {
+		cr := &legacyClusterRoles.Items[i]
+		if !deleteAll && cr.Name == fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name) {
+			continue
+		}
+		if (strings.HasPrefix(cr.Name, "kubeagents:") || strings.HasPrefix(cr.Name, "kubeagents-")) && cr.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, cr)); err != nil {
+				return fmt.Errorf("failed to delete legacy ClusterRole %s: %w", cr.Name, err)
+			}
+		}
+	}
+
+	// 4. Dynamically clean up RoleBindings in the agent's namespace (with SA swap protection)
+	var existingRoleBindings rbacv1.RoleBindingList
+	if err := r.List(ctx, &existingRoleBindings, client.InNamespace(agent.Namespace)); err != nil {
+		return fmt.Errorf("failed to list RoleBindings in namespace %s: %w", agent.Namespace, err)
+	}
+	for i := range existingRoleBindings.Items {
+		rb := &existingRoleBindings.Items[i]
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
+			continue
+		}
+		isTargetSA := false
+		for _, subj := range rb.Subjects {
+			if subj.Kind == "ServiceAccount" &&
+				(subj.Namespace == "" || subj.Namespace == agent.Namespace) &&
+				(subj.Name == saName || subj.Name == agent.Name) {
+				isTargetSA = true
+				break
+			}
+		}
+		if isTargetSA && (strings.HasPrefix(rb.Name, "kubeagents:") || strings.HasPrefix(rb.Name, "kubeagents-")) && rb.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, rb)); err != nil {
+				return fmt.Errorf("failed to clean up legacy RoleBinding %s: %w", rb.Name, err)
+			}
+		}
+	}
+
+	// 5. Clean up local and leader Role/RoleBindings if deleteAll is requested
+	if deleteAll {
+		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
+			return fmt.Errorf("failed to delete leader Role %s: %w", leaderBindingName, err)
+		}
+
+		rbLeader := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: leaderBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbLeader)); err != nil {
+			return fmt.Errorf("failed to delete leader RoleBinding %s: %w", leaderBindingName, err)
+		}
+
+		rLocal := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: localBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rLocal)); err != nil {
+			return fmt.Errorf("failed to delete local Role %s: %w", localBindingName, err)
+		}
+
+		rbLocal := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: localBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbLocal)); err != nil {
+			return fmt.Errorf("failed to delete local RoleBinding %s: %w", localBindingName, err)
+		}
+	}
+
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-	crbViewer := buildClusterRoleBinding(agent, viewerRBACName, "view")
-	err := r.applyManaged(ctx, agent, crbViewer)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile viewer ClusterRoleBinding: %w", err)
+	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
+	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
+	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+
+	// Reconcile minimal read-only audit ClusterRole and ClusterRoleBinding
+	minimalRole := buildMinimalPlatformRole(agent)
+	if err := r.applyManaged(ctx, agent, minimalRole); err != nil {
+		return fmt.Errorf("failed to reconcile minimal ClusterRole: %w", err)
 	}
 
-	explorerRole := buildPlatformExplorerRole(agent)
-	err = r.applyManaged(ctx, agent, explorerRole)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile explorer ClusterRole: %w", err)
+	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
+	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
+		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
 	}
 
-	explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-	crbExplorer := buildClusterRoleBinding(agent, explorerRBACName, explorerRole.Name)
-	err = r.applyManaged(ctx, agent, crbExplorer)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile explorer ClusterRoleBinding: %w", err)
+	// Reconcile namespace-scoped Role and RoleBinding for inspecting PlatformAgent CRs
+	localRole := buildPlatformLocalRole(agent)
+	if err := ctrl.SetControllerReference(agent, localRole, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on local Role: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, localRole); err != nil {
+		return fmt.Errorf("failed to reconcile local Role: %w", err)
 	}
 
+	localBinding := buildRoleBinding(agent, localBindingName, localRole.Name)
+	if err := ctrl.SetControllerReference(agent, localBinding, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on local RoleBinding: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, localBinding); err != nil {
+		return fmt.Errorf("failed to reconcile local RoleBinding: %w", err)
+	}
+
+	// Reconcile leader election Role and RoleBinding
 	leaderRole := buildPlatformLeaderRole(agent)
-	err = r.applyManaged(ctx, agent, leaderRole)
-	if err != nil {
+	if err := ctrl.SetControllerReference(agent, leaderRole, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on leader Role: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, leaderRole); err != nil {
 		return fmt.Errorf("failed to reconcile leader Role: %w", err)
 	}
 
-	leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-	rbLeader := buildLeaderRoleBinding(agent, leaderRBACName, leaderRole.Name)
-	err = r.applyManaged(ctx, agent, rbLeader)
-	if err != nil {
+	rbLeader := buildLeaderRoleBinding(agent, leaderBindingName, leaderRole.Name)
+	if err := ctrl.SetControllerReference(agent, rbLeader, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on leader RoleBinding: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, rbLeader); err != nil {
 		return fmt.Errorf("failed to reconcile leader RoleBinding: %w", err)
+	}
+
+	// Clean up legacy or un-canonical RBAC definitions after new roles are applied (Zero-Downtime Upgrade)
+	if err := r.cleanupAgentRBAC(ctx, agent, false); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+// the caller can decide whether the agent is still converging. otlpEndpoint and
+// otlpSource are the resolved telemetry wiring; they are reported rather than derived
+// because discovery is otherwise invisible to anyone reading the CR.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -592,6 +949,25 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 	}
 
+	// Cluster event ingestion, reported only while it is switched off. A
+	// permanently-present condition would have to read True on every healthy
+	// install, and True here could only ever mean "the operator asked for a
+	// watcher" — it is not a liveness check, and a watcher that dies leaves the
+	// pod Ready with nothing to show for it. Claiming otherwise on every CR is
+	// worse than saying nothing, so the condition exists only in the state that
+	// is genuinely worth reporting: somebody pressed the emergency stop.
+	eventWatcherOn := eventWatcherEnabled(agent)
+	existingWatcherCond := meta.FindStatusCondition(agent.Status.Conditions, eventWatcherConditionType)
+	// Message is compared alongside Status and Reason, as the Ready and Degraded
+	// terms below do. Reason is a constant here, so the only way the text can
+	// differ is a release that rewords eventWatcherDisabledMessage — and that
+	// message is the recovery instruction a reader gets from `kubectl describe`.
+	// Leaving it out would freeze the previous release's wording on every
+	// install still holding the stop, since nothing else about them changes.
+	eventWatcherUnchanged := (eventWatcherOn && existingWatcherCond == nil) ||
+		(!eventWatcherOn && existingWatcherCond != nil && existingWatcherCond.Status == metav1.ConditionFalse &&
+			existingWatcherCond.Reason == eventWatcherDisabledReason && existingWatcherCond.Message == eventWatcherDisabledMessage)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) ||
@@ -604,7 +980,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
 		agent.Status.ServiceStatus.Endpoint == newServiceStatusEndpoint &&
 		agent.Status.Address == newAddress &&
+		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
+		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		degradedUnchanged &&
+		eventWatcherUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return newPhase, nil
 	}
@@ -616,6 +995,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
 	agent.Status.ServiceStatus.Endpoint = newServiceStatusEndpoint
 	agent.Status.Address = newAddress
+	agent.Status.Telemetry.OTLPEndpoint = otlpEndpoint
+	agent.Status.Telemetry.OTLPEndpointSource = otlpSource
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -640,6 +1021,18 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
 	} else {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, "Degraded")
+	}
+
+	if eventWatcherOn {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, eventWatcherConditionType)
+	} else {
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:               eventWatcherConditionType,
+			Status:             metav1.ConditionFalse,
+			Reason:             eventWatcherDisabledReason,
+			Message:            eventWatcherDisabledMessage,
+			LastTransitionTime: now,
+		})
 	}
 
 	return newPhase, r.Status().Update(ctx, agent)
@@ -734,6 +1127,10 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	if r.APIReader == nil && mgr != nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	bld := ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		Owns(&appsv1.Deployment{}).
@@ -785,6 +1182,42 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return bld.
+		Watches(
+			// The metadata egress rules carry one /32 per node, so a node joining or
+			// leaving invalidates the policy. Without this the set would only be
+			// refreshed by an unrelated event or the 10-hour informer resync, and an
+			// agent scheduled onto an unrepresented node loses Workload Identity.
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
+				var list agentv1alpha1.PlatformAgentList
+				if err := mgr.GetClient().List(ctx, &list); err != nil {
+					return nil
+				}
+				reqs := make([]reconcile.Request, 0, len(list.Items))
+				for i := range list.Items {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: list.Items[i].Namespace,
+							Name:      list.Items[i].Name,
+						},
+					})
+				}
+				return reqs
+			}),
+			// Kubelet rewrites Node status constantly — conditions, capacity, the image
+			// list. Only an address change can alter the policy, so everything else is
+			// filtered out rather than allowed to storm the queue.
+			builder.WithPredicates(predicate.Funcs{
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					oldNode, okOld := e.ObjectOld.(*corev1.Node)
+					newNode, okNew := e.ObjectNew.(*corev1.Node)
+					if !okOld || !okNew {
+						return true
+					}
+					return !equality.Semantic.DeepEqual(oldNode.Status.Addresses, newNode.Status.Addresses)
+				},
+			}),
+		).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

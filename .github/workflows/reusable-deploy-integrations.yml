@@ -12,10 +12,10 @@ on:
         type: boolean
         default: false
         description: "If true, bypasses paths filter and forces deployment of all integrations"
-      checkout_ref:
+      checkout_sha:
         required: true
         type: string
-        description: "The git ref to pass to actions/checkout"
+        description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
 jobs:
   detect-changes:
@@ -28,12 +28,13 @@ jobs:
         if: ${{ inputs.force_deploy == false }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Detect changes
         if: ${{ inputs.force_deploy == false }}
         id: filter
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             litellm:
@@ -75,13 +76,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
-          cache-dependency-path: "k8s-operator/go.sum"
+          # No module cache: this job holds the target environment's deploy
+          # credentials, and a cache it writes on the default branch is
+          # restorable by every branch built off it.
+          cache: false
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -104,6 +109,9 @@ jobs:
           CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          # Allow deployments on pre-existing CI evaluation / environment clusters
+          # created without Cloud KMS CMEK encryption until they are upgraded.
+          ALLOW_UNENCRYPTED_SECRETS: ${{ vars.ALLOW_UNENCRYPTED_SECRETS || 'true' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -131,13 +139,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
-          cache-dependency-path: "k8s-operator/go.sum"
+          # No module cache: this job holds the target environment's deploy
+          # credentials, and a cache it writes on the default branch is
+          # restorable by every branch built off it.
+          cache: false
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -232,13 +244,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
-          cache-dependency-path: "k8s-operator/go.sum"
+          # No module cache: this job holds the target environment's deploy
+          # credentials, and a cache it writes on the default branch is
+          # restorable by every branch built off it.
+          cache: false
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0

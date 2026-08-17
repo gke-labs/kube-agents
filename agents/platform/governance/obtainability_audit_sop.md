@@ -61,7 +61,7 @@ gcloud container clusters list --format=json
 - **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; name any check that could have run there and did not in that cluster's `limitations`, and any check its shape rules out in `checks_not_applicable`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces both halves: it rejects a document whose two lists overlap, and any finding whose `cluster` names a `scope.skipped` entry.
 - A cluster you cannot read goes in `scope.skipped` with a literal reason: `"status=STOPPING"`, `"get-credentials failed: <stderr first line>"`, `"timeout after 30s"`. A skipped cluster is never silently dropped.
 - A partial read is **not** a skip. If the dump succeeded but one kind was refused, the cluster stays in `scope.clusters` and the refusal goes in its `limitations`: `"RBAC: cannot list horizontalpodautoscalers; checks 3.5 and 3.6 not run."` Skipping it would suppress every finding you did prove there.
-- Obtain per-cluster credentials into an isolated kubeconfig so clusters cannot bleed into each other:
+- Obtain per-cluster credentials into an isolated kubeconfig so clusters cannot bleed into each other — the naming and the reason it must sit under `$HERMES_HOME` are in `AGENTS.md` ("Cluster Credentials"):
   ```bash
   export KC="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml"
   KUBECONFIG=$KC gcloud container clusters get-credentials <cluster> --location=<location> --project=<project>
@@ -262,7 +262,7 @@ One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `pr
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
-- **An on-demand run is never silent.** If a person dispatched this job — from a kanban card, from chat, from `cronjob(action='run')` — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
+- **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
 
 What to report in each case:
 

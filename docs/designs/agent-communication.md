@@ -12,8 +12,8 @@
 
 The platform is a **decoupled, persona-based** system:
 
-- **Platform Agent** — one Hermes profile (the `default` profile). User-facing (chat), fleet-wide synthesis.
-- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. Runs its own cron for periodic local scans, processes delegated tasks, and keeps its own `multiuser_memory`.
+- **Platform Agent** — one Hermes profile (the `platform` profile). Fleet-wide synthesis. It is not the chat front door: the `default` profile is the Chat Agent, which owns chat ingress and delegates to this one (§6.1).
+- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. Runs its own cron for periodic local scans, and processes delegated tasks.
 
 Two communication channels, with different shapes and different reliability requirements:
 
@@ -254,7 +254,7 @@ The MVP starts with `health` and `utilization`; the others are added as their CU
 
 ### 2.7 Concurrency, atomicity, retention
 
-- **Atomic writes** (same-directory temp + `fsync` + `os.replace`) — no torn reads, crash-safe (matches the `multiuser_memory` / `save_job_output` recipe).
+- **Atomic writes** (same-directory temp + `fsync` + `os.replace`) — no torn reads, crash-safe (matches the `save_job_output` recipe).
 - **Latest-wins** — each `(cluster, location, type)` is a single file, overwritten each cycle. No history in the handover layer (history lives in cron output / logs if needed).
 - **Staleness** — readers honor `expires_at`; producers set a `ttl_seconds` sized to their scan cadence (e.g. a 5-minute health scan → `ttl ≈ 15m`).
 - **Concurrent writers within a profile** — the persistent cron context and any transient worker share the profile; if both could write the same handover file, wrap the helper's write in an `flock` (the `_jobs_lock` pattern). Low risk (distinct types, low cadence) but cheap to harden.
@@ -279,7 +279,7 @@ The platform agent can accomplish fleet operations **by itself**: it reads hando
 
 The platform delegates when it benefits from one of:
 
-- **Context preservation.** Deep per-cluster investigation (RCA, upgrade analysis) would bloat the platform's context window. Delegating gives each cluster subagent a **fresh context** plus its **own cluster memory** (`multiuser_memory`), and returns only a compact structured result to the platform.
+- **Context preservation.** Deep per-cluster investigation (RCA, upgrade analysis) would bloat the platform's context window. Delegating gives each cluster subagent a **fresh context**, and returns only a compact structured result to the platform.
 - **Deterministic planning.** The kanban board provides structured orchestration the platform would otherwise hand-roll: parent/child **DAG dependencies**, **fan-in** aggregation, lifecycle states, **claim/lease** semantics (no double-execution) and retries. When a job has real structure or ordering, delegating makes the plan deterministic and inspectable rather than something the platform juggles in a single turn.
 
 If neither applies (a quick, single-cluster action), the platform just does it directly and skips kanban.
@@ -301,7 +301,7 @@ Delegated cards **do not imperatively mutate clusters**. They either (a) **valid
 Delegation is **transparent to the user**, not hidden plumbing:
 
 - On `kanban_create`, the originating chat session is **auto-subscribed** to the task.
-- The gateway's kanban notifier surfaces task **lifecycle events** (claimed / completed / blocked) back into that chat, and workers can post progress via `kanban_comment`.
+- The gateway's kanban notifier surfaces a card's **terminal** events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `status`, `archived`, `unblocked`, `block_loop_detected`) back into that chat, plus `heartbeat` for mid-run progress: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note joins a `⏳` line in the card's rolling progress message, delivered straight from the board and deliberately not waking the subscribed agent, so progress costs no LLM turn. Only the first note posts a message; the rest are edits to it, on any platform whose adapter supports editing, so a talkative card interrupts the space once. A terminal event settles that message (`✓` or `⏹`) and posts its own — the completion is the notification. `claimed` is not among them, and `kanban_comment` posts nothing to chat at all — a comment reaches a human only by causing a worker to act.
 - The orchestrator (platform) narrates its plan when it decides to delegate ("delegating readiness checks to 3 clusters…") and reports the synthesized result when the fan-in completes.
 
 Net effect: delegated cluster subagents **emit their thoughts and results to the chat**, so the platform admin can watch the orchestration unfold and intervene (e.g. answer a `needs_input` block) without digging into internal state.
@@ -320,10 +320,12 @@ Net effect: delegated cluster subagents **emit their thoughts and results to the
 Card A  (assignee = clusterA):  "Can you host workload W?"      ─┐  parents
 Card B  (assignee = clusterB):  "Is it safe to evacuate W?"     ─┤  (parallel — independent checks)
                                                                  ▼
-Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in child
+Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in card
 ```
 
 The two validation cards are **parallel** (no ordering dependency — they're read-only checks). The make-before-break _execution_ ordering is handled later by KCC when it reconciles the PR, not by the agents.
+
+`parents` is a **"runs after"** list, not a "belongs to" list: an edge points at what must finish _first_, and a card is unclaimable until every parent is settled. So A and B are created with **no** `parents` — in particular not the orchestrator's own in-flight card, which would deadlock them behind a card that is itself waiting on them. The image guards this: `deploy/docker/patches/kanban_scheduling.py` inverts an edge when a card blocks and is the last unfinished prerequisite of its own children, and records a `dependency_repaired` task event.
 
 **Card A result — clusterA feasibility (`kanban_complete` metadata):**
 
@@ -397,7 +399,7 @@ The two validation cards are **parallel** (no ordering dependency — they're re
 
 **Raised by** @dshnayder in review of [#439](https://github.com/gke-labs/kube-agents/pull/439#discussion_r3660282410): when a user says _"check the health of **my cluster**"_, it would be good if the very first agent — the Chat Agent front door — knew which cluster that means.
 
-**Where this stands.** The memory half is now built. The Chat Agent is no longer stateless: it holds the `multiuser_memory` provider, which keys a private store off the gateway identity and hydrates it into the system prompt each session, and `SOUL.md` §1.6 requires it to substitute every possessive with a concrete value before composing a `kanban_create` body. So _"my cluster"_ resolves at the front door for any user who has stated their cluster once. The remaining gap is the **cold start** — a user who has not said it yet, where the front door must fall back to the roster.
+**Where this stands.** The memory half is now built. The Chat Agent is no longer stateless: it holds the `kube_agents_memory` provider, which tags each session's memories with the gateway identity and recalls that user's own facts into the prompt each turn, and `SOUL.md` §1.6 requires it to substitute every possessive with a concrete value before composing a `kanban_create` body. So _"my cluster"_ resolves at the front door for any user who has stated their cluster once. The remaining gap is the **cold start** — a user who has not said it yet, where the front door must fall back to the roster.
 
 **Why the roster fallback is hard.** It carries almost no per-cluster signal:
 
@@ -413,10 +415,10 @@ The two validation cards are **parallel** (no ordering dependency — they're re
 
 **Sketched direction** for the cold-start case, in increasing order of cost — each step is useful alone:
 
-| Step | Change                                                                                                                         | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1    | Front-door rule: if exactly one `cluster-*` agent exists, "my cluster" means that one; otherwise ask once, listing candidates. | Prompt-only (`agents/chat/SOUL.md`), no new state. Removes the silent-wrong-cluster failure but does not resolve the reference.                                                                                                                                                                                                                                                                                                            |
-| 2    | Surface structured `{project, cluster, location}` per agent in `list_agents`.                                                  | Reuses `read_cluster_identity()` (`agents/platform/scripts/cluster_agent_profile.py`), already documented as the robust inverse of the sanitized/hashed name. The router can import it: the Dockerfile colocates `agents/chat/scripts/` and `agents/platform/scripts/` under `$HERMES_HOME/scripts`. Note that helper currently catches only `FileNotFoundError`/`yaml.YAMLError`, so it needs an `OSError` guard to satisfy constraint 4. |
-| 3    | ~~A narrow per-user default-cluster preference.~~ **Done** — via general per-user memory rather than a scoped router tool.     | `multiuser_memory` on the `default` profile, keyed on the gateway `user_id`. One sub-question resolved the hard way: in a **shared thread** `user_id` is whoever opened the session, because `build_session_key()` omits the participant id there unless `thread_sessions_per_user` is set. The provider fails closed in that case — no personal reads, no personal writes — so step 1 or 2 is still the only cold-start path in a space.  |
+| Step | Change                                                                                                                         | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | Front-door rule: if exactly one `cluster-*` agent exists, "my cluster" means that one; otherwise ask once, listing candidates. | Prompt-only (`agents/chat/SOUL.md`), no new state. Removes the silent-wrong-cluster failure but does not resolve the reference.                                                                                                                                                                                                                                                                                                                                                                                |
+| 2    | Surface structured `{project, cluster, location}` per agent in `list_agents`.                                                  | Reuses `read_cluster_identity()` (`agents/platform/scripts/cluster_agent_profile.py`), already documented as the robust inverse of the sanitized/hashed name. The router can import it: the Dockerfile colocates `agents/chat/scripts/` and `agents/platform/scripts/` under `$HERMES_HOME/scripts`. Note that helper currently catches only `FileNotFoundError`/`yaml.YAMLError`, so it needs an `OSError` guard to satisfy constraint 4.                                                                     |
+| 3    | ~~A narrow per-user default-cluster preference.~~ **Done** — via general per-user memory rather than a scoped router tool.     | `kube_agents_memory` on the `default` profile, scoped by a tag derived from the gateway `user_id`. One sub-question resolved the hard way: in a **shared thread** `user_id` is whoever opened the session, because `build_session_key()` omits the participant id there unless `thread_sessions_per_user` is set — so a thread's participants would share one identity. The provider detects that case and disables personal memory rather than crossing users, which makes per-user memory DM-only by design. |
 
 Step 2 remains the open piece: it is what makes the cold start — and the shared-thread case, where personal memory is deliberately unavailable — resolvable without a round trip.

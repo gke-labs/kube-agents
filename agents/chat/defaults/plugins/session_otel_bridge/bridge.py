@@ -1,11 +1,22 @@
 import json
+import logging
 import os
 import sqlite3
+import sys
 from inspect import Signature, signature
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from hermes_plugins.hermes_otel.tracer import get_tracer
+
+# See the matching note in plugins/session_store/store.py.
+_PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
+if _PLUGINS_DIR not in sys.path:
+    sys.path.insert(0, _PLUGINS_DIR)
+
+from common.redactor import AuditRedactor  # noqa: E402
+
+logger = logging.getLogger("hermes.plugin.session_otel_bridge")
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -67,7 +78,14 @@ class OtelSessionBridge:
 
     def _merge_fixed_session_attributes(self, session_id: str, attributes: Optional[dict]) -> dict:
         attrs = dict(attributes or {})
-        session_attrs = self._span_attributes_for_session(session_id)
+        # start_span is monkey-patched onto the global Hermes tracer, so an
+        # exception raised here escapes into every span the agent opens. A
+        # metadata lookup failure must degrade to "no identity attributes".
+        try:
+            session_attrs = self._span_attributes_for_session(session_id)
+        except Exception as exc:
+            logger.warning("Failed to resolve session attributes for OTel span: %s", exc)
+            return attrs
         if session_attrs:
             attrs.update(session_attrs)
         return attrs
@@ -79,7 +97,18 @@ class OtelSessionBridge:
             return {}
 
         platform = metadata.get("platform") or ""
-        sender_id = metadata.get("user_id") or metadata.get("user_email") or ""
+        # `user_email`, and `user_id` on Google Chat, are only address-shaped on
+        # rows written before the identities were pseudonymised; hash them here
+        # so a span never carries a plain address. `pseudonymise_identity` is a
+        # pass-through for anything without an `@`, so an already-hashed digest
+        # and a Slack member id both survive unchanged. The server-side purge
+        # covers the same rows but is best-effort — it skips any row whose
+        # metadata will not parse — so this reader does not depend on it.
+        sender_id = (
+            AuditRedactor.pseudonymise_identity(metadata.get("user_id"))
+            or metadata.get("user_email_hash")
+            or AuditRedactor.pseudonymise_identity(metadata.get("user_email"))
+        )
         user_id = sender_id
         if user_id and platform and ":" not in str(user_id):
             user_id = f"{platform}:{user_id}"

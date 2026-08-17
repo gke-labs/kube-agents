@@ -1,0 +1,144 @@
+{{- if and .Values.operator.enabled .Values.operator.webhooks.enabled }}
+{{- /*
+  The one combination that cannot work, caught at render time rather than as a
+  rejected CR halfway through the apply. On a fresh install Helm registers the
+  webhook configurations before it creates the Certificate and the PlatformAgent
+  CR, so under failurePolicy=Fail the API server rejects that CR — the operator
+  is still waiting on a certificate that does not exist yet. Upgrades are fine:
+  the operator is already serving, which is why this is gated on IsInstall.
+*/}}
+{{- if and .Release.IsInstall (eq .Values.operator.webhooks.failurePolicy "Fail") .Values.platformAgent.enabled }}
+{{- fail "operator.webhooks.failurePolicy=Fail deadlocks a fresh install that also creates the PlatformAgent CR: Helm registers the webhooks before the operator has a serving certificate, so the CR is rejected. Install the operator first with platformAgent.enabled=false, then enable the CR; or install with the default failurePolicy=Ignore and switch to Fail on a later upgrade." }}
+{{- end }}
+{{- /*
+  Mirrors k8s-operator/config/webhook and config/certmanager, which the
+  kustomize install path composes in k8s-operator/config/default. The kustomize
+  copy is the source of truth; scripts/check_iac_parity.py compares the two.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kube-agents.webhookServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  ports:
+    - port: 443
+      protocol: TCP
+      targetPort: 10250
+  selector:
+    {{- include "kube-agents.operatorSelectorLabels" . | nindent 4 }}
+{{- if .Values.operator.webhooks.certManager.enabled }}
+---
+{{- /*
+  A self-signed issuer, matching config/certmanager/certificate.yaml. The
+  webhook's clients are the API server and nothing else, and the CA bundle
+  reaches it through cainjection rather than a trust store, so a public chain
+  buys nothing here.
+*/}}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Release.Name }}-selfsigned-issuer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "kube-agents.webhookCertificateName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  dnsNames:
+    - {{ printf "%s.%s.svc" (include "kube-agents.webhookServiceName" .) .Release.Namespace }}
+    - {{ printf "%s.%s.svc.cluster.local" (include "kube-agents.webhookServiceName" .) .Release.Namespace }}
+  issuerRef:
+    kind: Issuer
+    name: {{ .Release.Name }}-selfsigned-issuer
+  secretName: {{ include "kube-agents.webhookCertSecretName" . }}
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "kube-agents.webhookConfigurationPrefix" . }}-mutating-webhook-configuration
+  {{- if .Values.operator.webhooks.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ printf "%s/%s" .Release.Namespace (include "kube-agents.webhookCertificateName" .) }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+webhooks:
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: {{ include "kube-agents.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-kubeagents-x-k8s-io-v1alpha1-platformagent
+    failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
+    name: mplatformagent.kb.io
+    {{- /*
+      No namespaceSelector, matching the kustomize copy. The manager sets no
+      cache namespace restriction, so it reconciles PlatformAgents in every
+      namespace; scoping admission to the release namespace would let a CR
+      elsewhere be reconciled without ever being defaulted or validated.
+      The cost is that two releases both intercept cluster-wide — see the chart
+      README's Notes on running more than one.
+    */}}
+    rules:
+      - apiGroups:
+          - kubeagents.x-k8s.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - platformagents
+    sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "kube-agents.webhookConfigurationPrefix" . }}-validating-webhook-configuration
+  {{- if .Values.operator.webhooks.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ printf "%s/%s" .Release.Namespace (include "kube-agents.webhookCertificateName" .) }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+webhooks:
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: {{ include "kube-agents.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-kubeagents-x-k8s-io-v1alpha1-platformagent
+    failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
+    name: vplatformagent.kb.io
+    rules:
+      - apiGroups:
+          - kubeagents.x-k8s.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+        resources:
+          - platformagents
+    sideEffects: None
+{{- end }}

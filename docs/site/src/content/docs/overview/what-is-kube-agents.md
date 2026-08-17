@@ -15,15 +15,15 @@ A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines th
 
 The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. One gateway process hosts the co-located Hermes profiles:
 
-**The Chat Agent** (`agents/chat/`, the `default` profile) — the conversational front door and the only profile that receives chat ingress. It carries a `router` MCP server ([`agents/chat/scripts/router_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/router_server.py)) for discovering specialists (`list_agents`) and delegates work to them as kanban cards. It holds no infrastructure tools of its own.
+**The Chat Agent** (`agents/chat/`, the `default` profile) — the conversational front door and the only profile that receives chat ingress. Its `agent_roster` plugin injects the current specialists into every turn, so picking one to delegate to costs no tool call; the `router` MCP server ([`agents/chat/scripts/router_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/router_server.py)) exposes the same list as `list_agents` for an on-demand refresh. Both render from [`agents/chat/scripts/agent_roster.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/agent_roster.py). It delegates work to the specialists as kanban cards and holds no infrastructure tools of its own.
 
 **The Platform Agent** (`agents/platform/`, the `platform` profile) — the privileged specialist, scaffolded at pod startup from the workspace template by `profile_scaffold.py`. Inside it:
 
 - **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, kanban worker protocol, autonomous recovery ladder, and reporting style.
-- **Routing description (`CAPABILITIES.md`)** — the one-liner the Chat Agent's `list_agents` uses to decide what to route here.
+- **Routing description (`CAPABILITIES.md`)** — the one-liner that describes this profile on the Chat Agent's roster, so it knows what to route here.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
 - **Governance SOPs** (`agents/platform/governance/*.md`) — standard operating procedures the cron watchdogs invoke.
-- **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP.
+- **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP. Ticking is a property of the Chat Agent's gateway, the only running one, so a job on its roster advances this profile's schedule once a minute.
 - **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for session and agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
 - **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface, plus a `kanban` toolset for creating and routing delegation cards.
 
@@ -33,7 +33,7 @@ The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime]
 
 The Platform Agent talks to an LLM through a **Completions API** proxy so provider choice is a config toggle:
 
-- **[LiteLLM](https://litellm.ai)** for hosted models — Gemini (default), Anthropic, OpenAI, or a personal ChatGPT subscription. Example manifests: [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini), [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).
+- **[LiteLLM](https://litellm.ai)** for hosted models — Gemini (default), Vertex AI / Model Garden, Anthropic, OpenAI, or a personal ChatGPT subscription. Example manifests: [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini), [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).
 - **[vLLM](https://vllm.ai)** for local, open models on GPU node pools — [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) serves Gemma via GKE's official inference tutorial.
 - An optional **inference-replay proxy** in front of either can cache responses from a `PersistentVolumeClaim` so demos and tests replay deterministically — [`examples/inference-replay/`](https://github.com/gke-labs/kube-agents/tree/main/examples/inference-replay).
 

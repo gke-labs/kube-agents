@@ -27,7 +27,7 @@ mirror them.
 
 ```hcl
 module "github_minter" {
-  source     = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/github-minter?ref=vX.Y.Z"
+  source     = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/github-minter?ref=1.2.0"
   project_id = "my-gcp-project"
   location   = "us-central1"
 }

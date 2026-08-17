@@ -7,7 +7,8 @@ location     = "us-central1"
 #   openssl rand -hex 32
 api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
-# Model-provider credential(s) — set at least one so the agent can run.
+# Model-provider credential(s) — set at least one so the agent can run, unless
+# model_provider = "vertex_ai" (see below), which needs none.
 # Empty keys are omitted from the Secret.
 # NOTE: all keys above and below end up in plaintext in the Terraform state
 # (and in the in-cluster Secret) — keep the state in a protected backend.
@@ -16,8 +17,8 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # openai_api_key    = "sk-..."
 
 # Image tag for the operator and platform agent. Defaults to "latest";
-# pin a vX.Y.Z release tag for production.
-# image_tag = "vX.Y.Z"
+# pin an X.Y.Z release tag for production.
+# image_tag = "1.2.0"
 
 # Cluster tuning
 # deletion_protection = true
@@ -41,6 +42,60 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # model_provider     = "gemini"
 # model_default_name = ""
 
+# Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
+# Both vertex_* variables default to the install's project and cluster location.
+# model_provider     = "vertex_ai"
+# model_default_name = "gemini-3.5-flash"
+# vertex_project_id  = ""
+# vertex_location    = ""
+
 
 # Optional GitHub token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
+
+# Optional Slack integration. Needs no GCP resources: the tokens go into the
+# credentials Secret and the CR's slack section turns on. Creating the Slack
+# app (Socket Mode + bot scopes) stays manual — see the README.
+# enable_slack            = true
+# slack_bot_token         = "xoxb-..."
+# slack_app_token         = "xapp-..."
+# slack_allowed_users     = ["U01234567"]
+# slack_home_channel      = "C01234567"
+# slack_home_channel_name = "#kube-agents"
+
+# IAM. "read-only" (default) or "gke-admin" select the bundles
+# provision_04_gcp_iam.sh grants; "custom" requires project_roles. An explicit
+# project_roles list overrides permission_set either way.
+# permission_set = "read-only"
+
+# Optional scheduled backups of the release namespace. Off by default in both
+# install paths: Backup for GKE bills per backed-up pod and per GB of snapshot
+# storage, and the snapshots contain the agent's credentials Secret.
+# enable_gke_backup_plan = true
+# backup_cron_schedule   = "0 2 * * *"
+# backup_retain_days     = 30
+# backup_encryption_key  = "projects/my-gcp-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key"
+
+# Admission webhooks for the PlatformAgent CR, and the cert-manager install
+# that issues their serving certificate. Both default to on, matching
+# provision_03_gcp_gke_operator.sh.
+#
+# Set enable_cert_manager = false if the cluster ALREADY runs cert-manager —
+# the script skips an existing install, this apply fails on the existing CRDs.
+# The webhooks keep working in that case; they just use the cert-manager that
+# is already there.
+#
+# Destroying a release that installed cert-manager here removes its CRDs, and
+# with them every Certificate and Issuer in the cluster, not only these. On a
+# shared cluster, install cert-manager separately and set this to false.
+# enable_cert_manager  = true
+# enable_webhooks      = true
+# cert_manager_version = "v1.21.1"
+
+# Anything the variables above do not reach. Deep-merged over the values this
+# composition computes, so one leaf can be set without restating its block.
+# extra_helm_values = {
+#   litellm = { otel = true }
+#   telemetry = { otlpEndpoint = "http://opentelemetry-collector.observability.svc.cluster.local:4318" }
+#   platformAgent = { harness = { hermes = { dashboardEnabled = false } } }
+# }

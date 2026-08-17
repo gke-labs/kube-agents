@@ -40,7 +40,7 @@ For each changed source item:
   - Identifiers that have a source-of-truth file (service-account and namespace names, permission-set defaults, versions) — verify against the identifier-sources table in the map, never against other docs.
   - `SOUL.md §N` references anywhere in the docs — verify against the current headings of that `SOUL.md`.
   - Paths docs claim are baked into container images — verify against the Dockerfile.
-  - Hard-coded counts ("eleven steps", "20 skills") — outside the mechanically checked map these should generally not exist; flag any the PR introduces.
+  - Hard-coded counts ("eleven steps", "20 skills") — these should generally not exist anywhere, the map included; flag any the PR introduces.
   - Agent scope and topology claims — which profile receives chat ingress, which agents may mutate infrastructure or write to GitOps, which are read-only, and how work is delegated between them. Verify against the repository layout in `AGENTS.md` and the agents' own persona docs and config (`agents/*/SOUL.md`, `agents/*/config.yaml`), never against other docs or your memory of the architecture. Docs that conflate two agents' scopes, or that still describe the topology from before a PR that changed it, are drift.
 
 ## 3. Review changed docs (docs → rules and source)
@@ -56,7 +56,8 @@ For every doc the PR adds or edits:
 
 ## 4. Check the instruments themselves
 
-- **`docs/README.md` (the map):** if the PR adds, moves, renames, or deletes any doc, the map must reflect it — tree section, stated total, and inventory table. The map is hand-maintained; `make docs-check` (`docs-check-map`) enforces presence and counts — an inventory entry per tracked doc outside root-level dot-directories, no dead paths in the path column, the stated document total, and each collapsed family row's file count. The row summaries and the identifier-sources table have no mechanical guard, so verify those here. Also spot-check that map entries touching the PR's area are still accurate.
+- **`docs/README.md` (the map):** if the PR adds, moves, renames, or deletes a doc that no collapsed family row's glob already covers, the map must reflect it — tree section and inventory table. A file landing inside an existing family (a new skill, SOP, or reference) needs no map edit, only `make docs-generate`. The map is hand-maintained; `make docs-check` (`docs-check-map`) enforces presence and shape — an inventory entry per tracked doc outside root-level dot-directories, no dead paths in the path column, and single-space table padding. The map states no counts by design. A file _deleted_ from inside a family glob is invisible to those checks — the glob still matches the survivors — and is caught instead by the generated `docs/family-roster.txt`, which `docs-check-generated` fails on until it is regenerated; if the PR removes a family member, expect the deleted roster line in the diff and check the row still describes what is left. The row summaries and the identifier-sources table have no mechanical guard, so verify those here. Also spot-check that map entries touching the PR's area are still accurate.
+- **Map churn is a finding.** The map is the repository's most conflict-prone file. A map diff that rewrites rows the PR did not author — re-aligned table columns, re-wrapped cells — is Blocking: it conflicts with every other open PR that adds a row. The correct diff is the inserted rows and nothing else.
 - **Map staleness window:** the map stores no "last verified" stamp; derive the delta from git instead — everything that changed since the map itself was last touched is the map's unreviewed backlog:
 
   ```bash
@@ -69,7 +70,7 @@ For every doc the PR adds or edits:
 
 ## 5. Run the mechanical gates
 
-- `make docs-check` at the PR's HEAD — generated tables current, relative links resolve (targets must be git-tracked), terminology matches source, map inventory and counts current.
+- `make docs-check` at the PR's HEAD — generated tables current, relative links resolve (targets must be git-tracked), terminology matches source, map inventory current and its tables un-re-aligned.
 - If the PR touched a generated-table source: run `make docs-generate` and confirm `git status` is clean afterwards (a dirty tree means the PR forgot to commit regenerated tables).
 - `npx prettier --check` on changed `.md`/`.json`/`.yaml` files (note: the generated `skills/index.mdx` is intentionally prettier-exempt).
 - If site pages changed: `cd docs/site && npm run build`.

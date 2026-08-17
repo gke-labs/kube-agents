@@ -6,21 +6,77 @@ model:
   api_key: none
 
 # MCP Servers configuration.
+#
+# `agent_common` (the `call_agent` A2A tool) was declared here and is not any
+# more. It could not work in this deployment and never had: the agent container
+# holds API_SERVER_KEY="cluster-internal-trusted", the non-secret loopback
+# sentinel, while the Service URL the tool targets
+# (https://platform-agent…:8642) forwards to the credential sidecar's plaintext
+# agent-API listener on 8643, which authenticates against the real
+# API_SERVER_EXTERNAL_KEY it alone holds. So the request failed the TLS
+# handshake, and would have been refused as unauthenticated had it completed.
+# Making it work would mean putting the external key in the agent container,
+# collapsing a split the operator's own tests pin.
+#
+# Removed rather than repaired for the reason `ask_agent` was removed before it
+# (agents/chat/config.yaml, and renderConfigYAML in the operator): a
+# synchronous cross-agent call blocks up to 300s with no visible progress.
+# Delegation here is kanban-only. agent_common_server.py stays on disk —
+# platform_mcp_server.py and session_kv_server.py import helpers from it — so
+# only the tool surface is gone.
+#
+# `lazy: true` on every server, because this file is merged into the PLATFORM
+# profile and most of that profile's turns run in a throwaway kanban worker
+# process. Eagerly connecting these servers costs a worker ~3s before the agent
+# says anything (measured: `wait_for_mcp_discovery` blocks 2.4-3.8s of a ~9.7s
+# spawn-to-first-token, spawning and handshaking every server). The long-lived
+# gateway pays that once at boot; a worker re-pays it every task.
+#
+# Lazy registers each server's tools from `<profile>/cache/mcp_schema_cache.json`
+# with no child process (`_register_from_cache_sync` in hermes `tools/mcp_tool.py`),
+# and defers the spawn to the first call of one of its tools. Tool parity is
+# exact either way, because the cache holds the same manifests discovery would
+# fetch, and `config_fingerprint` hashes only command/args/url/transport/
+# tool-filters, so adding this key does not invalidate a warm cache.
+#
+# Two consequences worth knowing. A server that a task actually uses still pays
+# its ~1.2-1.6s connect, just at first use instead of at startup. And a broken
+# server now fails mid-task rather than at boot — which is why the platform
+# overlay keeps `connect_timeout` on platform_control.
+#
+# Those figures were measured across four servers and 44 tools, before the
+# `agent_common` removal above. That server exposed exactly one tool
+# (`call_agent`), so the counts are three and 43 here; the shape of the win is
+# unchanged and the absolute saving is slightly smaller.
 mcp_servers:
-  agent_common:
-    command: "/opt/hermes/.venv/bin/python3"
-    args:
-      - "/opt/data/scripts/agent_common_server.py"
+  # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit
+  # timeouts are a backstop: unpatched, mcp-remote drops the request id when the
+  # remote answers non-2xx, so the client parks for the whole 300s default.
+  # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
+  # time and carries the full analysis; this bounds the damage if it ever stops
+  # applying. Healthy calls to these endpoints measure 0.47-0.48s.
+  # `lazy: true`: register tools from the per-profile schema cache without
+  # spawning the node proxy; the child starts on first actual tool call. Kanban
+  # workers are fresh processes per card, and the eager spawns were ~2-4s of
+  # every worker's boot — paid even when no MCP tool was ever called. See the
+  # fuller note in agents/platform/config.yaml; a cold cache falls back to an
+  # eager connect and warms itself.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys
@@ -31,18 +87,74 @@ mcp_servers:
 platform_toolsets:
   cli:
     - hermes-cli
-    - mcp-agent_common
     - mcp-developer_knowledge
     - mcp-gke
   api_server:
     - hermes-api-server
-    - mcp-agent_common
     - mcp-developer_knowledge
     - mcp-gke
 
-# Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
+# Turn off Hermes' Python-toolchain probe. It is both wrong here and expensive.
+#
+# Wrong: on the common path it publishes "Python toolchain: python3=missing,
+# pip=missing, uv=installed." into the system prompt while python3 is present at
+# 3.13.5 — observed verbatim in 20 live platform sessions. Even when it reports
+# accurately it is telling an agent in an immutable sandbox about a pip it must
+# never use and a venv it must never create.
+#
+# Expensive: the probe spawns four Python interpreters per session to discover
+# that fixed state, and agent/system_prompt.py blocks the prompt build on the
+# result for up to 10s. Under gVisor, where a bare interpreter start measures
+# ~1s, that is the single largest avoidable item on the cold-start path, and
+# kanban pays it again for every card.
+#
+# agent/agent_init.py reads this key (default True) and agent/system_prompt.py
+# gates the prompt line on it. Set on every profile that ships a config: this
+# file feeds only the platform template, because the Chat Agent and Cluster
+# Agent configs are copied verbatim rather than merged (see deploy/docker/Dockerfile).
+agent:
+  environment_probe: false
+
+# Approval settings for the governance watchdogs on this profile's cron roster.
+#
+# cron_mode: approve — a scheduled run has no one at the keyboard, so it cannot
+# answer an approval prompt. Upstream's alternative, `deny`, refuses every
+# pattern-flagged command outright, which would stop the audits doing their job.
+# `approve` waives the PROMPT for those commands.
+#
+# It does not waive the Tirith content scan. Upstream conflated the two — it ran
+# the scanner only on the `deny` arm, so `cron_mode: approve` shipped every
+# command in every cron run unscanned — and the image patch at
+# deploy/docker/patches/cron_tirith_scan.py separates them again. The scan now
+# runs on both arms, and a finding refuses that one command (the run continues;
+# the gateway logs the refusal, but the execution ledger has no per-command rows
+# and the saved output holds only the run's final response, so neither records
+# it unless the model says so).
+#
+# That matters most for github-issue-resolver, which fires every 30 minutes over
+# issue text written by anyone with a GitHub account. Two things the scan buys,
+# both measured against the shipped image on 2026-08-08:
+#
+#   * Homograph and confusable-Unicode content, which DANGEROUS_PATTERNS does
+#     not look for at all. A Cyrillic-e `kubernetеs.io` is refused by the scan
+#     and invisible to the pattern layer.
+#   * The pattern-matched obfuscation shapes — `curl | sh`, base64-to-shell —
+#     which the pattern layer *does* recognise but which `cron_mode: approve`
+#     waives, since approve is exactly the instruction not to block on them.
+#     Tirith independently refuses these, so the waiver no longer ships them.
+#
+# What neither layer catches, so do not read the scan as covering it: a
+# pure-ASCII lookalike TLD (`kubernetes.io.evil-cdn.co` passes both), and
+# terminal escape injection (ANSI is stripped before pattern matching, and real
+# ESC payloads did not trip the scan either).
+#
+# cron_scan is stated rather than left to its default so this block reads as the
+# posture it is. Set it to false only for a profile whose watchdogs trip the
+# scanner for a reason someone has examined and accepted; `security.tirith_enabled:
+# false` is the blunter lever and takes interactive sessions down with it.
 approvals:
   cron_mode: approve
+  cron_scan: true
 
 # Enable DuckDuckGo web search
 web:

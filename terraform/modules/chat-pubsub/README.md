@@ -18,7 +18,7 @@ The module outputs are the values the PlatformAgent CR's `googleChat` integratio
 
 ```hcl
 module "chat_pubsub" {
-  source                      = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/chat-pubsub?ref=vX.Y.Z"
+  source                      = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/chat-pubsub?ref=1.2.0"
   project_id                  = "my-gcp-project"
   agent_service_account_email = "kubeagents-platform-gsa@my-gcp-project.iam.gserviceaccount.com"
 }

@@ -18,45 +18,45 @@ documentation and governance playbooks around them.
 
 1. **OCI registry for Helm charts, not a traditional chart repository.** The chart is
    published as an OCI artifact to GHCR (`oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents`)
-   by `chart-release.yml` on `v*.*.*` tag pushes, reusing existing GHCR auth and storage.
+   by `chart-release.yml` on SemVer tag pushes (`*.*.*`), reusing existing GHCR auth and storage.
    The chart `version` tracks `appVersion`: the workflow packages with both set from the
    git tag, so there is no independent chart-only release train.
 2. **Terraform modules sourced by Git release tag.** Reusable modules live under
    `terraform/modules/<module-name>/` and consumers pin them with
-   `git::https://github.com/gke-labs/kube-agents.git//terraform/modules/<module-name>?ref=vX.Y.Z`,
+   `git::https://github.com/gke-labs/kube-agents.git//terraform/modules/<module-name>?ref=1.2.0`,
    avoiding a separate module-registry backend.
 3. **RC pipeline feeds SemVer promotion.** Pre-release validation keeps using RC tags
    (`rc_YYMMDDHHMM_<short_sha>`, `*_validated` on success — see `scripts/release/README.md`).
-   A human then tags the validated commit `vMAJOR.MINOR.PATCH`, which triggers the
+   A human then tags the validated commit `MAJOR.MINOR.PATCH`, which triggers the
    image and chart publication workflows.
 4. **The operator defaults to its own release version.** Release builds inject the version
-   via `-ldflags "-X ...DefaultPlatformAgentVersion=vX.Y.Z"`; when a `PlatformAgent` CR
+   via `-ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z"`; when a `PlatformAgent` CR
    omits `spec.deployment.image`, the generated Deployment uses the matching versioned
    agent image instead of `:latest`. Precedence: CR spec > `PLATFORM_AGENT_IMAGE` env >
    build-injected version > `latest`.
 
 ## 3. What ships
 
-| Artifact             | Mechanism                                                                                                                                                                                    |
-| :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Container images     | `docker-publish-ghcr.yml` / `docker-publish-k8s-operator.yml` add a `vX.Y.Z` tag on tag pushes (`:latest` only from branch pushes; every push also gets the SHA)                             |
-| Operator default tag | Build-time version injection into `DefaultPlatformAgentVersion` (Makefile and operator Dockerfile ldflags)                                                                                   |
-| Helm chart           | `charts/kube-agents/` (CRDs, operator, PlatformAgent CR), published and cosign-signed by digest via `chart-release.yml`                                                                      |
-| Terraform modules    | `terraform/modules/{gke-cluster,kube-agents-iam,chat-pubsub,github-minter}/`, consumed via `?ref=vX.Y.Z`; `terraform/examples/full-install/` composes all four plus the chart into one apply |
-| Release guide        | [Release versioning & promotion](../site/src/content/docs/deploy/release-versioning.md)                                                                                                      |
-| Governance           | `standardization_validator_sop.md` Rule 3 (immutable-tag compliance); pre-release artifact checks live in CI (`validate.yml` and the RC pipeline), not in an agent SOP                       |
+| Artifact             | Mechanism                                                                                                                                                                                   |
+| :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Container images     | `docker-publish-ghcr.yml` / `docker-publish-k8s-operator.yml` add an `X.Y.Z` tag on tag pushes (`:latest` only from branch pushes; every push also gets the SHA)                            |
+| Operator default tag | Build-time version injection into `DefaultPlatformAgentVersion` (Makefile and operator Dockerfile ldflags)                                                                                  |
+| Helm chart           | `charts/kube-agents/` (CRDs, operator, PlatformAgent CR), published and cosign-signed by digest via `chart-release.yml`                                                                     |
+| Terraform modules    | `terraform/modules/{gke-cluster,kube-agents-iam,chat-pubsub,github-minter}/`, consumed via `?ref=1.2.0`; `terraform/examples/full-install/` composes all four plus the chart into one apply |
+| Release guide        | [Release versioning & promotion](../site/src/content/docs/deploy/release-versioning.md)                                                                                                     |
+| Governance           | `standardization_validator_sop.md` Rule 3 (immutable-tag compliance); pre-release artifact checks live in CI (`validate.yml` and the RC pipeline), not in an agent SOP                      |
 
 ## 4. Version flow
 
 ```mermaid
 graph TD
-    A["RC pipeline: rc_YYMMDDHHMM_sha → *_validated"] --> B["Human tags commit vX.Y.Z"]
-    B --> C["CI publishes GHCR images :vX.Y.Z"]
+    A["RC pipeline: rc_YYMMDDHHMM_sha → *_validated"] --> B["Human tags commit X.Y.Z"]
+    B --> C["CI publishes GHCR images :X.Y.Z"]
     B --> D["CI publishes + signs OCI chart (version = appVersion = tag)"]
-    B --> E["Git tag becomes ?ref=vX.Y.Z for TF modules"]
-    C --> F["PlatformAgent CR: spec.deployment.tag: vX.Y.Z (or omit image for the operator default)"]
+    B --> E["Git tag becomes ?ref=X.Y.Z for TF modules"]
+    C --> F["PlatformAgent CR: spec.deployment.tag: X.Y.Z (or omit image for the operator default)"]
     D --> G["helm install oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents --version X.Y.Z"]
-    E --> H["module source = git::...?ref=vX.Y.Z"]
+    E --> H["module source = git::...?ref=1.2.0"]
 ```
 
 ## 5. Deliberate exceptions and known gaps

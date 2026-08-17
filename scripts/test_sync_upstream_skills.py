@@ -30,24 +30,25 @@ class InjectFooterTest(unittest.TestCase):
 
     def test_injects_footer_for_configured_skill(self):
         d = self._skill_dir()
-        self.assertTrue(sync.inject_footer(str(d), "gke-cluster-creator"))
+        self.assertTrue(sync.inject_footer(str(d), "gke-cluster-creation"))
         text = self._read(d)
         self.assertIn(sync.FOOTER_MARKER, text)
         self.assertIn("provision the Cluster Agent profile", text)
         self.assertIn("cluster_agent_profile.py create", text)
 
-    def test_lifecycle_footer_covers_teardown(self):
+    def test_creation_footer_covers_teardown(self):
         d = self._skill_dir()
-        self.assertTrue(sync.inject_footer(str(d), "gke-cluster-lifecycle"))
+        self.assertTrue(sync.inject_footer(str(d), "gke-cluster-creation"))
         text = self._read(d)
         self.assertIn("Cluster Agent Profile Teardown", text)
+        self.assertIn("cluster_agent_profile.py delete", text)
         self.assertIn("cluster-agent-reconcile", text)
 
     def test_idempotent_no_duplicate(self):
         d = self._skill_dir()
-        self.assertTrue(sync.inject_footer(str(d), "gke-cluster-creator"))
+        self.assertTrue(sync.inject_footer(str(d), "gke-cluster-creation"))
         # Second call must be a no-op (footer already present from this run's copy).
-        self.assertFalse(sync.inject_footer(str(d), "gke-cluster-creator"))
+        self.assertFalse(sync.inject_footer(str(d), "gke-cluster-creation"))
         self.assertEqual(self._read(d).count(sync.FOOTER_MARKER), 1)
 
     def test_unconfigured_skill_untouched(self):
@@ -57,7 +58,7 @@ class InjectFooterTest(unittest.TestCase):
 
     def test_missing_skill_md_is_safe(self):
         d = Path(tempfile.mkdtemp())  # no SKILL.md
-        self.assertFalse(sync.inject_footer(str(d), "gke-cluster-creator"))
+        self.assertFalse(sync.inject_footer(str(d), "gke-cluster-creation"))
 
 
 if __name__ == "__main__":

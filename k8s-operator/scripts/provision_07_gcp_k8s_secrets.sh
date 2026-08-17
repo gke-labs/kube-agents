@@ -2,7 +2,8 @@
 # ==============================================================================
 # 🤖 Step 7: GKE Kubernetes Secrets Setup
 # ==============================================================================
-# Idempotent setup script to configure local Kubernetes secrets directly.
+# Idempotent setup script to validate and configure Kubernetes secrets directly.
+# Requires CMEK database encryption unless ALLOW_UNENCRYPTED_SECRETS=true is set.
 # ==============================================================================
 
 set -e
@@ -29,63 +30,71 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 
 # Prompt for Model Provider and Default Name early to determine which API key is required
 init_var_model_provider
 
-# Securely prompt for Gemini API Key if Gemini is the provider and it's not set/placeholder
+# Automatically sanitize any preexisting literal "placeholder" values from memory and vars.sh
+for var in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SESSION_KV_API_KEY SESSION_KV_SALT SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+  if [ "${!var:-}" = "placeholder" ]; then
+    save_secret_var "$var" ""
+  fi
+done
+
+# Securely prompt for Gemini API Key if Gemini is the active provider
 if [ "$MODEL_PROVIDER" = "gemini" ]; then
-  if [ -z "${GEMINI_API_KEY:-}" ] || [ "${GEMINI_API_KEY}" = "placeholder" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
-      save_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-placeholder}"
+  if [ -z "${GEMINI_API_KEY:-}" ]; then
+    if is_non_interactive; then
+      save_secret_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-}"
     else
-      echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to leave empty): ${C_RESET}"
       read -s -r INPUT_KEY
       echo ""
-      save_var "GEMINI_API_KEY" "${INPUT_KEY:-placeholder}"
+      save_secret_var "GEMINI_API_KEY" "${INPUT_KEY:-}"
     fi
+  else
+    save_secret_var "GEMINI_API_KEY" "${GEMINI_API_KEY}"
   fi
 else
-  save_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-placeholder}"
+  save_secret_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-}"
 fi
 
-# Securely prompt for OpenAI API Key if OpenAI is the provider and it's not set/placeholder
+# Securely prompt for OpenAI API Key if OpenAI is the active provider
 if [ "$MODEL_PROVIDER" = "openai" ]; then
-  if [ -z "${OPENAI_API_KEY:-}" ] || [ "${OPENAI_API_KEY}" = "placeholder" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
-      save_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-placeholder}"
+  if [ -z "${OPENAI_API_KEY:-}" ]; then
+    if is_non_interactive; then
+      save_secret_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-}"
     else
-      echo -ne "  ${C_CYAN}Enter your OPENAI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter your OPENAI_API_KEY (press ENTER to leave empty): ${C_RESET}"
       read -s -r INPUT_KEY
       echo ""
-      save_var "OPENAI_API_KEY" "${INPUT_KEY:-placeholder}"
+      save_secret_var "OPENAI_API_KEY" "${INPUT_KEY:-}"
     fi
+  else
+    save_secret_var "OPENAI_API_KEY" "${OPENAI_API_KEY}"
   fi
 else
-  save_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-placeholder}"
+  save_secret_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-}"
 fi
 
-# Securely prompt for Anthropic API Key if Anthropic is the provider and it's not set/placeholder
+# Securely prompt for Anthropic API Key if Anthropic is the active provider
 if [ "$MODEL_PROVIDER" = "anthropic" ]; then
-  if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ "${ANTHROPIC_API_KEY}" = "placeholder" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
-      save_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-placeholder}"
+  if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    if is_non_interactive; then
+      save_secret_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"
     else
-      echo -ne "  ${C_CYAN}Enter your ANTHROPIC_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter your ANTHROPIC_API_KEY (press ENTER to leave empty): ${C_RESET}"
       read -s -r INPUT_KEY
       echo ""
-      save_var "ANTHROPIC_API_KEY" "${INPUT_KEY:-placeholder}"
+      save_secret_var "ANTHROPIC_API_KEY" "${INPUT_KEY:-}"
     fi
+  else
+    save_secret_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY}"
   fi
 else
-  save_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-placeholder}"
-fi
-
-if [ -z "${API_SERVER_KEY:-}" ]; then
-  print_info "Generating a secure random API_SERVER_KEY..."
-  save_var "API_SERVER_KEY" "$(openssl rand -hex 16)"
+  save_secret_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"
 fi
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -124,12 +133,125 @@ apply_labelled_secret() {
     | kubectl apply -f -
 }
 execute_k8s_secrets() {
-  if [ "$MODEL_PROVIDER" = "gemini" ] && [ "$GEMINI_API_KEY" = "placeholder" ]; then
-    print_warning "GEMINI_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with Gemini until updated."
-  elif [ "$MODEL_PROVIDER" = "openai" ] && [ "$OPENAI_API_KEY" = "placeholder" ]; then
-    print_warning "OPENAI_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with OpenAI until updated."
-  elif [ "$MODEL_PROVIDER" = "anthropic" ] && [ "$ANTHROPIC_API_KEY" = "placeholder" ]; then
-    print_warning "ANTHROPIC_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with Anthropic until updated."
+  local enc_state
+  enc_state=$(gcloud container clusters describe "$CLUSTER_NAME" \
+    --location="$REGION" --project="$PROJECT_ID" \
+    --format="value(databaseEncryption.state)" 2>/dev/null || echo "")
+
+  if ! is_valid_cmek_encryption_state "$enc_state"; then
+    if ! is_truthy "${ALLOW_UNENCRYPTED_SECRETS:-false}"; then
+      print_error "Cluster database encryption state is '${enc_state:-UNKNOWN}'. Writing secrets requires CMEK database encryption or ALLOW_UNENCRYPTED_SECRETS=true override."
+      exit 1
+    else
+      print_warning "Cluster database encryption is not ENCRYPTED ('${enc_state:-UNKNOWN}'), but ALLOW_UNENCRYPTED_SECRETS=true is set. Proceeding..."
+    fi
+  fi
+
+  # Recover or generate API_SERVER_KEY on the connected target cluster
+  if [ -z "${API_SERVER_KEY:-}" ]; then
+    local existing_key=""
+    if [ "${DRY_RUN:-0}" -ne 1 ]; then
+      existing_key=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath='{.data.API_SERVER_KEY}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    fi
+    if [ -n "$existing_key" ]; then
+      print_info "Preserving existing API_SERVER_KEY from Kubernetes Secret..."
+      save_secret_var "API_SERVER_KEY" "$existing_key"
+    else
+      print_info "Generating a secure random API_SERVER_KEY..."
+      save_secret_var "API_SERVER_KEY" "$(openssl rand -hex 16)"
+    fi
+  else
+    save_secret_var "API_SERVER_KEY" "${API_SERVER_KEY}"
+  fi
+
+  # Recover or generate the two pod-scoped session values. Same
+  # preserve-then-generate shape as API_SERVER_KEY above, and the preservation
+  # is the point rather than a nicety: rotating SESSION_KV_SALT re-anonymises
+  # every user, so an operator re-running this script would silently break the
+  # correlation between a person's old sessions and their new ones.
+  #
+  #   SESSION_KV_API_KEY  bearer token for the pod-local Session KV server
+  #   SESSION_KV_SALT     HMAC salt for pseudonymising chat identities
+  local session_key existing_session_value
+  for session_key in SESSION_KV_API_KEY SESSION_KV_SALT; do
+    if [ -n "${!session_key:-}" ]; then
+      save_secret_var "$session_key" "${!session_key}"
+      continue
+    fi
+    existing_session_value=""
+    if [ "${DRY_RUN:-0}" -ne 1 ]; then
+      existing_session_value=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath="{.data.$session_key}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    fi
+    if [ -n "$existing_session_value" ]; then
+      print_info "Preserving existing $session_key from Kubernetes Secret..."
+      save_secret_var "$session_key" "$existing_session_value"
+    else
+      print_info "Generating a secure random $session_key..."
+      save_secret_var "$session_key" "$(openssl rand -hex 32)"
+    fi
+  done
+
+  # Recover or prompt for Slack tokens on the connected target cluster
+  if is_truthy "${SLACK_ENABLED:-false}"; then
+    if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+      local existing_bot_token=""
+      if [ "${DRY_RUN:-0}" -ne 1 ]; then
+        existing_bot_token=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath='{.data.SLACK_BOT_TOKEN}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+      fi
+      if [ -n "$existing_bot_token" ]; then
+        print_info "Preserving existing SLACK_BOT_TOKEN from Kubernetes Secret..."
+        save_secret_var "SLACK_BOT_TOKEN" "$existing_bot_token"
+      elif is_non_interactive; then
+        save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
+      else
+        echo -ne "  ${C_CYAN}Enter your SLACK_BOT_TOKEN (xoxb-...): ${C_RESET}"
+        read -s -r input_bot_token
+        echo ""
+        save_secret_var "SLACK_BOT_TOKEN" "${input_bot_token:-}"
+      fi
+    else
+      save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN}"
+    fi
+
+    if [ -z "${SLACK_APP_TOKEN:-}" ]; then
+      local existing_app_token=""
+      if [ "${DRY_RUN:-0}" -ne 1 ]; then
+        existing_app_token=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath='{.data.SLACK_APP_TOKEN}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+      fi
+      if [ -n "$existing_app_token" ]; then
+        print_info "Preserving existing SLACK_APP_TOKEN from Kubernetes Secret..."
+        save_secret_var "SLACK_APP_TOKEN" "$existing_app_token"
+      elif is_non_interactive; then
+        save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
+      else
+        echo -ne "  ${C_CYAN}Enter your SLACK_APP_TOKEN (xapp-...): ${C_RESET}"
+        read -s -r input_app_token
+        echo ""
+        save_secret_var "SLACK_APP_TOKEN" "${input_app_token:-}"
+      fi
+    else
+      save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN}"
+    fi
+  else
+    save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
+    save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
+  fi
+
+  for key in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SESSION_KV_API_KEY SESSION_KV_SALT SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+    if [ "${!key:-}" = "placeholder" ]; then
+      print_error "Refusing to write literal 'placeholder' for $key to Kubernetes secret."
+      exit 1
+    fi
+  done
+
+  if [ "$MODEL_PROVIDER" = "vertex_ai" ]; then
+    print_info "Model provider is 'vertex_ai'; no model API key is needed (LiteLLM authenticates with Workload Identity)."
+  elif [ "$MODEL_PROVIDER" = "gemini" ] && [ -z "${GEMINI_API_KEY:-}" ]; then
+    print_warning "GEMINI_API_KEY is empty. The platform agent will run but cannot authenticate with Gemini until updated."
+  elif [ "$MODEL_PROVIDER" = "openai" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+    print_warning "OPENAI_API_KEY is empty. The platform agent will run but cannot authenticate with OpenAI until updated."
+  elif [ "$MODEL_PROVIDER" = "anthropic" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    print_warning "ANTHROPIC_API_KEY is empty. The platform agent will run but cannot authenticate with Anthropic until updated."
   fi
 
   # pipefail so a failure in the generate or label stage is not masked by a
@@ -141,6 +263,8 @@ execute_k8s_secrets() {
         --namespace="$NAMESPACE" \
         --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
         --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
+        --from-literal=SESSION_KV_API_KEY="$SESSION_KV_API_KEY" \
+        --from-literal=SESSION_KV_SALT="$SESSION_KV_SALT" \
         --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
         --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
         --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \

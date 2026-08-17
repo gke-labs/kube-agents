@@ -6,11 +6,11 @@ on merge — `kubectl apply` for KCC, `terraform apply` for HCL. Agents author h
 
 Examples of what lives here: `ContainerCluster`, `ContainerNodePool`, project IAM (KCC), or the
 equivalent Terraform. HCL that consumes the kube-agents Terraform modules pins them to an immutable
-release tag (`?ref=vX.Y.Z`, never a branch ref) — illustrative, replace with real resources per PR:
+release tag (`?ref=1.2.0`, never a branch ref) — illustrative, replace with real resources per PR:
 
 ```hcl
 module "gke_cluster" {
-  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=vX.Y.Z"
+  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=1.2.0"
   project_id   = "my-gcp-project"
   cluster_name = "cluster-a"
   location     = "us-central1"

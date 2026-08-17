@@ -31,12 +31,49 @@ publish step against shared scratch state, restoring a stale findings file from
 a ``.bak``, and finally hand-blanking it to force the issue closed.
 
 The fix is a marker, ``HERMES_KANBAN_CRON_RUN``, held for the duration of a
-dispatched run as both a context variable and an environment variable — the
-pair ``gateway/session_context.py`` already uses for its per-job cron state. It
-says "this run is a cron job borrowing a worker's environment", which is
-precisely the distinction the kanban helpers could not previously draw. Defect
-1 is fixed separately, by an ``outcome`` out-param that lets ``run_one_job``
-hand its ``final_response`` back instead of dropping it.
+dispatched run in a ``contextvars.ContextVar``. It says "this run is a cron job
+borrowing a worker's environment", which is precisely the distinction the kanban
+helpers could not previously draw. Defect 1 is fixed separately, by an
+``outcome`` out-param that lets ``run_one_job`` hand its ``final_response`` back
+instead of dropping it.
+
+Why the scope does not also set an environment variable
+-------------------------------------------------------
+It used to, in imitation of ``gateway/session_context.py``'s cron auto-delivery
+pair, on the argument that a cron agent shelling out to ``hermes kanban …``
+should inherit the marker. That argument bought a hypothesis — nothing in this
+image reads the marker from a subprocess; every reader
+(``tools/kanban_tools.py``'s three call sites and
+``hermes_cli/kanban_guardrail_exit.py``) is in-process — and paid for it three
+times over, because an environment variable is process-global and a cron run is
+not:
+
+* **It leaked permanently.** Two *overlapping* runs — A in, B in, A out, B out —
+  restore in the wrong order: A pops the variable it never found, then B puts
+  A's marker back with no run active at all. From then on every worker in the
+  process is told it is a run of job A, so ``kanban_complete`` with no
+  ``task_id`` is refused, naming the explicit id is refused by
+  ``_enforce_worker_task_ownership``, and the guardrail backstop is suppressed
+  as well. The card sits ``running`` with no result and no failure, forever.
+  Two parallel ``cronjob(action='run')`` calls in one assistant turn reach this;
+  ``agent/tool_executor.py`` runs tool calls on a pool and ``cronjob`` is not on
+  its serial list.
+* **It bled across threads.** Any thread that never entered the scope still read
+  the marker through the fallback, so under ``dispatch_in_gateway`` an unrelated
+  worker running concurrently with somebody else's dispatch answered
+  ``current_cron_job() == '<their job>'``.
+* **It was inherited by spawned workers.** ``hermes_cli/kanban_db.py``'s spawn
+  copies ``os.environ`` and scrubs only the ``HERMES_KANBAN_*`` keys
+  ``gateway/session_context.py`` lists. This marker is not among them, so a
+  worker spawned during a run carried it for life.
+
+A ContextVar has none of those failure modes and needs no save/restore: it is
+scoped to the thread ``run_job`` submitted the run on, ``copy_context()`` carries
+it to ``run_conversation``, and ``reset(token)`` is exact under any interleaving.
+``current_cron_job`` still *reads* ``os.environ`` as a fallback, so if the fork
+case ever becomes real the marker can be stamped onto that child's environment
+deliberately — the way ``agent/delegation_context.py`` stamps its own — rather
+than onto the whole process.
 
 ``HERMES_KANBAN_TASK`` is deliberately left in place rather than unset for the
 duration. ``kanban_tools.heartbeat_current_worker_from_env()`` reads it on
@@ -66,51 +103,37 @@ CRON_RESPONSE_LIMIT = 4000
 #: Job id of the dispatch executing in this context, empty outside one.
 _CRON_RUN_JOB: ContextVar = ContextVar(CRON_RUN_ENV, default="")
 
-_UNSET = object()
-
 
 @contextlib.contextmanager
 def cron_run_scope(job_id: str) -> Iterator[None]:
     """Mark the current context as executing cron job ``job_id``.
 
-    Sets both a context variable and the environment variable, in deliberate
-    imitation of ``gateway/session_context.py`` — which keeps its cron
-    auto-delivery vars in exactly this pair "so concurrent jobs don't clobber
-    each other's delivery targets", and resolves reads context-var-first with
-    an ``os.environ`` fallback.
-
-    The context variable is what actually reaches the run: ``run_job`` takes a
+    A ``ContextVar`` and nothing else. ``run_job`` takes a
     ``contextvars.copy_context()`` immediately before submitting
     ``agent.run_conversation`` to its worker thread, so a variable set here is
     visible to every tool the cron agent calls, and to nothing else in the
-    process. The environment variable is the fallback that survives a fork —
-    a cron agent that shells out to ``hermes kanban …`` gets the marker too.
+    process — which is the whole requirement. ``reset(token)`` restores exactly
+    the value this scope displaced, on the way out and on an exception, under
+    any interleaving of concurrent or nested scopes.
 
-    Both are restored on the way out, including on an exception and including
-    the common case where there was no prior value, so a nested or repeated
-    dispatch cannot leave the marker set after the run ends.
+    The module docstring records the three ways the previous
+    ``os.environ``-writing version got that wrong.
     """
-    marker = str(job_id or "?")
-    token = _CRON_RUN_JOB.set(marker)
-    prior = os.environ.get(CRON_RUN_ENV, _UNSET)
-    os.environ[CRON_RUN_ENV] = marker
+    token = _CRON_RUN_JOB.set(str(job_id or "?"))
     try:
         yield
     finally:
         _CRON_RUN_JOB.reset(token)
-        if prior is _UNSET:
-            os.environ.pop(CRON_RUN_ENV, None)
-        else:
-            os.environ[CRON_RUN_ENV] = prior  # type: ignore[arg-type]
 
 
 def current_cron_job(environ: Optional[Mapping[str, str]] = None) -> str:
     """Return the job id of the dispatch running in this context, or ``""``.
 
-    Context variable first, environment second — the same resolution order
-    ``gateway/session_context.py:get_session_env`` uses, for the same reason:
-    the context variable is concurrency-safe where it is set, and the
-    environment is what a subprocess inherits.
+    Context variable first, environment second. Nothing in this image writes
+    the environment half — ``cron_run_scope`` deliberately does not — so today
+    the fallback only ever fires for a process launched with the marker already
+    set. It is kept because that is the one thing a ContextVar cannot do: cross
+    a fork. See the module docstring.
     """
     job_id = _CRON_RUN_JOB.get()
     if job_id:

@@ -26,18 +26,20 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these five audit ids may own a ledger. Any other id is rejected before a single git or gh
+Only these seven audit ids may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
 
-| Audit id                      | Rendered ledger title                                               |
-| ----------------------------- | ------------------------------------------------------------------- |
-| `compliance-audit`            | `[audit] Security & RBAC Posture Audit — 7 findings (2 critical)`   |
-| `security-patch-orchestrator` | `[audit] Upgrade & Patch Readiness Audit — 7 findings (2 critical)` |
-| `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`      |
-| `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`               |
-| `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`   |
+| Audit id                      | Rendered ledger title                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `compliance-audit`            | `[audit] Security & RBAC Posture Audit — 7 findings (2 critical)`              |
+| `security-patch-orchestrator` | `[audit] Upgrade & Patch Readiness Audit — 7 findings (2 critical)`            |
+| `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`                 |
+| `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`                          |
+| `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`              |
+| `ai-security-audit`           | `[audit] AI Workload Security Audit — 7 findings (2 critical)`                 |
+| `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -45,39 +47,34 @@ fails if the two drift apart. Do not restate a title anywhere else.
 ## Running a stream on demand
 
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
-for one tool call:
+for one command per stream:
 
 ```
-cronjob(action='run', job_id='compliance-audit')
+HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run compliance-audit
 ```
 
-**Dispatch it. Do not run the audit yourself in the session that received the request.** A
-dispatched job runs the same path the 06:20 tick runs: its own session, its own prompt naming the
-SOP and the line range its checks live in, its own skills, model, and turn budget. A session that
-improvises the audit instead has none of that — and when the request is "run all five", it has one
-turn budget for work the schedule spreads across five runs and two days. That is not a hypothetical
-failure mode: on 2026-08-03 a single worker asked to run all five streams issued zero `kubectl`
-commands, hand-typed five empty findings documents, and published a fleet-wide all-clear.
+Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
+`profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
+picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
+stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
 
-One call per job, and the call is synchronous — it returns after that stream's run finishes.
-Dispatch the next one once it comes back rather than firing five and assuming. If `executed` is
-`false` nothing ran: the scheduler already owns the fire, or the job is paused, and the response
-says which.
+`cronjob(action='run')` is not the route: it executes the job synchronously inside the session that
+calls it, which is the re-enactment the next paragraph exists to prevent.
 
-**The run reports back to you. Relay what it says; do not reconstruct it.** A completed dispatch
-returns the run's own closing report in `response` — the ledger issue URL, the finding counts, any
-coverage gap it hit — alongside `execution_success`, the `output_file` holding the run's full
-transcript, and a `delivery_error` if the chat delivery leg failed (which says nothing about whether
-the audit itself succeeded). The run has already published its ledger by the time you read this. You
-have nothing left to publish, and the scratch directory it worked in is shared and already consumed;
-anything you rebuild from it belongs to some other run. If `response` is empty, say the run returned
-no report and point at `output_file` — that is a real, reportable failure, not an invitation to run
-the audit yourself. A `response` of `[SILENT]` is the same situation wearing a different hat: the
-run suppressed its own delivery, which the SOPs forbid on an on-demand run, so read the
-`output_file` it named and report from that.
+**Do not run the audit yourself in the session that received the request.** A triggered run gets its
+own process and its own turn budget. A session that improvises the audit instead has neither — and
+when the request is "run them all", it has one turn budget for work the schedule spreads across
+every stream and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker
+asked to run all five streams that existed then issued zero `kubectl` commands, hand-typed five
+empty findings documents, and published a fleet-wide all-clear.
 
-Your own kanban card is yours to close. The dispatched run cannot close it for you and will be told
-so if it tries.
+The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
+started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
+is running and what each attempt did.
+
+**Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
+stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
+own `deliver` setting; repeating them here sends the same content twice.
 
 ## The two-command lifecycle
 
@@ -85,7 +82,7 @@ Run both commands from your normal working directory — the profile directory, 
 resolves. **You are not in a git checkout, and you do not need to be.** The
 audit crons start in the profile directory; the harness clones the GitOps repository itself, into
 `/opt/data/gitops/<audit-id>/<owner>__<name>` on the shared volume, and runs every git and gh call
-inside it. The clone is keyed by audit id because the five streams share the volume with each other
+inside it. The clone is keyed by audit id because the audit streams share the volume with each other
 and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
 can no longer reset another stream's working copy out from under it. The repository comes from the
 `Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
@@ -184,7 +181,8 @@ and not a surprise at publish time. Use it whenever you are unsure your document
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
 the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
 the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the five ids above. Exit 1 is fatal and means something else broke.
+JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else
+broke.
 
 ### Partial coverage
 
@@ -338,7 +336,7 @@ field, and publishes nothing:
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
 - **Do not write an `id`.** The harness derives it as `<check>.<cluster>.<namespace>.<object>` — one
-  grammar for all five streams — lowercasing each part, replacing every run of non-alphanumerics
+  grammar for all audit streams — lowercasing each part, replacing every run of non-alphanumerics
   with `-`, and substituting `_` for an absent namespace. Any `id` in the document is discarded.
 
   This used to be the model's job, specified in prose, and it was the wrong job to give it. A join
@@ -357,7 +355,12 @@ field, and publishes nothing:
   The derived id still has to satisfy `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..` run and
   no `.lock` suffix, and is shortened to fit: the id is the join key of the ledger's hidden delta
   block and of the `audit-persists:<id>` marker — both line-anchored regexes a space or a newline
-  would break — and an operator types it by hand in `/remediate <id>`.
+  would break — and an operator types it by hand in `/remediate <id>`. An id that had to be
+  shortened ends in `-<six hex characters>`, a digest of the id it was shortened from, because
+  trimming alone lands two long objects in one long-named namespace on the same string and the
+  duplicate-identity refusal above would then reject the whole document over two findings that are
+  genuinely different. The digest is a function of that finding's four fields and nothing else, so
+  it is the same next week.
 
 - `severity` is one of `critical`, `major`, `minor`.
 - `namespace` may be empty for cluster-scoped objects.
@@ -447,11 +450,12 @@ Corollaries:
   reviewer sees the rest, under their own credentials.
 
   The harness redacts high-confidence credential shapes as a backstop — a `data:`/`stringData:`
-  block, a field named like a secret, a self-identifying token prefix, a PEM header, an
+  block, an environment variable whose name ends in a credential word, a field named like a secret
+  carrying a value on the same line, a self-identifying token prefix, a PEM header, an
   `Authorization:` value — replacing them with `[redacted by audit_report.py]`. It is deliberately
-  conservative and **does not** touch bare base64, because legitimate audit output is full of it.
-  Treat the backstop as a seatbelt, not a licence: it will not catch a credential that looks like
-  ordinary output.
+  conservative and **does not** touch bare base64, a boolean, or an absolute path, because
+  legitimate audit output is full of all three. Treat the backstop as a seatbelt, not a licence: it
+  will not catch a credential that looks like ordinary output.
 
 - Report what the command showed, not what you infer it implies. Inference belongs in `impact`.
 - One finding per object. Do not roll up "12 namespaces lack NetworkPolicies" into one finding — each
@@ -465,7 +469,7 @@ and what pull request sits on its branch. Nothing is stored between runs.
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
 | `open`               | `open`                                | Reproduces; no pull request                | Nothing, unless it qualifies for auto-promotion              |
-| `pr-open`            | `fix proposed`                        | Reproduces; a fix is open on its branch    | **Nothing.** The pull request is left alone                  |
+| `pr-open`            | `fix proposed`                        | Reproduces; a fix is open on its branch    | **Labels re-asserted.** The pull request itself is untouched |
 | `pr-merged-persists` | `⚠ fix merged, still reproduces`      | Reproduces; the fix **merged anyway**      | Comments once on the merged PR; never reopens it             |
 | `refused`            | `fix refused`                         | Reproduces; a **human closed** the fix     | Nothing. The close stands until someone says `/remediate`    |
 | `withdrawn`          | `fix withdrawn, awaiting re-proposal` | Reproduces; the **harness closed** the fix | Treats it as having no pull request — it is promotable again |
@@ -479,9 +483,13 @@ the ordinary, expected ending, so nothing extra is closed and nothing extra is s
 
 Three of the five are easy to misread:
 
-- **`pr-open` is not refreshed.** An open pull request is left exactly as it is, because a reviewer
-  may have pushed onto it and a nightly force-push would silently discard their work. The ledger
-  links it; the diff is whatever a human last made it.
+- **`pr-open` is not refreshed.** An open pull request's diff is left exactly as it is, because a
+  reviewer may have pushed onto it and a nightly force-push would silently discard their work. The
+  ledger links it; the diff is whatever a human last made it. Its **labels** are the single
+  exception, re-asserted on every run that finds it still open: they are the harness's own index of
+  what it still owns rather than anything a reviewer authored, and a stripped `agent:audit` or a
+  `severity:` frozen at what the group used to be loses the pull request from the views triage works
+  from. Labels only — no push, no rewritten body, so the promise above still holds.
 - **`refused` is a human decision, not a rejected command.** It means someone closed the remediation
   pull request without merging it. That is a considered "no", and the harness never overrules it by
   re-opening the same fix tomorrow morning.
@@ -501,7 +509,7 @@ there. Either the remediation was incomplete or something outside this repositor
 ## Remediation pull requests
 
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
-to put in a diff otherwise. Two paths lead there:
+to put in a diff otherwise. Three paths lead there:
 
 - **Auto-promotion.** A finding that is `critical`, is a `manifest`, and has no live pull request on
   its branch is promoted automatically by `finish` — **at most five per run**. The surplus is named
@@ -510,13 +518,21 @@ to put in a diff otherwise. Two paths lead there:
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
   access to the repository. This path is uncapped: a human asked for that one by name.
+- **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
+  finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
+  `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
+  (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
+  requests only: a finding whose pull request a human closed is reported as `superseded`, never
+  re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
+  above stays with the write-gated comment.
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 
 - Accepted — one acknowledgement comment on the ledger naming each target and **what happened to
-  it**, never a count: the pull request URL, or "already open" and left untouched, or _superseded_
-  by a human close written after the request, or that publishing failed and the next run will retry.
-  "3 requests processed" is indistinguishable from "3 requests silently dropped".
+  it**, never a count: the pull request URL, or "already open" with its labels re-asserted and its
+  diff untouched, or _superseded_ by a human close written after the request, or that publishing
+  failed and the next run will retry. "3 requests processed" is indistinguishable from "3 requests
+  silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
   finding that is not in the current document, or one naming a non-`manifest` finding.
 - Refused **on syntax**, likewise once, because a command the parser will not honour is a person
@@ -545,7 +561,10 @@ answers itself never stops.
 All of these are guarded by a hidden marker carrying the triggering comment's node id, so a standing
 `/remediate` in the thread is answered once rather than every morning forever.
 
-Run the requested targets through the subcommand, which takes `--finding` once per id:
+A `/remediate` read on the ledger is never run through the subcommand — `finish` answers those on
+the comment's own timestamp, which is what lets a fresh post-close command revive a finding the
+subcommand would report as `superseded`. Run a direct ask's targets through it, `--finding` once
+per id:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
@@ -557,9 +576,15 @@ one `--finding` produces one pull request (or one, shared, for the group that pa
 five more for critical findings the requester never mentioned and cannot tell apart from the one they
 did. Auto-promotion happens in `finish`, where the whole fleet is being reported on anyway.
 
-It prints one JSON line — `status`, `prs_opened`, `already_open`, and `refused`:
+It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, and `refused`:
 
-- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"refused":["ns-quota"]}`
+- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"superseded":[],"refused":["ns-quota"]}`
+
+`superseded` names targets whose pull request a human closed: that close stands, and the
+subcommand does not re-propose them. Revival belongs to the write-gated `/remediate` comment
+(§ above, honoured by `finish` on the comment's own timestamp) — or to `--override-human-close`,
+which exists for the person at the terminal who could have written that comment themselves. An
+agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 
 `refused` names the targets whose remediation is not a readable file inside the clone — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
@@ -650,7 +675,7 @@ Two rules follow, and they are the whole rule:
   report, and every report carries `issue_url` in full.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
-  kanban card, from chat, or from `cronjob(action='run')`, they are waiting on the answer and
+  kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
 
 Two clean runs come back `silent_ok: false`, and both matter:
