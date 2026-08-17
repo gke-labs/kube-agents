@@ -1,0 +1,73 @@
+# Session routing. session_kv_server.py:532 orders the agent to pass the exact
+# session ID to its send_notification tool "so it routes as a threaded reply to
+# the warning alert"; a wrong, invented, or omitted id makes the triage report
+# post as a fresh message instead of a reply in the alert's thread, which is how
+# an operator loses the connection between the alert and its diagnosis.
+#
+# Requires BENCH_USE_MCP=true to be meaningful: the real assertion is on the
+# tool-call arguments, and the two routing checks are phrased as "Expected tool
+# call:" items so extract_checklist_items() drops them automatically when MCP is
+# off (see devops_bench/metrics/checklist.py) -- with MCP off the remaining
+# report-contract checks still score, but the routing contract is not exercised.
+#
+# No infrastructure: the event details travel in the prompt exactly as
+# _build_agent_query() (agents/platform/scripts/session_kv_server.py:501)
+# assembles them.
+#
+# Every checklist bullet below must stay on one line -- extract_checklist_items()
+# only reads lines beginning with "-", so a wrapped bullet silently loses its
+# continuation and the judge scores a truncated criterion.
+id: incident-triage-session-routing
+name: Incident triage notification carries the exact session id
+prompt: |
+  Analyze the following Kubernetes event warning on GKE cluster 'platform-agent-host' for the active session 'triage-7f3a9c21-payments'.
+
+  **Event Details:**
+  - **Resource:** payments/Pod/settlement-api-59b7c46d5f-w4hqz
+  - **Event Reason:** FailedScheduling
+  - **Warning Message:** 0/4 nodes are available: 4 Insufficient memory. preemption: 0/4 nodes are available: 4 No preemption victims found for incoming pod.
+
+  When calling your send_notification tool to report findings, you MUST pass this exact session ID: 'triage-7f3a9c21-payments' as the session_id argument so it routes as a threaded reply to the warning alert.
+
+  Propose only options you would open the pull request for right now, on the evidence in this event alone. Two tests disqualify an option: it rests on a fact you do not have ('...if the config is no longer needed', '...if the workload can tolerate it'), or you would argue against it in the same breath as recommending something else. Either way it is filler; leave it out. One option is the expected shape when the root cause has one sound fix, and a single well-chosen fix is a better report than a padded list.
+
+  Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.
+
+  The template below is the shape of a two-option report, not a target to fill: keep one Option line per option that survived those tests, and delete the rest along with the Recommended line if only one did. Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.
+
+  When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this:
+
+  📋 **Incident Triage**
+
+  - **Issue:** <Short 1-sentence description of the problem>
+  - **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>
+
+  🛠️ **Proposed Fixes (GitOps):**
+
+  - **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.
+  - **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix — delete this line unless a second option survived the tests above>.
+
+  ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice; delete this line when you proposed a single option>.
+
+  🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22)
+
+  👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.**
+
+  ---
+
+  **GitOps PR Instructions (For subsequent turns if the user replies):**
+  If the user replies to the thread with 'apply' or 'apply Option <letter>':
+  1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.
+  2. Post a threaded response confirming the PR was created and include the clickable PR link.
+  3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
+expected_output: |
+  critical requirements:
+  - Expected tool call: the send_notification tool is invoked with its session_id argument set to exactly the string "triage-7f3a9c21-payments", character for character.
+  - Expected tool call: no notification is sent with a missing session_id or with a different, truncated, or invented session id such as a newly generated one.
+  - The response confirms that the triage report was routed to session "triage-7f3a9c21-payments" so it lands as a threaded reply to the warning alert rather than a fresh message.
+  - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
+  - The root cause is that the settlement-api pod cannot be scheduled because none of the 4 nodes has enough allocatable memory for its memory request, and no preemption victims are available.
+  - The "Proposed Fixes (GitOps)" section labels its options "Option A", "Option B", ... in order with exactly one marked "Recommended" when more than one is proposed, and the report closes by inviting an "apply" reply to open a GitOps pull request.
+infrastructure:
+  deployer: noop
+validated: false

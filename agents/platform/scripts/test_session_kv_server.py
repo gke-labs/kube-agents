@@ -642,6 +642,27 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertIn("apply Option A", cta)
         self.assertIn("apply Option B", cta)
 
+    def test_the_optional_template_lines_are_marked_optional(self):
+        # The template is few-shot as much as it is a format: showing an Option
+        # B line and a Recommended line with nothing marking them conditional
+        # reads as "produce two options", and the agent did exactly that on a
+        # single-fix event -- padding with an option it then argued against in
+        # its own Recommended line. Both lines must carry their own delete
+        # instruction, because that is where the agent is looking when it
+        # decides how many options to write.
+        payload = {
+            "reason": "FailedMount",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query("test-session", payload)
+        option_b = next(line for line in query.splitlines() if line.startswith("- **Option B"))
+        recommended = next(line for line in query.splitlines() if line.startswith("✅"))
+        self.assertIn("delete this line", option_b)
+        self.assertIn("delete this line", recommended)
+
 
 if __name__ == "__main__":
     # Clean up temp database file on exit

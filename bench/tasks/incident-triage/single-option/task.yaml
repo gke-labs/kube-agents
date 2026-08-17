@@ -1,0 +1,70 @@
+# Single-option branch of the report contract. session_kv_server.py:535 tells the
+# agent that when only one sound fix exists it must OMIT the "Recommended" line and
+# drop the "apply Option <letter>" override from the call-to-action, since a bare
+# "apply" is then unambiguous. This task inverts the multi-option assertions in
+# incident-triage-report: the payload (a volume referencing a ConfigMap that does
+# not exist) has exactly one honest GitOps fix, so a second option would be filler.
+#
+# No infrastructure: the event details travel in the prompt exactly as
+# _build_agent_query() (agents/platform/scripts/session_kv_server.py:501) assembles
+# them, so the agent reasons from the payload rather than live cluster state.
+#
+# Run with BENCH_USE_MCP=false: the payload is self-contained, so ToolInvocation
+# would score a trajectory the task never asks the agent to produce.
+#
+# Every checklist bullet below must stay on one line -- extract_checklist_items()
+# only reads lines beginning with "-", so a wrapped bullet silently loses its
+# continuation and the judge scores a truncated criterion.
+id: incident-triage-single-option
+name: Incident triage single-option report contract
+prompt: |
+  Analyze the following Kubernetes event warning on GKE cluster 'platform-agent-host'.
+
+  **Event Details:**
+  - **Resource:** payments/Pod/checkout-7d9f4b8c6-x2klm
+  - **Event Reason:** FailedMount
+  - **Warning Message:** MountVolume.SetUp failed for volume "app-config" : configmap "checkout-config" not found
+
+  Propose only options you would open the pull request for right now, on the evidence in this event alone. Two tests disqualify an option: it rests on a fact you do not have ('...if the config is no longer needed', '...if the workload can tolerate it'), or you would argue against it in the same breath as recommending something else. Either way it is filler; leave it out. One option is the expected shape when the root cause has one sound fix, and a single well-chosen fix is a better report than a padded list.
+
+  Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.
+
+  The template below is the shape of a two-option report, not a target to fill: keep one Option line per option that survived those tests, and delete the rest along with the Recommended line if only one did. Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.
+
+  When done, post your final diagnostic report formatted exactly like this:
+
+  📋 **Incident Triage**
+
+  - **Issue:** <Short 1-sentence description of the problem>
+  - **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>
+
+  🛠️ **Proposed Fixes (GitOps):**
+
+  - **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.
+  - **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix — delete this line unless a second option survived the tests above>.
+
+  ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice; delete this line when you proposed a single option>.
+
+  🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22)
+
+  👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.**
+
+  ---
+
+  **GitOps PR Instructions (For subsequent turns if the user replies):**
+  If the user replies to the thread with 'apply' or 'apply Option <letter>':
+  1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.
+  2. Post a threaded response confirming the PR was created and include the clickable PR link.
+  3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
+expected_output: |
+  critical requirements:
+  - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
+  - The root cause is that a ConfigMap named "checkout-config" the pod needs to mount does not exist in the payments namespace, which is why the pod cannot start.
+  - Exactly one remediation option is proposed under a "Proposed Fixes (GitOps)" section, labelled "Option A"; there is no "Option B" and no further option.
+  - The report contains no "✅ **Recommended: Option <letter>**" marker line, because with a single option the recommendation marker must be omitted; the word "recommended" inside the closing call-to-action is the template's own wording and does not count as one.
+  - The closing call-to-action invites a bare "apply" reply to open a GitOps pull request and never offers an "apply Option A" or "apply Option <letter>" override.
+  - The proposed fix is a declarative change to checked-in manifests (adding or correcting the ConfigMap definition or the volume reference), never an imperative kubectl create/patch/apply against the live cluster.
+  - The report uses standard markdown throughout, writing bold as **bold** and links as [label](url), and never uses Slack-native syntax such as single-asterisk *bold* or <url|label>.
+infrastructure:
+  deployer: noop
+validated: false

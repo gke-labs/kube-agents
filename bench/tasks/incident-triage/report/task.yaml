@@ -1,0 +1,53 @@
+# Report-contract task for the incident triage surface. No infrastructure: the
+# event details travel in the prompt exactly as _build_agent_query()
+# (agents/platform/scripts/session_kv_server.py:501) assembles them, so the
+# agent reasons from the payload rather than live cluster state. This covers
+# the report half of the surface -- the PR half needs an `apply` reply and a
+# GitOps repo, which is a separate task.
+#
+# Run with BENCH_USE_MCP=false: the payload is self-contained, so ToolInvocation
+# would score a trajectory the task never asks the agent to produce.
+#
+# Every checklist bullet below must stay on one line -- extract_checklist_items()
+# only reads lines beginning with "-", so a wrapped bullet silently loses its
+# continuation and the judge scores a truncated criterion.
+id: incident-triage-report
+name: Incident triage report contract
+prompt: >-
+  Analyze the following Kubernetes event warning on GKE cluster
+  'platform-agent-host'.
+
+
+  **Event Details:**
+
+  - **Resource:** payments/Pod/checkout-7d9f4b8c6-x2klm
+
+  - **Event Reason:** FailedScheduling
+
+  - **Warning Message:** 0/3 nodes are available: 3 Insufficient cpu.
+  preemption: 0/3 nodes are available: 3 No preemption victims found for
+  incoming pod.
+
+
+  Propose only options you would open the pull request for right now, on the
+  evidence in this event alone. An option that rests on a fact you do not have,
+  or that you would argue against in the same breath as recommending something
+  else, is filler; leave it out. Label them 'Option A', 'Option B', ... in
+  order. When you propose more than one, mark exactly one
+  '✅ **Recommended: Option <letter>**'.
+  Post your final diagnostic report formatted as an Incident Triage report
+  headed '📋 **Incident Triage**', with an Issue line, a Root Cause line,
+  a Proposed Fixes (GitOps) section,
+  and a call-to-action inviting an 'apply' reply.
+expected_output: |
+  critical requirements:
+  - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
+  - The root cause is unschedulable pods caused by insufficient CPU capacity across all nodes, with no preemption victims available.
+  - The report has a "Proposed Fixes (GitOps)" section whose options are labelled "Option A", "Option B", ... in that order.
+  - Every proposed fix is a declarative manifest or node-pool change, never an imperative kubectl mutation of the live cluster.
+  - Exactly one option is marked "Recommended" when several are proposed, and none is marked when only one is proposed.
+  - No unfilled placeholder survives: the literal strings "<letter>", "<Action Title>" and "<...>" do not appear anywhere.
+  - The report closes by inviting the user to reply "apply" so a GitOps pull request can be opened; naming a specific option in that invitation is acceptable.
+infrastructure:
+  deployer: noop
+validated: false
