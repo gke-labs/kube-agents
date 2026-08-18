@@ -44,12 +44,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `vars.sh` and carried into the chart values). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
-| ------------------ | ---------------------------- | ------------------------------------------ |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
-| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
-| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                             |
+| ------------------ | ---------------------------- | ------------------------------------------------- |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                            |
+| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                         |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                            |
+| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below.        |
+| `gemma4` / `vllm`  | `google/gemma-4-E2B-it`      | Self-hosted via vLLM on GKE GPU accelerator node. |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 

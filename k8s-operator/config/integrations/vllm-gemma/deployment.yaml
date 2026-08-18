@@ -1,20 +1,18 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm-gemma-deployment
-  namespace: kubeagents-system
+  name: vllm-gemma
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: gemma-server
+      app: vllm-gemma
   template:
     metadata:
       labels:
-        app: gemma-server
+        app: vllm-gemma
         ai.gke.io/model: gemma-4-e2b-it
         ai.gke.io/inference-server: vllm
-        examples.ai.gke.io/source: user-guide
     spec:
       containers:
         - name: inference-server
@@ -30,7 +28,7 @@ spec:
               memory: "32Gi"
               ephemeral-storage: "40Gi"
               nvidia.com/gpu: "1"
-          command: ["python3", "-m", "vllm.entrypoints.api_server"]
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
             - --model=$(MODEL_ID)
             - --host=0.0.0.0
@@ -53,36 +51,46 @@ spec:
             - name: LD_LIBRARY_PATH
               value: ${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64
             - name: MODEL_ID
-              value: google/gemma-4-E2B-it
+              value: ${MODEL_DEFAULT_NAME}
             - name: OTEL_SERVICE_NAME
               value: vllm-gemma
-
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: token
+                  optional: true
+          ports:
+            - containerPort: 8000
+              name: http
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 10
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
                 - ALL
-          # /health is vLLM's own endpoint and answers only once the model is
-          # resident on the GPU. That is the whole point here: pulling and
-          # loading Gemma takes minutes, and without a readinessProbe the
-          # Service publishes this pod immediately and every request in the
-          # meantime fails. The startupProbe carries that load — 60 failures at
-          # 10s is a 10-minute budget — so readiness can stay tight afterwards.
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 60
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
           volumeMounts:
             - mountPath: /dev/shm
               name: dshm
@@ -92,24 +100,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Gi
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
       nodeSelector:
-        cloud.google.com/gke-accelerator: nvidia-rtx-pro-6000
-        cloud.google.com/gke-gpu-driver-version: latest
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: vllm-gemma
-  namespace: kubeagents-system
-spec:
-  # One replica pinned to a single GPU node, so there is no second pod to keep
-  # up. maxUnavailable: 1 states the intent — this workload may be evicted —
-  # while a minAvailable here would allow zero disruptions and hang every node
-  # drain, which is `blocking-pdb` in
-  # agents/platform/governance/obtainability_audit_sop.md §3.4.
-  maxUnavailable: 1
-  # Copied from the Deployment's own spec.selector: a PDB is matched to its
-  # workload by selector, never by name.
-  selector:
-    matchLabels:
-      app: gemma-server
+        cloud.google.com/gke-gpu-driver-version: default

@@ -1,0 +1,14 @@
+resources:
+  - deployment.yaml
+  - service.yaml
+  - podmonitoring.yaml
+  - networkpolicy.yaml
+
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/name: vllm-gemma
+      app.kubernetes.io/instance: vllm-gemma
+      app.kubernetes.io/part-of: kube-agents
+      app.kubernetes.io/managed-by: kustomize

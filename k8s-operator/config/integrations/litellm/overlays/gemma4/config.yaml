@@ -1,0 +1,8 @@
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: http://vllm-gemma:8000/v1
+      api_key: none
+litellm_settings:
+  callbacks: ["otel", "prometheus"]
