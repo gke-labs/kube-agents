@@ -615,7 +615,17 @@ def _post(args, marker_kind: str) -> int:
         request.get("created_at", ""),
     )
 
-    body = _confined_body(args.body_file).rstrip()
+    # Marker syntax is stripped out of the model's body before the real marker
+    # is appended. `handled_node_ids` reads raw bodies and counts *every* marker
+    # in a self-authored comment, so one the model imitated in its own prose
+    # becomes a real marker the moment this posts — and a marker naming another
+    # node id closes that request for good, at both readers, with silence as the
+    # reviewer's only signal. The model holds both halves: SKILL.md prints the
+    # syntax in full in order to forbid it, and `poll` carries every node id. A
+    # line of prose is not the boundary that belongs in front of that.
+    body = pr_triggers.strip_markers(_confined_body(args.body_file))
+    if not body:
+        _fail(f"Reply body {args.body_file} is nothing but marker syntax.")
     stamped = f"{body}\n\n{pr_triggers.marker(args.comment_id, marker_kind)}\n"
 
     # The stamped copy stays inside scratch: same confinement as the input, and

@@ -189,8 +189,10 @@ Write it in the past tense only for what you have read back. "I have set the
 limit to 512Mi" is a statement about the branch, and Step 4 will refuse to post
 it unless the commit you name is on the pull request.
 
-Do not write the `<!-- agent-answered:... -->` marker yourself — Step 4 appends
-it. Writing one by hand into the wrong comment marks the wrong request handled.
+Do not write the marker yourself — Step 4 appends it, from the `--comment-id`
+you pass. If the body contains marker syntax anyway, Step 4 strips it before
+posting rather than trusting this paragraph: a marker naming another request
+would close that request for good, and nobody would be told.
 
 ### Step 4: Post it
 
