@@ -782,6 +782,62 @@ class ListCommentsTest(unittest.TestCase):
         ]
         self.assertEqual(len(lookups), 1, f"expected one lookup, saw {lookups}")
 
+    def test_a_bot_and_a_user_of_the_same_name_are_two_accounts(self):
+        """The cache key must name the account it asked about.
+
+        `normalise_login` strips a trailing `[bot]` and folds case so a mention
+        matches a handle. Keying the permission cache on it collapsed the App
+        `helper[bot]` and the ordinary user `helper` into one slot, and
+        whichever `_collect` reached first decided trust for both — either
+        handing a non-collaborator the `can_write=True` that clears the sweep's
+        only trust gate, or refusing a maintainer and writing a permanent
+        `agent-refused` marker. Both accounts comment here, so the answer is
+        re-derived on every tick rather than depending on ordering.
+        """
+        fake = FakeGh(
+            {
+                "issues/12/comments": (
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "id": 200,
+                                "node_id": "IC_bot",
+                                "user": {"login": "helper[bot]"},
+                                "body": "/agent do it",
+                                "created_at": "2026-08-12T10:00:00Z",
+                            },
+                            {
+                                "id": 201,
+                                "node_id": "IC_human",
+                                "user": {"login": "helper"},
+                                "body": "/agent do it",
+                                "created_at": "2026-08-12T11:00:00Z",
+                            },
+                        ]
+                    ),
+                    "",
+                ),
+                "pulls/12/comments": (0, "[]", ""),
+                "pulls/12/reviews": (0, "[]", ""),
+                # The App is a collaborator; the same-named user is not.
+                "collaborators/helper%5Bbot%5D/permission": permission("write"),
+                "collaborators/helper/permission": (
+                    1,
+                    "",
+                    "gh: Not Found (HTTP 404)",
+                ),
+            }
+        )
+        by_id = {
+            c.node_id: c
+            for c in forge.GitHubProvider(run=fake).list_comments(
+                "acme/toolkit", self.pr
+            )
+        }
+        self.assertIs(by_id["IC_bot"].can_write, True)
+        self.assertIs(by_id["IC_human"].can_write, False)
+
     def test_an_empty_review_body_is_not_an_utterance(self):
         ids = [
             c.node_id

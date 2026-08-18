@@ -608,8 +608,31 @@ def strip_markers(text: str) -> str:
 
     This is for display only. `handled_node_ids` still reads raw bodies, because
     a body the agent has stripped is not the record the forge holds.
+
+    **Substituted to a fixpoint, not once.** Deleting a match splices what sat
+    either side of it into text the pass has already walked past, and those
+    halves can form a marker the single pass then never sees:
+    `<!-- agent-<!-- agent-answered:IC -->answered:IC -->` leaves a live
+    `<!-- agent-answered:IC -->` behind. That is not cosmetic where `_post` uses
+    this as the boundary keeping a marker the model wrote from becoming a real
+    one — a leftover naming another node id closes that request for good, at
+    both readers, with silence as the reviewer's only signal. A separator would
+    not close it either: `MARKER_RE` opens `<!--\\s*`, so it absorbs whatever is
+    substituted in.
+
+    The loop terminates because every pass that changes anything deletes at
+    least one whole match, and it is cheap because each one collapses the nest
+    rather than shaving it: a maximally nested 67,626-character body — deeper
+    than GitHub's comment limit allows — converges in 2,602 passes and 0.08s.
+    A fixpoint is also what makes the property total rather than tested: no
+    match remains, by definition of having stopped.
     """
-    return MARKER_RE.sub("", normalise_newlines(text)).strip()
+    text = normalise_newlines(text)
+    while True:
+        stripped = MARKER_RE.sub("", text)
+        if stripped == text:
+            return text.strip()
+        text = stripped
 
 
 def bot_allowlist() -> set[str]:

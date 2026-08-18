@@ -592,7 +592,23 @@ class GitHubProvider:
         """
         if not login:
             return False
-        key = normalise_login(login)
+        # Keyed on the login this actually asks about, not on `normalise_login`,
+        # which exists to make a mention match a handle and collapses accounts
+        # that are not the same account: it strips a trailing `[bot]` and a
+        # leading `app/`, so the App `foo[bot]` and the user `foo` shared one
+        # slot and whichever `_collect` reached first decided trust for both.
+        # One direction hands a non-collaborator `can_write=True` and clears the
+        # sweep's only trust gate; the other refuses a maintainer and writes a
+        # public `agent-refused` marker that `refused_node_ids` treats as
+        # permanent. Neither needs timing luck — permission is resolved eagerly
+        # for every comment author on every swept pull request, so once both
+        # accounts have commented the wrong answer is re-derived every tick.
+        #
+        # Case is folded because GitHub logins are case-insensitive, so `Foo`
+        # and `foo` are one account and one lookup. Nothing else is folded. The
+        # `app/` and bare-name spellings `normalise_login` handles come from
+        # `gh pr list` and from mention text, neither of which reaches here.
+        key = login.lower()
         if key in self._permission_cache:
             return self._permission_cache[key]
         quoted = urllib.parse.quote(login, safe="")
