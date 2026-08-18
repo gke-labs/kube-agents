@@ -123,6 +123,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-tpu-metrics-monitoring",
     ],
     "Observability": [
+        "gcp-recommender-ingest",
         "gke-basics",
         "gke-observability",
         "kube-agents-observability",

@@ -92,6 +92,19 @@
       "deliver": "all"
     },
     {
+      "id": "gcp-recommender-audit",
+      "name": "GCP Recommender & Cloud Notifications Ingest",
+      "schedule": {
+        "kind": "cron",
+        "expr": "10 8 * * *",
+        "display": "10 8 * * *"
+      },
+      "prompt": "Run the daily GCP Cloud Recommender insights and GKE security notifications ingest. Read the SOP at 'governance/gcp_recommender_sop.md' in your profile home — all 190 lines of it, before you run anything. Its five checks are section 2, lines 31-72, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
       "id": "github-repo-watcher",
       "name": "GitHub Repo Watcher",
       "schedule": {
