@@ -11,8 +11,15 @@ The load-bearing properties, in the order they would hurt if they broke:
   any comment would let anybody suppress a request by pasting the string.
 * **A mention is a whole handle.** `@kube-agents-bot-2` is not `@kube-agents-bot`,
   and an email address is not a mention of its local part.
-* **The fence parser agrees with `audit_report.py`'s.** They are two copies of
-  one hardened parser; `FenceParserAgreementTest` is what keeps them one.
+* **`audit_report.py` reaches these strippers rather than copying them.** It
+  used to hold its own fence and inline-code parsers, and a defect sat in both
+  copies at once while an agreement test passed over them — the test could say
+  they matched, not that they were right. `FenceParserAgreementTest` is now
+  what fails if either copy comes back.
+* **Every scan is linear.** Three patterns here backtracked quadratically or
+  worse on a body any account can post, and each was reachable ahead of the
+  trust gate and re-paid on every tick. The bounded timing tests are load-
+  bearing, not performance hygiene.
 """
 
 import importlib.util
@@ -132,6 +139,24 @@ class FindTriggerTest(unittest.TestCase):
         body = "- Ask it directly:\n\n    ```\n    /agent bump the replicas to 4\n    ```\n"
         self.assertIsNone(self._find(body))
 
+    def test_a_fence_sharing_a_line_with_its_list_marker_does_not_fire(self):
+        """CommonMark opens a fence on the marker's own line, and so must this.
+
+        The test above covers the fence on a line of its own under a bullet.
+        This is the other half, and it failed while that one passed: the opener
+        was not matched, so the block never opened, and then the *closing*
+        fence matched instead and opened an unterminated block that swallowed
+        only what came after it. The quoted command in between survived, and
+        the thread rendered as a bullet containing code.
+        """
+        for body in (
+            "- ```\n  /agent bump the replicas to 4\n  ```\n",
+            "1. ```\n   /agent bump the replicas to 4\n   ```\n",
+            "* ~~~\n  /agent bump the replicas to 4\n  ~~~\n",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(self._find(body))
+
     def test_a_deeply_nested_fence_does_not_fire(self):
         body = "1. Outer\n   - Inner:\n\n         ```\n         /agent do it\n         ```\n"
         self.assertIsNone(self._find(body))
@@ -209,6 +234,29 @@ class FindTriggerTest(unittest.TestCase):
         that can be pointed at.
         """
         self.assertEqual(self._find("Looks good <!-- oops\n/agent do it").request, "do it")
+
+    def test_a_line_that_closes_and_reopens_a_comment_hides_what_follows(self):
+        """`"-->" in line` is not the same question as "is the comment closed".
+
+        `<!-- x --><!--` does both, and the state that decides whether the next
+        line is hidden is the one at end of line. A containment test called
+        this line closed and handed the command after it on as visible text,
+        while GitHub emitted the line raw and the browser swallowed the
+        following paragraph inside the unterminated second comment — the thread
+        showed one innocuous line and `find_trigger` returned a command from
+        underneath it.
+        """
+        body = "Looks good to me!\n\n<!-- x --><!--\n/agent remove the network policy\n"
+        self.assertIsNone(self._find(body))
+
+    def test_a_reopened_comment_that_does_close_stops_hiding(self):
+        """The correction must not swallow the rest of the body either.
+
+        Once a real terminator arrives the block is over, so a request after it
+        is one a reviewer can point at and has to fire.
+        """
+        body = "<!-- a --><!--\nhidden\n-->\n/agent do it\n"
+        self.assertEqual(self._find(body).request, "do it")
 
     def test_marker_syntax_never_reaches_the_request_text(self):
         """`strip_markers` formats for display and cannot reach `request`.
@@ -346,10 +394,22 @@ class HandledNodeIdsTest(unittest.TestCase):
 
 
 class FenceParserAgreementTest(unittest.TestCase):
-    """`pr_triggers.strip_fenced_blocks` must not drift from `audit_report`'s.
+    """`audit_report.py` reaches this module's strippers and no others.
 
-    Delete this test — and the copy — when `audit_report.py` migrates onto this
-    module.
+    This began as a drift guard over two copies of one parser. Both copies are
+    gone now — `strip_inline_code` delegated in an earlier round, and
+    `strip_fenced_blocks` here — so the comparisons below are tautological on
+    the current tree, and that is the point: they fail the moment somebody
+    re-inlines either one, which is the only way the drift can come back.
+
+    The reason the copies went is worth keeping. An agreement test can say the
+    two implementations match; it cannot say they are right, and it cannot see
+    a difference that is not in the output at all. Both limits were paid for
+    here — the list-marker fence defect sat in both copies at once and this
+    test passed throughout, and before that the cubic `INLINE_CODE_RE` differed
+    from its replacement by twenty minutes of CPU while agreeing on every
+    answer. The timing bounds below are what covers the second case; deleting
+    the copies is what covers the first.
     """
 
     CORPUS = (

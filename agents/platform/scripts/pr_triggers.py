@@ -129,7 +129,20 @@ NEWLINE_RE = re.compile(r"\n")
 #: A fence opens on three or more backticks or tildes at any indentation. The
 #: closer is what carries an indentation bound, measured against the opener —
 #: see `strip_fenced_blocks` for why the opener's own bound had to go.
-FENCE_OPEN_RE = re.compile(r"^( *)(`{3,}|~{3,})")
+#:
+#: A list marker on the same line is skipped, for the reason
+#: `HTML_BLOCK_OPEN_RE` skips one: CommonMark measures a fence from the
+#: enclosing block's content column, and ```- ``` ``` opens a fence inside that
+#: item. Requiring the run to be the first non-space text was the same mistake
+#: as the old three-space bound in a different place — it missed the opener, so
+#: the block never opened, and then the *closing* fence matched instead and
+#: opened an unterminated block that swallowed only what came after it. The
+#: quoted line in between survived, and `SLASH_RE` read it as a command while
+#: every reader of the thread saw a bullet containing quoted code.
+#:
+#: Group 1 is therefore the whole prefix, markers included, which is what makes
+#: it the content column the closer's `+ 3` tolerance is measured from.
+FENCE_OPEN_RE = re.compile(r"^( *(?:(?:[-*+]|\d{1,9}[.)]) +)*)(`{3,}|~{3,})")
 
 #: An HTML comment. GitHub's renderer drops these entirely, so a trigger inside
 #: one is invisible to every human reading the thread — see `find_trigger`.
@@ -278,6 +291,38 @@ def strip_hidden_blocks(text: str) -> str:
     return _strip_blocks(text, html_blocks=True)
 
 
+def _comment_open_at_eol(line: str, inside: bool) -> bool:
+    """Is an HTML comment still open when `line` ends, having entered `inside`?
+
+    The question `"-->" in line` looks like is not the question that matters. A
+    line may close a comment and open another — `<!-- x --><!--` does both — and
+    what the renderer emits for an HTML block is the raw line, so what decides
+    whether the *next* line is hidden is the state at end of line, not whether a
+    terminator appeared anywhere in it.
+
+    The two disagree in the direction that hurts. `<!-- x --><!--` contains
+    `-->`, so a containment test hands the following line to the inline
+    stripper as visible text; the browser, reading the emitted raw HTML,
+    swallows it inside the unterminated second comment. That was a live bypass:
+    the thread rendered as one innocuous line and `find_trigger` returned a
+    command from underneath it.
+    """
+    pos = 0
+    while True:
+        if inside:
+            end = line.find("-->", pos)
+            if end < 0:
+                return True
+            pos = end + 3
+            inside = False
+        else:
+            start = line.find("<!--", pos)
+            if start < 0:
+                return False
+            pos = start + 4
+            inside = True
+
+
 def _strip_blocks(text: str, *, html_blocks: bool) -> str:
     """The line scan behind `strip_fenced_blocks` and `strip_hidden_blocks`."""
     if not text:
@@ -289,8 +334,7 @@ def _strip_blocks(text: str, *, html_blocks: bool) -> str:
     in_html = False
     for line in text.split("\n"):
         if in_html:
-            if "-->" in line:
-                in_html = False
+            in_html = _comment_open_at_eol(line, True)
             continue
         if fence_char:
             closer = line.rstrip()
@@ -305,7 +349,12 @@ def _strip_blocks(text: str, *, html_blocks: bool) -> str:
                 fence_indent = 0
             continue
         opener = HTML_BLOCK_OPEN_RE.match(line) if html_blocks else None
-        if opener and "-->" not in line[opener.end() :]:
+        if opener and _comment_open_at_eol(line[opener.end() - 4 :], False):
+            # Still open at end of line, so this is a block and it runs on.
+            # Closed on its own line, and the line falls through to the inline
+            # stripper instead: `<!-- note --> /agent x` renders that trailing
+            # text, and suppressing it would suppress a request every reader
+            # can see.
             in_html = True
             continue
         match = FENCE_OPEN_RE.match(line)

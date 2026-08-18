@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6147,6 +6148,23 @@ class TestFenceScanning(unittest.TestCase):
     def strip(self, text):
         return audit_report.strip_fenced_blocks(text)
 
+    def test_the_remediate_pattern_reads_a_command_in_linear_time(self):
+        # `[ \t]*(.*?)[ \t]*$` backtracks quadratically on a run of spaces
+        # followed by a non-space: 9.83s on the 65,536 characters GitHub allows
+        # in a comment. `parse_remediate_commands` runs this over issue comments
+        # on a timer, before any trust check, so any account that can comment
+        # can spend it. Every consumer already calls `.strip()` on the match, so
+        # the pattern's own trim bought nothing; the greedy form reads the same
+        # command in 0.00002s. Bound as in `test_pr_triggers`: four orders of
+        # magnitude above the fix, well below the defect.
+        body = "/remediate a" + " " * 65000 + "x"
+        started = time.monotonic()
+        found = audit_report.REMEDIATE_RE.findall(body)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.3, f"took {elapsed:.3f}s")
+        # A fast wrong answer is not the fix.
+        self.assertEqual([m.strip() for m in found], ["a" + " " * 65000 + "x"])
+
     def test_a_command_inside_a_fence_is_removed(self):
         self.assertNotIn("/remediate", self.strip("a\n```\n/remediate x\n```\nb"))
 
@@ -6203,6 +6221,20 @@ class TestFenceScanning(unittest.TestCase):
         # item's content column, four spaces from the root.
         out = self.strip("- quoting the docs:\n\n    ```\n    /remediate x\n    ```\n")
         self.assertNotIn("/remediate x", out)
+
+    def test_a_fence_sharing_a_line_with_its_list_marker_does_not_fire(self):
+        # The other half of the case above, and it was open in both copies of
+        # this parser at once while an agreement test held them together: the
+        # test could only say the two agreed, and they agreed on being wrong.
+        # `parse_remediate_commands` reads issue comments, so a quoted command
+        # under a bullet is exactly what a maintainer writes.
+        for body in (
+            "- ```\n  /remediate x\n  ```\n",
+            "1. ```\n   /remediate x\n   ```\n",
+            "* ~~~\n  /remediate x\n  ~~~\n",
+        ):
+            with self.subTest(body=body):
+                self.assertNotIn("/remediate x", self.strip(body))
 
     def test_a_four_space_closer_still_does_not_end_a_root_level_fence(self):
         # The indentation bound moved onto the closer rather than disappearing,

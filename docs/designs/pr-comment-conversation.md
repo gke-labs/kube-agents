@@ -374,21 +374,30 @@ fenced-block and inline-code stripping, the marker format, and `handled_node_ids
 must agree on all of it exactly, and neither is a plausible owner. Three layers, then: `forge.py` is
 mechanism, `pr_triggers.py` is policy, the gate and the skill are consumers.
 
-Two functions in it are deliberate **copies** rather than imports, each pinned by an agreement test
-that fails if the original moves: `strip_fenced_blocks` from the fleet-audit skill's
-`audit_report.py`, and — one layer down — `forge._parse_repo` from the issue resolver's
-`resolver.py`. Both originals live inside skills, and a module shared by every skill must not import
-from one. The copies and their tests are deletable in one move on the day those skills migrate onto
-the shared modules, which §7 already names as out of scope here.
+One function in it is a deliberate **copy** rather than an import, pinned by an agreement test that
+fails if the original moves: `forge._parse_repo`, from the issue resolver's `resolver.py`. The
+original lives inside a skill, and a module shared by every skill must not import from one. The copy
+and its test are deletable in one move on the day the resolver migrates onto the shared modules,
+which §7 already names as out of scope here.
 
-`strip_inline_code` was a third copy and is no longer one: `audit_report.py` imports this module's
-version. The direction is the safe one — a skill may depend on a shared module, and it is only the
-reverse that the paragraph above forbids — and it was forced rather than chosen. The pattern both
-copies used, ``(`+)[^\n]*?\1``, is cubic in the length of a backtick run, and `/remediate` reads
-issue comments on a timer before any trust check, so the fleet-audit ledger was exposed exactly as
-this sweep was. Output parity is no guard against that: two copies can agree on every answer and
-still differ by twenty minutes of CPU. An agreement test that only compares outputs would have gone
-on passing, which is why the timing bound sits beside it.
+**The two Markdown strippers were copies and are not any more.** `audit_report.py` now imports this
+module's `strip_inline_code` and `strip_fenced_blocks` instead of holding its own. The direction is
+the safe one — a skill may depend on a shared module, and it is only the reverse the paragraph above
+forbids — and in both cases it was forced rather than chosen, by a defect that an agreement test
+watched and could not see.
+
+The first was runtime. The inline pattern both copies used, ``(`+)[^\n]*?\1``, is cubic in the length
+of a backtick run, and `/remediate` reads issue comments on a timer before any trust check, so the
+fleet-audit ledger was exposed exactly as this sweep was. Output parity is no guard against that: two
+copies can agree on every answer and still differ by twenty minutes of CPU.
+
+The second was a plain defect held identically in both. Neither fence parser recognised an opener
+sharing a line with its list marker — `- ` ``` — so the block never opened, the _closing_ fence
+matched instead, and the quoted command in between survived to fire. The agreement test passed
+throughout, because both copies were wrong in the same way. That is the general limit worth
+recording: an agreement test can only say two implementations match, never that they are right, and
+a copy is a place for one bug to live twice. The timing bounds cover the first failure mode; deleting
+the copies is the only thing that covers the second.
 
 ## 5. Idempotency without state
 

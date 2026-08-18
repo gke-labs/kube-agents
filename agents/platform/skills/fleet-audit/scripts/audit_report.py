@@ -392,7 +392,15 @@ STALE_CLOSED_MARKER_RE = re.compile(
 # argument is captured loosely — anything up to end of line — so that a
 # malformed request like `/remediate f-1 please` is *answered* with a refusal
 # rather than silently matching nothing and leaving the requester waiting.
-REMEDIATE_RE = re.compile(r"^[ \t]*/remediate\b[ \t]*(.*?)[ \t]*$", re.M)
+#: Greedy and untrimmed, and deliberately so: the trimming form
+#: `[ \t]*(.*?)[ \t]*$` backtracks quadratically on a run of spaces followed
+#: by a non-space — 9.83s on a 65,536-character body, the limit GitHub allows.
+#: `parse_remediate_commands` reads issue comments on a timer before any trust
+#: check, so any account that can comment can pay that cost on every run. Every
+#: consumer below already calls `.strip()` on the match, so the pattern trimming
+#: it a second time bought nothing. Same defect and same fix as
+#: `pr_triggers.SLASH_RE`, which carries the measurements.
+REMEDIATE_RE = re.compile(r"^[ \t]*/remediate\b(.*)$", re.M)
 # The same word *anywhere*, used only to notice a request the line-anchored
 # regex above will not honour — `we should /remediate f-1` buried in a
 # sentence. Matching it is not accepting it; it exists so the answer can be
@@ -418,20 +426,6 @@ MAX_HINT_IDS = 10
 # rather than measuring the concatenation and reporting a failure that is not
 # real. Deliberately not valid Markdown — nothing a renderer would produce.
 DRY_RUN_PR_SEPARATOR = "=== WOULD OPEN PULL REQUEST ==="
-# A fence opener. Fenced code blocks are stripped before command matching, so a
-# `/remediate` quoted inside an evidence excerpt never fires; strip_fenced_blocks
-# scans line by line rather than with one regex, because the regex form missed
-# both an unterminated fence and a block closed by a longer run of backticks.
-# CommonMark, and the indentation is load-bearing rather than cosmetic — but it
-# is the *closer* that carries the bound, measured against its own opener. An
-# opener is matched at any indentation because CommonMark measures a fence from
-# the enclosing block's content column: bound the opener at three spaces and a
-# fence under a bullet is never recognised, so the `/remediate` a reader quoted
-# inside it gets read as a command. The closer keeps the bound, because matching
-# a stripped line instead treats `    ``` ` — which every Markdown renderer
-# shows as literal text *inside* the surrounding block — as a real delimiter,
-# ending the block early and leaving the lines after it exposed.
-FENCE_OPEN_RE = re.compile(r"^( *)(`{3,}|~{3,})")
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
@@ -2141,36 +2135,31 @@ def strip_fenced_blocks(text: str) -> str:
     its own opener, which preserves that bound for a root-level fence and
     travels with the fence into a list item.
 
-    Behaviour is held identical to `pr_triggers.strip_fenced_blocks` by
-    `FenceParserAgreementTest`; see that module's note on the two copies.
+    A list marker on the same line as the opener counts, for the same reason as
+    the indentation: ```- ``` ``` opens a fence inside that item. Requiring the
+    run to be the first non-space text is the too-tight failure in a second
+    place — the opener is missed, so the *closer* matches instead and opens an
+    unterminated block that swallows only what follows it, leaving the quoted
+    `/remediate` in between exposed while every reader sees a bullet containing
+    code.
+
+    Delegated to `pr_triggers`, which holds the only hardened implementation.
+    This used to be a second copy held to that one by `FenceParserAgreementTest`,
+    and the list-marker defect above sat in both of them at once — which is what
+    a copy costs even with an agreement test on it, since the test can only
+    check that the two agree and they agreed on being wrong. `strip_inline_code`
+    above delegates for the same reason. The `FENCE_OPEN_RE` that used to sit
+    beside `INLINE_CODE_RE` is gone rather than kept as a reference: it was the
+    pattern with the defect in it, and a wrong pattern left in place as
+    documentation is the one most likely to be copied back out.
+
+    Imported inside the function, like every other shared-module import in this
+    file, so `--dry-run` on a dev machine does not depend on what has been
+    staged into /opt.
     """
-    if not text:
-        return ""
-    out: list[str] = []
-    fence_char = ""
-    fence_len = 0
-    fence_indent = 0
-    for line in text.split("\n"):
-        if fence_char:
-            closer = line.rstrip()
-            body = closer.lstrip(" ")
-            if (
-                len(closer) - len(body) <= fence_indent + 3
-                and set(body) == {fence_char}
-                and len(body) >= fence_len
-            ):
-                fence_char = ""
-                fence_len = 0
-                fence_indent = 0
-            continue
-        match = FENCE_OPEN_RE.match(line)
-        if match:
-            fence_indent = len(match.group(1))
-            fence_char = match.group(2)[0]
-            fence_len = len(match.group(2))
-            continue
-        out.append(line)
-    return "\n".join(out)
+    import pr_triggers
+
+    return pr_triggers.strip_fenced_blocks(text)
 
 
 def parse_gh_timestamp(value: str | None) -> datetime | None:
