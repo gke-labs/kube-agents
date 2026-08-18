@@ -2596,7 +2596,6 @@ the answer does not change, and the single-writer requirement this design serves
 <!-- Source links, line-anchored and pinned to the commit these line numbers
      were read from (76a074b). Re-pin here when the numbers are refreshed. -->
 
-
 <!-- External prior art (3.0), pinned to the version this repository depends on. -->
 
 [Dockerfile-113]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/docker/Dockerfile#L113
