@@ -11,6 +11,7 @@ E3 is a Go check and is not run from here; see README.md for its recipe.
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -35,6 +36,14 @@ def record(eid, claim, verdict, detail=""):
 
 def spawn_exit(code):
     return subprocess.Popen([PY, "-c", f"import sys; sys.exit({code})"])
+
+
+def probe(ready_file, stale_after=3.0, liveness=False):
+    """Run the 3.4 probe over the supervisor's one-line `ready` file."""
+    argv = [PY, os.path.join(HERE, "probe.py"), ready_file, str(stale_after)]
+    if liveness:
+        argv.append("--liveness")
+    return subprocess.run(argv).returncode
 
 
 # ---------------------------------------------------------------- E1
@@ -155,24 +164,25 @@ def e4():
     with tempfile.TemporaryDirectory() as d:
         # -- optional past cap: degraded, but the supervisor lives --------
         S.STATUS = os.path.join(d, "opt.json")
+        S.READY = os.path.join(d, "opt.ready")
         table = [
             S.Supervised("session_kv", [PY, "-c", "import sys;sys.exit(1)"], required=False),
             S.Supervised("gateway", [PY, "-c", "import time;time.sleep(300)"], required=True),
         ]
         sup = S.Supervisor(table, mode="solo")
         try:
-            sup.run(iterations=10)
+            sup.run(iterations=12)
             status = json.load(open(S.STATUS))
             assert table[0].state == "gave_up", "the optional process should have given up"
             assert status["ready"] is True, "an optional process down must NOT make the pod unready"
             assert status["degraded"] is True, "it must be reported as degraded"
-            rc = subprocess.run([PY, os.path.join(HERE, "probe.py"), S.STATUS]).returncode
-            assert rc == 0, "the probe should report Ready while merely degraded"
+            assert probe(S.READY) == 0, "the probe should report Ready while merely degraded"
         finally:
             sup.shutdown("e4 optional teardown")
 
         # -- required past cap: cleanup, then exit ------------------------
         S.STATUS = os.path.join(d, "req.json")
+        S.READY = os.path.join(d, "req.ready")
         table = [
             S.Supervised("session_kv", [PY, "-c", "import time;time.sleep(300)"], required=False),
             S.Supervised("gateway", [PY, "-c", "import sys;sys.exit(1)"], required=True),
@@ -192,15 +202,22 @@ def e4():
         assert final["ready"] is False, (
             "cleanup must write ready:false, or the probe reports Ready for a dying container"
         )
-        rc = subprocess.run([PY, os.path.join(HERE, "probe.py"), S.STATUS]).returncode
-        assert rc == 1, "the probe should report NotReady after the supervisor gives up"
+        assert probe(S.READY) == 1, "readiness must fail after the supervisor gives up"
+        # 3.4: the two probes must DISAGREE here. The loop is fresh, so liveness
+        # passes; only readiness knows a required process is down. Sharing one
+        # script would restart the container and undo 3.3's restart policy.
+        assert probe(S.READY, liveness=True) == 0, (
+            "liveness must ignore `ready` -- a down required process is 3.3's "
+            "decision to escalate, not a probe's"
+        )
 
     record(
         "E4",
-        "the cap diverges on criticality, and cleanup tells the truth",
+        "the cap diverges on criticality, cleanup tells the truth, and the two probes disagree",
         "HOLDS",
         "optional past cap -> ready:true degraded:true, supervisor alive, probe Ready\n"
-        "required past cap -> cleanup ran, exit 1, ready:false, probe NotReady",
+        "required past cap -> cleanup ran, exit 1, ready:false\n"
+        "same file, same instant: readiness=1 (NotReady), liveness=0 (do NOT restart)",
     )
 
 
@@ -208,26 +225,21 @@ def e4():
 def e4c():
     """A wedged loop stops refreshing the file, and the probe must catch it."""
     with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "stale.json")
-        doc = {
-            "role": "leader",
-            "ready": True,
-            "degraded": False,
-            "updated_at": time.time(),
-            "processes": [],
-        }
-        json.dump(doc, open(path, "w"))
-        fresh = subprocess.run([PY, os.path.join(HERE, "probe.py"), path, "3"]).returncode
-        assert fresh == 0, "a fresh status should be Ready"
+        path = os.path.join(d, "stale.ready")
+        open(path, "w").write(f"{int(time.time())} 1\n")
+        assert probe(path) == 0, "a fresh status should be Ready"
+        assert probe(path, liveness=True) == 0, "and alive"
         time.sleep(3.5)  # nothing rewrites it: the loop is blocked
-        stale = subprocess.run([PY, os.path.join(HERE, "probe.py"), path, "3"]).returncode
-        assert stale == 1, "a stale status must be NotReady even though ready:true"
+        assert probe(path) == 1, "a stale status must be NotReady even though ready=1"
+        # BOTH probes fail on staleness -- that is the one condition they share,
+        # and the one liveness exists for (3.4).
+        assert probe(path, liveness=True) == 1, "a wedged loop must fail liveness too"
 
     record(
         "E4c",
-        "staleness is detected: a hung loop cannot report healthy",
+        "staleness is detected by both probes: a hung loop cannot report healthy",
         "HOLDS",
-        "identical ready:true document -> Ready at t=0, NotReady at t=3.5s",
+        "identical `ready 1` line -> pass at t=0, fail at t=3.5s, readiness and liveness alike",
     )
 
 
@@ -241,6 +253,7 @@ def e5():
     with tempfile.TemporaryDirectory() as d:
         for n in (1, 2, 3):
             S.STATUS = os.path.join(d, f"b{n}.json")
+            S.READY = os.path.join(d, f"b{n}.ready")
             table = [
                 S.Supervised(f"p{i}", [PY, "-c", ignore_term], required=(i == n - 1))
                 for i in range(n)
@@ -264,33 +277,58 @@ def e5():
 
 # ---------------------------------------------------------------- E6
 def e6():
-    """The lease inequality, and that it catches table growth."""
+    """The lease inequality, and that it catches table growth.
 
-    def margin(lease, poll, jitter, grace, n):
-        return lease - (poll + jitter + grace * n)
+    First term is the RENEW DEADLINE, not a sleep -- see E11 for why that
+    distinction is the whole of the fix rather than a rename. Today's rows keep
+    the sleep because that is what today's script has, and they are labelled as
+    the best case they are.
+    """
+
+    def margin(lease, detect, grace, n):
+        return lease - (detect + grace * n)
 
     cases = {
-        "today (1 proc)": margin(15, 5, 2, 10, 1),
-        "today (2 proc)": margin(15, 5, 2, 10, 2),
-        "A: lease 30 (2 proc)": margin(30, 5, 2, 10, 2),
-        "A+C: lease 30, poll 3+1 (2 proc)": margin(30, 3, 1, 10, 2),
-        "A+C (3 proc)": margin(30, 3, 1, 10, 3),
-        "B: grace 4 (2 proc)": margin(15, 5, 2, 4, 2),
+        "today, sleep 5+2 (1 proc)": margin(15, 7, 10, 1),
+        "today, sleep 5+2 (2 proc)": margin(15, 7, 10, 2),
+        "A: lease 35, deadline 12 (2 proc)": margin(35, 12, 10, 2),
+        "B: grace 4, deadline 8 (2 proc)": margin(15, 8, 4, 2),
+        "C: retry 2+1, deadline 8 (2 proc)": margin(15, 8, 10, 2),
+        "A+C+D: lease 35, deadline 8 (2 proc)": margin(35, 8, 10, 2),
+        "A+C+D (3 proc)": margin(35, 8, 10, 3),
+        # 3.5: the CONSTANT is 35, but a challenger reads what is stored on the
+        # Lease, and nothing rewrites it on an existing install. See E10.
+        "S3 only, STALE lease 15 (1 proc)": margin(15, 8, 10, 1),
+        "S3+S4, STALE lease 15 (2 proc)": margin(15, 8, 10, 2),
     }
     expected = {
-        "today (1 proc)": -2,
-        "today (2 proc)": -12,
-        "A: lease 30 (2 proc)": 3,
-        "A+C: lease 30, poll 3+1 (2 proc)": 6,
-        "A+C (3 proc)": -4,
-        "B: grace 4 (2 proc)": 0,
+        "today, sleep 5+2 (1 proc)": -2,
+        "today, sleep 5+2 (2 proc)": -12,
+        "A: lease 35, deadline 12 (2 proc)": 3,
+        "B: grace 4, deadline 8 (2 proc)": -1,
+        "C: retry 2+1, deadline 8 (2 proc)": -13,
+        "A+C+D: lease 35, deadline 8 (2 proc)": 7,
+        "A+C+D (3 proc)": -3,
+        "S3 only, STALE lease 15 (1 proc)": -3,
+        "S3+S4, STALE lease 15 (2 proc)": -13,
     }
     for k, v in expected.items():
         assert cases[k] == v, f"{k}: design says margin {v}, computed {cases[k]}"
-    assert cases["A+C (3 proc)"] < 0, "a third process must violate the inequality"
+    assert cases["A+C+D (3 proc)"] < 0, "a third process must violate the inequality"
+    assert cases["B: grace 4, deadline 8 (2 proc)"] < 0, (
+        "3.5 says B no longer even reaches zero once the first term is a real "
+        "deadline rather than a sleep"
+    )
+    assert cases["S3+S4, STALE lease 15 (2 proc)"] < cases["today, sleep 5+2 (1 proc)"], (
+        "3.5 claims an unmigrated Lease makes S3+S4 WORSE than today; computed "
+        f"{cases['S3+S4, STALE lease 15 (2 proc)']} vs {cases['today, sleep 5+2 (1 proc)']}"
+    )
+
+    # The deadline is only enforceable if one full retry fits inside it (3.5).
+    assert 8 > 2 + 1 + 3, "renew_deadline must exceed retry_period + jitter + call timeout"
 
     detail = "\n".join(
-        f"{k:34s} margin {cases[k]:+3d}s  {'OK' if cases[k] > 0 else 'VIOLATED -> refuses to start'}"
+        f"{k:38s} margin {cases[k]:+3d}s  {'OK' if cases[k] > 0 else 'VIOLATED -> refuses to start'}"
         for k in cases
     )
     record("E6", "every margin in design 3.5 reproduces; a third process fails the assertion", "HOLDS", detail)
@@ -348,8 +386,11 @@ def e8():
             "            except ChildProcessError: break\n"
             "            if pid==0: break\n"
             "    time.sleep(0.4)\n"
-            "z=[l for l in os.popen('ps -o pid=,stat= -x').read().splitlines()\n"
-            "   if len(l.split())>1 and 'Z' in l.split()[1]]\n"
+            # Count only OUR OWN zombies. A machine-wide `ps` count made this
+            # experiment fail on any developer box that already had one.
+            "me=os.getpid()\n"
+            "z=[l for l in os.popen('ps -o ppid=,stat= -x').read().splitlines()\n"
+            "   if len(l.split())>1 and l.split()[0]==str(me) and 'Z' in l.split()[1]]\n"
             "print('ZOMBIES', len(z))\n")
         def zombies(mode):
             out = subprocess.run(["sh", entry, sup, mode], capture_output=True, text=True).stdout
@@ -363,7 +404,312 @@ def e8():
            f"with the 3.7 reaper:                {fixed} zombie(s)")
 
 
-EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E4": e4, "E4c": e4c, "E5": e5, "E6": e6, "E7": e7, "E8": e8}
+# ---------------------------------------------------------------- E9
+def e9():
+    """A demoted leader that reacquires the lease must restart its table.
+
+    This is the first case to run in `elected` mode at all: every other
+    experiment builds a solo Supervisor, where is_leader() is hardcoded True and
+    no leadership transition is ever executed. The gap it covers is a deadlock,
+    not a slowdown -- a leader holding the label with nothing under it.
+    """
+    import supervisor as S
+
+    live = "import time;time.sleep(300)"
+    with tempfile.TemporaryDirectory() as d:
+        S.STATUS = os.path.join(d, "elected.json")
+        S.READY = os.path.join(d, "elected.ready")
+        S.LEASE = os.path.join(d, "lease")
+        table = [
+            S.Supervised("session_kv", [PY, "-c", live], required=False),
+            S.Supervised("gateway", [PY, "-c", live], required=True),
+        ]
+        sup = S.Supervisor(table, mode="elected")
+        try:
+            open(S.LEASE, "w").close()  # acquire
+            sup.run(iterations=2)
+            promoted = [p.state for p in table]
+            first_pids = [p.proc.pid for p in table]
+            assert all(s == "running" for s in promoted), f"leader should run its table: {promoted}"
+            assert json.load(open(S.STATUS))["ready"] is True
+
+            os.remove(S.LEASE)  # demote
+            sup.run(iterations=2)
+            demoted = [p.state for p in table]
+            assert all(p.proc is None for p in table), "a follower must run nothing"
+            assert json.load(open(S.STATUS))["ready"] is True, "followers stay Ready (3.4)"
+
+            open(S.LEASE, "w").close()  # reacquire -- the case the design missed
+            sup.run(iterations=2)
+            regained = [p.state for p in table]
+            second_pids = [p.proc.pid for p in table if p.proc]
+            assert all(s == "running" for s in regained), (
+                "3.3: a reacquired lease must restart the table, got "
+                f"{regained} -- a leader holding the label and serving nothing"
+            )
+            assert json.load(open(S.STATUS))["ready"] is True, "a restarted table is Ready again"
+            assert second_pids != first_pids, "these should be new processes, not stale handles"
+        finally:
+            sup.shutdown("e9 teardown")
+
+        assert [p.state for p in table] == ["stopped", "stopped"], (
+            "cleanup is terminating, so it may leave entries stopped"
+        )
+
+    record(
+        "E9",
+        "a demoted leader restarts its table on reacquiring the lease",
+        "HOLDS",
+        f"promoted {promoted} -> demoted {demoted} -> regained {regained}\n"
+        f"pids {first_pids} -> {second_pids} (restarted, not resumed)\n"
+        "stop() leaves entries `pending`; only cleanup leaves them `stopped`",
+    )
+
+
+# ---------------------------------------------------------------- E10
+def e10():
+    """lease_duration_seconds reaches the Lease object on the create path only.
+
+    Parsed from the real k8s-operator/internal/controller/leader_elect.py, so
+    this starts failing the moment S3 adds the renew-path write 3.5 asks for --
+    which is the point: the claim is about today's script.
+    """
+    import ast
+
+    repo = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+    path = os.path.join(repo, "k8s-operator", "internal", "controller", "leader_elect.py")
+    tree = ast.parse(open(path).read())
+
+    FIELD = "lease_duration_seconds"
+    # V1LeaseSpec(lease_duration_seconds=...) -- the create path
+    kwarg = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             if any(k.arg == FIELD for k in n.keywords)]
+    # lease.spec.lease_duration_seconds = ... -- what renew/takeover would need
+    stores = [t for n in ast.walk(tree) if isinstance(n, ast.Assign)
+              for t in n.targets if isinstance(t, ast.Attribute) and t.attr == FIELD]
+    # duration = lease.spec.lease_duration_seconds or ... -- the challenger's read
+    loads = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+             and n.attr == FIELD and isinstance(n.ctx, ast.Load)]
+    # every replace_namespaced_lease call, i.e. every write that is NOT the create
+    replaces = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "replace_namespaced_lease"]
+
+    assert len(kwarg) == 1, f"expected one V1LeaseSpec(...) carrying {FIELD}, found {len(kwarg)}"
+    assert not stores, (
+        f"{FIELD} is assigned on {len(stores)} path(s) -- if renew/takeover now write it, "
+        "3.5's migration step is done and this experiment should be retired"
+    )
+    assert loads, f"expected the challenger to READ the stored {FIELD}"
+    assert len(replaces) >= 2, "expected renew and takeover to both replace the lease body"
+
+    record(
+        "E10",
+        "raising the constant cannot reach an already-created Lease",
+        "HOLDS",
+        f"{FIELD}: written by 1 create (V1LeaseSpec kwarg, line {kwarg[0].lineno}), "
+        f"assigned on 0 other paths,\n"
+        f"read back by the expiry test at line {loads[0].lineno}; "
+        f"{len(replaces)} replace_namespaced_lease calls carry the server's body unchanged\n"
+        "=> an existing install keeps leaseDurationSeconds:15 after S3; see E6's STALE rows",
+    )
+
+
+# ---------------------------------------------------------------- E11
+def e11():
+    """A sleep does not bound how long a leader takes to notice; a deadline does.
+
+    This is the one that falsified 3.5's FIRST term. The inequality used to read
+    `max_poll_interval + shutdown`, with `max_poll_interval` meaning the loop's
+    time.sleep -- but an iteration is the sleep PLUS an untimed lease call, so
+    the term measured nothing. Here every lease call times out, and the two
+    supervisors differ only in whether a renew deadline exists.
+    """
+    import supervisor as S
+
+    live = "import time;time.sleep(300)"
+
+    def stops_within(renew_deadline, budget):
+        with tempfile.TemporaryDirectory() as d:
+            S.STATUS = os.path.join(d, "s.json")
+            S.READY = os.path.join(d, "s.ready")
+            S.LEASE = os.path.join(d, "lease")
+            open(S.LEASE, "w").close()
+            table = [S.Supervised("gateway", [PY, "-c", live], required=True)]
+            sup = S.Supervisor(table, mode="elected", renew_deadline=renew_deadline)
+            try:
+                sup.run(iterations=2)  # acquire and start the table
+                assert table[0].state == "running", "setup: the leader should be running"
+                # The API server stops answering. Note the LEASE FILE IS STILL
+                # THERE -- this pod has not lost the lease, it has lost contact,
+                # which is precisely the case a returning call can never report.
+                sup.lease_call_delay = S.LEASE_CALL_TIMEOUT * 4
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < budget and table[0].proc is not None:
+                    sup.run(iterations=1)
+                return table[0].proc is None, time.monotonic() - t0
+            finally:
+                sup.shutdown("e11 teardown")
+
+    budget = S.RENEW_DEADLINE * 4
+    fixed, t_fixed = stops_within(S.RENEW_DEADLINE, budget)
+    prefix, t_prefix = stops_within(None, budget)
+
+    assert fixed, (
+        f"a renew deadline of {S.RENEW_DEADLINE}s must stop the table inside {budget}s "
+        "even though no lease call ever completes"
+    )
+    assert not prefix, (
+        "without a deadline the pre-fix loop should still be leading -- if it stopped, "
+        "this experiment is not reproducing the gap it exists for"
+    )
+    record(
+        "E11",
+        "a renew deadline bounds detection where a sleep interval does not",
+        "HOLDS",
+        f"every lease call timing out, budget {budget:.0f}s:\n"
+        f"  with renew_deadline={S.RENEW_DEADLINE}s: table STOPPED after {t_fixed:.1f}s\n"
+        f"  without one (pre-fix):                  still leading after {t_prefix:.1f}s\n"
+        "the lease file was present throughout: losing contact is not losing the lease,\n"
+        "and only the local clock can tell the difference",
+    )
+
+
+# ---------------------------------------------------------------- E12
+def e12():
+    """The restart cap is a rate, and fixing the off-by-one is what exposed it."""
+    import supervisor as S
+
+    # -- the off-by-one, behaviourally. A cap of N permits N restarts. --------
+    entry = S.Supervised("x", ["/nonexistent"], required=False)
+    now, restarts = 0.0, 0
+    while entry.state != "gave_up":
+        now += 1.0
+        entry.penalise(now)
+        if entry.state != "gave_up":
+            restarts += 1
+        assert restarts <= S.RESTART_CAP + 1, "penalise() is not converging"
+    assert restarts == S.RESTART_CAP, (
+        f"a cap of {S.RESTART_CAP} must permit {S.RESTART_CAP} restarts before retiring; "
+        f"permitted {restarts}. `>=` instead of `>` gives CAP-1"
+    )
+
+    # -- the rate floor, at the DESIGN's constants ----------------------------
+    CAP, WINDOW, OLD_WINDOW = 5, 600, 300          # 3.3
+    LOCK_WINDOW = 60                                # session-kv-decomposition.md 4.2
+    spacings = [LOCK_WINDOW + b for b in (1, 2, 4, 8, 16)]   # + the 3.3 backoff
+    span = sum(spacings)                            # 1st failure to the (CAP+1)th
+    floor = WINDOW / CAP
+
+    assert max(spacings) < floor, (
+        f"the KV server fails every {max(spacings)}s, wider than the {floor:.0f}s floor a "
+        f"{CAP}-in-{WINDOW}s cap gives: gave_up and degraded would be unreachable"
+    )
+    assert span <= WINDOW, f"{CAP + 1} failures span {span}s and must fit in {WINDOW}s"
+    assert span > OLD_WINDOW, (
+        f"the {OLD_WINDOW}s window is what this experiment retired -- {span}s does not fit, "
+        "so the cap was unreachable the moment the off-by-one was corrected"
+    )
+
+    record(
+        "E12",
+        "the restart cap is a rate with a floor, and the 300 s window was below it",
+        "HOLDS",
+        f"a cap of {S.RESTART_CAP} permits exactly {restarts} restarts (`>` not `>=`)\n"
+        f"KV server failure spacings {spacings} -> {CAP + 1} failures span {span}s\n"
+        f"  {OLD_WINDOW}s window: floor {OLD_WINDOW / CAP:.0f}s, span {span}s -> UNREACHABLE\n"
+        f"  {WINDOW}s window: floor {floor:.0f}s, span {span}s -> reaches the cap",
+    )
+
+
+# ---------------------------------------------------------------- E13
+def e13():
+    """Stopping must reach a GRANDCHILD, or 3.5's guarantee is about the parent only.
+
+    The gateway shells out constantly. Popen.terminate() signals the direct
+    child, so anything it spawned survives the handover, reparents to the
+    supervisor, and is reaped (3.7) rather than stopped -- reaped is not the
+    same as gone.
+
+    This also pins a subtlety that a first pass at the fix got wrong: SIGTERM to
+    the process GROUP is not sufficient either. A grandchild ignoring SIGTERM
+    outlives a parent that honours it, wait() returns immediately, and the
+    SIGKILL-after-grace branch never runs. stop() has to sweep the group.
+    """
+    parent = (
+        "import os,signal,sys,time\n"
+        "if os.fork() == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "    time.sleep(300)\n"
+        "time.sleep(300)\n"          # the parent does NOT ignore SIGTERM
+    )
+
+    def grandchild_pid(path, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                return int(open(path).read())
+            except (OSError, ValueError):
+                time.sleep(0.05)
+        raise AssertionError("the grandchild never announced itself")
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    import supervisor as S
+
+    results = {}
+    with tempfile.TemporaryDirectory() as d:
+        # -- today's shape: Popen + terminate(), no process group -------------
+        marker = os.path.join(d, "gc-today")
+        proc = subprocess.Popen([PY, "-c", parent, marker],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        gc = grandchild_pid(marker)
+        proc.terminate()
+        proc.wait(timeout=5)
+        time.sleep(0.3)
+        results["today"] = alive(gc)
+        if results["today"]:
+            os.kill(gc, signal.SIGKILL)
+
+        # -- 3.3's shape: start_new_session + killpg, with the sweep ----------
+        marker = os.path.join(d, "gc-fixed")
+        entry = S.Supervised("forker", [PY, "-c", parent, marker], required=True, grace=1.0)
+        entry.start(time.monotonic())
+        gc = grandchild_pid(marker)
+        entry.stop(final=True)
+        time.sleep(0.3)
+        results["fixed"] = alive(gc)
+        if results["fixed"]:
+            os.kill(gc, signal.SIGKILL)
+
+    assert results["today"], (
+        "expected Popen.terminate() to leave the grandchild running -- if it did not, "
+        "this experiment is not reproducing the gap it exists for"
+    )
+    assert not results["fixed"], (
+        "start_new_session + killpg + the group sweep must leave nothing behind; "
+        "the grandchild survived"
+    )
+    record(
+        "E13",
+        "stopping reaches the whole process group, not just the supervised process",
+        "HOLDS",
+        "grandchild ignoring SIGTERM, parent honouring it:\n"
+        "  Popen.terminate()                        -> grandchild SURVIVES\n"
+        "  start_new_session + killpg + group sweep -> grandchild gone\n"
+        "SIGTERM to the group alone would not do it: the parent exits, wait() returns,\n"
+        "and the SIGKILL-after-grace branch is never reached",
+    )
+
+
+EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E4": e4, "E4c": e4c, "E5": e5, "E6": e6,
+               "E7": e7, "E8": e8, "E9": e9, "E10": e10, "E11": e11, "E12": e12, "E13": e13}
 
 
 def main(argv):
