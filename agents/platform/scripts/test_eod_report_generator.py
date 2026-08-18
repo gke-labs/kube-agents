@@ -350,7 +350,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         """An unopened table measures nothing, so it cannot clear the day.
 
         `problems=` by keyword, because the second positional parameter is
-        `incidents`: passed there, the list never reaches the guard and this
+        `cluster_name`: passed there, the list never reaches the guard and this
         read as a test of a branch it did not enter.
         """
         summary = filter_and_aggregate_events(
@@ -610,10 +610,6 @@ class TestTheRecapReadsOneDatabaseAndOnlyATrustedOne(unittest.TestCase):
                 " message, severity, occurrences, notified, created_at)"
                 " VALUES ('prod', ?, 'Pod', 'OOMKilled', 'm', 'Critical', 1, 1, datetime('now'))",
                 (workload,),
-            )
-            conn.execute(
-                "CREATE TABLE incidents (chat_id TEXT, thread_id TEXT, report TEXT,"
-                " created_at TIMESTAMP)"
             )
         conn.close()
         return path
