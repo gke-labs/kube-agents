@@ -422,14 +422,16 @@ DRY_RUN_PR_SEPARATOR = "=== WOULD OPEN PULL REQUEST ==="
 # `/remediate` quoted inside an evidence excerpt never fires; strip_fenced_blocks
 # scans line by line rather than with one regex, because the regex form missed
 # both an unterminated fence and a block closed by a longer run of backticks.
-# CommonMark, and the indentation is load-bearing rather than cosmetic. A fence
-# opener may be indented up to three spaces; at four it is an indented code
-# block and not a fence at all, and a closer follows the same rule. Matching a
-# stripped line instead treats `    ``` ` — which every Markdown renderer shows
-# as literal text *inside* the surrounding block — as a real delimiter, which
-# ends the block early and leaves the lines after it exposed. That is how a
-# `/remediate` a reader quoted inside a code block gets read as a command.
-FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# CommonMark, and the indentation is load-bearing rather than cosmetic — but it
+# is the *closer* that carries the bound, measured against its own opener. An
+# opener is matched at any indentation because CommonMark measures a fence from
+# the enclosing block's content column: bound the opener at three spaces and a
+# fence under a bullet is never recognised, so the `/remediate` a reader quoted
+# inside it gets read as a command. The closer keeps the bound, because matching
+# a stripped line instead treats `    ``` ` — which every Markdown renderer
+# shows as literal text *inside* the surrounding block — as a real delimiter,
+# ending the block early and leaving the lines after it exposed.
+FENCE_OPEN_RE = re.compile(r"^( *)(`{3,}|~{3,})")
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
@@ -2116,36 +2118,56 @@ def strip_fenced_blocks(text: str) -> str:
     one of these issues.
 
     So: CommonMark's actual rule. A fence opens on a run of three or more
-    backticks or tildes, indented at most three spaces; it closes on a run of
-    the same character, at least as long, indented at most three spaces, with
-    nothing else on the line. An unterminated fence runs to the end.
+    backticks or tildes; it closes on a run of the same character, at least as
+    long, with nothing else on the line. An unterminated fence runs to the end.
 
-    The indentation bound is the half that is easy to drop and expensive to
-    lose. Strip each line first and `    ``` ` — four spaces, which CommonMark
-    and GitHub both render as literal text inside the enclosing block — reads
-    as a closer, the block ends four lines early, and the `/remediate` the
-    author put inside it to talk *about* fires as a command.
+    Both bounds are measured **relative to the opener**, which is the half that
+    is easy to get wrong in either direction.
+
+    Too tight, and a fence inside a list item is not seen as a fence at all.
+    CommonMark measures indentation from the enclosing block's content column,
+    not from the document root, so under a bullet the fence sits at column 4 or
+    more and an opener bounded at three spaces never matches it — the block is
+    never opened and the `/remediate` inside it fires. Recognising an opener at
+    any indentation is what closes that; the failure it can cause instead is an
+    indented literal ``` at document root swallowing the rest of the body,
+    which suppresses a command rather than inventing one.
+
+    Too loose, and the closer stops being trustworthy. Accept `    ``` ` — four
+    spaces, which CommonMark and GitHub both render as literal text inside the
+    enclosing block — as a closer for a fence opened at column 0, and the block
+    ends early, and the `/remediate` the author put inside it to talk *about*
+    fires as a command. So the closer may be indented at most three spaces past
+    its own opener, which preserves that bound for a root-level fence and
+    travels with the fence into a list item.
+
+    Behaviour is held identical to `pr_triggers.strip_fenced_blocks` by
+    `FenceParserAgreementTest`; see that module's note on the two copies.
     """
     if not text:
         return ""
     out: list[str] = []
     fence_char = ""
     fence_len = 0
+    fence_indent = 0
     for line in text.split("\n"):
         if fence_char:
             closer = line.rstrip()
+            body = closer.lstrip(" ")
             if (
-                len(closer) - len(closer.lstrip(" ")) <= 3
-                and set(closer.lstrip(" ")) == {fence_char}
-                and len(closer.lstrip(" ")) >= fence_len
+                len(closer) - len(body) <= fence_indent + 3
+                and set(body) == {fence_char}
+                and len(body) >= fence_len
             ):
                 fence_char = ""
                 fence_len = 0
+                fence_indent = 0
             continue
         match = FENCE_OPEN_RE.match(line)
         if match:
-            fence_char = match.group(1)[0]
-            fence_len = len(match.group(1))
+            fence_indent = len(match.group(1))
+            fence_char = match.group(2)[0]
+            fence_len = len(match.group(2))
             continue
         out.append(line)
     return "\n".join(out)

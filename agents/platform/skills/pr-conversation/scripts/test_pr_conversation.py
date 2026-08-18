@@ -76,7 +76,7 @@ class FakeProvider:
     def list_comments(self, repo, pr):
         return list(self.comments.get(pr.number, []))
 
-    def list_commit_shas(self, repo, pr):
+    def list_commits(self, repo, pr):
         if isinstance(self.commits, Exception):
             raise self.commits
         return list(self.commits)
@@ -88,8 +88,15 @@ class FakeProvider:
             self.posted.append((pr.number, handle.read()))
 
 
+#: When the default request in these tests was made. Every commit below lands
+#: after it, so a test that is not about the recency bound does not trip it.
+REQUESTED_AT = "2026-08-12T10:00:00Z"
+
 #: The commits on the fake pull request, tip last.
-COMMITS = ["0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", HEAD_SHA]
+COMMITS = [
+    forge.Commit("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "2026-08-12T10:30:00Z"),
+    forge.Commit(HEAD_SHA, "2026-08-12T11:00:00Z"),
+]
 
 
 def make_pr(
@@ -115,7 +122,7 @@ def make_comment(
     body,
     author="reviewer",
     can_write=True,
-    created_at="2026-08-12T10:00:00Z",
+    created_at=REQUESTED_AT,
     kind="issue",
     path="",
     line=None,
@@ -757,7 +764,7 @@ class ClaimVerificationTest(_Harness):
     def test_an_earlier_commit_on_the_pr_is_accepted(self):
         """An amend that made two commits: the one written about is not the tip."""
         provider = answerable()
-        rc, _out = self._reply(provider, "--verify-commit", COMMITS[0])
+        rc, _out = self._reply(provider, "--verify-commit", COMMITS[0].sha)
         self.assertEqual(rc, 0)
         self.assertEqual(len(provider.posted), 1)
 
@@ -834,6 +841,140 @@ class ClaimVerificationTest(_Harness):
             self._reply(provider, "--verify-commit", "")
         self.assertEqual(provider.posted, [])
         self.assertIn("empty", err.getvalue())
+
+    def test_a_commit_that_predates_the_request_is_not_an_answer_to_it(self):
+        """Membership alone is satisfied by the commit that opened the branch.
+
+        Every commit the agent ever pushed is on the pull request, so a model
+        that changed nothing can clear the sha check by naming its own earlier
+        work — and the reply carries the marker that closes the request for
+        good. The claim is about work done *for this request*, so the commit
+        has to postdate it.
+        """
+        provider = answerable(
+            commits=[forge.Commit(HEAD_SHA, "2026-08-12T09:00:00Z")],  # request: 10:00
+        )
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", HEAD_SHA)
+        self.assertEqual(provider.posted, [])
+        self.assertIn("before the request", err.getvalue())
+
+    def test_a_commit_dated_after_the_request_is_accepted(self):
+        """The other half of the bound: real work must still post."""
+        provider = answerable(commits=[forge.Commit(HEAD_SHA, "2026-08-12T10:00:01Z")])
+        rc, _out = self._reply(provider, "--verify-commit", HEAD_SHA)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_a_commit_with_no_date_is_not_a_pass(self):
+        """Unverifiable is not verified, the same as an unreadable listing."""
+        provider = answerable(commits=[forge.Commit(HEAD_SHA, "")])
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._reply(provider, "--verify-commit", HEAD_SHA)
+        self.assertEqual(provider.posted, [])
+        self.assertIn("did not report a date", err.getvalue())
+
+    def test_an_unreadable_request_time_still_posts_and_says_so(self):
+        """The membership check ran; only the recency bound was skipped.
+
+        Failing closed here would wedge the request instead — it is handed back
+        every ten minutes until something posts. So the reply goes out and the
+        gap is on stderr rather than guessed at.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", created_at="")]},
+            commits=[forge.Commit(HEAD_SHA, "2026-08-12T09:00:00Z")],
+        )
+        err = StringIO()
+        with redirect_stderr(err):
+            rc, _out = self._reply(provider, "--verify-commit", HEAD_SHA)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+        self.assertIn("recency", err.getvalue())
+
+
+class TrustGateTest(_Harness):
+    """The permission the SKILL.md asks for, enforced where it is spent.
+
+    `poll` hands the worker every comment on the pull request including the
+    untrusted ones, so the argument for answering anyway arrives in the same
+    prompt as the row forbidding it. These pin the decision in code.
+    """
+
+    def _post(self, provider, command, *extra):
+        path = self.scratch_file("reply.md", "Body.")
+        return self.run_helper(
+            [command, "--pr", "12", "--comment-id", "IC_1", "--body-file", path]
+            + list(extra),
+            provider,
+        )
+
+    def _provider(self, **comment_kwargs):
+        return FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4", **comment_kwargs)]},
+        )
+
+    def test_a_reply_to_an_account_without_write_access_posts_nothing(self):
+        provider = self._provider(can_write=False, author="drive-by")
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._post(provider, "reply", "--no-change")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("does not have write access", err.getvalue())
+
+    def test_an_unresolved_permission_is_not_permission(self):
+        """`can_write` is False on an indeterminate lookup, but the reason
+        differs and so does the advice: this one waits for the next sweep."""
+        provider = self._provider(can_write=False, can_write_known=False)
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._post(provider, "reply", "--no-change")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("could not be determined", err.getvalue())
+
+    def test_a_trusted_request_still_answers(self):
+        rc, _out = self._post(self._provider(), "reply", "--no-change")
+        self.assertEqual(rc, 0)
+
+    def test_an_untrusted_request_can_still_be_refused(self):
+        """Refusal is how the worker closes a loop, so it is never gated.
+
+        Step 2 of the SKILL.md sends it here for exactly this case; blocking it
+        would leave the request handed back every ten minutes forever.
+        """
+        provider = self._provider(can_write=False, author="drive-by")
+        rc, _out = self._post(provider, "refuse")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_a_trusted_out_of_scope_request_can_be_refused(self):
+        """The other reason to refuse: a maintainer asking for something the
+        agent will not do. Gating refusal on `can_write` would block it."""
+        provider = self._provider()
+        rc, _out = self._post(provider, "refuse")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_an_ignored_pull_request_is_not_posted_to(self):
+        """`agent:ignore` is how a maintainer says stop posting here.
+
+        The sweep honours it, but a card filed before the label went on still
+        runs after it, and a hand-run never consulted it at all — so the label
+        has to hold at the point the comment is actually written.
+        """
+        provider = FakeProvider(
+            prs=[make_pr(labels=(forge.IGNORE_LABEL,))],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+        )
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._post(provider, "reply", "--no-change")
+        self.assertEqual(provider.posted, [])
+        self.assertIn(forge.IGNORE_LABEL, err.getvalue())
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime
 
 # `$HERMES_HOME/scripts`, where the entrypoint's step 2b force-sync stages the
 # shared modules. Resolved from the environment rather than by walking up from
@@ -102,12 +103,24 @@ def _find_pr(provider, repo: str, number: int, viewer: str):
     posts publicly under the agent's identity, and the sweep only ever files
     cards for pull requests the agent opened. A number that resolves to
     somebody else's is a bad card or a bad hand-run, not something to answer.
+
+    `agent:ignore` is honoured for the same reason the sweep honours it, and
+    honouring it in only one of the two places would make the label a request
+    rather than an opt-out: a card filed before the label went on still runs
+    afterwards, and a hand-run never consulted it at all. The label is how a
+    maintainer says "stop posting here", and the posting is what it has to
+    stop.
     """
     for pr in provider.list_open_prs(repo):
         if pr.number != number:
             continue
         if not forge.is_agent_pull_request(pr, repo, viewer):
             _fail(f"{repo}#{number} is not one of this agent's pull requests.")
+        if pr.is_ignored:
+            _fail(
+                f"{repo}#{number} is labelled {forge.IGNORE_LABEL}, so the agent does not "
+                "post on it. Nothing was posted."
+            )
         return pr
     _fail(f"{repo}#{number} is not an open pull request.")
 
@@ -309,7 +322,70 @@ def handle_poll(args) -> int:
 SHA_MIN_LEN = 7
 
 
-def _check_claim(provider, repo: str, pr, sha: str, no_change: bool) -> None:
+def _check_trust(request: dict, marker_kind: str, repo: str, number: int) -> None:
+    """Enforce here what the SKILL.md only asks for.
+
+    The sweep decides who may be acted for, and it decides it twice over:
+    `can_write` for the permission, `can_write_known` for whether the lookup
+    answered at all. Nothing re-checked either at post time, so the whole trust
+    boundary of this feature was a paragraph of prose in Step 2 of the
+    SKILL.md. `poll` hands the worker every comment on the pull request, from
+    every author, precisely so it can see the untrusted ones — which means the
+    text arguing it should answer anyway is *in the prompt*, next to the row
+    saying it must not. A model that misreads one row, or is talked into it by
+    the comment it is reading, posts a real answer under the agent's identity
+    to an account with no write access to the repository. That is a decision
+    this file can check, so it checks it.
+
+    Only `reply` is gated, and deliberately so. `refuse` posts no answer and
+    takes no action; it declines a request and stamps the marker that stops it
+    being handed back every ten minutes. Step 2 of the SKILL.md sends the
+    worker to it for exactly the case gated here, and for a trusted reviewer's
+    out-of-scope ask too. Blocking a refusal is how a request loops forever,
+    so the conservative verdict stays available from either side of the gate.
+
+    Unknown is not permission. A `reply` on an unanswered permission lookup is
+    the same public post on the same unverified account; the difference is only
+    that the failure was a proxy timeout rather than a stranger. The sweep
+    holds the request for the next tick in that case, and so does this.
+    """
+    if marker_kind == pr_triggers.REFUSED_MARKER:
+        return
+
+    author = request.get("author", "an unknown account")
+    where = f"{repo}#{number}"
+    if not request.get("can_write_known", False):
+        _fail(
+            f"whether @{author} has write access to {where} could not be determined, so "
+            "this request may not be answered. Nothing was posted, no marker was written, "
+            "and the next sweep re-reads it once the lookup works again."
+        )
+    if not request.get("can_write", False):
+        _fail(
+            f"@{author} does not have write access to {where}, so the agent does not act on "
+            "their request. Nothing was posted. Use `refuse` to decline it in the thread — "
+            "that is what closes the loop without answering it."
+        )
+
+
+def _parse_time(value: str):
+    """One forge timestamp as a comparable datetime, or None if unreadable.
+
+    Both timestamps compared here come from the same GitHub API and are
+    ISO-8601 with a `Z`, which `fromisoformat` did not accept before 3.11.
+    Unreadable returns None and the caller declines to compare rather than
+    guessing an ordering.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _check_claim(provider, repo: str, pr, sha: str, no_change: bool, requested_at: str = "") -> None:
     """Refuse to post a claim to have amended the branch until it is true.
 
     A reply saying "I have bumped the replica count to 2" is checkable, and
@@ -333,6 +409,16 @@ def _check_claim(provider, repo: str, pr, sha: str, no_change: bool) -> None:
     skipped every check, and posted the claim. Every other malformed sha fails
     loudly; that one input failed silently, in the unsafe direction, which is
     the one shape this whole check exists to make impossible.
+
+    On the branch is not enough, which is the second bound. Every commit the
+    agent ever pushed is on the branch, including the one that opened the pull
+    request — so a model that answers "done, see abc1234" while having changed
+    nothing passes the membership test by naming its own earlier work. That is
+    not a hypothetical: it is the same live failure recorded above, one step
+    later, and the check as first written would not have caught it. So the
+    commit must also postdate the request it claims to answer. `requested_at`
+    is the triggering comment's `created_at`, which the caller already holds
+    from the pending-request row it validated `--comment-id` against.
     """
     if no_change:
         return
@@ -349,17 +435,45 @@ def _check_claim(provider, repo: str, pr, sha: str, no_change: bool) -> None:
             f"give at least {SHA_MIN_LEN} characters."
         )
     try:
-        shas = [s.lower() for s in provider.list_commit_shas(repo, pr)]
+        commits = provider.list_commits(repo, pr)
     except forge.ForgeError as error:
         # Unverifiable is not verified. Posting anyway would put the claim in
         # the thread with the marker that closes it.
         _fail(f"could not read the commits on {repo}#{pr.number} to check the claim: {error}")
-    if not any(candidate.startswith(wanted) for candidate in shas):
+    shas = [c.sha.lower() for c in commits]
+    matched = [c for c in commits if c.sha.lower().startswith(wanted)]
+    if not matched:
         _fail(
             f"{sha} is not a commit on {repo}#{pr.number}, so the reply's claim to have "
             "changed the branch is not true yet. Nothing was posted. The branch tip is "
             f"{pr.head_sha or 'unknown'}"
             + (f"; its commits are {', '.join(s[:8] for s in shas)}." if shas else ".")
+        )
+
+    asked = _parse_time(requested_at)
+    if asked is None:
+        # No usable request time — the row carried none, or the forge sent a
+        # shape this cannot read. The membership check above still ran; the
+        # recency bound is skipped rather than guessed, and says so, because
+        # inventing an ordering here would fail in the unsafe direction.
+        sys.stderr.write(
+            "pr_conversation: request timestamp unreadable, so the commit's recency "
+            "was not checked — only that it is on the branch.\n"
+        )
+        return
+    landed = _parse_time(matched[0].committed_at)
+    if landed is None:
+        _fail(
+            f"the forge did not report a date for {sha}, so this reply's claim to have "
+            "changed the branch in response to the request cannot be checked. Nothing "
+            "was posted."
+        )
+    if landed < asked:
+        _fail(
+            f"{sha} was committed at {matched[0].committed_at}, before the request at "
+            f"{requested_at}. It is on the branch, but it is not work done in answer to "
+            "this request, so the reply's claim is not true. Push the change first, or "
+            "pass --no-change if the answer needs none. Nothing was posted."
         )
 
 
@@ -388,16 +502,19 @@ def _post(args, marker_kind: str) -> int:
     # the sweep re-answers it every ten minutes. That is the exact failure this
     # helper exists to prevent, so the id is checked against the requests the
     # forge reports as unanswered right now rather than trusted.
-    pending_ids = {row["comment_id"] for row in requests}
-    if args.comment_id not in pending_ids:
+    pending = {row["comment_id"]: row for row in requests}
+    if args.comment_id not in pending:
         _fail(
             f"{args.comment_id} is not an unanswered request on {repo}#{args.pr}. "
             + (
-                "Unanswered right now: " + ", ".join(sorted(pending_ids))
-                if pending_ids
+                "Unanswered right now: " + ", ".join(sorted(pending))
+                if pending
                 else "There are no unanswered requests on it."
             )
         )
+    request = pending[args.comment_id]
+
+    _check_trust(request, marker_kind, repo, args.pr)
 
     _check_claim(
         provider,
@@ -406,6 +523,7 @@ def _post(args, marker_kind: str) -> int:
         getattr(args, "verify_commit", ""),
         # `refuse` never claims a change, so it is not asked and never posts one.
         getattr(args, "no_change", marker_kind == pr_triggers.REFUSED_MARKER),
+        request.get("created_at", ""),
     )
 
     body = _confined_body(args.body_file).rstrip()

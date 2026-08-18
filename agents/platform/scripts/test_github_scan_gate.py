@@ -266,6 +266,70 @@ class CardBucketTest(unittest.TestCase):
         self.assertTrue(card.idempotency_key.endswith(expected))
 
 
+class PrCardKeyTest(unittest.TestCase):
+    """The same expiry, for the sweep that needed it more.
+
+    ``CardBucketTest`` above explains why the board's dedupe makes a permanent
+    key a latch: a repeat is matched against non-archived rows whatever their
+    state, so a card that *finished* answers its key forever and nothing here
+    archives cards. The PR sweep is the worse case. An issue key is scoped to
+    the issue, so a wedged one hides that issue; a PR key is scoped to the
+    first unanswered request's node id, and that id keeps being the first
+    unanswered one for as long as it goes unanswered — so one abandoned worker
+    silences *every later request on that pull request*, including ones from
+    reviewers who were never involved. A reviewer then watches the agent answer
+    nothing, on a live pull request, with no error raised anywhere.
+
+    An hour is the bucket the issue sweep already uses: long enough that a
+    worker running normally is not refiled underneath itself, short enough that
+    an abandoned one costs one retry rather than the pull request.
+    """
+
+    def _card(self, now, node_id="IC_1", number=12, repo="acme/toolkit"):
+        pr = forge.PullRequest(
+            number=number, head_ref="platform-agent/x", author="agent[bot]"
+        )
+        comment = forge.Comment(
+            node_id=node_id,
+            author="reviewer",
+            body="/agent bump to 4",
+            can_write=True,
+            created_at="2026-08-17T14:00:00Z",
+        )
+        trigger = pr_triggers.find_trigger(comment.body, "agent", node_id, comment.author)
+        return gate._pr_card(
+            pr, [gate._Pending(pr=pr, comment=comment, trigger=trigger)], repo, now=now
+        )
+
+    def test_the_same_hour_does_not_refile(self):
+        early = datetime(2026, 8, 17, 14, 0, tzinfo=timezone.utc)
+        late = datetime(2026, 8, 17, 14, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            self._card(early).idempotency_key, self._card(late).idempotency_key
+        )
+
+    def test_the_next_hour_refiles(self):
+        """Without this the pull request is silenced for good, not for an hour."""
+        before = datetime(2026, 8, 17, 14, 59, tzinfo=timezone.utc)
+        after = datetime(2026, 8, 17, 15, 0, tzinfo=timezone.utc)
+        self.assertNotEqual(
+            self._card(before).idempotency_key, self._card(after).idempotency_key
+        )
+
+    def test_the_repo_number_and_comment_still_scope_the_key(self):
+        """Bucketing must not have collapsed the other three scopes."""
+        now = datetime(2026, 8, 17, 14, 0, tzinfo=timezone.utc)
+        key = self._card(now).idempotency_key
+        self.assertNotEqual(key, self._card(now, repo="other/repo").idempotency_key)
+        self.assertNotEqual(key, self._card(now, number=13).idempotency_key)
+        self.assertNotEqual(key, self._card(now, node_id="IC_2").idempotency_key)
+
+    def test_the_default_clock_is_utc_not_local(self):
+        card = self._card(None)
+        expected = datetime.now(timezone.utc).strftime(gate.CARD_BUCKET_FORMAT)
+        self.assertTrue(card.idempotency_key.endswith(expected), card.idempotency_key)
+
+
 class RunResolverPollTest(unittest.TestCase):
     def test_missing_resolver_raises(self):
         """Better a loud sweep failure than a silent "no issues"."""
@@ -618,7 +682,13 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertIn("acme/toolkit#12", card.title)
         self.assertIn("IC_1", card.body)
         self.assertIn("platform-agent/x", card.body)
-        self.assertEqual(card.idempotency_key, "pr-conv-acme-toolkit-12-IC_1")
+        # Prefix, not equality: the key carries an hourly bucket so an abandoned
+        # request cannot silence the pull request forever. `PrCardKeyTest` owns
+        # the suffix; here it is the identity in front of it that matters.
+        self.assertTrue(
+            card.idempotency_key.startswith("pr-conv-acme-toolkit-12-IC_1-"),
+            card.idempotency_key,
+        )
 
     def test_the_reviewer_is_acknowledged_before_the_card_is_filed(self):
         """Inside the tick, not after a model has been scheduled."""
@@ -723,7 +793,10 @@ class PrCommentsSweepTest(unittest.TestCase):
         )
         cards = self._sweep(provider).cards
         self.assertEqual(len(cards), 1)
-        self.assertEqual(cards[0].idempotency_key, "pr-conv-acme-toolkit-12-IC_2")
+        self.assertTrue(
+            cards[0].idempotency_key.startswith("pr-conv-acme-toolkit-12-IC_2-"),
+            cards[0].idempotency_key,
+        )
 
     def test_the_agent_does_not_answer_itself(self):
         pr = make_pr()
@@ -965,7 +1038,11 @@ class PrCommentsSweepTest(unittest.TestCase):
             },
         )
         cards = self._sweep(provider).cards
-        self.assertEqual([c.idempotency_key for c in cards], ["pr-conv-acme-toolkit-12-IC_2"])
+        self.assertEqual(len(cards), 1)
+        self.assertTrue(
+            cards[0].idempotency_key.startswith("pr-conv-acme-toolkit-12-IC_2-"),
+            cards[0].idempotency_key,
+        )
 
     # -- whose pull request is it ------------------------------------------
     def test_the_branch_prefix_alone_does_not_make_a_pr_ours(self):

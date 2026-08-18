@@ -88,17 +88,30 @@ it is about, and the diff is the one part of that context `poll` does not carry.
 
 ### Step 2: Decide what each request is
 
-Each row in `requests` carries `can_write`, `kind`, and `request`.
+Each row in `requests` carries `can_write`, `can_write_known`, `kind`, and
+`request`.
 
 - **`can_write` is `false`** — refuse. Post one refusal (Step 4) explaining that
   requests are honoured from accounts with write access to the repository, and
   do nothing else for that request. Do not investigate it first: acting on
   reconnaissance you were not asked for is itself the thing the gate exists to
   stop.
+- **`can_write_known` is `false`** — the permission lookup did not answer: a
+  proxy fault, a timeout, a 5xx. `can_write` is `false` beside it because every
+  reader of that pair has to fail closed, but this is not a stranger and is not
+  refused. Leave the request alone entirely and say so when you complete the
+  card. A refusal here would stamp the marker that closes the request for good
+  on the strength of a network blip, and the maintainer it silenced gets no
+  second chance; the next sweep re-reads it in ten minutes.
+
 - **`kind` is `"mention"`** — you were pointed at something without being told
   what to do. The ask is in `conversations`, in what was said around the mention.
   If you still cannot find it, say so and ask, rather than guessing at a change.
 - **`kind` is `"slash"`** — `request` is what was asked.
+
+Both trust rules are enforced by `reply` itself, which posts nothing when they do
+not hold — so misreading a row costs you a failed command rather than a comment
+you cannot take back.
 
 Sort each request into one of two shapes:
 
@@ -109,6 +122,12 @@ No commit.
 <head_ref>`, edit, `submit`. Its `--force-with-lease` and protected-branch
 guards apply unchanged, and the change goes on the pull request's own branch.
 Never open a second pull request for a change to an existing one.
+
+**Stop after that skill's `submit`.** Its Step 5 ends by telling you to reply
+with `gh pr comment` — do not, here. That reply carries no marker, so it does
+not close the request: the sweep hands it back in ten minutes and the reviewer
+gets the same answer twice, then three times. Step 4 below is how this skill
+replies, and it is the only way that also records the request as handled.
 
 If a request is out of scope, technically wrong, or something you should not do,
 say so in the reply. A reasoned refusal is a complete answer; silently not doing
@@ -176,8 +195,11 @@ it. Writing one by hand into the wrong comment marks the wrong request handled.
 - **`--verify-commit <sha>`** — this reply says the branch changed. The sha is
   checked against the pull request's commits before anything is posted, so a
   claim about a commit that is not there fails here rather than in the thread.
-  Give the commit `submit` made; an abbreviation of seven characters or more is
-  enough.
+  It is also checked against the clock: the commit must have landed **after the
+  request you are answering**, because every commit you ever pushed is on this
+  branch and naming an old one would pass a membership test while changing
+  nothing. Give the commit `submit` made — the one you read back in Step 2b —
+  and an abbreviation of seven characters or more is enough.
 - **`--no-change`** — this reply changed nothing on the branch. Correct for an
   answer to a question, and correct for a change request you could not carry
   out. Nothing about it is checkable, which is exactly why the body must not

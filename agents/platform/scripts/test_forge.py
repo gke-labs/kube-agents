@@ -509,7 +509,7 @@ class ListOpenPrsTest(unittest.TestCase):
 COMMITS_ENDPOINT = "repos/acme/toolkit/pulls/12/commits"
 
 
-class ListCommitShasTest(unittest.TestCase):
+class ListCommitsTest(unittest.TestCase):
     """The read behind `pr_conversation reply --verify-commit`."""
 
     def _pr(self):
@@ -518,13 +518,54 @@ class ListCommitShasTest(unittest.TestCase):
     def test_shas_are_returned_tip_last(self):
         rows = json.dumps([{"sha": "aaa1"}, {"sha": "bbb2"}])
         provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
-        self.assertEqual(provider.list_commit_shas(REPO, self._pr()), ["aaa1", "bbb2"])
+        self.assertEqual(
+            [c.sha for c in provider.list_commits(REPO, self._pr())], ["aaa1", "bbb2"]
+        )
+
+    def test_the_committer_date_travels_with_the_sha(self):
+        """Membership alone cannot tell a commit made in answer to the request
+        from one that opened the pull request; the date is what does."""
+        rows = json.dumps(
+            [{"sha": "aaa1", "commit": {"committer": {"date": "2026-01-02T03:04:05Z"}}}]
+        )
+        provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(
+            provider.list_commits(REPO, self._pr())[0].committed_at, "2026-01-02T03:04:05Z"
+        )
+
+    def test_the_author_date_is_not_used(self):
+        """A rebase or cherry-pick keeps an author date from weeks ago, which
+        would clear the recency bound for work that predates the request."""
+        rows = json.dumps(
+            [
+                {
+                    "sha": "aaa1",
+                    "commit": {
+                        "author": {"date": "2020-01-01T00:00:00Z"},
+                        "committer": {"date": "2026-01-02T03:04:05Z"},
+                    },
+                }
+            ]
+        )
+        provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(
+            provider.list_commits(REPO, self._pr())[0].committed_at, "2026-01-02T03:04:05Z"
+        )
+
+    def test_a_missing_date_is_empty_not_absent(self):
+        """The caller distinguishes "no date" from "old date" and refuses on
+        the first, so the field must survive the row lacking it."""
+        rows = json.dumps([{"sha": "aaa1"}, {"sha": "bbb2", "commit": {}}])
+        provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
+        self.assertEqual(
+            [c.committed_at for c in provider.list_commits(REPO, self._pr())], ["", ""]
+        )
 
     def test_the_listing_paginates(self):
         """A long-lived pull request outruns one page, and a missed commit reads
         as a false claim."""
         fake = FakeGh({COMMITS_ENDPOINT: (0, "[]", "")})
-        forge.GitHubProvider(run=fake).list_commit_shas(REPO, self._pr())
+        forge.GitHubProvider(run=fake).list_commits(REPO, self._pr())
         self.assertIn("--paginate", fake.argv_containing(COMMITS_ENDPOINT))
 
     def test_a_row_without_a_sha_is_dropped_not_returned_empty(self):
@@ -532,7 +573,7 @@ class ListCommitShasTest(unittest.TestCase):
         `any(...)` on a short claim behave oddly. Drop it."""
         rows = json.dumps([{"sha": ""}, {}, {"sha": "ccc3"}])
         provider = forge.GitHubProvider(run=FakeGh({COMMITS_ENDPOINT: (0, rows, "")}))
-        self.assertEqual(provider.list_commit_shas(REPO, self._pr()), ["ccc3"])
+        self.assertEqual([c.sha for c in provider.list_commits(REPO, self._pr())], ["ccc3"])
 
     def test_a_failure_raises_rather_than_reporting_no_commits(self):
         """No commits and cannot tell are opposite answers to "did it land?"."""
@@ -540,7 +581,7 @@ class ListCommitShasTest(unittest.TestCase):
             run=FakeGh({COMMITS_ENDPOINT: (1, "", "gh: Server Error (HTTP 500)")})
         )
         with self.assertRaises(forge.ForgeError):
-            provider.list_commit_shas(REPO, self._pr())
+            provider.list_commits(REPO, self._pr())
 
 
 ISSUE_COMMENTS = json.dumps(

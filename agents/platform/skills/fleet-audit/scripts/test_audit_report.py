@@ -6181,10 +6181,35 @@ class TestFenceScanning(unittest.TestCase):
         out = self.strip("```\n    ```\n/remediate x\n```")
         self.assertNotIn("/remediate x", out)
 
-    def test_a_four_space_indented_run_does_not_open_a_block(self):
-        # The mirror image: treating it as an opener swallows every real
-        # command after it, so the channel silently stops working.
+    def test_a_four_space_indented_run_opens_a_block(self):
+        # A deliberate reversal, and its cost is real: at the document root
+        # CommonMark reads this as an indented code block rather than a fence,
+        # so treating it as an opener swallows every command after it and the
+        # channel goes quiet for that comment.
+        #
+        # It is still the right way round. A fence's indentation is measured
+        # from its *enclosing block's* content column, not from the document
+        # root, so under a bullet those same four spaces are an ordinary fence
+        # — and refusing to open there let a command inside a fenced block fire
+        # while every reader of the thread saw it as quoted. Not firing on a
+        # command someone meant is recoverable by retyping it; firing on one
+        # nobody meant is not. Telling the two apart needs list context this
+        # line-at-a-time stripper does not have.
         out = self.strip("    ```\n/remediate real")
+        self.assertNotIn("/remediate real", out)
+
+    def test_a_fence_inside_a_list_item_does_not_fire(self):
+        # The case the old bound was blocking: the fence sits at the list
+        # item's content column, four spaces from the root.
+        out = self.strip("- quoting the docs:\n\n    ```\n    /remediate x\n    ```\n")
+        self.assertNotIn("/remediate x", out)
+
+    def test_a_four_space_closer_still_does_not_end_a_root_level_fence(self):
+        # The indentation bound moved onto the closer rather than disappearing,
+        # and it is measured against its own opener — so a block opened at
+        # column 0 is unaffected by what the reversal above now allows.
+        out = self.strip("```\n    ```\n/remediate x\n```\n/remediate real")
+        self.assertNotIn("/remediate x", out)
         self.assertIn("/remediate real", out)
 
     def test_three_spaces_of_indent_is_still_a_fence(self):

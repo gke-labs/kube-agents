@@ -343,10 +343,14 @@ deterministic lives here, so an idle tick still costs no model at all.
   done on stderr rather than going quiet. One thing it cannot cover, and says so on stderr: the
   issues sweep runs `resolver.py poll`, whose stale-label sweep has no dry-run of its own.
 - **One card per pull request**, assigned to `platform`, keyed
-  `pr-conv-<owner>-<repo>-<n>-<node-id>`, carrying the PR number, head ref, the triggering comment
-  node ids, and the `notify_session_id` from §6. The node id enters that key case-preserved: it is
-  base64, so folding its case could give two distinct comments one idempotency key and lose the
-  second request.
+  `pr-conv-<owner>-<repo>-<n>-<node-id>-<hour>`, carrying the PR number, head ref and the triggering
+  comment node ids. The node id enters that key case-preserved: it is base64, so folding its case
+  could give two distinct comments one idempotency key and lose the second request. The hourly
+  bucket is the one §2's issue sweep already uses, and it matters more here: the board matches a
+  repeat key against non-archived rows whatever their state, so without it a single worker that
+  ends without answering leaves a _finished_ card holding the key of the oldest unanswered request
+  — which stays the oldest unanswered request — and every later request on that pull request is
+  deduped away in silence. Not the request: the pull request.
 - **A credential that cannot name itself stops the sweep loudly.** The viewer is what §5 counts
   markers against, so an empty one would make every marker invisible and re-answer the same request
   every ten minutes. Stopping is the safe direction, and it is the whole sweep rather than one pull
@@ -524,10 +528,11 @@ request: cost with no reader behind it.
 ### Escalation instead
 
 What the mirror was reaching for is real, but it is a different message. The hole this design does
-have is at the end of §6, step 5: a request the worker abandons, or one the per-tick cap keeps
-deferring, is re-offered every ten minutes **forever, in silence**. Deferral goes to stderr because
-it is ordinary backpressure; there is nothing that distinguishes "cleared on the next tick" from
-"has been failing all week". Recoverable is not the same as noticed.
+have is at the end of §6, step 5: a request the worker abandons is re-offered **forever, in
+silence** — hourly, since the card key's bucket in §4 is what expires it, and a request the per-tick
+cap keeps deferring is re-offered every ten minutes on the same terms. Deferral goes to stderr
+because it is ordinary backpressure; there is nothing that distinguishes "cleared on the next tick"
+from "has been failing all week". Recoverable is not the same as noticed.
 
 So the chat line is owed on **staleness, not on every reply**: a trigger still unanswered some
 threshold after the comment was posted earns one line in chat, and an answered one earns nothing.

@@ -217,6 +217,24 @@ class Comment:
         return self.author.endswith("[bot]")
 
 
+@dataclass(frozen=True)
+class Commit:
+    """One commit on a pull request's head branch.
+
+    The date rides along with the sha because a reply's claim to have amended
+    the branch is only true if the commit came *after* the request it answers.
+    A sha alone answers "is this on the branch", which every commit the agent
+    ever pushed satisfies — including the one that opened the pull request. See
+    `pr_conversation._check_claim`.
+    """
+
+    sha: str
+    #: ISO-8601 committer date as the forge reported it, or "" when it did not.
+    #: Empty is unverifiable, which the caller treats as a failure rather than
+    #: as a pass.
+    committed_at: str = ""
+
+
 class ForgeProvider(Protocol):
     """The complete forge-shaped surface of the PR-conversation feature."""
 
@@ -236,7 +254,7 @@ class ForgeProvider(Protocol):
 
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
 
-    def list_commit_shas(self, repo: str, pr: PullRequest) -> list[str]: ...
+    def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
 
 
 def normalise_login(login: str) -> str:
@@ -653,13 +671,18 @@ class GitHubProvider:
             return False
         return True
 
-    def list_commit_shas(self, repo: str, pr: PullRequest) -> list[str]:
-        """Every commit on the pull request, tip last.
+    def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]:
+        """Every commit on the pull request, tip last, each with its date.
 
         Exists so a reply that claims to have amended the branch can be checked
         against the branch before it is posted. The head sha alone is not
         enough: an amend that made two commits leaves the model naming the one
         it wrote about, which is real and is not the tip.
+
+        The committer date rather than the author date, because a rebase or a
+        cherry-pick preserves the author date of a commit written weeks ago.
+        The question being asked is "did this land on the branch after the
+        request", and the committer date is the one that answers it.
         """
         rows = self._call(
             [
@@ -668,7 +691,14 @@ class GitHubProvider:
                 "--paginate",
             ]
         )
-        return [str(row.get("sha", "")) for row in (rows or []) if row.get("sha")]
+        commits = []
+        for row in rows or []:
+            sha = str(row.get("sha", ""))
+            if not sha:
+                continue
+            committer = ((row.get("commit") or {}).get("committer")) or {}
+            commits.append(Commit(sha=sha, committed_at=str(committer.get("date", ""))))
+        return commits
 
 
 #: Host substring -> provider. One entry today; the point of the table is that
