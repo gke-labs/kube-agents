@@ -23,9 +23,11 @@
 #   • the event watcher must not then watch that cluster twice, once through --in-cluster and
 #     once through the new profile — buildWatchSet in cmd/k8s-event-watcher/main.go drops the
 #     duplicate;
-#   • the management cluster's Cluster Agent can read the harness's own namespace, including
-#     its Secrets, with the pod's GSA. That is a deliberate widening of the blast radius, not
-#     an oversight; RECONCILE_EXCLUDE is the opt-out.
+#   • the management cluster's Cluster Agent can read the harness's own namespace with the pod's
+#     GSA — not the KSA, since create_profile pins a get-credentials kubeconfig — so how far that
+#     reaches is the GSA's permission set: no Secrets on the default read-only roles, Secrets
+#     included on gke-admin. That is a deliberate widening of the blast radius, not an oversight;
+#     RECONCILE_EXCLUDE is the opt-out, and the security reference is the canonical statement.
 #
 # It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
 # profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
