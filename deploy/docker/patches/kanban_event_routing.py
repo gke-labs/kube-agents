@@ -46,6 +46,11 @@ the caller's arguments unchanged — leaving today's behaviour exactly as it is.
 A delivery-bookkeeping failure must never fail the ``kanban_create`` the agent
 is mid-conversation about, which is the same contract the function this hooks
 into already keeps.
+
+Failing open on an event session does recreate the original bug, though, so
+every such fall-through logs a warning naming the session and the reason. The
+report is still lost, but a lost report is now a greppable line rather than a
+board that reads healthy and a chat that stays empty.
 """
 
 from __future__ import annotations
@@ -105,6 +110,24 @@ def _stored_route(session_id: str, db_path: str) -> Optional[dict[str, Any]]:
     return metadata if isinstance(metadata, dict) else None
 
 
+def _log_undeliverable(session_id: str, reason: str) -> None:
+    """Say out loud that a subscription is being written undeliverable.
+
+    Failing open keeps ``kanban_create`` working, but it recreates the bug this
+    patch exists to fix: the row is written to a non-chat origin, the card
+    completes, and the report reaches nobody while the board reads healthy. The
+    substitution cannot be made mandatory — a CLI worker has no routing database
+    and is not doing event triage — so the only thing separating a legitimate
+    fall-through from a silent drop is this line.
+    """
+    log.warning(
+        "kanban event routing: session %s stays addressed to a non-chat origin "
+        "(%s) — a report completed on this card will not reach chat",
+        session_id,
+        reason,
+    )
+
+
 def resolve_chat_route(
     platform: str,
     chat_id: str,
@@ -129,15 +152,11 @@ def resolve_chat_route(
     try:
         metadata = _stored_route(chat_id, db_path or session_kv_db_path())
     except Exception as exc:  # sqlite, JSON, permissions — all fail open
-        log.warning(
-            "kanban event routing: could not resolve a chat route for "
-            "session %s: %s",
-            chat_id,
-            exc,
-        )
+        _log_undeliverable(chat_id, f"the routing database could not be read: {exc}")
         return platform, chat_id, thread_id
 
     if not metadata:
+        _log_undeliverable(chat_id, "no chat route was recorded for it")
         return platform, chat_id, thread_id
 
     route_platform = str(metadata.get("platform") or "")
@@ -150,6 +169,11 @@ def resolve_chat_route(
         or not route_chat_id
         or route_platform in NON_CHAT_ORIGINS
     ):
+        _log_undeliverable(
+            chat_id,
+            "the recorded route is not a chat surface either: "
+            f"{route_platform or '<unset>'}/{route_chat_id or '<unset>'}",
+        )
         return platform, chat_id, thread_id
 
     route_thread = metadata.get("thread_id") or None

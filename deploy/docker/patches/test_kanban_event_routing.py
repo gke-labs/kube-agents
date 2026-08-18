@@ -197,6 +197,56 @@ class FailOpenTest(unittest.TestCase):
         self.assertFalse(missing.exists())
 
 
+class UndeliverableWarningTest(unittest.TestCase):
+    """Failing open on an event session is the original bug, so it is loud.
+
+    The substitution cannot be made mandatory — a CLI worker has no routing
+    database and is not doing triage — so nothing distinguishes a legitimate
+    fall-through from a report about to be dropped except this line.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_an_unrecorded_session_says_the_report_will_not_arrive(self):
+        db = routing_db(self.tmp / "empty.db", {})
+        with self.assertLogs(ker.log, level="WARNING") as caught:
+            resolve_chat_route("api_server", "k8s-evt-x", None, db_path=db)
+        self.assertIn("k8s-evt-x", caught.output[0])
+        self.assertIn("will not reach chat", caught.output[0])
+
+    def test_a_non_chat_stored_route_names_what_it_found(self):
+        db = routing_db(self.tmp / "pre.db", {"k8s-evt-x": {"platform": "k8s-watcher"}})
+        with self.assertLogs(ker.log, level="WARNING") as caught:
+            resolve_chat_route("api_server", "k8s-evt-x", None, db_path=db)
+        self.assertIn("k8s-watcher", caught.output[0])
+
+    def test_an_unreadable_database_names_the_error(self):
+        corrupt = self.tmp / "corrupt.db"
+        corrupt.write_bytes(b"this is not a sqlite database")
+        with self.assertLogs(ker.log, level="WARNING") as caught:
+            resolve_chat_route("api_server", "k8s-evt-x", None, db_path=str(corrupt))
+        self.assertIn("could not be read", caught.output[0])
+
+    def test_a_successful_substitution_is_silent(self):
+        db = routing_db(
+            self.tmp / "ok.db",
+            {"k8s-evt-x": {"platform": "google_chat", "chat_id": SPACE}},
+        )
+        with mock.patch.object(ker.log, "warning") as warned:
+            resolve_chat_route("api_server", "k8s-evt-x", None, db_path=db)
+        warned.assert_not_called()
+
+    def test_a_cli_worker_is_silent(self):
+        # Not an event session, so there is nothing to warn about. Otherwise
+        # every kanban_create on a laptop with no routing database warns.
+        with mock.patch.object(ker.log, "warning") as warned:
+            resolve_chat_route(
+                "tui", "agent:main:tui:x", None, db_path=str(self.tmp / "absent.db")
+            )
+        warned.assert_not_called()
+
+
 class DbPathTest(unittest.TestCase):
     def test_the_env_override_wins(self):
         with mock.patch.dict("os.environ", {DB_PATH_ENV: "/tmp/elsewhere.db"}):
