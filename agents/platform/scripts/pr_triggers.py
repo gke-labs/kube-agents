@@ -91,10 +91,28 @@ MAX_REFUSALS_DEFAULT = 10
 #: either already knows the shape.
 TRIGGER_COMMAND = "/agent"
 
-#: Line-anchored, so a request has to be the thing the line is for. `(.*?)`
+#: Line-anchored, so a request has to be the thing the line is for. `(.*)`
 #: captures the request itself. Indentation is allowed because a reviewer
 #: replying inside a list writes the command indented and means it.
-SLASH_RE = re.compile(r"^[ \t]*/agent\b[ \t]*(.*?)[ \t]*$", re.M)
+#:
+#: The capture is **greedy and untrimmed**, and both of those matter. The
+#: obvious spelling — `[ \t]*(.*?)[ \t]*$` — trims the request in the pattern,
+#: and pays for it quadratically: the lazy group grows a character at a time
+#: while the trailing `[ \t]*` re-walks the rest of the run for every length.
+#: Measured on `/agent a` plus a run of spaces and one non-space, the same 4×
+#: per doubling as `INLINE_CODE_RE` and `HTML_COMMENT_RE` — 0.15s at 8,000
+#: characters, 2.42s at 32,000, and 9.83s at GitHub's 65,536-character comment
+#: limit. `find_trigger` runs this on the raw body of every comment from every
+#: account that can comment, before the trust gate, and a refused or
+#: budget-dropped comment writes no marker, so every later tick pays again.
+#: `re.M` bounds the damage to one line only in the sense that `.` excludes
+#: `\n`; one line may still be the whole comment.
+#:
+#: Nothing is lost by dropping the trim, because the only consumer already
+#: calls `.strip()` on each match — once to test it and once to take it. The
+#: two forms were fuzzed against each other over 30,000 random bodies with no
+#: disagreement, and the linear one runs the 65,536-character payload in 0.00002s.
+SLASH_RE = re.compile(r"^[ \t]*/agent\b(.*)$", re.M)
 
 #: An inline code span. Kept as the **reference** for what `strip_inline_code`
 #: means, and used by `test_pr_triggers.py` to fuzz the hand-written scanner

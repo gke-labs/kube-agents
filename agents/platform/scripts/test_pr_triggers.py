@@ -18,6 +18,7 @@ The load-bearing properties, in the order they would hurt if they broke:
 import importlib.util
 import os
 import random
+import re
 import sys
 import time
 import unittest
@@ -521,6 +522,67 @@ class HtmlCommentScannerTest(unittest.TestCase):
         # ~200x above the scan and ~5x below the regex, which is room for a
         # loaded machine without room for the defect.
         self.assertLess(elapsed, 0.3, f"took {elapsed:.3f}s")
+
+
+class SlashPatternTest(unittest.TestCase):
+    """`SLASH_RE` reads a request in linear time and reads the same request."""
+
+    #: The trimming form this replaced. Kept as the oracle for the agreement
+    #: test below, the way `HTML_COMMENT_RE` is kept for the scanner: it is the
+    #: readable statement of what a match means, and it is why the shipped
+    #: pattern may not be spelled that way.
+    TRIMMING_RE = re.compile(r"^[ \t]*/agent\b[ \t]*(.*?)[ \t]*$", re.M)
+
+    @staticmethod
+    def _request(pattern, text):
+        """`find_trigger`'s own reading of a match list, against any pattern."""
+        matches = pattern.findall(text)
+        if not matches:
+            return None
+        return next((m.strip().strip("`") for m in matches if m.strip()), "")
+
+    def test_the_pattern_reads_what_the_trimming_form_read(self):
+        # Dropping `[ \t]*(.*?)[ \t]*$` for `(.*)` moves the trim out of the
+        # pattern and onto the `.strip()` the consumer already ran. That is only
+        # safe if the two agree everywhere, so this fuzzes them rather than
+        # asserting it -- the alphabet is weighted to the characters that decide
+        # a match: the command itself, the whitespace it trims, a line break,
+        # and the backtick the consumer strips separately.
+        rng = random.Random(20260818)
+        for _ in range(30000):
+            body = "".join(rng.choice(" \t/agentx`-\n@.:#>*") for _ in range(rng.randint(0, 40)))
+            if rng.random() < 0.6:
+                body = "/agent" + body
+            got = self._request(pr_triggers.SLASH_RE, body)
+            want = self._request(self.TRIMMING_RE, body)
+            if got != want:
+                self.fail(f"{body!r} -> {got!r}, trimming form gives {want!r}")
+
+    def test_a_run_of_spaces_after_the_command_does_not_hang_the_sweep(self):
+        # A lazy capture in front of a greedy `[ \t]*$` grows one character at a
+        # time while the trailing run is re-walked for each length: 4x per
+        # doubling, 2.42s at 32,000 characters and 9.83s at GitHub's 65,536
+        # limit. Reachable before the trust gate -- `find_trigger` parses the raw
+        # body of every comment from every account that can post one -- and
+        # re-paid on every tick, because a refused or budget-dropped comment
+        # writes no marker for `handled_node_ids` to exclude.
+        #
+        # The trailing `x` is load-bearing for the same reason as in the comment
+        # test above: it is what stops the run being trailing whitespace the
+        # pattern can consume in one bite, and it is the shape that backtracks.
+        body = "/agent a" + " " * 65000 + "x"
+        started = time.monotonic()
+        trigger = pr_triggers.find_trigger(body, "agent", "node-1", "someone")
+        elapsed = time.monotonic() - started
+        # The same 0.3s bound as the comment scanner, and for the same reason:
+        # the linear pattern reads this in 0.00002s, so the bound sits four
+        # orders of magnitude above the fix and 30x below the defect.
+        self.assertLess(elapsed, 0.3, f"took {elapsed:.3f}s")
+        # Still a trigger, and still the request -- a fast wrong answer is not
+        # the fix.
+        self.assertIsNotNone(trigger)
+        self.assertEqual(trigger.kind, "slash")
+        self.assertEqual(trigger.request, "a" + " " * 65000 + "x")
 
 
 if __name__ == "__main__":
