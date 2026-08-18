@@ -28,7 +28,7 @@ The result is an ordinary cron run: its own process, homed at the Platform Agent
 
 ## The shipping jobs
 
-The rosters, with exact cron expressions, enabled state, and prompts, are generated from the two `jobs.json` files on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Seven governance jobs ship, all enabled on the Platform Agent's roster — the fleet audits below. An eighth entry, `github-repo-watcher`, shares that roster without being a watchdog: it is a `no_agent` poller that runs no model, described under [Pollers file cards](#pollers-file-cards-watchdogs-deliver-reports).
+The rosters, with exact cron expressions, enabled state, and prompts, are generated from the two `jobs.json` files on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Seven governance jobs ship, all enabled on the Platform Agent's roster — the fleet audits below. Two further entries share that roster without being watchdogs, both `no_agent` and neither running a model: `github-repo-watcher`, a poller described under [Pollers file cards](#pollers-file-cards-watchdogs-deliver-reports), and `eod-event-watcher-daily-report`, a weekday script that renders the k8s-event-watcher recap from the session ledger.
 
 ### The seven fleet audits
 
