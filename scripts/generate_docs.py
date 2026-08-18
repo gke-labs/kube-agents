@@ -125,6 +125,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Observability": [
         "gke-basics",
         "gke-observability",
+        "gke-runtime-telemetry-audit",
         "kube-agents-observability",
     ],
     "Reliability": [

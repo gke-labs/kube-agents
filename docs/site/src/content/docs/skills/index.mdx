@@ -77,6 +77,7 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | ----- | ----------- |
 | [`gke-basics`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-basics/SKILL.md) | Manages core GKE cluster provisioning, credentials, Autopilot vs Standard selection, and workload deployment. Use when creating GKE clusters, fetching kubectl credentials, configuring Workload Identity, or deciding between Autopilot and Standard modes. Don't use for specialized GKE networking (use gke-networking), advanced security hardening (use gke-platform-security or gke-workload-security), or cluster upgrades (use gke-upgrades). |
 | [`gke-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-observability/SKILL.md) | Workflows for setting up and auditing observability (logging, monitoring, tracing) on GKE. |
+| [`gke-runtime-telemetry-audit`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-runtime-telemetry-audit/SKILL.md) | Audits GKE clusters for Linux cgroup CPU throttling, kernel conntrack saturation, missing ingress preStop drain hooks, and ephemeral storage runaway. |
 | [`kube-agents-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/kube-agents-observability/SKILL.md) | Audit, monitor, and debug the logging, tracing, metrics, and API/dashboard observability of the Platform Agent. |
 
 ### Reliability
