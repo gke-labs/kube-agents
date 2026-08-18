@@ -645,6 +645,13 @@ def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to configured chat platforms (Google Chat and/or Slack).
 
+    This reaches a human, so it follows /opt/defaults/docs/output-style.md like any
+    other user-facing message: aim for 2000 characters and never exceed 4000, lead with
+    the headline rather than preamble, write standard Markdown (`**bold**`, headings at
+    `##`) and not Slack's own mrkdwn, and use exactly one leading severity glyph.
+    Slack renders this through the same Block Kit path as a card result, so the same
+    structure and the same limits apply.
+
     Args:
         message: The plaintext or markdown-formatted message string to post.
         session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply. Optional.
