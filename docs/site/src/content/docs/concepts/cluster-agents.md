@@ -12,8 +12,7 @@ A **Cluster Agent** is a read-only SRE scoped to exactly one GKE cluster. It is 
 Each profile is stamped from the [`agents/cluster/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster) template (baked into the image at `/opt/cluster-template`) by [`cluster_agent_profile.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/cluster_agent_profile.py):
 
 - **One cluster only.** A `KUBECONFIG` pinned to the target cluster is written into the profile's `.env`, and the cluster's project/name/location are recorded as a `cluster_identity` block in its config.
-- **Read-only toolset.** The template config exposes the `gke` and `developer_knowledge` MCP servers — no `platform_control` (provisioning), no GitOps write path. A Cluster Agent diagnoses; it never mutates cluster state and never opens pull requests.
-- **One egress.** The single exception to the above is `notify`, a server that exposes one tool, `send_notification`, so the agent can post the report of an event triage into the chat thread that raised it. It writes to chat, never to the cluster. Handing it `platform_control` instead would have bought that one `hermes send` with the whole provisioning surface.
+- **Read-only toolset.** The template config exposes only the `gke` and `developer_knowledge` MCP servers — no `platform_control` (provisioning), no GitOps write path. A Cluster Agent diagnoses; it never mutates cluster state and never opens pull requests.
 - **Its own skills.** Six single-cluster runtime-debugging skills ship in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) (observability, reliability, storage, workload scaling, workload security, workload troubleshooting) — listed under their own heading in the [skill catalog](/kube-agents/skills/).
 
 ## Lifecycle
@@ -35,11 +34,11 @@ Delegation runs on the shared kanban board — agents never pass context to each
 
 For multi-cluster work the Platform Agent fans out one card per cluster plus a fan-in card assigned to itself, synthesizing every parent's `metadata` once all complete — see the `workload-rebalancing` skill for the pattern.
 
-## Event triage: the one card that delivers nothing
+## Event triage
 
-A Kubernetes event alert arrives as a card like any other, but it is the one kind whose completion reaches nobody. The [event watcher](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/cmd/k8s-event-watcher/README.md) posts the event to the Session KV server, which opens a session named `k8s-evt-…` on the gateway's default profile — the Chat Agent — whose whole instruction is to file **one** card, to the agent scoped to the cluster that raised the event, carrying the diagnostic brief verbatim.
+A Kubernetes event alert arrives as a card like any other. The [event watcher](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/cmd/k8s-event-watcher/README.md) posts the event to the Session KV server, which records the chat thread it alerted in and then opens a session named `k8s-evt-…` on the gateway's default profile — the Chat Agent — whose whole instruction is to file **one** card, to the agent scoped to the cluster that raised the event, carrying the diagnostic brief verbatim.
 
-That card's requester is the API session, and no chat thread is subscribed to it, so `kanban_complete` posts the report nowhere. The Cluster Agent finishes with two calls in order instead: `send_notification(session_id="k8s-evt-…", …)`, which threads the report under the alert it answers, and then `kanban_complete` for the board's own bookkeeping. That is what the one egress above is for. A Cluster Agent with no way to post was how event triages used to end — the analysis was written and then dropped.
+The Cluster Agent finishes it with `kanban_complete` and nothing else, passing the whole report as `result`. Every card carries a subscription to the session it was filed from, and the notifier posts a subscribed card's `result` to chat when the card turns terminal — so completing the card is the delivery, threaded under the alert it answers. What made that fail before was the address rather than the mechanism: an event session's ambient platform is `api_server`, which no chat adapter can deliver to, so the subscription was written well-formed and undeliverable and every report was produced and dropped.
 
 ## Security posture
 

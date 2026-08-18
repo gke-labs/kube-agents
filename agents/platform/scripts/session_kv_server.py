@@ -461,14 +461,21 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
     """Save thread configurations in session_metadata SQLite table.
 
-    `platform` is recorded alongside the thread because a thread belongs to
-    exactly one chat platform and the reply has to go back to that one. Without
-    it, `notify_delivery.resolve_thread` has to guess from the install's enabled
-    set, and on an install with both platforms enabled it guessed Slack for a
-    Google Chat thread: `hermes send` was handed
-    `slack:spaces/…:spaces/…/threads/…` and refused it, so the RCA was not
-    delivered at all. Rows written before this field existed still fall through
-    to that guess — see the shape-sniffing fallback in `resolve_thread`.
+    These three fields — `platform`, `chat_id`, `thread_id` — are the address
+    the event-triage card's report is delivered to.
+    `deploy/docker/patches/kanban_event_routing.py` reads the row back by
+    session id when the front door files that card, and substitutes them for the
+    `api_server` origin the REST gateway would otherwise stamp on the
+    subscription. Writing this row is therefore ordered before the agent turn is
+    started, not merely before the reply arrives.
+
+    `platform` is what this function adds to the row, and the substitution needs
+    it: a thread belongs to exactly one chat platform, and `hermes send` refuses
+    a Google Chat thread addressed as Slack rather than degrading it to the home
+    channel. A row without it carries `k8s-watcher` from `POST /sessions`, which
+    the patch treats as non-chat and declines to substitute — so a session that
+    never reached this function keeps today's behaviour instead of being
+    re-addressed to a guess.
     """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -505,11 +512,10 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     key in this body is accepted with a 201 and dropped. See
     `_build_agent_query`, which delegates from the front door instead.
     """
-    body: Dict[str, Any] = {"session_id": session_id, "title": f"Triage {session_id}"}
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions",
-            data=json.dumps(body).encode("utf-8"),
+            data=json.dumps({"session_id": session_id, "title": f"Triage {session_id}"}).encode("utf-8"),
             headers=headers,
             method="POST"
         )
@@ -524,17 +530,19 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     return False
 
 
-def _triage_task_body(session_id: str, payload: Dict[str, Any]) -> str:
+def _triage_task_body(payload: Dict[str, Any]) -> str:
     """The kanban card body the front door files for the failing cluster's agent.
 
-    Written to be copied verbatim rather than summarised, because the summary is
-    where issue #630 happened: the front door paraphrased the request into a
-    card, the session id and the obligation to post did not survive the
-    paraphrase, and the Cluster Agent completed a card whose result reached
-    nobody. It is a card completion, not a chat reply, and the requester here is
-    an `api_server` session with no chat thread subscribed to it — so
-    `kanban_complete` alone delivers the report precisely nowhere. Hence the two
-    terminal calls this body demands, in that order.
+    Written to be copied verbatim rather than summarised, because a paraphrase
+    is how the front door turned one instruction into three on 2026-08-17.
+
+    The delivery is `kanban_complete` and nothing else. The card carries a
+    subscription pointing at the chat thread the alert was posted in — see
+    `deploy/docker/patches/kanban_event_routing.py`, which resolves that thread
+    from the routing this module records — so the notifier posts the `result`
+    when the card turns terminal. That is why this body asks for the whole
+    report in `result` rather than a summary of it: `result` is the message the
+    human reads.
 
     The report template below is a second instruction channel alongside the
     persona, and says "formatted exactly like this" — so it wins any
@@ -574,29 +582,24 @@ def _triage_task_body(session_id: str, payload: Dict[str, Any]) -> str:
     logs_project_query = f";project={gcp_project}" if gcp_project else ""
 
     return (
-        f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
-        f"for the active session '{session_id}'.\n\n"
+        f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}'.\n\n"
         f"**Event Details:**\n"
         f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
         f"- **Event Reason:** {event_reason}\n"
         f"- **Warning Message:** {message}\n\n"
-        f"**Finish with two calls, in this order.** First "
-        f"`send_notification(session_id='{session_id}', message=<your completed report>)`, then "
-        f"`kanban_complete(result=<the same report>, summary=<one line>)`.\n\n"
-        f"The `send_notification` call is the delivery, and it is not optional. This card was filed on behalf of session "
-        f"'{session_id}', which arrived over the API rather than over chat, so no chat thread is subscribed to its completion: "
-        f"a card you complete without posting sends your report nowhere at all. That is what issue #630 was. "
-        f"The session id is what threads the report under the alert it answers; get it wrong and the report posts to the home channel, "
-        f"where nobody can tell which incident it explains.\n\n"
-        f"**Do this yourself. Do not delegate the diagnosis or the posting to another agent, and do not open child cards for it** — "
-        f"you are the agent scoped to the cluster that is failing, and the obligation to post does not survive being summarised into a task for someone else.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where the "
+        f"alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` delivers "
+        f"one line to the person waiting for the diagnosis.\n\n"
+        f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
+        f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
         f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
         f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"The last bullet under '## What to do' is the call to action, not another option: keep its 'To authorize:' label, never give it an Option letter, and never count it when you number the options.\n\n"
-        f"Format the report you pass to `send_notification`, and to `kanban_complete`'s `result`, exactly like this — "
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
         f"<Short 1-sentence description of the problem>\n\n"
@@ -619,7 +622,7 @@ def _triage_task_body(session_id: str, payload: Dict[str, Any]) -> str:
     )
 
 
-def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
+def _build_agent_query(payload: Dict[str, Any]) -> str:
     """The turn sent to the gateway, which is always the Chat Agent's.
 
     `_create_gateway_session` cannot choose a profile, so the reader is the
@@ -630,9 +633,13 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     is meant to act on. The rules are numbered and short because the failure this
     replaces was not a refusal — it was a helpful front door improvising: on
     2026-08-17 it summarised the brief into one card for the Cluster Agent,
-    dropped the posting obligation on the way, filed a second card asking the
-    Platform Agent to post instead, and leaked a "This is a test notification"
+    dropped the delivery instruction on the way, filed a second card asking the
+    Platform Agent to deliver instead, and leaked a "This is a test notification"
     probe into the user's incident thread from a third.
+
+    Nothing about where the answer goes travels through this text. The card the
+    front door files inherits the alert's chat route from the session it is
+    filed in, so a paraphrase can cost the report's shape but not its address.
     """
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
@@ -650,16 +657,16 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"- `body`: everything between the two markers below, **copied verbatim**.\n\n"
         f"Three rules, and they are why this text spells the call out:\n\n"
         f"1. **Copy the body exactly.** Do not summarise it, shorten it, reformat it, or restate it in your own words. "
-        f"It carries the session id and the instruction to post the report, and a paraphrase that drops either one is how "
-        f"issue #630 lost every RCA it lost.\n"
+        f"It carries the report format and the delivery instruction the diagnosis depends on, and on 2026-08-17 a "
+        f"paraphrase dropped both.\n"
         f"2. **One card, to the Cluster Agent.** Not `platform` — this is one named cluster's live runtime state, which is "
         f"exactly what a Cluster Agent is for. Assign to `platform` only if that cluster genuinely has no agent after a "
         f"`list_agents` refresh.\n"
         f"3. **Do nothing else.** Do not diagnose the event, do not post anything to chat, and do not file a second card to "
-        f"have someone else post the report. The assignee has its own `send_notification` tool and the body tells it to use it; "
-        f"a card asking another agent to deliver the report is a bug, not a fallback.\n\n"
+        f"have someone else deliver the answer. Completing the card is the delivery: this one is subscribed to the thread "
+        f"the alert was posted in, and the report reaches the user from there.\n\n"
         f"--- BEGIN TASK BODY (copy verbatim) ---\n"
-        f"{_triage_task_body(session_id, payload)}\n"
+        f"{_triage_task_body(payload)}\n"
         f"--- END TASK BODY ---"
     )
 
@@ -687,7 +694,10 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 1. Post initial warning notification to Google Chat or Slack
     thread_id = _post_initial_alert(active_platform, alert_msg)
     
-    # 2. Register thread-to-session mappings for two-way chat routing
+    # 2. Register thread-to-session mappings for two-way chat routing. This has
+    #    to happen before the turn in step 5: the card that turn files reads
+    #    this row to address its completion back to the alert's thread (see
+    #    deploy/docker/patches/kanban_event_routing.py).
     if thread_id:
         _register_session_routing(session_id, active_platform, thread_id)
 
@@ -707,7 +717,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         return
 
     # 5. Formulate instructions query and execute the agent turn
-    agent_query = _build_agent_query(session_id, payload)
+    agent_query = _build_agent_query(payload)
     _start_agent_turn(api_url, session_id, agent_query, headers)
 
 

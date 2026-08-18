@@ -202,34 +202,30 @@ It is two strings, in fact, because the reader of the first is not the agent tha
 so the turn always lands on the front door. `_build_agent_query()` therefore addresses a router:
 one `kanban_create` to the `cluster-*` agent scoped to the event's cluster, with the diagnostic brief
 copied between two markers **verbatim**, and nothing else — no diagnosis, no posting, no second card
-asking someone else to post. That last clause is not hypothetical tidiness; a front door handed the
-brief as instructions rather than as cargo summarised it, dropped the session id and the obligation to
-post, and filed extra cards to have other agents deliver the report.
+asking someone else to answer. That last clause is not hypothetical tidiness; a front door handed the
+brief as instructions rather than as cargo summarised it, dropped the delivery instruction, and filed
+extra cards to have other agents deliver the report.
 
 `_triage_task_body()` builds what travels between the markers, and it is the string above's real
 payload. Abridged, as it runs today:
 
 ```
-Analyze the following Kubernetes event warning on GKE cluster '{cluster}'
-for the active session '{session_id}'.
+Analyze the following Kubernetes event warning on GKE cluster '{cluster}'.
 
 **Event Details:**
 • *Resource:* {namespace}/{kind}/{name}
 • *Event Reason:* {reason}
 • *Warning Message:* {message}
 
-**Finish with two calls, in this order.** First `send_notification(session_id='{session_id}',
-message=<your completed report>)`, then `kanban_complete(result=<the same report>, ...)`.
+**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.**
+Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat
+thread where the alert was raised, and `result` is what gets posted there ...
 
-The `send_notification` call is the delivery, and it is not optional. This card was filed on
-behalf of session '{session_id}', which arrived over the API rather than over chat, so no chat
-thread is subscribed to its completion ...
+**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards
+for it** — ... the report has to be this card's own result to be delivered.
 
-**Do this yourself. Do not delegate the diagnosis or the posting to another agent, and do not
-open child cards for it** ...
-
-Format the report you pass to `send_notification`, and to `kanban_complete`'s `result`, exactly
-like this — these three `##` sections are the only ones, and there is no fourth:
+Format the report you pass to `kanban_complete`'s `result` exactly like this — these three
+`##` sections are the only ones, and there is no fourth:
 
 ## What's wrong
 <1-sentence description of the problem>
@@ -251,12 +247,14 @@ against the GitOps repository, and nothing is written to the live cluster direct
 
 **What that one string pins down** — four design decisions, not formatting preferences:
 
-- **The delivery** — the work runs on a kanban card whose requester is an API session with no chat
-  thread subscribed to it, so completing the card displays the report to nobody. It exists for a human
-  only if the agent calls `send_notification` with this session id. The prompt therefore states that
-  obligation unconditionally, orders it before `kanban_complete`, and forbids delegating it: an
-  instruction that read as conditional, handed on to an agent with no egress of its own, is how issue
-  #630 lost most of the reports the fleet produced.
+- **The delivery** — completing the card _is_ the delivery. Hermes subscribes every card to the session
+  it was filed from and posts a terminal card's `result` to that chat thread, so the prompt asks for one
+  terminal call and insists the whole report goes in `result` rather than a summary of it. It also
+  forbids delegating the diagnosis, because only this card carries the subscription: a child card's
+  result is delivered nowhere. What made this fail was the address, not the mechanism — an event-triage
+  turn arrives over the REST gateway, which stamps the subscription with `platform="api_server"`, and
+  the row was written well-formed and undeliverable. Issue #630, closed in the image by
+  `deploy/docker/patches/kanban_event_routing.py`.
 - **The report shape** — a fixed layout the reader learns once. Consistency across domains is what makes
   the output skimmable at 3am. It is not an independent choice: "formatted exactly like this" outranks
   the persona, so a shape here that disagrees with the Platform Agent's SOUL.md §7 does not extend that
@@ -342,9 +340,9 @@ The GKE-events path is live end to end:
   recorded with the platform that thread lives on, with the triage report stored for follow-up replies.
   The turn wakes the front door, which delegates the diagnosis as one kanban card to the Cluster Agent
   of the cluster that raised the event.
-- **Judgment** — that cluster's Cluster Agent loads the matching skill, diagnoses root cause, and posts a
-  plain-language triage with as many GitOps fix options as the root cause warrants, through its
-  `send_notification` tool.
+- **Judgment** — that cluster's Cluster Agent loads the matching skill, diagnoses root cause, and
+  completes its card with a plain-language triage carrying as many GitOps fix options as the root cause
+  warrants; the card's subscription posts it back into the alert's thread.
 - **Human-in-the-loop** — an engineer approves in-thread; nothing reaches production without it.
 - **Remediation** — the approved fix ships as a GitOps PR.
 

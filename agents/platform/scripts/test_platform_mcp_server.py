@@ -695,13 +695,30 @@ class TestSendNotification(unittest.TestCase):
 class TestSessionKvHeaders(unittest.TestCase):
     """The Session KV server rejects an unauthenticated caller with a 401.
 
-    Every call site swallows that — `resolve_thread` fails open to the home
-    channel and the incident POST sits behind `chat_id and thread_id` — so a
+    Both call sites swallow that: `send_notification` catches the HTTPError and
+    only prints, and the incident POST sits behind `chat_id and thread_id`, so a
     missing token costs every alert-driven report its thread and stores no
-    incident at all, silently. The header itself is built in notify_delivery
-    now and tested there; what stays here is the platform side of the config
-    contract that has to carry the value into this subprocess.
+    incident at all — silently. Hence a test on the header itself and one on the
+    config that has to carry the value into this subprocess.
     """
+
+    def setUp(self):
+        self._saved = os.environ.get("SESSION_KV_API_KEY")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        if self._saved is not None:
+            os.environ["SESSION_KV_API_KEY"] = self._saved
+
+    def test_the_configured_token_becomes_a_bearer_header(self):
+        os.environ["SESSION_KV_API_KEY"] = "test-session-kv-key"
+        headers = platform_mcp_server._session_kv_headers({"Content-Type": "application/json"})
+        self.assertEqual(headers["Authorization"], "Bearer test-session-kv-key")
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_an_unset_token_sets_no_header(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        self.assertNotIn("Authorization", platform_mcp_server._session_kv_headers())
 
     def test_config_yaml_passes_the_key_into_this_subprocess(self):
         """Hermes hands a stdio MCP server only the keys named in `env`, so the

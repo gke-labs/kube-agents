@@ -397,9 +397,9 @@ class ResolutionModelTests(unittest.TestCase):
         An earlier revision had this backwards -- the table's comment claimed
         the copy ran "for *every* profile" and a test here pinned that as
         correct, so the next reader to notice would have been told by a green
-        suite that they were mistaken. The entrypoint's own scripts-symlink
-        loop is the tell: it links $TARGET_DIR/scripts into each specialist
-        home, which it would not need if the layer arrived there on its own.
+        suite that they were mistaken. The entrypoint's own line 538 is the
+        tell: it symlinks $TARGET_DIR/scripts into profiles/platform, which it
+        would not need if the layer arrived there on its own.
         """
         entrypoint = (REPO / "deploy/shared/docker-entrypoint.sh").read_text(
             encoding="utf-8"
@@ -442,17 +442,10 @@ class ResolutionModelTests(unittest.TestCase):
             set(cpa.PROFILE_HOME_ITEMS["platform"]),
             "platform home model has drifted from docker-entrypoint.sh --items",
         )
-        # The `scripts` symlink is the one addition to either list, and it is
-        # conditional on the profile marker -- assert the loop that makes it,
-        # not just its name. It iterates the platform home and every
-        # profiles/cluster-*, so both halves of the union below come from here.
+        # The `scripts` symlink is the one addition, and it is conditional on
+        # the profile marker -- assert the line that makes it, not just its name.
         self.assertIn(
-            'for profile_home in "$TARGET_DIR/profiles/platform" '
-            '"$TARGET_DIR"/profiles/cluster-*; do',
-            entrypoint,
-        )
-        self.assertIn(
-            'ln -sfn "$TARGET_DIR/scripts" "$profile_home/scripts"',
+            'ln -sfn "$TARGET_DIR/scripts" "$TARGET_DIR/profiles/platform/scripts"',
             entrypoint,
         )
 
@@ -462,15 +455,10 @@ class ResolutionModelTests(unittest.TestCase):
         declared = re.search(r"OVERLAY_ITEMS = \(([^)]*)\)", scaffold)
         self.assertIsNotNone(declared, "OVERLAY_ITEMS moved or changed shape")
         self.assertEqual(
-            set(re.findall(r'"([^"]+)"', declared.group(1))) | {"scripts"},
+            set(re.findall(r'"([^"]+)"', declared.group(1))),
             set(cpa.PROFILE_HOME_ITEMS["cluster"]),
             "cluster home model has drifted from cluster_agent_profile.py",
         )
-        # A cluster profile gets the link twice over: from the loop above for
-        # one already on the PVC, and from the scaffolder for a new one. The
-        # entrypoint alone would not justify the union -- a cluster onboarded
-        # after the pod started never passes through it.
-        self.assertIn("_link_shared_scripts", scaffold)
 
 
 class CheckoutPathTests(unittest.TestCase):

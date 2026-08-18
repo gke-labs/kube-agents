@@ -383,12 +383,12 @@ class TestPlaintextIdentityPurge(unittest.TestCase):
 class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
     """The row has to say which platform its thread lives on.
 
-    A thread belongs to exactly one, and a reply sent to the other is not
-    degraded but refused: `hermes send --to slack:spaces/…:spaces/…/threads/…`
-    resolves nothing and the report is never delivered. Before this field was
-    written, `notify_delivery.resolve_thread` had to infer the platform from
-    the install's enabled set, and an install with both enabled picked Slack
-    for every Google Chat thread.
+    It is the address deploy/docker/patches/kanban_event_routing.py substitutes
+    into the event-triage card's subscription, and a thread belongs to exactly
+    one platform: a report addressed to the other is not degraded but refused
+    -- `slack:spaces/…:spaces/…/threads/…` resolves nothing. Before this field
+    was written the row carried `k8s-watcher` from POST /sessions, which the
+    patch treats as non-chat and declines to substitute.
     """
 
     def setUp(self):
@@ -649,7 +649,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         self.assertIn("project=test-project-id", query)
         self.assertNotIn("jayantid-gkedemos", query)
 
@@ -663,7 +663,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         with patch.dict(os.environ, {"GCP_PROJECT_ID": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
+            query = session_kv_server._build_agent_query(payload)
             self.assertIn("project=test-project-legacy", query)
 
     def test_build_agent_query_no_project(self):
@@ -675,7 +675,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
+            query = session_kv_server._build_agent_query(payload)
             # With no project configured the console links carry no project
             # qualifier at all — `?project=` / `;project=` are omitted rather
             # than emitted empty, which would send the reader to a dead link.
@@ -693,7 +693,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message",
             "cluster": "prod-us-central1"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         self.assertIn("prod-us-central1", query)
         self.assertNotIn("platform-agent-host", query)
 
@@ -708,7 +708,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         self.assertIn("platform-agent-host", query)
 
     def test_call_to_action_names_options_instead_of_a_placeholder(self):
@@ -729,7 +729,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         what_to_do = query.split("## What to do", 1)[1]
         cta = next(
             line for line in what_to_do.splitlines()
@@ -754,7 +754,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         headings = [line.strip() for line in query.splitlines() if line.startswith("## ")]
         self.assertEqual(headings, ["## What's wrong", "## Why", "## What to do"])
         # The old shape's labelled blocks are gone, not merely relocated.
@@ -772,7 +772,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         body = query.split("## What to do", 1)[1].split("**What happens if the user replies", 1)[0]
         self.assertIn("apply Option A", body)
         self.assertIn("Recommended: Option", body)
@@ -787,10 +787,13 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
 
 
 class TestTriageDeliveryInstruction(unittest.TestCase):
-    """The one instruction issue #630 turned on: post the report, unconditionally.
+    """What the card body has to say now that the card itself is the channel.
 
-    It lives in the card body rather than in the turn, because the turn is read
-    by the front door and the card is read by the agent that does the work.
+    Delivery is the subscription the card carries, resolved to the alert's chat
+    thread by deploy/docker/patches/kanban_event_routing.py. The body's job is
+    no longer to ask for a second tool call; it is to make sure the thing the
+    notifier posts -- `kanban_complete`'s `result` -- is the whole report, and
+    that it is this card's result rather than some child card's.
     """
 
     PAYLOAD = {
@@ -803,45 +806,48 @@ class TestTriageDeliveryInstruction(unittest.TestCase):
     }
 
     def body(self):
-        return session_kv_server._triage_task_body("k8s-evt-abc123", self.PAYLOAD)
+        return session_kv_server._triage_task_body(self.PAYLOAD)
 
-    def test_the_call_is_demanded_not_offered(self):
-        # The old wording put MUST on the argument -- "when calling your
+    def test_completion_is_demanded_not_offered(self):
+        # The old wording put MUST on an argument -- "when calling your
         # send_notification tool ... you MUST pass this exact session ID" --
-        # which reads as a condition on making the call at all. The agent
+        # which read as a condition on making the call at all. The agent
         # summarised it back as "pass session_id if notification tools are
-        # used", finished its analysis, called nothing, and the RCA was lost.
+        # used", called nothing, and the RCA was lost. Whatever the mechanism,
+        # the terminal call may not sound conditional.
         body = self.body()
-        self.assertIn("send_notification(session_id='k8s-evt-abc123'", body)
-        self.assertIn("is the delivery, and it is not optional", body)
-        # Nothing anywhere may make the call itself sound optional.
+        self.assertIn("**Finish by calling `kanban_complete(", body)
         for hedge in ("if you have", "if notification", "if available", "If you have access"):
             self.assertNotIn(hedge, body)
 
-    def test_it_says_why_completing_the_card_is_not_delivering_the_report(self):
-        # The reason has to travel with the instruction: an agent whose whole
-        # persona says "the card is the channel" will rationally skip an extra
-        # tool call unless told why this card is the exception.
+    def test_the_whole_report_goes_in_result(self):
+        # `result` is verbatim what the notifier posts, so a card completed with
+        # a one-line result delivers one line. This is the failure the old
+        # send_notification path could not have: the report was a separate
+        # argument to a separate call.
         body = self.body()
-        self.assertIn("arrived over the API", body)
-        self.assertIn("no chat thread is subscribed to its completion", body)
+        self.assertIn("Pass the entire report as `result`, not a summary of it", body)
+        self.assertIn("`result` is what gets posted there", body)
 
-    def test_both_terminal_calls_are_named_and_ordered(self):
-        # kanban_complete alone loses the report; send_notification alone
-        # leaves the card running until its claim expires.
-        body = self.body()
-        self.assertIn("kanban_complete", body)
-        self.assertLess(
-            body.index("send_notification(session_id="),
-            body.index("kanban_complete(result="),
-            "the delivery must be demanded before the completion",
-        )
+    def test_it_says_where_the_result_goes(self):
+        # An agent whose persona says "the card is the channel" needs to know
+        # this card's completion is read by a human, or it writes `result` for
+        # the board.
+        self.assertIn("subscribed to the chat thread where the alert was raised", self.body())
 
     def test_the_report_may_not_be_delegated(self):
-        # Delegation is the specific failure mode: the instruction did not
-        # survive being compressed into a task for another agent, and the agent
-        # it landed on had no egress of its own.
-        self.assertIn("Do not delegate the diagnosis or the posting", self.body())
+        # Delegation is the specific failure mode, and it is fatal under this
+        # design for a sharper reason than before: only *this* card carries the
+        # subscription, so a child card's result is delivered nowhere.
+        body = self.body()
+        self.assertIn("Do not delegate the diagnosis to another agent", body)
+        self.assertIn("do not open child cards", body)
+        self.assertIn("this card's own result", body)
+
+    def test_no_second_egress_call_is_asked_for(self):
+        # The Cluster Agent has no send_notification tool. Naming one is how the
+        # instruction became unfollowable.
+        self.assertNotIn("send_notification", self.body())
 
 
 class TestFrontDoorDelegation(unittest.TestCase):
@@ -862,7 +868,7 @@ class TestFrontDoorDelegation(unittest.TestCase):
     }
 
     def query(self):
-        return session_kv_server._build_agent_query("k8s-evt-abc123", self.PAYLOAD)
+        return session_kv_server._build_agent_query(self.PAYLOAD)
 
     def test_it_asks_for_one_card_on_the_failing_cluster_s_agent(self):
         query = self.query()
@@ -883,7 +889,7 @@ class TestFrontDoorDelegation(unittest.TestCase):
         # one. Markers are what let the router copy it without reading it as
         # its own task.
         query = self.query()
-        body = session_kv_server._triage_task_body("k8s-evt-abc123", self.PAYLOAD)
+        body = session_kv_server._triage_task_body(self.PAYLOAD)
         between = query.split("--- BEGIN TASK BODY (copy verbatim) ---\n", 1)[1]
         between = between.split("\n--- END TASK BODY ---", 1)[0]
         self.assertEqual(between, body)

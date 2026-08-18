@@ -43,4 +43,4 @@ Because reconciliation manages **all** project clusters, deleting a still-existi
 ## Notes
 
 - Requires the cluster to be reachable by the platform's credentials (the create step runs `gcloud container clusters get-credentials`). If that fails, surface the error — the user may need to grant access.
-- The Cluster Agent is **read-only** against the cluster; managing a cluster does not grant any mutation ability. Its one write is `send_notification`, the chat egress it uses to post the event triage it was asked for. Remediation still flows through the Platform Agent's GitOps write path.
+- The Cluster Agent is **read-only**; managing a cluster does not grant any mutation ability. Remediation still flows through the Platform Agent's GitOps write path.
