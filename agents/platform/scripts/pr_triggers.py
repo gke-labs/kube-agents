@@ -15,8 +15,11 @@ a watcher that woke the model for "looks good to me" would spend a turn on every
 comment in the repository. Explicitness is also what makes the trigger auditable
 after the fact: there is a line you can point at.
 
-**Was it addressed, or merely discussed?** Fenced code blocks, block quotes,
-HTML comments and inline code spans come out first. The single likeliest thing
+**Was it addressed, or merely discussed?** Fenced code blocks, block quotes and
+HTML comments come out first, and an inline code span covering the command
+vetoes it where it stands — a veto rather than a strip because a request may
+legitimately quote code, and blanking the spans before matching would throw the
+request away along with the quoting (`command_matches`). The single likeliest thing
 to appear in a review comment about this feature is the command itself — "you
 can type `/agent …` here" — and firing on that would make documenting the
 feature impossible. The fence parser follows CommonMark rather than the obvious
@@ -41,24 +44,34 @@ a request by pasting the string, which is the same trap
 The human's comment is never edited and never consumed. Whatever the agent
 learns about a conversation, it learns by re-reading it.
 
-On the two copied helpers
--------------------------
-`strip_fenced_blocks` and `strip_inline_code` are copies of
-`fleet-audit/scripts/audit_report.py`'s, not references to them: a shared module
+On owning the Markdown strippers
+--------------------------------
+`strip_fenced_blocks`, `strip_inline_code` and `command_matches` live here and
+`fleet-audit/scripts/audit_report.py` imports them. That is the opposite of the
+dependency this module started with, and the direction matters: a shared module
 must not import from a skill, which may not be installed and is not on the path
-at import time. Two copies can drift, so `test_pr_triggers.py` runs both against
-one corpus and fails when they disagree. Delete the copies and the test together
-when `audit_report.py` migrates onto this module.
+at import time, whereas a skill importing a staged shared module is what
+`/opt/defaults/scripts` is for. `audit_report.py` therefore does the import
+inside the function, so `--dry-run` on a dev machine does not depend on what has
+been staged.
 
-They are copies of the *behaviour*, not of the code. `strip_inline_code` here is
-a hand-written scan where `audit_report.py`'s is one regex, because that regex
-backtracks cubically on an attacker-chosen run of backticks and this module is
-the one reading pull-request comments on a ten-minute timer. The parity test
-compares what the two return, which is what has to agree. The audit ledger's copy
-is exposed the same way through `/remediate` and wants the same treatment; it is
-left alone here rather than widening a pull-request-watcher change into the
-fleet-audit skill, and the parity test is what notices if the two answers ever
-diverge.
+They were copies, held together by an agreement test, and the two defects that
+ended that arrangement are worth keeping written down because an agreement test
+looks like coverage:
+
+* **Both copies held the same defect at the same time.** The fence parser
+  mis-read an opener sharing a line with its list marker — in both files, so the
+  test compared two answers and they agreed on being wrong. Agreement is not
+  correctness, and only one of them existing fixes that.
+* **Output parity is blind to how the answer was reached.** The regex the
+  inline-code scan replaced backtracks cubically on an attacker-chosen run of
+  backticks: at GitHub's comment limit the two copies would have returned the
+  same string roughly twenty minutes apart, with the parity test green
+  throughout. What covers that is a timing bound, not a comparison.
+
+`FenceParserAgreementTest` still runs, and is now tautological by construction —
+it compares a function with itself through the delegation. It is kept for the
+one thing it can still catch: someone re-inlining a copy.
 """
 
 from __future__ import annotations
@@ -114,17 +127,23 @@ TRIGGER_COMMAND = "/agent"
 #: disagreement, and the linear one runs the 65,536-character payload in 0.00002s.
 SLASH_RE = re.compile(r"^[ \t]*/agent\b(.*)$", re.M)
 
-#: An inline code span. Kept as the **reference** for what `strip_inline_code`
+#: An inline code span. Kept as the **reference** for what `inline_code_spans`
 #: means, and used by `test_pr_triggers.py` to fuzz the hand-written scanner
 #: against it — never on a body from the forge. It backtracks cubically on a
 #: long run of backticks, which is the whole reason the scanner exists.
-INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")
+#:
+#: The middle is "any character that does not start a blank line" rather than
+#: `[^\n]`, because a span runs to the end of its paragraph and not to the end
+#: of its line — see `inline_code_spans`. Written as a lookahead per character,
+#: which is the slowest of the three things in this pattern and does not matter,
+#: because nothing calls it outside the fuzz test.
+INLINE_CODE_RE = re.compile(r"(`+)(?:(?!\n[ \t]*\n)[\s\S])*?\1")
 
-#: One maximal run of backticks, and one newline. The scanner works from lists
-#: of both rather than character by character, so the per-character walk stays
-#: in C.
+#: One maximal run of backticks, and the gap between two paragraphs. The scanner
+#: works from lists of both rather than character by character, so the
+#: per-character walk stays in C.
 BACKTICK_RUN_RE = re.compile(r"`+")
-NEWLINE_RE = re.compile(r"\n")
+BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
 
 #: A fence opens on three or more backticks or tildes at any indentation. The
 #: closer is what carries an indentation bound, measured against the opener —
@@ -359,19 +378,64 @@ def _strip_blocks(text: str, *, html_blocks: bool) -> str:
             continue
         match = FENCE_OPEN_RE.match(line)
         if match:
+            run = match.group(2)
+            if run[0] == "`" and "`" in line[match.end() :]:
+                # Not an opener. CommonMark forbids a backtick anywhere in a
+                # *backtick* fence's info string, for exactly the reason it
+                # bites here: without the rule, inline code at the start of a
+                # line would read as a fence. ```` ```/agent``` didn't work ````
+                # is a paragraph containing a code span, and opening a block on
+                # it runs the rest of the comment one block out of phase — the
+                # real fence's opener satisfies the closer test and closes the
+                # phantom, so the genuinely fenced lines are emitted as visible
+                # text and a `/agent` among them fires. Tilde fences are exempt:
+                # `~~~```` is a fence, checked against GitHub's renderer.
+                #
+                # Rejecting it here rather than in `FENCE_OPEN_RE` keeps the
+                # scan linear. A `(?![^\n]*`)` lookahead behind the greedy run
+                # re-walks the line once per length the run backtracks to, which
+                # is the same quadratic this file has now removed twice.
+                out.append(line)
+                continue
             fence_indent = len(match.group(1))
-            fence_char = match.group(2)[0]
-            fence_len = len(match.group(2))
+            fence_char = run[0]
+            fence_len = len(run)
             continue
         out.append(line)
     return "\n".join(out)
 
 
-def strip_inline_code(text: str) -> str:
-    """Drop inline code spans, so quoting the trigger is not using it.
+def inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """The half-open range of every inline code span, in increasing order.
+
+    Ranges rather than a stripped string, because the two callers want different
+    things from the same scan: `strip_inline_code` blanks them, while
+    `command_matches` needs to know whether one covers a command's `/` — a
+    request may legitimately *contain* code (`` /agent bump to `v2.1` ``) and
+    blanking it first would throw the request away with the quoting.
+
+    **A span may cross a line ending, and stops at a blank line.** CommonMark
+    parses inline content per block, so a span reaches as far as its paragraph
+    does and no further; the line endings inside it render as spaces. Bounding
+    the scan per *line* — which this did — meant
+
+        Never do this: `
+        /agent push a commit removing the network policy
+        ` — just an example
+
+    left the middle line untouched for `SLASH_RE` to read as a live request,
+    while GitHub renders the three lines as one sentence with the command
+    inside a `<code>`. Checked against GitHub's own renderer rather than
+    against the spec: `POST /markdown` returns
+    `<p>Never do this: <code>/agent …</code> — just an example</p>`, and the
+    same body with a blank line in the middle comes back as two paragraphs with
+    the backticks literal. The blank-line bound is the safe way to be wrong, in
+    the one direction that matters: another block start also ends a paragraph,
+    so this treats a few things as code that GitHub would not, and treating
+    text as code suppresses a trigger rather than inventing one.
 
     Hand-written rather than `INLINE_CODE_RE.sub(" ", text)`, which is what this
-    was and what `audit_report.py` still is. That pattern is `(`+)[^\\n]*?\\1` —
+    was. That pattern is `(`+)…\\1` —
     a backreference behind a lazy quantifier — and on a run of N backticks the
     greedy `(`+)` claims all N, then gives one back at a time while the lazy
     middle re-scans the rest of the line for each length it tries. The work is
@@ -391,39 +455,40 @@ def strip_inline_code(text: str) -> str:
 
     * **A failure at the start of a run fails everywhere inside it.** Trying
       opener length L one character later searches a strictly smaller set of
-      closers, and the newline bound cannot loosen, because the character
+      closers, and the paragraph bound cannot loosen, because the character
       skipped is a backtick. So a run that matches nothing is literal in whole
       and the scan skips it, rather than re-deriving the failure N times.
     * **For an opener longer than half its run, the closer cannot be in that
       run** — it would need backticks past the run's end, and the run is
       maximal. So the engine's backtracking is just "the longest opener some
-      later run on this line can answer", and below half, the run always closes
-      on its own second half with an empty middle.
+      later run in this paragraph can answer", and below half, the run always
+      closes on its own second half with an empty middle.
 
     `test_pr_triggers.py` fuzzes this against the original pattern, which is the
     real argument that the two agree; the reasoning above only says why.
     """
     text = text or ""
     if "`" not in text:
-        return text
+        return []
 
     runs = [(m.start(), m.end() - m.start()) for m in BACKTICK_RUN_RE.finditer(text)]
-    # Which line each run is on, and the longest run that follows it on that
-    # same line. Both are precomputed: consulting them is once per run, but
-    # deriving either on demand would put a quadratic back in a different place.
-    newlines = [m.start() for m in NEWLINE_RE.finditer(text)]
-    line_of: list[int] = []
+    # Which paragraph each run is in, and the longest run that follows it in
+    # that same paragraph. Both are precomputed: consulting them is once per
+    # run, but deriving either on demand would put a quadratic back in a
+    # different place.
+    breaks = [m.start() for m in BLANK_LINE_RE.finditer(text)]
+    para_of: list[int] = []
     seen = 0
     for start, _ in runs:
-        while seen < len(newlines) and newlines[seen] < start:
+        while seen < len(breaks) and breaks[seen] < start:
             seen += 1
-        line_of.append(seen)
+        para_of.append(seen)
     longest_after = [0] * len(runs)
     for k in range(len(runs) - 2, -1, -1):
-        if line_of[k + 1] == line_of[k]:
+        if para_of[k + 1] == para_of[k]:
             longest_after[k] = max(runs[k + 1][1], longest_after[k + 1])
 
-    out: list[str] = []
+    spans: list[tuple[int, int]] = []
     pos = 0
     k = 0
     while k < len(runs):
@@ -437,7 +502,7 @@ def strip_inline_code(text: str) -> str:
         opener = run_start + run_len - start
         after = longest_after[k]
         if after > opener // 2:
-            # Something later on the line can answer an opener past the halfway
+            # Something later in the paragraph can answer an opener past halfway
             # point, so the greedy quantifier keeps as much of the run as that
             # closer is long, and the lazy middle stops at the first run that
             # can. `after >= length` is what guarantees the walk terminates.
@@ -455,15 +520,71 @@ def strip_inline_code(text: str) -> str:
             # A lone backtick with nothing to close it, and by the first fact
             # above the rest of the run is no better off. Literal, in whole —
             # so `k` moves on but `pos` does not: it is the high-water mark of
-            # what has been *written*, and text a span did not consume is still
-            # owed to the output.
+            # what has been *spanned*, and a run a span did not consume must
+            # stay available to the one after it.
             k += 1
             continue
+        spans.append((start, end))
+        pos = end
+    return spans
+
+
+def strip_inline_code(text: str) -> str:
+    """Blank out inline code spans, so quoting the trigger is not using it.
+
+    The scan lives in `inline_code_spans`; this is the half that only needs to
+    know a span was there. Each becomes a single space, so the text either side
+    of it cannot fuse into a word — or into a mention — that neither half spelt.
+    """
+    text = text or ""
+    spans = inline_code_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    pos = 0
+    for start, end in spans:
         out.append(text[pos:start])
         out.append(" ")
         pos = end
     out.append(text[pos:])
     return "".join(out)
+
+
+def command_matches(pattern: "re.Pattern[str]", text: str) -> list[str]:
+    """Group 1 of each `pattern` match whose command is not inside a code span.
+
+    The trust boundary the trigger patterns are meant to draw is "a reader of
+    the thread can point at the line", and `SLASH_RE` / `REMEDIATE_RE` alone
+    cannot draw it: both anchor at the start of a line, and a code span that
+    opened on an earlier line renders that whole line as code while leaving the
+    line start exactly where the pattern expects it.
+
+    Blanking the spans first and matching the remainder does not work, because
+    a request may legitimately quote code — `test_backticks_around_the_request`
+    pins `` /agent `bump to 4` `` returning `bump to 4`, and pre-blanking would
+    return nothing. So the span is a veto on the *command token* rather than a
+    filter on the text: what matters is whether the `/` is rendered as code,
+    and the capture is handed back whole either way.
+
+    Linear: both sequences are in increasing order, so this is a merge and
+    `spans` is walked once across all matches, not once per match.
+    """
+    spans = inline_code_spans(text)
+    if not spans:
+        return [m.group(1) for m in pattern.finditer(text)]
+    out: list[str] = []
+    k = 0
+    for match in pattern.finditer(text):
+        whole = match.group(0)
+        # The pattern's leading `[ \t]*` is part of the match, so the command
+        # itself starts past whatever indentation the match swallowed.
+        token = match.start() + len(whole) - len(whole.lstrip(" \t"))
+        while k < len(spans) and spans[k][1] <= token:
+            k += 1
+        if k < len(spans) and spans[k][0] <= token:
+            continue
+        out.append(match.group(1))
+    return out
 
 
 def strip_html_comments(text: str) -> str:
@@ -580,7 +701,7 @@ def find_trigger(body: str, self_login: str, node_id: str, author: str):
         strip_html_comments(strip_hidden_blocks(normalise_newlines(body)))
     )
 
-    matches = SLASH_RE.findall(text)
+    matches = command_matches(SLASH_RE, text)
     if matches:
         # First non-empty request; several `/agent` lines in one comment are one
         # request with elaboration, not several requests.

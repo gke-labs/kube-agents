@@ -406,16 +406,21 @@ REMEDIATE_RE = re.compile(r"^[ \t]*/remediate\b(.*)$", re.M)
 # sentence. Matching it is not accepting it; it exists so the answer can be
 # "not like that" rather than nothing at all.
 REMEDIATE_MENTION_RE = re.compile(r"/remediate\b")
-# An inline code span, removed before the mention search so that prose *about*
+# Inline code spans are removed before the mention search so that prose *about*
 # the command — `see `/remediate <id>` above` — is not mistaken for an attempt
 # to use it. Every `/remediate` this harness itself writes into a comment is
 # backticked for exactly this reason: the ledger's own replies are read back on
 # the next run, and a bot that answers itself never stops.
 #
-# One line, shortest run-delimited span, which is CommonMark's rule for
-# everything but a span that wraps a newline. Those are vanishingly rare in an
-# issue comment and erring towards *not* stripping only risks one extra reply.
-INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")
+# The pattern that used to sit here is gone rather than kept as a reference,
+# for the reason `FENCE_OPEN_RE` went: it said one line, shortest run-delimited
+# span, and argued that a span wrapping a newline was rare enough to ignore
+# because missing one "only risks one extra reply". Both halves were wrong. A
+# span does wrap a newline — that is CommonMark, and GitHub's renderer agrees —
+# and what it risks is a `/remediate` firing off a line every reader of the
+# thread sees as code. `pr_triggers.INLINE_CODE_RE` is the reference now, and
+# it is the one the scan is actually fuzzed against; a wrong pattern left in
+# place as documentation is the one most likely to be copied back out.
 # How many finding ids a refusal lists back before it gives up and says "and N
 # more". A refusal is help, not a second copy of the report.
 MAX_HINT_IDS = 10
@@ -2237,24 +2242,47 @@ def strip_inline_code(text: str) -> str:
     """Drop inline code spans, so quoting the command is not using it.
 
     Delegated to `pr_triggers`, which holds the only hardened implementation.
-    `INLINE_CODE_RE` above is `(`+)[^\\n]*?\\1` — a backreference behind a lazy
-    quantifier — and its cost is cubic in the length of a backtick run: 6,400
-    backticks take 1.3s, 12,800 take 10.2s, and a body at GitHub's 65,536
+    The pattern this replaced was `(`+)[^\\n]*?\\1` — a backreference behind a
+    lazy quantifier — and its cost is cubic in the length of a backtick run:
+    6,400 backticks take 1.3s, 12,800 take 10.2s, and a body at GitHub's 65,536
     character comment limit extrapolates to roughly twenty minutes. `/remediate`
     is read off issue comments on a timer, before any trust check, so the input
-    is anyone's to choose. The pattern stays as the definition of what this
-    means, and as the oracle the scan is fuzzed against.
+    is anyone's to choose.
 
-    The fence parser below is still a copy, held together by
-    `FenceParserAgreementTest`. This one is not: a copy of a subtle scan is how
-    two answers drift apart, and here the divergence that mattered was never in
-    the answer. Imported inside the function, like every other shared-module
-    import in this file, so `--dry-run` on a dev machine does not depend on
-    what has been staged into /opt.
+    A copy of a subtle scan is how two answers drift apart, and every stripper
+    this file needs now delegates rather than holding one. Imported inside the
+    function, like every other shared-module import in this file, so
+    `--dry-run` on a dev machine does not depend on what has been staged into
+    /opt.
     """
     import pr_triggers
 
     return pr_triggers.strip_inline_code(text)
+
+
+def remediate_commands(text: str) -> list[str]:
+    """Every `/remediate` argument in `text` that a reader would see as a command.
+
+    `REMEDIATE_RE.findall` is not this, and the gap is the whole point of the
+    function. The pattern anchors at the start of a line, and a code span that
+    opened on an *earlier* line renders its whole paragraph as code without
+    moving where any line begins — so
+
+        Do not run: `
+        /remediate cluster-a
+        ` — it deletes the node pool
+
+    renders as one sentence with the command inside a `<code>`, and a bare
+    `findall` reads line 2 as a live request. Same defect, same shape, and the
+    same fix as `pr_triggers.find_trigger`: the span vetoes the command token,
+    and the argument is still returned whole so that a request may quote code.
+
+    `text` must already have been through `strip_fenced_blocks`; this is the
+    inline half only.
+    """
+    import pr_triggers
+
+    return pr_triggers.command_matches(REMEDIATE_RE, text)
 
 
 def _promotable_hint(promotable: set[str]) -> str:
@@ -2367,7 +2395,7 @@ def parse_remediate_commands(
 
     for comment in comments or []:
         body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        matches = REMEDIATE_RE.findall(body)
+        matches = remediate_commands(body)
         # Nothing at the start of a line, but the word is in there somewhere and
         # not inside a code span: an attempt at the command, not a discussion of
         # it. Worth a reply; never worth acting on.
@@ -2529,7 +2557,7 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     out: list[dict] = []
     for comment in comments or []:
         body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        targets = [raw.strip().strip("`") for raw in REMEDIATE_RE.findall(body)]
+        targets = [raw.strip().strip("`") for raw in remediate_commands(body)]
         if not targets and not REMEDIATE_MENTION_RE.search(strip_inline_code(body)):
             continue
         # Authorization is deliberately not consulted here, as above — but
@@ -2572,7 +2600,7 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         if association not in WRITE_ASSOCIATIONS:
             continue
         body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        for raw in REMEDIATE_RE.findall(body):
+        for raw in remediate_commands(body):
             target = raw.strip().strip("`")
             if target and target != "all":
                 targets.add(target)

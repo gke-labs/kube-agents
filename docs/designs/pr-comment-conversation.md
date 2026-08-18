@@ -380,8 +380,9 @@ original lives inside a skill, and a module shared by every skill must not impor
 and its test are deletable in one move on the day the resolver migrates onto the shared modules,
 which §7 already names as out of scope here.
 
-**The two Markdown strippers were copies and are not any more.** `audit_report.py` now imports this
-module's `strip_inline_code` and `strip_fenced_blocks` instead of holding its own. The direction is
+**The Markdown strippers were copies and are not any more.** `audit_report.py` now imports this
+module's `strip_inline_code`, `strip_fenced_blocks` and `command_matches` instead of holding its
+own. The direction is
 the safe one — a skill may depend on a shared module, and it is only the reverse the paragraph above
 forbids — and in both cases it was forced rather than chosen, by a defect that an agreement test
 watched and could not see.
@@ -398,6 +399,23 @@ throughout, because both copies were wrong in the same way. That is the general 
 recording: an agreement test can only say two implementations match, never that they are right, and
 a copy is a place for one bug to live twice. The timing bounds cover the first failure mode; deleting
 the copies is the only thing that covers the second.
+
+Two later defects came from the same root and are recorded here because the root is not "copies" —
+it is that a start-of-line regex cannot see how Markdown will render the line it is anchored to.
+A code span runs to the end of its **paragraph**, not its line, so a span opened on an earlier line
+renders a whole `/agent` line as code without moving where that line begins; and CommonMark forbids
+a backtick in a backtick fence's info string precisely so that line-initial inline code is not read
+as a fence, so accepting ` ```/agent``` ` as an opener put the rest of the comment one block out of
+phase and spilled genuinely fenced lines out as text. Both fired live triggers off comments every
+reader of the thread sees as code. `command_matches` is the answer to the first — a span vetoes the
+command token rather than being stripped from the text, so a request may still quote code — and the
+info-string rule is the answer to the second.
+
+The lesson generalises past this feature: the stripper's job is not to implement CommonMark but to
+**agree with the renderer**, and the only way to know it does is to ask the renderer. Each of these
+was settled against GitHub's own `POST /markdown` rather than against a reading of the spec, in both
+directions — that the payload renders as code, and that the near-miss beside it does not, so the
+fix suppresses nothing a reviewer can actually see.
 
 ## 5. Idempotency without state
 

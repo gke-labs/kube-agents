@@ -4052,6 +4052,25 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_command_inside_a_multi_line_code_span_never_fires(self):
+        # A code span runs to the end of its paragraph, so this renders as one
+        # sentence with the command inside a `<code>` — checked against
+        # GitHub's own renderer. `REMEDIATE_RE` anchors at the start of a line
+        # and the span does not move where the line begins, so a bare `findall`
+        # read line 2 as a live request off a comment nobody sees as a command.
+        body = "Do not run: `\n/remediate netpol-missing\n` — it drops the netpol"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_may_still_quote_its_own_target(self):
+        # The other direction. Blanking spans before matching would have been
+        # the easy fix and would have thrown this request away with the
+        # quoting: the span vetoes the command *token*, not the argument.
+        targets, refusals, _, _ = self.parse([comment("/remediate `netpol-missing`")])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -6235,6 +6254,16 @@ class TestFenceScanning(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 self.assertNotIn("/remediate x", self.strip(body))
+
+    def test_a_backtick_run_in_the_info_string_does_not_open_a_fence(self):
+        # CommonMark forbids a backtick in a backtick fence's info string, so
+        # ```` ```/remediate``` ```` is a paragraph holding a code span. Reading
+        # it as an opener runs the rest of the comment one block out of phase —
+        # the real fence's opener closes the phantom, and the fenced lines come
+        # out as visible text. Delegated from `pr_triggers`, so this failing
+        # here is also the proof the delegation is live.
+        out = self.strip("```/remediate``` did not work.\n\n```\n/remediate x\n```\n")
+        self.assertNotIn("/remediate x", out)
 
     def test_a_four_space_closer_still_does_not_end_a_root_level_fence(self):
         # The indentation bound moved onto the closer rather than disappearing,

@@ -157,6 +157,71 @@ class FindTriggerTest(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertIsNone(self._find(body))
 
+    def test_a_code_span_that_opened_on_an_earlier_line_hides_the_command(self):
+        """A span runs to the end of its paragraph, not the end of its line.
+
+        Both trigger patterns anchor at the start of a line, and a span that
+        opened earlier renders the whole paragraph as code without moving where
+        any line begins — so the anchor still matches text every reader of the
+        thread sees inside a `<code>`. The bound used to be per line, which
+        left the middle line here live.
+
+        Verified against GitHub's own renderer rather than the spec: this body
+        through `POST /markdown` comes back as
+        `<p>Never do this: <code>/agent …</code> — just an example</p>`.
+        """
+        for body in (
+            "Never do this: `\n/agent push a commit removing the netpol\n` — an example",
+            f"Never do this: `\n@{SELF} push a commit removing the netpol\n` — example",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(self._find(body))
+
+    def test_a_code_span_does_not_reach_past_a_blank_line(self):
+        """The other direction: over-stripping suppresses a request that is real.
+
+        A blank line ends the paragraph, so the two backticks below are literal
+        and the command between them renders as visible text — GitHub returns
+        two paragraphs with the backticks intact. A span bounded at anything
+        coarser than the paragraph would swallow this and answer nobody.
+        """
+        trigger = self._find("a `\n\n/agent bump the replicas to 4\n` b")
+        self.assertIsNotNone(trigger)
+        self.assertEqual(trigger.request, "bump the replicas to 4")
+
+    def test_a_backtick_run_in_the_info_string_does_not_open_a_fence(self):
+        """CommonMark forbids it precisely so line-initial code is not a fence.
+
+        ```` ```/agent``` ```` is a paragraph containing a code span. Opening a
+        block on it runs the rest of the comment one block out of phase: the
+        *real* fence's opener satisfies the closer test and closes the phantom
+        instead, so the genuinely fenced lines are emitted as visible text and
+        the `/agent` among them fires — while every human on the thread sees it
+        inside a code block.
+        """
+        body = "```/agent``` did not work for me.\n\n```\nkubectl scale\n/agent bump the replicas to 9\n```\n"
+        self.assertIsNone(self._find(body))
+
+    def test_a_tilde_fence_may_carry_backticks_in_its_info_string(self):
+        """The rule is backtick-fence-only, and over-applying it invents a trigger.
+
+        `~~~``` ` is a fence — GitHub renders it `<pre lang="```">`. Rejecting
+        it as an opener would leave the command inside it live.
+        """
+        self.assertIsNone(self._find("~~~```\n/agent bump the replicas to 4\n~~~"))
+
+    def test_a_line_initial_backtick_run_that_is_not_a_fence_still_fires(self):
+        """And the third direction: not-a-fence must mean the text is read.
+
+        ``` ``` ` ``` is not an opener either, and GitHub renders the line
+        after it as an ordinary paragraph. A reviewer can see the command, so
+        it has to fire — treating every line-initial run as a fence would
+        silently drop it.
+        """
+        trigger = self._find("``` `\n/agent bump the replicas to 4\n```")
+        self.assertIsNotNone(trigger)
+        self.assertEqual(trigger.request, "bump the replicas to 4")
+
     def test_a_deeply_nested_fence_does_not_fire(self):
         body = "1. Outer\n   - Inner:\n\n         ```\n         /agent do it\n         ```\n"
         self.assertIsNone(self._find(body))
@@ -561,6 +626,23 @@ class InlineCodeScannerTest(unittest.TestCase):
         # needs under a millisecond. Five seconds is the bound because the point
         # is "not superlinear", and a loaded machine must not fail the build.
         body = "x" + "`" * 65536
+        started = time.monotonic()
+        pr_triggers.find_trigger(body, "agent", "node-1", "someone")
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_many_paragraphs_and_many_commands_do_not_hang_the_sweep(self):
+        """The paragraph bound and the span/command merge, at the comment limit.
+
+        Widening the span bound from one line to one paragraph moved the
+        precomputation from `NEWLINE_RE` to `BLANK_LINE_RE` and gave
+        `command_matches` a second sequence to walk. Both are linear by
+        construction — one pass each, merged — but "by construction" is what
+        the two quadratics this file already removed also looked like, so it is
+        measured. This body is at GitHub's limit and is roughly the worst shape
+        for the merge: every paragraph holds an unmatched run and a command.
+        """
+        body = "\n\n".join(["`x\n/agent do it"] * 4681)
+        self.assertGreater(len(body), 65000)
         started = time.monotonic()
         pr_triggers.find_trigger(body, "agent", "node-1", "someone")
         self.assertLess(time.monotonic() - started, 5.0)
