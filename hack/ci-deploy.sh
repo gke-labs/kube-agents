@@ -28,7 +28,7 @@ trap dump_prow_artifacts_on_failure EXIT
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
 PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
 export TAG="pr-${PULL_NUMBER:-local}-${PULL_SHA_SHORT:-latest}"
-export AR_REPO="${AR_REPO:-us-central1-docker.pkg.dev/kube-agents-prow/kube-agents}"
+export AR_REPO="${AR_REPO:-us-central1-docker.pkg.dev/${PROJECT_ID}/kube-agents}"
 
 export IMG="${AR_REPO}/kube-agents-operator:${TAG}"
 export AGENT_IMAGE="${AR_REPO}/platform-agent"
