@@ -8178,6 +8178,27 @@ spec:
                                 instead of letting it sit unremarked in the spec.
                           type: boolean
                       type: object
+                    experimental:
+                      description: |-
+                        Experimental holds opt-in behaviour that is not supported and may change
+                        or disappear in any release.
+                      properties:
+                        platformFrontDoor:
+                          default: false
+                          description: |-
+                            PlatformFrontDoor makes the Platform Agent the profile the Hermes gateway
+                            runs as, so chat messages are handled by it directly instead of arriving
+                            at the Chat Agent, which delegates through the router and the kanban board.
+
+                            The trade is the Chat Agent's whole reason for existing: its lockdown (a
+                            router with three toolsets) is what keeps an inbound message from reaching
+                            the full Platform Agent tool surface before a card and a worker turn have
+                            framed it. With this on, an inbound message reaches that surface directly.
+
+                            One gateway means one profile, so this is not additive: while it is on, the
+                            Chat Agent persona sees no chat at all.
+                          type: boolean
+                      type: object
                     hermes:
                       description:
                         Hermes configures the internal event-routing or agent

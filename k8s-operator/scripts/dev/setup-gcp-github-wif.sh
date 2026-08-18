@@ -76,6 +76,7 @@ gcloud services enable iamcredentials.googleapis.com \
   container.googleapis.com \
   storage.googleapis.com \
   pubsub.googleapis.com \
+  gkebackup.googleapis.com \
   --project="${PROJECT_ID}"
 
 # 3. Create Service Account
@@ -106,6 +107,9 @@ if [ "$IS_ADMIN" = true ]; then
 
     # Required by provision_05_gcp_gchat.sh & teardown_05 for Google Chat Pub/Sub topic and subscription management
     "roles/pubsub.admin"
+
+    # Required by provision_12_gke_backup_plan.sh & teardown_12_gke_backup_plan.sh to manage Backup for GKE plans
+    "roles/gkebackup.admin"
   )
 fi
 

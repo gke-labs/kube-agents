@@ -414,6 +414,43 @@ warn_on_third_party_prefix_mismatch() {
   esac
 }
 
+# Attach IMAGE_TAG to an image reference that carries neither a tag nor a
+# digest. The saved *_IMAGE values are deliberately bare repository paths:
+# IMAGE_TAG is scoped to one pipeline run and is never persisted to vars.sh
+# (see init_var_image_tag), so the tag has to be re-attached where the
+# reference is used. Handing a bare path to Kubernetes resolves it to
+# ':latest', which the provisioner never builds or pushes.
+# A reference that already names a tag or digest is returned untouched, so
+# this is safe to apply to a user-supplied override.
+#
+# This is the shell twin of resolveAgentImage() in
+# k8s-operator/internal/controller/manifest_helpers.go, which applies the same
+# split-at-the-last-slash rule to CR-supplied images. The two differ on purpose
+# when no tag is available: the operator is serving a live CR and falls back to
+# "latest", while a provisioning run can still fail and so does, loudly. Change
+# one and check the other.
+qualify_image_ref() {
+  local ref="$1"
+  local tag="${2:-${IMAGE_TAG:-}}"
+  if [ -z "$ref" ]; then
+    print_error "qualify_image_ref: called with an empty image reference"
+    return 1
+  fi
+  # Only the final path segment can hold the tag — a registry host may carry
+  # a port, as in 'registry.example.com:5000/kube-agents/platform-agent'.
+  case "${ref##*/}" in
+    *:* | *@*) ;;
+    *)
+      if [ -z "$tag" ]; then
+        print_error "qualify_image_ref: no tag available for bare reference '${ref}' (IMAGE_TAG is unset). Set IMAGE_TAG, or pin the reference with an explicit tag or digest."
+        return 1
+      fi
+      ref="${ref}:${tag}"
+      ;;
+  esac
+  echo "$ref"
+}
+
 # Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
 # "us-central1-c") is not a valid key location. REGION doubles as the cluster
 # location, which for a zonal cluster must stay the zone, so KMS needs its own

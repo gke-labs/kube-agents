@@ -10,9 +10,9 @@ The `setup-gcp-github-wif.sh` script automates the creation and configuration of
 
 ### What it does
 
-1. **Enables Required APIs**: Ensures fundamental APIs (`iamcredentials`, `cloudresourcemanager`, `container`, `storage`, `pubsub`) are enabled on your GCP project.
+1. **Enables Required APIs**: Ensures fundamental APIs (`iamcredentials`, `cloudresourcemanager`, `container`, `storage`, `pubsub`, `gkebackup`) are enabled on your GCP project.
 2. **Creates a Service Account**: Provisions a dedicated GCP Service Account for GitHub Actions to impersonate.
-3. **Assigns IAM Roles**: Grants necessary permissions (`roles/cloudkms.admin`, `roles/container.admin`, etc.) to the new service account. When run with `--admin`, grants extended lifecycle administration roles (`roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/pubsub.admin`) required by `provision.sh` / `teardown.sh`.
+3. **Assigns IAM Roles**: Grants necessary permissions (`roles/cloudkms.admin`, `roles/container.admin`, etc.) to the new service account. When run with `--admin`, grants extended lifecycle administration roles (`roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/pubsub.admin`, `roles/gkebackup.admin`) required by `provision.sh` / `teardown.sh`.
 4. **Configures WIF**: Creates a Workload Identity Pool and an OIDC Provider linked to GitHub (`https://token.actions.githubusercontent.com`).
 5. **Secures Access**: Configures attribute mapping and conditions so that _only_ your specific GitHub Repository is authorized to authenticate via this pool.
 6. **Grants WIF Principal Role**: Grants the `roles/serviceusage.serviceUsageConsumer` role to the WIF principal to allow it to consume service quota.
@@ -28,7 +28,7 @@ Before running the script, you must have the Google Cloud CLI (`gcloud`) install
 
 #### Options
 
-- `--admin`: Grants extended IAM roles (`roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/pubsub.admin`) for full autonomous `provision.sh` / `teardown.sh` lifecycle operations.
+- `--admin`: Grants extended IAM roles (`roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/pubsub.admin`, `roles/gkebackup.admin`) for full autonomous `provision.sh` / `teardown.sh` lifecycle operations.
 - `ADMIN=true`: Environment variable alternative to `--admin`.
 
 > **Note:** IAM role grants made with `--admin` are additive and remain assigned to the service account in your GCP project until manually revoked.

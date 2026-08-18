@@ -45,7 +45,10 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
-init_var "REPLAY_IMAGE" "$(registry_prefix)/replay-proxy:${IMAGE_TAG:-latest}" "Enter Replay Proxy container image"
+# Bare by design, like every other saved *_IMAGE: init_var only writes a value
+# it prompted for, so baking IMAGE_TAG into the default would freeze the first
+# run's tag into vars.sh and silently redeploy it on every later run.
+init_var "REPLAY_IMAGE" "$(registry_prefix)/replay-proxy" "Enter Replay Proxy container image"
 warn_on_registry_prefix_mismatch "REPLAY_IMAGE"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -67,6 +70,7 @@ verify_inference_replay() {
   return 1
 }
 execute_inference_replay() {
+  REPLAY_IMAGE="$(qualify_image_ref "$REPLAY_IMAGE")" || return 1
   print_info "Deploying Inference Replay proxy into GKE (image=${REPLAY_IMAGE})..."
   export NAMESPACE REPLAY_IMAGE
   make -C "${OPERATOR_DIR}" deploy-inference-replay || return 1

@@ -108,6 +108,34 @@ type HarnessSpec struct {
 	// baked into the agent image.
 	// +optional
 	Tuning *TuningSpec `json:"tuning,omitempty"`
+
+	// Experimental holds opt-in behaviour that is not supported and may change
+	// or disappear in any release.
+	// +optional
+	Experimental *ExperimentalSpec `json:"experimental,omitempty"`
+}
+
+// ExperimentalSpec gathers the unsupported switches. Nothing here carries a
+// compatibility promise: a field may change meaning, change default, or be
+// removed outright between releases, and an install that depends on one is
+// expected to be re-checked at every upgrade. Fields belong here while the
+// question they answer is still open — once the answer is settled the switch
+// either graduates into a supported spec block or goes away.
+type ExperimentalSpec struct {
+	// PlatformFrontDoor makes the Platform Agent the profile the Hermes gateway
+	// runs as, so chat messages are handled by it directly instead of arriving
+	// at the Chat Agent, which delegates through the router and the kanban board.
+	//
+	// The trade is the Chat Agent's whole reason for existing: its lockdown (a
+	// router with three toolsets) is what keeps an inbound message from reaching
+	// the full Platform Agent tool surface before a card and a worker turn have
+	// framed it. With this on, an inbound message reaches that surface directly.
+	//
+	// One gateway means one profile, so this is not additive: while it is on, the
+	// Chat Agent persona sees no chat at all.
+	// +kubebuilder:default=false
+	// +optional
+	PlatformFrontDoor *bool `json:"platformFrontDoor,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service

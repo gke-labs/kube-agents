@@ -605,6 +605,7 @@ spec:
               value: owner
             - name: API_SERVER_MODEL_NAME
               value: model-default
+            - name: HERMES_GATEWAY_PROFILE
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent

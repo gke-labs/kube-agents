@@ -37,6 +37,11 @@ init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 DEFAULT_OPERATOR_IMAGE="$(registry_prefix)/k8s-operator"
 init_var "OPERATOR_IMAGE" "$DEFAULT_OPERATOR_IMAGE" "Enter Operator Image Path"
 warn_on_registry_prefix_mismatch "OPERATOR_IMAGE"
+# This step forwards these two to the operator as well, so a saved value left
+# behind in another registry is just as misleading here as OPERATOR_IMAGE is.
+# Both are unset on a stock install, and the check is a no-op when empty.
+warn_on_registry_prefix_mismatch "PLATFORM_AGENT_IMAGE"
+warn_on_registry_prefix_mismatch "CREDENTIAL_PROXY_IMAGE"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -168,8 +173,10 @@ verify_operator() {
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."
   make -C "$OPERATOR_DIR" install || return 1
-  print_info "Deploying Operator Controller Manager (${OPERATOR_IMAGE}:${IMAGE_TAG}) to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy IMG="${IMG:-${OPERATOR_IMAGE}:${IMAGE_TAG}}" || return 1
+  local operator_image_ref
+  operator_image_ref="$(qualify_image_ref "$OPERATOR_IMAGE")" || return 1
+  print_info "Deploying Operator Controller Manager (${operator_image_ref}) to the GKE cluster..."
+  make -C "$OPERATOR_DIR" deploy IMG="${IMG:-$operator_image_ref}" || return 1
 
   # Propagate image overrides to the operator so PlatformAgent CRs created
   # without an explicit spec.deployment.image also pull from the custom
@@ -177,28 +184,41 @@ execute_operator() {
   # Precedence: explicit PLATFORM_AGENT_IMAGE > custom AGENT_IMAGE > custom
   # REGISTRY_PREFIX. Nothing is set for a default install so the operator's
   # compiled-in default stays authoritative.
-  local env_overrides=()
+  #
+  # Every reference goes through qualify_image_ref: the saved *_IMAGE values
+  # are bare repository paths (IMAGE_TAG is per-run and never persisted), and
+  # an untagged value reaches the operator as ':latest', which no step of this
+  # provisioner pushes. FLUENT_BIT_IMAGE is exempt — it names an upstream
+  # fluent/fluent-bit release whose tag has nothing to do with IMAGE_TAG.
+  #
+  # CREDENTIAL_PROXY_IMAGE is unset unless a user pins the sidecar by hand:
+  # install.sh deliberately does not write it, because the operator derives the
+  # sidecar from each CR's own agent image and an env override wins over that
+  # derivation for every CR in the cluster (resolveCredentialProxyImage).
+  # Each reference is qualified into a variable first: a command substitution
+  # inside an array element discards the helper's exit status, so a failure
+  # would otherwise be forwarded to the operator as an empty override.
+  local env_overrides=() agent_image_ref="" proxy_image_ref=""
   if [ -n "${PLATFORM_AGENT_IMAGE:-}" ]; then
-    env_overrides+=("PLATFORM_AGENT_IMAGE=${PLATFORM_AGENT_IMAGE}")
+    agent_image_ref="$(qualify_image_ref "$PLATFORM_AGENT_IMAGE")" || return 1
   elif [ -n "${AGENT_IMAGE:-}" ] && [ "${AGENT_IMAGE}" != "$(registry_prefix)/platform-agent" ]; then
     # A custom AGENT_IMAGE feeds the CR rendered in provision_08; mirror it to
     # the operator so hand-written CRs that omit spec.deployment.image pull
-    # from the same place. Only append IMAGE_TAG when the value is bare.
-    local agent_image_ref="${AGENT_IMAGE}"
-    case "${agent_image_ref##*/}" in
-      *:* | *@*) ;;
-      *) agent_image_ref="${agent_image_ref}:${IMAGE_TAG}" ;;
-    esac
-    env_overrides+=("PLATFORM_AGENT_IMAGE=${agent_image_ref}")
+    # from the same place.
+    agent_image_ref="$(qualify_image_ref "$AGENT_IMAGE")" || return 1
   elif [ "$(registry_prefix)" != "$DEFAULT_REGISTRY_PREFIX" ]; then
-    env_overrides+=("PLATFORM_AGENT_IMAGE=$(registry_prefix)/platform-agent:${IMAGE_TAG}")
+    agent_image_ref="$(qualify_image_ref "$(registry_prefix)/platform-agent")" || return 1
+  fi
+  if [ -n "$agent_image_ref" ]; then
+    env_overrides+=("PLATFORM_AGENT_IMAGE=${agent_image_ref}")
   fi
   # No derived default for the credential proxy: the operator already builds
   # the sidecar reference from the agent image by swapping the last path
   # element (resolveCredentialProxyImage), which lands on the mirror as soon as
   # PLATFORM_AGENT_IMAGE above does. Only an explicit override needs passing.
   if [ -n "${CREDENTIAL_PROXY_IMAGE:-}" ]; then
-    env_overrides+=("CREDENTIAL_PROXY_IMAGE=${CREDENTIAL_PROXY_IMAGE}")
+    proxy_image_ref="$(qualify_image_ref "$CREDENTIAL_PROXY_IMAGE")" || return 1
+    env_overrides+=("CREDENTIAL_PROXY_IMAGE=${proxy_image_ref}")
   fi
   # fluent-bit has no such derivation — the operator's only knob is this env
   # var — so a mirrored install has to be told, or every agent pod keeps

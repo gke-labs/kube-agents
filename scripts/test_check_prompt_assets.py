@@ -425,8 +425,17 @@ class ResolutionModelTests(unittest.TestCase):
         entrypoint = (REPO / "deploy/shared/docker-entrypoint.sh").read_text(
             encoding="utf-8"
         )
-        items = re.findall(r'--items "([^"]+)"', entrypoint)
-        platform = max(items, key=len).split()
+        # The platform list is no longer written inline at its --items: the
+        # front-door flag drops config.yaml from the force-sync (that file
+        # becomes one the running agent writes to), so the entrypoint passes
+        # "$(platform_sync_items)" and the function assembles the list from a
+        # base plus a conditional prefix. Re-derive it from those two lines --
+        # both halves, so a name moving between them is not read as a removal.
+        base = re.search(r'_items="([^"$]+)"', entrypoint)
+        prefix = re.search(r'_items="([^"$]*)\$_items"', entrypoint)
+        self.assertIsNotNone(base, "platform_sync_items no longer sets a base list")
+        self.assertIsNotNone(prefix, "platform_sync_items no longer prepends to it")
+        platform = prefix.group(1).split() + base.group(1).split()
         self.assertIn("governance", platform, "picked up the wrong --items list")
         self.assertEqual(
             set(platform) | {"scripts"},

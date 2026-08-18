@@ -220,6 +220,15 @@ re-runs reuse it; the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, `REPLAY_IMAGE`
 _after_ a first run means editing the saved values in `vars.sh` — saved state wins over a new
 export — and the scripts warn when a saved image no longer matches the effective prefix.
 
+`IMAGE_TAG` is per-run and is deliberately not saved to `vars.sh`, so those `*_IMAGE` variables
+normally hold a bare repository path. The step that consumes one attaches the current
+`IMAGE_TAG` to it when it names neither a tag nor a digest — `provision_03` for the operator,
+agent, and credential-proxy references, `provision_11` for the replay proxy. The third-party
+images are excluded, because their tags come from `images.json` and have nothing to do with
+`IMAGE_TAG`. Set a value explicitly
+(`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:1.4.0`) to pin a reference
+independently of `IMAGE_TAG`.
+
 cert-manager is the one install step that applies a manifest it does not own. `provision_03`
 rewrites `quay.io/jetstack/` to the third-party prefix before applying it. Two escape hatches
 sit alongside: `CERT_MANAGER_MANIFEST` points the step at a local or mirrored manifest instead of
@@ -238,7 +247,9 @@ now both do automatically when a prefix is in effect:
 
 `CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives that sidecar from the agent image by
 swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror on
-its own. Setting it explicitly still wins.
+its own. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
+otherwise keeps each sidecar in step with its own agent's image.
 
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
 the above for that agent's containers — see the
