@@ -226,7 +226,7 @@ postdates the other columns, and unlike `delivery_error` the reader gets no tole
 absence: `record_intercepted_event` names it in every INSERT, so a table without it records nothing
 at all, and the recap reports that as an unreadable ledger rather than a quiet day — see
 "A pre-release table, and no migration" below. Rows expire on the same 14-day TTL as the rest of the
-database:
+database, and on a row cap besides — see "Two bounds, not one":
 
 ```sql
 CREATE TABLE intercepted_events(
@@ -244,6 +244,22 @@ CREATE TABLE intercepted_events(
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+##### Two bounds, not one
+
+This is the only table here whose write rate the cluster sets rather than an operator, so the TTL
+does not bound the file. Once the day's ceiling for a severity is spent the daemon answers
+`suppressed`, and on that answer the watcher rolls its dedup entry back — so a hundred pods failing
+at kubelet's repeat cadence write a row per _sighting_ rather than a row per incident, all day, for
+fourteen days. The same database carries thread routing and triage context on the shared session
+PVC, so the ledger filling the volume takes those down with it.
+
+`cleanup_old_records` therefore trims the ledger to the newest `SESSION_KV_LEDGER_MAX_ROWS` rows
+(200,000) after the TTL delete, and `record_intercepted_event` truncates `message` to
+`SESSION_KV_LEDGER_MESSAGE_MAX_CHARS` (512) on the way in. At those bounds the table holds on the
+order of a hundred megabytes. The recap's own 120-character cut is a display choice applied at render
+time and bounds nothing on disk; 512 keeps more than it shows, which leaves room for a
+`FailedScheduling` message that names a predicate per node.
 
 ##### A pre-release table, and no migration
 

@@ -538,6 +538,76 @@ class TestInterceptedEventLedger(unittest.TestCase):
         self.assertEqual(self.client.post("/sessions").status_code, 201)
         self.assertEqual(self._rows("stale-workload"), [])
 
+    def test_the_ledger_is_capped_by_rows_as_well_as_by_age(self):
+        """A time bound alone does not bound the file.
+
+        Every row here is inside the TTL, so the TTL delete leaves all of them.
+        What a storm produces is exactly this: the day's ceiling is spent, the
+        watcher rolls its dedup entry back on every `suppressed`, and each
+        sighting writes another row for the next fourteen days. The database
+        also carries thread routing and triage context on a shared PVC, so the
+        ledger growing without a ceiling takes those down with it.
+        """
+        import sqlite3
+
+        with patch.object(session_kv_server, "LEDGER_MAX_ROWS", 5):
+            with sqlite3.connect(temp_db_path) as conn:
+                with conn:
+                    conn.execute("DELETE FROM intercepted_events")
+                    conn.executemany(
+                        "INSERT INTO intercepted_events "
+                        "(namespace, workload, reason, severity, occurrences, notified) "
+                        "VALUES ('prod', ?, 'BackOff', 'Info', 1, 0)",
+                        [(f"storm-{i}",) for i in range(12)],
+                    )
+
+            self.assertEqual(self.client.post("/sessions").status_code, 201)
+
+            with sqlite3.connect(temp_db_path) as conn:
+                kept = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT workload FROM intercepted_events ORDER BY id"
+                    ).fetchall()
+                ]
+
+        # The newest survive: a recap reads today, and the rows a cap has to
+        # drop are the ones furthest from being reported.
+        self.assertEqual(len(kept), 5)
+        self.assertEqual(kept, [f"storm-{i}" for i in range(7, 12)])
+
+    def test_a_stored_message_is_bounded_on_the_way_in(self):
+        """The reader's 120-character cut is a display choice; the row is what the PVC holds.
+
+        `FailedScheduling` on a large cluster names a predicate per node and
+        runs to a kilobyte or more, and the storm path writes one of those per
+        sighting.
+        """
+        import sqlite3
+
+        row_id = session_kv_server.record_intercepted_event(
+            cluster="c",
+            namespace="prod",
+            workload="verbose-api",
+            object_kind="Pod",
+            reason="FailedScheduling",
+            message="0/900 nodes are available: " + "insufficient cpu, " * 400,
+            severity="Info",
+            occurrences=1,
+            notified=False,
+        )
+        self.assertIsNotNone(row_id)
+
+        with sqlite3.connect(temp_db_path) as conn:
+            stored = conn.execute(
+                "SELECT message FROM intercepted_events WHERE id = ?", (row_id,)
+            ).fetchone()[0]
+
+        self.assertEqual(len(stored), session_kv_server.LEDGER_MESSAGE_MAX_CHARS)
+        # Truncated, not summarised: what is kept is the front of the message,
+        # which is the part naming the object and the leading predicate.
+        self.assertTrue(stored.startswith("0/900 nodes are available: insufficient cpu,"))
+
 
 
 

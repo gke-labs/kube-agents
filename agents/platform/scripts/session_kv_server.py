@@ -52,6 +52,20 @@ CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 # the reports themselves weigh.
 RECENT_REPORTS_WINDOW_HOURS = int(os.getenv("SESSION_KV_RECENT_REPORTS_HOURS", "24"))
 RECENT_REPORTS_LIMIT = int(os.getenv("SESSION_KV_RECENT_REPORTS_LIMIT", "8"))
+# The two bounds on the event ledger, which is the only table here whose write
+# rate the cluster sets rather than an operator; `cleanup_old_records` explains
+# why the TTL above cannot hold it on its own. At the cap a row averaging half
+# a kilobyte occupies on the order of a hundred megabytes of the shared session
+# PVC — enough to survive a storm without being the reason the volume fills.
+LEDGER_MAX_ROWS = int(os.getenv("SESSION_KV_LEDGER_MAX_ROWS", "200000"))
+# Longest event message the ledger stores. `sanitize_chat_message` in
+# `eod_report_generator.py` cuts every message to 120 characters before it is
+# rendered, so nothing beyond this is ever displayed — but the untruncated text
+# is what occupies the row, and a `FailedScheduling` message that names one
+# predicate per node runs to a kilobyte or more on a large cluster. 512 keeps
+# the failing container and the leading predicate, which is more than the
+# reader shows.
+LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", "512"))
 
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
@@ -377,6 +391,29 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
+        # A row cap beside the TTL, because a time bound alone does not bound
+        # the file. The ledger is the one table here whose write rate is set by
+        # the cluster rather than by an operator: once the day's ceiling for a
+        # severity is spent the watcher rolls its dedup entry back on every
+        # `suppressed`, so a hundred pods failing at kubelet's repeat cadence
+        # write a row per sighting rather than a row per incident, all day, for
+        # CLEANUP_TTL_DAYS. This database also holds thread routing and
+        # triage context on a shared PVC, so the ledger filling it takes those
+        # down with it.
+        #
+        # `MAX(id) - ?` rather than an `ORDER BY ... LIMIT ? OFFSET ?` subquery:
+        # this runs on `POST /sessions`, which is the same per-sighting path the
+        # storm floods, and MAX over an AUTOINCREMENT primary key is a single
+        # index seek where the offset form scans the whole retained window. Ids
+        # never repeat, so the arithmetic keeps at most LEDGER_MAX_ROWS; gaps
+        # left by the TTL delete above can make it fewer, and they sit at the
+        # old end that delete has already cleared. `<=` rather than `<`: the
+        # boundary id is the (LEDGER_MAX_ROWS + 1)-th newest and goes. MAX over
+        # an empty table is NULL, and `id <= NULL` matches nothing.
+        conn.execute(
+            "DELETE FROM intercepted_events WHERE id <= (SELECT MAX(id) - ? FROM intercepted_events)",
+            (LEDGER_MAX_ROWS,),
+        )
         # Spent quota is only meaningful for the day it belongs to; the history
         # is kept the same 14 days as everything else so an operator asked
         # "what did we drop last week" still has an answer.
@@ -414,6 +451,11 @@ def record_intercepted_event(
     the send happens in a background task and a row written afterwards would be
     lost entirely if the process died mid-flight. `mark_delivery_failed` is what
     turns that intent back into an observation.
+
+    `message` is truncated to `LEDGER_MESSAGE_MAX_CHARS` on the way in rather
+    than on the way out. The reader's 120-character cut is a display choice and
+    leaves the row itself unbounded, and the row is what the shared session PVC
+    has to hold once a storm is writing one per sighting.
     """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -428,7 +470,7 @@ def record_intercepted_event(
                         workload,
                         object_kind,
                         reason,
-                        message,
+                        message[:LEDGER_MESSAGE_MAX_CHARS],
                         severity,
                         int(occurrences),
                         1 if notified else 0,
