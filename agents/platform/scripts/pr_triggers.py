@@ -49,6 +49,16 @@ must not import from a skill, which may not be installed and is not on the path
 at import time. Two copies can drift, so `test_pr_triggers.py` runs both against
 one corpus and fails when they disagree. Delete the copies and the test together
 when `audit_report.py` migrates onto this module.
+
+They are copies of the *behaviour*, not of the code. `strip_inline_code` here is
+a hand-written scan where `audit_report.py`'s is one regex, because that regex
+backtracks cubically on an attacker-chosen run of backticks and this module is
+the one reading pull-request comments on a ten-minute timer. The parity test
+compares what the two return, which is what has to agree. The audit ledger's copy
+is exposed the same way through `/remediate` and wants the same treatment; it is
+left alone here rather than widening a pull-request-watcher change into the
+fleet-audit skill, and the parity test is what notices if the two answers ever
+diverge.
 """
 
 from __future__ import annotations
@@ -67,6 +77,15 @@ from forge import normalise_login
 #: gate passed over must not become one the worker acts on.
 BOT_ALLOWLIST_ENV = "PR_AGENT_BOT_ALLOWLIST"
 
+#: How many refusals the agent will ever write on one pull request. Read here
+#: for the same reason as the allowlist above, and the reason bit: the sweep
+#: stopped refusing at this number and the worker skill did not know the number
+#: existed, so an account with no write access could spend the sweep's budget,
+#: wait for any trusted reviewer to file a card, and have the worker post the
+#: rest of the hundred comments the budget was there to prevent.
+MAX_REFUSALS_ENV = "PR_AGENT_MAX_REFUSALS_PER_PR"
+MAX_REFUSALS_DEFAULT = 10
+
 #: The command form. A leading `/` mirrors `/remediate` on the audit ledger and
 #: `/review` on this repository's own pull requests, so a reviewer who has seen
 #: either already knows the shape.
@@ -77,9 +96,17 @@ TRIGGER_COMMAND = "/agent"
 #: replying inside a list writes the command indented and means it.
 SLASH_RE = re.compile(r"^[ \t]*/agent\b[ \t]*(.*?)[ \t]*$", re.M)
 
-#: An inline code span, removed before the mention search so prose *about* the
-#: trigger is not mistaken for a use of it.
+#: An inline code span. Kept as the **reference** for what `strip_inline_code`
+#: means, and used by `test_pr_triggers.py` to fuzz the hand-written scanner
+#: against it — never on a body from the forge. It backtracks cubically on a
+#: long run of backticks, which is the whole reason the scanner exists.
 INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")
+
+#: One maximal run of backticks, and one newline. The scanner works from lists
+#: of both rather than character by character, so the per-character walk stays
+#: in C.
+BACKTICK_RUN_RE = re.compile(r"`+")
+NEWLINE_RE = re.compile(r"\n")
 
 #: A fence opens on three or more backticks or tildes at any indentation. The
 #: closer is what carries an indentation bound, measured against the opener —
@@ -200,8 +227,102 @@ def strip_fenced_blocks(text: str) -> str:
 
 
 def strip_inline_code(text: str) -> str:
-    """Drop inline code spans, so quoting the trigger is not using it."""
-    return INLINE_CODE_RE.sub(" ", text or "")
+    """Drop inline code spans, so quoting the trigger is not using it.
+
+    Hand-written rather than `INLINE_CODE_RE.sub(" ", text)`, which is what this
+    was and what `audit_report.py` still is. That pattern is `(`+)[^\\n]*?\\1` —
+    a backreference behind a lazy quantifier — and on a run of N backticks the
+    greedy `(`+)` claims all N, then gives one back at a time while the lazy
+    middle re-scans the rest of the line for each length it tries. The work is
+    cubic in N. Measured on this machine: 1,600 backticks 0.03s, 6,400 1.3s,
+    12,800 10.2s, and GitHub's 65,536-character comment limit extrapolates to
+    roughly twenty minutes.
+
+    That is reachable by anyone. `sweep_pr_comments` calls `find_trigger` on
+    every unhandled comment before it consults `can_write`, nothing upstream
+    removes the payload — a line of `x` followed by 60,000 backticks is not a
+    fence opener, so `strip_fenced_blocks` leaves it — and `profile_cron_tick`
+    holds the job lock for the life of the child and hands off rather than
+    killing on timeout, so one comment wedges the issue sweep too, silently.
+
+    The scan below is linear in the number of backtick runs and produces the
+    same string the pattern did. Two facts make that possible:
+
+    * **A failure at the start of a run fails everywhere inside it.** Trying
+      opener length L one character later searches a strictly smaller set of
+      closers, and the newline bound cannot loosen, because the character
+      skipped is a backtick. So a run that matches nothing is literal in whole
+      and the scan skips it, rather than re-deriving the failure N times.
+    * **For an opener longer than half its run, the closer cannot be in that
+      run** — it would need backticks past the run's end, and the run is
+      maximal. So the engine's backtracking is just "the longest opener some
+      later run on this line can answer", and below half, the run always closes
+      on its own second half with an empty middle.
+
+    `test_pr_triggers.py` fuzzes this against the original pattern, which is the
+    real argument that the two agree; the reasoning above only says why.
+    """
+    text = text or ""
+    if "`" not in text:
+        return text
+
+    runs = [(m.start(), m.end() - m.start()) for m in BACKTICK_RUN_RE.finditer(text)]
+    # Which line each run is on, and the longest run that follows it on that
+    # same line. Both are precomputed: consulting them is once per run, but
+    # deriving either on demand would put a quadratic back in a different place.
+    newlines = [m.start() for m in NEWLINE_RE.finditer(text)]
+    line_of: list[int] = []
+    seen = 0
+    for start, _ in runs:
+        while seen < len(newlines) and newlines[seen] < start:
+            seen += 1
+        line_of.append(seen)
+    longest_after = [0] * len(runs)
+    for k in range(len(runs) - 2, -1, -1):
+        if line_of[k + 1] == line_of[k]:
+            longest_after[k] = max(runs[k + 1][1], longest_after[k + 1])
+
+    out: list[str] = []
+    pos = 0
+    k = 0
+    while k < len(runs):
+        run_start, run_len = runs[k]
+        if run_start + run_len <= pos:
+            # Consumed by the span before it. A span can also end mid-run, which
+            # is why this compares against the run's end rather than its start.
+            k += 1
+            continue
+        start = max(run_start, pos)
+        opener = run_start + run_len - start
+        after = longest_after[k]
+        if after > opener // 2:
+            # Something later on the line can answer an opener past the halfway
+            # point, so the greedy quantifier keeps as much of the run as that
+            # closer is long, and the lazy middle stops at the first run that
+            # can. `after >= length` is what guarantees the walk terminates.
+            length = min(opener, after)
+            closer = k + 1
+            while runs[closer][1] < length:
+                closer += 1
+            end = runs[closer][0] + length
+        elif opener >= 2:
+            # Nothing later can answer it, so the run answers itself: half the
+            # run opens, the other half closes, and the middle is empty. An odd
+            # run leaves one backtick over, which the next pass reads literally.
+            end = start + 2 * (opener // 2)
+        else:
+            # A lone backtick with nothing to close it, and by the first fact
+            # above the rest of the run is no better off. Literal, in whole —
+            # so `k` moves on but `pos` does not: it is the high-water mark of
+            # what has been *written*, and text a span did not consume is still
+            # owed to the output.
+            k += 1
+            continue
+        out.append(text[pos:start])
+        out.append(" ")
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def strip_html_comments(text: str) -> str:
@@ -320,6 +441,22 @@ def bot_allowlist() -> set[str]:
     """Logins allowed to address the agent despite the `[bot]` suffix."""
     raw = os.environ.get(BOT_ALLOWLIST_ENV, "")
     return {normalise_login(name) for name in raw.split(",") if name.strip()}
+
+
+def max_refusals_per_pr() -> int:
+    """Total refusals either caller may write on one pull request.
+
+    Same reading as `github_scan_gate._int_env`, which this was: unset or
+    unparseable takes the default, and zero or below is honoured as a way to
+    stop the agent refusing at all without editing the roster.
+    """
+    raw = os.environ.get(MAX_REFUSALS_ENV, "").strip()
+    if not raw:
+        return MAX_REFUSALS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return MAX_REFUSALS_DEFAULT
 
 
 def is_addressable_bot(comment, allowed: set[str]) -> bool:

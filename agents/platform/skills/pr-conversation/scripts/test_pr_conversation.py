@@ -941,7 +941,7 @@ class TrustGateTest(_Harness):
         self.assertEqual(rc, 0)
 
     def test_an_untrusted_request_can_still_be_refused(self):
-        """Refusal is how the worker closes a loop, so it is never gated.
+        """Refusal closes a loop, so `can_write` alone never gates it.
 
         Step 2 of the SKILL.md sends it here for exactly this case; blocking it
         would leave the request handed back every ten minutes forever.
@@ -950,6 +950,102 @@ class TrustGateTest(_Harness):
         rc, _out = self._post(provider, "refuse")
         self.assertEqual(rc, 0)
         self.assertEqual(len(provider.posted), 1)
+
+    def test_an_unresolved_permission_cannot_be_refused_either(self):
+        """The one mistake on this path that cannot be taken back.
+
+        `agent-refused` closes the request for good, so refusing on a lookup
+        that failed silences a maintainer permanently on the strength of a proxy
+        timeout. The sweep holds these rather than refusing them and says why;
+        this file held the opposite, because the early return for a refusal sat
+        above the check. The next sweep re-reads it once the lookup works.
+        """
+        provider = self._provider(can_write=False, can_write_known=False)
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self._post(provider, "refuse")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("could not be determined", err.getvalue())
+
+    def _spent_budget(self, budget=2, **request_kwargs):
+        """A pull request whose refusal budget the sweep has already spent."""
+        kwargs = {"author": "drive-by", "can_write": False}
+        kwargs.update(request_kwargs)
+        already = [
+            make_comment(
+                f"IC_old{n}",
+                f"Refused.\n\n{pr_triggers.marker('IC_them%d' % n, pr_triggers.REFUSED_MARKER)}",
+                author=SELF,
+            )
+            for n in range(budget)
+        ]
+        return FakeProvider(
+            prs=[make_pr()],
+            comments={12: already + [make_comment("IC_1", "/agent bump to 4", **kwargs)]},
+        )
+
+    def test_a_refusal_past_the_budget_posts_nothing(self):
+        """One budget, not one per caller.
+
+        The sweep stops refusing at `PR_AGENT_MAX_REFUSALS_PER_PR` so that a
+        hundred comments from an account with no write access cannot become a
+        hundred public comments from the agent. It drops those without a marker,
+        so they stay unanswered and `poll` kept handing them back — and the next
+        card any trusted reviewer filed had the worker post them after all.
+        """
+        provider = self._spent_budget()
+        err = StringIO()
+        with (
+            mock.patch.dict(os.environ, {pr_triggers.MAX_REFUSALS_ENV: "2"}),
+            self.assertRaises(SystemExit),
+            redirect_stderr(err),
+        ):
+            self._post(provider, "refuse")
+        self.assertEqual(provider.posted, [])
+        self.assertIn("budget", err.getvalue())
+
+    def test_the_budget_does_not_gate_refusing_a_maintainer(self):
+        """A bound on one thing does not become a bound on another.
+
+        Past the budget the agent stops answering accounts that can comment
+        without limit. A reviewer with write access asking for something out of
+        scope is still owed the reasoned "no" the SKILL.md promises, and
+        refusing them is not the amplification the bound exists to stop.
+        """
+        provider = self._spent_budget(author="maintainer", can_write=True)
+        with mock.patch.dict(os.environ, {pr_triggers.MAX_REFUSALS_ENV: "2"}):
+            rc, _out = self._post(provider, "refuse")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.posted), 1)
+
+    def test_poll_stops_offering_untrusted_requests_past_the_budget(self):
+        """`_check_trust` is the enforcement; this keeps it out of the prompt.
+
+        A row the worker is handed and then forbidden to act on is a turn spent
+        on a failed command, and an invitation to argue with the gate.
+        """
+        provider = self._spent_budget()
+        err = StringIO()
+        with (
+            mock.patch.dict(os.environ, {pr_triggers.MAX_REFUSALS_ENV: "2"}),
+            redirect_stderr(err),
+        ):
+            _rc, out = self.run_helper(["poll", "--pr", "12"], provider)
+        self.assertEqual(json.loads(out)["status"], "NO_REQUESTS")
+        self.assertIn("refusal budget is spent", err.getvalue())
+
+    def test_an_unresolved_lookup_is_still_offered_past_the_budget(self):
+        """Held is not refused, and the budget is about accounts, not faults.
+
+        Dropping these would hide a maintainer's request behind a proxy wobble,
+        on a pull request some stranger had already spent the budget on.
+        """
+        provider = self._spent_budget(can_write=False, can_write_known=False)
+        with mock.patch.dict(os.environ, {pr_triggers.MAX_REFUSALS_ENV: "2"}):
+            _rc, out = self.run_helper(["poll", "--pr", "12"], provider)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_1"])
 
     def test_a_trusted_out_of_scope_request_can_be_refused(self):
         """The other reason to refuse: a maintainer asking for something the

@@ -17,7 +17,9 @@ The load-bearing properties, in the order they would hurt if they broke:
 
 import importlib.util
 import os
+import random
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -336,12 +338,72 @@ class FenceParserAgreementTest(unittest.TestCase):
                 )
 
     def test_inline_code_stripping_agrees(self):
-        for text in ("`a`", "``a`b``", "no code", "`unterminated", "a `b` c `d` e"):
+        for text in (
+            "`a`",
+            "``a`b``",
+            "no code",
+            "`unterminated",
+            "a `b` c `d` e",
+            # The scanner is hand-written here and a regex there, so the corpus
+            # carries the shapes that distinguish them: an odd run that leaves a
+            # backtick over, a run with no closer at all, and a pair split
+            # across a newline, which is not a span on either side.
+            "``````@x```a ",
+            "```b```\n `",
+            "\n```a",
+            "a b`\nb```c",
+        ):
             with self.subTest(text=text):
                 self.assertEqual(
                     pr_triggers.strip_inline_code(text),
                     self.audit.strip_inline_code(text),
                 )
+
+
+class InlineCodeScannerTest(unittest.TestCase):
+    """`strip_inline_code` is a hand-written scan, so it is held to the regex.
+
+    `INLINE_CODE_RE` is the definition of what the function means and was the
+    implementation until a run of backticks in a pull-request comment turned it
+    into a denial of service — see the function's docstring. Keeping the pattern
+    as the oracle is what stops the rewrite quietly changing which comments
+    count as code, which is a trust boundary: text the agent reads as code is
+    text it will not act on.
+    """
+
+    ALPHABETS = (
+        ("`", "``", "```", "````", "a", "b", " ", "\n", "@x", "/agent"),
+        ("`", "``", "a", "\n"),
+        ("`", "`````", "x", "\n", " "),
+    )
+
+    def test_the_scanner_matches_the_reference_pattern(self):
+        rng = random.Random(20260817)
+        for alphabet in self.ALPHABETS:
+            for _ in range(10000):
+                body = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 16)))
+                got = pr_triggers.strip_inline_code(body)
+                want = pr_triggers.INLINE_CODE_RE.sub(" ", body)
+                # Not subTest: 30,000 iterations of it costs more than the
+                # comparison. The failure message carries the input instead.
+                if got != want:
+                    self.fail(f"{body!r} -> {got!r}, reference gives {want!r}")
+
+    def test_text_a_span_did_not_consume_survives(self):
+        # An odd run closes on itself and leaves one backtick over. Losing the
+        # remainder — or the prose before it — is the shape the fuzz caught.
+        self.assertEqual(pr_triggers.strip_inline_code("hi ```there"), "hi  `there")
+
+    def test_a_long_run_of_backticks_does_not_hang_the_sweep(self):
+        # 65,536 is GitHub's comment limit, and this input is what an account
+        # with no write access can post to a pull request the agent opened. The
+        # pattern this replaced needed roughly twenty minutes on it; the scan
+        # needs under a millisecond. Five seconds is the bound because the point
+        # is "not superlinear", and a loaded machine must not fail the build.
+        body = "x" + "`" * 65536
+        started = time.monotonic()
+        pr_triggers.find_trigger(body, "agent", "node-1", "someone")
+        self.assertLess(time.monotonic() - started, 5.0)
 
 
 if __name__ == "__main__":

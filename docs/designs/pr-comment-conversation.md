@@ -182,8 +182,12 @@ class ForgeProvider(Protocol):
                                                           # created_at, kind, path/line
     def post_comment(self, repo, pr, body_file) -> None
     def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
-    def list_commit_shas(self, repo, pr) -> list[str]     # tip last; backs the reply claim check
+    def list_commits(self, repo, pr) -> list[Commit]      # sha + committed_at, tip last;
+                                                          # backs the reply claim check
 ```
+
+`Commit` carries the committer date beside the sha because a list of shas cannot express the bound
+the claim check enforces — see step 4 of the worker skill below.
 
 `GitHubProvider` implements it over the proxied `gh`, merging GitHub's three comment endpoints
 (`issues/N/comments`, `pulls/N/comments`, `pulls/N/reviews`) into one normalised list. Selection
@@ -439,9 +443,18 @@ prompt:
    every other malformed value already failed loudly, and that one failed silently in the unsafe
    direction.
 
-   The check is deliberately narrow. It settles the part a script can settle — whether the named
-   commit is on the pull request — and does not attempt to judge whether the commit does what the
-   reply says. `--no-change` is not verifiable at all, and is not pretended to be: what it buys is
+   **On the branch is not enough**, which is the second bound and the reason `list_commits` returns
+   dates rather than shas. Every commit the agent ever pushed is on this branch, including the one
+   that opened the pull request — so a worker that answers "done, see `abc1234`" while having
+   changed nothing passes a membership test by naming its own earlier work. That is the same live
+   failure one step later, and the check as first written would not have caught it. So the commit
+   must also postdate the request it answers: the triggering comment's `created_at` against the
+   commit's committer date, which is the one GitHub moves on a rebase or an amend. A commit the
+   forge reports no date for fails, because unverifiable is not verified.
+
+   The check is deliberately narrow. It settles the parts a script can settle — whether the named
+   commit is on the pull request, and whether it came after the request — and does not attempt to
+   judge whether the commit does what the reply says. `--no-change` is not verifiable at all, and is not pretended to be: what it buys is
    that a false claim now has to survive the model asserting the opposite one line above it, on the
    command line, where the turn's history keeps it. An unreadable commit list fails closed —
    unverifiable is not verified, and posting anyway would put the claim in the thread with the

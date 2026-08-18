@@ -166,6 +166,21 @@ def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
     return comments, requests
 
 
+def _refusals_already_posted(comments, viewer: str) -> int:
+    """Refusals the agent has already written on this pull request.
+
+    Read from the thread rather than tracked, for the same reason the answered
+    markers are: the sweep and the worker are separate processes on separate
+    schedules, and the thread is the only state both of them can see.
+    """
+    return len(pr_triggers.refused_node_ids(comments, viewer))
+
+
+def _refusals_exhausted(comments, viewer: str) -> bool:
+    """Whether this pull request has spent its whole refusal budget."""
+    return _refusals_already_posted(comments, viewer) >= pr_triggers.max_refusals_per_pr()
+
+
 def _confined_body(path: str) -> str:
     """The reply body, read from a path confined to the scratch directory.
 
@@ -279,8 +294,26 @@ def handle_poll(args) -> int:
 
         found = []
         threads = []
+        over_budget = 0
         for pr in prs:
             comments, pr_requests = _requests_on(provider, repo, pr, viewer)
+            # Untrusted requests past this pull request's refusal budget are not
+            # offered at all. The sweep already stopped refusing them, on
+            # purpose, and handing them to the worker is how that bound got
+            # spent twice. `_check_trust` is the enforcement; this is only about
+            # keeping work out of the prompt that the worker would then be told
+            # it may not do.
+            if _refusals_exhausted(comments, viewer):
+                # Known-untrusted only. A row whose lookup did not answer is not
+                # a stranger and stays visible, so the worker can say it was
+                # held rather than appear to have missed a maintainer.
+                kept = [
+                    row
+                    for row in pr_requests
+                    if row.get("can_write") or not row.get("can_write_known")
+                ]
+                over_budget += len(pr_requests) - len(kept)
+                pr_requests = kept
             if not pr_requests:
                 # No thread without a request in it: the worker is answering
                 # something, and a transcript of a pull request nobody addressed
@@ -297,6 +330,15 @@ def handle_poll(args) -> int:
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))
         return 0
+
+    if over_budget:
+        # stderr, so it stays out of the JSON the SKILL parses. Recorded rather
+        # than silent for the reason the sweep records its own drops: a bound
+        # nobody can see reads as "there was nothing there".
+        sys.stderr.write(
+            f"pr_conversation: {over_budget} untrusted request(s) not offered — "
+            "the pull request's refusal budget is spent\n"
+        )
 
     if not found:
         print(json.dumps({"status": "NO_REQUESTS", "repository": repo}))
@@ -322,7 +364,13 @@ def handle_poll(args) -> int:
 SHA_MIN_LEN = 7
 
 
-def _check_trust(request: dict, marker_kind: str, repo: str, number: int) -> None:
+def _check_trust(
+    request: dict,
+    marker_kind: str,
+    repo: str,
+    number: int,
+    refused_so_far: int = 0,
+) -> None:
     """Enforce here what the SKILL.md only asks for.
 
     The sweep decides who may be acted for, and it decides it twice over:
@@ -337,29 +385,61 @@ def _check_trust(request: dict, marker_kind: str, repo: str, number: int) -> Non
     to an account with no write access to the repository. That is a decision
     this file can check, so it checks it.
 
-    Only `reply` is gated, and deliberately so. `refuse` posts no answer and
-    takes no action; it declines a request and stamps the marker that stops it
-    being handed back every ten minutes. Step 2 of the SKILL.md sends the
-    worker to it for exactly the case gated here, and for a trusted reviewer's
-    out-of-scope ask too. Blocking a refusal is how a request loops forever,
-    so the conservative verdict stays available from either side of the gate.
+    Three rules, and which of them a refusal is subject to is the whole subtlety
+    of this function.
 
-    Unknown is not permission. A `reply` on an unanswered permission lookup is
-    the same public post on the same unverified account; the difference is only
-    that the failure was a proxy timeout rather than a stranger. The sweep
-    holds the request for the next tick in that case, and so does this.
+    **Write access gates `reply` only.** `refuse` posts no answer and takes no
+    action; it declines a request and stamps the marker that stops it being
+    handed back every ten minutes. Step 2 of the SKILL.md sends the worker to it
+    for exactly the case gated here, and for a trusted reviewer's out-of-scope
+    ask too. Blocking a refusal is how a request loops forever, so the
+    conservative verdict stays available from either side of that gate.
+
+    **An unanswered permission lookup gates both.** Unknown is not permission,
+    and a `reply` on it is the same public post on the same unverified account.
+    But a *refusal* on it is worse, and it is the one mistake here that cannot
+    be taken back: `agent-refused` closes the request for good, so a proxy
+    timeout would silence a maintainer permanently and no later sweep would
+    re-open it. The sweep holds these for the next tick rather than refusing
+    them, says so in as many words, and this now holds them too. The
+    close-the-loop failure the paragraph above guards against does not apply,
+    because the request is not being declined — it is being left for a tick when
+    the lookup works.
+
+    **The per-pull-request refusal budget gates a refusal of an untrusted
+    account.** The sweep stops at `pr_triggers.max_refusals_per_pr()` so that a
+    hundred comments from an account with no write access cannot become a
+    hundred public comments from the agent. Those requests are dropped without a
+    marker, which means they are still unanswered — so `poll` kept handing them
+    back, and the next card any trusted reviewer filed had the worker post the
+    refusals the sweep had already declined to. Counting here is what makes the
+    budget one budget. A refusal of a *trusted* reviewer is not counted against
+    it: that is an answer to somebody entitled to one, and the amplification the
+    budget exists to stop needs an account that can comment without limit.
     """
-    if marker_kind == pr_triggers.REFUSED_MARKER:
-        return
-
     author = request.get("author", "an unknown account")
     where = f"{repo}#{number}"
+    refusing = marker_kind == pr_triggers.REFUSED_MARKER
+    verb = "declined in the thread" if refusing else "answered"
+
     if not request.get("can_write_known", False):
         _fail(
             f"whether @{author} has write access to {where} could not be determined, so "
-            "this request may not be answered. Nothing was posted, no marker was written, "
+            f"this request may not be {verb}. Nothing was posted, no marker was written, "
             "and the next sweep re-reads it once the lookup works again."
         )
+
+    if refusing:
+        budget = pr_triggers.max_refusals_per_pr()
+        if not request.get("can_write", False) and refused_so_far >= budget:
+            _fail(
+                f"{where} has already been refused {refused_so_far} time(s), which is its "
+                f"whole budget of {budget}. Requests from accounts without write access are "
+                "ignored in silence past it, so nothing was posted and no marker was "
+                "written. Say so when you complete the card and leave the request alone."
+            )
+        return
+
     if not request.get("can_write", False):
         _fail(
             f"@{author} does not have write access to {where}, so the agent does not act on "
@@ -491,7 +571,7 @@ def _post(args, marker_kind: str) -> int:
         if not viewer:
             _fail("the GitHub credential could not name the account it authenticates as.")
         pr = _find_pr(provider, repo, args.pr, viewer)
-        _, requests = _requests_on(provider, repo, pr, viewer)
+        comments, requests = _requests_on(provider, repo, pr, viewer)
     except forge.ForgeError as error:
         _fail(f"{error.reason}: {error.value}")
 
@@ -514,7 +594,16 @@ def _post(args, marker_kind: str) -> int:
         )
     request = pending[args.comment_id]
 
-    _check_trust(request, marker_kind, repo, args.pr)
+    # Counted from the thread this call just read, not from what `poll` saw:
+    # between the two, the sweep or an earlier command in this same run may have
+    # spent the rest of the budget.
+    _check_trust(
+        request,
+        marker_kind,
+        repo,
+        args.pr,
+        _refusals_already_posted(comments, viewer),
+    )
 
     _check_claim(
         provider,

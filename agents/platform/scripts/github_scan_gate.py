@@ -104,8 +104,13 @@ PR_MAX_PER_TICK_DEFAULT = 3
 # hundred times. Past this many the requests are ignored in silence, which costs
 # the repository nothing — a collaborator can still say something, and
 # `agent:ignore` still parks the thread entirely.
-PR_MAX_REFUSALS_ENV = "PR_AGENT_MAX_REFUSALS_PER_PR"
-PR_MAX_REFUSALS_DEFAULT = 10
+#
+# Defined in `pr_triggers` and re-exported here, not the other way round: the
+# worker skill enforces the same budget on its own refusal path, and a budget
+# two callers each read from their own constant is a budget the second one can
+# spend again.
+PR_MAX_REFUSALS_ENV = pr_triggers.MAX_REFUSALS_ENV
+PR_MAX_REFUSALS_DEFAULT = pr_triggers.MAX_REFUSALS_DEFAULT
 
 
 @dataclass
@@ -373,7 +378,8 @@ def _max_per_tick() -> int:
 
 
 def _max_refusals_per_pr() -> int:
-    return _int_env(PR_MAX_REFUSALS_ENV, PR_MAX_REFUSALS_DEFAULT)
+    # Delegated, not re-derived: `pr_conversation.py` reads the same function.
+    return pr_triggers.max_refusals_per_pr()
 
 
 def _post_body(provider, repo: str, pr, body: str) -> None:
