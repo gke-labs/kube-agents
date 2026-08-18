@@ -60,7 +60,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run Checkov
-        uses: bridgecrewio/checkov-action@69437f47399a9e321cd0f08938cb5cf2bb846dba # v12.2928.0
+        uses: bridgecrewio/checkov-action@358405ddafaa109ad35d3d607bbc7cf933c742d9 # v12.3116.0
         with:
           framework: terraform,github_actions
           output_format: cli
