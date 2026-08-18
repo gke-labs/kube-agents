@@ -2245,8 +2245,27 @@ class RemediateRequests(NamedTuple):
 
 
 def strip_inline_code(text: str) -> str:
-    """Drop inline code spans, so quoting the command is not using it."""
-    return INLINE_CODE_RE.sub(" ", text or "")
+    """Drop inline code spans, so quoting the command is not using it.
+
+    Delegated to `pr_triggers`, which holds the only hardened implementation.
+    `INLINE_CODE_RE` above is `(`+)[^\\n]*?\\1` — a backreference behind a lazy
+    quantifier — and its cost is cubic in the length of a backtick run: 6,400
+    backticks take 1.3s, 12,800 take 10.2s, and a body at GitHub's 65,536
+    character comment limit extrapolates to roughly twenty minutes. `/remediate`
+    is read off issue comments on a timer, before any trust check, so the input
+    is anyone's to choose. The pattern stays as the definition of what this
+    means, and as the oracle the scan is fuzzed against.
+
+    The fence parser below is still a copy, held together by
+    `FenceParserAgreementTest`. This one is not: a copy of a subtle scan is how
+    two answers drift apart, and here the divergence that mattered was never in
+    the answer. Imported inside the function, like every other shared-module
+    import in this file, so `--dry-run` on a dev machine does not depend on
+    what has been staged into /opt.
+    """
+    import pr_triggers
+
+    return pr_triggers.strip_inline_code(text)
 
 
 def _promotable_hint(promotable: set[str]) -> str:

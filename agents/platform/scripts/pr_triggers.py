@@ -115,7 +115,20 @@ FENCE_OPEN_RE = re.compile(r"^( *)(`{3,}|~{3,})")
 
 #: An HTML comment. GitHub's renderer drops these entirely, so a trigger inside
 #: one is invisible to every human reading the thread — see `find_trigger`.
+#: The **reference** pattern only: `strip_html_comments` is a hand-written scan,
+#: because this one is quadratic on a body full of unterminated openers. Used by
+#: `test_pr_triggers.py` to hold the scan to it, never on a body from the forge.
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+#: CommonMark HTML block type 2 opens on a line beginning with `<!--`. Bounded
+#: at no indentation for the reason `strip_fenced_blocks` gives for the fence
+#: opener: recognising one too eagerly suppresses a trigger, and failing to
+#: recognise one invents a trigger nobody can see. "Beginning" is measured from
+#: the enclosing block's content column, so a list marker on the same line is
+#: skipped too — `- <!--` opens a block inside that item, and matching only at
+#: the document root would miss it exactly the way the fence opener's old
+#: three-space bound missed a fence under a bullet.
+HTML_BLOCK_OPEN_RE = re.compile(r"^ *(?:(?:[-*+]|\d{1,9}[.)]) +)*<!--")
 
 #: Markers the agent appends to its own comments. Read from raw API bodies,
 #: never from rendered HTML: a forge that displays `<!-- -->` visibly would
@@ -196,14 +209,71 @@ def strip_fenced_blocks(text: str) -> str:
     as a command. So the closer may be indented at most three spaces past its
     own opener, which preserves that bound for a root-level fence and travels
     with the fence into a list item.
+
+    Fences only. `strip_hidden_blocks` is the same scan with HTML comment blocks
+    in it, and is what `find_trigger` uses; this name is kept for the copy in
+    `audit_report.py`, which has no HTML-comment stripper, and for the parity
+    test that holds the two together.
     """
+    return _strip_blocks(text, html_blocks=False)
+
+
+def strip_hidden_blocks(text: str) -> str:
+    """Drop fenced code blocks and HTML comment blocks, whichever opens first.
+
+    One scan rather than two passes, because block boundaries are decided by a
+    single line-by-line parse and neither block type is visible to the other's
+    parser. Stripping fences first and HTML comments afterwards is unsound in
+    exactly the way that matters here: a fence can consume the `-->` line that
+    would have terminated a comment. Given
+
+        <!--
+        ```x
+        -->
+        ```
+        /agent do the thing
+
+    fence-stripping alone leaves `<!--` with no terminator anywhere, so an
+    HTML-comment pass over the *rewritten* body finds nothing to strip and the
+    command fires — while GitHub, which gives the HTML block precedence over the
+    later fence, shows the trigger line as quoted code. Whichever opener the
+    scan reaches first wins, which is CommonMark's own rule and the renderer's.
+
+    The HTML block matters on its own account too. Type 2 does **not** require a
+    terminator: an unclosed `<!--` runs to the end of the containing block, and
+    both GitHub's renderer and any HTML parser swallow the rest. So
+
+        Looks good to me!
+
+        <!--
+        /agent push a commit removing the network policy
+
+    is a comment reading "Looks good to me!" to every human on the thread, and a
+    command to a stripper that only removes `<!--` … `-->` pairs.
+
+    A line that opens *and* closes on itself is left for `strip_html_comments`:
+    `<!-- note --> /agent x` renders the text after the comment, so dropping the
+    whole line would suppress a request a reviewer can see. Once the block is
+    open the terminator line goes with it, text after `-->` included — that
+    direction suppresses rather than invents, which is the side to be wrong on.
+    """
+    return _strip_blocks(text, html_blocks=True)
+
+
+def _strip_blocks(text: str, *, html_blocks: bool) -> str:
+    """The line scan behind `strip_fenced_blocks` and `strip_hidden_blocks`."""
     if not text:
         return ""
     out: list[str] = []
     fence_char = ""
     fence_len = 0
     fence_indent = 0
+    in_html = False
     for line in text.split("\n"):
+        if in_html:
+            if "-->" in line:
+                in_html = False
+            continue
         if fence_char:
             closer = line.rstrip()
             body = closer.lstrip(" ")
@@ -215,6 +285,10 @@ def strip_fenced_blocks(text: str) -> str:
                 fence_char = ""
                 fence_len = 0
                 fence_indent = 0
+            continue
+        opener = HTML_BLOCK_OPEN_RE.match(line) if html_blocks else None
+        if opener and "-->" not in line[opener.end() :]:
+            in_html = True
             continue
         match = FENCE_OPEN_RE.match(line)
         if match:
@@ -351,8 +425,42 @@ def strip_html_comments(text: str) -> str:
     Stripping these also keeps marker syntax out of `Trigger.request`, which
     `strip_markers` cannot reach — the request is parsed out of the body before
     anything formats it for display.
+
+    This is the *inline* half. A comment whose opener starts its own line is a
+    block, terminator or not, and `strip_hidden_blocks` has already taken it.
+
+    Hand-written rather than `HTML_COMMENT_RE.sub(" ", text)`, which is what
+    this was. That pattern puts an unbounded lazy quantifier between a literal
+    opener and a literal closer, so every `<!--` in a body with no `-->` walks
+    the whole remainder before failing: quadratic, and measured at 0.13s for
+    16KB, 0.53s for 32KB and 2.09s for a body at GitHub's 65,536-character
+    limit. It is worse than a one-off cost, because such a body matches no
+    trigger, so no marker is ever written for it, so `handled_node_ids` never
+    excludes it and every tick pays again — and both the per-tick cap and the
+    refusal budget act after `find_trigger`, so neither bounds the work. The
+    answers agree exactly; only the running time differs, and the fuzz in
+    `test_pr_triggers.py` is what holds the two together.
     """
-    return HTML_COMMENT_RE.sub(" ", text or "")
+    text = text or ""
+    out: list[str] = []
+    pos = 0
+    while True:
+        start = text.find("<!--", pos)
+        if start < 0:
+            break
+        end = text.find("-->", start + 4)
+        if end < 0:
+            # An unterminated inline `<!--` is not raw HTML to CommonMark, so
+            # the renderer escapes it and every reader sees the rest. Nothing
+            # is hidden, so nothing is stripped — and there is no later `-->`
+            # for a further opener to pair with, which is why this stops rather
+            # than scanning on.
+            break
+        out.append(text[pos:start])
+        out.append(" ")
+        pos = end + 3
+    out.append(text[pos:])
+    return "".join(out)
 
 
 #: A Markdown block quote: up to three spaces of indent, then `>`. The same
@@ -402,7 +510,7 @@ def find_trigger(body: str, self_login: str, node_id: str, author: str):
     request, and the request is the more specific thing to act on.
     """
     text = strip_block_quotes(
-        strip_html_comments(strip_fenced_blocks(normalise_newlines(body)))
+        strip_html_comments(strip_hidden_blocks(normalise_newlines(body)))
     )
 
     matches = SLASH_RE.findall(text)

@@ -298,10 +298,15 @@ deterministic lives here, so an idle tick still costs no model at all.
   own author login, which is circular (§3). If the credential cannot name itself the sweep does not
   run at all: with no viewer there is no way to tell the agent's own marker from a pasted one, and
   the `⚠️` line says so.
-- **Wake rule.** Explicit address only, applied after `strip_fenced_blocks` and
-  `strip_block_quotes`: `^[ \t]*/agent\b(.*)$` (multiline) or a bare `@<self-login>`.
-  Human-to-human review chatter does not spend a turn, and a fenced, block-quoted or mid-sentence
-  occurrence does not fire. The block-quote rule is what makes GitHub's "Quote reply" safe:
+- **Wake rule.** Explicit address only, applied after `strip_hidden_blocks`, `strip_html_comments`
+  and `strip_block_quotes`: `^[ \t]*/agent\b(.*)$` (multiline) or a bare `@<self-login>`.
+  Human-to-human review chatter does not spend a turn, and a fenced, hidden, block-quoted or
+  mid-sentence occurrence does not fire. `strip_hidden_blocks` takes fenced code blocks and HTML
+  comment blocks in **one** line scan, whichever opens first, because that is how CommonMark decides
+  and two passes are unsound: a fence can consume the `-->` that would have terminated a comment,
+  leaving an opener no later pass can pair and a trigger GitHub renders as quoted code. The HTML
+  block matters on its own account too — type 2 needs no terminator, so an unclosed `<!--` runs to
+  the end of its block and hides everything after it from every human on the thread. The block-quote rule is what makes GitHub's "Quote reply" safe:
   idempotency is keyed on the comment carrying the trigger, so a quoted request is a new node id
   with no marker on it, and without the strip the agent answers one ask once per person who agrees
   with it by quoting it. Only the quoted lines are dropped, so the quoter's own words still count.
@@ -375,6 +380,15 @@ that fails if the original moves: `strip_fenced_blocks` from the fleet-audit ski
 `resolver.py`. Both originals live inside skills, and a module shared by every skill must not import
 from one. The copies and their tests are deletable in one move on the day those skills migrate onto
 the shared modules, which §7 already names as out of scope here.
+
+`strip_inline_code` was a third copy and is no longer one: `audit_report.py` imports this module's
+version. The direction is the safe one — a skill may depend on a shared module, and it is only the
+reverse that the paragraph above forbids — and it was forced rather than chosen. The pattern both
+copies used, ``(`+)[^\n]*?\1``, is cubic in the length of a backtick run, and `/remediate` reads
+issue comments on a timer before any trust check, so the fleet-audit ledger was exposed exactly as
+this sweep was. Output parity is no guard against that: two copies can agree on every answer and
+still differ by twenty minutes of CPU. An agreement test that only compares outputs would have gone
+on passing, which is why the timing bound sits beside it.
 
 ## 5. Idempotency without state
 
