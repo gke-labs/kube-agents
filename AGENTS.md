@@ -128,6 +128,17 @@ Rules:
   from several branches every week, and a re-aligned table rewrites rows your PR did not author.
   `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
   family needs no map edit at all.
+- **Write it straight.** Lead with the fact — no preamble, no restating the question, no "it's
+  worth noting". Cut hype and self-assessment (`comprehensive`, `robust`, `seamless`, `simply`,
+  `powerful`). Skip the "not X, but Y" antithesis and rule-of-three padding: one precise example
+  beats three synonyms. Prefer prose to a `**Bold term:** explanation` list. Claim first, caveat
+  after; a hedge in front of a fact hides it. `SKILL.md` files are the exception to the prose
+  preference — `.agents/skills/skill-review/SKILL.md` asks for terse imperative bullets there.
+- **Match a document's length to what the task needs.** Agent-written documents run long by
+  default, so cover the substance and stop: no filler sections, no summary that repeats the
+  section above it, no boilerplate scaffolding a reader will skip. Anthropic's
+  [Opus 5 prompting guide](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-5)
+  is the upstream source for this and for the conciseness rule above.
 
 Run `make docs-check` before pushing. It verifies generated regions are current, relative links
 resolve, identifiers match their source, and every Markdown document has an entry in the
@@ -151,6 +162,12 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   SHA and the comment together.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
+- **Write PR titles, bodies, commit messages, and review replies the same way** the Documentation
+  Guidelines' "Write it straight" rule requires: what changed and why, in plain declaratives. Do
+  not grade your own work — "comprehensive", "significantly improves", and "production-ready" are
+  claims the diff either supports or does not, and the reviewer is the one who decides. Lead with
+  the outcome: the first sentence of a PR body, a review reply, or a report back to the user
+  answers "what happened", and the supporting detail follows it.
 - **Adversarial self-review before opening a PR, and record it in the PR body.** Run the
   `review-adversarial` skill (`.agents/skills/review-adversarial/SKILL.md`) against your branch
   diff, fix what it confirms, and fill in the template's **Self-Review** section with what you
