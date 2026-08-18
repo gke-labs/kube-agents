@@ -5,14 +5,14 @@ Executable backing for [`../agent-process-supervisor.md`](../agent-process-super
 **This is not shipping code and is not wired into CI.** It exists so the design's mechanisms could
 be tested before anyone implements them in
 [`k8s-operator/internal/controller/leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py).
-It earned its place by being wrong: eight claims the design asserted were falsified here and
+It earned its place by being wrong: nine claims the design asserted were falsified here and
 corrected before reaching an implementation PR.
 
 ## Running it
 
 ```bash
 cd docs/designs/agent-process-supervisor
-python3 run_experiments.py          # all of them, ~75s
+python3 run_experiments.py          # all of them, ~90s
 python3 run_experiments.py E1 E6    # a subset
 ```
 
@@ -42,24 +42,25 @@ prototype's.
 
 ## What the experiments establish
 
-| #     | Claim                                                            | Note                                                                                         |
-| ----- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `E1`  | `waitpid(-1)` rewrites a crash into a clean exit                 | **Falsified the design.** See below                                                          |
-| `E1b` | One reaper dispatching by pid preserves exit statuses            | The fix `E1` forced                                                                          |
-| `E2`  | An `httpGet` probe cannot reach a server bound to `127.0.0.1`    | Why §3.4 uses an `exec` probe                                                                |
-| `E4`  | The restart cap diverges on criticality; the two probes disagree | **Surfaced the stale-`ready:true`-on-exit gap**, and now pins readiness vs liveness          |
-| `E4c` | A wedged loop is detected via the timestamp, by both probes      | A hung supervisor must not report healthy                                                    |
-| `E5`  | Shutdown is the sum over the table                               | 3 processes overrun the 30 s default `terminationGracePeriodSeconds`                         |
-| `E6`  | Every margin in §3.5 reproduces                                  | Including a third process failing the startup assertion, and the stale-Lease rows from `E10` |
-| `E7`  | Eleven manifest-level claims, against rendered output            | Uses the operator's own `buildDeployment` / `buildNetworkPolicy` / `buildPlatformLeaderRole` |
-| `E8`  | An entrypoint background job reparents to the supervisor         | The Hindsight migration: one zombie per boot without §3.7's reaper                           |
-| `E9`  | A demoted leader restarts its table on reacquiring the lease     | **Falsified the design.** The only case that runs in `elected` mode                          |
-| `E10` | The raised lease duration cannot reach an existing Lease         | **Falsified the design.** Parsed from the real `leader_elect.py`                             |
-| `E11` | A renew deadline bounds detection where a sleep does not         | **Falsified the design.** The first term of §3.5's inequality measured nothing               |
-| `E12` | The restart cap is a rate, and its window was below the floor    | **Falsified the design.** Two defects were cancelling                                        |
-| `E13` | Stopping a process stops everything it started                   | **Falsified the design twice.** Including the first attempt at the fix                       |
+| #     | Claim                                                             | Note                                                                                         |
+| ----- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `E1`  | `waitpid(-1)` rewrites a crash into a clean exit                  | **Falsified the design.** See below                                                          |
+| `E1b` | One reaper dispatching by pid preserves exit statuses             | The fix `E1` forced                                                                          |
+| `E2`  | An `httpGet` probe cannot reach a server bound to `127.0.0.1`     | Why §3.4 uses an `exec` probe                                                                |
+| `E4`  | The restart cap diverges on criticality; the two probes disagree  | **Surfaced the stale-`ready:true`-on-exit gap**, and now pins readiness vs liveness          |
+| `E4c` | A wedged loop is detected via the timestamp, by both probes       | A hung supervisor must not report healthy                                                    |
+| `E5`  | Shutdown is the sum over the table                                | 3 processes overrun the 30 s default `terminationGracePeriodSeconds`                         |
+| `E6`  | Every margin in §3.5 reproduces                                   | Including a third process failing the startup assertion, and the stale-Lease rows from `E10` |
+| `E7`  | Eleven manifest-level claims, against rendered output             | Uses the operator's own `buildDeployment` / `buildNetworkPolicy` / `buildPlatformLeaderRole` |
+| `E8`  | An entrypoint background job reparents to the supervisor          | The Hindsight migration: one zombie per boot without §3.7's reaper                           |
+| `E9`  | A demoted leader restarts its table on reacquiring the lease      | **Falsified the design.** The only case that runs in `elected` mode                          |
+| `E10` | The raised lease duration cannot reach an existing Lease          | **Falsified the design.** Parsed from the real `leader_elect.py`                             |
+| `E11` | A renew deadline bounds detection only when every step is clamped | **Falsified the design twice.** Naming a deadline is not having one                          |
+| `E12` | The restart cap is a rate, and its window was below the floor     | **Falsified the design.** Two defects were cancelling                                        |
+| `E13` | Stopping a process stops everything it started                    | **Falsified the design twice.** Including the first attempt at the fix                       |
+| `E14` | A definitive denial is not forgotten on the next timed-out call   | **Falsified the design.** A denied leader re-promoted itself                                 |
 
-### The eight the design got wrong
+### The nine the design got wrong
 
 1. **The reaper.** §3.7 proposed reaping `-1` and skipping PIDs found in the process table. The
    guard cannot work — `waitpid(-1)` has already consumed the status by the time it returns the
@@ -86,20 +87,30 @@ prototype's.
    lease read and write. The term measured nothing, and §3.4 said so in passing — it sized a 30 s
    staleness window on the premise that the same iteration is long and unpredictable. `E11` makes
    every lease call time out and shows the pre-fix loop leading forever. §3.5 now uses a **renew
-   deadline** on the local clock, with a request timeout so the loop reaches the check.
+   deadline** on the local clock. The first fix for that was itself too weak — a deadline _tested
+   once per pass_, with the calls and the sleep free to run past it, is bounded by the iteration
+   and not by itself. `E11` gained a third arm that measures the overshoot, and every blocking
+   step is now clamped to the remaining deadline.
 7. **The restart cap was unreachable, and only an off-by-one hid it.** The cap tested
    `len(failures) >= CAP`, retiring after `CAP-1` restarts rather than `CAP`. Correcting that to
    `>` is what exposed the real defect: reaching a cap of `C` needs `C+1` failures inside the
    window, so anything failing less often than `WINDOW/C` never reaches it. The KV server's
    failures land 61–76 s apart against a 60 s floor. The window goes from 300 s to 600 s.
-8. **Stopping a process did not stop what it started.** `Popen.terminate()` signals the direct
+8. **A denied leader re-promoted itself.** The renew deadline answers "nobody has told me
+   anything", but §3.5 never said a _definitive_ not-the-holder read must invalidate it. Left set,
+   the next timed-out call reads as "still inside the deadline" and restarts the whole table while
+   the real holder is running it — reachable directly by §3.5's own `kubectl delete lease`
+   migration step. `E14` is verified to falsify without the invalidation, which the first draft of
+   that experiment was not: it passed either way because the deadline had already elapsed by the
+   time the timeout landed, so it now asserts the window is still open before relying on it.
+9. **Stopping a process did not stop what it started.** `Popen.terminate()` signals the direct
    child, so a grandchild survives the handover §3.5 guarantees. The first fix — `SIGTERM` to the
    process group — was also wrong, and `E13` is the case that shows why: the parent honours it and
    exits inside the grace, so the `SIGKILL`-after-grace branch never runs and the grandchild lives.
    `stop()` now sweeps the group unconditionally once the child is gone.
 
-Five of the eight came out of review rather than out of running the suite (4, 5, 6, 7 and half of
-8), which is worth recording. Four of those five were about a **transition** — leader → follower →
+Six of the nine came out of review rather than out of running the suite (4, 5, 6, 7, 8 and half of
+9), which is worth recording. Four of those five were about a **transition** — leader → follower →
 leader, old constant → new object, a call that never returns, a parent that exits before its child
 — and none had a case that crossed one. Every experiment that existed started from a clean state
 and stayed there.

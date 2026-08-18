@@ -30,8 +30,8 @@ RESTART_WINDOW = 60  # design: 600
 BACKOFF_MAX = 8  # design: 30
 POLL = 1.0  # design: 2 + U(0,1)
 GRACE = 2.0  # design: 10, and per entry rather than global
-RENEW_DEADLINE = 2.0  # design: 8
-LEASE_CALL_TIMEOUT = 0.5  # design: 3 (_request_timeout on every lease call)
+RENEW_DEADLINE = 3.0  # design: 9
+LEASE_CALL_TIMEOUT = 0.5  # design: 2, clamped to the remaining deadline
 
 STATUS = os.environ.get("SUPERVISOR_STATUS_FILE", "supervisor.json")
 READY = os.environ.get("SUPERVISOR_READY_FILE", "supervisor.ready")
@@ -162,7 +162,7 @@ class Supervised:
 
 
 class Supervisor:
-    def __init__(self, table, mode, renew_deadline=RENEW_DEADLINE):
+    def __init__(self, table, mode, renew_deadline=RENEW_DEADLINE, clamp=True):
         self.table = table
         self.mode = mode  # "solo" | "elected"
         self.role = "solo" if mode == "solo" else "follower"
@@ -170,6 +170,10 @@ class Supervisor:
         # 3.5. `renew_deadline=None` is the pre-fix behaviour E11 contrasts
         # against: leadership ends only when a call comes back and says so.
         self.renew_deadline = renew_deadline
+        # 3.5. clamp=False is the OTHER pre-fix shape E11 contrasts against: a
+        # deadline tested once per iteration, with calls free to run past it,
+        # which bounds detection by the iteration rather than by the deadline.
+        self.clamp = clamp
         self.last_renew = float("-inf")
         self.lease_call_delay = 0.0  # E11 turns this up to simulate a slow API
 
@@ -194,18 +198,34 @@ class Supervisor:
             log(f"reaped {orphans} orphan(s)")
 
     # -- 3.5 ---------------------------------------------------------------
-    def read_lease(self):
-        """The stubbed lease call, BOUNDED like the real one's _request_timeout.
+    def read_lease(self, budget=None):
+        """The stubbed lease call, BOUNDED like the real one's _request_timeout
+        and CLAMPED to whatever is left of the renew deadline.
 
-        Returns True/False, or None when the call did not complete in time. An
-        untimed call is what made 3.5's first term meaningless (E11).
+        Returns True/False, or None when the call did not finish in time. An
+        untimed call is what made 3.5's first term meaningless; an untimed-but-
+        capped one still overshoots the deadline by up to a whole call, which is
+        why the cap is the MINIMUM of the two (E11).
         """
-        waited = min(self.lease_call_delay, LEASE_CALL_TIMEOUT)
-        if waited:
+        cap = LEASE_CALL_TIMEOUT if budget is None else min(LEASE_CALL_TIMEOUT, budget)
+        waited = min(self.lease_call_delay, max(cap, 0.0))
+        if waited > 0:
             time.sleep(waited)
-        if self.lease_call_delay > LEASE_CALL_TIMEOUT:
-            return None  # timed out
+        if self.lease_call_delay > cap:
+            return None  # timed out, or the deadline cut it short
         return os.path.exists(LEASE)
+
+    def sleep_budget(self, now, want=POLL):
+        """3.5: the WAIT is clamped to the remaining deadline too.
+
+        Clamping only the calls leaves the sleep free to run past the deadline,
+        which puts detection at `deadline + retry_period` rather than at the
+        deadline. Both clamps, or the first term of the inequality is not the
+        number the design says it is.
+        """
+        if self.mode != "elected" or self.renew_deadline is None or not self.clamp:
+            return want
+        return max(0.0, min(want, (self.last_renew + self.renew_deadline) - now))
 
     def is_leader(self, now):
         """3.5: leadership ends on the LOCAL clock, not on a reply.
@@ -216,16 +236,30 @@ class Supervisor:
         """
         if self.mode == "solo":
             return True
-        held = self.read_lease()
+
+        budget = None
+        if self.renew_deadline is not None and self.clamp:
+            budget = max(0.0, (self.last_renew + self.renew_deadline) - now)
+        held = self.read_lease(budget)
+
         if held is True:
-            self.last_renew = now
+            self.last_renew = time.monotonic()
             return True
         if held is False:
+            # A definitive denial is an ANSWER, and the deadline only ever answers
+            # "nobody has told me anything". Leave last_renew set and the next
+            # timed-out call re-promotes a supervisor that was told no, while the
+            # real holder is still running the table.
+            self.last_renew = float("-inf")
             return False
+
         if self.renew_deadline is None:
             # Pre-fix: an inconclusive call leaves the leader leading, forever.
             return self.role == "leader"
-        return now - self.last_renew <= self.renew_deadline
+        # Re-tested AFTER the call, against the clock as it is now. Testing the
+        # entry-time clock is the per-iteration form, bounded by the iteration.
+        stamp = time.monotonic() if self.clamp else now
+        return stamp - self.last_renew <= self.renew_deadline
 
     # -- 3.4 ---------------------------------------------------------------
     def write_status(self, ready, degraded):
@@ -292,6 +326,9 @@ class Supervisor:
                     sys.exit(1)
 
             required_ok = all(p.state == "running" for p in self.table if p.required)
-            degraded = any(p.state == "gave_up" for p in self.table if not p.required)
+            # 3.4: ONE definition -- an optional process that is not running. Keyed
+            # on gave_up it would miss every restart and, per 3.3's rate floor, would
+            # never fire at all for a slowly-failing process.
+            degraded = any(p.state != "running" for p in self.table if not p.required)
             self.write_status(ready=required_ok, degraded=degraded)
-            time.sleep(POLL)
+            time.sleep(self.sleep_budget(time.monotonic()))

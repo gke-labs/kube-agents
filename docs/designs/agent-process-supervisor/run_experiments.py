@@ -180,6 +180,32 @@ def e4():
         finally:
             sup.shutdown("e4 optional teardown")
 
+        # -- degraded is keyed on "not running", not on "gave_up" ---------
+        # 3.4 has ONE definition. Keyed on gave_up this reads false while the
+        # process is merely restarting, 6's e2e check (one pkill, expect
+        # degraded, expect it to clear) could never pass, and 3.3's rate floor
+        # means a slowly-failing process would never set it at all.
+        S.STATUS = os.path.join(d, "deg.json")
+        S.READY = os.path.join(d, "deg.ready")
+        table = [
+            S.Supervised("session_kv", [PY, "-c", "import sys;sys.exit(1)"], required=False),
+            S.Supervised("gateway", [PY, "-c", "import time;time.sleep(300)"], required=True),
+        ]
+        sup = S.Supervisor(table, mode="solo")
+        try:
+            sup.run(iterations=2)  # failed once; backing off, nowhere near the cap
+            st = json.load(open(S.STATUS))
+            assert table[0].state == "backoff", (
+                f"setup: expected the optional process to be backing off, got {table[0].state}"
+            )
+            assert st["degraded"] is True, (
+                "degraded must be true while an optional process is merely restarting; "
+                "keyed on gave_up it would read false here"
+            )
+            assert st["ready"] is True, "and it must not touch readiness"
+        finally:
+            sup.shutdown("e4 degraded teardown")
+
         # -- required past cap: cleanup, then exit ------------------------
         S.STATUS = os.path.join(d, "req.json")
         S.READY = os.path.join(d, "req.ready")
@@ -291,31 +317,31 @@ def e6():
     cases = {
         "today, sleep 5+2 (1 proc)": margin(15, 7, 10, 1),
         "today, sleep 5+2 (2 proc)": margin(15, 7, 10, 2),
-        "A: lease 35, deadline 12 (2 proc)": margin(35, 12, 10, 2),
-        "B: grace 4, deadline 8 (2 proc)": margin(15, 8, 4, 2),
-        "C: retry 2+1, deadline 8 (2 proc)": margin(15, 8, 10, 2),
-        "A+C+D: lease 35, deadline 8 (2 proc)": margin(35, 8, 10, 2),
-        "A+C+D (3 proc)": margin(35, 8, 10, 3),
+        "A: lease 35, deadline 13 (2 proc)": margin(35, 13, 10, 2),
+        "B: grace 4, deadline 9 (2 proc)": margin(15, 9, 4, 2),
+        "C: retry 2+1, deadline 9 (2 proc)": margin(15, 9, 10, 2),
+        "A+C+D: lease 35, deadline 9 (2 proc)": margin(35, 9, 10, 2),
+        "A+C+D (3 proc)": margin(35, 9, 10, 3),
         # 3.5: the CONSTANT is 35, but a challenger reads what is stored on the
         # Lease, and nothing rewrites it on an existing install. See E10.
-        "S3 only, STALE lease 15 (1 proc)": margin(15, 8, 10, 1),
-        "S3+S4, STALE lease 15 (2 proc)": margin(15, 8, 10, 2),
+        "S3 only, STALE lease 15 (1 proc)": margin(15, 9, 10, 1),
+        "S3+S4, STALE lease 15 (2 proc)": margin(15, 9, 10, 2),
     }
     expected = {
         "today, sleep 5+2 (1 proc)": -2,
         "today, sleep 5+2 (2 proc)": -12,
-        "A: lease 35, deadline 12 (2 proc)": 3,
-        "B: grace 4, deadline 8 (2 proc)": -1,
-        "C: retry 2+1, deadline 8 (2 proc)": -13,
-        "A+C+D: lease 35, deadline 8 (2 proc)": 7,
-        "A+C+D (3 proc)": -3,
-        "S3 only, STALE lease 15 (1 proc)": -3,
-        "S3+S4, STALE lease 15 (2 proc)": -13,
+        "A: lease 35, deadline 13 (2 proc)": 2,
+        "B: grace 4, deadline 9 (2 proc)": -2,
+        "C: retry 2+1, deadline 9 (2 proc)": -14,
+        "A+C+D: lease 35, deadline 9 (2 proc)": 6,
+        "A+C+D (3 proc)": -4,
+        "S3 only, STALE lease 15 (1 proc)": -4,
+        "S3+S4, STALE lease 15 (2 proc)": -14,
     }
     for k, v in expected.items():
         assert cases[k] == v, f"{k}: design says margin {v}, computed {cases[k]}"
     assert cases["A+C+D (3 proc)"] < 0, "a third process must violate the inequality"
-    assert cases["B: grace 4, deadline 8 (2 proc)"] < 0, (
+    assert cases["B: grace 4, deadline 9 (2 proc)"] < 0, (
         "3.5 says B no longer even reaches zero once the first term is a real "
         "deadline rather than a sleep"
     )
@@ -324,12 +350,31 @@ def e6():
         f"{cases['S3+S4, STALE lease 15 (2 proc)']} vs {cases['today, sleep 5+2 (1 proc)']}"
     )
 
-    # The deadline is only enforceable if one full retry fits inside it (3.5).
-    assert 8 > 2 + 1 + 3, "renew_deadline must exceed retry_period + jitter + call timeout"
+    # 3.5: the deadline is enforceable only if one full RENEW fits inside it, and
+    # a renew is TWO calls (read then replace). Budgeting one is what an earlier
+    # revision did, and it passes the weaker test while failing the real one.
+    RETRY_MAX = 3
+    NOW = {"deadline": 9, "call": 2}      # proposed
+    WAS = {"deadline": 8, "call": 3}      # the revision the review caught
+    for label, c in (("proposed", NOW), ("earlier", WAS)):
+        one, two = RETRY_MAX + c["call"], RETRY_MAX + 2 * c["call"]
+        fits_wrong, fits_right = c["deadline"] > one, c["deadline"] > two
+        if label == "proposed":
+            assert fits_right, f"{c} must fit a full read+write retry ({two}s)"
+        else:
+            assert fits_wrong, "the one-call form is what made the earlier numbers look fine"
+            assert not fits_right, (
+                f"deadline {c['deadline']}s vs a {two}s read+write round trip is the gap: a "
+                "leader whose first renew timed out would demote without ever retrying"
+            )
 
     detail = "\n".join(
         f"{k:38s} margin {cases[k]:+3d}s  {'OK' if cases[k] > 0 else 'VIOLATED -> refuses to start'}"
         for k in cases
+    ) + (
+        f"\n\nrenew deadline must fit one FULL retry (read+write):"
+        f"\n  proposed  9 > 3 + 2x2 = 7   OK"
+        f"\n  earlier   8 > 3 + 2x3 = 9   VIOLATED (looked fine against 3+3=6, the one-call form)"
     )
     record("E6", "every margin in design 3.5 reproduces; a third process fails the assertion", "HOLDS", detail)
 
@@ -529,14 +574,14 @@ def e11():
 
     live = "import time;time.sleep(300)"
 
-    def stops_within(renew_deadline, budget):
+    def stops_within(renew_deadline, budget, clamp=True):
         with tempfile.TemporaryDirectory() as d:
             S.STATUS = os.path.join(d, "s.json")
             S.READY = os.path.join(d, "s.ready")
             S.LEASE = os.path.join(d, "lease")
             open(S.LEASE, "w").close()
             table = [S.Supervised("gateway", [PY, "-c", live], required=True)]
-            sup = S.Supervisor(table, mode="elected", renew_deadline=renew_deadline)
+            sup = S.Supervisor(table, mode="elected", renew_deadline=renew_deadline, clamp=clamp)
             try:
                 sup.run(iterations=2)  # acquire and start the table
                 assert table[0].state == "running", "setup: the leader should be running"
@@ -551,8 +596,9 @@ def e11():
             finally:
                 sup.shutdown("e11 teardown")
 
-    budget = S.RENEW_DEADLINE * 4
+    budget = S.RENEW_DEADLINE * 5
     fixed, t_fixed = stops_within(S.RENEW_DEADLINE, budget)
+    loose, t_loose = stops_within(S.RENEW_DEADLINE, budget, clamp=False)
     prefix, t_prefix = stops_within(None, budget)
 
     assert fixed, (
@@ -563,13 +609,24 @@ def e11():
         "without a deadline the pre-fix loop should still be leading -- if it stopped, "
         "this experiment is not reproducing the gap it exists for"
     )
+    # The middle arm is the review's finding: naming a deadline is not having one.
+    assert loose, "the per-iteration form should still stop eventually"
+    assert t_loose > t_fixed, (
+        "a deadline tested once per pass, with the calls and the sleep free to run past "
+        f"it, must overshoot the clamped form; got {t_loose:.2f}s vs {t_fixed:.2f}s"
+    )
+    assert t_fixed <= S.RENEW_DEADLINE + S.LEASE_CALL_TIMEOUT + 0.6, (
+        f"clamped detection should land at about the deadline ({S.RENEW_DEADLINE}s); "
+        f"took {t_fixed:.2f}s"
+    )
     record(
         "E11",
-        "a renew deadline bounds detection where a sleep interval does not",
+        "a renew deadline bounds detection only when every blocking step is clamped to it",
         "HOLDS",
-        f"every lease call timing out, budget {budget:.0f}s:\n"
-        f"  with renew_deadline={S.RENEW_DEADLINE}s: table STOPPED after {t_fixed:.1f}s\n"
-        f"  without one (pre-fix):                  still leading after {t_prefix:.1f}s\n"
+        f"every lease call timing out; deadline {S.RENEW_DEADLINE}s, budget {budget:.0f}s:\n"
+        f"  calls AND wait clamped to the deadline: STOPPED after {t_fixed:.2f}s\n"
+        f"  deadline tested once per iteration:     STOPPED after {t_loose:.2f}s  <- overshoots\n"
+        f"  no deadline at all (pre-fix):           still leading after {t_prefix:.2f}s\n"
         "the lease file was present throughout: losing contact is not losing the lease,\n"
         "and only the local clock can tell the difference",
     )
@@ -708,8 +765,70 @@ def e13():
     )
 
 
+# ---------------------------------------------------------------- E14
+def e14():
+    """A supervisor told "you are not the leader" must not re-promote on a timeout.
+
+    The renew deadline answers "nobody has told me anything". If a definitive
+    denial leaves `last_renew` set, the very next timed-out call reads as "still
+    inside the deadline" and restarts the whole table -- while the real holder is
+    running it. Two supervisors on one table is what R6 and the whole of 3.5 exist
+    to prevent, and E9 never crosses this transition because it only ever moves
+    between held and not-held with the calls succeeding.
+    """
+    import supervisor as S
+
+    live = "import time;time.sleep(300)"
+    with tempfile.TemporaryDirectory() as d:
+        S.STATUS = os.path.join(d, "s.json")
+        S.READY = os.path.join(d, "s.ready")
+        S.LEASE = os.path.join(d, "lease")
+        open(S.LEASE, "w").close()
+        table = [S.Supervised("gateway", [PY, "-c", live], required=True)]
+        sup = S.Supervisor(table, mode="elected")
+        try:
+            sup.run(iterations=2)                       # acquire; table running
+            assert table[0].state == "running", "setup: the leader should be running"
+            last_ok = sup.last_renew                    # capture BEFORE the denial
+
+            os.remove(S.LEASE)                          # a peer takes the lease
+            sup.run(iterations=1)                       # ONE pass: definitive denial
+            assert table[0].proc is None, "a denied leader must stop its table"
+            assert sup.role == "follower"
+
+            # Contact drops. The lease is still NOT ours, so nothing may bring the
+            # table back -- but the deadline window has to still be OPEN or the
+            # case proves nothing, so assert that before relying on it.
+            sup.lease_call_delay = S.LEASE_CALL_TIMEOUT * 4
+            elapsed = time.monotonic() - last_ok
+            assert elapsed < S.RENEW_DEADLINE, (
+                f"vacuous: {elapsed:.2f}s since the last successful renew already exceeds "
+                f"the {S.RENEW_DEADLINE}s deadline, so nothing could re-promote regardless "
+                "and this experiment is not testing what it claims"
+            )
+            sup.run(iterations=1)
+            revived = table[0].proc is not None
+            window = time.monotonic() - last_ok
+        finally:
+            sup.shutdown("e14 teardown")
+
+    assert not revived, (
+        "a timed-out call after a DEFINITIVE denial re-promoted the supervisor and "
+        "restarted the table -- last_renew was not invalidated on the denial path"
+    )
+    record(
+        "E14",
+        "a definitive denial is not forgotten when the next lease call times out",
+        "HOLDS",
+        f"held -> not-held (table stopped, role=follower) -> call times out at "
+        f"{window:.2f}s,\nstill inside the {S.RENEW_DEADLINE}s deadline window, so the "
+        "buggy form re-promotes here\n"
+        "table stays stopped: the deadline answers 'no news', never 'I was told no'",
+    )
+
+
 EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E4": e4, "E4c": e4c, "E5": e5, "E6": e6,
-               "E7": e7, "E8": e8, "E9": e9, "E10": e10, "E11": e11, "E12": e12, "E13": e13}
+               "E7": e7, "E8": e8, "E9": e9, "E10": e10, "E11": e11, "E12": e12, "E13": e13, "E14": e14}
 
 
 def main(argv):
