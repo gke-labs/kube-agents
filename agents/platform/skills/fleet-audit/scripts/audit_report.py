@@ -2260,29 +2260,57 @@ def strip_inline_code(text: str) -> str:
     return pr_triggers.strip_inline_code(text)
 
 
-def remediate_commands(text: str) -> list[str]:
-    """Every `/remediate` argument in `text` that a reader would see as a command.
+def remediate_commands(body: str) -> list[str]:
+    """Every `/remediate` argument in `body` that a reader would see as a command.
 
-    `REMEDIATE_RE.findall` is not this, and the gap is the whole point of the
-    function. The pattern anchors at the start of a line, and a code span that
-    opened on an *earlier* line renders its whole paragraph as code without
-    moving where any line begins — so
+    Takes a **raw comment body** and does the whole job, because splitting it
+    was the bug. Every call site used to pair `strip_fenced_blocks` with
+    `REMEDIATE_RE.findall`, and that pairing suppresses two of the four things
+    it needs to: a comment reading "Looks fine to me" above
+
+        <!--
+        /remediate netpol-missing
+        -->
+
+    renders as five words and opened a remediation pull request the thread
+    shows nothing about. `pr_triggers.visible_text` is the answer to "what can
+    a reader act on", it is the same answer `/agent` gets, and having one
+    function is what stops the two drifting again.
+
+    The second half is the line anchor, which cannot see rendering either. A
+    code span that opened on an *earlier* line renders its whole paragraph as
+    code without moving where any line begins — so
 
         Do not run: `
         /remediate cluster-a
         ` — it deletes the node pool
 
-    renders as one sentence with the command inside a `<code>`, and a bare
-    `findall` reads line 2 as a live request. Same defect, same shape, and the
-    same fix as `pr_triggers.find_trigger`: the span vetoes the command token,
-    and the argument is still returned whole so that a request may quote code.
-
-    `text` must already have been through `strip_fenced_blocks`; this is the
-    inline half only.
+    is one sentence with the command inside a `<code>`, and a bare `findall`
+    reads line 2 as a live request. `command_matches` vetoes a command whose
+    token sits inside a span, and hands the argument back whole either way, so
+    a request may still quote its own target.
     """
     import pr_triggers
 
-    return pr_triggers.command_matches(REMEDIATE_RE, text)
+    return pr_triggers.command_matches(REMEDIATE_RE, pr_triggers.visible_text(body))
+
+
+def remediate_mentioned(body: str) -> bool:
+    """Whether `body` names `/remediate` anywhere a reader would see as a command.
+
+    The weaker half of the pair: not at the start of a line, so never acted on,
+    but worth one reply saying so. Takes a raw body and applies the same
+    `visible_text` as `remediate_commands`, because the two are asked about the
+    same comment and an answer of "no command, but a mention" drawn from two
+    different notions of visible is not an answer.
+    """
+    import pr_triggers
+
+    return bool(
+        REMEDIATE_MENTION_RE.search(
+            pr_triggers.strip_inline_code(pr_triggers.visible_text(body))
+        )
+    )
 
 
 def _promotable_hint(promotable: set[str]) -> str:
@@ -2394,14 +2422,12 @@ def parse_remediate_commands(
     requested_at: dict[str, str] = {}
 
     for comment in comments or []:
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        matches = remediate_commands(body)
+        raw_body = comment.get("body", "")
+        matches = remediate_commands(raw_body)
         # Nothing at the start of a line, but the word is in there somewhere and
         # not inside a code span: an attempt at the command, not a discussion of
         # it. Worth a reply; never worth acting on.
-        mention_only = not matches and bool(
-            REMEDIATE_MENTION_RE.search(strip_inline_code(body))
-        )
+        mention_only = not matches and remediate_mentioned(raw_body)
         if not matches and not mention_only:
             continue
 
@@ -2556,9 +2582,9 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for comment in comments or []:
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        targets = [raw.strip().strip("`") for raw in remediate_commands(body)]
-        if not targets and not REMEDIATE_MENTION_RE.search(strip_inline_code(body)):
+        raw_body = comment.get("body", "")
+        targets = [raw.strip().strip("`") for raw in remediate_commands(raw_body)]
+        if not targets and not remediate_mentioned(raw_body):
             continue
         # Authorization is deliberately not consulted here, as above — but
         # authorship is. "That finding no longer reproduces" is the useful
@@ -2599,8 +2625,7 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         association = str(comment.get("authorAssociation", "") or "").upper()
         if association not in WRITE_ASSOCIATIONS:
             continue
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        for raw in remediate_commands(body):
+        for raw in remediate_commands(comment.get("body", "")):
             target = raw.strip().strip("`")
             if target and target != "all":
                 targets.add(target)

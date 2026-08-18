@@ -4052,6 +4052,27 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_command_inside_an_html_comment_never_fires(self):
+        # The ledger path paired `strip_fenced_blocks` with the line anchor and
+        # nothing else, so two of the four things that must suppress a command
+        # did not: this renders as the four words "Looks fine to me" and opened
+        # a remediation pull request the thread showed nothing about. Both
+        # paths now go through `pr_triggers.visible_text`.
+        body = "Looks fine to me\n\n<!--\n/remediate netpol-missing\n-->"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_quoted_command_never_fires(self):
+        # The other half of the same gap. It happened not to fire before, but
+        # only because `>` breaks `REMEDIATE_RE`'s line anchor rather than
+        # because anything stripped the quote — so the docs claim that
+        # `/remediate` follows the same four rules as `/agent` was true by
+        # coincidence on this one and false on the case above.
+        targets, refusals, _, _ = self.parse([comment("> /remediate netpol-missing")])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
     def test_a_command_inside_a_multi_line_code_span_never_fires(self):
         # A code span runs to the end of its paragraph, so this renders as one
         # sentence with the command inside a `<code>` — checked against

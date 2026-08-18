@@ -178,7 +178,21 @@ HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 #: skipped too — `- <!--` opens a block inside that item, and matching only at
 #: the document root would miss it exactly the way the fence opener's old
 #: three-space bound missed a fence under a bullet.
-HTML_BLOCK_OPEN_RE = re.compile(r"^ *(?:(?:[-*+]|\d{1,9}[.)]) +)*<!--")
+#:
+#: A block-quote marker is skipped for the same reason and was missed for one
+#: run longer: a quote is an enclosing block exactly as a list item is, so
+#: `> <!--` opens an unterminated block inside the quote and — checked against
+#: GitHub's renderer — swallows the rest of the *document*, blank line and
+#: closing quote included. `strip_block_quotes` then deleted the one line
+#: carrying the opener and handed the rest back intact, so a body rendering as
+#: nothing but "Looks good to me!" returned a live trigger.
+#:
+#: `<!--` must still be the block's first content. A mid-line `<!--` is inline,
+#: which GitHub escapes to `&lt;!--` while leaving everything after it visible,
+#: so `> quoted text with <!-- a note` opens nothing and a command below it
+#: fires — the prefix alternatives each consume at least one character, which
+#: is what keeps this from matching one.
+HTML_BLOCK_OPEN_RE = re.compile(r"^ *(?:(?:[-*+]|\d{1,9}[.)]) +|> *)*<!--")
 
 #: Markers the agent appends to its own comments. Read from raw API bodies,
 #: never from rendered HTML: a forge that displays `<!-- -->` visibly would
@@ -691,15 +705,35 @@ def mention_re(login: str) -> re.Pattern:
     )
 
 
+def visible_text(body: str) -> str:
+    """What is left of a comment once everything a reader cannot act on is gone.
+
+    Fenced blocks and HTML blocks, then inline HTML comments, then block quotes.
+    The order is the one `strip_hidden_blocks` argues for: block boundaries are
+    one parse, so the block pass must run before the inline one rather than
+    after it.
+
+    This is the whole of "was the agent addressed, or merely quoted", and it is
+    a named function because it has to be the same answer on both command paths.
+    It was not: `find_trigger` ran all four strippers while every `/remediate`
+    site in `audit_report.py` ran only `strip_fenced_blocks`, so a `<!-- … -->`
+    on an audit ledger hid a live `/remediate` — the invisible-trigger case
+    `strip_html_comments` exists to close, open on the other path the entire
+    time. A caller wanting less than this should be spelt out and argued for;
+    the default is everything.
+    """
+    return strip_block_quotes(
+        strip_html_comments(strip_hidden_blocks(normalise_newlines(body)))
+    )
+
+
 def find_trigger(body: str, self_login: str, node_id: str, author: str):
     """The trigger in one comment, or None.
 
     A command wins over a mention when both are present: the reviewer typed a
     request, and the request is the more specific thing to act on.
     """
-    text = strip_block_quotes(
-        strip_html_comments(strip_hidden_blocks(normalise_newlines(body)))
-    )
+    text = visible_text(body)
 
     matches = command_matches(SLASH_RE, text)
     if matches:
