@@ -160,8 +160,19 @@ BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
 #: every reader of the thread saw a bullet containing quoted code.
 #:
 #: Group 1 is therefore the whole prefix, markers included, which is what makes
-#: it the content column the closer's `+ 3` tolerance is measured from.
-FENCE_OPEN_RE = re.compile(r"^( *(?:(?:[-*+]|\d{1,9}[.)]) +)*)(`{3,}|~{3,})")
+#: it the content column the closer's `+ 3` tolerance is measured from — after
+#: `expandtabs(4)`, because a tab in that prefix is worth up to four columns and
+#: `len` would put the content column to the left of where CommonMark puts it.
+#:
+#: The separator after a marker is `[ \t]+`, not ` +`. See `HTML_BLOCK_OPEN_RE`
+#: for the whole argument; the short form is that `SLASH_RE` spells its own
+#: indentation `^[ \t]*`, so a tab made a line the trigger reads as a command
+#: into a line this pattern refused to read as an opener. The *leading*
+#: indentation stays spaces-only on purpose: a tab there is four columns, which
+#: makes the line an indented code block rather than a fence, and — checked
+#: against GitHub's renderer — leaves a `/agent` beneath it rendering as an
+#: ordinary visible paragraph that must still fire.
+FENCE_OPEN_RE = re.compile(r"^( *(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*)(`{3,}|~{3,})")
 
 #: An HTML comment. GitHub's renderer drops these entirely, so a trigger inside
 #: one is invisible to every human reading the thread — see `find_trigger`.
@@ -192,7 +203,22 @@ HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 #: so `> quoted text with <!-- a note` opens nothing and a command below it
 #: fires — the prefix alternatives each consume at least one character, which
 #: is what keeps this from matching one.
-HTML_BLOCK_OPEN_RE = re.compile(r"^ *(?:(?:[-*+]|\d{1,9}[.)]) +|> *)*<!--")
+#:
+#: Every separator is `[ \t]`, not a space. CommonMark expands a tab to the next
+#: four-column stop before it reads block structure, so `-<TAB><!--` opens a
+#: type 2 block inside that item exactly as `- <!--` does — but `SLASH_RE`
+#: spells its indentation `^[ \t]*` and nothing here expands tabs, so for one
+#: whitespace character the trigger pattern read a command on a line these
+#: patterns refused to read as an opener. Checked against GitHub's renderer:
+#: `-<TAB><!--` above a `/agent` line renders as `<ul><li></li></ul>` — the
+#: command is absent from the page — while the scan returned a live trigger.
+#: Same for `*`, `1.`, `>`, a nested pair, and a leading-space variant.
+#:
+#: The leading indentation stays ` *`, spaces only, for the reason
+#: `FENCE_OPEN_RE` gives: a tab at the document root is four columns, so
+#: `<TAB><!--` is an indented code block whose `<!--` GitHub escapes and shows,
+#: and the `/agent` beneath it is a visible paragraph that must fire.
+HTML_BLOCK_OPEN_RE = re.compile(r"^ *(?:(?:[-*+]|\d{1,9}[.)])[ \t]+|>[ \t]*)*<!--")
 
 #: Markers the agent appends to its own comments. Read from raw API bodies,
 #: never from rendered HTML: a forge that displays `<!-- -->` visibly would
@@ -371,6 +397,11 @@ def _strip_blocks(text: str, *, html_blocks: bool) -> str:
             continue
         if fence_char:
             closer = line.rstrip()
+            # Spaces only, and deliberately: CommonMark allows a closer at most
+            # three *columns* in, so a leading tab is four and disqualifies it.
+            # Leaving the tab in `body` fails the `set(body)` test, which is the
+            # renderer's answer — checked, a tab-indented ``` does not close a
+            # space-opened fence and the block runs on.
             body = closer.lstrip(" ")
             if (
                 len(closer) - len(body) <= fence_indent + 3
@@ -411,7 +442,9 @@ def _strip_blocks(text: str, *, html_blocks: bool) -> str:
                 # is the same quadratic this file has now removed twice.
                 out.append(line)
                 continue
-            fence_indent = len(match.group(1))
+            # Columns, not characters: a tab in the prefix is worth up to four
+            # of them, and the closer's `+ 3` tolerance below is a column bound.
+            fence_indent = len(match.group(1).expandtabs(4))
             fence_char = run[0]
             fence_len = len(run)
             continue

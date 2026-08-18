@@ -713,15 +713,37 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
   block that is quoting it. The helper returns the **whole** block — opener, body, closer — because
   the earlier version returned a bare delimiter and two callers emitted a stray ` ``` ` into a
   comment while dropping the command they meant to show.
-- **Fence detection follows CommonMark, including the indentation bound.** `strip_fenced_blocks`
+- **Fence detection follows the renderer, and the bound lives on the closer.** `strip_fenced_blocks`
   exists so a `/remediate` quoted inside evidence never fires, and quoting the command to discuss it
   is the single most likely thing anyone writes in one of these issues. A non-greedy ` ```…``` `
   regex pairs the first fence with the second and leaves the third dangling, so text every renderer
-  puts _inside_ a block survives stripping. The rule is: open on a run of three or more backticks or
-  tildes indented at most three spaces, close on a run of the same character at least as long,
-  likewise indented at most three, nothing else on the line, unterminated fences run to the end.
-  Dropping the indentation bound — stripping each line before comparing — makes four-space
-  ` ``` `, which CommonMark and GitHub both render as literal text, read as a closer.
+  puts _inside_ a block survives stripping. The rule is: **open** on a run of three or more backticks
+  or tildes at any leading indentation, optionally behind list or block-quote markers, with a
+  backtick anywhere in a _backtick_ fence's info string disqualifying it; **close** on a run of the
+  same character at least as long, nothing else on the line, indented at most three columns past the
+  opener's own content column; unterminated fences run to the end.
+
+  The closer keeps an indentation bound because dropping it — stripping each line before comparing —
+  makes a four-space ` ``` `, which CommonMark and GitHub both render as literal text, read as a
+  closer. The **opener's** absolute bound had to go the other way: a fence nested inside a list item
+  is measured from that item's content column, which is routinely past three, so requiring the run
+  to be the first non-space text missed the opener, the block never opened, and the real closing
+  fence then matched as an opener and swallowed everything after it — leaving the quoted command in
+  between exposed. Separators after a marker are `[ \t]`, since CommonMark expands a tab before it
+  reads block structure; leading indentation stays spaces-only, because a tab there is four columns
+  and makes the line an indented code block rather than a fence.
+
+  **The known cost of dropping the opener's bound:** a root-level four-space ` ``` `, which GitHub
+  renders as an indented code block, is read here as a fence opener, so a `/remediate` beneath it is
+  suppressed even though a reader can see it. That is the safe direction — suppressing a visible
+  request loses a reply, while missing a hidden one acts on text nobody can point at — and a
+  line-at-a-time scan cannot tell four spaces at the root from four spaces inside a nested item
+  without tracking the enclosing blocks.
+
+  This stripper now lives in `agents/platform/scripts/pr_triggers.py` and is imported here rather
+  than copied; [`pr-comment-conversation.md`](pr-comment-conversation.md) records why the two copies
+  were merged.
+
 - **Table cells escape `|` and flatten newlines**; identifiers additionally replace a backtick,
   because one backtick closes the inline code span they sit in and the rest of the value renders as
   live Markdown.
