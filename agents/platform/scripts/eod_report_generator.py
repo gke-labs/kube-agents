@@ -171,6 +171,13 @@ def load_intercepted_events(
     ledger records one row per forwarded event, with the fields the report
     needs and a timestamp to bound them by.
 
+    Nothing here scopes the query to one cluster, and that is deliberate.
+    `start-services.sh` passes the watcher `--profiles-dir`, which makes every
+    Cluster Agent profile in the pod a watched cluster fanning into this one
+    table, so a `WHERE cluster = ?` would discard most of the fleet's events.
+    The rows carry their cluster and `generate_markdown_report` says which ones
+    the window covered.
+
     Returning `[]` is ambiguous — a quiet fleet and an unreadable ledger look
     identical to the caller — and this runs as a `no_agent` cron job whose
     stdout *is* the chat message, so a warning on stderr reaches the container
@@ -196,21 +203,41 @@ def load_intercepted_events(
             conn = sqlite3.connect(str(p), timeout=2.0)
             try:
                 cursor = conn.cursor()
-                # `cluster` postdates the rest of the table. Naming it
-                # unconditionally would turn a database written by an older
-                # session server into an OperationalError and lose the whole
-                # day's ledger, so it is selected only when it is there and
-                # substituted with '' when it is not.
                 columns = {row[1] for row in cursor.execute("PRAGMA table_info(intercepted_events)")}
-                cluster_col = "cluster" if "cluster" in columns else "''"
-                # Same treatment, and for the same reason: a database written
-                # by a session server that predates the delivery write-back has
-                # no such column, and naming it would cost the whole day's
-                # ledger. Absent reads as '' — no failure recorded — which is
-                # the truthful answer for rows nobody ever checked.
+                # A table without `cluster` is not an older shape to read
+                # around, it is a ledger nothing can write to.
+                # `session_kv_server.record_intercepted_event` names the column
+                # unconditionally in its INSERT and wraps the whole write in a
+                # blanket `except`, so on this shape every event raises
+                # `no such column: cluster`, is logged, and is dropped. The
+                # table stays empty. Substituting '' would read that empty
+                # table cleanly and print a 🟢 all-clear every weekday over a
+                # recording path that has never worked — the precise failure
+                # the `problems` list exists to prevent. Reported as a read
+                # failure instead; `session_management.md`, "A pre-release
+                # table, and no migration", is the operator-facing fix.
+                #
+                # Guarded on `columns` being non-empty because PRAGMA returns
+                # no rows for a table that does not exist, and that fault has
+                # its own message: the SELECT below raises `no such table`.
+                if columns and "cluster" not in columns:
+                    raise sqlite3.OperationalError(
+                        "`intercepted_events` has no `cluster` column, so "
+                        "session_kv_server.py cannot write to it and the table "
+                        "will stay empty — drop the table and let the server "
+                        "recreate it"
+                    )
+                # `delivery_error` gets the tolerance `cluster` does not, and
+                # the difference is which statement names the column. The
+                # INSERT does not, so a table missing this one is still being
+                # written to correctly; only `mark_delivery_failed`'s later
+                # UPDATE fails. Absent therefore reads as '' — no failure
+                # recorded — which is the truthful answer for rows nobody ever
+                # checked, and the recap keeps working against a ledger written
+                # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
                 cursor.execute(
-                    f"SELECT {cluster_col}, namespace, workload, object_kind, reason, message, "
+                    "SELECT cluster, namespace, workload, object_kind, reason, message, "
                     f"severity, occurrences, notified, created_at, {delivery_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
@@ -222,9 +249,11 @@ def load_intercepted_events(
                 conn.close()
         except sqlite3.OperationalError as e:
             # A database that predates the ledger has every other table but not
-            # this one. Reported rather than swallowed: the recap is about to
-            # say nothing happened, and "the table is missing" is a different
-            # thing from "the fleet was quiet".
+            # this one, and one that predates `cluster` has a table the writer
+            # cannot use — the check above raises into here so both arrive as
+            # one kind of answer. Reported rather than swallowed: the recap is
+            # about to say nothing happened, and "the ledger is unusable" is a
+            # different thing from "the fleet was quiet".
             sys.stderr.write(f"Warning: Cannot read intercepted_events from {path_str}: {e}\n")
             failures.append(f"`{path_str}` — cannot read `intercepted_events`: {e}")
             continue
@@ -295,6 +324,11 @@ _LISTED_EMOJI = "🔹"
 _SECTION_HEADING = "🔕 Informational Events Held Back from Chat"
 # The overflow past this is counted on a trailing line, never dropped silently.
 _ENTRY_LIMIT = 10
+# How many foreign cluster names the scope line prints before it counts the
+# rest. A fan-in install can watch more clusters than a chat card can carry,
+# and the point of the line is that the reader sees the scope is wider than the
+# header's one name — not that they read every name.
+_CLUSTER_LIMIT = 5
 
 
 def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -315,6 +349,12 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_occurrences = 0
     forwarded = 0
     excluded_occurrences = 0
+    # Every cluster the window's rows came from, excluded namespaces included:
+    # this is the scope the recap looked at, not the scope it found noise in.
+    # Rows written with no cluster belong to whichever cluster the ledger is
+    # mounted on, which `_workload_label` already treats as the report's own, so
+    # they add nothing here.
+    clusters_seen: set = set()
     alerts_posted = 0
     suppressed_info = 0
     cap_dropped = 0
@@ -380,6 +420,8 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # into one `api` line the SRE cannot resolve back to a service.
         workload = event.get("workload", "") or "unknown-workload"
         cluster = event.get("cluster", "") or ""
+        if cluster:
+            clusters_seen.add(cluster)
         # Cluster, severity and outcome are all in the key, and each for the
         # same reason: a group is listed or dropped as a unit, and its `count`
         # is printed as a fact about every row in it, so anything the listing
@@ -513,6 +555,9 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # is what lets the closing lines say they are reporting part of the
         # fleet instead of implying they covered all of it.
         "excluded_occurrences": excluded_occurrences,
+        # Which clusters the counts above are summed over. Sorted so the header
+        # renders the same way twice for the same day.
+        "clusters": sorted(clusters_seen),
         "alerts_posted": alerts_posted,
         "suppressed_info": suppressed_info,
         "cap_dropped": cap_dropped,
@@ -612,7 +657,29 @@ def generate_markdown_report(
         header_emoji = "📊"
     else:
         header_emoji = "🟢"
-    lines.append(f"{header_emoji} *k8s-event-watcher Daily Activity Recap* — `{cluster_name}` ({report_date})")
+
+    # `cluster_name` is the cluster this job runs on, and on a fan-in install it
+    # is not the scope of a single number below it: the watcher is started with
+    # `--profiles-dir`, so every Cluster Agent profile in the pod forwards into
+    # one ledger and the reader counts all of it. The counts stay fleet-wide —
+    # scoping them to the host would throw most of the report away — so what has
+    # to change is the header, which otherwise prints a fleet's totals under one
+    # cluster's name. Named, not filtered. SOP: "Which clusters a recap covers".
+    other_clusters = [c for c in summary.get("clusters", []) if c and c != cluster_name]
+    fleet_suffix = f" +{_plural(len(other_clusters), 'cluster')}" if other_clusters else ""
+    lines.append(
+        f"{header_emoji} *k8s-event-watcher Daily Activity Recap* — "
+        f"`{cluster_name}`{fleet_suffix} ({report_date})"
+    )
+    if other_clusters:
+        named = ", ".join(f"`{c}`" for c in other_clusters[:_CLUSTER_LIMIT])
+        remaining_clusters = len(other_clusters) - _CLUSTER_LIMIT
+        if remaining_clusters > 0:
+            named += f" and {_plural(remaining_clusters, 'other')}"
+        lines.append(
+            "_One ledger serves every watched cluster, so every count below covers "
+            f"{named} as well as `{cluster_name}`._"
+        )
 
     if entry_count > 0:
         # The alert count is a count, not a listing: it says the watcher paged

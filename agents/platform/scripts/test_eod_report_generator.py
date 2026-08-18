@@ -474,6 +474,7 @@ class TestLedgerLoading(unittest.TestCase):
                 or """
                 CREATE TABLE intercepted_events (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
                     namespace   TEXT NOT NULL DEFAULT '',
                     workload    TEXT NOT NULL DEFAULT '',
                     object_kind TEXT NOT NULL DEFAULT '',
@@ -515,20 +516,8 @@ class TestLedgerLoading(unittest.TestCase):
         self.assertEqual(rows[0]["workload"], "api")
         self.assertTrue(rows[0]["notified"])
 
-    def test_the_cluster_column_is_read_when_present_and_missed_gracefully(self):
-        """`cluster` postdates the rest of the table, so both shapes are live.
-
-        Naming it unconditionally in the SELECT turns a database written by an
-        older session server into an OperationalError, and that path already
-        gives up on the file — so a column added to improve the recap would have
-        silently cost a day of it.
-        """
-        # The old shape, which _db builds: every row reads back unattributed
-        # rather than the query failing.
-        path = self._db([("prod", "api", "OOMKilled", 1, 2)])
-        self.assertEqual(load_intercepted_events(path, window_hours=24)[0]["cluster"], "")
-
-        os.remove(path)  # _db always writes session_kv.db into the same tmpdir
+    def test_the_cluster_column_is_read_when_present(self):
+        """The column the recap groups and scopes by, read as stored."""
         path = self._db(
             [("prod", "api", "OOMKilled", 1, 2)],
             table_sql="""
@@ -550,6 +539,53 @@ class TestLedgerLoading(unittest.TestCase):
         self.assertEqual(
             load_intercepted_events(path, window_hours=24)[0]["cluster"], "cluster-b"
         )
+
+    def test_a_table_without_the_cluster_column_is_a_read_failure(self):
+        """A pre-release shape the writer cannot use, not an older one to tolerate.
+
+        `record_intercepted_event` names `cluster` in its INSERT
+        unconditionally and swallows the resulting `no such column` per event,
+        so on this shape nothing is ever recorded. Reading it as an empty ledger
+        would print a green all-clear every weekday over a table no event can
+        reach. It is reported as a read failure, which the recap renders as 🔴
+        with the path named.
+        """
+        err = io.StringIO()
+        path = self._db(
+            [("prod", "api", "OOMKilled", 1, 2)],
+            table_sql="""
+            CREATE TABLE intercepted_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace   TEXT NOT NULL DEFAULT '',
+                workload    TEXT NOT NULL DEFAULT '',
+                object_kind TEXT NOT NULL DEFAULT '',
+                reason      TEXT NOT NULL DEFAULT '',
+                message     TEXT NOT NULL DEFAULT '',
+                severity    TEXT NOT NULL DEFAULT '',
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                notified    INTEGER NOT NULL DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+        problems = []
+        with mock.patch.object(eod_report_generator.sys, "stderr", err):
+            rows = load_intercepted_events(path, window_hours=24, problems=problems)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(path, problems[0])
+        self.assertIn("cluster", problems[0])
+        self.assertIn("drop the table", problems[0])
+
+        report = generate_markdown_report(
+            filter_and_aggregate_events(rows),
+            cluster_name="prod",
+            report_date="2026-08-14",
+            problems=problems,
+        )
+        self.assertTrue(report.startswith("🔴"), report.splitlines()[0])
+        self.assertNotIn("Nothing was held back from chat in this window", report)
 
     def test_missing_table_reports_rather_than_crashing(self):
         """A volume that predates the ledger has the DB but not the table."""
@@ -717,7 +753,8 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
         with conn:
             conn.execute(
                 "CREATE TABLE intercepted_events ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT, workload TEXT,"
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, cluster TEXT DEFAULT '',"
+                " namespace TEXT, workload TEXT,"
                 " object_kind TEXT, reason TEXT, message TEXT, severity TEXT,"
                 " occurrences INTEGER, notified INTEGER, created_at TIMESTAMP)"
             )
@@ -895,7 +932,10 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
         """A session server predating the write-back writes no such column.
 
         Naming it unconditionally in the SELECT would cost the whole day's
-        ledger, the same way `cluster` would have.
+        ledger for nothing: the INSERT does not name `delivery_error`, so this
+        shape is still recording events correctly and only the write-back
+        fails. `cluster` is the opposite case and is a read failure — see
+        `test_a_table_without_the_cluster_column_is_a_read_failure`.
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "session_kv.db")
@@ -904,6 +944,7 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
                 """
                 CREATE TABLE intercepted_events (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
                     namespace   TEXT NOT NULL DEFAULT '',
                     workload    TEXT NOT NULL DEFAULT '',
                     object_kind TEXT NOT NULL DEFAULT '',
@@ -1241,6 +1282,77 @@ class TestAnExclusionBarsTheGreenHeader(unittest.TestCase):
         self.assertNotIn("🟢", report)
         self.assertIn("Nothing was held back from chat in this window.", report)
 
+
+
+class TestTheHeaderSaysWhichClustersItCounted(unittest.TestCase):
+    """The counts are fleet-wide; the header names one cluster.
+
+    `start-services.sh` starts the watcher with `--profiles-dir`, so every
+    Cluster Agent profile in the pod fans into one ledger, and the reader
+    deliberately does not scope its query by cluster — filtering to the host
+    would throw most of the fleet's events away. What that leaves is a header
+    reading "— `platform-agent-host`" over totals that are nothing of the sort,
+    and an on-call who reads three OOMKills as three on the cluster named.
+    """
+
+    report = staticmethod(recap)
+
+    def test_a_foreign_cluster_is_named_above_the_counts(self):
+        _, report = self.report(
+            [listed(cluster="test-cluster"), listed(cluster="cluster-b")]
+        )
+
+        header = report.splitlines()[0]
+        self.assertIn("`test-cluster` +1 cluster", header)
+        self.assertIn("every count below covers `cluster-b`", report)
+
+    def test_a_single_cluster_recap_is_unchanged(self):
+        """The control. The ordinary install watches one cluster and says so once."""
+        _, report = self.report([listed(cluster="test-cluster")])
+
+        self.assertEqual(
+            report.splitlines()[0].split("— ")[1],
+            "`test-cluster` (2026-08-14)",
+        )
+        self.assertNotIn("every count below covers", report)
+
+    def test_rows_with_no_cluster_belong_to_the_host(self):
+        """A ledger row written before the column had a value is not a fan-in.
+
+        `_workload_label` already reads an empty cluster as this report's own,
+        so counting it as a second cluster would put a scope line on every
+        single-cluster recap that ever saw one.
+        """
+        _, report = self.report([listed(cluster=""), listed(workload="other")])
+
+        self.assertNotIn("every count below covers", report)
+        self.assertNotIn("+1 cluster", report.splitlines()[0])
+
+    def test_the_scope_line_counts_the_clusters_it_does_not_name(self):
+        """A fan-in install can watch more clusters than a chat card can carry."""
+        _, report = self.report(
+            [listed(cluster=f"cluster-{i}", workload=f"w{i}") for i in range(8)]
+        )
+
+        header = report.splitlines()[0]
+        self.assertIn("`test-cluster` +8 clusters", header)
+        # Five named, three counted — and nothing dropped silently.
+        self.assertIn("and 3 others", report)
+        self.assertIn("`cluster-4`", report)
+        self.assertNotIn("`cluster-5`", report)
+
+    def test_an_excluded_namespace_is_still_a_cluster_the_recap_read(self):
+        """The scope line reports where it looked, not where it found noise.
+
+        Keyed off the counted rows instead, a fan-in whose only foreign traffic
+        was `kube-system` churn would report fleet-wide totals under one
+        cluster's name again.
+        """
+        _, report = self.report(
+            [listed(), listed(cluster="cluster-b", namespace="kube-system")]
+        )
+
+        self.assertIn("every count below covers `cluster-b`", report)
 
 
 class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):

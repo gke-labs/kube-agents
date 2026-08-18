@@ -329,11 +329,17 @@ def init_db() -> None:
             # `delivery_error` columns: this table has never been in a release,
             # so the only databases carrying an older shape are pre-release dev
             # installs. `DROP TABLE intercepted_events` on one of those is the
-            # fix, and costs a day of recap data. Skipping the drop is silent
-            # in the direction that matters — `mark_delivery_failed` raises
-            # `no such column`, its own blanket except swallows that, and the
-            # row keeps `notified = 1`. `session_management.md`, "A pre-release
-            # table, and no migration", is the operator-facing version.
+            # fix, and it is mandatory rather than a tidy-up. Skipping it is
+            # silent in both directions and worst on `cluster`, which
+            # `record_intercepted_event` names in every INSERT: each write
+            # raises `no such column`, the blanket except below the call
+            # swallows it, and the table stays empty forever. The recap reads
+            # that shape as a read failure rather than a quiet day, which is
+            # the only warning the condition produces. A missing
+            # `delivery_error` costs only the write-back, leaving an
+            # undelivered alert recorded as delivered.
+            # `session_management.md`, "A pre-release table, and no migration",
+            # is the operator-facing version.
             #
             # The recap queries one day at a time; without this it is a full
             # scan of a table that grows with every event in the retention

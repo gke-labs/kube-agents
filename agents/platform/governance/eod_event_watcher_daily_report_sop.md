@@ -51,10 +51,37 @@ does send, so a ratio over these rows would measure how many distinct incidents 
 duplicate `CrashLoopBackOff` events collapsing into three injects would report zero. The real figure
 is the `eventsDedupSuppress` Prometheus counter.
 
+### Which clusters a recap covers
+
+**Every count is fleet-wide, and the header says so when it is.** `start-services.sh` starts the
+watcher with `--profiles-dir` as well as `--cluster-name`, which turns on multi-cluster fan-in:
+every Cluster Agent profile in the pod becomes a watched cluster, and all of them forward into the
+one `intercepted_events` table on `127.0.0.1:8699`. The reader does not scope its query by cluster
+— that is deliberate, since filtering to the host would discard most of the fleet's events — so on
+a fan-in install the headline counts, the listing and the closing total all span every watched
+cluster.
+
+What that leaves is a header naming one cluster over numbers that are not its own. So when the
+window's rows carry a cluster other than the one the job runs on, the first line reads
+``— `host` +2 clusters`` and a line under it names them: "one ledger serves every watched cluster,
+so every count below covers `cluster-b`, `cluster-c` as well as `host`". Five names, then a count of
+the rest. The scope line reports where the recap **looked**, not where it found noise, so a cluster
+whose only traffic was in an excluded namespace is still named. A single-cluster install, and a
+ledger whose rows carry no cluster at all, print the header exactly as before — an empty `cluster`
+is read as the host's, the same way the workload listing reads it.
+
+Within the listing, a foreign cluster is prefixed onto the workload label
+(`cluster-b:prod-api/payment-api`) and the local one is left bare. `cluster` is also part of the
+grouping key, so `prod/api` on two clusters is two lines rather than one line with the counts added.
+
 ### When the ledger cannot be read
 
-A missing database, or a volume old enough to have the database but not the table, yields zero rows
-— indistinguishable from a quiet fleet. Per
+A missing database, a volume old enough to have the database but not the table, or a table old
+enough to be missing its `cluster` column, all yield zero rows — indistinguishable from a quiet
+fleet. The third is the nastiest, and is not a stale-reader problem: `record_intercepted_event`
+names `cluster` in its INSERT, so on that shape every write fails and the ledger stays permanently
+empty. See ["A pre-release table, and no migration"](../docs/session_management.md) for the
+`DROP TABLE` that fixes it. Per
 ["I found nothing" and "I could not look" must not arrive as the same silence](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md),
 the header turns 🔴, the body names each path and why it failed, and the telemetry counts, the
 suppressed-events line and the ✅ all-clear are all withheld: those zeroes are the absence of a

@@ -208,7 +208,7 @@ all-clear — so this column is the sole record that a delivery failed anywhere 
 metric counts them; the SOP's "What this recap does not report" says so, and says what to query
 instead. Like `cluster`, it postdates the first draft of this table, and the recap selects it only
 when `PRAGMA table_info` says it is there — see "A pre-release table, and no migration" below for
-why that tolerance is in the reader and not in `init_db`.
+why that tolerance is in the reader and not in `init_db`, and why `cluster` does not get it.
 
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
 before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
@@ -221,8 +221,11 @@ log is where it surfaces.
 
 `cluster` is recorded because one session KV database backs every cluster profile in the pod, the
 same reason the ceiling is fleet-wide. Without it the recap cannot tell two same-named workloads in
-two clusters apart. It postdates the other columns, and the recap selects it only when
-`PRAGMA table_info` says it is there. Rows expire on the same 14-day TTL as the rest of the
+two clusters apart, and it is what lets the recap's header say which clusters a count covers. It
+postdates the other columns, and unlike `delivery_error` the reader gets no tolerance for its
+absence: `record_intercepted_event` names it in every INSERT, so a table without it records nothing
+at all, and the recap reports that as an unreadable ledger rather than a quiet day — see
+"A pre-release table, and no migration" below. Rows expire on the same 14-day TTL as the rest of the
 database:
 
 ```sql
@@ -250,21 +253,34 @@ only databases carrying an earlier shape are dev installs that ran an intermedia
 change that introduced it, and a migration maintained for a shape no user has is machinery that
 outlives its reason.
 
-**If you have such an install, drop the table before rolling the image.** `CREATE TABLE IF NOT
-EXISTS` is a no-op against it, so the columns never appear, and the failure is silent in the
-direction that matters: `mark_delivery_failed` raises `no such column: delivery_error`, the blanket
-`except Exception` around it swallows that, and the row keeps `notified = 1`. The recap then counts
-an alert nobody received as one that reached chat — the exact false reassurance `delivery_error`
-exists to remove.
+**If you have such an install, you must drop the table before rolling the image.** `CREATE TABLE IF
+NOT EXISTS` is a no-op against it, so the columns never appear, and how badly that ends depends on
+which column is missing:
+
+- **No `cluster`** — the ledger stops recording anything. `record_intercepted_event` names the
+  column in its INSERT, so every write raises `no such column: cluster` into the blanket
+  `except Exception` around it, is logged once per event, and is dropped. The table stays empty for
+  as long as the shape lasts.
+- **No `delivery_error`** — events are still recorded correctly and only the correction fails.
+  `mark_delivery_failed` raises `no such column: delivery_error`, the same blanket `except`
+  swallows it, and the row keeps `notified = 1`, so the recap counts an alert nobody received as
+  one that reached chat.
 
 ```bash
 sqlite3 "$SESSION_KV_DB_PATH" 'DROP TABLE IF EXISTS intercepted_events;'
 ```
 
 `init_db` recreates it on the next start. The cost is at most a day of recap data, since the recap
-reads a 24-hour window (72 on a Monday). The reader's `PRAGMA table_info` tolerance is a separate
-thing and stays: it keeps a recap running against a ledger written by an older _session server_ in
-the same pod during a rollout, which is a skew a drop cannot fix.
+reads a 24-hour window (72 on a Monday) — and on the `cluster`-missing shape there is no data to
+lose, because none was ever written.
+
+The reader treats the two shapes the way the writer does. A ledger with no `delivery_error` reads
+normally, with the column substituted as empty: that keeps a recap running against a ledger written
+by an older _session server_ in the same pod during a rollout, which is a skew a drop cannot fix. A
+ledger with no `cluster` is a **read failure** — the recap prints the 🔴 card naming the path
+instead of a green all-clear over a table nothing can write to. That card is the only warning this
+condition produces; the per-event log lines go to the session server's own stderr, which nobody
+reads on a day the recap said everything was fine.
 
 #### `alert_quota`
 
