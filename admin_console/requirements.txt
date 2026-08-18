@@ -1,4 +1,4 @@
-streamlit>=1.60,<2
+streamlit>=1.61.1,<2
 plotly>=6.9.0,<7
 fastapi>=0.116,<1
 httpx>=0.28,<1
