@@ -75,7 +75,9 @@ carries the worst thing the ledger saw, not a summary of the report's length.
 🟢 is the only assertion the header makes, so it is gated on the same condition as the ✅ all-clear
 rather than on whether there was anything to list: a day with no informational events but thirty
 `Critical` alerts the ceiling withheld grades 📊 — neutral, which is honest, where green would not
-be.
+be. It carries one gate the ✅ does not: green also requires that nothing was excluded, because the
+✅ can qualify itself in words and an emoji cannot. See
+[What this recap does not report](#what-this-recap-does-not-report).
 
 The ✅ all-clear claims nothing was held back from chat. It does **not** claim the watcher is alive:
 this script never contacts it, and both tables it reads are written by the daemon's own `/inject`
@@ -147,14 +149,24 @@ Neither filter reaches those counts. `min_event_count` applies to the listing on
 does apply it measures the withheld rows rather than the group's total: a group is one
 cluster/namespace/workload/reason/severity key and may hold rows with different outcomes, so a
 workload with one withheld alert and nine delivered ones would otherwise clear a threshold of five
-on the strength of nine events that were not withheld. `EOD_EXCLUDE_NAMESPACES` removes a
-namespace from the workload breakdown, the headline counts and the closing informational total, but
-not from the veto — `kube-system` ships in the exclusion list and the watcher forwards it anyway, so
-applied to the veto a control-plane delivery failure would drop out of it and the recap would end
-the day green over it. Excluding a namespace narrows what the report _says_ and must not widen what
-it is willing to _claim_, so the row is flagged rather than skipped. Once the filter has removed
-anything, the ✅ all-clear and the 📉 closing total both carry "namespaces in
-`EOD_EXCLUDE_NAMESPACES` are outside this recap's scope".
+on the strength of nine events that were not withheld. `EOD_EXCLUDE_NAMESPACES` removes a namespace from
+the workload breakdown, the headline counts and the closing informational total, and **the two alert
+tallies are exempt from it**: a ceiling drop or a failed delivery in an excluded namespace is counted
+and still vetoes the ✅ and the 🟢. `kube-system` ships in the exclusion list and the watcher forwards
+it anyway, so were the veto filtered too, a control-plane delivery failure would drop out of it and
+the recap would end the day green over it. Excluding a namespace narrows what the report _says_ and
+must not widen what it is willing to _claim_, so for those two the row is flagged rather than
+skipped.
+
+Informational churn is the exception, and deliberately so: it is dropped from `suppressed_info`,
+which is the informational leg of the veto. Counting it there would put every stock install
+permanently out of all-clear on `kube-system` `BackOff` noise, which is the thing the filter exists
+to stop reporting. What that must not buy is a green light over a window the recap did not fully
+read, so **any exclusion at all bars 🟢**: once the filter has removed something the header grades
+📊, and the ✅ all-clear and the 📉 closing total both carry "namespaces in `EOD_EXCLUDE_NAMESPACES`
+are outside this recap's scope". A day whose only withheld traffic was excluded informational events
+therefore still prints the ✅ — the recap looked at everything in scope and found nothing — under a
+neutral header that does not assert the day was clean.
 
 ## Running it by hand
 

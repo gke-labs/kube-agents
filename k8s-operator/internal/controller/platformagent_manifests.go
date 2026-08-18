@@ -2377,11 +2377,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// path, a credential or an image reference would not.
 	//
 	// The two EOD_* names are the end-of-day recap's only tunables. They
-	// narrow what its listing prints and reach nothing else — not what the
-	// notifier forwards, not what the recap is willing to claim about the
-	// day. A value that is not a namespace list or an integer is warned about
-	// on stderr and ignored, so the worst an arbitrary one can do is leave
-	// the defaults in place.
+	// narrow what its listing prints and reach nothing the notifier does: no
+	// event stops being forwarded, no alert stops being posted, and a ceiling
+	// drop or a failed delivery in an excluded namespace is still counted and
+	// still withholds the recap's all-clear. What an exclusion does reach is
+	// the informational tally, which is the point of it — so the recap grades
+	// its header neutral rather than green whenever the filter removed
+	// anything, and cannot be tuned into asserting a clean day it did not
+	// measure. A value that is not a namespace list or an integer is warned
+	// about on stderr and ignored, so the worst an arbitrary one can do is
+	// leave the defaults in place.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},

@@ -36,17 +36,27 @@ def excluded_namespaces() -> FrozenSet[str]:
     `session_kv_server.py`, `WATCHER_*` on the sidecar. A file needs a search
     path, a parser and an answer for every way it can be half-written, and each
     of those three was load-bearing enough to carry its own tests; an
-    environment variable is one `getenv` and is settable on a running pod with
-    `kubectl set env`, which the file never was.
+    environment variable is one `getenv`. Set it on the `PlatformAgent` CR under
+    `spec.deployment.env` — the operator's `safeSandboxEnvOverrides` allowlist
+    carries the name, and `kubectl set env` on the Deployment is reverted by the
+    next reconcile.
 
     Resolved per call rather than at import so a test, or a cron tick with a
     patched environment, sees the current value. An empty value excludes
     nothing, which is the one setting the file could not express without
     tripping over its own `None` handling.
 
-    This is a noise filter and it stops there: excluded rows still count
-    towards the all-clear veto in `filter_and_aggregate_events`, so silencing a
-    namespace cannot make a bad day read as a quiet one.
+    This is a noise filter, and what it can and cannot reach is exact. An
+    excluded row is still counted by the two alert tallies — `cap_dropped` and
+    `delivery_failed` — so silencing a namespace cannot hide a ceiling drop or a
+    failed delivery, and cannot take the all-clear off a day one of those
+    spoiled. It does drop the row from `suppressed_info`: informational churn in
+    an excluded namespace is precisely what the filter exists to stop reporting,
+    and counting it in the veto would put every stock install with `kube-system`
+    excluded permanently out of all-clear. What the exclusion must not buy is a
+    green light over a window the recap did not fully read, so
+    `excluded_occurrences` bars 🟢 on its own in `generate_markdown_report` and
+    the ✅ carries the scope note.
     """
     raw = os.getenv("EOD_EXCLUDE_NAMESPACES")
     if raw is None:
@@ -587,9 +597,18 @@ def generate_markdown_report(
     # no informational events but 30 ceiling-withheld Criticals must not take
     # it; it falls to 📊, neutral, which is honest where green would not be.
     # SOP: "What the header emoji grades".
+    #
+    # `excluded_occurrences` bars green for the same reason, and it is the one
+    # veto term the namespace filter reaches. An excluded row's `Info` tally is
+    # skipped, so a window whose only withheld traffic was informational churn
+    # in `kube-system` clears `all_clear` honestly — the recap did not look
+    # there. The ✅ below carries `scope_note` and says so; an emoji cannot, and
+    # green read at a glance is the one part of this card nobody re-reads. The
+    # alert tallies are not filtered, so this changes nothing about a day the
+    # ceiling or a failed post spoiled: those were never green to begin with.
     if problems:
         header_emoji = "🔴"
-    elif entry_count > 0 or not all_clear:
+    elif entry_count > 0 or not all_clear or summary.get("excluded_occurrences"):
         header_emoji = "📊"
     else:
         header_emoji = "🟢"

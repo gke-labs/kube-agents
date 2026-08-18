@@ -1087,7 +1087,7 @@ class TestTheListingIsFixedToInfo(unittest.TestCase):
         self.assertEqual([e["reason"] for e in summary["entries"]], ["BackOff"])
 
 
-class TestTheNamespaceFilterDoesNotReachTheVeto(unittest.TestCase):
+class TestTheNamespaceFilterDoesNotReachTheAlertVeto(unittest.TestCase):
     """`EOD_EXCLUDE_NAMESPACES` is a noise filter, and stops where the noise does.
 
     `kube-system` ships excluded and the watcher forwards it anyway. The recap
@@ -1095,6 +1095,11 @@ class TestTheNamespaceFilterDoesNotReachTheVeto(unittest.TestCase):
     still count them, from every namespace, because that count is what stops it
     printing an all-clear. A `continue` on the excluded row would let a
     control-plane delivery failure end the day green.
+
+    The informational tally is the deliberate exception, and the class named
+    below pins what pays for it. Counting excluded `Info` churn in the veto
+    would leave every stock install permanently out of all-clear on `kube-system`
+    `BackOff` noise, which is the one thing the filter exists to stop reporting.
     """
 
     report = staticmethod(recap)
@@ -1173,6 +1178,68 @@ class TestTheNamespaceFilterDoesNotReachTheVeto(unittest.TestCase):
 
         self.assertIn("Nothing was held back from chat in this window.", report)
         self.assertIn("outside this recap's scope", report)
+
+
+class TestAnExclusionBarsTheGreenHeader(unittest.TestCase):
+    """The ✅ can qualify itself in words. The header emoji cannot.
+
+    Excluded informational churn is dropped from `suppressed_info`, so a window
+    whose only withheld traffic was `kube-system` `BackOff` noise clears
+    `all_clear` — honestly, because the recap did not look there, and the ✅
+    beside it says so. Green is read at a glance and carries no such sentence,
+    which makes it the one part of this card that would assert a clean day the
+    report never measured. Any exclusion at all therefore grades the header 📊.
+
+    The alert tallies are unfiltered, so this changes nothing about a day a
+    ceiling drop or a failed delivery spoiled: those were never green.
+    """
+
+    report = staticmethod(recap)
+
+    def excluded_churn(self):
+        return [
+            event(namespace="kube-system", workload="kube-proxy", severity="Info",
+                  notified=False)
+        ]
+
+    def test_the_header_is_neutral_when_the_filter_removed_something(self):
+        _, report = self.report(self.excluded_churn())
+
+        self.assertNotIn("🟢", report)
+        self.assertIn("📊", report)
+        # Neutral header, but the day was still clear in scope, so the ✅ stays
+        # — carrying the note that says what "in scope" left out.
+        self.assertIn("Nothing was held back from chat in this window.", report)
+        self.assertIn("outside this recap's scope", report)
+
+    def test_an_unfiltered_clean_day_is_still_green(self):
+        """The control. Without it this test passes on a recap that never greens."""
+        with exclude(""):
+            _, report = self.report(self.excluded_churn())
+
+        # Nothing excluded now, so the same rows are ordinary listed churn.
+        self.assertNotIn("🟢", report)
+        self.assertIn("📊", report)
+
+        _, empty = self.report([])
+        self.assertIn("🟢", empty)
+        self.assertIn("Nothing was held back from chat in this window.", empty)
+        self.assertNotIn("outside this recap's scope", empty)
+
+    def test_an_excluded_delivered_alert_also_bars_green(self):
+        """`excluded_occurrences` counts the row, whatever became of it.
+
+        A delivered alert in an excluded namespace spoils nothing and is not
+        withheld, so the ✅ is correct. The header still drops to 📊, because
+        the reader is being told a namespace went unread either way.
+        """
+        summary, report = self.report(
+            [event(namespace="kube-system", workload="kube-apiserver", notified=True)]
+        )
+
+        self.assertEqual(summary["cap_dropped"], 0)
+        self.assertNotIn("🟢", report)
+        self.assertIn("Nothing was held back from chat in this window.", report)
 
 
 
