@@ -16,13 +16,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install actionlint
-        env:
-          ACTIONLINT_VERSION: 1.7.7
-        run: |
-          curl -sSfL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" -o actionlint.tar.gz
-          tar -xzf actionlint.tar.gz actionlint
-          sudo mv actionlint /usr/local/bin/actionlint
-
       - name: Run actionlint
-        run: actionlint -color
+        uses: reviewdog/action-actionlint@d63ba7532e0942965320cd8d73cbae4c7b3c5283 # v1.73.1
+        with:
+          fail_level: error
+          filter_mode: nofilter
+          reporter: local

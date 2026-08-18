@@ -14,13 +14,15 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
 
 jobs:
   publish-controller-ghcr:
     runs-on: ubuntu-latest
     if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

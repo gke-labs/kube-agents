@@ -11,13 +11,15 @@ This page is the canonical glossary for humans. The agents carry their own trimm
 
 ## `kube-agents` concepts
 
-### Chat Agent
+### Planning Agent
 
-The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). The available specialists are injected into every turn by its `agent_roster` plugin (the `router` MCP tool `list_agents` re-reads the same list on demand); it delegates each request as a [kanban card](#kanban-task-delegation). Progress and results reach the thread on their own: the specialist's heartbeats and the card's completion post there directly, verbatim and without waking the front door, which is woken only when a card blocks or fails. It holds no infrastructure tools of its own: the front door can route, not mutate. One profile receives chat ingress and it is this one, unless the experimental [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) flag moves the gateway to the Platform Agent, in which case this persona sees no chat at all.
+The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). It works out what a request actually requires, then files that work as a [kanban card](#kanban-task-delegation) for the specialist that can execute it; the available specialists are injected into every turn by its `agent_roster` plugin, and the `router` MCP tool `list_agents` re-reads the same list on demand. Progress and results reach the thread on their own: the specialist's heartbeats and the card's completion post there directly, verbatim and without waking the front door, which is woken only when a card blocks or fails. It holds no infrastructure tools of its own: it can plan and delegate, not mutate. One profile receives chat ingress and it is this one, unless the experimental [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) flag moves the gateway to the Platform Agent, in which case this persona sees no chat at all.
+
+The source tree is `agents/chat/` and the Hermes profile is `default`; neither identifier carries the name. Chat Agent was the earlier name for the same component and still appears in parts of the tree this rename did not reach, including the CRD field descriptions `kubectl explain` prints.
 
 ### Platform Agent
 
-The privileged specialist shipped in `agents/platform/` — the `platform` [Hermes profile](#hermes-profile), scaffolded at pod startup from the workspace template. Configured with the `SOUL.md` persona, a library of skills, governance SOPs, and cron watchdogs, it owns the GitOps write path and the lifecycle of the per-cluster [Cluster Agents](#cluster-agent). It no longer receives chat directly; the Chat Agent routes work to it over the kanban board. All profiles run in the same operator-deployed Deployment on the [Hermes runtime](https://github.com/NousResearch/hermes-agent).
+The privileged specialist shipped in `agents/platform/` — the `platform` [Hermes profile](#hermes-profile), scaffolded at pod startup from the workspace template. Configured with the `SOUL.md` persona, a library of skills, governance SOPs, and cron watchdogs, it owns the GitOps write path and the lifecycle of the per-cluster [Cluster Agents](#cluster-agent). It no longer receives chat directly; the Planning Agent routes work to it over the kanban board. All profiles run in the same operator-deployed Deployment on the [Hermes runtime](https://github.com/NousResearch/hermes-agent).
 
 ### Cluster Agent
 
@@ -63,7 +65,7 @@ The agent runtime all the agents run on ([nousresearch/hermes-agent](https://git
 
 ### Hermes profile
 
-A native Hermes feature (`hermes -p <name>`) giving multiple isolated Hermes instances — each with its own config, sessions, skills, and home directory — inside a single gateway process. In `kube-agents`, the `default` profile is the [Chat Agent](#chat-agent), the `platform` profile is the [Platform Agent](#platform-agent), and each `cluster-*` profile is a [Cluster Agent](#cluster-agent). Executable scripts are shared across profiles; persona, config, and skills are per-profile.
+A native Hermes feature (`hermes -p <name>`) giving multiple isolated Hermes instances — each with its own config, sessions, skills, and home directory — inside a single gateway process. In `kube-agents`, the `default` profile is the [Planning Agent](#planning-agent), the `platform` profile is the [Platform Agent](#platform-agent), and each `cluster-*` profile is a [Cluster Agent](#cluster-agent). Executable scripts are shared across profiles; persona, config, and skills are per-profile.
 
 ### MCP (Model Context Protocol)
 

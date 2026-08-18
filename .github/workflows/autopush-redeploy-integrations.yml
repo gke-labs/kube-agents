@@ -12,6 +12,7 @@ on:
       # The LiteLLM and token-minter pins live here, not in the manifests that
       # consume them, so a version bump touches only this file.
       - "images.json"
+  #checkov:skip=CKV_GHA_7:Manual dispatch workflow requires boolean input parameters to select integration targets
   workflow_dispatch:
     inputs:
       deploy_litellm:
@@ -29,10 +30,12 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   call-deploy:
+    permissions:
+      contents: read
+      id-token: write
     # inherit, not an explicit mapping: the called workflow's jobs read
     # GH_APP_ID, an environment secret. A `uses:` job cannot declare an
     # environment, so mapping the secrets here would evaluate them in this job,

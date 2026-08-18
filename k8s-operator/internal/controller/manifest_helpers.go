@@ -55,7 +55,7 @@ const (
 	// private registry. Set on the controller-manager Deployment; a CR's
 	// spec.deployment.image still takes precedence over PLATFORM_AGENT_IMAGE.
 	platformAgentImageEnvVar   = "PLATFORM_AGENT_IMAGE"
-	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE"
+	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	fluentBitImageEnvVar       = "FLUENT_BIT_IMAGE"
 
 	defaultSurgePercent = "25%"

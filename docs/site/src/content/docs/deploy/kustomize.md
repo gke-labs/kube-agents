@@ -145,7 +145,7 @@ The exposed ports:
 - `config/integrations/github/` — Minty deployment.
 - `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and `chatgpt` and `vertex_ai` overlays).
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, and PVC.
-- `config/integrations/hindsight/` — the Chat Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `NetworkPolicy`, and `PodMonitoring`.
+- `config/integrations/hindsight/` — the Planning Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `NetworkPolicy`, and `PodMonitoring`.
 
 Each is built and applied on its own; there is no aggregate kustomization over
 `config/integrations/`, because every one of them needs `envsubst` over the built

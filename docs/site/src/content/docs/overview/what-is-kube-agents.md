@@ -11,19 +11,19 @@ description: The concrete artifacts that make up kube-agents — what installs w
 
 A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines the `PlatformAgent` custom resource and reconciles it into a running Platform Agent Deployment, Service, ServiceAccount, RBAC bindings, and a `ConfigMap` for the persona and skills. Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator).
 
-### 2. The agent Deployment (Chat Agent + Platform Agent + Cluster Agents)
+### 2. The agent Deployment (Planning Agent + Platform Agent + Cluster Agents)
 
 The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. One gateway process hosts the co-located Hermes profiles:
 
-**The Chat Agent** (`agents/chat/`, the `default` profile) — the conversational front door and the only profile that receives chat ingress. Its `agent_roster` plugin injects the current specialists into every turn, so picking one to delegate to costs no tool call; the `router` MCP server ([`agents/chat/scripts/router_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/router_server.py)) exposes the same list as `list_agents` for an on-demand refresh. Both render from [`agents/chat/scripts/agent_roster.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/agent_roster.py). It delegates work to the specialists as kanban cards and holds no infrastructure tools of its own.
+**The Planning Agent** (`agents/chat/`, the `default` profile) — the conversational front door and the only profile that receives chat ingress. Its `agent_roster` plugin injects the current specialists into every turn, so picking one to delegate to costs no tool call; the `router` MCP server ([`agents/chat/scripts/router_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/router_server.py)) exposes the same list as `list_agents` for an on-demand refresh. Both render from [`agents/chat/scripts/agent_roster.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/agent_roster.py). It delegates work to the specialists as kanban cards and holds no infrastructure tools of its own.
 
 **The Platform Agent** (`agents/platform/`, the `platform` profile) — the privileged specialist, scaffolded at pod startup from the workspace template by `profile_scaffold.py`. Inside it:
 
 - **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, kanban worker protocol, autonomous recovery ladder, and reporting style.
-- **Routing description (`CAPABILITIES.md`)** — the one-liner that describes this profile on the Chat Agent's roster, so it knows what to route here.
+- **Routing description (`CAPABILITIES.md`)** — the one-liner that describes this profile on the Planning Agent's roster, so it knows what to route here.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
 - **Governance SOPs** (`agents/platform/governance/*.md`) — standard operating procedures the cron watchdogs invoke.
-- **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP. Ticking is a property of the Chat Agent's gateway, the only running one, so a job on its roster advances this profile's schedule once a minute.
+- **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP. Ticking is a property of the Planning Agent's gateway, the only running one, so a job on its roster advances this profile's schedule once a minute.
 - **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for session and agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
 - **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface, plus a `kanban` toolset for creating and routing delegation cards.
 

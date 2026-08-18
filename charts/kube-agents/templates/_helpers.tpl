@@ -189,6 +189,23 @@ model_list:
       model: {{ printf "%s/%s" .provider .model }}
 litellm_settings:
   callbacks: {{ .callbacks }}
+{{- /*
+  Prompt caching. Kept identical to the kustomize base — scripts/check_iac_parity.py
+  compares the two — and see that file for why the breakpoints live here rather
+  than in the agent's own config, and why non-Anthropic backends are unaffected.
+*/}}
+router_settings:
+  default_litellm_params:
+    cache_control_injection_points:
+      - location: message
+        role: system
+        control:
+          type: ephemeral
+          ttl: 1h
+      - location: message
+        index: -3
+      - location: message
+        index: -1
 {{- end }}
 
 {{/*

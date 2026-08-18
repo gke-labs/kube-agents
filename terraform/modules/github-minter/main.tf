@@ -20,6 +20,7 @@ resource "google_kms_key_ring" "minter" {
 # App private key PEM is imported into it afterwards (a manual step, or
 # k8s-operator/scripts/provision_10_deploy_github_minter.sh via the Minty CLI).
 resource "google_kms_crypto_key" "minter" {
+  #checkov:skip=CKV_GCP_82:Import-only asymmetric signing key lifecycle is managed via Minty/KMS
   name     = var.kms_key_name
   key_ring = google_kms_key_ring.minter.id
   purpose  = "ASYMMETRIC_SIGN"

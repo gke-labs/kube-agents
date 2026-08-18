@@ -1,0 +1,67 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * 1" # Weekly Monday scan
+
+permissions:
+  contents: read
+
+jobs:
+  gosec-scan:
+    name: Go Security Scan (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-operator/go.mod"
+          cache: true
+          cache-dependency-path: "k8s-operator/go.sum"
+      - name: Run gosec
+        working-directory: k8s-operator
+        run: go run github.com/securego/gosec/v2/cmd/gosec ./...
+
+  trivy-scan:
+    name: Container & Manifest Scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Scan Repository Configs & Manifests
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: "config"
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+          trivyignores: ".trivyignore.yaml"
+
+  semgrep-scan:
+    name: SAST Scan (semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.155.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run semgrep
+        run: semgrep scan --config=.github/semgrep-security-audit.yml --exclude=.github/semgrep-security-audit.yml --severity=ERROR --error
+
+  checkov-scan:
+    name: IaC Security Scan (checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@358405ddafaa109ad35d3d607bbc7cf933c742d9 # v12.3116.0
+        with:
+          framework: terraform,github_actions
+          output_format: cli
+          config_file: .checkov.yaml

@@ -13,7 +13,6 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   call-deploy:
@@ -21,6 +20,9 @@ jobs:
     # alone would also match a fork branch that happens to be named "main".
     # The event clause covers both triggers the publisher declares; dropping
     # workflow_dispatch would stop a manual publish from autodeploying.
+    permissions:
+      contents: read
+      id-token: write
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       github.event.workflow_run.conclusion == 'success' &&

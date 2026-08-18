@@ -11,10 +11,12 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   call-deploy:
+    permissions:
+      contents: read
+      id-token: write
     # inherit, not an explicit mapping: the called workflow's jobs read
     # GH_APP_ID, an environment secret. A `uses:` job cannot declare an
     # environment, so mapping the secrets here would evaluate them in this job,

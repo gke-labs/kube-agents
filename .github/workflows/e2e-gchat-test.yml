@@ -1,6 +1,7 @@
 name: Google Chat Agent E2E Test
 
 on:
+  #checkov:skip=CKV_GHA_7:Manual E2E test dispatch requires target GCP project and chat space parameters
   workflow_dispatch:
     inputs:
       gcp_project_id:

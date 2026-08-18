@@ -77,7 +77,7 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 USER root
 
 # 1. Install all common system utilities and dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-transport-https \
     ca-certificates \
     curl \
@@ -1261,6 +1261,8 @@ RUN set -eu; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
 
+USER 10000:10000
+
 # --- CREDENTIAL PROXY TARGET ---
 # Only this image contains the real credential-aware CLIs. The platform target
 # above contains wrappers with the same names and cannot execute locally.
@@ -1278,7 +1280,7 @@ COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
 
 RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    apt-get update && apt-get install -y \
+    apt-get update && apt-get install -y --no-install-recommends \
       git \
       google-cloud-cli \
       google-cloud-cli-gke-gcloud-auth-plugin \
@@ -1289,6 +1291,8 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \
     chmod 755 /etc/envoy
+
+USER 10000:10000
 
 
 # --- ENTRYPOINT GATE TEST TARGET ---
@@ -1304,24 +1308,12 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
 # Everything the check needs is already in the `platform` stage above, so this reuses its
 # cache entirely: on a build that has just produced `platform`, the marginal cost is one
 # COPY, one RUN, and a few seconds.
+#
+# Invariant: This stage depends on `platform` ending as non-root (USER 10000:10000) so that
+# entrypoint step 1 (stage2-hook.sh) executes as hermes rather than root.
 FROM platform AS entrypoint-gate-test
 
 COPY --chmod=0755 deploy/shared/entrypoint_gate_check.sh /usr/local/bin/entrypoint-gate-check
 
-# As the runtime UID, not as root, and the difference decides whether this stage tests
-# anything at all. The `platform` stage is still USER root from the base image's setup, but
-# no container ever runs it that way: the operator pins runAsUser/fsGroup 10000 with
-# runAsNonRoot, so every pod executes the entrypoint as hermes.
-#
-# Step 1 of the entrypoint runs upstream's stage2-hook.sh, which branches on exactly this:
-#
-#     as_hermes() { [ "$(id -u)" = 0 ] || { "$@"; return; }; s6-setuidgid hermes "$@"; }
-#
-# As hermes that short-circuits. As root it reaches for s6-setuidgid, which lives in
-# /command and is on no PATH outside s6-overlay's own init — so the hook exits non-zero,
-# the entrypoint's `set -eu` takes the script down at step 1, and all sixteen checks fail
-# having never reached the gate they exist to test. A green build here has to mean the gate
-# is right, not that the image happened to be assembled by the same user that runs it.
-USER 10000
 
 RUN /usr/local/bin/entrypoint-gate-check

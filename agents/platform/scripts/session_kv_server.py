@@ -505,7 +505,7 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
     """POST request to local gateway API to initialize the troubleshooting session ID.
 
-    The session lands on the gateway's default profile — the Chat Agent — and
+    The session lands on the gateway's default profile — the Planning Agent — and
     there is no way to ask for another one here. Hermes selects a profile by URL
     prefix (`/p/<profile>/api/sessions`), only when `gateway.multiplex_profiles`
     is enabled, and only against that profile's own `API_SERVER_KEY`; a `profile`
@@ -623,7 +623,7 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
 
 
 def _build_agent_query(payload: Dict[str, Any]) -> str:
-    """The turn sent to the gateway, which is always the Chat Agent's.
+    """The turn sent to the gateway, which is always the Planning Agent's.
 
     `_create_gateway_session` cannot choose a profile, so the reader is the
     `default` front door: an agent with no cluster access and no chat egress of

@@ -17,6 +17,9 @@ on:
         type: string
         description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
+permissions:
+  contents: read
+
 jobs:
   detect-changes:
     runs-on: ubuntu-latest
@@ -58,12 +61,12 @@ jobs:
           FILTER_LITELLM: ${{ steps.filter.outputs.litellm }}
           FILTER_GITHUB: ${{ steps.filter.outputs.github }}
         run: |
-          if [ "$FORCE_DEPLOY" = "true" ]; then
+          if [ "${FORCE_DEPLOY}" = "true" ]; then
             echo "litellm=true" >> "$GITHUB_OUTPUT"
             echo "github=true" >> "$GITHUB_OUTPUT"
           else
-            echo "litellm=$FILTER_LITELLM" >> "$GITHUB_OUTPUT"
-            echo "github=$FILTER_GITHUB" >> "$GITHUB_OUTPUT"
+            echo "litellm=${FILTER_LITELLM}" >> "$GITHUB_OUTPUT"
+            echo "github=${FILTER_GITHUB}" >> "$GITHUB_OUTPUT"
           fi
 
   provision-secrets:
@@ -71,6 +74,9 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.litellm == 'true' || needs.detect-changes.outputs.github == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-secrets
@@ -134,6 +140,9 @@ jobs:
     needs: [detect-changes, provision-secrets]
     if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-litellm
@@ -238,6 +247,9 @@ jobs:
     needs: [detect-changes, provision-secrets, check-github-config]
     if: ${{ needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-github

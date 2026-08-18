@@ -137,6 +137,7 @@ var defaultAccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnc
 // The broker currently receives a shell command string, so these rules allow
 // flags between command components. If the protocol is extended to carry argv,
 // replace this regex matching with tool-specific argument parsing.
+// #nosec G101 -- Policy JSON schema definition, not credentials
 const credentialProxyPolicyJSON = `{
   "apiVersion": "cli.proxy.kubeagents.io/v1alpha1",
   "blockedMessage": "Command blocked for security reasons.",

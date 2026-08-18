@@ -53,7 +53,7 @@ import check_docs_map
 REPO = Path(__file__).resolve().parent.parent
 
 # Two rosters, two profiles. Cron ticking is a property of a running gateway
-# and only the `default` (Chat Agent) profile has one, so its roster is the
+# and only the `default` (Planning Agent) profile has one, so its roster is the
 # only store the gateway thread advances — and it carries `profile-cron-tick`,
 # which runs `hermes cron tick` against every named profile with work due. That
 # is what makes the Platform Agent's own roster live, so the governance
@@ -61,7 +61,7 @@ REPO = Path(__file__).resolve().parent.parent
 # files feed the page; a job documented from one roster alone is a job half the
 # fleet cannot find.
 CRON_ROSTERS = (
-    ("Chat Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
+    ("Planning Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
     ("Platform Agent", REPO / "agents/platform/cron/jobs.json"),
 )
 SKILLS_DIR = REPO / "agents/platform/skills"

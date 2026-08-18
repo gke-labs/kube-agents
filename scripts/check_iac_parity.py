@@ -269,6 +269,45 @@ def model_names(text: str, path: Path) -> list[str]:
     return names
 
 
+def cache_control_points(text: str, path: Path) -> list[str]:
+    """The prompt-cache breakpoints a LiteLLM config injects, in order.
+
+    Each point flattens to one ``key=value`` string, sorted within the point but
+    not across them: order is load-bearing, since the 1h system breakpoint has to
+    precede the rolling 5m ones. Nesting is discarded — ``control.ttl`` and a
+    hypothetical top-level ``ttl`` would compare equal — which is enough to catch
+    the drift this guards against without a YAML dependency.
+
+    Finding no block means caching moved elsewhere, not that the gateway injects
+    nothing, so it exits rather than returning [] for both surfaces and passing.
+    """
+    lines = text.splitlines()
+    for start, line in enumerate(lines):
+        if line.strip() == "cache_control_injection_points:":
+            outer = len(line) - len(line.lstrip())
+            break
+    else:
+        sys.exit(f"ERROR: no cache_control_injection_points in {path.relative_to(REPO)}")
+
+    points: list[dict[str, str]] = []
+    for line in lines[start + 1 :]:
+        body = line.strip()
+        if not body or body.startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) <= outer:
+            break
+        if body.startswith("- "):
+            points.append({})
+            body = body[2:].strip()
+        key, _, value = body.partition(":")
+        value = value.strip()
+        if value and points:
+            points[-1][key.strip()] = value.strip('"').strip("'")
+    if not points:
+        sys.exit(f"ERROR: cache_control_injection_points is empty in {path.relative_to(REPO)}")
+    return [" ".join(f"{k}={v}" for k, v in sorted(p.items())) for p in points]
+
+
 # ─── checks ───────────────────────────────────────────────────────────────────
 
 
@@ -340,6 +379,24 @@ def check_litellm_aliases(f: Failures) -> None:
         f.add(
             "litellm-model-aliases",
             f"chart serves {chart}, kustomize base serves {kustomize} "
+            f"({CHART_HELPERS.relative_to(REPO)} vs {LITELLM_CONFIG.relative_to(REPO)})",
+        )
+
+
+def check_litellm_cache_points(f: Failures) -> None:
+    """The prompt-cache breakpoints, which only the gateway config carries.
+
+    The agent asks for "model-default" over the OpenAI wire and never names a
+    model, so nothing on the agent side can place these — a chart install that
+    lost the block would run uncached against an Anthropic backend and show it
+    only as a bill.
+    """
+    kustomize = cache_control_points(read(LITELLM_CONFIG), LITELLM_CONFIG)
+    chart = cache_control_points(read(CHART_HELPERS), CHART_HELPERS)
+    if kustomize != chart:
+        f.add(
+            "litellm-cache-control",
+            f"chart injects {chart}, kustomize base injects {kustomize} "
             f"({CHART_HELPERS.relative_to(REPO)} vs {LITELLM_CONFIG.relative_to(REPO)})",
         )
 
@@ -737,6 +794,7 @@ def check_cert_manager_resources(f: Failures) -> None:
 CHECKS = (
     check_litellm_image,
     check_litellm_aliases,
+    check_litellm_cache_points,
     check_model_defaults,
     check_registry_prefix,
     check_iam_roles,

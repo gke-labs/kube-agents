@@ -488,7 +488,7 @@ func useGoogleTokenSource(cfg *rest.Config, ts oauth2.TokenSource) {
 // cluster_agent_profile.read_cluster_identity treats as absent. A config.yaml
 // that exists but cannot be parsed is a real error.
 func readClusterIdentity(path string) (*clusterIdentity, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- Path to profile config file supplied via flag / discovery
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil

@@ -397,7 +397,7 @@ with thread:
     with heading:
         if conversation is None:
             st.markdown("### New session")
-            st.caption(f"Portal · default Chat Agent · {session_id}")
+            st.caption(f"Portal · default Planning Agent · {session_id}")
         else:
             subject = session_subject(conversation)
             st.markdown(f"### {subject}")

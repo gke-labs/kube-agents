@@ -218,6 +218,11 @@ module "litellm_vertex_iam" {
 }
 
 resource "google_project_iam_member" "litellm_vertex_user" {
+  #checkov:skip=CKV_GCP_41:LiteLLM gateway uses dedicated service account for Vertex AI inference
+  #checkov:skip=CKV_GCP_42:Service account is granted non-admin aiplatform.user role
+  #checkov:skip=CKV_GCP_46:Dedicated custom service account used for LiteLLM workload identity
+  #checkov:skip=CKV_GCP_49:LiteLLM gateway uses dedicated service account for Vertex AI inference
+  #checkov:skip=CKV_GCP_117:Vertex AI user role required for LiteLLM gateway inference access
   count = local.use_vertex ? 1 : 0
 
   project = local.vertex_project

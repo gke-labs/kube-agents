@@ -38,7 +38,7 @@ Read the Prometheus counter, not the session fields.
 
 ## OpenTelemetry
 
-The Hermes runtime enables the `hermes_otel` plugin (enabled in every profile config — Chat Agent, Platform Agent, and the Cluster Agent template). Its trace backend is baked into the image pointing at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace. That bake is a **fallback**: at container start the entrypoint rewrites the backend of every plugin config it can see — the runtime root and each existing profile — to whatever `OTEL_EXPORTER_OTLP_ENDPOINT` says, and profiles scaffolded later (the per-cluster Cluster Agents) get the same treatment when they are created. Leave the variable unset and the baked endpoint stands.
+The Hermes runtime enables the `hermes_otel` plugin (enabled in every profile config — Planning Agent, Platform Agent, and the Cluster Agent template). Its trace backend is baked into the image pointing at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace. That bake is a **fallback**: at container start the entrypoint rewrites the backend of every plugin config it can see — the runtime root and each existing profile — to whatever `OTEL_EXPORTER_OTLP_ENDPOINT` says, and profiles scaffolded later (the per-cluster Cluster Agents) get the same treatment when they are created. Leave the variable unset and the baked endpoint stands.
 
 LiteLLM (via the `otel` callback and `OTEL_EXPORTER_OTLP_ENDPOINT`) and vLLM (via `--otlp-traces-endpoint`) are configured in their deployment manifests to export directly to the same collector — no per-component collector deploy.
 

@@ -14,7 +14,7 @@
 # (deploy/docker/Dockerfile), which is far too heavy to install for a unit-test
 # run, so pinning them here would be pinning a fiction rather than what ships.
 #
-# If the install fails with "No matching distribution found for mcp<2", pip is
+# If the install fails with "No matching distribution found for mcp<3", pip is
 # pointed at a mirror that does not carry it -- check `pip config debug`. The
 # package is on PyPI, so the fix is to name the index for this one install
 # rather than to reconfigure the machine:
@@ -30,7 +30,7 @@ fastapi
 
 # agent_common_server.py does `from mcp.server.fastmcp import FastMCP`, which
 # 2.x moved. Held below 2.0 until that import is updated.
-mcp<2
+mcp<3
 
 python-dotenv
 pyyaml

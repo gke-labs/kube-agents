@@ -1,5 +1,8 @@
 name: Publish Helm Charts to OCI (GHCR)
 
+permissions:
+  contents: read
+
 on:
   push:
     tags:

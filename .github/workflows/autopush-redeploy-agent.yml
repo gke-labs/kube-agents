@@ -13,7 +13,6 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   call-deploy:
@@ -21,6 +20,9 @@ jobs:
     # alone would also match a fork branch that happens to be named "main".
     # The event clause narrows to the maintainer-only triggers a publisher may
     # declare, so adding a pull_request trigger upstream cannot reach this job.
+    permissions:
+      contents: read
+      id-token: write
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       github.event.workflow_run.conclusion == 'success' &&

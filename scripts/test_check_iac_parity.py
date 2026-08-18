@@ -289,6 +289,86 @@ class ModelNamesTest(unittest.TestCase):
             parity.model_names("apiVersion: v1\nkind: ConfigMap\n", FAKE)
 
 
+class CacheControlPointsTest(unittest.TestCase):
+    """The prompt-cache breakpoints, which the chart repeats verbatim.
+
+    The chart's copy sits inside a `define`, so the extractor has to end the
+    block on the template's own `{{- end }}` as readily as on a sibling YAML key.
+    """
+
+    KUSTOMIZE = textwrap.dedent(
+        """\
+        router_settings:
+          default_litellm_params:
+            cache_control_injection_points:
+              - location: message
+                role: system
+                control:
+                  type: ephemeral
+                  ttl: 1h
+              - location: message
+                index: -1
+        general_settings:
+          master_key: sk-1234
+        """
+    )
+
+    CHART = textwrap.dedent(
+        """\
+        {{- define "kube-agents.litellmConfig" -}}
+        router_settings:
+          default_litellm_params:
+            cache_control_injection_points:
+              # Same points, one comment and a template terminator later.
+              - control:
+                  ttl: 1h
+                  type: ephemeral
+                role: system
+                location: message
+              - location: message
+                index: -1
+        {{- end }}
+        """
+    )
+
+    def test_flattens_each_point_and_stops_at_the_next_key(self):
+        self.assertEqual(
+            parity.cache_control_points(self.KUSTOMIZE, FAKE),
+            ["location=message role=system ttl=1h type=ephemeral", "index=-1 location=message"],
+        )
+
+    def test_chart_spelling_compares_equal(self):
+        """Key order within a point is not a difference; the two must match."""
+        self.assertEqual(
+            parity.cache_control_points(self.CHART, FAKE),
+            parity.cache_control_points(self.KUSTOMIZE, FAKE),
+        )
+
+    def test_point_order_is_a_difference(self):
+        """Breakpoints are positional: the same two in the other order differ."""
+        reordered = textwrap.dedent(
+            """\
+            cache_control_injection_points:
+              - location: message
+                index: -1
+              - location: message
+                role: system
+                control:
+                  type: ephemeral
+                  ttl: 1h
+            """
+        )
+        self.assertNotEqual(
+            parity.cache_control_points(reordered, FAKE),
+            parity.cache_control_points(self.KUSTOMIZE, FAKE),
+        )
+
+    def test_no_block_exits_rather_than_reporting_none(self):
+        """Caching dropped from both surfaces must fail, not compare equal."""
+        with self.assertRaises(SystemExit):
+            parity.cache_control_points("litellm_settings:\n  callbacks: []\n", FAKE)
+
+
 class DigTest(unittest.TestCase):
     def test_missing_key_exits(self):
         with self.assertRaises(SystemExit):

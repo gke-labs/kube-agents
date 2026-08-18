@@ -29,13 +29,13 @@ platform/
 ├── config.yaml              # MCP servers, toolsets, plugins
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
-├── cron/jobs.json           # empty — the schedules live on the Chat Agent
+├── cron/jobs.json           # empty — the schedules live on the Planning Agent
 ├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```
 
-In the operator-deployed pod this workspace is one of several Hermes profiles: chat ingress is owned by the separate Chat Agent workspace (`agents/chat/`, whose `defaults/` holds the chat-ingress hooks and plugins), which delegates to the Platform Agent over the kanban board, and per-cluster Cluster Agent profiles are scaffolded at runtime from the `agents/cluster/` template. A manual install that only registers `agents/platform/` gives you a working direct-query agent; to reproduce the shipped chat front-door behaviour you also need to register `agents/chat/` as the chat-facing profile.
+In the operator-deployed pod this workspace is one of several Hermes profiles: chat ingress is owned by the separate Planning Agent workspace (`agents/chat/`, whose `defaults/` holds the chat-ingress hooks and plugins), which delegates to the Platform Agent over the kanban board, and per-cluster Cluster Agent profiles are scaffolded at runtime from the `agents/cluster/` template. A manual install that only registers `agents/platform/` gives you a working direct-query agent; to reproduce the shipped chat front-door behaviour you also need to register `agents/chat/` as the chat-facing profile.
 
 ## Step 2: Register the agent
 
@@ -51,7 +51,7 @@ Configure your harness to register a new agent named `platform`:
 
 The Platform Agent runs its routine maintenance and drift detection as autonomous governance jobs on cron schedules. They live in the workspace you just copied, at `agents/platform/cron/jobs.json`, and each carries a pre-authored `prompt` that points at a [governance SOP](/kube-agents/concepts/governance-sops/) under the Platform Agent's `governance/`.
 
-- If your harness has native cron support (Hermes does), the jobs register automatically once the workspace is loaded — no extra configuration is needed. Ticking is a property of the profile that owns the running gateway, so a second job, `profile-cron-tick` on the Chat Agent's roster (`agents/chat/defaults/cron/jobs.json`), is what advances this profile's schedule; it ships with that workspace.
+- If your harness has native cron support (Hermes does), the jobs register automatically once the workspace is loaded — no extra configuration is needed. Ticking is a property of the profile that owns the running gateway, so a second job, `profile-cron-tick` on the Planning Agent's roster (`agents/chat/defaults/cron/jobs.json`), is what advances this profile's schedule; it ships with that workspace.
 - Otherwise, wire each job into your scheduler by hand: for every entry in `agents/platform/cron/jobs.json`, create a recurring task on the job's `schedule.expr` (a standard 5-field cron expression) that sends the job's `prompt` verbatim to the `platform` agent.
 
 See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) for the full, annotated job list.

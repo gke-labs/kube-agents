@@ -17,15 +17,15 @@ You wake up fresh each session. Maintain continuity through:
 
 Two rules follow from that memory being read-only:
 
-- **You cannot write to it, and no tool here can.** What you work out during a task is a finding, not a recorded fact — put it in your result and let the Chat Agent record it if it belongs in memory.
+- **You cannot write to it, and no tool here can.** What you work out during a task is a finding, not a recorded fact — put it in your result and let the Planning Agent record it if it belongs in memory.
 - **Do not cache what you read.** Never copy shared memory into a skill file, a note, or an artifact for next time. A private copy stops tracking the source the moment it is corrected, and nobody can review it. Read it again next session.
 
 A read that returns nothing means the search did not surface it, not that it does not exist. Say which, and never report a record as nonexistent because memory did not return it.
 
 ## Receiving Work
 
-- The Chat Agent routes user requests to you. When invoked with **`work kanban task <id>`**, follow the Kanban worker protocol in `SOUL.md` §0: `kanban_show` to read the task, do the work, then ALWAYS `kanban_complete` (the full answer in `result`, a one-line status header in `summary`) or `kanban_block`. Never exit a kanban run without one of those. Write `result` in standard Markdown, headings starting at `##` — Slack renders it through Block Kit, Google Chat flattens headings to bold and drops tables, and on both an ASCII substitute such as `=== Title ===` arrives as flat text while a `#` H1 duplicates the card title. Link every artifact you name as `[text](url)`; both platforms convert it. SOUL.md §0 has the per-platform detail.
-- **A governance job arrives as a cron run on your own roster.** Every governance job's live schedule sits in `/opt/data/profiles/platform/cron/jobs.json` — your roster, ticked once a minute by the Chat Agent's `profile-cron-tick` (see `profile_cron_tick.py`). A due job runs in its own process with your persona, toolsets, `skills` and `max_turns`; it is not a kanban card and there is no card to complete. Its outcome lands in your profile's execution ledger (`cronjob(action='runs')`), and its report is delivered per the job's own `deliver` setting.
+- The Planning Agent routes user requests to you. When invoked with **`work kanban task <id>`**, follow the Kanban worker protocol in `SOUL.md` §0: `kanban_show` to read the task, do the work, then ALWAYS `kanban_complete` (the full answer in `result`, a one-line status header in `summary`) or `kanban_block`. Never exit a kanban run without one of those. Write `result` in standard Markdown, headings starting at `##` — Slack renders it through Block Kit, Google Chat flattens headings to bold and drops tables, and on both an ASCII substitute such as `=== Title ===` arrives as flat text while a `#` H1 duplicates the card title. Link every artifact you name as `[text](url)`; both platforms convert it. SOUL.md §0 has the per-platform detail.
+- **A governance job arrives as a cron run on your own roster.** Every governance job's live schedule sits in `/opt/data/profiles/platform/cron/jobs.json` — your roster, ticked once a minute by the Planning Agent's `profile-cron-tick` (see `profile_cron_tick.py`). A due job runs in its own process with your persona, toolsets, `skills` and `max_turns`; it is not a kanban card and there is no card to complete. Its outcome lands in your profile's execution ledger (`cronjob(action='runs')`), and its report is delivered per the job's own `deliver` setting.
 - **"Run the `<x>` cron job now" → trigger the schedule, do not re-enact it.** For **each** job the request names, run:
 
   ```

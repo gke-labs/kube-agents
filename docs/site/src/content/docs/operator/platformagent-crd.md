@@ -88,7 +88,7 @@ Hermes' empty string, which cannot be expressed here: an absent field takes the 
 
 Only a Hindsight-backed provider reaches the specialist profiles, because only that one can be made
 read-only and scoped by tag. Under any other value the specialists get no provider at all and the
-Chat Agent keeps the store to itself.
+Planning Agent keeps the store to itself.
 
 `memoryEnabled` and `userProfileEnabled` are a **different** mechanism — Hermes' built-in
 `MEMORY.md` / `USER.md` files, which have no per-user scoping. Both providers above replace that
@@ -159,7 +159,7 @@ turns it off.
 
 ### `spec.harness.tuning`
 
-Execution limits per agent persona, where `<persona>` is one of `default` (the Chat Agent front
+Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
@@ -251,7 +251,7 @@ the switch either graduates into a supported block or goes away.
 #### `platformFrontDoor`
 
 Makes the **Platform Agent** the profile the Hermes gateway runs as, so a chat message is handled by
-the agent that has the tools instead of arriving at the Chat Agent, which delegates through the
+the agent that has the tools instead of arriving at the Planning Agent, which delegates through the
 router MCP server and the kanban board.
 
 ```bash
@@ -281,7 +281,7 @@ Three things change while it is on:
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
 keys are unapplied rather than left behind, and the force-sync resumes.
 
-**What it costs.** The Chat Agent's lockdown is the Chat Agent's whole reason for existing: a router
+**What it costs.** The Planning Agent's lockdown is its whole reason for existing: a front door
 with three toolsets, so an inbound message cannot reach the full Platform Agent tool surface before a
 card and a worker turn have framed it. With this on, an inbound message reaches that surface
 directly. The lockdown is deliberately **not** copied onto the platform profile — copying it would
@@ -289,12 +289,12 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 
 **Known limits.**
 
-- One gateway means one profile, so this is not additive. While it is on, the Chat Agent persona sees
+- One gateway means one profile, so this is not additive. While it is on, the Planning Agent persona sees
   no chat at all and the router MCP path is simply unused. Kanban delegation is not: the front door
   keeps `dispatch_in_gateway`, so it can still hand a card to a spawned worker — it just does so as
   the agent that could also have done the work itself.
 - `gateway.multiplex_profiles` is still off, so a `/p/<profile>/` prefix on an API request is
-  ignored. Those requests now land on the Platform Agent rather than the Chat Agent.
+  ignored. Those requests now land on the Platform Agent rather than the Planning Agent.
 - The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
   shows that profile's sessions while the front door is the platform one.
 - **An [`AgentPlugin`](./agentplugin-crd.md) without a `spec.targetProfile` does not follow the
@@ -446,7 +446,7 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 
 ## How config reaches each profile
 
-A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
+A deployment runs several Hermes **profiles** from one pod: `default` (the Planning Agent front door),
 `platform`, and one `cluster-*` profile per managed cluster. The named profiles are each configured
 by an overlay merged into an image-built base at startup. The `default` profile is the exception: it
 takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
