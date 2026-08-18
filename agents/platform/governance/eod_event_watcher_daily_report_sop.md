@@ -120,7 +120,10 @@ Events whose Kubernetes `Event.Type` is not `Warning` are classified `Info` by
 still written to `intercepted_events` with `notified = 0`, and they are this report's subject —
 listed by workload and reason under `🔕 Informational Events Held Back from Chat`, and totalled on
 the closing line. That line prints even on a day with nothing to list, so "no alerts today" cannot
-be confused with a watcher that has stopped forwarding.
+be confused with a watcher that has stopped forwarding. Its total is in occurrences, the same unit
+as the `count` on each listed group and as the headline's events-forwarded figure, so the listing
+adds up to it. `*N alerts* went to chat` on the line above is a count of chat posts instead — one
+per ledger row, whatever a row stands for.
 
 `ALWAYS_ALERT_REASONS` never land in that count, whatever their `Event.Type`:
 `get_severity_details` grades them on the reason, so they come back `Warning` or `Critical` and are
@@ -172,6 +175,14 @@ ceiling ate thirty `Critical` alerts is not silence about the drops, it is a den
 day reports as 📊 with no all-clear line — the reader is told nothing about what went wrong, and is
 not told that nothing did.
 
+Such a day also prints "counts cover every severity; only informational events are listed" under the
+headline. The headline totals are the whole ledger, the listing below them is `Info` alone, and on a
+day with a ceiling drop or a failed delivery those two disagree by exactly the events this section
+says are not reported. The line is what stops the gap reading as an arithmetic error. It is gated on
+those two counts rather than printed always: a delivered alert also sits in the totals and not in
+the listing, but "_N alerts_ went to chat" in the sentence above already accounts for it, and a note
+printed every day is read on none of them.
+
 Neither filter reaches those counts. `min_event_count` applies to the listing only, and where it
 does apply it measures the withheld rows rather than the group's total: a group is one
 cluster/namespace/workload/reason/severity key and may hold rows with different outcomes, so a
@@ -190,8 +201,9 @@ which is the informational leg of the veto. Counting it there would put every st
 permanently out of all-clear on `kube-system` `BackOff` noise, which is the thing the filter exists
 to stop reporting. What that must not buy is a green light over a window the recap did not fully
 read, so **any exclusion at all bars 🟢**: once the filter has removed something the header grades
-📊, and the ✅ all-clear and the 📉 closing total both carry "namespaces in `EOD_EXCLUDE_NAMESPACES`
-are outside this recap's scope". A day whose only withheld traffic was excluded informational events
+📊, and the same qualifier line under the headline counts carries "namespaces in
+`EOD_EXCLUDE_NAMESPACES` are outside this recap's scope" — once, whichever body the recap goes on to
+print. A day whose only withheld traffic was excluded informational events
 therefore still prints the ✅ — the recap looked at everything in scope and found nothing — under a
 neutral header that does not assert the day was clean.
 

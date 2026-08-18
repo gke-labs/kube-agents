@@ -116,7 +116,10 @@ def event(**overrides):
     `occurrences` is 1 because that is the only value production writes: the
     watcher drops duplicates before /inject and the payload's `count` comes
     from the dedupNewIncident branch, which hardcodes 1. Tests that assert on
-    richer values were asserting a shape the system cannot produce.
+    richer values were asserting a shape the system cannot produce. The one
+    exception is a test about the *unit* a count is kept in, where the whole
+    point is that rows and occurrences stop agreeing when they differ — see
+    `test_the_total_is_in_the_same_unit_the_listing_prints`.
     """
     row = {
         "namespace": "prod-api",
@@ -1221,6 +1224,106 @@ class TestTheNamespaceFilterDoesNotReachTheAlertVeto(unittest.TestCase):
         self.assertIn("outside this recap's scope", report)
 
 
+class TestTheCountsSayWhatTheyCover(unittest.TestCase):
+    """The numbers are summed over every severity. The listing under them is not.
+
+    `LISTED_SEVERITIES` holds `Info` alone while `total_occurrences` and
+    `unique_incidents` count every row in scope, so a day of ceiling-dropped
+    Criticals reports events and groups no listed line accounts for. A
+    delivered alert is already explained in words — "*N alerts* went to chat",
+    "*Alerts Raised:* N" — which leaves the ceiling drop and the failed
+    delivery as the residue nothing accounts for, and those two are the gate.
+
+    Both qualifications share one line, printed once. Appended to each claim
+    instead, the namespace note reached the headline, the ✅ and the 📉 of one
+    small card, and a note printed three times is read none.
+    """
+
+    report = staticmethod(recap)
+
+    SEVERITY_NOTE = "Counts cover every severity; only informational events are listed."
+    SCOPE_NOTE = "Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope."
+
+    def test_a_ceiling_drop_in_the_counts_is_declared(self):
+        """The headline counts a Critical the listing cannot show."""
+        summary, report = self.report([listed(), event(notified=False)])
+
+        self.assertEqual(summary["cap_dropped"], 1)
+        self.assertEqual(summary["total_occurrences"], 2)
+        self.assertEqual(len(listing_of(report)), 1)
+        self.assertIn(self.SEVERITY_NOTE, report)
+
+    def test_a_day_of_ceiling_drops_alone_still_declares_it(self):
+        """The card with no listing at all — three bullets are the whole of it.
+
+        30 events across 30 groups over a listing naming none of them is the
+        shape the note exists for, and the one card where the reader has
+        nothing else to reconcile the numbers against.
+        """
+        summary, report = self.report(
+            [event(workload=f"svc-{i}", notified=False) for i in range(30)]
+        )
+
+        self.assertEqual(summary["cap_dropped"], 30)
+        self.assertEqual(listing_of(report), [])
+        self.assertIn("• *Events Forwarded:* 30", report)
+        self.assertIn(self.SEVERITY_NOTE, report)
+
+    def test_an_undelivered_alert_is_the_other_trigger(self):
+        summary, report = self.report([event(delivery_error="chat 503")])
+
+        self.assertEqual(summary["delivery_failed"], 1)
+        self.assertIn(self.SEVERITY_NOTE, report)
+
+    def test_an_informational_day_does_not_qualify_what_needs_no_qualifying(self):
+        """The control. Every counted row is a listed row, so the numbers reconcile."""
+        _, report = self.report([listed(), listed(workload="web")])
+
+        self.assertNotIn(self.SEVERITY_NOTE, report)
+
+    def test_a_delivered_alert_is_explained_by_the_sentence_it_is_already_in(self):
+        """The second control, and the reason the gate is not `severity != Info`.
+
+        A Critical that reached chat is counted in the headline and absent from
+        the listing, exactly like a cap-dropped one — but "*1 alert* went to
+        chat as it happened and is not repeated here" has already said so, and
+        a second sentence saying it again is the repetition this line replaced.
+        """
+        _, report = self.report([listed(), event()])
+
+        self.assertIn("*1 alert* went to chat as it happened", report)
+        self.assertNotIn(self.SEVERITY_NOTE, report)
+
+    def test_the_namespace_note_is_printed_once_and_not_three_times(self):
+        """A kube-system-only day carries the bullet counts, the ✅ and the 📉.
+
+        The note used to be appended to all three. One card, one statement of
+        what it did not read.
+        """
+        _, report = self.report(
+            [event(namespace="kube-system", workload="kube-proxy", severity="Info",
+                   notified=False)]
+        )
+
+        self.assertEqual(report.count(self.SCOPE_NOTE), 1)
+        # Still on the card, and still above both lines that used to carry it.
+        self.assertIn("Nothing was held back from chat in this window.", report)
+        self.assertIn("held back from chat today", report)
+        self.assertLess(report.index(self.SCOPE_NOTE), report.index("✅"))
+
+    def test_both_qualifications_share_one_line(self):
+        """A day needing each of them prints two sentences, not two lines."""
+        _, report = self.report([
+            listed(),
+            event(notified=False),
+            event(namespace="kube-system", workload="kube-proxy", notified=False),
+        ])
+
+        self.assertEqual(report.count(self.SEVERITY_NOTE), 1)
+        self.assertEqual(report.count(self.SCOPE_NOTE), 1)
+        self.assertIn(f"_{self.SEVERITY_NOTE} {self.SCOPE_NOTE}_", report)
+
+
 class TestAnExclusionBarsTheGreenHeader(unittest.TestCase):
     """The ✅ can qualify itself in words. The header emoji cannot.
 
@@ -1392,6 +1495,26 @@ class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):
         self.assertEqual(summary["entries"][0]["count"], summary["suppressed_info"])
         self.assertEqual([e["count"] for e in listing_of(report)], [1])
         self.assertIn("*1 informational event* held back", report)
+
+    def test_the_total_is_in_the_same_unit_the_listing_prints(self):
+        """Occurrences, not rows.
+
+        The invariant above holds trivially while every row carries
+        `occurrences = 1`, which is all production writes: the watcher's
+        payload count comes from `Observe`'s new-incident branch and a
+        duplicate never reaches the dispatch. Counted per row, a ledger whose
+        rows stood for several sightings each would print `7 events` and
+        `3 events` in the listing and total them as 2 — one card, two units.
+        """
+        summary, report = self.report([
+            listed(workload="api", occurrences=7),
+            listed(workload="web", occurrences=3),
+        ])
+
+        self.assertEqual([e["count"] for e in listing_of(report)], [7, 3])
+        self.assertEqual(summary["suppressed_info"], 10)
+        self.assertEqual(summary["suppressed_info"], sum(e["count"] for e in summary["entries"]))
+        self.assertIn("*10 informational events* held back", report)
 
     def test_the_ordinary_day_is_unchanged(self):
         """The control. Every row this version writes is notified=0."""

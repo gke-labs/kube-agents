@@ -55,8 +55,8 @@ def excluded_namespaces() -> FrozenSet[str]:
     and counting it in the veto would put every stock install with `kube-system`
     excluded permanently out of all-clear. What the exclusion must not buy is a
     green light over a window the recap did not fully read, so
-    `excluded_occurrences` bars 🟢 on its own in `generate_markdown_report` and
-    the ✅ carries the scope note.
+    `excluded_occurrences` bars 🟢 on its own in `generate_markdown_report`, and
+    the qualifier line under the counts names the filter.
     """
     raw = os.getenv("EOD_EXCLUDE_NAMESPACES")
     if raw is None:
@@ -399,6 +399,18 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # falls past both branches into the `else` and is counted as withheld by
         # the ceiling. The branch still has to claim the row; only the increment
         # is skipped.
+        #
+        # `suppressed_info` is counted in occurrences, not rows: it is printed
+        # by the closing 📉 line, which a reader checks against the `count` on
+        # each listed group and against `total_occurrences` in the headline,
+        # and those are occurrences. `alerts_posted` stays a row count on
+        # purpose — it is printed as "*N alerts* went to chat", and chat
+        # received one post per row however many sightings that row stands
+        # for. Every row this version writes carries `occurrences = 1`, since
+        # the watcher's payload count comes from `Observe`'s new-incident
+        # branch and duplicates never reach the dispatch, so the two units
+        # agree today; they are written apart so they keep agreeing if a
+        # future writer batches sightings into one row.
         event_delivery_failed = bool(event.get("delivery_error"))
         event_cap_dropped = False
         if event_delivery_failed:
@@ -408,7 +420,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 alerts_posted += 1
         elif severity == "Info":
             if not excluded:
-                suppressed_info += 1
+                suppressed_info += count
         else:
             cap_dropped += 1
             event_cap_dropped = True
@@ -606,16 +618,33 @@ def generate_markdown_report(
     entry_count = len(entries)
 
     suppressed = summary.get("suppressed_info", 0)
-    # Appended to the two lines that make a claim about the whole fleet, and
-    # only when the filter actually removed something. Without it a recap
-    # excluding kube-system reports "nothing was held back from chat" over a day
-    # of kube-system churn — true of what it counted, false as the reader will
-    # read it.
-    scope_note = (
-        " Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope."
-        if summary.get("excluded_occurrences")
-        else ""
-    )
+    # What the counts cover, printed once and directly under them. Two
+    # qualifications, each answering a way the numbers mislead on their own,
+    # each gated on the condition that makes it true.
+    #
+    # Severity, because the headline and the three bullet counts are summed
+    # over every row in scope while the listing below them holds `Info` alone.
+    # A delivered alert is already accounted for in words — "*N alerts* went to
+    # chat", "*Alerts Raised:* N" — so the residue that nothing explains is the
+    # ceiling drop and the failed delivery, and those two are the gate. Without
+    # it a day of 30 cap-dropped Criticals reports 30 events across 30 groups
+    # over a listing naming none of them, and the reader who tries to reconcile
+    # the two is reading a card whose numbers do not add up.
+    #
+    # Namespace, because a recap excluding `kube-system` otherwise says
+    # "nothing was held back from chat" over a day of `kube-system` churn —
+    # true of what it counted, false as the reader will read it.
+    #
+    # One line rather than a clause on each claim. Appended, the namespace note
+    # landed in the headline, the ✅ and the 📉 of one small card — three times
+    # on a day whose whole traffic was excluded — and a note printed three
+    # times is read none.
+    qualifiers: List[str] = []
+    if summary.get("cap_dropped") or summary.get("delivery_failed"):
+        qualifiers.append("Counts cover every severity; only informational events are listed.")
+    if summary.get("excluded_occurrences"):
+        qualifiers.append("Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope.")
+    scope_line = "_" + " ".join(qualifiers) + "_" if qualifiers else ""
     # This recap reports informational events and nothing else. A ceiling-withheld
     # or undelivered alert is graded Critical or Warning, was never this report's
     # subject, and is not named, counted or hinted at anywhere below — see the SOP,
@@ -647,8 +676,8 @@ def generate_markdown_report(
     # veto term the namespace filter reaches. An excluded row's `Info` tally is
     # skipped, so a window whose only withheld traffic was informational churn
     # in `kube-system` clears `all_clear` honestly — the recap did not look
-    # there. The ✅ below carries `scope_note` and says so; an emoji cannot, and
-    # green read at a glance is the one part of this card nobody re-reads. The
+    # there. The qualifier line under the counts says so in words; an emoji
+    # cannot, and green read at a glance is the one part nobody re-reads. The
     # alert tallies are not filtered, so this changes nothing about a day the
     # ceiling or a failed post spoiled: those were never green to begin with.
     if problems:
@@ -688,10 +717,10 @@ def generate_markdown_report(
             f"_Forwarded *{_plural(summary['total_occurrences'], 'event')}* across "
             f"*{_plural(summary['unique_incidents'], 'workload/reason group')}*. "
             f"*{_plural(summary['alerts_posted'], 'alert')}* went to chat as it happened "
-            f"and {'is' if summary['alerts_posted'] == 1 else 'are'} not repeated here."
-            + scope_note
-            + "_"
+            f"and {'is' if summary['alerts_posted'] == 1 else 'are'} not repeated here._"
         )
+        if scope_line:
+            lines.append(scope_line)
         lines.append("")
 
         lines.append(f"*{_SECTION_HEADING}*")
@@ -719,8 +748,8 @@ def generate_markdown_report(
             lines.append(f"• *Alerts Raised:* {summary['alerts_posted']}")
             # Otherwise a recap excluding kube-system prints three zeroes that
             # read as a claim about the whole fleet on a day of kube-system churn.
-            if scope_note:
-                lines.append(f"_{scope_note.strip()}_")
+            if scope_line:
+                lines.append(scope_line)
             lines.append("")
         if problems:
             # The paths, in the body. This job runs `no_agent`, so its stdout is
@@ -748,7 +777,7 @@ def generate_markdown_report(
         # not the watcher. SOP: "What the ✅ all-clear does and does not claim".
         elif all_clear:
             lines.append(
-                "✅ _Nothing was held back from chat in this window." + scope_note + " This "
+                "✅ _Nothing was held back from chat in this window. This "
                 "reports the ledger, not the watcher: confirm the daemon is running before "
                 "reading a quiet day as a healthy one._"
             )
@@ -766,7 +795,7 @@ def generate_markdown_report(
         lines.append("")
         lines.append(
             f"📉 _*{_plural(suppressed, 'informational event')}* held back from chat today, "
-            "across every workload counted here." + scope_note + "_"
+            "across every workload counted here._"
         )
 
     return "\n".join(lines)
