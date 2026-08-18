@@ -11,7 +11,7 @@
 # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../k8s-operator/scripts" && pwd)/gke_dns_endpoint.sh"
 
-export PROJECT_ID="kube-agents-evals"
+export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 
