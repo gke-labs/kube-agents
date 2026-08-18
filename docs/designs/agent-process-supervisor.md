@@ -435,11 +435,11 @@ The three numeric budgets, at the parameters 3.5 and 3.7 propose:
 | Lease inequality (3.5)       | 35 s lease                      | 29 s                   | **6 s**  | 39 s — **−4 s, refuses to start**  |
 | Restart cap (3.3)            | 5 restarts / 600 s, per process | —                      | —        | unaffected; the cap is per-process |
 
-The lease row is the binding one and 3.5 derives it. Its spend is `renew_deadline (8) + Σ grace
+The lease row is the binding one and 3.5 derives it. Its spend is `renew_deadline (9) + Σ grace
 (2 × 10)`, **not** a sleep interval plus a grace: an earlier revision used the sleep, which is not
 a bound on anything, and 3.5 says at length why that mattered.
 
-**The 7 s is not headroom for a third process, and must not be described as one.** An earlier
+**The 6 s is not headroom for a third process, and must not be described as one.** An earlier
 revision justified widening the margin on the grounds that "it has to absorb a third process
 later" while simultaneously proving a third process cannot fit — the third column of that row is
 the proof. The margin absorbs _variance_ in the two terms it is made of; the table's size is held
@@ -1637,14 +1637,26 @@ So the deadline is enforced **at every point the loop can block**, which means t
 than one:
 
 ```
+# A deadline exists only WHILE THIS POD HOLDS THE LEASE.
 deadline = last_successful_renew + renew_deadline_seconds
 
-every lease call times out at   min(lease_call_timeout, deadline - now)   # clamp the calls
-the loop sleeps at most         min(retry_period,       deadline - now)   # clamp the WAIT too
-the deadline is re-tested after every call and every sleep, not once per pass
+while holding:      every lease call times out at min(lease_call_timeout, deadline - now)
+                    the loop sleeps at most       min(retry_period,       deadline - now)
+                    the deadline is re-tested after every call and every sleep
+
+while not holding:  calls get the full lease_call_timeout — there is no deadline to miss
 
 renew_deadline_seconds  >  max_retry_period + 2 x lease_call_timeout      # one full retry fits
 ```
+
+**The clamp is on the renew path, never on the acquire path**, and stating it unqualified is a way
+to build something that cannot elect anyone. A pod that has never renewed — every pod, at boot —
+and a pod that has just been definitively denied both have no live deadline, so `deadline - now` is
+not a positive number and an unqualified clamp issues every call with a **zero** timeout. It can
+never get an answer, so it can never renew, so the budget never re-opens: a cold multi-replica
+install elects nobody, and with the Service selecting on `kubeagents.io/is-leader` that is zero
+endpoints and no probe that would notice. This is what client-go means by clamping the renew
+context and not the acquire loop, and it is the qualification the rule above now carries.
 
 **Both clamps, or the term is still not the deadline.** Clamping only the calls leaves the sleep
 free to run past it, so the first observation lands up to a full `retry_period` late and the honest
@@ -2326,7 +2338,7 @@ rather than an alternative to it, and 8 records the choice as open rather than s
 | S1    | Supervisor modes and the process table, with the gateway as the only process. PID-1 reaping (3.7). Operator sets `Args` unconditionally. Behaviour-preserving at both replica counts.                                                                 | Low — the single-replica path gains a parent process and nothing else                                                                                                                   |
 | S2    | Per-process restart policy, the status files, and the **startup + readiness** probes (`supervisor-alive` gating `supervisor-ready`).                                                                                                                  | Medium — first probe on this container, and at one replica the strategy is `Recreate`, so a probe that never passes is an outage rather than a stalled rollout. Roll to one agent first |
 | S2b   | **Liveness** probe — `supervisor-alive`, a _different_ script (3.4), longer threshold.                                                                                                                                                                | Medium — a wrongly-firing liveness probe is a restart loop. Ships only after S2's readiness has soaked                                                                                  |
-| S3    | Renew deadline + lease-call timeout, lease 35 s, retry `2 + U(0,1)`, `terminationGracePeriodSeconds: 60`. Writes the duration on renew and takeover, **migrates the existing Lease object** (3.5), and adds the startup assertion of 6.               | Medium — the constant does not reach an existing Lease on its own, and S3+S4 against a stale one is a **13 s** overlap, worse than the 2 s P5 exists to close. Plus the longer lease    |
+| S3    | Renew deadline + lease-call timeout, lease 35 s, retry `2 + U(0,1)`, `terminationGracePeriodSeconds: 60`. Writes the duration on renew and takeover, **migrates the existing Lease object** (3.5), and adds the startup assertion of 6.               | Medium — the constant does not reach an existing Lease on its own, and S3+S4 against a stale one is a **14 s** overlap, worse than the 2 s P5 exists to close. Plus the longer lease    |
 | S4    | Second process adopted (the Session KV server), and entrypoint step 5 plus the MCP launcher deleted — but not its `mkdir -p logs` (1.2). Adds the single-writer guard 3.1 shows RWO does not provide. Owned by `session-kv-decomposition.md` phase 3. | Medium — the entrypoint gate check asserts on step 5                                                                                                                                    |
 
 **S1, S2 and S2b are worth shipping on their own merits.** They fix P1–P4, which are live defects
@@ -2375,8 +2387,8 @@ S4 is where this design and the KV decomposition meet.
 The mechanisms in 3.3–3.7 were prototyped before this design was finalised — a supervisor with the
 process table, criticality, backoff and cap, the status file, the probe, and sequential shutdown,
 with the lease stubbed to a file so it runs without Kubernetes, plus a Go check that renders the
-operator's real manifests. **Nine of the experiments falsified something this document previously
-asserted** (E1, E3, E4, E9, E10, E11, E12, E13, E14), and those corrections are folded into the sections above.
+operator's real manifests. **Ten of the experiments falsified something this document previously
+asserted** (E1, E3, E4, E9, E10, E11, E12, E13, E14, E15), and those corrections are folded into the sections above.
 
 The prototype lives in
 [`agent-process-supervisor/`](agent-process-supervisor/)
@@ -2401,7 +2413,7 @@ additions listed under **Unit** below.
 | E3  | 25% yields `maxUnavailable: 0` at 2 replicas                                                             | **Confirmed and widened** — it is 0 at 1, 2 _and_ 3 replicas (P4)                                                                                                                                                                                                                                            |
 | E4  | Optional-vs-required divergence at the cap                                                               | **Confirmed.** Optional → `ready:true, degraded:true`, supervisor lives. Required → cleanup, then exit. Also surfaced the stale-`ready:true`-on-exit gap now fixed in 3.3                                                                                                                                    |
 | E5  | Shutdown is the sum over the table                                                                       | **Confirmed.** 10 s / 20 s / 30 s for 1 / 2 / 3 processes at a 10 s grace — 3 processes overruns the 30 s default and needs 3.7's 60 s                                                                                                                                                                       |
-| E6  | The inequality catches table growth                                                                      | **Confirmed.** Reproduces every margin in 3.5: today −2, A alone +3, A+C+D +7, a third process −3 (refuses to start), and the unmigrated-Lease rows, where S3+S4 is −13                                                                                                                                      |
+| E6  | The inequality catches table growth                                                                      | **Confirmed.** Reproduces every margin in 3.5: today −2, A alone +2, A+C+D +6, a third process −4 (refuses to start), and the unmigrated-Lease rows, where S3+S4 is −14                                                                                                                                      |
 | E7  | The eleven manifest-level claims of sections 1 and 3 (fifteen assertions, two of them per-replica-count) | **Confirmed against rendered output.** Renders Deployments at 1/2/3 replicas through the operator's own `buildDeployment`, plus `buildNetworkPolicy`, `buildPlatformService` and `buildPlatformLeaderRole`                                                                                                   |
 | E8  | An entrypoint background job reparents to the supervisor                                                 | **Confirmed.** One zombie per boot under today's supervisor, none under 3.7's reaper. The case is the Hindsight migration in 1.2                                                                                                                                                                             |
 | E9  | A demoted leader restarts its table on reacquiring the lease                                             | **Falsified 3.3, now fixed.** A stopped entry was terminal, so a reacquired lease resumed with an empty table — label held, nothing served. Also the only case that runs in `elected` mode                                                                                                                   |
@@ -2410,6 +2422,7 @@ additions listed under **Unit** below.
 | E12 | The restart cap fires at the rate the KV server will actually fail                                       | **Falsified 3.3, now fixed.** 5-in-300 s needs failures closer than 60 s apart; the KV server's are 61–76 s apart, so the cap was unreachable the moment the `>=` off-by-one was corrected. The window goes to 600 s                                                                                         |
 | E13 | Stopping a supervised process stops everything it started                                                | **Falsified 3.3 twice.** `Popen.terminate()` leaves a grandchild running; so does `SIGTERM` to the process group, because the parent exits before the grace elapses and the `SIGKILL` branch never runs. `stop()` gains an unconditional group sweep                                                         |
 | E14 | A definitive denial survives the next timed-out lease call                                               | **Falsified 3.5, now fixed.** The deadline answers "nobody has told me anything"; left set through an explicit not-the-holder read, the next timed-out call re-promoted a denied supervisor and restarted the table under the real holder. Verified to fail without the invalidation                         |
+| E15 | A cold-booted supervisor can still acquire the lease                                                     | **Falsified 3.5, now fixed.** Stated unqualified, the clamp applies to the acquire path too — where there is no deadline, so the budget is zero and every call times out. A cold multi-replica install would elect nobody. The clamp is on the renew path only                                               |
 
 E2 and E3 are checks against the authoritative source rather than against reasoning: E2 reads
 `HTTPGetAction.Host`'s own documentation in the vendored `k8s.io/api`, and E3 evaluates

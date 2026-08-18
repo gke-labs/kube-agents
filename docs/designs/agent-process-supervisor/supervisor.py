@@ -174,6 +174,10 @@ class Supervisor:
         # deadline tested once per iteration, with calls free to run past it,
         # which bounds detection by the iteration rather than by the deadline.
         self.clamp = clamp
+        # 3.5: a deadline exists only WHILE THIS POD HOLDS THE LEASE. Clamping the
+        # acquire path too gives every call a zero budget, so a cold boot -- or a
+        # pod that was denied once -- can never acquire again.
+        self.holding = False
         self.last_renew = float("-inf")
         self.lease_call_delay = 0.0  # E11 turns this up to simulate a slow API
 
@@ -223,7 +227,12 @@ class Supervisor:
         deadline. Both clamps, or the first term of the inequality is not the
         number the design says it is.
         """
-        if self.mode != "elected" or self.renew_deadline is None or not self.clamp:
+        if (
+            self.mode != "elected"
+            or self.renew_deadline is None
+            or not self.clamp
+            or not self.holding
+        ):
             return want
         return max(0.0, min(want, (self.last_renew + self.renew_deadline) - now))
 
@@ -238,12 +247,13 @@ class Supervisor:
             return True
 
         budget = None
-        if self.renew_deadline is not None and self.clamp:
+        if self.renew_deadline is not None and self.clamp and self.holding:
             budget = max(0.0, (self.last_renew + self.renew_deadline) - now)
         held = self.read_lease(budget)
 
         if held is True:
             self.last_renew = time.monotonic()
+            self.holding = True
             return True
         if held is False:
             # A definitive denial is an ANSWER, and the deadline only ever answers
@@ -251,6 +261,7 @@ class Supervisor:
             # timed-out call re-promotes a supervisor that was told no, while the
             # real holder is still running the table.
             self.last_renew = float("-inf")
+            self.holding = False
             return False
 
         if self.renew_deadline is None:
@@ -259,7 +270,11 @@ class Supervisor:
         # Re-tested AFTER the call, against the clock as it is now. Testing the
         # entry-time clock is the per-iteration form, bounded by the iteration.
         stamp = time.monotonic() if self.clamp else now
-        return stamp - self.last_renew <= self.renew_deadline
+        alive = stamp - self.last_renew <= self.renew_deadline
+        if not alive:
+            # The deadline blew: we are acquiring again, so stop clamping.
+            self.holding = False
+        return alive
 
     # -- 3.4 ---------------------------------------------------------------
     def write_status(self, ready, degraded):

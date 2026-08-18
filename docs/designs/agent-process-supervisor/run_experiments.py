@@ -827,8 +827,57 @@ def e14():
     )
 
 
+# ---------------------------------------------------------------- E15
+def e15():
+    """A cold-booted supervisor must be able to acquire at all.
+
+    3.5 clamps every blocking step to the remaining renew deadline. Stated
+    unqualified that is unimplementable: a pod that has never renewed has no
+    deadline, `deadline - now` is not positive, and every call it makes gets a
+    ZERO timeout -- so it never gets an answer, never renews, and never opens a
+    budget. A cold multi-replica install would elect nobody.
+
+    The clamp therefore applies to the RENEW path only. This drives the case
+    with a non-zero call latency, which is what the earlier stub hid: at exactly
+    0.0 the timeout test `delay > cap` is false and a zero-budget call still
+    returned the real answer.
+    """
+    import supervisor as S
+
+    live = "import time;time.sleep(300)"
+    with tempfile.TemporaryDirectory() as d:
+        S.STATUS = os.path.join(d, "s.json")
+        S.READY = os.path.join(d, "s.ready")
+        S.LEASE = os.path.join(d, "lease")
+        open(S.LEASE, "w").close()                  # the lease is free to take
+        table = [S.Supervised("gateway", [PY, "-c", live], required=True)]
+        sup = S.Supervisor(table, mode="elected")
+        # Every call costs something, as it would against a real API server, but
+        # comfortably less than the call timeout. Only a ZERO budget can fail here.
+        sup.lease_call_delay = S.LEASE_CALL_TIMEOUT / 2
+        assert not sup.holding, "setup: a fresh supervisor holds nothing"
+        try:
+            sup.run(iterations=3)
+            acquired = table[0].proc is not None and sup.role == "leader"
+        finally:
+            sup.shutdown("e15 teardown")
+
+    assert acquired, (
+        "a cold-booted supervisor never acquired the lease -- the renew-deadline clamp "
+        "is being applied to the acquire path, where the budget is always zero"
+    )
+    record(
+        "E15",
+        "the renew-deadline clamp does not stop a cold supervisor acquiring",
+        "HOLDS",
+        f"fresh supervisor, lease free, every call costing {S.LEASE_CALL_TIMEOUT / 2:.2f}s:\n"
+        "acquired and started its table. Clamped on the acquire path the budget is 0 s,\n"
+        "the call times out, and the install elects nobody",
+    )
+
+
 EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E4": e4, "E4c": e4c, "E5": e5, "E6": e6,
-               "E7": e7, "E8": e8, "E9": e9, "E10": e10, "E11": e11, "E12": e12, "E13": e13, "E14": e14}
+               "E7": e7, "E8": e8, "E9": e9, "E10": e10, "E11": e11, "E12": e12, "E13": e13, "E14": e14, "E15": e15}
 
 
 def main(argv):

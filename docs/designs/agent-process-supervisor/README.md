@@ -5,7 +5,7 @@ Executable backing for [`../agent-process-supervisor.md`](../agent-process-super
 **This is not shipping code and is not wired into CI.** It exists so the design's mechanisms could
 be tested before anyone implements them in
 [`k8s-operator/internal/controller/leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py).
-It earned its place by being wrong: nine claims the design asserted were falsified here and
+It earned its place by being wrong: ten claims the design asserted were falsified here and
 corrected before reaching an implementation PR.
 
 ## Running it
@@ -60,7 +60,7 @@ prototype's.
 | `E13` | Stopping a process stops everything it started                    | **Falsified the design twice.** Including the first attempt at the fix                       |
 | `E14` | A definitive denial is not forgotten on the next timed-out call   | **Falsified the design.** A denied leader re-promoted itself                                 |
 
-### The nine the design got wrong
+### The ten the design got wrong
 
 1. **The reaper.** §3.7 proposed reaping `-1` and skipping PIDs found in the process table. The
    guard cannot work — `waitpid(-1)` has already consumed the status by the time it returns the
