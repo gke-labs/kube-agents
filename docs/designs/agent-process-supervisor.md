@@ -3,8 +3,8 @@
 > **STATUS — draft; not implemented.** Nothing here ships today. Section 1 describes the
 > launch path as it currently exists; sections 3 onward are the proposal.
 >
-> Section 1 was re-verified against `main` at `76a074b` on 2026-08-18. **Every problem in section
-> 2 still holds**, and the eleven manifest-level claims are asserted against real rendered
+> Section 1 was re-verified against `main` at `d1eea17` on 2026-08-18. **Every problem in section
+> 2 still holds**, and the twelve manifest-level claims are asserted against real rendered
 > operator output rather than read off the source (E7 in 6.0): `leader_elect.py` and its tests are
 > byte-identical, the gateway container still carries no probe at any replica count,
 > `terminationGracePeriodSeconds` is still unset, and the lease inequality of 3.5 is still false.
@@ -57,7 +57,7 @@ Every file this design cites, linked to `main` — follow these to read a file a
 
 Links **inside** the sections below work the other way. Each one names a line range and is
 anchored to it, pinned to
-[`76a074b`](https://github.com/gke-labs/kube-agents/commit/76a074b8cddc467c753e33801c3c69d814ec8469),
+[`d1eea17`](https://github.com/gke-labs/kube-agents/commit/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5),
 the commit these line numbers were read from on 2026-08-18. Pinning is what keeps an anchor
 honest: `#L139-L141` on a moving branch silently comes to point at whatever code later occupies
 those lines, which is worse than no anchor at all. GitHub offers a jump to the current file from
@@ -66,7 +66,7 @@ refresh is a single edit.
 
 | File                                                                                                                                                                                     | Its part in this design                                          |
 | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| [`k8s-operator/internal/controller/leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py)                                 | The script that becomes the supervisor. 159 lines; read it whole |
+| [`k8s-operator/internal/controller/leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py)                                 | The script that becomes the supervisor. 176 lines; read it whole |
 | [`k8s-operator/internal/controller/test_leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/test_leader_elect.py)                       | Its four existing tests, two of which S1 breaks                  |
 | [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh)                                                             | `exec "$@"`, the `IS_BOOTSTRAP_PRIMARY` gate, and step 5         |
 | [`k8s-operator/internal/controller/platformagent_manifests.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests.go)           | `Args`, the probes, the Service selector, the two stale comments |
@@ -92,33 +92,46 @@ here was checked against `main` and resolves.
 
 ## 1. What exists today
 
-### 1.1 Two launch paths, chosen by replica count
+### 1.1 Three launch paths, chosen by replica count and by the front door
 
 The image `ENTRYPOINT` is
 [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh),
-which builds the shared tree and ends in `exec "$@"` ([`docker-entrypoint.sh:1293`][docker-entrypoint-sh-1293]). What `"$@"` is
-depends on the replica count:
+which builds the shared tree and ends in `exec "$@"` ([`docker-entrypoint.sh:1393`][docker-entrypoint-sh-1393]). What `"$@"` is
+depends on the replica count **and, at one replica, on whether the platform front door is on**:
 
-| Replicas | Gateway container `Args`                              | What supervises `hermes gateway run` |
-| -------- | ----------------------------------------------------- | ------------------------------------ |
-| 1        | unset — the image `CMD`                               | nothing; it is PID 1's exec target   |
-| > 1      | `/opt/hermes/.venv/bin/python3 $HOME/leader_elect.py` | `leader_elect.py`                    |
+| Replicas | Front door | Gateway container `Args`                              | What supervises the gateway        |
+| -------- | ---------- | ----------------------------------------------------- | ---------------------------------- |
+| 1        | off        | unset — the image `CMD`                               | nothing; it is PID 1's exec target |
+| 1        | **on**     | `hermes --profile platform gateway run`               | nothing; it is PID 1's exec target |
+| > 1      | either     | `/opt/hermes/.venv/bin/python3 $HOME/leader_elect.py` | `leader_elect.py`                  |
 
-The operator sets `Args` only in the `replicas > 1` branch, and sets `ENABLE_LEADER_ELECTION` /
-`LEADER_ELECTION_LEASE_NAME` / `LEADER_ELECTION_NAMESPACE` in the same branch
-([`platformagent_manifests.go:1561-1576`][platformagent_manifests-go-1561-1576]) —
-[`platformagent_manifests.go:2298-2303`][platformagent_manifests-go-2298-2303]:
+The operator sets `Args` in a three-way `switch`, and sets `ENABLE_LEADER_ELECTION` /
+`LEADER_ELECTION_LEASE_NAME` / `LEADER_ELECTION_NAMESPACE` only in the first case
+([`platformagent_manifests.go:1766-1781`][platformagent_manifests-go-1766-1781]) —
+[`platformagent_manifests.go:2503-2519`][platformagent_manifests-go-2503-2519]:
 
 ```go
 var args []string
 
 replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-if replicas > 1 {
+switch {
+case replicas > 1:
 	args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
+case platformFrontDoorEnabled(agent):
+	args = []string{"hermes", "--profile", platformProfileName, "gateway", "run"}
 }
 ```
 
-Deleting the `if` is the whole of change 3.1 on the operator side.
+**The middle row is the one that changes 3.1's shape, and it makes the change smaller rather than
+larger.** The front door arrived after this design's first draft, and it did the hard part already:
+the profile does not travel in `Args` when the wrapper runs, it travels in
+`HERMES_GATEWAY_PROFILE`, which the operator appends **unconditionally**
+([`platformagent_manifests.go:2578-2596`][platformagent_manifests-go-2578-2596] — the `if` computes the value, not whether to
+set it), and which `leader_elect.py` already reads into `HERMES_COMMAND`
+([`leader_elect.py:26-27`][leader_elect-py-26-27]). So 3.1 replaces the whole `switch` with one unconditional
+assignment and the front-door case keeps working through the environment. It is no longer true
+that "deleting the `if` is the whole of the change" — there is no `if` — but the replacement is
+still one statement, and 3.1 says what it is.
 
 The branch tests the **effective** replica count, which `resolveDeploymentReplicasAndStrategy`
 forces to `0` when `scaleToZero` is set ([`manifest_helpers.go:286-287`][manifest_helpers-go-286-287]). An agent configured
@@ -130,10 +143,10 @@ question:
 
 | Gate                                         | Where                                                                          | Keyed on  |
 | -------------------------------------------- | ------------------------------------------------------------------------------ | --------- |
-| `Args` — is there a supervisor at all?       | [`platformagent_manifests.go:2298-2303`][platformagent_manifests-go-2298-2303] | effective |
-| `LEADER_ELECTION_*` — solo or elected? (3.1) | [`platformagent_manifests.go:1561-1576`][platformagent_manifests-go-1561-1576] | effective |
-| Service selector — `kubeagents.io/is-leader` | [`platformagent_manifests.go:2846-2849`][platformagent_manifests-go-2846-2849] | effective |
-| PVC access mode — `ReadWriteOnce` vs `Many`  | [`platformagent_manifests.go:100-117`][platformagent_manifests-go-100-117]     | effective |
+| `Args` — is there a supervisor at all?       | [`platformagent_manifests.go:2503-2519`][platformagent_manifests-go-2503-2519] | effective |
+| `LEADER_ELECTION_*` — solo or elected? (3.1) | [`platformagent_manifests.go:1766-1781`][platformagent_manifests-go-1766-1781] | effective |
+| Service selector — `kubeagents.io/is-leader` | [`platformagent_manifests.go:3085-3088`][platformagent_manifests-go-3085-3088] | effective |
+| PVC access mode — `ReadWriteOnce` vs `Many`  | [`platformagent_manifests.go:116-133`][platformagent_manifests-go-116-133]     | effective |
 
 Because all four agree, the `scaleToZero` rendering is _inert_ rather than wrong: no pods, no
 election, and a `ReadWriteOnce` volume that matches. **What is not true is that 3.1's unconditional
@@ -178,12 +191,12 @@ configured. This is P2, and 3.1's `solo` mode is what replaces these two lines.
 
 Nothing that is not the gateway is started by whatever is supervising the gateway:
 
-| Process                    | Started by                                                                              | Supervised by |
-| -------------------------- | --------------------------------------------------------------------------------------- | ------------- |
-| `hermes gateway run`       | [`leader_elect.py:138`][leader_elect-py-138], or the entrypoint's exec                  | see above     |
-| Session KV server          | [`docker-entrypoint.sh:1193-1200`][docker-entrypoint-sh-1193-1200], with `&`            | nothing       |
-| Session KV server          | [`platform_mcp_server.py:748-789`][platform_mcp_server-py-748-789], if the port is free | nothing       |
-| Hindsight memory migration | [`docker-entrypoint.sh:1256-1264`][docker-entrypoint-sh-1256-1264], with `&`            | nothing       |
+| Process                        | Started by                                                                              | Supervised by |
+| ------------------------------ | --------------------------------------------------------------------------------------- | ------------- |
+| the gateway (`HERMES_COMMAND`) | [`leader_elect.py:155`][leader_elect-py-155], or the entrypoint's exec                  | see above     |
+| Session KV server              | [`docker-entrypoint.sh:1293-1300`][docker-entrypoint-sh-1293-1300], with `&`            | nothing       |
+| Session KV server              | [`platform_mcp_server.py:748-789`][platform_mcp_server-py-748-789], if the port is free | nothing       |
+| Hindsight memory migration     | [`docker-entrypoint.sh:1356-1364`][docker-entrypoint-sh-1356-1364], with `&`            | nothing       |
 
 The fourth row arrived with the Hindsight memory provider, after this design's first draft, and it
 is a different kind of thing from the others: a one-shot migration that runs once and exits, not a
@@ -268,14 +281,14 @@ for "did the setup run" and says so in its own docstring. S4 deletes the server,
 ### 1.3 One supervision idiom
 
 `leader_elect.py` handles exactly one process and has one response to it exiting — the whole of it,
-at [`leader_elect.py:134-153`][leader_elect-py-134-153]:
+at [`leader_elect.py:151-170`][leader_elect-py-151-170]:
 
 ```python
 if holder == pod_name:
     if process is None:
         print(f"[{pod_name}] Acquired leadership! Starting Hermes...", flush=True)
         update_pod_label(v1, True)
-        process = subprocess.Popen(["hermes", "gateway", "run"])
+        process = subprocess.Popen(HERMES_COMMAND)
     elif process.poll() is not None:
         print(f"[{pod_name}] Hermes process crashed with code {process.returncode}. Exiting to trigger pod restart...", flush=True)
         sys.exit(process.returncode)
@@ -294,7 +307,7 @@ else:
 ```
 
 A single `process` global, `sys.exit` when it exits, and a 10 s grace on loss. The `SIGTERM` path
-([`leader_elect.py:25-55`][leader_elect-py-25-55]) repeats the same terminate-wait-kill and then releases the lease. Three
+([`leader_elect.py:42-72`][leader_elect-py-42-72]) repeats the same terminate-wait-kill and then releases the lease. Three
 things follow that section 2 turns into problems: the crash response restarts the whole container
 without releasing anything (P3), the state is one variable rather than a table (3.2), and the 10 s
 grace is one of the two terms in the timing inequality (P5).
@@ -303,7 +316,7 @@ grace is one of the two terms in the timing inequality (P5).
 
 The `platform-agent` container declares no probe of any kind. The whole container spec is short
 enough to show, and the point is what is absent from it
-([`platformagent_manifests.go:2339-2357`][platformagent_manifests-go-2339-2357]):
+([`platformagent_manifests.go:2578-2596`][platformagent_manifests-go-2578-2596]):
 
 ```go
 Name:            "platform-agent",
@@ -330,7 +343,7 @@ SecurityContext: &corev1.SecurityContext{
 No `ReadinessProbe`, no `LivenessProbe`, no `StartupProbe` — the container that serves port 8642 is
 never asked a question. The only readiness probe in the pod belongs to the `envoy-credential-proxy`
 container, and it is the shape 3.4's probe should match — an existing, working example in the same
-file ([`platformagent_manifests.go:1972-1979`][platformagent_manifests-go-1972-1979]):
+file ([`platformagent_manifests.go:2177-2184`][platformagent_manifests-go-2177-2184]):
 
 ```go
 ReadinessProbe: &corev1.Probe{
@@ -346,18 +359,18 @@ Nothing the gateway container runs — the gateway itself, the KV server's `/hea
 asked whether it is alive.
 
 At `replicas > 1` the Service selector gains `kubeagents.io/is-leader=true`
-([`platformagent_manifests.go:2849`][platformagent_manifests-go-2849]), so followers are already excluded from endpoints by label.
+([`platformagent_manifests.go:3088`][platformagent_manifests-go-3088]), so followers are already excluded from endpoints by label.
 Readiness today therefore changes nothing about routing, and its absence costs only visibility.
 
 ### 1.5 The timing parameters
 
 | Parameter                    | Value                                      | Where                                                                                                            |
 | ---------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `lease_duration_seconds`     | 15 s                                       | [`leader_elect.py:70`][leader_elect-py-70]                                                                       |
-| sleep between polls          | 5 s + U(0,2)                               | [`leader_elect.py:71`][leader_elect-py-71], [`leader_elect.py:156`][leader_elect-py-156]                         |
-| lease read/write timeout     | **none** — the client default              | [`leader_elect.py:78`][leader_elect-py-78], [`leader_elect.py:84`][leader_elect-py-84]                           |
+| `lease_duration_seconds`     | 15 s                                       | [`leader_elect.py:87`][leader_elect-py-87]                                                                       |
+| sleep between polls          | 5 s + U(0,2)                               | [`leader_elect.py:88`][leader_elect-py-88], [`leader_elect.py:173`][leader_elect-py-173]                         |
+| lease read/write timeout     | **none** — the client default              | [`leader_elect.py:95`][leader_elect-py-95], [`leader_elect.py:101`][leader_elect-py-101]                         |
 | renew deadline               | **none** — there is no such concept        | —                                                                                                                |
-| process termination grace    | 10 s                                       | [`leader_elect.py:35`][leader_elect-py-35], [`leader_elect.py:148`][leader_elect-py-148]                         |
+| process termination grace    | 10 s                                       | [`leader_elect.py:52`][leader_elect-py-52], [`leader_elect.py:165`][leader_elect-py-165]                         |
 | Deployment strategy, `n = 1` | **Recreate**                               | [`manifest_helpers.go:275-277`][manifest_helpers-go-275-277]                                                     |
 | Deployment strategy, `n > 1` | RollingUpdate, 25% surge / 25% unavailable | [`manifest_helpers.go:61`][manifest_helpers-go-61], [`manifest_helpers.go:290-297`][manifest_helpers-go-290-297] |
 
@@ -403,7 +416,7 @@ most of E7's claims assert the broken state and are meant to start failing when 
 | R9  | **The supervisor behaves as PID 1**: forwards signals, reaps orphans it never started, and leaves nothing of a supervised process behind when it stops one                                                  | 3.7, 3.3 | E1b, E8, E13; 6 Unit                                               |
 | R10 | **Per-iteration writes are pod-local.** Nothing the supervisor writes every poll may be a fixed path on the shared volume (L5)                                                                              | 3.4      | 6 Operator; 6 E2E                                                  |
 | R11 | **Timing safety is asserted mechanically, at startup of `elected` mode** — never in prose, never only in review, and never in `solo`, which has no lease to be unsafe about                                 | 3.5, 6   | E6; 6 Timing                                                       |
-| R12 | **S1 is behaviour-preserving at both replica counts.** The single-replica path gains a parent process and nothing else                                                                                      | 5        | golden files; 6 E2E                                                |
+| R12 | **S1 is behaviour-preserving on all three of 1.1's launch paths**, front door included. The single-replica paths gain a parent process and nothing else                                                     | 5        | golden files; 6 E2E                                                |
 
 #### Hard limits
 
@@ -510,7 +523,7 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 
 Reaching anything else takes three optional fields in a row — `spec.deployment`, then
 `.availability`, then `.replicas`, all pointer-typed and all `+optional`
-([`common_types.go:385-390`][common_types-go-385-390]):
+([`common_types.go:413-418`][common_types-go-413-418]):
 
 ```go
 // AvailabilitySpec defines high availability and scheduling settings.
@@ -523,7 +536,7 @@ type AvailabilitySpec struct {
 
 Omitting any one of the three yields one replica, and the chart's `values.yaml` sets none of
 them. So the deployment this design has to work for is the one where `leader_elect.py` is mounted
-into the container ([`platformagent_manifests.go:1818-1819`][platformagent_manifests-go-1818-1819]) and never executed.
+into the container ([`platformagent_manifests.go:2023-2024`][platformagent_manifests-go-2023-2024]) and never executed.
 
 That is what makes this the blocking problem rather than a rough edge. The Session KV
 decomposition's plan — put the store under the election's supervision — is correct at
@@ -547,7 +560,7 @@ mode rather than adding a branch beside it.
 
 ### P3 — One process exiting restarts the whole container, and the crash path leaks leader state
 
-The response to a process that has exited is two lines ([`leader_elect.py:139-141`][leader_elect-py-139-141]):
+The response to a process that has exited is two lines ([`leader_elect.py:156-158`][leader_elect-py-156-158]):
 
 ```python
 elif process.poll() is not None:
@@ -565,7 +578,7 @@ because a container restart re-runs the entrypoint from the top, which rebuilds 
 and starts another Session KV server.
 
 **It bypasses the cleanup path.** `sys.exit` here is not `release_lease_and_exit`; that function
-is only ever reached through the signal handlers registered at [`leader_elect.py:63-64`][leader_elect-py-63-64]:
+is only ever reached through the signal handlers registered at [`leader_elect.py:80-81`][leader_elect-py-80-81]:
 
 ```python
 signal.signal(signal.SIGTERM, release_lease_and_exit)
@@ -573,7 +586,7 @@ signal.signal(signal.SIGINT,  release_lease_and_exit)
 ```
 
 Everything that function does on the way out is therefore skipped when a supervised process
-exits ([`leader_elect.py:41-55`][leader_elect-py-41-55]):
+exits ([`leader_elect.py:58-72`][leader_elect-py-58-72]):
 
 ```python
     try:
@@ -684,8 +697,8 @@ Worst case for an outgoing leader to notice it has lost the lease and finish shu
 ```
 
 **The 7 s is the sleep, not the iteration.** Between two sleeps the loop performs a lease read and,
-on the leader, a lease write ([`leader_elect.py:78`][leader_elect-py-78],
-[`leader_elect.py:84`][leader_elect-py-84]), neither carrying a request timeout, on a loop sharing a
+on the leader, a lease write ([`leader_elect.py:95`][leader_elect-py-95],
+[`leader_elect.py:101`][leader_elect-py-101]), neither carrying a request timeout, on a loop sharing a
 CPU-limited gVisor sandbox (L12). So 17 s is the best case for this arithmetic and there is no
 worst case at all — a hung API call stops the leader from noticing indefinitely, and nothing else
 will. That is a second defect inside P5 rather than a footnote to it, and it is why 3.5's answer
@@ -707,7 +720,7 @@ nothing prevents two processes from both believing they hold it for a bounded wi
 
 The loop does self-terminate on a partition, though by accident rather than by design. A non-404
 `ApiException` leaves `holder` at its initialised `None` and falls through to the loss branch
-([`leader_elect.py:111-153`][leader_elect-py-111-153]):
+([`leader_elect.py:128-170`][leader_elect-py-128-170]):
 
 ```python
 except ApiException as e:
@@ -771,7 +784,7 @@ is named rather than linked, except where a version-pinned line is worth reading
 | Pattern                                            | Applied at                                   | Canonical statement                                                                                                                                            |
 | -------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Lease (a lock with an expiry)**                  | the whole elected mode; P5, 3.5              | Gray & Cheriton, 1989; Chubby, OSDI 2006. The holder may act only until the lease expires, and must stop before it does                                        |
-| **Active/passive failover**                        | the Service's leader-label selector          | Already named in the script's own header comment ([`leader_elect.py:12-16`][leader_elect-py-12-16]) — a blackhole, not request-continuous HA                   |
+| **Active/passive failover**                        | the Service's leader-label selector          | Already named in the script's own header comment ([`leader_elect.py:29-33`][leader_elect-py-29-33]) — a blackhole, not request-continuous HA                   |
 | **Backoff with jitter**                            | the retry period, `2 + U(0,1)` (3.5)         | AWS, "Exponential Backoff And Jitter" (Brooker, 2015); client-go uses `JitterFactor = 1.2`. Jitter is what stops N replicas polling in lockstep                |
 | **Renew deadline** (self-fencing on a local clock) | 3.5's `renew_deadline_seconds`               | client-go's `RenewDeadline`: the holder gives up leading when _it_ has not renewed in time, without waiting for a call to return. The one term 3.5 was missing |
 | **Bounded remote call**                            | 3.5's `_request_timeout` on every lease call | Nygard again. An untimed call is an unbounded one, and the renew deadline is only enforceable if the loop reaches it                                           |
@@ -850,14 +863,25 @@ choice rather than settling it here.
 ### 3.1 One supervisor, two modes, every replica count
 
 `leader_elect.py` becomes a supervisor with an explicit mode, and the operator makes it the
-gateway container's `Args` unconditionally.
+gateway container's `Args` unconditionally — replacing the whole three-way `switch` of 1.1 with one
+assignment, not deleting a branch from a two-way `if`.
+
+**The front-door case comes along for free, and it is worth saying why rather than leaving it to
+be rediscovered.** At one replica with the front door on, the operator today puts
+`hermes --profile platform gateway run` in `Args`. Under S1 that argv disappears and the wrapper
+takes its place — which is behaviour-preserving only because the profile already travels in
+`HERMES_GATEWAY_PROFILE`, set unconditionally by the operator and read by the wrapper into
+`HERMES_COMMAND`. That is not a coincidence this design can rely on quietly: #699 put it in an
+environment variable **precisely so the `replicas > 1` path could carry it**, and S1 is the change
+that makes every path that path. If a future change moves the profile back into `Args`, S1 breaks
+the front door, so the coupling is recorded here and asserted by E7's `C1`.
 
 ```
 mode = elected  if LEADER_ELECTION_LEASE_NAME and LEADER_ELECTION_NAMESPACE else solo
 ```
 
 - **`solo`** — behave as a permanent leader. Start the processes, supervise them, never contact
-  the API server, never label the pod. This replaces the `os.execvp` at [`leader_elect.py:60-61`][leader_elect-py-60-61];
+  the API server, never label the pod. This replaces the `os.execvp` at [`leader_elect.py:77-78`][leader_elect-py-77-78];
   the reason to supervise rather than exec is that there is more than one process to start, and
   that is true independent of how many replicas there are.
 - **`elected`** — today's loop, unchanged in structure: acquire, label, start processes, renew,
@@ -896,7 +920,7 @@ not. **`ReadWriteOnce` is a per-_node_ mode**: the volume may be mounted read-wr
 and Kubernetes explicitly allows several pods on that node to mount it read-write at once.
 `ReadWriteOncePod` is the mode that means one pod, and nothing in this repository asks for it.
 Nothing keeps the replicas apart either — `buildDeployment` takes `Affinity` only from
-user-supplied `availability.affinity` ([`platformagent_manifests.go:1706`][platformagent_manifests-go-1706]), so there is no
+user-supplied `availability.affinity` ([`platformagent_manifests.go:1911`][platformagent_manifests-go-1911]), so there is no
 default anti-affinity and the scheduler may co-schedule them.
 
 So a `kubectl scale --replicas=3` that lands two pods on one node gives two `solo` supervisors
@@ -906,11 +930,11 @@ the honest consequence is that **S4 needs a real single-writer guard rather than
 4 carries that as an explicit ask.
 
 And a `solo` supervisor never labels the pod, so at one replica the Service selector must continue
-not to require `kubeagents.io/is-leader` ([`platformagent_manifests.go:2849`][platformagent_manifests-go-2849] adds it only above
+not to require `kubeagents.io/is-leader` ([`platformagent_manifests.go:3088`][platformagent_manifests-go-3088] adds it only above
 one replica) — S1 must not disturb that.
 
-Making the script the exec target at every replica count is what collapses 1.1's table to one
-row. It has two knock-ons, both of them comments in the operator that are written around the
+Making the script the exec target at every replica count is what collapses 1.1's three rows to
+one. It has two knock-ons, both of them comments in the operator that are written around the
 single-replica case this removes:
 
 - The entrypoint's shared-state auto-detection looks for a bare `gateway` argument
@@ -918,7 +942,7 @@ single-replica case this removes:
   single replica today. The operator already names the owner explicitly with
   `AGENT_SHARED_STATE_SETUP=owner`, so nothing changes in behaviour — but the comment gets simpler
   and should be updated rather than left describing a case that no longer exists.
-- The `Args, never Command` comment ([`platformagent_manifests.go:2288-2297`][platformagent_manifests-go-2288-2297]) explains the
+- The `Args, never Command` comment ([`platformagent_manifests.go:2493-2502`][platformagent_manifests-go-2493-2502]) explains the
   exec-target choice partly in terms of the entrypoint "start[ing] the Session KV server on 8699
   that the event-watcher is pointed at". That clause survives S1 but not S4, where the entrypoint
   stops starting it.
@@ -931,10 +955,19 @@ either of them may shell out to. The supervisor holds them in a table rather tha
 `process` global of 1.3, and the rest of this design says "process" for a table entry wherever
 that is unambiguous.
 
-| Supervised process   | Start | Stop | Grace                 | Criticality                                               |
-| -------------------- | ----- | ---- | --------------------- | --------------------------------------------------------- |
-| Session KV server    | 1     | 2    | 10 s — **unmeasured** | **optional** — the gateway's plugins fail open without it |
-| `hermes gateway run` | 2     | 1    | 10 s                  | **required** — the container exists to run it             |
+| Supervised process | Start | Stop | Grace                 | Criticality                                               |
+| ------------------ | ----- | ---- | --------------------- | --------------------------------------------------------- |
+| Session KV server  | 1     | 2    | 10 s — **unmeasured** | **optional** — the gateway's plugins fail open without it |
+| the gateway        | 2     | 1    | 10 s                  | **required** — the container exists to run it             |
+
+**The required entry is `HERMES_COMMAND`, not the literal `hermes gateway run`.** The diagrams in
+this document write the short form because it is what runs on a default install, but the command
+`leader_elect.py` builds is `["hermes"] + (["--profile", p] if p else []) + ["gateway", "run"]`
+([`leader_elect.py:26-27`][leader_elect-py-26-27]), with `p` from `HERMES_GATEWAY_PROFILE`. The
+`--profile` flag is global and **position-sensitive** — the file's own comment records that
+`hermes gateway run --profile platform` is a different, wrong command, because the subcommand has
+no such flag. An implementer who builds the table from the short form re-homes the gateway to the
+default profile on a front-door install, which is a silent misconfiguration rather than a crash.
 
 **Grace is a property of the entry, not a global constant**, even though both rows carry the same
 number today. 3.5's shutdown term is the sum of this column, so it is the column an implementer
@@ -957,7 +990,7 @@ stating, because "why isn't memory in here?" is the obvious question a reader no
 
 | Thing                       | Why it is not a table entry                                                                                                                                                                                                                                                                                                  |
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Hindsight itself**        | Not in this container, or any container of this pod. It is a separate in-cluster Deployment reached over a Service — the operator hands the gateway `http://hindsight-api.<ns>.svc.cluster.local:8888` ([`platformagent_manifests.go:1627`][platformagent_manifests-go-1627]). A remote dependency, not a supervised process |
+| **Hindsight itself**        | Not in this container, or any container of this pod. It is a separate in-cluster Deployment reached over a Service — the operator hands the gateway `http://hindsight-api.<ns>.svc.cluster.local:8888` ([`platformagent_manifests.go:1832`][platformagent_manifests-go-1832]). A remote dependency, not a supervised process |
 | **The memory migration**    | One-shot. It runs once per boot and exits, so there is nothing to keep running. It is in 1.2 rather than here, because what matters about it is that the supervisor _inherits_ it (3.7)                                                                                                                                      |
 | **`memory_ttl_curator.py`** | Not scheduled by anything — its own header says so, and it is run by hand through `kubectl exec`. Periodic work belongs in Hermes cron or an operator action, not in a supervisor whose job is keeping services up                                                                                                           |
 
@@ -1104,7 +1137,7 @@ Per process, not per pod:
 - **Stopping signals the process group, not the process** — and sweeps it afterwards. Every entry
   is started with `start_new_session=True`, so it leads its own group, and stopped with `killpg`
   rather than `Popen.terminate()`. Today's script signals the direct child only
-  ([`leader_elect.py:146`][leader_elect-py-146]), which is adequate when the child is the only
+  ([`leader_elect.py:163`][leader_elect-py-163]), which is adequate when the child is the only
   thing that matters and is not adequate here: 3.5's guarantee is that _nothing the outgoing leader
   ran_ is still touching the resource, and the gateway shells out constantly. A grandchild
   outlives `terminate()`, reparents to the supervisor, and is then reaped by 3.7 — reaped, note,
@@ -1319,10 +1352,10 @@ and none is an `httpGet`.
 #### The file must be pod-local, and `$PLATFORM_AGENT_HOME` is not
 
 The obvious home for it is under the agent's own home directory, and that is the one place it must
-not go. `PLATFORM_AGENT_HOME` is `homeDir` ([`platformagent_manifests.go:1385-1389`][platformagent_manifests-go-1385-1389]), which is
+not go. `PLATFORM_AGENT_HOME` is `homeDir` ([`platformagent_manifests.go:1590-1594`][platformagent_manifests-go-1590-1594]), which is
 `defaultAgentHome = "/opt/data"` ([`platformagent_manifests.go:55`][platformagent_manifests-go-55]) — the mount point of the
-`platform-agent-data-vol` PVC ([`platformagent_manifests.go:1810-1815`][platformagent_manifests-go-1810-1815]). Above one replica that
-PVC is `ReadWriteMany` on `standard-rwx` ([`platformagent_manifests.go:100-117`][platformagent_manifests-go-100-117]): **one volume,
+`platform-agent-data-vol` PVC ([`platformagent_manifests.go:2015-2020`][platformagent_manifests-go-2015-2020]). Above one replica that
+PVC is `ReadWriteMany` on `standard-rwx` ([`platformagent_manifests.go:116-133`][platformagent_manifests-go-116-133]): **one volume,
 mounted by every replica of the Deployment.**
 
 So a fixed path under it would mean, in elected mode — the only mode in which more than one
@@ -1342,7 +1375,7 @@ for.
 
 None of this is a new lesson here. The entrypoint already tags its staging paths with `$HOSTNAME`
 for the same reason, and says why at length
-([`docker-entrypoint.sh:872-896`][docker-entrypoint-sh-872-896]): "at `availability.replicas > 1` the operator hands every
+([`docker-entrypoint.sh:923-947`][docker-entrypoint-sh-923-947]): "at `availability.replicas > 1` the operator hands every
 replica the SAME PVC (ReadWriteMany) … fixed siblings … are shared names on a shared volume."
 
 **So the status file goes on a pod-local volume**, not on the PVC and not under
@@ -1350,8 +1383,8 @@ replica the SAME PVC (ReadWriteMany) … fixed siblings … are shared names on 
 `/var/run/supervisor` in the `platform-agent` container only. That is the shape the pod already
 uses twice for exactly this kind of runtime scratch —
 `credential-proxy-runtime` and `event-watcher-kubeconfig`
-([`platformagent_manifests.go:2192-2193`][platformagent_manifests-go-2192-2193]) — so it needs no new pattern, and `fsGroup` on the pod
-([`platformagent_manifests.go:1730-1736`][platformagent_manifests-go-1730-1736]) makes it writable by UID 10000 without any further
+([`platformagent_manifests.go:2397-2398`][platformagent_manifests-go-2397-2398]) — so it needs no new pattern, and `fsGroup` on the pod
+([`platformagent_manifests.go:1935-1941`][platformagent_manifests-go-1935-1941]) makes it writable by UID 10000 without any further
 grant. Tagging a path on the PVC with `$HOSTNAME` would also work, and is rejected: it keeps a
 per-poll write on a network volume, and leaves one file per pod name to be cleaned up by nobody.
 
@@ -1470,7 +1503,7 @@ probe silently covers; it is listed as an open question in 8.
 
 **And the gap widens as the gateway grows dependencies it reaches over the network.** The memory
 provider is the current example: recall and retention go to `hindsight-api` in another pod
-([`platformagent_manifests.go:1627`][platformagent_manifests-go-1627]), so a gateway whose
+([`platformagent_manifests.go:1832`][platformagent_manifests-go-1832]), so a gateway whose
 Hindsight is unreachable is degraded in a way neither a PID nor a TCP accept can detect.
 
 The tempting response — have the probe check the gateway's dependencies too — is to turn a
@@ -1501,7 +1534,7 @@ which is what the startup probe below exists for.
 
 L9 is not a footnote here. `docker-entrypoint.sh` must finish before anything is supervised,
 because it builds the tree the processes read, and the supervisor is its `exec "$@"` target
-([`docker-entrypoint.sh:1293`][docker-entrypoint-sh-1293]). Until that `exec`, **no supervisor
+([`docker-entrypoint.sh:1393`][docker-entrypoint-sh-1393]). Until that `exec`, **no supervisor
 exists and nothing has written `/var/run/supervisor/ready`** — so both probes fail, either on the
 missing file or, worse, on a stale timestamp the previous container left in the pod-scoped
 `emptyDir` that 3.4 relies on surviving a container restart.
@@ -1679,20 +1712,20 @@ exists to prevent, so the invalidation is part of the mechanism rather than an i
 detail.
 The last line prices a renew correctly, which an earlier revision did not: **a renew is two calls,
 not one** — `read_namespaced_lease` then `replace_namespaced_lease`
-([`leader_elect.py:78`][leader_elect-py-78], [`leader_elect.py:84`][leader_elect-py-84]) — so
+([`leader_elect.py:95`][leader_elect-py-95], [`leader_elect.py:101`][leader_elect-py-101]) — so
 budgeting one round trip means budgeting two timeouts. Sized against one, a leader whose first
 renew round trip timed out would demote without ever retrying, tearing down the table on a single
 transient blip.
 
 **What a timed-out call raises is not something to assume.** An earlier revision argued the
 aggressive timeout was safe because "a timed-out read leaves `holder` at `None` and falls into the
-loss branch" ([`leader_elect.py:111-153`][leader_elect-py-111-153]). The loop has exactly two
-handlers and both are `except ApiException` ([`leader_elect.py:85`][leader_elect-py-85],
-[`leader_elect.py:111`][leader_elect-py-111]), and `_request_timeout` is passed through to urllib3,
+loss branch" ([`leader_elect.py:128-170`][leader_elect-py-128-170]). The loop has exactly two
+handlers and both are `except ApiException` ([`leader_elect.py:102`][leader_elect-py-102],
+[`leader_elect.py:128`][leader_elect-py-128]), and `_request_timeout` is passed through to urllib3,
 whose timeout errors the client does not convert — `kubernetes.client.rest` special-cases `SSLError`
 and little else. An unconverted timeout therefore propagates out of `main()` and **kills the
 process**, and since `release_lease_and_exit` is wired only to `SIGTERM`/`SIGINT`
-([`leader_elect.py:63-64`][leader_elect-py-63-64]) nothing drops the label or clears
+([`leader_elect.py:80-81`][leader_elect-py-80-81]) nothing drops the label or clears
 `holder_identity` — P3's leaked-leader state, reached by the very change that was supposed to be
 the safe direction, and now holding a 35 s lease instead of a 15 s one.
 
@@ -1760,8 +1793,8 @@ Before pricing the options, correct the price. Every earlier revision costed a l
 "+15 s of failover blackhole" flat, and that is wrong for the failover that happens most often.
 
 **A clean handover does not wait for the lease to expire.** `release_lease_and_exit` clears
-`holder_identity` ([`leader_elect.py:49-50`][leader_elect-py-49-50]), and a challenger's next poll
-tests `if holder is None or is_expired` ([`leader_elect.py:100`][leader_elect-py-100]) — the
+`holder_identity` ([`leader_elect.py:66-67`][leader_elect-py-66-67]), and a challenger's next poll
+tests `if holder is None or is_expired` ([`leader_elect.py:117`][leader_elect-py-117]) — the
 `None` arm fires immediately. The stored duration is never consulted. So:
 
 | Failover                                                    | The challenger waits for                    | Effect of 15 → 35 s               |
@@ -1826,20 +1859,20 @@ kernel finishes.
 #### Raising the constant does not raise the Lease
 
 `lease_duration_seconds` reaches the API object on exactly one code path: the 404-create branch
-([`leader_elect.py:114-125`][leader_elect-py-114-125]). Neither of the other two writers touches the field —
+([`leader_elect.py:131-142`][leader_elect-py-131-142]). Neither of the other two writers touches the field —
 
 | Path      | Where                                                | Writes `leaseDurationSeconds`?                            |
 | --------- | ---------------------------------------------------- | --------------------------------------------------------- |
-| create    | [`leader_elect.py:114-125`][leader_elect-py-114-125] | **Yes** — the only place the constant is ever stored      |
-| renew     | [`leader_elect.py:82-84`][leader_elect-py-82-84]     | No — `replace_namespaced_lease` on the body read back     |
-| take over | [`leader_elect.py:101-106`][leader_elect-py-101-106] | No — same; it sets holder, renew, acquire and transitions |
+| create    | [`leader_elect.py:131-142`][leader_elect-py-131-142] | **Yes** — the only place the constant is ever stored      |
+| renew     | [`leader_elect.py:99-101`][leader_elect-py-99-101]   | No — `replace_namespaced_lease` on the body read back     |
+| take over | [`leader_elect.py:118-123`][leader_elect-py-118-123] | No — same; it sets holder, renew, acquire and transitions |
 
 — and a challenger's expiry test reads the **stored** value, not its own constant:
 `duration = lease.spec.lease_duration_seconds or lease_duration_seconds`
-([`leader_elect.py:89`][leader_elect-py-89]). Nothing outside the script writes it either: the operator
+([`leader_elect.py:106`][leader_elect-py-106]). Nothing outside the script writes it either: the operator
 reconciles the leader `Role` and `RoleBinding` and never the Lease
 ([`platformagent_controller.go:841-855`][platformagent_controller-go-841-855]), and the object is created with bare
-name/namespace metadata and **no owner reference** ([`leader_elect.py:117`][leader_elect-py-117]), so it survives every
+name/namespace metadata and **no owner reference** ([`leader_elect.py:134`][leader_elect-py-134]), so it survives every
 rollout, upgrade and CR deletion.
 
 On any already-running multi-replica install, therefore, the Lease keeps `leaseDurationSeconds: 15`
@@ -1915,7 +1948,7 @@ resource itself, which is Kleppmann's answer and the one this design declines be
 
 A leader partitioned from the API server keeps running until its own next poll
 fails — and today's loop does self-terminate in that case, because a non-404 `ApiException` leaves
-`holder` as `None` and falls into the loss branch ([`leader_elect.py:111-153`][leader_elect-py-111-153]) — but "eventually
+`holder` as `None` and falls into the loss branch ([`leader_elect.py:128-170`][leader_elect-py-128-170]) — but "eventually
 self-terminates" is not the same as "cannot still be writing". Nothing about the Lease prevents two
 processes from both believing they are the leader for a bounded window.
 
@@ -1937,7 +1970,7 @@ obligations an ordinary process does not. These two are the whole job of the **i
 pattern (3.0), and the reason `tini` and `dumb-init` exist at all.
 
 **Signals.** The kernel installs no default handlers for PID 1: an unhandled `SIGTERM` is
-_ignored_ rather than fatal. [`leader_elect.py:63-64`][leader_elect-py-63-64] already registers one, so this works today;
+_ignored_ rather than fatal. [`leader_elect.py:80-81`][leader_elect-py-80-81] already registers one, so this works today;
 it is listed because deleting that registration would not fail any test, and the symptom — pods
 that take the full grace period and then die by `SIGKILL` on every rollout, losing the lease
 release every time — is a slow, easily-misattributed regression.
@@ -2243,10 +2276,13 @@ rather than an alternative to it, and 8 records the choice as open rather than s
 
 ## 4. Operator changes
 
-- Set the gateway container's `Args` to the supervisor at **every** replica count
-  ([`platformagent_manifests.go:2298-2303`][platformagent_manifests-go-2298-2303]). **Change this gate only** — the other three in
-  1.1's table stay on the effective replica count, deliberately:
-  - Moving the `LEADER_ELECTION_*` gate ([`platformagent_manifests.go:1561-1576`][platformagent_manifests-go-1561-1576]) to the
+- Replace the three-way `switch` selecting the gateway container's `Args`
+  ([`platformagent_manifests.go:2503-2519`][platformagent_manifests-go-2503-2519]) with the supervisor, unconditionally. Both
+  existing cases collapse into it: the elected one already used it, and the front-door one is
+  carried by `HERMES_GATEWAY_PROFILE`, which is set unconditionally and which the wrapper reads
+  (3.1). **Change this gate only** — the other three in 1.1's table stay on the effective replica
+  count, deliberately:
+  - Moving the `LEADER_ELECTION_*` gate ([`platformagent_manifests.go:1766-1781`][platformagent_manifests-go-1766-1781]) to the
     intended count would render `elected` mode on a Deployment with zero pods and a
     `ReadWriteOnce` volume, and would then need the Service selector moved with it or followers
     running nothing would sit in the endpoint list. That is three coupled changes to improve a
@@ -2261,7 +2297,7 @@ rather than an alternative to it, and 8 records the choice as open rather than s
     there: 1.1 works through why `replicas: 3` plus `scaleToZero` renders RollingUpdate beside
     `solo` mode, and E7's `C9` pins the disagreement so a later change to either side is visible.
 - Add the **exec** readiness probe of 3.4 to the `platform-agent` container
-  ([`platformagent_manifests.go:2339-2357`][platformagent_manifests-go-2339-2357]) — matching the `envoy-credential-proxy` probe's shape,
+  ([`platformagent_manifests.go:2578-2596`][platformagent_manifests-go-2578-2596]) — matching the `envoy-credential-proxy` probe's shape,
   not an `httpGet` — **together with the `startupProbe`, which is not optional and not deferrable**.
   Nothing writes the status file until the entrypoint `exec`s the supervisor, and the entrypoint's
   bootstrap lock alone can wait 300 s ([`docker-entrypoint.sh:304`][docker-entrypoint-sh-304]), so a
@@ -2273,22 +2309,22 @@ rather than an alternative to it, and 8 records the choice as open rather than s
   `status.json` and the one-line `ready` the probes read. It must not be a path under
   `$PLATFORM_AGENT_HOME`, which is the ReadWriteMany PVC every replica shares; 3.4 works
   through what a shared status file breaks. The two `emptyDir`s at
-  [`platformagent_manifests.go:2192-2193`][platformagent_manifests-go-2192-2193] are the shape to copy.
+  [`platformagent_manifests.go:2397-2398`][platformagent_manifests-go-2397-2398] are the shape to copy.
 - Set `terminationGracePeriodSeconds: 60` on the pod spec (3.7). It is unset today, so it is 30 s,
   which the two-process shutdown budget does not fit inside with useful margin.
 - **At S4, give the single-writer rule something that actually enforces it.** `ReadWriteOnce` does
   not: it is a per-node mode, and two co-scheduled pods may both mount the volume read-write (3.1).
   Either request `ReadWriteOncePod` for the volume the KV server owns, or add a default pod
   anti-affinity — today `Affinity` comes only from user-supplied `availability.affinity`
-  ([`platformagent_manifests.go:1706`][platformagent_manifests-go-1706]). This is not needed for S1–S3, which add no exclusive
+  ([`platformagent_manifests.go:1911`][platformagent_manifests-go-1911]). This is not needed for S1–S3, which add no exclusive
   writer, and it must not be skipped at S4, which does.
 - Retime the election (3.5): `lease_duration_seconds` 15 → **35**, the retry period `5 + U(0,2)` →
   **`2 + U(0,1)`**, and two new constants — `renew_deadline_seconds = 9` and a **2 s
   `_request_timeout`, clamped to the remaining deadline, on every lease call**. The last two are
   the ones without which the rest is cosmetic. All of them live in
-  [`k8s-operator/internal/controller/leader_elect.py:70-71`][leader_elect-py-70-71], a real file that
-  [`platformagent_manifests.go:3452`][platformagent_manifests-go-3452] pulls in with `//go:embed` and
-  [`platformagent_manifests.go:185`][platformagent_manifests-go-185] mounts as a ConfigMap key — they are not inline string literals
+  [`k8s-operator/internal/controller/leader_elect.py:87-88`][leader_elect-py-87-88], a real file that
+  [`platformagent_manifests.go:3691`][platformagent_manifests-go-3691] pulls in with `//go:embed` and
+  [`platformagent_manifests.go:201`][platformagent_manifests-go-201] mounts as a ConfigMap key — they are not inline string literals
   in the Go source.
 - **Stop leading on the renew deadline, not on a reply** (3.5). This is a change to the loop's
   shape rather than a constant, and it is the part of S3 that P5 and P6 both actually need. Four
@@ -2301,17 +2337,17 @@ rather than an alternative to it, and 8 records the choice as open rather than s
   - **Clear `last_renew` on a definitive loss**, not only on a timeout, or a denied leader
     re-promotes on its next timed-out call.
   - **Catch broadly around every lease call.** Today the loop has two handlers and both are
-    `except ApiException` ([`leader_elect.py:85`][leader_elect-py-85],
-    [`leader_elect.py:111`][leader_elect-py-111]); a `_request_timeout` firing need not produce
+    `except ApiException` ([`leader_elect.py:102`][leader_elect-py-102],
+    [`leader_elect.py:128`][leader_elect-py-128]); a `_request_timeout` firing need not produce
     one, and an unconverted exception kills the process while it still holds the lease and the
     label. Treat any failure of a lease call as "no answer" and let the deadline decide.
 - **Signal the process group** (3.3): `start_new_session=True` on every `Popen`, and `killpg`
   rather than `Popen.terminate()`, so a grandchild of the gateway cannot outlive the handover 3.5
   guarantees.
 - **Write `lease_duration_seconds` on the renew and takeover paths as well as on create**
-  ([`leader_elect.py:82-84`][leader_elect-py-82-84], [`leader_elect.py:101-106`][leader_elect-py-101-106]). Without this the constant
+  ([`leader_elect.py:99-101`][leader_elect-py-99-101], [`leader_elect.py:118-123`][leader_elect-py-118-123]). Without this the constant
   above changes nothing on an existing install, because a challenger reads the value stored on the
-  Lease ([`leader_elect.py:89`][leader_elect-py-89]) and nothing ever rewrites it — 3.5 has the arithmetic, and the
+  Lease ([`leader_elect.py:106`][leader_elect-py-106]) and nothing ever rewrites it — 3.5 has the arithmetic, and the
   answer is a 9 s overlap where P5's is 2 s.
 - **Migrate the Lease as an explicit step of S3**: `kubectl delete lease <agent>-leader`, or patch
   `leaseDurationSeconds` on it. The object has no owner reference, so it outlives the rollout that
@@ -2324,7 +2360,7 @@ rather than an alternative to it, and 8 records the choice as open rather than s
   the interpreter the operator's own `Args` names.
 - Update the two comments named in 3.1: `AGENT_SHARED_STATE_SETUP` at
   [`platformagent_manifests.go:60-70`][platformagent_manifests-go-60-70] and `Args, never Command` at
-  [`platformagent_manifests.go:2288-2297`][platformagent_manifests-go-2288-2297]. The second is also
+  [`platformagent_manifests.go:2493-2502`][platformagent_manifests-go-2493-2502]. The second is also
   rewritten at S4 by the KV decomposition's phase 3, which quotes it — one edit, not two.
 - Golden files in `k8s-operator/internal/testing/testdata/platform/expected/` gain the probe and,
   at a single replica, the `Args` they currently omit.
@@ -2335,7 +2371,7 @@ rather than an alternative to it, and 8 records the choice as open rather than s
 
 | Phase | Change                                                                                                                                                                                                                                                | Risk                                                                                                                                                                                    |
 | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S1    | Supervisor modes and the process table, with the gateway as the only process. PID-1 reaping (3.7). Operator sets `Args` unconditionally. Behaviour-preserving at both replica counts.                                                                 | Low — the single-replica path gains a parent process and nothing else                                                                                                                   |
+| S1    | Supervisor modes and the process table, with the gateway as the only process. PID-1 reaping (3.7). Operator replaces 1.1's three-way `Args` switch with the supervisor. Behaviour-preserving on all three launch paths.                               | Low — the single-replica path gains a parent process and nothing else                                                                                                                   |
 | S2    | Per-process restart policy, the status files, and the **startup + readiness** probes (`supervisor-alive` gating `supervisor-ready`).                                                                                                                  | Medium — first probe on this container, and at one replica the strategy is `Recreate`, so a probe that never passes is an outage rather than a stalled rollout. Roll to one agent first |
 | S2b   | **Liveness** probe — `supervisor-alive`, a _different_ script (3.4), longer threshold.                                                                                                                                                                | Medium — a wrongly-firing liveness probe is a restart loop. Ships only after S2's readiness has soaked                                                                                  |
 | S3    | Renew deadline + lease-call timeout, lease 35 s, retry `2 + U(0,1)`, `terminationGracePeriodSeconds: 60`. Writes the duration on renew and takeover, **migrates the existing Lease object** (3.5), and adds the startup assertion of 6.               | Medium — the constant does not reach an existing Lease on its own, and S3+S4 against a stale one is a **14 s** overlap, worse than the 2 s P5 exists to close. Plus the longer lease    |
@@ -2414,7 +2450,7 @@ additions listed under **Unit** below.
 | E4  | Optional-vs-required divergence at the cap                                                               | **Confirmed.** Optional → `ready:true, degraded:true`, supervisor lives. Required → cleanup, then exit. Also surfaced the stale-`ready:true`-on-exit gap now fixed in 3.3                                                                                                                                    |
 | E5  | Shutdown is the sum over the table                                                                       | **Confirmed.** 10 s / 20 s / 30 s for 1 / 2 / 3 processes at a 10 s grace — 3 processes overruns the 30 s default and needs 3.7's 60 s                                                                                                                                                                       |
 | E6  | The inequality catches table growth                                                                      | **Confirmed.** Reproduces every margin in 3.5: today −2, A alone +2, A+C+D +6, a third process −4 (refuses to start), and the unmigrated-Lease rows, where S3+S4 is −14                                                                                                                                      |
-| E7  | The eleven manifest-level claims of sections 1 and 3 (fifteen assertions, two of them per-replica-count) | **Confirmed against rendered output.** Renders Deployments at 1/2/3 replicas through the operator's own `buildDeployment`, plus `buildNetworkPolicy`, `buildPlatformService` and `buildPlatformLeaderRole`                                                                                                   |
+| E7  | The twelve manifest-level claims of sections 1 and 3 (sixteen assertions, two of them per-replica-count) | **Confirmed against rendered output.** Renders Deployments at 1/2/3 replicas through the operator's own `buildDeployment`, plus `buildNetworkPolicy`, `buildPlatformService` and `buildPlatformLeaderRole`                                                                                                   |
 | E8  | An entrypoint background job reparents to the supervisor                                                 | **Confirmed.** One zombie per boot under today's supervisor, none under 3.7's reaper. The case is the Hindsight migration in 1.2                                                                                                                                                                             |
 | E9  | A demoted leader restarts its table on reacquiring the lease                                             | **Falsified 3.3, now fixed.** A stopped entry was terminal, so a reacquired lease resumed with an empty table — label held, nothing served. Also the only case that runs in `elected` mode                                                                                                                   |
 | E10 | Raising `lease_duration_seconds` reaches an existing Lease                                               | **Falsified 3.5, now fixed.** Parsed from the real `leader_elect.py`: the constant is stored on the create path only, and a challenger reads what is stored. 4 gains the migration step                                                                                                                      |
@@ -2495,7 +2531,7 @@ is a bug this design had in an earlier draft:
   graces no longer fit. Both directions, or the mode gate is untested.
 
 The existing file mocks the `kubernetes` package wholesale before importing the module
-([`test_leader_elect.py:5-13`][test_leader_elect-py-5-13]). Solo mode must not need that mock at all — a solo-mode test that
+([`test_leader_elect.py:6-14`][test_leader_elect-py-6-14]). Solo mode must not need that mock at all — a solo-mode test that
 passes with `sys.modules['kubernetes']` unset is the real assertion that 3.1's "never contact the
 API server" holds.
 
@@ -2759,86 +2795,87 @@ in-cluster Postgres that ships unconditionally, replicated, and authenticated. S
 the answer does not change, and the single-writer requirement this design serves is load-bearing.
 
 <!-- Source links, line-anchored and pinned to the commit these line numbers
-     were read from (76a074b). Re-pin here when the numbers are refreshed. -->
+     were read from (d1eea17). Re-pin here when the numbers are refreshed. -->
 
 <!-- External prior art (3.0), pinned to the version this repository depends on. -->
 
-[Dockerfile-113]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/docker/Dockerfile#L113
-[Makefile-71]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/Makefile#L71
-[ci-deploy-sh-144]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/hack/ci-deploy.sh#L144
+[Dockerfile-113]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/docker/Dockerfile#L113
+[Makefile-71]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/Makefile#L71
+[ci-deploy-sh-144]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/hack/ci-deploy.sh#L144
 [client-go-fencing]: https://github.com/kubernetes/client-go/blob/v0.31.0/tools/leaderelection/leaderelection.go#L19-L20
 [client-go-onstoppedleading]: https://github.com/kubernetes/client-go/blob/v0.31.0/tools/leaderelection/leaderelection.go#L95-L96
 [client-go-tryacquireorrenew]: https://github.com/kubernetes/client-go/blob/v0.31.0/tools/leaderelection/leaderelection.go#L408-L415
 [client-go-validate]: https://github.com/kubernetes/client-go/blob/v0.31.0/tools/leaderelection/leaderelection.go#L76-L82
-[common_types-go-385-390]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/api/v1alpha1/common_types.go#L385-L390
-[docker-entrypoint-sh-1193-1200]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/docker-entrypoint.sh#L1193-L1200
-[docker-entrypoint-sh-1256-1264]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/docker-entrypoint.sh#L1256-L1264
-[docker-entrypoint-sh-1293]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/docker-entrypoint.sh#L1293
-[docker-entrypoint-sh-249-253]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/docker-entrypoint.sh#L249-L253
-[docker-entrypoint-sh-304]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/docker-entrypoint.sh#L304
-[docker-entrypoint-sh-872-896]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/docker-entrypoint.sh#L872-L896
-[entrypoint_gate_check-sh-27-31]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/entrypoint_gate_check.sh#L27-L31
-[entrypoint_gate_check-sh-313-324]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/entrypoint_gate_check.sh#L313-L324
-[entrypoint_gate_check-sh-87]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/deploy/shared/entrypoint_gate_check.sh#L87
-[go-mod-11]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/go.mod#L11
-[leader_elect-py-100]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L100
-[leader_elect-py-101-106]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L101-L106
-[leader_elect-py-111-153]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L111-L153
-[leader_elect-py-111]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L111
-[leader_elect-py-114-125]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L114-L125
-[leader_elect-py-117]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L117
-[leader_elect-py-12-16]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L12-L16
-[leader_elect-py-134-153]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L134-L153
-[leader_elect-py-138]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L138
-[leader_elect-py-139-141]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L139-L141
-[leader_elect-py-146]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L146
-[leader_elect-py-148]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L148
-[leader_elect-py-156]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L156
-[leader_elect-py-25-55]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L25-L55
-[leader_elect-py-35]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L35
-[leader_elect-py-41-55]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L41-L55
-[leader_elect-py-49-50]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L49-L50
-[leader_elect-py-60-61]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L60-L61
-[leader_elect-py-63-64]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L63-L64
-[leader_elect-py-70-71]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L70-L71
-[leader_elect-py-70]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L70
-[leader_elect-py-71]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L71
-[leader_elect-py-78]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L78
-[leader_elect-py-82-84]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L82-L84
-[leader_elect-py-84]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L84
-[leader_elect-py-85]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L85
-[leader_elect-py-89]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/leader_elect.py#L89
-[main-go-197-198]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/cmd/main.go#L197-L198
-[manifest_helpers-go-273-278]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/manifest_helpers.go#L273-L278
-[manifest_helpers-go-275-277]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/manifest_helpers.go#L275-L277
-[manifest_helpers-go-286-287]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/manifest_helpers.go#L286-L287
-[manifest_helpers-go-290-297]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/manifest_helpers.go#L290-L297
-[manifest_helpers-go-290]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/manifest_helpers.go#L290
-[manifest_helpers-go-61]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/manifest_helpers.go#L61
-[platform_mcp_server-py-748-789]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/agents/platform/scripts/platform_mcp_server.py#L748-L789
-[platformagent_controller-go-841-855]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_controller.go#L841-L855
-[platformagent_manifests-go-100-117]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L100-L117
-[platformagent_manifests-go-1385-1389]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1385-L1389
-[platformagent_manifests-go-1561-1576]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1561-L1576
-[platformagent_manifests-go-1627]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1627
-[platformagent_manifests-go-1706]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1706
-[platformagent_manifests-go-1730-1736]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1730-L1736
-[platformagent_manifests-go-1810-1815]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1810-L1815
-[platformagent_manifests-go-1818-1819]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1818-L1819
-[platformagent_manifests-go-185]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L185
-[platformagent_manifests-go-1972-1979]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L1972-L1979
-[platformagent_manifests-go-2192-2193]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L2192-L2193
-[platformagent_manifests-go-2288-2297]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L2288-L2297
-[platformagent_manifests-go-2298-2303]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L2298-L2303
-[platformagent_manifests-go-2339-2357]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L2339-L2357
-[platformagent_manifests-go-2846-2849]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L2846-L2849
-[platformagent_manifests-go-2849]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L2849
-[platformagent_manifests-go-3452]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L3452
-[platformagent_manifests-go-55]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L55
-[platformagent_manifests-go-60-70]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L60-L70
-[platformagent_manifests-go-65-70]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests.go#L65-L70
-[platformagent_manifests_test-go-2278-2282]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests_test.go#L2278-L2282
-[platformagent_manifests_test-go-2340]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/platformagent_manifests_test.go#L2340
-[session_kv_server-py-382]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/agents/platform/scripts/session_kv_server.py#L382
-[test_docker_entrypoint-py-19]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/tests/test_docker_entrypoint.py#L19
-[test_leader_elect-py-5-13]: https://github.com/gke-labs/kube-agents/blob/76a074b8cddc467c753e33801c3c69d814ec8469/k8s-operator/internal/controller/test_leader_elect.py#L5-L13
+[common_types-go-413-418]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/api/v1alpha1/common_types.go#L413-L418
+[docker-entrypoint-sh-1293-1300]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/docker-entrypoint.sh#L1293-L1300
+[docker-entrypoint-sh-1356-1364]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/docker-entrypoint.sh#L1356-L1364
+[docker-entrypoint-sh-1393]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/docker-entrypoint.sh#L1393
+[docker-entrypoint-sh-249-253]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/docker-entrypoint.sh#L249-L253
+[docker-entrypoint-sh-304]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/docker-entrypoint.sh#L304
+[docker-entrypoint-sh-923-947]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/docker-entrypoint.sh#L923-L947
+[entrypoint_gate_check-sh-27-31]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/entrypoint_gate_check.sh#L27-L31
+[entrypoint_gate_check-sh-313-324]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/entrypoint_gate_check.sh#L313-L324
+[entrypoint_gate_check-sh-87]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/deploy/shared/entrypoint_gate_check.sh#L87
+[go-mod-11]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/go.mod#L11
+[leader_elect-py-101]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L101
+[leader_elect-py-102]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L102
+[leader_elect-py-106]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L106
+[leader_elect-py-117]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L117
+[leader_elect-py-118-123]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L118-L123
+[leader_elect-py-128-170]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L128-L170
+[leader_elect-py-128]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L128
+[leader_elect-py-131-142]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L131-L142
+[leader_elect-py-134]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L134
+[leader_elect-py-151-170]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L151-L170
+[leader_elect-py-155]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L155
+[leader_elect-py-156-158]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L156-L158
+[leader_elect-py-163]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L163
+[leader_elect-py-165]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L165
+[leader_elect-py-173]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L173
+[leader_elect-py-26-27]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L26-L27
+[leader_elect-py-29-33]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L29-L33
+[leader_elect-py-42-72]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L42-L72
+[leader_elect-py-52]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L52
+[leader_elect-py-58-72]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L58-L72
+[leader_elect-py-66-67]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L66-L67
+[leader_elect-py-77-78]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L77-L78
+[leader_elect-py-80-81]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L80-L81
+[leader_elect-py-87-88]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L87-L88
+[leader_elect-py-87]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L87
+[leader_elect-py-88]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L88
+[leader_elect-py-95]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L95
+[leader_elect-py-99-101]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/leader_elect.py#L99-L101
+[main-go-197-198]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/cmd/main.go#L197-L198
+[manifest_helpers-go-273-278]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/manifest_helpers.go#L273-L278
+[manifest_helpers-go-275-277]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/manifest_helpers.go#L275-L277
+[manifest_helpers-go-286-287]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/manifest_helpers.go#L286-L287
+[manifest_helpers-go-290-297]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/manifest_helpers.go#L290-L297
+[manifest_helpers-go-290]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/manifest_helpers.go#L290
+[manifest_helpers-go-61]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/manifest_helpers.go#L61
+[platform_mcp_server-py-748-789]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/agents/platform/scripts/platform_mcp_server.py#L748-L789
+[platformagent_controller-go-841-855]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_controller.go#L841-L855
+[platformagent_manifests-go-116-133]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L116-L133
+[platformagent_manifests-go-1590-1594]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L1590-L1594
+[platformagent_manifests-go-1766-1781]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L1766-L1781
+[platformagent_manifests-go-1832]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L1832
+[platformagent_manifests-go-1911]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L1911
+[platformagent_manifests-go-1935-1941]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L1935-L1941
+[platformagent_manifests-go-2015-2020]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2015-L2020
+[platformagent_manifests-go-201]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L201
+[platformagent_manifests-go-2023-2024]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2023-L2024
+[platformagent_manifests-go-2177-2184]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2177-L2184
+[platformagent_manifests-go-2397-2398]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2397-L2398
+[platformagent_manifests-go-2493-2502]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2493-L2502
+[platformagent_manifests-go-2503-2519]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2503-L2519
+[platformagent_manifests-go-2578-2596]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L2578-L2596
+[platformagent_manifests-go-3085-3088]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L3085-L3088
+[platformagent_manifests-go-3088]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L3088
+[platformagent_manifests-go-3691]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L3691
+[platformagent_manifests-go-55]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L55
+[platformagent_manifests-go-60-70]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L60-L70
+[platformagent_manifests-go-65-70]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests.go#L65-L70
+[platformagent_manifests_test-go-2278-2282]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests_test.go#L2278-L2282
+[platformagent_manifests_test-go-2340]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/platformagent_manifests_test.go#L2340
+[session_kv_server-py-382]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/agents/platform/scripts/session_kv_server.py#L382
+[test_docker_entrypoint-py-19]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/tests/test_docker_entrypoint.py#L19
+[test_leader_elect-py-6-14]: https://github.com/gke-labs/kube-agents/blob/d1eea17e33dc22df16573ab17e13b7de2fb9fbf5/k8s-operator/internal/controller/test_leader_elect.py#L6-L14

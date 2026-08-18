@@ -17,12 +17,15 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 func render(replicas int32) *appsv1.Deployment {
@@ -42,14 +45,61 @@ func report(t *testing.T, id, claim string, ok bool, detail string) {
 	}
 }
 
-// C1 -- P1: at the default replica count nothing supervises anything.
+// C1 -- P1 and 1.1: Args is a THREE-way switch, and at neither single-replica
+// case is anything supervising the gateway.
+//
+// The front-door row is why this renders three fixtures rather than two: an
+// earlier version rendered only 1 and 2 with the front door off, so it modelled
+// the operator as a two-way `if` and could not have noticed the third branch.
 func TestClaimC1DefaultReplicaHasNoSupervisor(t *testing.T) {
 	one := containerNamed(t, render(1), "platform-agent")
 	two := containerNamed(t, render(2), "platform-agent")
-	ok := len(one.Args) == 0 && len(one.Command) == 0 && len(two.Args) == 2
-	report(t, "C1", "Args (the supervisor) is set only above one replica", ok,
-		fmt.Sprintf("replicas=1 -> command=%v args=%v ; replicas=2 -> args=%v",
-			one.Command, one.Args, two.Args))
+
+	fd := haAgent("claims", 1)
+	fd.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{PlatformFrontDoor: ptr.To(true)},
+	}
+	front := containerNamed(t, buildDeployment(fd, "h1", "h2", "h3", "h4", nil,
+		renderOptions{imageVolumeSupported: true}), "platform-agent")
+
+	supervised := func(a []string) bool { return len(a) == 2 && strings.HasSuffix(a[1], "leader_elect.py") }
+	ok := len(one.Args) == 0 && len(one.Command) == 0 && // 1 replica, front door off
+		len(front.Args) == 5 && front.Args[0] == "hermes" && // 1 replica, front door on
+		supervised(two.Args) // above one
+	report(t, "C1", "Args is three-way; only the >1 case is the supervisor", ok,
+		fmt.Sprintf("replicas=1 -> args=%v ; replicas=1+frontDoor -> args=%v ; replicas=2 -> args=%v",
+			one.Args, front.Args, two.Args))
+}
+
+// C12 -- 3.1: the gateway profile reaches the container through the ENVIRONMENT,
+// unconditionally, not through Args. This is the coupling S1 depends on: the
+// wrapper replaces the front-door argv and still runs the right profile only
+// because HERMES_GATEWAY_PROFILE is set either way. If a future change moves the
+// profile back into Args, S1 silently re-homes the front door to the default
+// profile -- so assert the mechanism rather than trusting the comment.
+func TestClaimC12ProfileTravelsInTheEnvironment(t *testing.T) {
+	get := func(c corev1.Container, k string) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == k {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	off := containerNamed(t, render(1), "platform-agent")
+	fd := haAgent("claims", 1)
+	fd.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{PlatformFrontDoor: ptr.To(true)},
+	}
+	on := containerNamed(t, buildDeployment(fd, "h1", "h2", "h3", "h4", nil,
+		renderOptions{imageVolumeSupported: true}), "platform-agent")
+
+	vOff, setOff := get(off, "HERMES_GATEWAY_PROFILE")
+	vOn, setOn := get(on, "HERMES_GATEWAY_PROFILE")
+	report(t, "C12", "HERMES_GATEWAY_PROFILE is always set; only its value varies",
+		setOff && setOn && vOff == "" && vOn != "",
+		fmt.Sprintf("front door off -> set=%v value=%q ; on -> set=%v value=%q",
+			setOff, vOff, setOn, vOn))
 }
 
 // C2 -- 1.4 / P4: the gateway container carries no probe of any kind.
