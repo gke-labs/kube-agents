@@ -897,9 +897,16 @@ func realMain(argv []string) error {
 // Reachability is the half that cannot be reconstructed; project and location are
 // the half that can. The profile is untouched — it is still the agent that
 // answers the triage, it is just not how the events are read.
+//
+// Unless the name is ambiguous. The direct entry can only match on the bare
+// name, and two profiles can share one, so a collision makes the match a guess:
+// the watch set then keeps every profile and drops the direct entry instead.
 func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, error) {
 	var clusters []targetCluster
-	profileFor := make(map[string]targetCluster) // cluster name -> the profile entry covering it
+	// Cluster name -> every profile with that name. A slice because the name is
+	// not unique: GKE names are unique per (project, location), so one project
+	// with two regions is enough to collide.
+	profilesNamed := make(map[string][]targetCluster)
 
 	if f.profilesDir != "" {
 		discovered, err := discoverClusterProfiles(ctx, f.profilesDir, m)
@@ -912,7 +919,7 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			log.Printf("k8s-event-watcher: no Cluster Agent profiles in %s (nothing to fan out to yet)", f.profilesDir)
 		}
 		for _, tc := range discovered {
-			profileFor[tc.Name] = tc
+			profilesNamed[tc.Name] = append(profilesNamed[tc.Name], tc)
 		}
 		clusters = append(clusters, discovered...)
 	}
@@ -920,35 +927,52 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 	// Add the directly-reachable cluster when asked for explicitly, or when
 	// --profiles-dir was not given at all (the single-cluster default).
 	if f.profilesDir == "" || f.inCluster || f.kubeconfig != "" {
-		// Profile stays "direct" whether or not a profile was absorbed: it is the
-		// per-cluster filename for dedup snapshots, and every install already on
-		// disk has this cluster's cache under that name. Renaming it to the
-		// profile would silently resume from an empty cache after an upgrade,
-		// which is one duplicate alert per incident still inside the window.
-		direct := targetCluster{Name: f.clusterName, Profile: "direct"}
-		// Matched on the bare name because that is all the direct entry has —
-		// --in-cluster reads no cluster_identity. Two same-named clusters in
-		// different locations would therefore match the wrong profile and stamp
-		// this one with the other's location; the log line below prints the
-		// identity being adopted so that shows up rather than being inferred.
-		if covered, dup := profileFor[f.clusterName]; dup {
-			clusters = removeProfile(clusters, covered.Profile)
-			direct.ProjectID, direct.Location = covered.ProjectID, covered.Location
-			log.Printf("k8s-event-watcher: %s is covered by profile %s and by the direct client; watching it once, directly, as %s (the pod's own credential cannot be denied by IAM or by master authorized networks)",
-				f.clusterName, covered.Profile, direct.identity())
+		// Matched on the bare name: --in-cluster reads no cluster_identity, so
+		// there is no triple to compare.
+		candidates := profilesNamed[f.clusterName]
+		if len(candidates) > 1 {
+			// Ambiguous, so absorb nothing and add no direct entry. Picking one
+			// would unwatch the other cluster and stamp this one with its
+			// location, and the duplicate would survive through the profile not
+			// picked. Safe only here: two or more profiles means the watch set
+			// cannot be the single never-syncing entry initialSyncGrace guards.
+			log.Printf("k8s-event-watcher: %d profiles are named %q (%s) and the in-cluster client cannot say which one it is; watching them through their profiles and adding no direct entry",
+				len(candidates), f.clusterName, identities(candidates))
+		} else {
+			// Profile stays "direct" whether or not a profile was absorbed: it is
+			// the per-cluster filename for dedup snapshots, and every install
+			// already on disk has this cluster's cache under that name. Renaming
+			// it would silently resume from an empty cache after an upgrade.
+			direct := targetCluster{Name: f.clusterName, Profile: "direct"}
+			if len(candidates) == 1 {
+				covered := candidates[0]
+				clusters = removeProfile(clusters, covered.Profile)
+				direct.ProjectID, direct.Location = covered.ProjectID, covered.Location
+				log.Printf("k8s-event-watcher: %s is covered by profile %s and by the direct client; watching it once, directly, as %s (the pod's own credential cannot be denied by IAM or by master authorized networks)",
+					f.clusterName, covered.Profile, direct.identity())
+			}
+			client, err := buildKubeClient(f)
+			if err != nil {
+				return nil, err
+			}
+			direct.Client = client
+			clusters = append(clusters, direct)
 		}
-		client, err := buildKubeClient(f)
-		if err != nil {
-			return nil, err
-		}
-		direct.Client = client
-		clusters = append(clusters, direct)
 	}
 
 	if len(clusters) == 0 {
 		return nil, fmt.Errorf("no clusters to watch: %s contained no Cluster Agent profiles and neither --in-cluster nor --kubeconfig was given", f.profilesDir)
 	}
 	return clusters, nil
+}
+
+// identities renders clusters as "profile=project/location/name" for a log line.
+func identities(clusters []targetCluster) string {
+	parts := make([]string, 0, len(clusters))
+	for _, tc := range clusters {
+		parts = append(parts, tc.Profile+"="+tc.identity())
+	}
+	return strings.Join(parts, ", ")
 }
 
 // removeProfile drops the entry discovered from profile, preserving the order of

@@ -479,6 +479,48 @@ func TestBuildWatchSet_DirectClusterSurvivesWhenNoProfileCoversIt(t *testing.T) 
 	}
 }
 
+// GKE names are unique per (project, location), so two profiles can answer to
+// one name and the direct entry — which knows only a name — cannot tell them
+// apart. Absorbing a guess would unwatch the other cluster and mis-stamp this
+// one, so nothing is absorbed and no direct entry is added.
+func TestBuildWatchSet_AmbiguousNameAbsorbsNothing(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
+	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-east1", "projA", "mgmt", "us-east1")
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	if err := os.WriteFile(kubeconfig,
+		[]byte(minimalKubeconfig("https://example.invalid", gkeContext("projA", "mgmt", "us-central1"))), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+
+	f := &flags{
+		profilesDir: dir,
+		kubeconfig:  kubeconfig,
+		clusterName: "mgmt",
+	}
+	clusters, err := buildWatchSet(context.Background(), f, newMetrics())
+	if err != nil {
+		t.Fatalf("buildWatchSet: %v", err)
+	}
+	if got, want := len(clusters), 2; got != want {
+		t.Fatalf("got %d watched clusters, want %d — both same-named clusters keep their profile", got, want)
+	}
+	byIdentity := map[string]string{}
+	for _, c := range clusters {
+		if c.Profile == "direct" {
+			t.Errorf("a direct entry was added for an ambiguous name; it would have taken one of the two identities at random")
+		}
+		byIdentity[c.identity()] = c.Profile
+	}
+	// The dropped-cluster case: neither may go missing.
+	for _, want := range []string{"projA/us-central1/mgmt", "projA/us-east1/mgmt"} {
+		if _, ok := byIdentity[want]; !ok {
+			t.Errorf("%s is not watched; the watch set is %v", want, byIdentity)
+		}
+	}
+}
+
 func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 	cases := []struct {
 		name    string
