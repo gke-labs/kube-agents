@@ -90,10 +90,10 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # ─── 4. Build Container Images ────────────────────────────────────────────────
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
-# One submit, not three. credential-proxy derives from platform, so building
-# them as consecutive steps on one worker lets the second reuse the first's
-# layers instead of rebuilding the chain on a cold daemon; the operator build
-# runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
+# One submit, not three. The two agent images share the agent-base chain, so
+# building them as consecutive steps on one worker lets the second reuse the
+# first's layers instead of rebuilding that chain on a cold daemon; the operator
+# build runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
 # Set REQUIRE_CACHE=true in the job environment to fail the build on a cache
 # miss instead of cold-building. Default false so a broken cache source cannot
 # block the PR that fixes it.
