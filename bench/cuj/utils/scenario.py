@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import pytest
 
+from cuj.utils.acceptance_criteria import AcceptanceCriteria
 from cuj.utils.evidence import EvidenceLog
 from cuj.utils.interaction import InteractionRunner
 from cuj.utils.milestones import MilestoneSuite
@@ -69,7 +70,8 @@ class ScenarioConfig:
 class Scenario:
     id: str
     build_prompt: Callable[[], str]
-    evaluate: Callable[[dict[str, Any]], MilestoneSuite]
+    evaluate_acceptance: Callable[[dict[str, Any]], AcceptanceCriteria]
+    evaluate_milestones: Callable[[dict[str, Any]], MilestoneSuite] | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9_]*", self.id):
@@ -85,16 +87,46 @@ class Scenario:
                     prompt,
                     session_prefix=f"portal_{self.id}",
                 )
-            suite = self.evaluate(interaction)
-            for result in suite.results:
+            acceptance = self.evaluate_acceptance(interaction)
+            milestones = None
+            milestone_results = ()
+            milestone_summary = None
+            milestone_error = ""
+            if self.evaluate_milestones is not None:
+                try:
+                    milestones = self.evaluate_milestones(interaction)
+                    milestone_results = milestones.results
+                    milestone_summary = milestones.summary()
+                except Exception as exc:  # diagnostic evaluation is non-gating
+                    milestones = None
+                    milestone_error = f"{type(exc).__name__}: {exc}"
+                    log.record("milestone_error", milestone_error)
+            for result in milestone_results:
                 log.record("milestone", result.to_dict())
-            log.record("summary", suite.summary())
+            for result in acceptance.results:
+                log.record("acceptance_criterion", result.to_dict())
+            log.record(
+                "summary",
+                {
+                    "acceptanceCriteria": acceptance.summary(),
+                    "milestones": milestone_summary,
+                    "milestoneError": milestone_error or None,
+                },
+            )
         except (OSError, ValueError, PortalError) as exc:
             pytest.fail(f"{self.id} setup failed: {exc}; evidence: {log.path}")
 
-        for line in suite.report_lines():
+        if milestones is not None:
+            print("Milestones (diagnostic only):")
+            for line in milestones.report_lines():
+                print(line)
+        elif milestone_error:
+            print(f"Milestones unavailable (diagnostic only): {milestone_error}")
+        print("Acceptance criteria (test outcome):")
+        for line in acceptance.report_lines():
             print(line)
         print(f"Evidence: {log.path}")
-        assert suite.passed, (
-            f"milestones not met: {suite.failure_summary()}; evidence: {log.path}"
+        assert acceptance.passed, (
+            "acceptance criteria not met: "
+            f"{acceptance.failure_summary()}; evidence: {log.path}"
         )
