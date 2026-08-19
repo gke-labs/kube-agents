@@ -99,7 +99,7 @@
         "expr": "50 9 * * *",
         "display": "50 9 * * *"
       },
-      "prompt": "Run the daily GKE runtime telemetry and Linux kernel cgroup audit. Read the SOP at 'governance/gke_runtime_telemetry_sop.md' in your profile home — all 174 lines of it, before you run anything. Its five checks are section 2, lines 38-84, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily GKE runtime telemetry and Linux kernel cgroup audit. Read the SOP at 'governance/gke_runtime_telemetry_sop.md' in your profile home — all 173 lines of it, before you run anything. Its five checks are section 2, lines 38-84, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "all"
