@@ -60,7 +60,14 @@ class MilestoneSuite:
         self._order = tuple(item.id for item in ordered)
         self._results: dict[str, MilestoneResult] = {}
 
-    def record(self, milestone_id: str, met: bool, observed: Any) -> None:
+    def record(
+        self,
+        milestone_id: str,
+        met: bool,
+        observed: Any,
+        *,
+        blocked_by: tuple[str, ...] = (),
+    ) -> None:
         if milestone_id in self._results:
             raise ValueError(f"milestone {milestone_id} was already recorded")
         try:
@@ -72,14 +79,15 @@ class MilestoneSuite:
             raise ValueError(
                 f"milestone {milestone_id} evaluated before dependencies: {missing}"
             )
-        blocked_by = tuple(
+        dependency_blockers = tuple(
             item
             for item in milestone.depends_on
             if self._results[item].status is not MilestoneStatus.PASSED
         )
+        blockers = tuple(dict.fromkeys((*dependency_blockers, *blocked_by)))
         status = (
             MilestoneStatus.BLOCKED
-            if blocked_by
+            if blockers
             else MilestoneStatus.PASSED
             if met
             else MilestoneStatus.FAILED
@@ -88,7 +96,7 @@ class MilestoneSuite:
             milestone,
             status,
             observed,
-            blocked_by,
+            blockers,
         )
 
     @property
