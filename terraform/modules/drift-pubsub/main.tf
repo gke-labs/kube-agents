@@ -27,8 +27,13 @@ locals {
   # drift signal. A Lease is created at runtime by the controller that holds it,
   # never applied from a manifest, so there is no Git-side object for it to
   # diverge from. Measured over a 15-minute window on a two-cluster project,
-  # leases.update plus leases.create were 9,558 of 10,000 mutating calls --
-  # 95.6%, or roughly 960k/day against ~42k/day for everything else.
+  # leases.update plus leases.create were 9,558 of 10,000 sampled mutating
+  # calls -- 95.6%.
+  #
+  # That 10,000 is the query's row cap, not the window's true total, so daily
+  # figures do not come from it. They come from a separate untruncated count of
+  # the surviving stream: 623 non-lease calls per 15 minutes, about 60k/day,
+  # against roughly 1.35M/day unfiltered.
   #
   # The exclusion is scoped by principal rather than dropping leases outright,
   # so that a person running `kubectl patch lease` still reaches the detector.

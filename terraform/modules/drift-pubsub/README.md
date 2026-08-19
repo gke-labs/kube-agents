@@ -23,9 +23,11 @@ One category is dropped before publication: **Lease writes by machine identities
 | `leases.update` + `leases.create` | 9,558 | 95.6% |
 | Everything else                   | 442   | 4.4%  |
 
+The 10,000 is the query's row cap rather than the window's true total, so it fixes the ratio but not the volume. A separate untruncated count put the surviving stream at 623 calls per 15 minutes — roughly **60k/day, against ~1.35M/day unfiltered**.
+
 The exclusion is scoped by principal rather than dropping Leases outright, so a person running `kubectl patch lease` still reaches the detector. That is not GitOps drift, but it can knock an active controller off its lock, and discarding it silently is hard to defend.
 
-Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same window `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches any `*.iam.gserviceaccount.com`, covering it and any future service agent without a change here.
+Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same sample `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches any `*.iam.gserviceaccount.com`, covering it and any future service agent without a change here.
 
 Set the variable to `false` to export the unfiltered stream while debugging.
 
