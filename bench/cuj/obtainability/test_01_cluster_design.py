@@ -605,7 +605,7 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
 
 
 def build_prompt() -> str:
-    return PROMPT.format(project_id=required_env("CUJ1_PROJECT_ID"))
+    return PROMPT.format(project_id=required_env("CUJ_PROJECT_ID"))
 
 
 def test_01_cluster_design() -> None:

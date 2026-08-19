@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -26,16 +25,13 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 
 
 def configured_agent_profiles() -> tuple[tuple[str, str], ...]:
-    """Return distinct agent/profile pairs configured for collected CUJs."""
+    """Return the agent/profile pair shared by all collected CUJs."""
 
-    configured: set[tuple[str, str]] = set()
-    for name, value in os.environ.items():
-        match = re.fullmatch(r"(CUJ\d+)_AGENT_ID", name)
-        agent_id = value.strip()
-        if match and agent_id:
-            profile = os.environ.get(f"{match.group(1)}_PROFILE", "default")
-            configured.add((agent_id, profile.strip() or "default"))
-    return tuple(sorted(configured))
+    agent_id = os.environ.get("CUJ_AGENT_ID", "").strip()
+    if not agent_id:
+        return ()
+    profile = os.environ.get("CUJ_PROFILE", "default").strip() or "default"
+    return ((agent_id, profile),)
 
 
 def active_gcloud_account() -> str:
