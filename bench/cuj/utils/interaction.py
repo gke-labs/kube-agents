@@ -6,11 +6,13 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Any, Collection
+from typing import TYPE_CHECKING, Any, Collection
 
 from cuj.utils.evidence import EvidenceLog
 from cuj.utils.portal import Portal, PortalError
-from cuj.utils.scenario import ScenarioConfig
+
+if TYPE_CHECKING:
+    from cuj.utils.scenario import ScenarioConfig
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 

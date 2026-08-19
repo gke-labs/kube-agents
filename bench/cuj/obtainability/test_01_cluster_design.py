@@ -5,19 +5,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import pytest
-
-from cuj.utils.evidence import EvidenceLog
 from cuj.utils.interaction import (
-    InteractionRunner,
     completed_evidence,
     opaque_tool_calls,
     projected_tasks,
     tool_operations,
 )
 from cuj.utils.milestones import Milestone, MilestoneSuite
-from cuj.utils.portal import PortalError, isolated_portal
-from cuj.utils.scenario import ScenarioConfig, required_env
+from cuj.utils.scenario import Scenario, required_env
 
 PROMPT = """Act as my GKE design partner. Design a new production cluster named \
 cuj1-a100-design in project {project_id} for a distributed training workload \
@@ -282,38 +277,9 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     return suite
 
 
-def run(
-    config: ScenarioConfig,
-    log: EvidenceLog,
-    *,
-    project_id: str,
-) -> MilestoneSuite:
-    prompt = PROMPT.format(project_id=project_id)
-    interaction = InteractionRunner(config, log).run(
-        prompt,
-        session_prefix="portal_cuj1",
-    )
-    suite = evaluate(interaction)
-    for result in suite.results:
-        log.record("milestone", result.to_dict())
-    log.record("summary", suite.summary())
-    return suite
+def build_prompt() -> str:
+    return PROMPT.format(project_id=required_env("CUJ1_PROJECT_ID"))
 
 
 def test_01_cluster_design() -> None:
-    log = EvidenceLog.temporary("kube-agents-cuj1-")
-    try:
-        with isolated_portal(log.root) as endpoint:
-            suite = run(
-                ScenarioConfig.from_env(endpoint, "CUJ1"),
-                log,
-                project_id=required_env("CUJ1_PROJECT_ID"),
-            )
-    except (OSError, ValueError, PortalError) as exc:
-        pytest.fail(f"CUJ1 setup failed: {exc}; evidence: {log.path}")
-    for line in suite.report_lines():
-        print(line)
-    print(f"Evidence: {log.path}")
-    assert suite.passed, (
-        f"milestones not met: {suite.failure_summary()}; evidence: {log.path}"
-    )
+    Scenario("cuj1", build_prompt, evaluate).run_test()

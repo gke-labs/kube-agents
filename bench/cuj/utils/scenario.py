@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+from typing import Any, Callable
+
+import pytest
+
+from cuj.utils.evidence import EvidenceLog
+from cuj.utils.interaction import InteractionRunner
+from cuj.utils.milestones import MilestoneSuite
+from cuj.utils.portal import PortalError, isolated_portal
 
 DEFAULT_TIMEOUT_SECONDS = 1600.0
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
@@ -53,4 +62,39 @@ class ScenarioConfig:
             poll_interval=float(
                 os.environ.get(f"{prefix}_POLL_INTERVAL", default_poll_interval)
             ),
+        )
+
+
+@dataclass(frozen=True)
+class Scenario:
+    id: str
+    build_prompt: Callable[[], str]
+    evaluate: Callable[[dict[str, Any]], MilestoneSuite]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", self.id):
+            raise ValueError("scenario id must contain lowercase letters, digits, or _")
+
+    def run_test(self) -> None:
+        log = EvidenceLog.temporary(f"kube-agents-{self.id}-")
+        try:
+            prompt = self.build_prompt()
+            with isolated_portal(log.root) as endpoint:
+                config = ScenarioConfig.from_env(endpoint, self.id)
+                interaction = InteractionRunner(config, log).run(
+                    prompt,
+                    session_prefix=f"portal_{self.id}",
+                )
+            suite = self.evaluate(interaction)
+            for result in suite.results:
+                log.record("milestone", result.to_dict())
+            log.record("summary", suite.summary())
+        except (OSError, ValueError, PortalError) as exc:
+            pytest.fail(f"{self.id} setup failed: {exc}; evidence: {log.path}")
+
+        for line in suite.report_lines():
+            print(line)
+        print(f"Evidence: {log.path}")
+        assert suite.passed, (
+            f"milestones not met: {suite.failure_summary()}; evidence: {log.path}"
         )
