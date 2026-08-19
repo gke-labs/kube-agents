@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Collection
 
-from cuj.utils.evidence import EvidenceWriter
+from cuj.utils.evidence import EvidenceLog
 from cuj.utils.portal import Portal, PortalError
 from cuj.utils.scenario import ScenarioConfig
 
@@ -18,7 +18,7 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 @dataclass(frozen=True)
 class InteractionRunner:
     config: ScenarioConfig
-    evidence: EvidenceWriter
+    log: EvidenceLog
     approval_choice: str = "deny"
 
     def run(self, prompt: str, *, session_prefix: str) -> dict[str, Any]:
@@ -29,21 +29,24 @@ class InteractionRunner:
             "input": {"text": prompt},
             "history": [],
         }
-        self.evidence.write("00-request.json", request)
+        self.log.record("request", request)
 
         portal = Portal(self.config.endpoint)
         interaction = portal.post("interactions", request)
-        self.evidence.write("01-submitted.json", interaction)
+        self.log.record("interaction", {"poll": 0, "value": interaction})
         interaction_id = str(interaction.get("interactionId") or "")
         if not interaction_id:
             raise PortalError("portal response did not include interactionId")
 
         deadline = time.monotonic() + self.config.timeout
         poll = 0
-        previous = interaction
         while str(interaction.get("status") or "") not in TERMINAL_STATUSES:
             if time.monotonic() >= deadline:
                 interaction = {**interaction, "evaluatorTimedOut": True}
+                self.log.record(
+                    "interaction",
+                    {"poll": poll, "value": interaction},
+                )
                 break
             if interaction.get("status") == "waiting_for_approval":
                 interaction = portal.post(
@@ -57,14 +60,11 @@ class InteractionRunner:
                     f"interactions/{urllib.parse.quote(interaction_id, safe='')}"
                 )
             poll += 1
-            if interaction != previous:
-                self.evidence.write(
-                    f"02-state-changes/{poll:04d}.json",
-                    interaction,
-                )
-                previous = interaction
+            self.log.record(
+                "interaction",
+                {"poll": poll, "value": interaction},
+            )
 
-        self.evidence.write("03-final-interaction.json", interaction)
         return interaction
 
 

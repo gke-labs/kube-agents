@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from cuj.utils.evidence import EvidenceWriter
+from cuj.utils.evidence import EvidenceLog
 from cuj.utils.interaction import (
     InteractionRunner,
     completed_evidence,
@@ -284,47 +284,36 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
 
 def run(
     config: ScenarioConfig,
-    evidence: EvidenceWriter,
+    log: EvidenceLog,
     *,
     project_id: str,
 ) -> MilestoneSuite:
     prompt = PROMPT.format(project_id=project_id)
-    interaction = InteractionRunner(config, evidence).run(
+    interaction = InteractionRunner(config, log).run(
         prompt,
         session_prefix="portal_cuj1",
     )
-    evidence.write(
-        "04-conversation.json",
-        {
-            "user": prompt,
-            "kage": interaction.get("output", ""),
-            "delegatedTasks": interaction.get("tasks", []),
-        },
-    )
     suite = evaluate(interaction)
-    for index, result in enumerate(suite.results, start=1):
-        evidence.write(
-            f"05-milestones/{index:02d}-{result.milestone.id}.json",
-            result.to_dict(),
-        )
-    evidence.write("06-summary.json", suite.summary())
+    for result in suite.results:
+        log.record("milestone", result.to_dict())
+    log.record("summary", suite.summary())
     return suite
 
 
 def test_01_cluster_design() -> None:
-    evidence = EvidenceWriter.temporary("kube-agents-cuj1-")
+    log = EvidenceLog.temporary("kube-agents-cuj1-")
     try:
-        with isolated_portal(evidence.root) as endpoint:
+        with isolated_portal(log.root) as endpoint:
             suite = run(
                 ScenarioConfig.from_env(endpoint, "CUJ1"),
-                evidence,
+                log,
                 project_id=required_env("CUJ1_PROJECT_ID"),
             )
     except (OSError, ValueError, PortalError) as exc:
-        pytest.fail(f"CUJ1 setup failed: {exc}; evidence: {evidence.root}")
+        pytest.fail(f"CUJ1 setup failed: {exc}; evidence: {log.path}")
     for line in suite.report_lines():
         print(line)
-    print(f"Evidence: {evidence.root}")
+    print(f"Evidence: {log.path}")
     assert suite.passed, (
-        f"milestones not met: {suite.failure_summary()}; evidence: {evidence.root}"
+        f"milestones not met: {suite.failure_summary()}; evidence: {log.path}"
     )

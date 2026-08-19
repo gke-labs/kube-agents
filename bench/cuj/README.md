@@ -15,11 +15,11 @@ uv run --project bench pytest -s bench/cuj
 Pytest reports every journey independently using its normal test discovery.
 Each test starts an API-only portal on an OS-assigned loopback port and uses a
 unique interaction session, so parallel workers do not share ports or sessions.
-CUJ1 writes its request, state transitions, final interaction, conversation,
-individual milestones, and summary to a unique
-`/tmp/kube-agents-cuj1-*` directory. A failed milestone fails its pytest case
-but leaves all evidence in place. Every milestone reports the CUJ requirement,
-the proof required to satisfy it, and the observed evidence.
+CUJ1 appends its request, every changed interaction projection, milestones, and
+summary to `interactions.jsonl` in a unique `/tmp/kube-agents-cuj1-*`
+directory. A failed milestone fails its pytest case but leaves the detailed log
+in place. Every milestone reports the CUJ requirement, the proof required to
+satisfy it, and the observed evidence.
 
 ## Adding a journey
 
