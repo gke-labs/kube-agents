@@ -9,18 +9,19 @@ From the repository root, run every CUJ with pytest:
 ```bash
 CUJ1_AGENT_ID=platform-agent \
 CUJ1_PROJECT_ID=test-project \
+CUJ3_AGENT_ID=platform-agent \
 uv run --project bench pytest -s bench/cuj
 ```
 
 Pytest reports every journey independently using its normal test discovery.
 Each test starts an API-only portal on an OS-assigned loopback port and uses a
 unique interaction session, so parallel workers do not share ports or sessions.
-CUJ1 appends its request, every portal interaction response, acceptance
+Each journey appends its request, every portal interaction response, acceptance
 criteria, milestones, and summary to `interactions.jsonl` in a unique
-`/tmp/kube-agents-cuj1-*` directory. Backend-independent acceptance criteria
-determine the pytest result. Backend-specific milestones report diagnostic
-progress but do not pass or fail the test. Both report the required proof and
-observed evidence.
+`/tmp/kube-agents-<scenario>-*` directory. Backend-independent acceptance
+criteria determine the pytest result. Backend-specific milestones report
+diagnostic progress but do not pass or fail the test. Both report the required
+proof and observed evidence.
 
 ## Adding a journey
 
