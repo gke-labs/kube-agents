@@ -10,10 +10,14 @@ From the repository root, run every CUJ with pytest:
 CUJ1_AGENT_ID=platform-agent \
 CUJ1_PROJECT_ID=test-project \
 CUJ3_AGENT_ID=platform-agent \
-uv run --project bench pytest -s bench/cuj
+uv run --project bench pytest -x -s bench/cuj
 ```
 
 Pytest reports every journey independently using its normal test discovery.
+Before running a journey, `test_00_agent_responsive.py` requires each distinct
+`CUJ<n>_AGENT_ID` to be discoverable and complete a minimal `READY` interaction
+through the same admin portal path. `-x` stops the suite at this prerequisite
+when the portal target or agent is unhealthy.
 Each test starts an API-only portal on an OS-assigned loopback port and uses a
 unique interaction session, so parallel workers do not share ports or sessions.
 Each journey appends its request, every portal interaction response, acceptance

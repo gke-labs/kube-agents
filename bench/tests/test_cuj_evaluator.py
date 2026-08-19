@@ -1,3 +1,5 @@
+"""Offline behavior checks for the legacy matrix-oriented CUJ evaluator."""
+
 from __future__ import annotations
 
 import json

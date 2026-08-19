@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -16,7 +19,23 @@ from typing import Iterator
 from kube_agents_bench.cuj import PortalTransport as Portal
 from kube_agents_bench.cuj import PortalTransportError as PortalError
 
+from cuj.utils.evidence import EvidenceLog
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
+
+
+def configured_agent_profiles() -> tuple[tuple[str, str], ...]:
+    """Return distinct agent/profile pairs configured for collected CUJs."""
+
+    configured: set[tuple[str, str]] = set()
+    for name, value in os.environ.items():
+        match = re.fullmatch(r"(CUJ\d+)_AGENT_ID", name)
+        agent_id = value.strip()
+        if match and agent_id:
+            profile = os.environ.get(f"{match.group(1)}_PROFILE", "default")
+            configured.add((agent_id, profile.strip() or "default"))
+    return tuple(sorted(configured))
 
 
 def active_gcloud_account() -> str:
@@ -65,6 +84,69 @@ def wait_for_portal(
         except (OSError, urllib.error.URLError):
             time.sleep(0.1)
     raise PortalError("portal did not become ready within 30 seconds")
+
+
+def verify_agent(
+    endpoint: str,
+    agent_id: str,
+    log: EvidenceLog,
+    *,
+    profile: str = "default",
+    timeout: float = 120,
+) -> Path:
+    """Require a discovered agent to complete a minimal portal interaction."""
+
+    portal = Portal(endpoint)
+    discovered = portal.get("agents").get("agents", [])
+    log.record("prerequisite_agents", discovered)
+    if agent_id not in discovered:
+        raise PortalError(
+            f"agent {agent_id!r} is not live in the admin portal; "
+            f"discovered agents: {discovered!r}; evidence: {log.path}"
+        )
+
+    request = {
+        "agentId": agent_id,
+        "profile": profile,
+        "sessionId": f"portal_prerequisite_{uuid.uuid4().hex}",
+        "input": {
+            "text": "Reply with exactly READY and nothing else. Do not use tools."
+        },
+        "history": [],
+    }
+    log.record("prerequisite_request", request)
+    interaction = portal.post("interactions", request)
+    log.record("prerequisite_interaction", interaction)
+    interaction_id = str(interaction.get("interactionId") or "")
+    if not interaction_id:
+        raise PortalError(
+            f"agent prerequisite response omitted interactionId; evidence: {log.path}"
+        )
+
+    deadline = time.monotonic() + timeout
+    while str(interaction.get("status") or "") not in TERMINAL_STATUSES:
+        if time.monotonic() >= deadline:
+            raise PortalError(
+                f"agent {agent_id!r} did not respond within {timeout:g} seconds; "
+                f"evidence: {log.path}"
+            )
+        time.sleep(1)
+        interaction = portal.get(
+            f"interactions/{urllib.parse.quote(interaction_id, safe='')}"
+        )
+        log.record("prerequisite_interaction", interaction)
+
+    status = str(interaction.get("status") or "unknown")
+    response = str(interaction.get("output") or "").strip()
+    if status != "completed" or response != "READY":
+        error = str(interaction.get("error") or "no terminal error reported")
+        raise PortalError(
+            f"agent {agent_id!r} profile {profile!r} is not responsive through "
+            "the admin portal: "
+            f"status={status}, error={error}, output={response!r}; "
+            f"evidence: {log.path}"
+        )
+    return log.path
 
 
 @contextmanager
