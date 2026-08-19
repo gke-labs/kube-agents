@@ -173,17 +173,29 @@ def completed_evidence(interaction: dict[str, Any]) -> set[str]:
     return found
 
 
+def projected_tool_calls(interaction: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = interaction.get("toolCalls", [])
+    found = (
+        [call for call in calls if isinstance(call, dict)]
+        if isinstance(calls, list)
+        else []
+    )
+    for task in interaction.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        task_calls = task.get("toolCalls", [])
+        if isinstance(task_calls, list):
+            found.extend(call for call in task_calls if isinstance(call, dict))
+    return found
+
+
 def tool_operations(
     interaction: dict[str, Any], *, completed_only: bool = False
 ) -> list[str]:
-    calls = interaction.get("toolCalls", [])
-    if not isinstance(calls, list):
-        return []
     return [
         str(call.get("operation") or call.get("name") or "")
-        for call in calls
-        if isinstance(call, dict)
-        and (not completed_only or call.get("status") == "completed")
+        for call in projected_tool_calls(interaction)
+        if not completed_only or call.get("status") == "completed"
     ]
 
 
@@ -219,14 +231,10 @@ def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
 
 
 def opaque_tool_calls(interaction: dict[str, Any]) -> list[str]:
-    calls = interaction.get("toolCalls", [])
-    if not isinstance(calls, list):
-        return []
     return [
         str(call.get("name") or "")
-        for call in calls
-        if isinstance(call, dict)
-        and not str(call.get("operation") or "").strip()
+        for call in projected_tool_calls(interaction)
+        if not str(call.get("operation") or "").strip()
         and str(call.get("name") or "").casefold() in OPAQUE_TOOLS
     ]
 
@@ -238,6 +246,9 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
         "skills" in task and "loadedSkills" in task for task in platform_tasks
     )
     task_evidence_available = any("evidence" in task for task in platform_tasks)
+    worker_tool_evidence_available = bool(platform_tasks) and all(
+        "toolCalls" in task for task in platform_tasks
+    )
     routed = [
         task
         for task in platform_tasks
@@ -247,11 +258,7 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     completed = completed_evidence(interaction)
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
-    result_text = "\n".join(
-        str(task.get(key) or "")
-        for task in tasks
-        for key in ("result", "summary")
-    ).casefold()
+    result_text = str(interaction.get("output") or "")
     claims_met, claims_observed = capacity_claims(result_text)
     opaque_calls = opaque_tool_calls(interaction)
     suite = MilestoneSuite(MILESTONES)
@@ -326,12 +333,20 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
             "operations": operations,
             "opaqueTools": opaque_calls,
         },
-        blocked_by=(
-            ("portal interaction projection omits toolEvidenceComplete",)
-            if "toolEvidenceComplete" not in interaction
-            else ("tool evidence omits normalized operations",)
-            if opaque_calls
-            else ()
+        blocked_by=tuple(
+            reason
+            for condition, reason in (
+                (
+                    "toolEvidenceComplete" not in interaction,
+                    "portal interaction projection omits toolEvidenceComplete",
+                ),
+                (
+                    not worker_tool_evidence_available,
+                    "portal task projection omits worker toolCalls",
+                ),
+                (bool(opaque_calls), "tool evidence omits normalized operations"),
+            )
+            if condition
         ),
     )
     return suite
