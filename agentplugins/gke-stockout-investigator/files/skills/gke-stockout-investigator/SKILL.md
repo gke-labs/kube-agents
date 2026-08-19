@@ -82,7 +82,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 2. **Lease a private workspace.** The pod is not a git checkout, and its volume is shared with every other agent running in it. `submit_suggestion.py prepare` clones the GitOps repository into a working tree that is yours alone, takes the remediation branch, and prints one JSON line:
 
    ```bash
-   ./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+   python3 ./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
      --branch "platform-agent/remediate-stockout-<workload_name>"
    ```
 
@@ -172,7 +172,17 @@ If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot
        --format="json"
    ```
 
-_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
+#### E. Autoscaler Status & Backoff Loop Verification
+
+To check if the cluster autoscaler is actively scaling, stalled, or stuck in a priority backoff reset loop:
+
+```bash
+kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
+```
+
+Analyze the `nodeGroups` statuses and check if any groups have `backoffInfo` with `backoffUntil` timestamps, or if they are repeatedly failing to scale up.
+
+_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), capacity history (`gcloud beta compute advice capacity-history`), and the autoscaler status check (`kubectl get configmap cluster-autoscaler-status`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
 
 ### 5. Diagnose Using ComputeClass Debugging Guidelines
 
@@ -216,6 +226,9 @@ Inspect the target `ComputeClass` and workload manifests in the leased workspace
 > **MANDATORY PRIORITY CHECK**: If a ComputeClass `priorities[]` list contains more than 10 granular `machineType` rules (e.g., 25 priority rules for specific machine shapes like `n2-standard-4`, `n2-standard-8`, etc.), this is a Rule G violation. You MUST NOT add more `machineType` rules. Instead, you MUST auto-compress the configuration by replacing ALL 25 granular `machineType` rules with 4 family-level (`machineFamily`) rules (e.g., `n4`, `c3`, `n2`, `e2`).
 
 - **Problem**: A Custom Compute Class (CCC) contains excessive granular `machineType` rules (e.g., 25 priority rules for specific machine shapes), exceeding Flex Advisor's cache limit (generating >200 combinations) and triggering a Cluster Autoscaler backoff reset loop. Lower-priority fallbacks (`n2`, `e2`) are starved and pods remain stuck in `Pending`.
+- **Diagnosis**:
+  1. **Static manifest check:** Parse the ComputeClass manifest and calculate the total number of combinations: $Rules \times Zones$ (where Rules is the number of priority entries in the `priorities` list, and Zones is the number of target zones). If this combinations count exceeds 200, flag this as a Rule G violation.
+  2. **Runtime status check:** Inspect the `cluster-autoscaler-status` ConfigMap output. Identify if the node groups created for fallback priorities (e.g., `n2`, `e2`) show continuous `backoffInfo` blocks or if they are repeatedly failing to scale up, while the primary node group is retried over a long duration (>5 minutes). This indicates a shared-backoff reset loop.
 - **Fix**: Auto-compress the CCC configuration: Completely REPLACE the entire list of specific granular machine sizes (`machineType`) with 4 family-level definitions (`machineFamily`: `n4`, `c3`, `n2`, `e2`), reducing priority rules from 25 to 4 family-level priorities and avoiding the starvation loop.
 
 #### Rule H: Hyperdisk Incompatibility with Older Generation Machines
@@ -251,16 +264,14 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 
 **CRITICAL**: You MUST use the `submit_suggestion.py` helper script to open the Pull Request. Do NOT use `gh pr create` directly. Do NOT write your own python script to create the PR.
 
-**MANDATORY Summary Requirements**:
-
-- 🛑 **NON-NEGOTIABLE RULE**: The `--body` string for `submit_suggestion.py` MUST contain the literal text `- **Checks Performed**:` followed by a `\`\`\`bash`code block containing the exact`kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...`commands you executed during analysis. Failing to include this`\`\`\`bash`block in the`--body` argument will cause the PR to be rejected by automated SRE audit rules.
+- 🛑 **NON-NEGOTIABLE RULE**: The `--body` string for `submit_suggestion.py` MUST contain the literal text `- **Checks Performed**:` followed by a `\`\`\`bash`code block containing the exact`kubectl describe pod ...`, `kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...`commands you executed during analysis. Failing to include this`\`\`\`bash`block in the`--body` argument will cause the PR to be rejected by automated SRE audit rules.
 - Do NOT omit the `Checks Performed` section or code block from the `--body` argument.
 - Do NOT include any `gh` commands (such as `gh pr list` or `gh pr create`) in the summary or PR description.
 
 Run the `submit_suggestion.py` helper script with the `submit` subcommand to push the branch and open a SRE review Pull Request EXACTLY as follows, substituting `<workspace>` and `<lease>` with the values Step 3 printed:
 
 ```bash
-./skills/submit-suggestion/scripts/submit_suggestion.py submit \
+python3 ./skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --workspace "<workspace>" \
   --lease "<lease>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
@@ -273,6 +284,7 @@ Run the `submit_suggestion.py` helper script with the `submit` subcommand to pus
 \`\`\`bash
 # Diagnostic commands executed during analysis:
 kubectl describe pod <pod_name> -n <namespace>
+kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
 gcloud compute regions describe us-central1 --format=\"json(quotas.filter(metric=NVIDIA_L4_GPUS))\"
 gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selection-machine-types=\"g2-standard-4,g2-standard-12\" --target-distribution-shape=ANY --size=1 --region=us-central1 --format=\"json\"
 gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-type=g2-standard-4 --types=PREEMPTION,PRICE --region=us-central1 --format=\"json\"
@@ -286,7 +298,7 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
 
 ````json
-send_notification(message="🛠️ GKE Stockout Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
+send_notification(message="🛠️ GKE Stockout Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
 ````
 
 After calling the tool, provide the user with the generated PR URL and a summary of your findings.
