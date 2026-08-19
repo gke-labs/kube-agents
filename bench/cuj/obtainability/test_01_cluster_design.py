@@ -163,6 +163,10 @@ def tool_operations(
 def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     tasks = [item for item in interaction.get("tasks", []) if isinstance(item, dict)]
     platform_tasks = [task for task in tasks if task.get("assignee") == "platform"]
+    skill_evidence_available = any(
+        "skills" in task and "loadedSkills" in task for task in platform_tasks
+    )
+    task_evidence_available = any("evidence" in task for task in platform_tasks)
     routed = [
         task
         for task in platform_tasks
@@ -213,6 +217,9 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
             }
             for task in platform_tasks
         ],
+        blocked_by=()
+        if skill_evidence_available
+        else ("portal task projection omits skills/loadedSkills",),
     )
     suite.record(
         "m4-specialist-completes",
@@ -222,11 +229,22 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
         ),
         platform_tasks,
     )
-    suite.record("m5-quota-checked", "quota_check" in completed, sorted(completed))
+    evidence_blocker = (
+        ()
+        if task_evidence_available
+        else ("portal task projection omits evidence",)
+    )
+    suite.record(
+        "m5-quota-checked",
+        "quota_check" in completed,
+        sorted(completed),
+        blocked_by=evidence_blocker,
+    )
     suite.record(
         "m6-live-obtainability-checked",
         "advice_service_capacity" in completed,
         sorted(completed),
+        blocked_by=evidence_blocker,
     )
     suite.record(
         "m7-capacity-claims-qualified",
@@ -245,6 +263,7 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
         "m8-computeclass-validates",
         "computeclass_server_dry_run" in completed,
         sorted(completed),
+        blocked_by=evidence_blocker,
     )
     suite.record(
         "m9-design-remains-read-only",
@@ -254,6 +273,9 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
             "toolEvidenceComplete": interaction.get("toolEvidenceComplete"),
             "operations": operations,
         },
+        blocked_by=()
+        if "toolEvidenceComplete" in interaction
+        else ("portal interaction projection omits toolEvidenceComplete",),
     )
     return suite
 
