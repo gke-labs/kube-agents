@@ -96,7 +96,7 @@ Nobody reads a change as cheaply as the person who wrote it, and right now the f
 
 The method is the repository's own review skill, [`.agents/skills/review-adversarial/SKILL.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/skills/review-adversarial/SKILL.md) — run it against your branch diff with whatever agent you use. It works ten angles over the change, then re-derives each candidate from the source as a hostile second reader and throws out what it cannot defend.
 
-Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it. If your harness will not start a subagent without a human's approval, ask for the approval — that setting blocks this step rather than waiving it, and running the pass in the session that wrote the code instead is the one configuration that does not work.
+Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it. If your harness will not start a subagent without a human's approval, ask for the approval — that setting blocks this step rather than waiving it.
 
 What the section should say:
 

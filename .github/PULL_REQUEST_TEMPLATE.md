@@ -74,8 +74,9 @@ not.
 
 Run the pass in a context that did not write the change — a subagent, or a fresh
 session, handed the diff range and nothing else. If your harness will not start
-one without a human's approval, ask for it; reviewing in the session that wrote
-the code is the one configuration that does not work.
+one without a human's approval, ask for it. A session that still holds the
+reasoning behind the diff re-derives that reasoning instead of testing it, so it
+clears the errors the reasoning caused.
 
 Fix what the pass confirms and report what it only suspects, and claim no more
 than you did: a Self-Review the diff contradicts is worse than none.

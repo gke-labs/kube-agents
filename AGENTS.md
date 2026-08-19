@@ -199,8 +199,9 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   - **If your harness will not spawn one without a human's approval, go and get the approval.** A
     setting that requires sign-off before starting a subagent blocks this step; it does not waive
     it. Ask when you hit it, not after the review, and say what you are blocked on. Quietly running
-    the pass in the session that wrote the code instead is the configuration the bullet above rules
-    out, and reporting it as a self-review without that caveat tells the reviewer something untrue.
+    the pass in the session that wrote the code instead buys a review from the context that already
+    believes the change is correct, and reporting that as a self-review without the caveat tells
+    the reviewer something untrue about how the change was checked.
   - **A finding you decide not to fix is an answer**, provided the reason is an argument about
     this change rather than a shrug. "Out of scope", "pre-existing", and "will fix later" are not
     reasons on their own; the separate issue you filed is.
