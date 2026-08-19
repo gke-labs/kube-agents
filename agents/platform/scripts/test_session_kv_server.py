@@ -736,22 +736,39 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
 class TestGatewayApiToken(unittest.TestCase):
     """Which `API_SERVER_KEY` the loopback callers send.
 
-    Regression test for a live failure: the operator puts the non-secret
-    sentinel `cluster-internal-trusted` in the container environment, Hermes
-    prefers `$HERMES_HOME/.env` and rewrites the key there on every boot, and so
-    every caller that trusted `os.environ` got 401 on every run.
+    Regression test for a live failure (issue #786): the operator puts the
+    non-secret sentinel `cluster-internal-trusted` in the container
+    environment, Hermes prefers `$HERMES_HOME/.env` and rewrites the key there
+    on every boot, and so every caller that trusted `os.environ` got 401 on
+    every run.
+
+    The order under test is `load_hermes_dotenv`'s own — managed `.env`, then
+    PVC `.env`, then the environment — and reproducing it exactly is the point.
+    The operator's fix pins the sentinel in the managed file, which Hermes
+    applies last with `override=True`; a resolver that stopped at the PVC file
+    would hand back stage2's generated key on precisely the pods the pin has
+    already repaired.
     """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dotenv = os.path.join(self._tmp.name, ".env")
-        self._patch = patch.object(session_kv_server, "DOTENV_PATH", self.dotenv)
-        self._patch.start()
+        # Both default to absent, so each test writes only the layer it is
+        # about; an operator-managed pod has the managed file, a `docker run`
+        # has neither.
+        self.managed = os.path.join(self._tmp.name, "managed.env")
+        self._patches = [
+            patch.object(session_kv_server, "DOTENV_PATH", self.dotenv),
+            patch.object(session_kv_server, "MANAGED_DOTENV_PATH", self.managed),
+        ]
+        for item in self._patches:
+            item.start()
         self._prior = os.environ.get("API_SERVER_KEY")
         os.environ["API_SERVER_KEY"] = "cluster-internal-trusted"
 
     def tearDown(self):
-        self._patch.stop()
+        for item in self._patches:
+            item.stop()
         self._tmp.cleanup()
         if self._prior is None:
             os.environ.pop("API_SERVER_KEY", None)
@@ -762,8 +779,36 @@ class TestGatewayApiToken(unittest.TestCase):
         with open(self.dotenv, "w", encoding="utf-8") as handle:
             handle.write(text)
 
+    def _write_managed(self, text):
+        with open(self.managed, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
     def test_the_dotenv_key_wins_over_the_environment_sentinel(self):
         self._write("SOMETHING_ELSE=x\nAPI_SERVER_KEY=the-real-one\n")
+        self.assertEqual(session_kv_server._gateway_api_token(), "the-real-one")
+
+    def test_the_managed_pin_wins_over_the_dotenv_key(self):
+        """The shape of #786, and of its fix.
+
+        `.env` still carries whatever stage2 generated — the operator never
+        touches that file — but Hermes applies the managed scope after it, so
+        the pinned sentinel is what the API server will accept.
+        """
+        self._write("API_SERVER_KEY=" + "a1b2" * 16 + "\n")
+        self._write_managed("API_SERVER_KEY=cluster-internal-trusted\n")
+        self.assertEqual(
+            session_kv_server._gateway_api_token(), "cluster-internal-trusted"
+        )
+
+    def test_the_managed_file_is_consulted_for_this_key_only(self):
+        """A managed file that pins other names must not shadow `.env`.
+
+        The real one pins the Google Chat block on most deployments and the API
+        key on all of them; treating "managed file exists" as "managed file
+        answers" would send the wrong bearer on the former.
+        """
+        self._write("API_SERVER_KEY=the-real-one\n")
+        self._write_managed("GOOGLE_CHAT_HOME_CHANNEL=spaces/AAA\n")
         self.assertEqual(session_kv_server._gateway_api_token(), "the-real-one")
 
     def test_quotes_and_whitespace_are_stripped(self):
@@ -788,7 +833,10 @@ class TestGatewayApiToken(unittest.TestCase):
         self.assertEqual(session_kv_server._gateway_api_token(), "cluster-internal-trusted")
 
     def test_a_missing_file_is_not_an_error(self):
+        # Neither layer exists: a plain `docker run`, where the environment is
+        # the only thing that has ever been asked.
         self.assertFalse(os.path.exists(self.dotenv))
+        self.assertFalse(os.path.exists(self.managed))
         self.assertEqual(session_kv_server._gateway_api_token(), "cluster-internal-trusted")
 
     def test_it_is_read_per_call_not_cached(self):

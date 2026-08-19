@@ -596,14 +596,41 @@ cleanup_workload() {
 
 # ---------------------------------------------------------------------- watching
 
+# Returns the gateway's session list as JSON, or `{}` — and says which, on stderr, when
+# it is the second one.
+#
+# The `|| echo '{}'` used to cover the whole call, and a rejected request is not a call
+# that failed: `requests.get` returns a 401 body happily, this printed it, and the caller's
+# `.get('data', [])` read it as an empty session list. So a watcher pointed at an agent
+# whose entire API surface was returning 401 reported "nothing has happened yet" and went
+# on doing so until it timed out — which is exactly what issue #786 was, for two months,
+# across every caller shaped like this one. An empty result and a refused one look the
+# same to every consumer downstream, so the distinction has to be made here or nowhere.
+#
+# Still non-fatal: a scenario watcher that aborts on one transient blip is worse than one
+# that waits. The contract is unchanged for callers; what is new is that a human reading
+# the transcript can tell the two apart.
 _sessions_json() {
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+    local out
+    # The diagnostic goes to stdout inside the pod and is CAPTURED, not printed: this
+    # function's stdout is piped straight into a json.load, and `warn` writes to stdout
+    # too. Only the failure branch un-captures it, onto stderr.
+    if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         python3 -c "
-import os, requests
+import os, sys, requests
 key = os.environ.get('API_SERVER_KEY', '')
-print(requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
-                   headers={'Authorization': 'Bearer ' + key}, timeout=10).text)
-" 2>/dev/null || echo '{}'
+r = requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
+                 headers={'Authorization': 'Bearer ' + key}, timeout=10)
+if r.status_code != 200:
+    print('the gateway API refused it: HTTP %s %s' % (r.status_code, r.text[:200]))
+    sys.exit(1)
+print(r.text)
+" 2>/dev/null)"; then
+        printf '%s\n' "$out"
+    else
+        warn "could not read the agent's session list; treating it as empty — ${out:-no response} (issue #786)" >&2
+        echo '{}'
+    fi
 }
 
 # Sessions started before we published are from earlier runs; only a newer one is ours.
