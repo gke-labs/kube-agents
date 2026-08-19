@@ -50,6 +50,7 @@ SOP_FILENAMES = {
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
     "ai-security-audit": "ai_security_audit_sop.md",
     "stockout-prevention": "stockout_prevention_sop.md",
+    "gce-compute-fleet-audit": "gce_compute_fleet_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or

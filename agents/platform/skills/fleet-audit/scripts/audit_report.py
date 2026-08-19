@@ -229,9 +229,9 @@ AUDITS: dict[str, AuditSpec] = {
         (
             "gce-startup-script-status",
             "mig-autoscaler-flapping",
-            "ops-agent-health-degraded",
-            "sole-tenant-headroom-risk",
-            "orphaned-snapshot-schedule",
+            "ops-agent-guest-health",
+            "sole-tenant-headroom",
+            "orphaned-snapshots",
         ),
     ),
 }

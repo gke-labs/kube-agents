@@ -11,11 +11,13 @@ import os
 import subprocess
 import sys
 
-def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-    """Runs a shell command and returns (rc, stdout, stderr)."""
+def run_cmd(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    """Runs a shell command with a timeout and returns (rc, stdout, stderr)."""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
         return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", f"Command timed out after {timeout} seconds"
     except Exception as e:
         return -1, "", str(e)
 
