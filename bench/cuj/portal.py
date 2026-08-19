@@ -1,63 +1,22 @@
-"""Reusable admin portal lifecycle and HTTP client for live CUJ tests."""
+"""Reusable isolated admin portal lifecycle for live CUJ tests."""
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
+
+from kube_agents_bench.cuj import PortalTransport as Portal
+from kube_agents_bench.cuj import PortalTransportError as PortalError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-class PortalError(RuntimeError):
-    pass
-
-
-class Portal:
-    def __init__(self, endpoint: str) -> None:
-        parsed = urllib.parse.urlsplit(endpoint.rstrip("/"))
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("endpoint must be an absolute HTTP(S) URL")
-        self.endpoint = endpoint.rstrip("/")
-
-    def get(self, path: str) -> dict[str, Any]:
-        return self._request("GET", path)
-
-    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", path, payload)
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        request = urllib.request.Request(
-            f"{self.endpoint}/{path.lstrip('/')}",
-            data=None if payload is None else json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method=method,
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                result = json.load(response)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read(8192).decode(errors="replace")
-            raise PortalError(f"portal returned HTTP {exc.code}: {detail}") from exc
-        except (OSError, TimeoutError, json.JSONDecodeError) as exc:
-            raise PortalError(f"portal request failed: {exc}") from exc
-        if not isinstance(result, dict):
-            raise PortalError("portal returned a non-object response")
-        return result
 
 
 def active_gcloud_account() -> str:
