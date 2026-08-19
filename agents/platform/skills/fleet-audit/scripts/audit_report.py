@@ -229,9 +229,12 @@ AUDITS: dict[str, AuditSpec] = {
         (
             "iam-least-privilege",
             "gke-upgrade-available",
-            "idle-resource-waste",
-            "container-rightsizing",
-            "security-posture-insight",
+            "idle-compute-instance",
+            "unattached-persistent-disk",
+            "gke-webhook-readiness",
+            "gke-security-posture-cve",
+            "idle-ip-address",
+            "cost-optimization-rightsizing",
         ),
     ),
 }
