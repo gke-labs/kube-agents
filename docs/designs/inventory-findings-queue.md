@@ -125,6 +125,7 @@ Grain is one problem: one check, at one object, on one cluster.
 | `state`                                      | `queued` → `surfaced` → `accepted` \| `dismissed` \| `resolved`, plus `snoozed` and `stale`                                                                                                                                |
 | `first_seen`, `last_verified`, `surfaced_at` |                                                                                                                                                                                                                            |
 | `surface_count`, `snoozed_until`             | drive the re-offer interval and the explicit silence (§7)                                                                                                                                                                  |
+| `verification`                               | `{kind, command, still_failing_when}` — how to ask the cluster whether this is still true. Written at registration by whoever found it (§7.3)                                                                              |
 | `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not the drip's routing input (§8)                                                                                                              |
 
 **`id` is derived from the finding's own fields**, by the rule `audit_report.py` already implements
@@ -139,9 +140,124 @@ also means an inventory finding and an audit finding about the same object produ
 which §10 depends on.
 
 **`findings` is exempt from `cleanup_old_records`.** A backlog with a TTL is not a backlog. The
-lifecycle is `state`, not age: a finding leaves the table when it is resolved, dismissed, or has
-stopped reproducing for long enough to be marked `stale`, and each of those is a decision something
-made rather than a timer.
+lifecycle is `state`, not age, and no row is deleted by a timer. A finding that reaches a terminal
+state stays in the table: `dismissed` in particular has to outlive the sweep that found it, or the
+next sweep re-registers what the user already rejected and the drip offers it again (§5.2).
+
+### 3.1 The schema
+
+```sql
+CREATE TABLE IF NOT EXISTS findings (
+    id               TEXT PRIMARY KEY,
+    source           TEXT NOT NULL,               -- inventory | event-watcher | audit
+    check_slug       TEXT NOT NULL,
+    cluster          TEXT NOT NULL,
+    namespace        TEXT NOT NULL DEFAULT '',    -- '' for cluster-scoped, matching derive_finding_id
+    object           TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    detail           TEXT NOT NULL DEFAULT '',
+    root_cause       TEXT,
+    severity         TEXT NOT NULL,               -- critical | major | minor, derived (§4.2)
+    rank_score       INTEGER NOT NULL,
+    rubric           TEXT NOT NULL,               -- JSON {B, L, detect, recover, C}
+    provider_managed INTEGER NOT NULL DEFAULT 0,
+    actionable       INTEGER NOT NULL DEFAULT 1,
+    recommendation   TEXT NOT NULL,               -- JSON {action, rationale, risk}
+    remediation      TEXT NOT NULL,               -- JSON {kind, path, note}
+    verification     TEXT NOT NULL,               -- JSON {kind, command, still_failing_when}
+    pr_url           TEXT,
+    pr_state         TEXT,
+    state            TEXT NOT NULL DEFAULT 'queued',
+    first_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_verified    TIMESTAMP,
+    surfaced_at      TIMESTAMP,
+    surface_count    INTEGER NOT NULL DEFAULT 0,
+    snoozed_until    TIMESTAMP,
+    next_offer_after TIMESTAMP,
+    chat_id          TEXT,
+    thread_id        TEXT,
+    likelihood       INTEGER GENERATED ALWAYS AS (json_extract(rubric, '$.L')) VIRTUAL,
+    blast_radius     INTEGER GENERATED ALWAYS AS (json_extract(rubric, '$.B')) VIRTUAL
+)
+```
+
+Four choices in there are not free.
+
+**`check_slug`, not `check`.** `CHECK` is a SQLite keyword and `CREATE TABLE findings (check TEXT)`
+is a syntax error; `"check"` parses but leaves every query one forgotten quote away from the same
+error. The column is the audit streams' check slug (§10) whatever it is called here.
+
+**`likelihood` and `blast_radius` are generated columns, not stored ones.** §4.2's floor and §7's
+urgent slot both select on L, and a `WHERE json_extract(rubric, '$.L') = 10` cannot use an index.
+Generated columns can be indexed and cannot drift from the vector they are computed from, which is
+the objection §4.2 raises against keeping an `active` flag in a column of its own: a second copy of
+a derived fact is free to disagree with the fact. These are not a second copy — SQLite recomputes
+them from `rubric` on read, so a re-rank that moves L moves them in the same statement.
+
+**`next_offer_after` is stored rather than recomputed.** §7.1's intervals are a function of L and
+`surface_count`, so the drip could derive the date every morning. Storing it means the re-offer
+schedule is visible in the row — you can ask why a finding did not appear today and get an answer —
+and it survives a change to the interval rules without silently re-timing every finding already in
+flight.
+
+**`json_extract` over separate columns for the three JSON blobs.** `recommendation` and
+`remediation` carry the audit schema's own shapes so that §9 can hand a row to `remediate`
+unmodified; decomposing them into columns would mean recomposing them at promotion time, which is
+the mapping bug this reuse exists to avoid.
+
+The indexes follow the two queries the drip actually runs:
+
+```sql
+CREATE INDEX IF NOT EXISTS findings_drip     ON findings(state, next_offer_after, rank_score DESC);
+CREATE INDEX IF NOT EXISTS findings_urgent   ON findings(likelihood, state, rank_score DESC);
+CREATE INDEX IF NOT EXISTS findings_object   ON findings(cluster, namespace, object);
+CREATE INDEX IF NOT EXISTS findings_pr       ON findings(pr_state) WHERE pr_state IS NOT NULL;
+```
+
+`findings_object` is what makes §7's batching a lookup rather than a scan. `findings_pr` is narrow
+on purpose: it exists only so the promotion reconciler (§3.2) can find rows with a live pull request
+without walking the backlog.
+
+### 3.2 Lifecycle: who moves a row, and on what
+
+`fleet-audit-issue-ledger.md` §4 computes finding state per run and never stores it, because a
+ledger is rendered fresh each time. A queue cannot do that: `snoozed` and `dismissed` are decisions a
+person made once and nothing in the cluster records them. So state here is stored, and every
+transition has exactly one actor.
+
+| state       | entered when                                                   | by                           | effect on the drip                                       |
+| ----------- | -------------------------------------------------------------- | ---------------------------- | -------------------------------------------------------- |
+| `queued`    | registration, for an id not already present                    | any source (§5)              | eligible for either slot                                 |
+| `surfaced`  | the drip or an on-demand pull posted it                        | the drip job, after the send | eligible again once `next_offer_after` passes (§7.1)     |
+| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card      | excluded until `snoozed_until`, then back to `surfaced`  |
+| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card      | excluded from both slots; still re-verified              |
+| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card      | excluded permanently, and sticky against re-registration |
+| `resolved`  | re-verification found it no longer reproduces                  | the drip job                 | excluded; kept as the record that it was fixed           |
+| `stale`     | the object it names no longer exists, so it cannot be verified | the drip job                 | excluded; distinct from `resolved` on purpose            |
+
+**`resolved` and `stale` are different answers and must not be merged.** "The Deployment no longer
+crash-loops" and "the namespace is gone, so nobody can say" look identical to a query that only
+checks whether the finding still reproduces. Recording the second as the first is how a queue
+reports a fix that never happened — the failure mode `derive_finding_id`'s docstring describes from
+the other direction, where a renamed key made four unfixed criticals read as resolved.
+
+**Only three of the seven transitions belong to a person, and none of them can be inferred.** §6 is
+explicit that the Chat Agent holds no tools for this table, so a user replying "snooze that" in a
+thread does not reach the row. The reply becomes a kanban card assigned to `platform`, exactly as
+[`scan_completed.md`](../../agents/chat/defaults/onboarding/scan_completed.md) already prescribes
+for the on-demand pull, and the `platform` worker makes the transition. This is the one place where
+the queue's boundary costs a round trip, and it is the same boundary §6 declines to route around.
+
+Silence transitions nothing. §7.1 says why: inferring dismissal from an unanswered message is how
+this design would end up back at ignoring its own top item.
+
+**One transition has no actor yet, and it is the gap to close at implementation.** `pr_state` needs
+someone to notice a merge. Nothing in the drip's path polls GitHub, and `remediate`'s own reconcile
+runs on the audit stream's schedule against the ledger rather than against this table. The cheapest
+answer is for the drip to reconcile the rows `findings_pr` returns as part of the run it already
+makes — a handful of `gh pr view` calls bounded by the number of open promotions, not by the size of
+the backlog, which is the same cost principle as §9's surface-time promotion. Whoever builds the
+drip owns this; it is listed in §12.
 
 ## 4. The priority rubric
 
@@ -366,6 +482,69 @@ a CrashLoopBackOff that is rescheduled ten times is ten dedup keys. `derive_find
 recreations of the same Deployment's pod it is. The watcher keeps its cache for session suppression;
 the queue keys on the finding id and updates the existing row.
 
+### 5.1 What a source has to supply, and what it cannot
+
+Registration is not "hand over the finding". A row needs four things the finding itself does not
+obviously carry, and the three sources are unequal in their ability to produce them.
+
+| what registration needs         | inventory                                 | audit stream                         | event watcher                  |
+| ------------------------------- | ----------------------------------------- | ------------------------------------ | ------------------------------ |
+| `check_slug`                    | adopt the audit vocabulary (§10)          | already has one                      | **has none** — see below       |
+| `{B, L, detect, recover, C}`    | the extended prioritize SOP classifies it | its own SOP classifies it            | **cannot** — Go, no model turn |
+| `recommendation`, `remediation` | already written by the sweep              | already in the audit schema          | from the reason, by table      |
+| `verification`                  | the check's own detection query           | the `####` section's detection query | the object's condition         |
+
+**The watcher is the hard case and the document previously waved at it.** "One more call on a path
+that exists" is true of the HTTP request and false of everything in the request body. The watcher
+sees `(involvedObject, reason, message)`. It has no check slug, so it cannot call
+`derive_finding_id`, so the cross-source collision §10 depends on does not happen — a
+CrashLoopBackOff the watcher reports and one the sweep reports would sit in two rows. And it runs in
+Go with no model in the loop, so it cannot classify a rubric vector.
+
+Both are fixed by the same small thing: **a static reason-to-check map, in the watcher, alongside
+the reason allowlist it already carries.** A `BackOff`/`CrashLoopBackOff` event maps to the same
+slug the obtainability stream uses for a crash-looping workload; `FailedMount`, `OOMKilling`,
+`NodeNotReady` likewise. The map gives the watcher a `check_slug`, which gives it an id, which is
+what makes its row and the sweep's row the same row. For the vector it supplies only what an event
+actually tells you — L = 10, because a watcher finding is by definition failing now (§4.6 already
+says this), and C = 1.0, because the fault was observed directly — and leaves B, detect and recover
+to a default per reason in the same map. Those are the two measures an event cannot see, and a
+default that is sometimes wrong is a re-rank (§4.6), not a wrong identity.
+
+Reasons outside the map register nothing. The watcher keeps doing what it does today — open a
+troubleshooting session — and the queue stays out of it, which is better than a row whose check slug
+was invented to fill the column.
+
+### 5.2 Re-registration: what a second sweep does to the first one's rows
+
+Every source re-runs, so every registration is an upsert against an id that may already exist. The
+rule is per state, and two of the seven are the whole point of writing it down:
+
+- `queued`, `surfaced`, `snoozed`, `accepted` — update `detail`, `last_verified`, and the rubric
+  vector; **do not touch `state`, `surface_count`, `next_offer_after`, or `snoozed_until`.** A
+  re-registration is the same problem seen again, not a new one, and resetting the re-offer clock is
+  how a queue starts nagging.
+- `dismissed` — **stays dismissed, and the sweep does not resurrect it.** This is the sticky case.
+  Without it the next sweep re-registers what the user explicitly rejected, the row goes back to
+  `queued`, and the drip offers it again — which is not a queue with a dismissal, it is a queue that
+  forgets. Record the re-observation on the row so the count is honest; do not act on it.
+- `resolved`, `stale` — a re-registration means it came back. Move to `queued`, keep `first_seen`,
+  reset `surface_count` to zero. A recurrence is news and should be allowed to reach the urgent slot
+  again, but it is the same problem with a history, not a new one.
+
+**A finding that stops being reported is not thereby resolved.** This is the reciprocal case and the
+one an upsert cannot express, because it is about the rows a run did _not_ mention. The temptation
+is to treat absence from the latest sweep as a fix and close everything missing — cheap, and wrong
+in the expensive direction. A sweep that failed halfway, ran against one cluster of two, or lost a
+credential produces exactly the same absence as a fleet that got healthier overnight, and closing on
+it announces fixes that did not happen.
+
+So absence downgrades confidence rather than deciding anything: on a completed run, a `queued` row
+the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
+absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
+from §7.3's verification when the row next reaches a slot. Only a run that reports its own scope as
+complete for that cluster may do even this much; a partial run touches nothing.
+
 ## 6. Who reads it
 
 The Chat Agent has no tools to read this, and that is deliberate rather than an oversight to route
@@ -379,9 +558,47 @@ prescribes for the full inventory: "You hold no tools for reading it yourself, s
 applies as everywhere else: file it, do not promise it." The queue reuses an established boundary
 rather than working around one.
 
-New MCP tools land on
-[`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py), which already
-talks to the Session KV server on loopback.
+### 6.1 The surface is HTTP, and MCP is a wrapper over it
+
+The obvious answer is "new MCP tools on
+[`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py)", and it is the
+wrong layer to start from. MCP is how an _agent turn_ reaches something, and only one of the three
+callers here is an agent turn.
+
+[`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) owns the SQLite file
+and already exposes `incidents` over HTTP — `POST /v1/incidents`, `GET /v1/incidents/by-thread`,
+`GET /v1/incidents/recent`, each behind `verify_api_key`. `findings` sits in the same database and
+gets the same treatment, for two reasons that are not stylistic:
+
+- **The event watcher cannot call an MCP tool.** It is Go, it speaks HTTP to this server today, and
+  §5.1 makes it a first-class writer. An endpoint has to exist whatever the agent uses.
+- **The selection rules have to be code.** §4.1 rejects model-side scoring because three runs on
+  identical input produced 3, 6 and 6 items; selection has the same exposure and a worse blast
+  radius, because it decides what a person sees rather than what order a list is in. A drip that
+  re-derives "today's two" from prose each morning is that instability wearing a different hat. So
+  the two-slot pick is a Python function beside the table, reached as an endpoint that returns rows
+  already chosen — not a prompt that asks a model to choose.
+
+| endpoint                          | caller                            | does                                                                                       |
+| --------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------ |
+| `POST /v1/findings`               | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id     |
+| `GET /v1/findings/drip`           | the drip job                      | the urgent and drain picks, batching applied (§7), selection in code                       |
+| `GET /v1/findings`                | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                                 |
+| `POST /v1/findings/{id}/surfaced` | the drip job                      | after the send: `surface_count`, `surfaced_at`, `next_offer_after`, `chat_id`, `thread_id` |
+| `PATCH /v1/findings/{id}`         | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation                |
+| `POST /v1/findings/{id}/verified` | the drip job                      | the three-outcome result of §7.3, with what was observed                                   |
+
+Then, and only then, the MCP layer: thin tools on `platform_mcp_server.py` that call those endpoints
+on loopback. That is not a new pattern — `send_notification` and `report_to_chat` are already
+exactly this, MCP tools whose bodies are a request to the Session KV server built with
+`_session_kv_headers`. An agent turn gets tools; the watcher gets the endpoint underneath them; the
+selection logic gets a unit test instead of a prompt.
+
+**Not a CLI.** `audit_report.py` is the counter-example worth naming, because §9 shells out to it
+and a reader will ask why the queue does not follow suit. That script is a CLI because it drives
+`git` and `gh` against a repository and holds no state of its own between runs. The queue is the
+opposite on both counts: its state is a database another process already owns, and a second writer
+to that file is a locking problem rather than a convenience.
 
 ## 7. The drip
 
@@ -533,6 +750,80 @@ re-offers daily forever, which is the nagging behaviour §7.1 exists to prevent.
 The simulation is a design aid, not a test — it assumes the rubric's own scores are right and
 models a fleet rather than measuring one. What it can show is a selection rule starving its own
 queue, which it did.
+
+### 7.3 Re-verification, and why the finding has to carry its own check
+
+"Re-check the candidates before posting" is one line of §7 and the hardest thing in this document to
+build, because there is no generic way to ask a cluster whether a finding is still true. What
+"still failing" means is a property of the individual finding: for a CrashLoopBackOff it is a pod
+phase, for an expiring certificate a date, for a missing NetworkPolicy the absence of an object, for
+a project-scoped service-account key the continued existence of a binding. A per-check-slug query
+does not cover it either — the same slug at two objects can need different questions.
+
+Two ways to answer, and the choice matters more than it looks.
+
+**A model turn reasons it out from the finding's prose.** Flexible, and it fails in the direction
+that costs most. This is §4.1's instability aimed at the one judgement where being wrong is
+unrecoverable: a finding wrongly marked `resolved` leaves the queue and is never offered again.
+`derive_finding_id`'s docstring records what that looks like in production — on 2026-08-03 the 16:34
+run announced four unfixed criticals as resolved, in writing, three internet-reachable control
+planes among them, because a join key had been re-derived rather than computed. A re-verification
+that re-reasons the fault from prose every morning is the same mechanism with a shorter fuse.
+
+**The finding carries its own check, written when it was found.** At registration the source has the
+detection in hand — it is how it found the thing — so it writes down how to ask again. That is the
+`verification` column: `kind` (`kubectl`, `gcloud`, or `manual`), a read-only `command`, and
+`still_failing_when`, the condition on that command's output which means the problem persists. §10's
+owned checks inherit theirs from the `####` detection query in the owning stream's SOP, which
+`test_check_rosters_match_the_sops` already keeps honest; §10.1's three unowned checks acquire one
+when they get their sections, which is a third reason to write them; the watcher's comes from the
+reason map in §5.1.
+
+The stored check is the default and the model turn is the bounded fallback, not the other way round.
+Where `kind` is `manual` — a Workload Identity migration, an SLO practice observation — no command
+can settle it, and the drip says so rather than guessing.
+
+**Three outcomes, never two.** This is the part that has to survive contact with implementation.
+
+| outcome              | means                                                | effect                                                        |
+| -------------------- | ---------------------------------------------------- | ------------------------------------------------------------- |
+| still reproduces     | the command ran and `still_failing_when` held        | `last_verified` advances; surface it                          |
+| no longer reproduces | the command ran and the condition did not hold       | `resolved` (§3.2); close any open PR through `remediate`      |
+| could not verify     | the command failed, timed out, or the object is gone | `last_verified` **does not advance**; stay queued, or `stale` |
+
+Collapsing the third into the second is the entire failure mode. An expired credential, an
+unreachable control plane, a `kubectl` that returned nothing because the context was wrong — each
+produces "the condition did not hold" from a query that never really ran. The distinction is between
+"asked and got no" and "did not manage to ask", and only the first may resolve a finding. Where the
+object itself is gone the answer is `stale`, which §3.2 keeps separate from `resolved` for this
+reason.
+
+A finding that cannot be verified for several consecutive attempts is worth surfacing as such. It
+usually means the queue has lost access to something it used to be able to see, which is a fleet
+problem wearing a queue problem's clothes.
+
+### 7.4 The job, and the SOP it runs
+
+The drip is a job in [`jobs.json`](../../agents/platform/cron/jobs.json) and an SOP under
+`agents/platform/governance/`, in the shape every other job on that roster already takes: the entry
+schedules it and names the profile, the SOP is what the turn actually does. Naming both matters
+because §7's behaviour has to live somewhere, and "a new job" on its own leaves the largest piece of
+this design — read the queue, verify, promote, compose — with no file to be written into.
+
+- **`findings_drip_sop.md`**, beside `inventory_prioritize_sop.md`. Four steps: fetch the picks from
+  `GET /v1/findings/drip`; run §7.3's verification on each and post the results back; promote what
+  §9 says to promote; compose the message in §7.1's shape — full treatment on a first surface, one
+  line on a re-offer — and exit `[SILENT]` when the picks are empty.
+- **The roster entry**, `deliver: "chat"` like the seven audits. Daily rather than weekly, because
+  §7's premise is "what must be done today". Scheduled _after_ the daily audit jobs rather than
+  before: the latest of them lands at 09:20, they are themselves a source (§5), and a drip that runs
+  first shows the user a queue that is a day behind its own inputs.
+
+The SOP is deliberately thin on judgement. Selection is already decided by the endpoint (§6.1),
+verification by the stored check (§7.3), promotion by §9, and the ranking by §4 — so what is left
+for the turn is running commands and writing English, which is what a model should be doing here.
+An SOP that re-opens any of those four decisions has reintroduced the instability each of them was
+written to remove.
 
 ## 8. How a queued finding reaches a human
 
@@ -709,3 +1000,30 @@ It does not replace the audit ledgers. It builds no new remediation-PR machinery
 `remediate` wholesale. It does not change what the first-time report looks like — the delivered
 `INVENTORY.md` keeps its cap and stays verbatim. And `INVENTORY.raw.md` stays where it is as the
 full-detail record of what a sweep saw, which the queue references rather than replaces.
+
+## 12. What building this consists of
+
+Collected from the sections above so an implementation can be scoped and split, in dependency order.
+Each item names the section that specifies it; nothing here is new.
+
+| #   | deliverable                                                                                                                       | where      |
+| --- | --------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 1   | `findings` table, indexes, and exemption from `cleanup_old_records`, in `session_kv_server.py`                                    | §3.1       |
+| 2   | Upsert rules per existing state, including sticky `dismissed`, and the absence-lowers-confidence rule                             | §5.2       |
+| 3   | The six HTTP endpoints, with the two-slot selection as a tested Python function rather than a prompt                              | §6.1, §7   |
+| 4   | Thin MCP tools over those endpoints on `platform_mcp_server.py`                                                                   | §6.1       |
+| 5   | `inventory_prioritize_sop.md` extended to register the full collapsed set with rubric vectors                                     | §5         |
+| 6   | The rubric's anchors and worked examples written into that SOP                                                                    | §4.2, §4.3 |
+| 7   | Reason-to-check map in `k8s-event-watcher`, plus its registration call                                                            | §5.1       |
+| 8   | `findings_drip_sop.md` and its `jobs.json` entry, scheduled after the daily audits                                                | §7.4       |
+| 9   | Verification execution and its three outcomes, including "could not verify"                                                       | §7.3       |
+| 10  | Surface-time promotion through `remediate`, and `pr_state` reconciliation for open promotions                                     | §9, §3.2   |
+| 11  | Three `####` sections — `startupProbe`, `readOnlyRootFilesystem`, ResourceQuota/LimitRange — in the SOPs of their nearest streams | §10.1      |
+
+Items 1–4 are the storage layer and stand alone; 5–7 are the writers and can land in any order once
+4 exists; 8–10 are the drip and need everything above. Item 11 is independent of all of it and is
+work the audit streams arguably owe anyway.
+
+Two things to settle against a running install rather than on paper, both already flagged: the
+`platforms` key a named-profile cron job needs in order to reach chat at all, and the Google Chat
+home-channel shape (§8).
