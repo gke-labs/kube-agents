@@ -108,6 +108,11 @@ class Scenario:
             log.record(
                 "summary",
                 {
+                    "interaction": {
+                        "status": interaction.get("status"),
+                        "error": interaction.get("error") or None,
+                        "diagnostics": interaction.get("diagnostics") or [],
+                    },
                     "acceptanceCriteria": acceptance.summary(),
                     "milestones": milestone_summary,
                     "milestoneError": milestone_error or None,
@@ -116,6 +121,11 @@ class Scenario:
         except (OSError, ValueError, PortalError) as exc:
             pytest.fail(f"{self.id} setup failed: {exc}; evidence: {log.path}")
 
+        status = str(interaction.get("status") or "unknown").upper()
+        error = str(interaction.get("error") or "").strip()
+        print(f"Interaction outcome: {status}" + (f" — {error}" if error else ""))
+        for diagnostic in interaction.get("diagnostics") or []:
+            print(f"      Diagnostic: {diagnostic}")
         if milestones is not None:
             print("Milestones (diagnostic only):")
             for line in milestones.report_lines():
@@ -126,7 +136,15 @@ class Scenario:
         for line in acceptance.report_lines():
             print(line)
         print(f"Evidence: {log.path}")
+        interaction_failure = (
+            f"interaction {status}"
+            + (f": {error}" if error else "")
+            + "; "
+            if interaction.get("status") != "completed"
+            else ""
+        )
         assert acceptance.passed, (
-            "acceptance criteria not met: "
+            interaction_failure
+            + "acceptance criteria not met: "
             f"{acceptance.failure_summary()}; evidence: {log.path}"
         )

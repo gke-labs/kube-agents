@@ -126,11 +126,20 @@ class AcceptanceCriteria:
         return lines
 
     def failure_summary(self) -> str:
-        return "; ".join(
-            f"{item.criterion.id} ({item.status.value}): {item.criterion.requirement}"
-            for item in self.results
-            if not item.passed
-        )
+        failures: list[str] = []
+        for item in self.results:
+            if item.passed:
+                continue
+            reason = (
+                f"; blocked by {', '.join(item.blocked_by)}"
+                if item.blocked_by
+                else ""
+            )
+            failures.append(
+                f"{item.criterion.id} ({item.status.value}{reason}): "
+                f"{item.criterion.requirement}"
+            )
+        return "; ".join(failures)
 
 
 def _concise(value: Any, limit: int = 240) -> str:
