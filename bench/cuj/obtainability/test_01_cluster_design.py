@@ -301,34 +301,13 @@ def run(
             "delegatedTasks": interaction.get("tasks", []),
         },
     )
-    evidence.write(
-        "05-skill-routing.json",
-        [
-            {
-                "taskId": task.get("taskId"),
-                "assignee": task.get("assignee"),
-                "skills": task.get("skills"),
-                "loadedSkills": task.get("loadedSkills"),
-            }
-            for task in interaction.get("tasks", [])
-            if isinstance(task, dict)
-        ],
-    )
-    evidence.write(
-        "06-delegated-evidence.json",
-        [
-            {"taskId": task.get("taskId"), "evidence": task.get("evidence")}
-            for task in interaction.get("tasks", [])
-            if isinstance(task, dict)
-        ],
-    )
     suite = evaluate(interaction)
     for index, result in enumerate(suite.results, start=1):
         evidence.write(
-            f"07-milestones/{index:02d}-{result.milestone.id}.json",
+            f"05-milestones/{index:02d}-{result.milestone.id}.json",
             result.to_dict(),
         )
-    evidence.write("08-summary.json", suite.summary())
+    evidence.write("06-summary.json", suite.summary())
     return suite
 
 
