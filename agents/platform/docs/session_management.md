@@ -83,6 +83,7 @@ sequenceDiagram
     participant Gateway as Hermes Gateway (Port 8642)
     participant Front as Planning Agent (default profile)
     participant Agent as Cluster Agent for the event's cluster
+    participant Fixer as Platform Agent (holds the GitOps write path)
     participant Notifier as Kanban notifier
     participant Chat as Google Chat / Slack
     participant Plugin as incident_context Plugin
@@ -110,15 +111,16 @@ sequenceDiagram
     Watcher->>Proxy: POST /sessions/k8s-evt-abc123/inject (Payload: count=5)
     Proxy->>Chat: Post threaded repeat warning message
 
-    Note over Agent, Chat: Phase 3: Reporting & Human-in-the-Loop Resolution
+    Note over Fixer, Chat: Phase 3: Reporting & Human-in-the-Loop Resolution
     Chat->>Plugin: User replies: "apply" (recommended) or "apply Option B" (Hook: pre_gateway_dispatch)
     Plugin->>Proxy: GET /v1/incidents/by-thread
     Proxy-->>Plugin: Return triage report content
     Note over Plugin: Rewrite message text to prepend triage report context
-    Plugin->>Gateway: Spawn Fixer Agent with rewritten message
-    Gateway->>Agent: Inject context into conversation turn
-    Agent->>Agent: Create branch, edit git manifests, open GitOps PR
-    Agent->>Chat: Post threaded reply "Created PR #334"
+    Plugin->>Gateway: Dispatch the rewritten message
+    Gateway->>Front: Ordinary chat ingress, so it lands on the front door
+    Front->>Fixer: Delegate the apply — the Cluster Agent that wrote the report cannot open a PR
+    Fixer->>Fixer: Create branch, edit git manifests, open GitOps PR
+    Fixer->>Chat: Post threaded reply "Created PR #334"
 ```
 
 ---
