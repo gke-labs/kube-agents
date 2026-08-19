@@ -124,8 +124,10 @@ carries the worst thing the ledger saw, not a summary of the report's length.
 🟢 is the only assertion the header makes, so it is gated on the same condition as the ✅ all-clear
 rather than on whether there was anything to list: a day with no informational events but thirty
 `Critical` alerts the ceiling withheld grades 📊 — neutral, which is honest, where green would not
-be. It carries one gate the ✅ does not: green also requires that nothing was excluded, because the
-✅ can qualify itself in words and an emoji cannot. See
+be. The gate is exactly the ✅'s, no wider: a namespace exclusion does not bar green. It reads as
+though it should, since the recap did not look there, but `kube-system` ships excluded and the
+watcher forwards it anyway, so vetoing on it would hold the header at 📊 every day and leave 🟢
+unreachable. The scope caveat rides the qualifier line under the counts instead. See
 [What this recap does not report](#what-this-recap-does-not-report).
 
 The ✅ all-clear claims nothing was held back from chat. It does **not** claim the watcher is alive:
@@ -220,13 +222,16 @@ skipped.
 Informational churn is the exception, and deliberately so: it is dropped from `suppressed_info`,
 which is the informational leg of the veto. Counting it there would put every stock install
 permanently out of all-clear on `kube-system` `BackOff` noise, which is the thing the filter exists
-to stop reporting. What that must not buy is a green light over a window the recap did not fully
-read, so **any exclusion at all bars 🟢**: once the filter has removed something the header grades
-📊, and the same qualifier line under the headline counts carries "namespaces in
+to stop reporting. **The exclusion count is not a veto term of its own either.** It reads as though
+it ought to be — the recap did not read those namespaces, so green overclaims by that much — but the
+same `kube-system` traffic makes the count non-zero on an ordinary day, and vetoing on it would hold
+the header at 📊 permanently, which grades nothing and costs 📊 the meaning it was added to carry.
+The caveat goes in words instead: the qualifier line under the headline counts reads "namespaces in
 `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope" — once, whichever body the recap goes on to
-print. A day whose only withheld traffic was excluded informational events
-therefore still prints the ✅ — the recap looked at everything in scope and found nothing — under a
-neutral header that does not assert the day was clean.
+print. So a day whose only withheld traffic was excluded informational events prints the ✅ and
+grades 🟢, and what bounds that claim is the qualifier line rather than the emoji. What an exclusion
+cannot do is any of the above to a ceiling drop or a failed delivery, which is the property that
+matters and is the paragraph above.
 
 ## Running it by hand
 

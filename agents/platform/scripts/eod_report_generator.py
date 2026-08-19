@@ -49,14 +49,20 @@ def excluded_namespaces() -> FrozenSet[str]:
     This is a noise filter, and what it can and cannot reach is exact. An
     excluded row is still counted by the two alert tallies — `cap_dropped` and
     `delivery_failed` — so silencing a namespace cannot hide a ceiling drop or a
-    failed delivery, and cannot take the all-clear off a day one of those
+    failed delivery, and cannot hand the all-clear back to a day one of those
     spoiled. It does drop the row from `suppressed_info`: informational churn in
     an excluded namespace is precisely what the filter exists to stop reporting,
     and counting it in the veto would put every stock install with `kube-system`
-    excluded permanently out of all-clear. What the exclusion must not buy is a
-    green light over a window the recap did not fully read, so
-    `excluded_occurrences` bars 🟢 on its own in `generate_markdown_report`, and
-    the qualifier line under the counts names the filter.
+    excluded permanently out of all-clear.
+
+    `excluded_occurrences` is not a veto term either, for that same reason at one
+    remove: `kube-system` ships excluded and the watcher forwards it anyway, so
+    the count is non-zero on an ordinary day and vetoing on it would pin the
+    header to 📊 and leave 🟢 unreachable. The residue is that a day whose only
+    informational churn sat in an excluded namespace still grades green, which
+    overstates coverage by exactly that much; the qualifier line under the counts
+    carries the scope caveat in words, which an emoji cannot.
+    `generate_markdown_report` owns that argument.
     """
     raw = os.getenv("EOD_EXCLUDE_NAMESPACES")
     if raw is None:

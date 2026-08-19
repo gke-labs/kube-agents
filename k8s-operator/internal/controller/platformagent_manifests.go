@@ -2380,13 +2380,25 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// narrow what its listing prints and reach nothing the notifier does: no
 	// event stops being forwarded, no alert stops being posted, and a ceiling
 	// drop or a failed delivery in an excluded namespace is still counted and
-	// still withholds the recap's all-clear. What an exclusion does reach is
-	// the informational tally, which is the point of it — so the recap grades
-	// its header neutral rather than green whenever the filter removed
-	// anything, and cannot be tuned into asserting a clean day it did not
-	// measure. A value that is not a namespace list or an integer is warned
-	// about on stderr and ignored, so the worst an arbitrary one can do is
-	// leave the defaults in place.
+	// still withholds the recap's all-clear — `eod_report_generator.py` flags
+	// an excluded row rather than skipping it, so the loop keeps tallying it.
+	// That is the property this allowlist entry rests on: no value of
+	// EOD_EXCLUDE_NAMESPACES can tune the recap into hiding a withheld alert
+	// or a refused post.
+	//
+	// It buys less than that in one respect, and the difference is worth
+	// stating rather than rounding off. What an exclusion does reach is the
+	// informational tally, which is the point of it, and the exclusion count
+	// is deliberately not a veto term — so a day whose only informational
+	// churn sat in an excluded namespace still grades green, over a window the
+	// recap did not fully read. The scope caveat rides a qualifier line in the
+	// report body instead. The bound is that the overclaim is confined to
+	// informational churn; the two alert tallies above are what an operator
+	// setting this variable cannot touch.
+	//
+	// A value that is not a namespace list or an integer is warned about on
+	// stderr and ignored, so the worst an arbitrary one can do is leave the
+	// defaults in place.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
