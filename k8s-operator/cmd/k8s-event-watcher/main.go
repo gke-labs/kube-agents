@@ -873,13 +873,33 @@ func realMain(argv []string) error {
 // EventKey is (UID, reason) with no cluster in it, so two entries for one
 // cluster are not deduplicated anywhere downstream: the same pod crash would
 // raise two alerts, open two sessions, and burn two slots of the daily ceiling.
-// The profile entry wins, because it carries the project/location/cluster
-// identity that the payload is stamped with and that the triage session is
-// routed by; the direct entry knows only a name. Dropping the direct entry
-// costs nothing — it is the same cluster, reached with a different credential.
+//
+// The two entries are not interchangeable, so which one survives matters. The
+// profile carries the project/location/cluster identity that stamps the payload
+// and labels every metric; the direct entry knows only a name. But the profile
+// also carries a credential that can be refused: it authenticates as the GSA
+// through a get-credentials kubeconfig, so a permission set without
+// roles/container.viewer, or master authorized networks that exclude the pod's
+// egress, denies it. The direct entry uses the pod's own service account against
+// kubernetes.default.svc and never leaves the cluster.
+//
+// Nothing here would notice the difference. discoverClusterProfiles builds a
+// client without contacting an API server, so a profile displaces on the
+// strength of a well-formed kubeconfig and the credential is not exercised until
+// the informer's initial list — by which time the entry it displaced is gone. On
+// a single-cluster install that leaves a watch set of one, and a watch set of one
+// that never syncs trips the initialSyncGrace check in run: the process exits and
+// the pod crashloops watching nothing. On a fleet it is quieter and worse — the
+// peers sync, nothing restarts, and the one cluster whose failure breaks
+// everything else is silently unmonitored.
+//
+// So the direct entry wins and takes the profile's identity triple with it.
+// Reachability is the half that cannot be reconstructed; project and location are
+// the half that can. The profile is untouched — it is still the agent that
+// answers the triage, it is just not how the events are read.
 func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, error) {
 	var clusters []targetCluster
-	profileNames := make(map[string]string) // cluster name -> profile it came from
+	profileFor := make(map[string]targetCluster) // cluster name -> the profile entry covering it
 
 	if f.profilesDir != "" {
 		discovered, err := discoverClusterProfiles(ctx, f.profilesDir, m)
@@ -892,7 +912,7 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			log.Printf("k8s-event-watcher: no Cluster Agent profiles in %s (nothing to fan out to yet)", f.profilesDir)
 		}
 		for _, tc := range discovered {
-			profileNames[tc.Name] = tc.Profile
+			profileFor[tc.Name] = tc
 		}
 		clusters = append(clusters, discovered...)
 	}
@@ -900,30 +920,49 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 	// Add the directly-reachable cluster when asked for explicitly, or when
 	// --profiles-dir was not given at all (the single-cluster default).
 	if f.profilesDir == "" || f.inCluster || f.kubeconfig != "" {
+		// Profile stays "direct" whether or not a profile was absorbed: it is the
+		// per-cluster filename for dedup snapshots, and every install already on
+		// disk has this cluster's cache under that name. Renaming it to the
+		// profile would silently resume from an empty cache after an upgrade,
+		// which is one duplicate alert per incident still inside the window.
+		direct := targetCluster{Name: f.clusterName, Profile: "direct"}
 		// Matched on the bare name because that is all the direct entry has —
 		// --in-cluster reads no cluster_identity. Two same-named clusters in
-		// different locations would therefore hide this one, but only in the
-		// window before reconcile has given the management cluster its own
-		// profile, and the log line below says which profile absorbed it.
-		if profile, dup := profileNames[f.clusterName]; dup {
-			log.Printf("k8s-event-watcher: %s is already watched through profile %s; not watching it a second time directly (that would raise two alerts per event)", f.clusterName, profile)
-		} else {
-			client, err := buildKubeClient(f)
-			if err != nil {
-				return nil, err
-			}
-			clusters = append(clusters, targetCluster{
-				Name:    f.clusterName,
-				Profile: "direct",
-				Client:  client,
-			})
+		// different locations would therefore match the wrong profile and stamp
+		// this one with the other's location; the log line below prints the
+		// identity being adopted so that shows up rather than being inferred.
+		if covered, dup := profileFor[f.clusterName]; dup {
+			clusters = removeProfile(clusters, covered.Profile)
+			direct.ProjectID, direct.Location = covered.ProjectID, covered.Location
+			log.Printf("k8s-event-watcher: %s is covered by profile %s and by the direct client; watching it once, directly, as %s (the pod's own credential cannot be denied by IAM or by master authorized networks)",
+				f.clusterName, covered.Profile, direct.identity())
 		}
+		client, err := buildKubeClient(f)
+		if err != nil {
+			return nil, err
+		}
+		direct.Client = client
+		clusters = append(clusters, direct)
 	}
 
 	if len(clusters) == 0 {
 		return nil, fmt.Errorf("no clusters to watch: %s contained no Cluster Agent profiles and neither --in-cluster nor --kubeconfig was given", f.profilesDir)
 	}
 	return clusters, nil
+}
+
+// removeProfile drops the entry discovered from profile, preserving the order of
+// the rest. Profile directory names are unique by construction (the Python side
+// derives them from the whole project/location/cluster triple), so this removes
+// exactly one entry.
+func removeProfile(clusters []targetCluster, profile string) []targetCluster {
+	kept := make([]targetCluster, 0, len(clusters))
+	for _, tc := range clusters {
+		if tc.Profile != profile {
+			kept = append(kept, tc)
+		}
+	}
+	return kept
 }
 
 // runSnapshotLoop periodically triggers a cache persistence snapshot.
