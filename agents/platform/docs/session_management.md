@@ -74,6 +74,13 @@ Behaviour worth knowing before relying on it:
 
 The diagram below details the lifecycles of alert ingestion, session routing, and interactive GitOps fixes:
 
+> **Phase 3 is not reachable from Phase 1 today.** The plugin and both `/v1/incidents` routes work, but
+> the only writer of the `incidents` table they read is `platform_mcp_server.send_notification` — the
+> egress call Phase 1's kanban delivery replaced. So `_lookup` finds nothing, the reply is passed through
+> unrewritten, and the front door gets a bare `apply`. The report template withholds the invitation to
+> reply until that is fixed (issue #802); the phase is drawn because the machinery is still there
+> and a Platform Agent posting a threaded notification still populates it.
+
 ```mermaid
 sequenceDiagram
     autonumber

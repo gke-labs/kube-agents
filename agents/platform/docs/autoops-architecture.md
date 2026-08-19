@@ -94,6 +94,10 @@ flowchart TB
 > `incidents` holds the triage report and its fix options, so a reply of _"apply Option B"_ hours later
 > still resolves. The Session Manager is ours (`session_kv_server.py`, SQLite-backed); the Agent Gateway
 > is the Hermes REST endpoint it calls to run each turn.
+>
+> **The second turn is not reachable from event triage today.** Nothing on that path writes the
+> `incidents` row the reply depends on — see [Known gaps](#known-gaps) — so the report stops at ①, and
+> the template no longer invites the approval that would start ②.
 
 ## What qualifies as a domain
 
@@ -170,9 +174,12 @@ same session instead of starting a new one.
 `INSERT OR IGNORE`, so later chatter cannot overwrite the decision record.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
-knows what Option B was. Both tables expire on a TTL sweep (`SESSION_KV_CLEANUP_TTL_DAYS`, default 14).
+knows what Option B was. Its only writer is `send_notification`, so an event triage — which now delivers by
+completing its kanban card instead — leaves no row and no follow-up. Both tables expire on a TTL sweep
+(`SESSION_KV_CLEANUP_TTL_DAYS`, default 14).
 
-**A new domain supplies:** nothing. It inherits sessions, thread routing, and follow-up for free.
+**A new domain supplies:** nothing. It inherits sessions and thread routing for free, and follow-up as far
+as its delivery path writes an `incidents` row.
 
 #### What it unlocks — every incident leaves a written report behind
 
@@ -237,12 +244,11 @@ Format the report you pass to `kanban_complete`'s `result` exactly like this —
 - **Option A (<Action Title>):** <1-sentence GitOps fix>
 - **Option B (<Action Title>):** <1-sentence GitOps fix>
 - ✅ **Recommended: Option <letter>** — <why this is the safer choice>
-- **To authorize:** reply **'apply'** ... or name one directly with **'apply Option A'** / **'apply Option B'**
 
-**What happens if the user replies 'apply':**
-The reply lands as ordinary chat ingress, on the front door rather than in this session, and is
-carried out by the agent that holds the GitOps write path ... the fix ships as a Pull Request
-against the GitOps repository, and nothing is written to the live cluster directly.
+**Who acts on this:**
+A human reads your options and the agent that holds the GitOps write path opens the Pull
+Request ... the fix ships as a Pull Request against the GitOps repository, and nothing is
+written to the live cluster directly.
 ```
 
 **What that one string pins down** — four design decisions, not formatting preferences:
@@ -261,10 +267,13 @@ against the GitOps repository, and nothing is written to the live cluster direct
   policy, it silently replaces it. A new domain's template starts from §7's three sections. The template
   spells that shape out rather than citing the section, because the agent reading it is a Cluster Agent,
   whose persona has no §7.
-- **The approval interaction** — the exact words that turn a suggestion into an authorized action, and
-  the fact that a reply is required at all. It now shares a bullet list with the fix options, so it is
-  labelled `To authorize:` and the instruction above the template says it is not an option; a bare
-  fourth bullet in a lettered list reads as Option C.
+- **The approval interaction** — the exact words that turn a suggestion into an authorized action. The
+  template used to end with `To authorize: reply 'apply'`, and that bullet is withheld until something
+  honours it. The agent acting on such a reply reads the report back from `incidents`, whose only writer
+  is `send_notification` — the egress call the card delivery replaced — so the lookup returns nothing and
+  the front door receives a bare `apply` with no report and no options. The prompt now tells the agent
+  not to write a call-to-action of its own either, since a list ending in a recommendation invites one.
+  Restoring it means storing the report on the delivery path first (issue #802).
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
@@ -423,6 +432,11 @@ Stated plainly, because they scope the next milestone:
 
 - **The inject envelope is k8s-shaped**, and so is `_build_agent_query()`. The second domain generalizes both.
 - **No incident corpus yet** — the `incidents` table has the data but not the keys, outcomes, or retention.
+- **Event triage stops at the report** (issue #802). Turn ② needs the `incidents` row, and the only
+  writer is `send_notification` — the egress call the kanban card delivery replaced. So a reply of _"apply"_
+  reaches an agent that cannot see the report, and the template withholds the invitation rather than
+  making a promise nothing keeps. The fix is to store the completed report on the delivery path, where the
+  subscription row already holds the chat id, thread id and result together.
 - **No metric or quota tooling** — two of the five cross-domain CUJ rows are blocked on it.
 - **Judgment has no regression harness** — judgment is the differentiator, so it needs an eval suite.
 - **Outbound is chat-only** — the only paths out are the chat thread and the PR link posted into it.

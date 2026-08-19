@@ -711,17 +711,16 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         query = session_kv_server._build_agent_query(payload)
         self.assertIn("platform-agent-host", query)
 
-    def test_call_to_action_names_options_instead_of_a_placeholder(self):
-        # The call-to-action is copied verbatim into the chat message, so a
-        # `<letter>` there reaches the responder as an unfilled placeholder
-        # rather than a choice they can act on. `<letter>` is still correct in
-        # the instruction prose above the template, which the agent reads but
-        # never echoes -- so pin the template line, not the whole query.
-        #
-        # Locate it structurally, by its position and label, rather than by the
-        # text under test: selecting the line that contains `apply Option A`
-        # would make the assertions below tautological, and the instruction
-        # prose above the template legitimately says `apply Option <letter>`.
+    def test_the_template_does_not_invite_a_reply_it_cannot_honour(self):
+        # The report used to end with "To authorize: reply 'apply'". The agent
+        # that acts on such a reply reads the report back from the `incidents`
+        # table via the incident_context plugin, and the only writer of that
+        # table is platform_mcp_server.send_notification -- the egress call this
+        # delivery path replaced. So the row is never written, the lookup
+        # returns None, and the front door gets the bare word `apply` with no
+        # report, no options and no cluster. Nothing unsafe happens; it just
+        # cannot work. The invitation is withheld until #802 stores the
+        # report on the delivery path.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -731,13 +730,8 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         }
         query = session_kv_server._build_agent_query(payload)
         what_to_do = query.split("## What to do", 1)[1]
-        cta = next(
-            line for line in what_to_do.splitlines()
-            if line.startswith("- **To authorize:**")
-        )
-        self.assertNotIn("<letter>", cta)
-        self.assertIn("apply Option A", cta)
-        self.assertIn("apply Option B", cta)
+        for promise in ("To authorize:", "reply **'apply'**", "apply Option A"):
+            self.assertNotIn(promise, what_to_do)
 
     def test_template_uses_only_the_three_permitted_sections(self):
         # The template says "formatted exactly like this", so it outranks the
@@ -761,10 +755,11 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         for stale in ("📋 **Incident Triage**", "🛠️ **Proposed Fixes (GitOps):**", "- **Issue:**"):
             self.assertNotIn(stale, query)
 
-    def test_approval_line_survives_inside_what_to_do(self):
-        # The authorization words are the one thing the reader cannot recover
-        # if the shape change drops them: without them they have a recommended
-        # GitOps fix and no stated way to authorize it.
+    def test_the_agent_is_told_not_to_write_its_own_call_to_action(self):
+        # Removing the bullet from the template is not enough on its own. The
+        # options end in a recommendation, which reads like it wants a decision,
+        # and an agent completing that shape will supply the missing line
+        # itself. So the instruction prose says outright not to.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -773,17 +768,28 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         query = session_kv_server._build_agent_query(payload)
-        body = query.split("## What to do", 1)[1].split("**What happens if the user replies", 1)[0]
-        self.assertIn("apply Option A", body)
-        self.assertIn("Recommended: Option", body)
-        # It shares a bullet list with the Options now that the separate `👉`
-        # block is gone, so it has to be labelled as the authorization step or
-        # it reads as one more thing to choose between.
-        authorize = next(
-            line for line in body.splitlines()
-            if line.startswith("- **To authorize:**")
-        )
-        self.assertNotRegex(authorize, r"\*\*Option [A-Z]")
+        instructions = query.split("## What to do", 1)[0]
+        self.assertIn("Do not end the report by inviting a reply", instructions)
+        self.assertIn("cannot see your report", instructions)
+
+    def test_the_options_and_the_recommendation_are_still_there(self):
+        # The report is now read rather than replied to, so the options carry
+        # the whole of its value. Dropping the call-to-action must not take the
+        # thing the call-to-action pointed at.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query(payload)
+        what_to_do = query.split("## What to do", 1)[1]
+        self.assertIn("**Option A (<Action Title>):**", what_to_do)
+        self.assertIn("Recommended: Option", what_to_do)
+        # And the report still has to be actionable by whoever opens the PR,
+        # since nothing can ask its author a follow-up question.
+        self.assertIn("open the Pull Request from your report alone", query)
 
 
 class TestTriageDeliveryInstruction(unittest.TestCase):

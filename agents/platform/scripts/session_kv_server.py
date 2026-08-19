@@ -553,12 +553,22 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     extending it. The template states that shape itself rather than citing the
     section, because the reader is a Cluster Agent, whose persona has no §7 —
     the delegation to that persona is what makes the citation unresolvable for
-    the agent being asked to obey it. The GitOps call-to-action lives inside
-    **What to do** because it is an action, and because §7 rule 3 cuts trailing
-    lines that read as an offer rather than a finding. It shares a list with the Option
-    bullets now that the old ``👉`` block is gone, so it carries a
-    ``To authorize:`` label and the instruction above the template says it is
-    not an option — without both, the fourth bullet reads as Option C.
+    the agent being asked to obey it.
+
+    The report used to end by inviting the reader to reply ``apply``, and that
+    invitation is withheld here until something honours it. The agent that acts
+    on such a reply reads the report back from the ``incidents`` table through
+    the ``incident_context`` plugin, and the only writer of that table is
+    ``platform_mcp_server.send_notification`` — the egress call this delivery
+    path replaced. So the row is never written, ``_lookup`` returns ``None``,
+    and the front door receives the bare word ``apply`` with no report, no
+    options and no cluster. Nothing unsafe happens; the front door holds no
+    write path and simply cannot act. It is a promise the system cannot keep,
+    and on ``main`` it was never tested because no report reached a human to
+    reply to. Storing the report on the delivery path is issue #802; the
+    bullet comes back with it. §7 rule 3 — "no offer to help further" — is on the
+    side of the removal, which is why the docstring here used to have to argue
+    the call-to-action past it.
 
     The report template below is STANDARD markdown, and must stay that way.
     Every chat platform's adapter translates the agent's markdown on the way
@@ -595,10 +605,12 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
         f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
-        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
-        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
+        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line.\n\n"
+        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
-        f"The last bullet under '## What to do' is the call to action, not another option: keep its 'To authorize:' label, never give it an Option letter, and never count it when you number the options.\n\n"
+        f"**Do not end the report by inviting a reply.** No 'To authorize:', no 'reply apply', no offer to open the Pull Request "
+        f"if the reader asks — a reply to this thread reaches an agent that cannot see your report, so the offer would not be honoured. "
+        f"The Recommended line is the last bullet you write.\n\n"
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
@@ -608,15 +620,13 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
         f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n"
-        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n"
-        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
+        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n\n"
         f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
         f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
         f"---"
-        f"\n\n**What happens if the user replies 'apply':**\n"
-        f"The reply lands as ordinary chat ingress, on the front door rather than in this session, and is carried out by the agent that holds the GitOps write path — "
-        f"a bare 'apply' (or 'apply recommended') meaning the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. "
-        f"Your job is to make that possible: name the manifest change each option needs precisely enough that another agent can open the Pull Request from your report alone. "
+        f"\n\n**Who acts on this:**\n"
+        f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
+        f"Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
         f"Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
         f"(no `kubectl scale`, `patch`, or `apply`)."
     )
