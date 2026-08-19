@@ -17,6 +17,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 ## PR hygiene (from `AGENTS.md`)
 
+- **Start from a freshly fetched `main`.** `main` moves fast enough that a week-old checkout is a different repository, so branch from `upstream/main` after fetching it rather than from whatever your working tree is on — a plan built by reading a stale checkout is wrong before you write a line. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and is canonical; it gives agents the exact commands, including how to tell whether `main` has moved underneath the files you are changing.
 - **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and gives agents the exact commands.
 - **Scope.** Keep changes scoped to the request. Don't bundle unrelated formatting changes.
 - **Structure.** Maintain the shape and intent of agent configuration files. Don't restructure `agents/platform/` for cosmetic reasons in an unrelated PR.

@@ -98,8 +98,12 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform
 # them as consecutive steps on one worker lets the second reuse the first's
 # layers instead of rebuilding the chain on a cold daemon; the operator build
 # runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
+# Set REQUIRE_CACHE=true in the job environment to fail the build on a cache
+# miss instead of cold-building. Default false so a broken cache source cannot
+# block the PR that fixes it.
+export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest}"
 gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PLATFORM_LATEST=${AR_REPO}/platform-agent:latest,_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_PROXY_LATEST=${AR_REPO}/credential-proxy:latest,_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
   --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
 echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 
