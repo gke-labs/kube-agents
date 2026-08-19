@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import tempfile
-import time
-import urllib.parse
-import uuid
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from cuj.milestones import Milestone, MilestoneSuite
-from cuj.portal import Portal, PortalError, isolated_portal
+from cuj.utils.evidence import EvidenceWriter
+from cuj.utils.interaction import (
+    InteractionRunner,
+    completed_evidence,
+    opaque_tool_calls,
+    projected_tasks,
+    tool_operations,
+)
+from cuj.utils.milestones import Milestone, MilestoneSuite
+from cuj.utils.portal import PortalError, isolated_portal
+from cuj.utils.scenario import ScenarioConfig, required_env
 
 PROMPT = """Act as my GKE design partner. Design a new production cluster named \
 cuj1-a100-design in project {project_id} for a distributed training workload \
@@ -63,7 +64,6 @@ NEGATED_GUARANTEE = re.compile(
     r"[^.\n]{0,50}\bguarantee",
     re.IGNORECASE,
 )
-TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 MILESTONES = (
     Milestone(
         "interaction-completed",
@@ -138,67 +138,6 @@ MILESTONES = (
 )
 
 
-@dataclass(frozen=True)
-class Config:
-    endpoint: str
-    agent_id: str
-    project_id: str
-    profile: str = "default"
-    timeout: float = 1600
-    poll_interval: float = 2
-
-
-def dump(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(value, str):
-        path.write_text(value.rstrip() + "\n", encoding="utf-8")
-    else:
-        path.write_text(
-            json.dumps(value, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-
-def completed_evidence(interaction: dict[str, Any]) -> set[str]:
-    found: set[str] = set()
-    for task in interaction.get("tasks", []):
-        if not isinstance(task, dict):
-            continue
-        for item in task.get("evidence") or []:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status") or "").casefold()
-            if status in {"completed", "passed"}:
-                found.add(str(item.get("type") or ""))
-    return found
-
-
-def projected_tool_calls(interaction: dict[str, Any]) -> list[dict[str, Any]]:
-    calls = interaction.get("toolCalls", [])
-    found = (
-        [call for call in calls if isinstance(call, dict)]
-        if isinstance(calls, list)
-        else []
-    )
-    for task in interaction.get("tasks", []):
-        if not isinstance(task, dict):
-            continue
-        task_calls = task.get("toolCalls", [])
-        if isinstance(task_calls, list):
-            found.extend(call for call in task_calls if isinstance(call, dict))
-    return found
-
-
-def tool_operations(
-    interaction: dict[str, Any], *, completed_only: bool = False
-) -> list[str]:
-    return [
-        str(call.get("operation") or call.get("name") or "")
-        for call in projected_tool_calls(interaction)
-        if not completed_only or call.get("status") == "completed"
-    ]
-
-
 def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
     folded = result_text.casefold()
     present = sorted(term for term in CAPACITY_TERMS if term in folded)
@@ -230,18 +169,9 @@ def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
     )
 
 
-def opaque_tool_calls(interaction: dict[str, Any]) -> list[str]:
-    return [
-        str(call.get("name") or "")
-        for call in projected_tool_calls(interaction)
-        if not str(call.get("operation") or "").strip()
-        and str(call.get("name") or "").casefold() in OPAQUE_TOOLS
-    ]
-
-
 def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
-    tasks = [item for item in interaction.get("tasks", []) if isinstance(item, dict)]
-    platform_tasks = [task for task in tasks if task.get("assignee") == "platform"]
+    tasks = projected_tasks(interaction)
+    platform_tasks = projected_tasks(interaction, assignee="platform")
     skill_evidence_available = any(
         "skills" in task and "loadedSkills" in task for task in platform_tasks
     )
@@ -260,7 +190,7 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     completed_operations = tool_operations(interaction, completed_only=True)
     result_text = str(interaction.get("output") or "")
     claims_met, claims_observed = capacity_claims(result_text)
-    opaque_calls = opaque_tool_calls(interaction)
+    opaque_calls = opaque_tool_calls(interaction, OPAQUE_TOOLS)
     suite = MilestoneSuite(MILESTONES)
     suite.record(
         "interaction-completed",
@@ -352,57 +282,27 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     return suite
 
 
-def run(config: Config, output: Path) -> MilestoneSuite:
-    prompt = PROMPT.format(project_id=config.project_id)
-    request = {
-        "agentId": config.agent_id,
-        "profile": config.profile,
-        "sessionId": f"portal_cuj1_{uuid.uuid4().hex}",
-        "input": {"text": prompt},
-        "history": [],
-    }
-    dump(output / "00-request.json", request)
-
-    portal = Portal(config.endpoint)
-    interaction = portal.post("interactions", request)
-    dump(output / "01-submitted.json", interaction)
-    interaction_id = str(interaction.get("interactionId") or "")
-    if not interaction_id:
-        raise PortalError("portal response did not include interactionId")
-
-    deadline = time.monotonic() + config.timeout
-    poll = 0
-    previous = interaction
-    while str(interaction.get("status") or "") not in TERMINAL_STATUSES:
-        if time.monotonic() >= deadline:
-            interaction = {**interaction, "evaluatorTimedOut": True}
-            break
-        if interaction.get("status") == "waiting_for_approval":
-            interaction = portal.post(
-                f"interactions/{urllib.parse.quote(interaction_id, safe='')}/approval",
-                {"choice": "deny"},
-            )
-        else:
-            time.sleep(config.poll_interval)
-            interaction = portal.get(
-                f"interactions/{urllib.parse.quote(interaction_id, safe='')}"
-            )
-        poll += 1
-        if interaction != previous:
-            dump(output / "02-state-changes" / f"{poll:04d}.json", interaction)
-            previous = interaction
-
-    dump(output / "03-final-interaction.json", interaction)
-    dump(
-        output / "04-conversation.json",
+def run(
+    config: ScenarioConfig,
+    evidence: EvidenceWriter,
+    *,
+    project_id: str,
+) -> MilestoneSuite:
+    prompt = PROMPT.format(project_id=project_id)
+    interaction = InteractionRunner(config, evidence).run(
+        prompt,
+        session_prefix="portal_cuj1",
+    )
+    evidence.write(
+        "04-conversation.json",
         {
             "user": prompt,
             "kage": interaction.get("output", ""),
             "delegatedTasks": interaction.get("tasks", []),
         },
     )
-    dump(
-        output / "05-skill-routing.json",
+    evidence.write(
+        "05-skill-routing.json",
         [
             {
                 "taskId": task.get("taskId"),
@@ -414,8 +314,8 @@ def run(config: Config, output: Path) -> MilestoneSuite:
             if isinstance(task, dict)
         ],
     )
-    dump(
-        output / "06-delegated-evidence.json",
+    evidence.write(
+        "06-delegated-evidence.json",
         [
             {"taskId": task.get("taskId"), "evidence": task.get("evidence")}
             for task in interaction.get("tasks", [])
@@ -424,43 +324,28 @@ def run(config: Config, output: Path) -> MilestoneSuite:
     )
     suite = evaluate(interaction)
     for index, result in enumerate(suite.results, start=1):
-        dump(
-            output / "07-milestones" / f"{index:02d}-{result.milestone.id}.json",
+        evidence.write(
+            f"07-milestones/{index:02d}-{result.milestone.id}.json",
             result.to_dict(),
         )
-    dump(output / "08-summary.json", suite.summary())
+    evidence.write("08-summary.json", suite.summary())
     return suite
 
 
-def config_from_env(endpoint: str) -> Config:
-    required = {
-        "CUJ1_AGENT_ID": os.environ.get("CUJ1_AGENT_ID", "").strip(),
-        "CUJ1_PROJECT_ID": os.environ.get("CUJ1_PROJECT_ID", "").strip(),
-    }
-    missing = [name for name, value in required.items() if not value]
-    assert not missing, f"required environment variables: {', '.join(missing)}"
-    config = Config(
-        endpoint=endpoint,
-        agent_id=required["CUJ1_AGENT_ID"],
-        project_id=required["CUJ1_PROJECT_ID"],
-        profile=os.environ.get("CUJ1_PROFILE", "default"),
-        timeout=float(os.environ.get("CUJ1_TIMEOUT", "1600")),
-        poll_interval=float(os.environ.get("CUJ1_POLL_INTERVAL", "2")),
-    )
-    assert config.timeout > 0 and config.poll_interval > 0, (
-        "CUJ1_TIMEOUT and CUJ1_POLL_INTERVAL must be positive"
-    )
-    return config
-
-
 def test_01_cluster_design() -> None:
-    output = Path(tempfile.mkdtemp(prefix="kube-agents-cuj1-", dir="/tmp"))
+    evidence = EvidenceWriter.temporary("kube-agents-cuj1-")
     try:
-        with isolated_portal(output) as endpoint:
-            suite = run(config_from_env(endpoint), output)
+        with isolated_portal(evidence.root) as endpoint:
+            suite = run(
+                ScenarioConfig.from_env(endpoint, "CUJ1"),
+                evidence,
+                project_id=required_env("CUJ1_PROJECT_ID"),
+            )
     except (OSError, ValueError, PortalError) as exc:
-        pytest.fail(f"CUJ1 setup failed: {exc}; evidence: {output}")
+        pytest.fail(f"CUJ1 setup failed: {exc}; evidence: {evidence.root}")
     for line in suite.report_lines():
         print(line)
-    print(f"Evidence: {output}")
-    assert suite.passed, f"milestones not met: {suite.failure_summary()}; evidence: {output}"
+    print(f"Evidence: {evidence.root}")
+    assert suite.passed, (
+        f"milestones not met: {suite.failure_summary()}; evidence: {evidence.root}"
+    )
