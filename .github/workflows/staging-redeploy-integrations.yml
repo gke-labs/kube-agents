@@ -14,6 +14,9 @@ permissions:
 
 jobs:
   call-deploy:
+    # A fork inherits the tag trigger but none of the deploy credentials, so a
+    # staging/** tag pushed there would fail and mail the fork owner.
+    if: github.repository == 'gke-labs/kube-agents'
     permissions:
       contents: read
       id-token: write

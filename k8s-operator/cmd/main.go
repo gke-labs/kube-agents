@@ -28,13 +28,10 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -196,23 +193,6 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
-		Cache: cache.Options{
-			ByObject: map[client.Object]cache.ByObject{
-				// The NetworkPolicy reconciler needs one field of a Node — its addresses
-				// — but caching Nodes whole keeps the list of every image on every node
-				// resident for the life of the process. On a large cluster that dwarfs
-				// everything else the operator holds.
-				&corev1.Node{}: {
-					Transform: func(obj any) (any, error) {
-						if node, ok := obj.(*corev1.Node); ok {
-							node.Status.Images = nil
-							node.ManagedFields = nil
-						}
-						return obj, nil
-					},
-				},
-			},
-		},
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")

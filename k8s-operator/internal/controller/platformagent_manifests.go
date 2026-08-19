@@ -34,6 +34,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2463,6 +2464,55 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	return prefix + name + suffix
 }
 
+// agentAPIProbe returns a probe that asks the Hermes API on loopback for one
+// session. Callers supply periodSeconds and failureThreshold, which is the only
+// difference between the gateway's startup and readiness probes: the startup
+// one has to cover a cold boot that scaffolds every profile onto a fresh PVC,
+// while readiness afterwards should withdraw the pod quickly.
+//
+// /api/sessions is the endpoint the agent's own callers use — see the pubsub
+// adapter and admin_console — and the Authorization: Bearer form is theirs too.
+// Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
+// 1-second default timeout is far too tight for a container this busy at boot.
+//
+// The exit-7 branch is what makes this probe safe above one replica. At
+// replicas > 1 the container runs leader_elect.py, and a pod that does not hold
+// the lease never starts `hermes gateway run` at all — nothing binds 8642, so a
+// plain curl probe would fail every attempt and kubelet would kill a standby
+// that is doing exactly its job. curl exits 7 for "could not connect", which is
+// precisely that state, so it counts as healthy while leader election is on.
+// It is deliberately not tolerated on a single-replica agent, where nothing
+// listening means the gateway is down.
+//
+// Tolerating 7 does not hide a dead leader: leader_elect.py exits with the
+// gateway's own status when the process it started dies, so the container
+// restarts rather than lingering unreachable. And it is a connection refusal
+// only — a gateway that answers with 5xx exits 22, and a hung one 28, both of
+// which still fail. Detecting the standby by looking for the process instead
+// would not work: `hermes` is a shim that execs `s6-suid hermes $REAL "$@"`, so
+// the string "hermes gateway run" never appears in any command line to match.
+func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"sh", "-c",
+					`curl --fail --silent --show-error -o /dev/null ` +
+						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
+						`http://127.0.0.1:8642/api/sessions?limit=1; rc=$?; ` +
+						`[ "$rc" -eq 0 ] && exit 0; ` +
+						`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0; ` +
+						`exit "$rc"`,
+				},
+			},
+		},
+		InitialDelaySeconds: 5,
+		PeriodSeconds:       periodSeconds,
+		TimeoutSeconds:      5,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
 // buildBaseContainers generates the base containers for PlatformAgent.
 func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
 	homeDir := defaultAgentHome
@@ -2589,6 +2639,22 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			Env:          gatewayEnvVars,
 			Resources:    resources,
 			VolumeMounts: volumeMounts,
+			// Without these the Service publishes this pod the moment the container
+			// process starts, minutes before the Hermes API binds :8642 — the
+			// entrypoint scaffolds every profile onto the PVC before it execs the
+			// gateway. Callers that resolve the Service in that window get
+			// connection-refused from a pod Kubernetes calls Ready.
+			//
+			// exec, not httpGet: API_SERVER_HOST is 127.0.0.1 (the sidecar's Envoy on
+			// :8643 is what the Service targets), and kubelet dials the pod IP, so an
+			// httpGet or tcpSocket probe would never reach a loopback listener. This
+			// is the same shape as the credential proxy's own probe below.
+			//
+			// The bearer key is the non-secret loopback sentinel already in this
+			// container's env, and API_SERVER_ENABLED is unconditionally true above,
+			// so the probe is valid in every configuration.
+			StartupProbe:   agentAPIProbe(10, 60),
+			ReadinessProbe: agentAPIProbe(15, 3),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -2710,6 +2776,24 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
+			// The Service publishes :9119 whenever the dashboard is enabled, so
+			// without this the UI port is advertised before anything listens on it.
+			//
+			// tcpSocket rather than httpGet: this one binds all interfaces, so kubelet
+			// can reach it on the pod IP, but `hermes dashboard` exposes no health
+			// path we have verified — and a probe against a guessed path that 404s
+			// would hold the whole pod unready, taking the API down with it.
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromString("dashboard"),
+					},
+				},
+				InitialDelaySeconds: 5,
+				PeriodSeconds:       15,
+				TimeoutSeconds:      5,
+				FailureThreshold:    3,
+			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -3122,6 +3206,50 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	}
 }
 
+// buildPlatformPDB generates the PodDisruptionBudget manifest for PlatformAgent.
+//
+// maxUnavailable: 1 at every replica count, which is the shape the Workload
+// Reliability Audit this project ships requires:
+// agents/platform/governance/obtainability_audit_sop.md §3.3 — "Always
+// maxUnavailable, never minAvailable ... maxUnavailable: 1 is structurally safe
+// at any replica count >= 2."
+//
+// The reason it is unconditional rather than derived from the replica count is
+// that a budget keyed to replicas is only safe while the replica count holds.
+// minAvailable: 1 against one replica leaves zero allowed disruptions, so
+// `kubectl drain` never completes and node-pool upgrades, auto-repair, and
+// autoscaler scale-down all stall until a human deletes this object — the
+// critical `blocking-pdb` finding of §3.4. Deriving the field from the resolved
+// count avoids that on the way up but not on the way down: a scaled-out agent
+// carrying minAvailable: 1 that is later scaled back to one produces exactly
+// that deadlock, and nothing reconciles the budget at the moment someone runs
+// `kubectl scale`.
+//
+// The selector is the Deployment's, NOT the Service's. Above, a multi-replica
+// Service narrows to kubeagents.io/is-leader so only the leader serves; a PDB
+// carrying that label would budget the single leader pod rather than the
+// Deployment's pods.
+func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "policy/v1",
+			Kind:       "PodDisruptionBudget",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": agent.Name + "-gateway",
+				},
+			},
+		},
+	}
+}
+
 // buildPlatformLeaderRole generates the Role manifest for leader election leases in the agent namespace
 func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
@@ -3351,7 +3479,7 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string, metadataNodeIPs []string) *networkingv1.NetworkPolicy {
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
@@ -3374,9 +3502,9 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
 
 	// Everything the rewritten packet can be addressed to, all of it on port 988:
-	// the metadata daemon's own link-local address on the iptables datapath, and the
-	// hosting node's internal IP on Dataplane V2. See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers(append([]string{metadataLinkLocalIP, metadataDaemonIP}, metadataNodeIPs...), true)
+	// the metadata daemon's own link-local address on the iptables datapath.
+	// See metadataDaemonIP.
+	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, metadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{

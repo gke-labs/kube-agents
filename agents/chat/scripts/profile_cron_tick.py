@@ -249,6 +249,26 @@ HOME_TARGET_ENV_KEYS = {
     ),
 }
 
+# The switch that turns `deliver: "chat"` on, and the reason it is set HERE.
+#
+# It is the `cron_deliver_env_var` of the bundled `chat` platform plugin
+# (`deploy/docker/plugins/chat/adapter.py`), which hands a job's finished report
+# to the Chat Agent instead of posting it. Setting it does two things at once:
+# it makes `load_gateway_config` enable the platform in this child, and it gives
+# `_get_home_target_chat_id("chat")` a value, without which the scheduler will
+# not resolve `deliver: "chat"` to a target.
+#
+# Only cron children get it. The gateway must NOT have it set: the plugin has no
+# inbound adapter, so an enabled `chat` platform in the gateway process is a
+# delivery target it could try to start and cannot. Leaving it out of the pod
+# environment and setting it per-spawn here is what keeps that true — the
+# platform is invisible everywhere except the process that delivers.
+#
+# The value is a label. The relay route has exactly one destination, so nothing
+# reads it; it is only ever tested for emptiness.
+CHAT_RELAY_ENV_KEY = "CHAT_HOME_CHANNEL"
+CHAT_RELAY_ENV_VALUE = "cron-reports"
+
 
 def _mapping(value: object) -> dict:
     """``value`` if it is a mapping, else an empty one.
@@ -385,6 +405,9 @@ def spawn_tick(
     last; an inherited value that survived scrubbing came from an earlier
     write. A key it maps to the empty string is removed rather than blanked,
     so the child cannot tell a cleared thread id from one never set.
+
+    ``CHAT_HOME_CHANNEL`` is added unconditionally — see
+    :data:`CHAT_RELAY_ENV_KEY` for why this is the only place it is ever set.
     """
     workspace = os.environ.get("CREDENTIAL_PROXY_WORKSPACE_ROOT", "")
     cwd = workspace if workspace and Path(workspace).is_dir() else str(profile_home)
@@ -395,6 +418,7 @@ def spawn_tick(
     env = {
         **{key: value for key, value in os.environ.items() if key not in cleared},
         **{key: value for key, value in (home_env or {}).items() if value != ""},
+        CHAT_RELAY_ENV_KEY: CHAT_RELAY_ENV_VALUE,
         "HERMES_HOME": str(profile_home),
     }
 

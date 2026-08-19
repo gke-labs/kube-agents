@@ -1610,16 +1610,20 @@ class TestAuditCatalogue(unittest.TestCase):
     def test_every_watchdog_declares_all_delivery(self):
         """A watchdog whose run fails has to be audible.
 
-        `"all"` sends the outcome to the configured target; `"local"` resolves
-        to no target at all (`scheduler.py:_deliver_result`), so a run that
-        failed would be built into a message and then dropped — leaving a
-        watchdog that has stopped working indistinguishable from a fleet with
-        nothing to report.
+        `"all"` sends the outcome to the configured target and `"chat"` hands it
+        to the Chat Agent (`deploy/docker/plugins/chat/adapter.py`); both
+        carry a failure, because the scheduler builds one into a message
+        (`_summarize_cron_failure_for_delivery`) and delivers it on the same leg
+        as a report. `"local"` resolves to no target at all
+        (`scheduler.py:_deliver_result`), so that message would be built and
+        then dropped — leaving a watchdog that has stopped working
+        indistinguishable from a fleet with nothing to report.
 
         The audit's own findings do not travel this leg — Tier 1 is the ledger
         issue — so this is not the route for reports, only for the failure of
         the thing that produces them.
         """
+        audible = {"all", "chat"}
         watchdogs = self.governance_jobs()
         self.assertTrue(
             watchdogs,
@@ -1628,9 +1632,9 @@ class TestAuditCatalogue(unittest.TestCase):
         )
         for job_id, job in sorted(watchdogs.items()):
             with self.subTest(job=job_id):
-                self.assertEqual(
+                self.assertIn(
                     job.get("deliver"),
-                    "all",
+                    audible,
                     f"platform roster[{job_id}] declares "
                     f"deliver={job.get('deliver')!r}; a failed run would then "
                     f"resolve to no delivery target and vanish",

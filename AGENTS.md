@@ -160,6 +160,17 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   (`@v4`, `@main`) are not permitted — a retagged release would silently change what CI runs.
   Local reusable workflows (`uses: ./.github/workflows/…`) are exempt. Dependabot updates the
   SHA and the comment together.
+- **Guard automatically-triggered credentialed workflows against forks.** A workflow that needs
+  this repository's secrets and starts on its own — `push`, a tag, `schedule`, or `workflow_run`
+  — carries `if: github.repository == 'gke-labs/kube-agents'` on every job. A fork inherits those
+  triggers but none of the secrets, so an unguarded job fails there on every sync and mails the
+  fork owner. Put the guard on each job rather than trusting the skip to cascade through `needs`;
+  an `always()` added later removes the implicit `success()` and the job runs anyway. Two classes
+  need no guard: a workflow reachable only through `workflow_call` is gated by its caller
+  (`reusable-deploy-*.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
+  starts it (`rc-create-tag.yml`, `rc-deploy-environment.yml`, `rc-tag-validated.yml`,
+  `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
+  can publish its own Pages site.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
 - **Write PR titles, bodies, commit messages, and review replies the same way** the Documentation
@@ -185,6 +196,12 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
     talks you into approving it, and the blind spot sits exactly where you were already wrong. It
     is why `.claude/commands/pr-review-batch.md` gives every pull request its own subagent, and a
     self-review earns it for the same reason.
+  - **If your harness will not spawn one without a human's approval, go and get the approval.** A
+    setting that requires sign-off before starting a subagent blocks this step; it does not waive
+    it. Ask when you hit it, not after the review, and say what you are blocked on. Quietly running
+    the pass in the session that wrote the code instead buys a review from the context that already
+    believes the change is correct, and reporting that as a self-review without the caveat tells
+    the reviewer something untrue about how the change was checked.
   - **A finding you decide not to fix is an answer**, provided the reason is an argument about
     this change rather than a shrug. "Out of scope", "pre-existing", and "will fix later" are not
     reasons on their own; the separate issue you filed is.
@@ -220,6 +237,16 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
     that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
     section is not an answer.
+- **Keep these sections current, not chronological.** **Self-Review** and **Live validation** tell
+  a reviewer at a glance what has been reviewed and exercised against the branch as it stands. A
+  second pass — after review findings, after a rebase — folds into what is there rather than being
+  appended beneath it: work that still holds stays and is not re-run just to have been run against
+  the new head, a check the new commits invalidated is re-run or kept with a line saying it no
+  longer reaches the head, and new findings join the rest. What a re-run drops is the superseded
+  round, not the contents these sections owe a reviewer — the angles you ran, the layers you
+  observed, what you could not cover. Round-by-round history of a _reviewer's_ findings is the
+  exception: it belongs in the threads, where a reply naming the fix and its commit stays attached
+  to the finding it answers.
 - **IaC parity review when a PR touches more than one install surface's territory:**
   the provisioning scripts (`k8s-operator/scripts/`, `k8s-operator/config/`), the
   Terraform modules, and the Helm chart each express the same install, and nothing in
@@ -350,6 +377,14 @@ After pushing fixes, remember that the push alone does not re-trigger anything: 
 to comment `/review` for another pass — `/review` to confirm the fixes against a strict read,
 `/review all` when the branch changed enough that it deserves a first-review-width look again. Then
 wait for it the same way, counting reviews rather than watching for a second 👀.
+
+Pushing fixes is also what makes the pull request body stale. Fixes that answer a finding, and any
+live test you re-ran to confirm them, belong in **Self-Review** and **Live validation** — folded
+into what is already there, per "Keep these sections current, not chronological" above. Do it once
+the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
+review brings fresh findings, and folding them in twice is the same wasted round. Nothing else in
+this workflow reopens the body, so a branch whose sections still describe the commit it was opened
+at is the normal outcome of skipping it here.
 
 **Then resolve the conversations.** `main` requires every conversation on a pull request to be
 resolved before it can merge, and the triage sweep counts an open thread as work outstanding on the

@@ -62,12 +62,10 @@ spec:
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
-    # 3. GKE Workload Identity host-network daemon (port 988). The node DNATs
-    #    169.254.169.254:80 here before NetworkPolicy is evaluated, so this rule — not
-    #    rule 2 — is what actually admits a token fetch. 169.254.169.252 is the rewrite
-    #    target on the iptables datapath. Dataplane V2 rewrites to the hosting node's
-    #    internal IP instead, which a static manifest cannot know: add one /32 per node,
-    #    or use the operator, which discovers them and keeps them current.
+    # 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+    #    the node rewrites 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    #    is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+    #    policy is evaluated pre-NAT at the socket layer and matched by rule 2.
     - ports:
         - port: 988
           protocol: TCP

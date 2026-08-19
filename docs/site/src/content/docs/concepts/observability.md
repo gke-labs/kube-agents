@@ -31,6 +31,8 @@ All container `stdout`/`stderr` is ingested by Cloud Logging by the GKE log agen
 
 The exposure to watch when changing this code is **wrapped errors**, not deliberate logging. A failure from parsing a profile's `kubeconfig.yaml`, minting a token, or an API server rejecting a request can carry its input into the error string, and those inputs are credentials. When adding a log line, prefer the identifier over the value: the profile name rather than the file's contents, the cluster rather than the token, the status code rather than the response body.
 
+One place deliberately logs the body: `_handle_github_refresh` in `credential_proxy.py` records the GitHub refresh helper's stderr, because a broker that refuses a mint is otherwise recorded nowhere — the caller gets a reason code with no detail, and the reason code is all a chat room ever sees. It passes the text through `redact_credentials` before bounding it, which blanks GitHub token and JWT shapes. Extend that function rather than the exception if another credentialed subprocess needs the same treatment.
+
 ## Session metadata plumbing
 
 Every Chat message carries session context (space ID, user, thread) that flows through Hermes as OpenTelemetry span attributes and out to Cloud Trace. The `session_store` and `session_otel_bridge` plugins that do this run on the Planning Agent profile, which owns chat ingress. The trace is documented in [`docs/designs/gchat-session-metadata-data-flow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).

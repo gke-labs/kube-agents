@@ -33,6 +33,9 @@ permissions:
 
 jobs:
   call-deploy:
+    # A fork inherits the push trigger but none of the deploy credentials, so
+    # the job would fail there and mail the fork owner on every sync of main.
+    if: github.repository == 'gke-labs/kube-agents'
     permissions:
       contents: read
       id-token: write

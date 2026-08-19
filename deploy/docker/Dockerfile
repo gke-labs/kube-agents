@@ -332,6 +332,51 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
 
+# Cron delivery: `deliver: "chat"` hands a job's finished report to the Chat
+# Agent instead of posting it, so the finding lands in a thread that can answer
+# "why does that matter?".
+# Upstream resolves `deliver` to a chat platform and sends. On this install that
+# is where a watchdog's report goes to die: profile_cron_tick.py can only hand a
+# child profile the Slack home channel, so on Google Chat `deliver: "all"`
+# expands to an empty target list and the run records "no delivery target
+# resolved" while posting nowhere. Even where it does post, the report arrives
+# from a process that has exited -- the Chat Agent, which is who the user
+# replies to, never saw it.
+# A delivery MODE rather than a line in every job's prompt, because the prompt
+# only reaches jobs shipped in this image. A job the user asks for at runtime is
+# created through cronjob(action='create') and carries no such contract, which
+# is the case this has to cover: `deliver` is a field every creation path can
+# set, including the model's own tool call.
+# NOT a patch. Upstream already routes `deliver=<name>` through the platform
+# registry, and cron/scheduler.py::_plugin_cron_env_var says in its own words
+# that a plugin setting `cron_deliver_env_var` gets "cron delivery support
+# without editing this module". So this is a bundled platform plugin, dropped
+# into plugins/platforms/ where Hermes auto-registers it: zero lines of the
+# Hermes tree are modified and there is no anchor to go stale.
+# What replaces the patch's build-time failure is verify_chat_relay.py. The
+# plugin depends on a handful of upstream behaviours and every one of them
+# fails QUIETLY -- a watchdog that reports nothing looks exactly like a watchdog
+# with nothing to report -- so the verifier drives the real _deliver_result
+# against a loopback stand-in for the Session KV server and asserts on what
+# crossed the wire. Its own docstring enumerates them.
+# See the module docstring in deploy/docker/plugins/chat/adapter.py.
+#
+# The verifier rides in on the plugin's own COPY and is deleted by the RUN that
+# executes it, rather than being staged into /tmp of its own: one COPY for the
+# four, not two for three and one, because `credential-proxy` builds FROM this
+# chain and the budget at the top of this file is the binding constraint. It
+# resolves the plugin through `os.getcwd()`, so /opt/hermes is still the cwd it
+# needs and nothing about the check changes -- only where the file sits for the
+# one layer it exists.
+COPY --chmod=0644 deploy/docker/plugins/chat/plugin.yaml \
+     deploy/docker/plugins/chat/__init__.py \
+     deploy/docker/plugins/chat/adapter.py \
+     deploy/docker/plugins/verify_chat_relay.py \
+     /opt/hermes/plugins/platforms/chat/
+RUN cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 plugins/platforms/chat/verify_chat_relay.py && \
+    rm -f plugins/platforms/chat/verify_chat_relay.py
+
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
 # three edits to the same twenty lines of gateway/kanban_watchers.py. Three
@@ -1020,10 +1065,10 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 # `import run_agent` alone, base image vs this one, both read-only: 3.0s → 1.0s.
 # The bytecode costs ~170MB of image.
 #
-# This must run AFTER every patch this stage applies to /opt/hermes: compileall
-# stamps each .pyc with its source's mtime and size, so bytecode written before a
-# patch would simply be discarded at import and we would be back to compiling on
-# every start. Python that later stages add is not covered here, and the two
+# This must run AFTER everything this stage writes into /opt/hermes — the patches
+# above and the bundled `chat` platform plugin alike: compileall stamps each .pyc
+# with its source's mtime and size, so bytecode written before the write would
+# simply be discarded at import and we would be back to compiling on every start. Python that later stages add is not covered here, and the two
 # cases go different ways. `agents/platform/plugins/` lands in /opt/hermes/plugins
 # in the `platform` stage, which runs a second pass of its own over the same tree
 # — everything compiled here is already up to date and skipped, so that pass costs
@@ -1109,8 +1154,9 @@ RUN rm -f /opt/defaults/config.yaml
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
-COPY agents/chat/scripts/ /opt/defaults/scripts/
-COPY agents/platform/scripts/ /opt/defaults/scripts/
+# One COPY for the two, for the same destination-sharing reason as the three
+# below.
+COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 # One COPY for the three, not three: `credential-proxy` builds FROM this stage and the
 # chain is bounded at 128 layers — see the layer-budget note at the top of the file.
 # They share a destination anyway.
@@ -1165,9 +1211,19 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # sources are called config.yaml), but the overlay and the merger can share one
 # COPY into the staging directory. Layers are budgeted here — see the note at
 # the top of the file.
+#
+# verify_slack_relay_registry_contract.py rides along in that second COPY, and
+# runs from the same RUN, for the layer budget alone — it has nothing to do
+# with the platform config. It checks the relay patches copied to
+# /opt/defaults/scripts above against the Hermes tree they monkeypatch, which
+# is why it cannot run in CI: `credential-proxy` builds FROM this stage and its
+# chain measured 119 of the 120 layers `scripts/check_image_layers.py` allows,
+# so a COPY/RUN pair of its own is a layer this file does not have. See the
+# module docstring for what a failure here means.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
+     deploy/docker/patches/verify_slack_relay_registry_contract.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
@@ -1179,6 +1235,7 @@ caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {}))
 assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     rm -rf /tmp/platform-config
 
 # Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
@@ -1189,8 +1246,9 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
 # directory records ownership: kube_agents_memory needs the user identity that
 # only chat ingress carries, so it lives with the Chat Agent.
-COPY agents/platform/plugins/ /opt/hermes/plugins/
-COPY agents/chat/plugins/ /opt/hermes/plugins/
+# One COPY for the two: they share a destination, and the chain is bounded at
+# 128 layers — see the layer-budget note at the top of the file.
+COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config

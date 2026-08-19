@@ -112,17 +112,19 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # per directory rather than once over the tree, because none of them are
 # packages -- `unittest discover` pointed at agents/platform/skills finds
 # nothing and still exits 0, which reads as a passing suite. That also keeps
-# deploy/docker and deploy/docker/patches separate, which they must be: the
-# patch tests import their subject by bare module name, which only resolves
-# with their own directory as the discovery root.
+# deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
+# separate, which they must be: those tests import their subject by bare module
+# name, which only resolves with their own directory as the discovery root.
 PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
+	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
+	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/test_*.py)))
 

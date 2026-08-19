@@ -96,13 +96,15 @@ Nobody reads a change as cheaply as the person who wrote it, and right now the f
 
 The method is the repository's own review skill, [`.agents/skills/review-adversarial/SKILL.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/skills/review-adversarial/SKILL.md) — run it against your branch diff with whatever agent you use. It works ten angles over the change, then re-derives each candidate from the source as a hostile second reader and throws out what it cannot defend.
 
-Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it.
+Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it. If your harness will not start a subagent without a human's approval, ask for the approval — that setting blocks this step rather than waiving it.
 
 What the section should say:
 
 - **What you looked for**, in the skill's terms — which angles you ran, and which you could not.
 - **What it found, and where each finding ended up.** Fixed, naming the commit or hunk; or deliberately not fixed, with a reason. A reason is an argument about this change — the path is unreachable for a stated invariant, the fix belongs to the issue you just filed. "Out of scope" or "will fix later" alone is not.
-- **Nothing you cannot back.** A self-review the diff contradicts is worse than no self-review: it spends the reviewer's trust before they reach the code.
+- **Nothing you cannot back.** A self-review the diff contradicts is worse than no self-review: it spends the reviewer's trust before they reach the code. Fix what the pass confirms and report what it only suspects; a finding it could not pin down is an open question for the section, not a licence to rewrite working code.
+
+Re-running the pass folds into the section rather than stacking a round beneath it. Keep what still holds, re-state what the new commits changed, and drop the superseded round — not a finding's disposition. The same goes for **Live validation**: a reviewer should be able to see at a glance what has been reviewed and exercised against the branch as it stands.
 
 "No findings" is an ordinary outcome on a good change and costs you nothing — provided you also say what you looked for. A pass that names none of its angles is indistinguishable from no pass at all.
 

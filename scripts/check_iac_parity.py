@@ -409,7 +409,12 @@ def check_model_defaults(f: Failures) -> None:
         sys.exit(f"ERROR: no default_model_for_provider in {COMMON_SH.relative_to(REPO)}")
     script: dict[str, str] = {}
     fallback: str | None = None
-    for patterns, model in re.findall(r"^\s*([^\s)]+(?:\s*\|\s*[^\s)]+)*)\)\s*echo\s+\"([^\"]+)\"", body.group(1), re.M):
+    # The alternatives inside a case arm exclude "|" so each one has exactly one
+    # way to match. Letting [^\s)] swallow the separator too made "a|b|c" parse
+    # ambiguously and backtrack exponentially on a long unterminated arm (CodeQL
+    # py/redos). ArmScannerBacktrackingTest holds the line.
+    arm = re.compile(r"^\s*([^\s)|]+(?:\s*\|\s*[^\s)|]+)*)\)\s*echo\s+\"([^\"]+)\"", re.M)
+    for patterns, model in arm.findall(body.group(1)):
         for provider in (p.strip() for p in patterns.split("|")):
             if provider == "*":
                 # The catch-all arm, not a provider. Anything the case does not

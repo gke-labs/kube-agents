@@ -29,6 +29,12 @@ operator:
     tag: "" # defaults to Chart.appVersion
     pullPolicy: IfNotPresent
   replicaCount: 1
+  podDisruptionBudget:
+    # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
+    # not configurable: minAvailable is the shape that deadlocks node drains,
+    # and the audit SOP this project ships rules it out at every replica count
+    # (obtainability_audit_sop.md 3.3).
+    enabled: true
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -155,6 +161,12 @@ litellm:
     tag: v1.96.2
     pullPolicy: IfNotPresent
   replicaCount: 2
+  podDisruptionBudget:
+    # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
+    # not configurable: minAvailable is the shape that deadlocks node drains,
+    # and the audit SOP this project ships rules it out at every replica count
+    # (obtainability_audit_sop.md 3.3).
+    enabled: true
   resources:
     requests:
       cpu: 100m

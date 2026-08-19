@@ -7,7 +7,10 @@
 # Requires step 9, since Hindsight sends its extraction and consolidation calls
 # through the LiteLLM gateway. Skipped unless the install asked for it:
 # MEMORY_PROVIDER must name a Hindsight-backed provider, so an install that chose
-# `multiuser_memory` or `none` runs no database.
+# `multiuser_memory` or `none` runs no database. Waits for the API to roll out
+# and fails with diagnostics if it does not (override the wait budget with
+# AGENT_READY_TIMEOUT, default 600s; a cold roll spends most of it pulling a
+# 1.4 GB image and loading models).
 # ==============================================================================
 
 set -e
@@ -38,6 +41,7 @@ init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var_memory_provider
+init_agent_ready_timeout
 
 # ─── Memory Selection Gate ────────────────────────────────────────────────────
 #
@@ -102,11 +106,36 @@ execute_hindsight() {
 # embedding and reranking models at startup, so a first roll takes visibly longer
 # than the rest of the install and a failure here is silent until the first
 # person tries to use memory.
+#
+# On the shared readiness budget (AGENT_READY_TIMEOUT, default 600s) rather than
+# a hardcoded 5m, which was too short for what api.yaml's probe comment
+# describes: a cold roll pulls the image and only then spends a 5-minute
+# startupProbe budget loading models. run_step turns a false return into an
+# `exit 1`, so a gate that expires fails the whole install rather than reporting
+# a slow one — which is why it is worth having room, and why it fails loudly
+# (#712).
 verify_hindsight_ready() {
-  kubectl rollout status deploy/hindsight-api -n "$NAMESPACE" --timeout=5m
+  # Always false, the way step 14's gate is. run_step runs verify and then
+  # execute, so waiting in both would give a stuck rollout two full budgets
+  # back to back; and `rollout status` on a finished rollout returns at once,
+  # so there is nothing for a verify to save.
+  return 1
 }
 execute_hindsight_ready() {
-  kubectl rollout status deploy/hindsight-api -n "$NAMESPACE" --timeout=5m
+  print_info "Waiting for hindsight-api rollout to complete (timeout ${AGENT_READY_TIMEOUT})..."
+  kubectl rollout status deploy/hindsight-api -n "$NAMESPACE" \
+      --timeout="${AGENT_READY_TIMEOUT}" || {
+    # Same shape as step 14's gate. Without this the operator's only signal is
+    # kubectl's one-line "timed out waiting for the condition", after a wait
+    # long enough that they have stopped watching.
+    print_error "hindsight-api did not roll out successfully."
+    kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=hindsight,app.kubernetes.io/component=api \
+        -o jsonpath='{range .items[*]}{.metadata.name}: phase={.status.phase}{"\n"}{range .status.containerStatuses[*]}  {.name}: ready={.ready} restarts={.restartCount} state={.state}{"\n"}{end}{end}' 2>/dev/null || true
+    print_info "Recent container logs:"
+    kubectl logs -n "$NAMESPACE" -l app.kubernetes.io/name=hindsight,app.kubernetes.io/component=api \
+        --all-containers --prefix --tail=20 2>/dev/null || true
+    return 1
+  }
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────

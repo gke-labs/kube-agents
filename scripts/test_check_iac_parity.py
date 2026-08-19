@@ -19,10 +19,12 @@ directly::
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import re
 import tempfile
 import textwrap
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -422,6 +424,21 @@ class ModelDefaultsTest(unittest.TestCase):
     def test_explicitly_cased_provider_still_compared(self):
         self.assertEqual(self._run('"anthropic" "claude-sonnet-4-5-20250929"'), [])
 
+    def test_both_alternatives_of_a_multi_pattern_arm_are_read(self):
+        """`chatgpt | openai)` names two providers, not one string with a pipe.
+
+        This pins the alternation parse, not the backtracking fix — the
+        capture group wraps the whole alternation, so the pre-fix pattern
+        passes it too. ArmScannerBacktrackingTest is the guard for that. What
+        this one catches is a parser rewritten to stop splitting arms on "|"
+        at all, which would silently drop every provider after the first.
+        """
+        self.assertEqual(self._run('"chatgpt" "gpt-5.4" "openai" "gpt-5.4"'), [])
+        self.assertEqual(
+            self._run('"openai" "gpt-4"'),
+            [("model-defaults", "openai: chart defaults to gpt-4, common.sh to gpt-5.4")],
+        )
+
     def test_drift_on_a_fall_through_provider_is_caught(self):
         """The regression the `*`-as-gemini reading would have hidden."""
         failures = self._run('"vertex_ai" "some-other-model"')
@@ -433,6 +450,55 @@ class ModelDefaultsTest(unittest.TestCase):
         failures = self._run('"nosuchprovider" "gemini-3.5-flash"')
         self.assertEqual(len(failures), 1, failures)
         self.assertIn("common.sh does not", failures[0][1])
+
+
+class ArmScannerBacktrackingTest(unittest.TestCase):
+    """The `case`-arm scanner must not backtrack exponentially (CodeQL py/redos).
+
+    While the alternative classes still admitted "|", they could match a
+    pipe-joined arm two ways — as one run of the first class, or as several
+    repetitions of the alternation — so an arm that never reached its
+    `) echo "..."` cost time exponential in the number of alternatives: 0.009 s
+    at 16, 0.15 s at 20, 2.7 s at 24, minutes not far above that.
+
+    The test drives the real ``check_model_defaults`` rather than a copy of the
+    pattern, because a copy would keep passing after the production regex
+    regressed. The budget sits five orders of magnitude above the fixed
+    scanner's ~5 us, so only a genuine return of the blowup trips it, not a
+    loaded CI runner. It is also why the count is 26 and not larger: it has to
+    stay cheap when the scanner is correct and be ruinous when it is not.
+    """
+
+    ALTERNATIVES = 26
+    BUDGET_SECONDS = 1.0
+
+    def test_pipe_joined_arm_with_no_body_is_rejected_promptly(self):
+        arm = "|".join("a" for _ in range(self.ALTERNATIVES))
+        common_sh = textwrap.dedent(
+            """\
+            default_model_for_provider() {
+              case "$1" in
+                %s X
+              esac
+            }
+            """
+        ) % arm
+
+        f = parity.Failures()
+        started = time.perf_counter()
+        with unittest.mock.patch.object(parity, "read", return_value=common_sh):
+            # The arm scan runs before anything reads the chart, so whatever the
+            # rest of the check makes of this fixture is beside the point.
+            with contextlib.suppress(SystemExit):
+                parity.check_model_defaults(f)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(
+            elapsed,
+            self.BUDGET_SECONDS,
+            f"scanning a {self.ALTERNATIVES}-alternative arm took {elapsed:.3f}s; "
+            f"the case-arm regex is backtracking exponentially again",
+        )
 
 
 class WebhookParityTest(unittest.TestCase):

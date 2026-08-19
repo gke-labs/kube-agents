@@ -35,8 +35,10 @@ delivery, so routing it through a card loses the run. A poller is the inverse: i
 has nothing to deliver on almost every tick, its product goes to GitHub, and it
 owes a model turn only when real work exists — which is why `github-repo-watcher`
 is a `no_agent` script that costs nothing when idle and files a card when it
-finds something. It keeps `deliver: "all"` for itself, so a sweep that cannot run
-still says so.
+finds something. It still names an audible `deliver` for itself — `"chat"`, like
+every other entry here — so a sweep that cannot run still says so. Being
+`no_agent` changes what it delivers, not whether it does: a clean tick prints
+nothing and relays nothing, and only a sweep that failed produces text.
 
 Adding a sweep is one line in `github_scan_gate.py`'s `SWEEPS` registry —
 `SWEEP_ORDER` is derived from it, so there is no second list to keep in step —
@@ -51,19 +53,62 @@ rosters both carrying one id is that audit running twice per schedule,
 concurrently with itself, writing its ledger issue twice. The per-job lock
 (`cron/.job-<id>.lock`) is per profile directory, so it does not stop this.
 
-## `deliver` is `"all"`, deliberately
+## `deliver` is never `"local"`
 
-Every enabled job here sets `deliver: "all"`. `cron/scheduler.py::_resolve_delivery_targets`
-returns an **empty target list** for `"local"` — the outcome is written to
-`last_output` and delivered nowhere. A watchdog whose run failed would then be
-indistinguishable from a quiet fleet. `"all"` expands at fire time to every
-platform with a configured home channel, so a failure is audible.
+Every enabled job here sets `deliver` to `"chat"` (`"all"` is the other audible
+value). `cron/scheduler.py::_resolve_delivery_targets` returns an **empty target list**
+for `"local"` — the outcome is written to `last_output` and delivered nowhere. A
+watchdog whose run failed would then be indistinguishable from a quiet fleet.
+Both audible values carry a failure: the scheduler builds one with
+`_summarize_cron_failure_for_delivery` and delivers it on the same leg.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
 `test_every_watchdog_declares_all_delivery` in
 `../skills/fleet-audit/scripts/test_audit_report.py` enforces this.
+
+## `deliver: "chat"` — reporting through the Chat Agent
+
+`"all"` gets the words into a channel. It does not make them answerable: the
+process that produced them has exited, and the Chat Agent — which is who the
+user replies to — never saw the finding. `"all"` now expands to include the
+relay as well as the channel, so a job left on it is heard twice rather than
+not at all.
+
+`deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
+it and thereby owns the thread the user replies in. It is a delivery mode, not a
+prompt contract: **the job's prompt says nothing about it**, because the
+scheduler applies `[SILENT]` and builds the failure summary before delivery is
+reached.
+
+The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
+platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
+that Hermes registers like any other. So it is one target among several — a job
+on `"chat,slack"` relays _and_ posts, and an unreachable relay records
+`last_delivery_error` rather than falling back. Note that `"all"` now expands to
+include the relay, so `"all"` and `"chat"` together deliver once, not twice, but
+`"all"` alone relays too. The full rationale — why the Chat Agent composes but
+does not send, why the session is per job per day, why a mode rather than an
+instruction, and what the plugin route costs — is
+[`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
+
+## Moving the roster onto `"chat"` needed no migration
+
+Every job here names `"chat"`, and getting there was an edit to this file alone
+— no script, no one-off Job, nothing run against a live volume. `deliver` is an
+image-owned key on this profile: `merge_cron_store` gives the image every key it
+ships and leaves the volume only the keys it does not, so the next pod start
+rewrites `"all"` to `"chat"` on stores this repo can no longer reach by any other
+means. `test_the_image_decides_where_a_report_is_delivered` in
+`../scripts/test_profile_scaffold.py` pins that.
+
+It does not generalise. The Chat Agent's roster is reconciled by
+`cron_jobs_sync.py`, which lists `deliver` in `RUNTIME_WINS` because onboarding
+rewrites it to `origin` on the delivery job — there the volume's value stands and
+an image edit is ignored. And a job the agent creates at runtime is not in the
+image at all, so nothing rewrites it; that one is answered in `../AGENTS.md`, by
+telling the agent to pass `deliver='chat'` in the first place.
 
 ## `schedule.display` mirrors `schedule.expr`
 

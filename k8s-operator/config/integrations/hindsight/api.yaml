@@ -32,6 +32,14 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   replicas: 1
+  # 15 minutes, above the default 600s, because this pod's own budget is not
+  # the whole story: a cold roll pulls 1.4 GB before the container starts and
+  # only then spends the startupProbe budget below loading models. At the
+  # default, `kubectl rollout status` stops waiting and reports
+  # "exceeded its progress deadline" on a pod that is still starting normally,
+  # whatever timeout the caller passed — the deadline is a ceiling over it, so
+  # provisioning step 13's wait has to sit under this number to mean anything.
+  progressDeadlineSeconds: 900
   selector:
     matchLabels:
       app.kubernetes.io/name: hindsight
@@ -128,12 +136,35 @@ spec:
             capabilities:
               drop:
                 - ALL
-          # Model loading dominates startup, hence the 30s liveness delay.
+          # This is the canonical account of the probe timings; the design doc
+          # and provisioning step 13 defer to it.
+          #
+          # Model loading dominates cold start: the embedding and reranking
+          # models load in-process before the API binds :8888. So startup gets
+          # its own probe and the other two stay tight. Neither liveness nor
+          # readiness runs until the startupProbe first succeeds, which is why
+          # neither carries an initialDelaySeconds — a liveness delay is the
+          # wrong tool for a long start, and the 30s one this used to have put
+          # the third failure at t=50s, killing cold containers mid-load and
+          # making the next attempt start the load over (#712).
+          #
+          # 5 minutes of budget (5s × 60), where LiteLLM's is 3: this loads two
+          # transformer models rather than parsing a config, and a kill costs
+          # the whole load again. Restarting a container that is merely slow
+          # buys nothing. A genuinely wedged one still waits out the budget and
+          # is then restarted, so this trades a faster kill for not killing the
+          # common case.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /health
               port: 8888
-            initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
@@ -141,7 +172,6 @@ spec:
             httpGet:
               path: /health
               port: 8888
-            initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3

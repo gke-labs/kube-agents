@@ -38,10 +38,16 @@ be spelled out in the card, resolved to concrete values.
   context each turn, and durable facts are retained to personal memory when the session ends.
 - **The tools are for the exceptions.** `memory_recall` to look up something not already in
   context, `memory_retain` to store a fact immediately, `memory_reflect` to ask an open question
-  about what is remembered. Each takes a `scope` (`personal`, `shared`, or `both`) — writes
-  default to `personal`, reads to `both`. Full rules are in `SOUL.md` §1.6.
+  about what is remembered. Each takes a `scope` (`personal`, `shared`, or `both`) — reads default
+  to `both`; a write defaults to `personal` in any session with a person in it, and to `shared` in
+  one with nobody in it. Full rules are in `SOUL.md` §1.6.
 - **Personal memory is DM-only.** In a thread more than one person can post in, the sender cannot
-  be attributed, so personal memory is disabled and only shared memory works.
+  be attributed, so personal memory is disabled and only shared memory works. A write that names
+  no scope is refused there rather than falling back to shared: the fact is one participant's, and
+  shared is the whole organisation.
+- **A session with nobody in it writes shared.** Scheduled runs and event-driven wakes carry no
+  identity at all, so there is no personal memory to get wrong; `memory_retain` is their only
+  route into memory, since nothing is captured automatically without a person to attribute it to.
 - **A stated role goes to shared, deliberately.** Who holds which role, owns which system, or
   approves what is org knowledge the rest of the fleet needs; preferences and possessions stay
   personal. It is never automatic, and you say so when you do it — conditions in `SOUL.md` §1.6.

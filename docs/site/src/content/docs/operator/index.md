@@ -35,6 +35,7 @@ The controller reconciles a `PlatformAgent` into:
 
 - A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar.
 - A `Service` fronting the Deployment (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
+- A `PodDisruptionBudget` selecting the Deployment's pods, `maxUnavailable: 1` at every replica count. That declares the agent evictable rather than blocking node drains, and it stays correct when the agent is scaled — a budget keyed to the replica count would deadlock drains the first time someone scaled back to one.
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope / GitOps repo) mounted into `/opt/data/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.

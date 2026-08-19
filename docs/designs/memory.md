@@ -453,8 +453,14 @@ It adds exactly two workloads to `kubeagents-system`.
   lives in `images.json` at the repository root and the manifest takes it as a
   variable, so a mirrored install can point it at an approved registry.
 - Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;
-  `/health` backs both probes. Liveness waits 30s because model loading dominates
-  cold start.
+  `/health` backs all three probes. Model loading dominates cold start, so the
+  budget for it sits in a **`startupProbe`**, and liveness and readiness do not
+  run until that first succeeds. Before
+  [#712](https://github.com/gke-labs/kube-agents/issues/712) a 30s liveness delay
+  carried that budget instead, which put the third failure at t=50s and killed
+  cold containers mid-load. The timings and the reasoning behind each are in
+  `api.yaml`'s probe comment, which is canonical for them; step 13's rollout gate
+  is sized to cover a pull plus that budget.
 - `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. The embedding and reranking
   models are baked into the image, so the pod needs **no Hugging Face egress** —
   and both flags must stay set, or the libraries reach out on every cold start and
@@ -783,11 +789,11 @@ out of the installed plugin source with `ast` rather than retyping them.
 
 The three retain strategies:
 
-| Strategy     | Settings                           | Used by                                    |
-| ------------ | ---------------------------------- | ------------------------------------------ |
-| `personal`   | personal extraction mission        | automatic capture; `memory_retain` default |
-| `shared`     | shared extraction mission          | `memory_retain(scope="shared")`            |
-| `checkpoint` | `retain_extraction_mode: "chunks"` | the TTL curator (built, not running)       |
+| Strategy     | Settings                           | Used by                                   |
+| ------------ | ---------------------------------- | ----------------------------------------- |
+| `personal`   | personal extraction mission        | automatic capture; an attributable retain |
+| `shared`     | shared extraction mission          | `memory_retain(scope="shared")`           |
+| `checkpoint` | `retain_extraction_mode: "chunks"` | the TTL curator (built, not running)      |
 
 `retain_default_strategy` is `personal`, so anything that reaches the bank without
 naming a strategy is treated as one person's fact rather than as org knowledge.
@@ -809,9 +815,17 @@ one item with `tags`, `observation_scopes: [tags]`, the matching `strategy`, and
 optional short `context` label, then calls `aretain_batch(..., retain_async=False)`.
 Synchronous, so the tool result reflects the write.
 
-Because automatic capture is personal-only, **nothing reaches shared memory without
-a deliberate `memory_retain(scope="shared")` by the model**. That is the floor the
-rest of the scope design sits on.
+Because automatic capture is personal-only, **nothing reaches shared memory except
+through a `memory_retain` the model chose to make**. That is the floor the rest of
+the scope design sits on, and it holds in every session: no transcript is ever
+absorbed into the corpus everyone reads.
+
+What the write is _spelled_ varies, because the safe reading of an unqualified
+retain is not the same everywhere. Wherever a person is in the conversation it
+stays `scope="shared"`, explicitly; in an unattended session — cron, the k8s event
+watcher — there is no personal scope to write to and an unqualified retain resolves
+to shared instead of failing. The three cases are in
+[The tools](#the-tools).
 
 #### What goes in which scope
 
@@ -930,7 +944,7 @@ The Chat Agent gets three, from `get_tool_schemas()`:
 
 | Tool             | Scope parameter                                   | Notes                                              |
 | ---------------- | ------------------------------------------------- | -------------------------------------------------- |
-| `memory_retain`  | `personal` \| `shared` — defaults to `personal`   | Requires `content`; optional short `context` label |
+| `memory_retain`  | `personal` \| `shared` — see the default below    | Requires `content`; optional short `context` label |
 | `memory_recall`  | `personal` \| `shared` \| `both` — default `both` | Semantic search; returns matches                   |
 | `memory_reflect` | same as recall                                    | Synthesises an answer across memories              |
 
@@ -940,6 +954,26 @@ shared half is still answerable and the system prompt has already explained why 
 personal half is not), while an explicit `personal` returns the disabling reason as
 an error. `_tags_for(scope)` is the single place tags are derived, used by both the
 read and write paths.
+
+A write that names no scope is the model declining to state intent, so the default
+is the safe reading of that silence — which depends on who is in the room, not on
+whether the session happens to hold a user tag:
+
+| Session                                | Write default | An unqualified retain                            |
+| -------------------------------------- | ------------- | ------------------------------------------------ |
+| DM from a known user                   | `personal`    | filed under that user                            |
+| Group thread (`SHARED_SESSION_NOTICE`) | `personal`    | refused, with the reason, and nothing is written |
+| Unattended (`NO_IDENTITY_NOTICE`)      | `shared`      | filed under `scope:shared`                       |
+
+The middle row is why the provider carries `_unattended` rather than keying on
+`self._user_tag` being empty: both of the last two states have no tag, and only one
+of them is an empty room. A space is full of named people whose personal memory
+exists and is merely unreachable from a session that cannot attribute the speaker,
+so an unqualified write there must keep failing closed — publishing one
+participant's stated fact org-wide is the outcome the whole scope design exists to
+prevent. `get_tool_schemas` splits the same way: only the unattended variant drops
+`personal` from the write enum, because in a space that value is the model's only
+way to say "this belongs to one person" and earn the refusal.
 
 Neither read delegates to the stock tool. `memory_reflect` cannot, because
 `hindsight_reflect` drops the tag filter (pinned setting 3). `memory_recall` no

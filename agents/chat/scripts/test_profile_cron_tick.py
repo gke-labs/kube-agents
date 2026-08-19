@@ -222,12 +222,13 @@ class DispatchTest(unittest.TestCase):
         path = self.tmp / f"hermes-{exit_code}"
         path.write_text(
             "#!/bin/sh\n"
-            # Fields 4 and 5 are the home target. The child resolves
-            # `deliver=all` from its environment alone, so the only way to see
-            # whether it can post anywhere is to have the stub report what it
-            # was handed.
-            'printf "%s|%s|%s|%s|%s\\n" "$HERMES_HOME" "$*" "$PWD" '
+            # Fields 4 and 5 are the home target, field 6 the chat-relay
+            # switch. The child resolves `deliver=all` and `deliver=chat` from
+            # its environment alone, so the only way to see whether it can post
+            # anywhere is to have the stub report what it was handed.
+            'printf "%s|%s|%s|%s|%s|%s\\n" "$HERMES_HOME" "$*" "$PWD" '
             '"$SLACK_HOME_CHANNEL" "$SLACK_HOME_CHANNEL_THREAD_ID" '
+            '"$CHAT_HOME_CHANNEL" '
             '>> "$PROFILE_CRON_TICK_RECORD"\n'
             'echo "stub hermes says hello"\n'
             f"exit {exit_code}\n",
@@ -289,6 +290,9 @@ class DispatchTest(unittest.TestCase):
 
     def home_targets(self):
         return [(row[3], row[4]) for row in self.invocations()]
+
+    def chat_relay_switches(self):
+        return [row[5] for row in self.invocations()]
 
     @staticmethod
     def reap(children) -> None:
@@ -455,6 +459,39 @@ class DispatchTest(unittest.TestCase):
         self.run_main()
 
         self.assertEqual(sorted(self.home_targets()), [("D0BKGRBM6RH", "")] * 2)
+
+    # --- the chat relay switch ---------------------------------------------
+
+    def test_every_cron_child_can_deliver_to_the_chat_agent(self):
+        """`deliver: "chat"` resolves to nothing unless the child has this.
+
+        It is both the `cron_deliver_env_var` the scheduler reads to find a
+        target and the flag the plugin's `is_connected` uses to have the
+        platform enabled at all — so an unset one is a job that runs and
+        reports nowhere, which is the failure the relay exists to end.
+        """
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.profile("other", job("sweep", None))
+
+        self.run_main()
+
+        self.assertEqual(
+            self.chat_relay_switches(), [pct.CHAT_RELAY_ENV_VALUE] * 2
+        )
+
+    def test_the_switch_does_not_depend_on_the_pod_having_it(self):
+        """The gateway must NOT carry it — see `CHAT_RELAY_ENV_KEY`.
+
+        The plugin has no inbound adapter, so a `chat` platform enabled in the
+        gateway process is a delivery target it could try to start and cannot.
+        Setting it per-spawn is what keeps the gateway free of it.
+        """
+        self._patch_env(pct.CHAT_RELAY_ENV_KEY, None)
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+
+        self.run_main()
+
+        self.assertEqual(self.chat_relay_switches(), [pct.CHAT_RELAY_ENV_VALUE])
 
     def test_no_home_set_still_ticks(self):
         # Delivery is not the point of a tick: jobs with an explicit target

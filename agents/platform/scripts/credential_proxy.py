@@ -58,6 +58,38 @@ def is_valid_repository(repository: Any) -> bool:
     )
 
 
+# Two shapes, because two are what the GitHub refresh helper handles: the
+# installation token Minty returns, and the Google OIDC identity token sent to
+# authenticate the request to it.
+_CREDENTIAL_SHAPES = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+)
+
+
+def redact_credentials(text: str) -> str:
+    """Blank out token-shaped substrings so a subprocess's output can be logged.
+
+    This container is the one place holding credentials and everything it writes
+    to stdout leaves the cluster, so the rule is that none of it may be
+    credential material (`concepts/observability.md`). Tracing the GitHub
+    refresh helper says its stderr already satisfies that -- it never formats
+    either token into a message, and the installation token reaches `gh` over
+    stdin rather than argv, so it cannot surface in a `CalledProcessError`. The
+    gap that argument does not close is the broker's own error body, which this
+    repository does not own: a Minty that echoed the request's `X-OIDC-Token`
+    header back in a 4xx would put a credential in a string we are about to log.
+    Match on shape so that stops being an argument about someone else's service.
+
+    Deliberately not a general-purpose redactor. Two others already exist
+    (`AuditRedactor`, and `redact_secrets` in the fleet-audit skill) and both
+    cover more shapes; neither belongs in this container, which must not import
+    from the Hermes plugin tree. Consolidating the three is separate work.
+    """
+    return _CREDENTIAL_SHAPES.sub("[REDACTED]", text)
+
+
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
 
@@ -1500,7 +1532,27 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         if result.exit_code != 0:
-            LOGGER.warning("GitHub credential refresh exited %d", result.exit_code)
+            # The helper's stderr is the only place the broker's actual refusal
+            # exists: github_token_refresh raises `Minty returned error (HTTP
+            # <code>): <body>` and its main() logs that line. Without this the
+            # caller's reason code -- GITHUB_TOKEN_REFRESH_FAILED, which the
+            # resolver renders into a chat room -- is the whole diagnosis, and
+            # an operator has nothing to read during a broker outage.
+            #
+            # Same split as the shell bootstrap above: the detail must not
+            # travel in the response, which crosses back into the agent sandbox,
+            # so it is logged here where only an operator reading the sidecar's
+            # own logs sees it and the reply stays output-free. Bounded because
+            # `_execute` caps output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES (4 MiB
+            # by default), which is not a log line, and this path can fire on
+            # every cron tick. Redacted before it is bounded, so that a token cut
+            # in half by the slice is not what survives.
+            detail = redact_credentials(result.stderr.strip())
+            LOGGER.warning(
+                "GitHub credential refresh exited %d%s",
+                result.exit_code,
+                f": {detail[:1000]}" if detail else "",
+            )
             self._json(
                 HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"}
             )

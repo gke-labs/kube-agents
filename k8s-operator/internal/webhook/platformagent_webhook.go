@@ -22,7 +22,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
@@ -65,8 +64,7 @@ var platformagentlog = logf.Log.WithName("platformagent-resource")
 
 // SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent in the manager.
 func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&agentv1alpha1.PlatformAgent{}).
+	return ctrl.NewWebhookManagedBy(mgr, &agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
 		WithValidator(&PlatformAgentCustomValidator{
 			Client: mgr.GetAPIReader(),
@@ -76,17 +74,13 @@ func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
 
 // +kubebuilder:webhook:path=/mutate-kubeagents-x-k8s-io-v1alpha1-platformagent,mutating=true,failurePolicy=fail,sideEffects=None,groups=kubeagents.x-k8s.io,resources=platformagents,verbs=create;update,versions=v1alpha1,name=mplatformagent.kb.io,admissionReviewVersions=v1
 
-// PlatformAgentCustomDefaulter struct to implement CustomDefaulter.
+// PlatformAgentCustomDefaulter struct to implement admission.Defaulter.
 type PlatformAgentCustomDefaulter struct{}
 
-var _ admission.CustomDefaulter = &PlatformAgentCustomDefaulter{}
+var _ admission.Defaulter[*agentv1alpha1.PlatformAgent] = &PlatformAgentCustomDefaulter{}
 
-// Default implements admission.CustomDefaulter so a webhook will be registered for the type PlatformAgent.
-func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.Object) error {
-	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return fmt.Errorf("expected a PlatformAgent object but got %T", obj)
-	}
+// Default implements admission.Defaulter so a webhook will be registered for the type PlatformAgent.
+func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) error {
 	platformagentlog.Info("defaulting PlatformAgent", "name", platformAgent.Name)
 
 	if platformAgent.Spec.Deployment != nil {
@@ -111,30 +105,22 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 
 // +kubebuilder:webhook:path=/validate-kubeagents-x-k8s-io-v1alpha1-platformagent,mutating=false,failurePolicy=fail,sideEffects=None,groups=kubeagents.x-k8s.io,resources=platformagents,verbs=create;update;delete,versions=v1alpha1,name=vplatformagent.kb.io,admissionReviewVersions=v1
 
-// PlatformAgentCustomValidator struct to implement CustomValidator.
+// PlatformAgentCustomValidator struct to implement admission.Validator.
 type PlatformAgentCustomValidator struct {
 	Client client.Reader
 }
 
-var _ admission.CustomValidator = &PlatformAgentCustomValidator{}
+var _ admission.Validator[*agentv1alpha1.PlatformAgent] = &PlatformAgentCustomValidator{}
 
-// ValidateCreate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
-func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator so a webhook will be registered for the type PlatformAgent.
+func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	platformagentlog.Info("validating PlatformAgent creation", "name", platformAgent.Name)
 
 	return v.validatePlatformAgent(ctx, platformAgent)
 }
 
-// ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
-func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	platformAgent, ok := newObj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", newObj)
-	}
+// ValidateUpdate implements admission.Validator so a webhook will be registered for the type PlatformAgent.
+func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
 
 	return v.validatePlatformAgent(ctx, platformAgent)
@@ -281,12 +267,8 @@ func validateContainerSecurity(sc *corev1.SecurityContext, path *field.Path) fie
 	return errs
 }
 
-// ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
-func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", obj)
-	}
+// ValidateDelete implements admission.Validator so a webhook will be registered for the type PlatformAgent.
+func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	platformagentlog.Info("validating PlatformAgent deletion", "name", platformAgent.Name)
 
 	if platformAgent.Annotations != nil && platformAgent.Annotations[PreventDeletionAnnotation] == "true" {

@@ -68,6 +68,36 @@ spec:
             # directory keeps whatever auth method it was created with.
             - name: POSTGRES_HOST_AUTH_METHOD
               value: trust
+          # Readiness only, deliberately: the Service above publishes this pod's
+          # address the moment the container starts, and initdb takes several
+          # seconds on a fresh volume, so the Hindsight API otherwise races the
+          # database on first install. A *liveness* probe on Postgres is the
+          # opposite of helpful — a busy database that misses a check gets
+          # restarted mid-transaction.
+          #
+          # -h 127.0.0.1 is what makes this probe close that race rather than
+          # look like it does. The postgres entrypoint runs a *temporary* server
+          # while it applies extensions and init scripts, and that server sets
+          # listen_addresses='' — it answers on the Unix socket only. A bare
+          # pg_isready connects over that socket and so reports ready during
+          # initialisation, minutes before the real server accepts a TCP
+          # connection; measured on this image, the socket says ready for the
+          # entire time the init scripts run while 127.0.0.1 is still refused.
+          # The API connects over TCP, so TCP is what has to be probed.
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - 127.0.0.1
+                - -U
+                - hindsight
+                - -d
+                - hindsight
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests:
               cpu: 250m

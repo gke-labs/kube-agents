@@ -25,6 +25,11 @@ concurrency:
 jobs:
   step-1-create-tag:
     name: Step 1 - Create Release Candidate Tag
+    # A fork inherits the cron but none of the release credentials, so every
+    # scheduled run there fails and mails the fork owner. The guard repeats on
+    # each job rather than relying on the skip cascading through `needs`: an
+    # `always()` added to a later job would silently un-guard the pipeline.
+    if: github.repository == 'gke-labs/kube-agents'
     uses: ./.github/workflows/rc-create-tag.yml
     permissions:
       contents: write
@@ -38,7 +43,9 @@ jobs:
   step-2-deploy-env:
     name: Step 2 - Provision RC Environment
     needs: step-1-create-tag
-    if: needs.step-1-create-tag.outputs.skip_rc != 'true'
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
     uses: ./.github/workflows/rc-deploy-environment.yml
     permissions:
       contents: read
@@ -51,7 +58,9 @@ jobs:
   step-3-run-e2e-tests:
     name: Step 3 - Run E2E Tests
     needs: [step-1-create-tag, step-2-deploy-env]
-    if: needs.step-1-create-tag.outputs.skip_rc != 'true'
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
     runs-on: ubuntu-latest
     environment: rc
     concurrency:
@@ -110,7 +119,9 @@ jobs:
   step-4-tag-validated:
     name: Step 4 - Tag Validated Release
     needs: [step-1-create-tag, step-3-run-e2e-tests]
-    if: needs.step-1-create-tag.outputs.skip_rc != 'true'
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
     uses: ./.github/workflows/rc-tag-validated.yml
     permissions:
       contents: write

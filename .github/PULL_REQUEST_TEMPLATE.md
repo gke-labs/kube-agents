@@ -51,6 +51,9 @@ cleaned up.
 If the change cannot reach a running installation — docs-only, a CI workflow, a path
 that needs infrastructure you do not have — write "Not live-tested" and say why.
 
+Re-testing after new commits folds into this section rather than stacking a round
+beneath it: keep what still holds, and re-run or flag what the new commits invalidated.
+
 Full contract: AGENTS.md, "Pull Request Hygiene".
 -->
 
@@ -68,6 +71,19 @@ with the reason.
 what you looked for. A reason for not fixing something is an answer when it is an
 argument about this change; "out of scope" and "will fix later" on their own are
 not.
+
+Run the pass in a context that did not write the change — a subagent, or a fresh
+session, handed the diff range and nothing else. If your harness will not start
+one without a human's approval, ask for it. A session that still holds the
+reasoning behind the diff re-derives that reasoning instead of testing it, so it
+clears the errors the reasoning caused.
+
+Fix what the pass confirms and report what it only suspects, and claim no more
+than you did: a Self-Review the diff contradicts is worse than none.
+
+Re-running the pass folds into this section rather than stacking a round beneath
+it: keep what still holds, re-state what the new commits changed, and drop the
+superseded round rather than a finding's disposition.
 
 Full contract: AGENTS.md, "Pull Request Hygiene".
 -->

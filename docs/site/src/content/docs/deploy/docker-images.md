@@ -86,7 +86,7 @@ The Dockerfile installs system tooling the Platform Agent needs to inspect and r
 
 It also builds the `k8s-event-watcher` binary from `k8s-operator/cmd/k8s-event-watcher/` in a Go builder stage and copies it into the image.
 
-A late build step precompiles the Python tree — `/opt/hermes`, its venv, and the stdlib — to `.pyc`. The base image ships almost none, sets `PYTHONDONTWRITEBYTECODE=1`, and `/opt/hermes` is read-only to the runtime user, so without this every short-lived process recompiled its imports from source and threw the result away. Each kanban worker is exactly such a process: a fresh `hermes -p <profile> --cli chat -q`. Shipping the bytecode costs ~170MB of image and takes about 6s off a worker's startup. It has to run after every patch the Dockerfile applies to `/opt/hermes` — `compileall` stamps each `.pyc` with its source's mtime and size, so bytecode written before a patch would simply be discarded at import.
+A late build step precompiles the Python tree — `/opt/hermes`, its venv, and the stdlib — to `.pyc`. The base image ships almost none, sets `PYTHONDONTWRITEBYTECODE=1`, and `/opt/hermes` is read-only to the runtime user, so without this every short-lived process recompiled its imports from source and threw the result away. Each kanban worker is exactly such a process: a fresh `hermes -p <profile> --cli chat -q`. Shipping the bytecode costs ~170MB of image and takes about 6s off a worker's startup. It has to run after everything the Dockerfile writes into `/opt/hermes` — its patches and its bundled plugins alike — because `compileall` stamps each `.pyc` with its source's mtime and size, so bytecode written before the write would simply be discarded at import.
 
 ### `credential-proxy`
 
