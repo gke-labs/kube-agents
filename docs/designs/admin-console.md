@@ -262,6 +262,28 @@ responses, validation errors, or portal state. Device OAuth returns the
 authorization log without waiting for readiness; a bounded status poll waits
 for the new rollout before verification.
 
+#### Integration status
+
+```text
+GET /api/v1/integrations/google-chat
+```
+
+The Google Chat read model selects the canonical `PlatformAgent`, reads its
+`spec.integration.googleChat` values, and describes only that exact project,
+topic, and subscription. It verifies all three required APIs, pull-compatible
+subscription state, route agreement, and the live publisher/subscriber IAM
+policies. The response includes the full topic path, project number, service
+identities, one normalized checklist, and command evidence. It redacts
+credential-shaped Kubernetes values before returning that evidence. It
+does not infer that the separate Google Chat API console configuration was
+saved because that app configuration has no corresponding read resource in the
+Chat REST API. It also labels publisher IAM only as bindings: the Chat and
+Workspace Add-ons registrations resolve to the same service account, so that
+account and its policy cannot independently prove both registrations occurred.
+The same response includes a bounded 30-day Google Chat session observation
+from the canonical runtime. Absence is reported separately from backend health;
+it becomes positive evidence only after an event reaches Hermes.
+
 #### Start and observe an interaction
 
 ```text
@@ -678,6 +700,11 @@ override identity or correlation fields.
   Activity Explorer, Task Kanban, and Scheduled Cron. A shared connection gate
   replaces provider-backed content with concise connection guidance until the
   selected target is verified.
+- **Integration:** the navigation group after Observability. Its first page,
+  Google Chat, shows one backend verdict, the exact Cloud Pub/Sub topic to enter
+  in the Chat app, live CR and service-identity values, one check table, and
+  collapsed raw evidence. It never substitutes chart defaults or configured
+  project values for the connected installation's live resources.
 - **Overview:** activity volume, human/autonomous split, attention items,
   attribution coverage, recent outcomes, and page-local activity scope.
 - **Chat:** an always-discoverable session workspace with recent Hermes
