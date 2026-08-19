@@ -324,6 +324,24 @@ trusted interaction, user, task, or proxy request identifiers remain labeled
 as missing. The ledger page and selected event are persisted in the URL;
 free-text and facet filters remain local to the browser session.
 
+## Google Chat integration
+
+The **Integration → Google Chat** page is a read-only projection of the
+canonical live `PlatformAgent` and its exact Google Cloud resources. It derives
+the project, topic, subscription, mode, user allowlist, home channel, and
+workload service account from the CR, then verifies the required APIs, topic,
+pull subscription, routing, and publisher/subscriber IAM. It does not list
+unrelated project resources.
+
+The page also reports Google Chat sessions observed by Hermes in the last 30
+days. No recent activity is distinct from backend failure.
+
+The portal shows the fully qualified topic for the Google Chat app's **Cloud
+Pub/Sub** setting and links to that project's configuration page. The Chat API
+does not expose the console's saved app configuration, so **Backend ready**
+covers Kubernetes and Pub/Sub only. **Raw evidence** redacts credential-shaped
+Kubernetes values.
+
 ## Validate
 
 ```bash

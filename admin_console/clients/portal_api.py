@@ -190,6 +190,9 @@ class PortalApiClient:
     def inspect_llm_gateway(self) -> dict[str, Any]:
         return self._payload(self._get("llm-gateway", timeout=120))
 
+    def inspect_google_chat_integration(self) -> dict[str, Any]:
+        return self._payload(self._get("integrations/google-chat", timeout=120))
+
     def llm_gateway_device_status(self) -> dict[str, Any]:
         return self._payload(self._get("llm-gateway/device-status", timeout=30))
 
