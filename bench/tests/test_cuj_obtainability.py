@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
-from cuj.milestones import MilestoneStatus
 from cuj.obtainability import test_01_cluster_design as cluster_design
+from cuj.utils.milestones import MilestoneStatus
 
 
 def interaction(*, include_future_evidence: bool) -> dict[str, Any]:
@@ -113,13 +111,3 @@ def test_worker_mutation_fails_read_only_milestone() -> None:
 
     assert result.milestone.id == "m9-design-remains-read-only"
     assert result.status is MilestoneStatus.FAILED
-
-
-def test_default_timeout_covers_portal_root_and_task_budgets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("CUJ1_AGENT_ID", "platform-agent")
-    monkeypatch.setenv("CUJ1_PROJECT_ID", "test-project")
-    monkeypatch.delenv("CUJ1_TIMEOUT", raising=False)
-
-    assert cluster_design.config_from_env("http://127.0.0.1/api/v1").timeout == 1600

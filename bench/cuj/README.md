@@ -40,6 +40,9 @@ must:
 - use ordinary pytest assertions for configuration, transport, and milestone
   failures.
 
-Reuse portal startup and HTTP behavior from `cuj.portal`, and dependency-aware
-pass/fail/blocked reporting from `cuj.milestones`. Keep prompts, polling, and
-milestone checks in the scenario.
+Reuse configuration from `cuj.utils.scenario`, evidence output from
+`cuj.utils.evidence`, portal execution and projection helpers from
+`cuj.utils.interaction`, portal startup from `cuj.utils.portal`, and
+dependency-aware pass/fail/blocked reporting from `cuj.utils.milestones`. Keep
+only the prompt, scenario-specific inputs, and milestone checks in the
+scenario.
