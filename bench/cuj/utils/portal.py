@@ -22,16 +22,14 @@ from cuj.utils.evidence import EvidenceLog
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
+CANONICAL_AGENT_ID = "platform-agent"
 
 
 def configured_agent_profiles() -> tuple[tuple[str, str], ...]:
-    """Return the agent/profile pair shared by all collected CUJs."""
+    """Return the canonical agent/profile pair shared by all collected CUJs."""
 
-    agent_id = os.environ.get("CUJ_AGENT_ID", "").strip()
-    if not agent_id:
-        return ()
     profile = os.environ.get("CUJ_PROFILE", "default").strip() or "default"
-    return ((agent_id, profile),)
+    return ((CANONICAL_AGENT_ID, profile),)
 
 
 def active_gcloud_account() -> str:
