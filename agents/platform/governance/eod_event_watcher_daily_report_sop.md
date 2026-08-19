@@ -14,10 +14,16 @@ and for the gap it leaves.
 
 `eod-event-watcher-daily-report` is a `no_agent` script entry on the Platform Agent's roster
 (`cron/jobs.json`): a tick runs `eod_report_generator.py` as a plain subprocess and prompts no
-model. The scheduler delivers a `no_agent` job's stdout verbatim, which is why the entry ships
-`deliver: "all"` — the report _is_ the stdout, and `local` would resolve to no delivery target and
-drop it. Nothing rewrites that output, so the script emits a bullet list rather than a Markdown
-table, which wraps badly in chat viewports.
+model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
+it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
+
+The entry ships `deliver: "chat"`, with the rest of the roster. That routes the report through the
+Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
+[relay design](../../../docs/designs/cron-report-relay.md) is canonical. `"all"` is the wrong value
+even though it is audible: it expands to every platform with a home channel, and the relay now has
+one, so a job left on `"all"` reports twice — once flat and once through the Chat Agent. `"local"`
+resolves to no target and drops the report. The script still emits a bullet list rather than a
+Markdown table, which wraps badly in chat viewports.
 
 `profile-cron-tick` ticks the roster once a minute with `HERMES_HOME` set to this profile's home,
 and restores the home-channel routing a `no_agent` child would otherwise lose. The script

@@ -132,7 +132,7 @@
       "no_agent": true,
       "script": "eod_report_generator.py",
       "enabled": true,
-      "deliver": "all"
+      "deliver": "chat"
     }
   ]
 }
