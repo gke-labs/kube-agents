@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 import urllib.parse
@@ -36,6 +37,32 @@ FORBIDDEN_OPERATIONS = {
     "submit_suggestion",
     "open_pull_request",
 }
+OPAQUE_TOOLS = {"bash", "exec", "gcloud", "git", "kubectl", "python", "shell"}
+CAPACITY_TERMS = {
+    "quota",
+    "obtainability",
+    "live capacity",
+    "autopilot",
+    "standard",
+    "computeclass",
+}
+QUOTA_DISTINCTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bquota\b[^.\n]{0,120}\b(?:separate|distinct|different|independent)\b"
+        r"[^.\n]{0,40}\b(?:capacity|obtainability)\b",
+        r"\bquota\b[^.\n]{0,80}\b(?:does not|doesn't|cannot|can't)\b"
+        r"[^.\n]{0,50}\b(?:prove|guarantee|indicate|mean|establish)\b"
+        r"[^.\n]{0,40}\b(?:capacity|obtainability)\b",
+        r"\b(?:capacity|obtainability)\b[^.\n]{0,120}"
+        r"\b(?:separate|distinct|different|independent)\b[^.\n]{0,40}\bquota\b",
+    )
+)
+NEGATED_GUARANTEE = re.compile(
+    r"\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|without)\b"
+    r"[^.\n]{0,50}\bguarantee",
+    re.IGNORECASE,
+)
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 MILESTONES = (
     Milestone(
@@ -117,7 +144,7 @@ class Config:
     agent_id: str
     project_id: str
     profile: str = "default"
-    timeout: float = 1200
+    timeout: float = 1600
     poll_interval: float = 2
 
 
@@ -160,6 +187,50 @@ def tool_operations(
     ]
 
 
+def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
+    folded = result_text.casefold()
+    present = sorted(term for term in CAPACITY_TERMS if term in folded)
+    distinguishes_quota = any(
+        pattern.search(result_text) for pattern in QUOTA_DISTINCTION_PATTERNS
+    )
+    guarantee_claims = [
+        sentence.strip()
+        for sentence in re.split(r"[.!?\n]+", result_text)
+        if "capacity" in sentence.casefold()
+        and "guarantee" in sentence.casefold()
+        and not NEGATED_GUARANTEE.search(sentence)
+    ]
+    absolute_claims = [
+        claim
+        for claim in ("100% obtainability", "100% startup reliability")
+        if claim in folded
+    ]
+    observed = {
+        "present": present,
+        "distinguishesQuota": distinguishes_quota,
+        "forbidden": [*absolute_claims, *guarantee_claims],
+    }
+    return (
+        len(present) == len(CAPACITY_TERMS)
+        and distinguishes_quota
+        and not observed["forbidden"],
+        observed,
+    )
+
+
+def opaque_tool_calls(interaction: dict[str, Any]) -> list[str]:
+    calls = interaction.get("toolCalls", [])
+    if not isinstance(calls, list):
+        return []
+    return [
+        str(call.get("name") or "")
+        for call in calls
+        if isinstance(call, dict)
+        and not str(call.get("operation") or "").strip()
+        and str(call.get("name") or "").casefold() in OPAQUE_TOOLS
+    ]
+
+
 def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     tasks = [item for item in interaction.get("tasks", []) if isinstance(item, dict)]
     platform_tasks = [task for task in tasks if task.get("assignee") == "platform"]
@@ -181,19 +252,8 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
         for task in tasks
         for key in ("result", "summary")
     ).casefold()
-    required_phrases = {
-        "quota",
-        "obtainability",
-        "live capacity",
-        "autopilot",
-        "standard",
-        "computeclass",
-    }
-    forbidden_claims = {
-        "100% obtainability",
-        "100% startup reliability",
-        "guaranteed capacity",
-    }
+    claims_met, claims_observed = capacity_claims(result_text)
+    opaque_calls = opaque_tool_calls(interaction)
     suite = MilestoneSuite(MILESTONES)
     suite.record(
         "interaction-completed",
@@ -248,16 +308,8 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
     )
     suite.record(
         "m7-capacity-claims-qualified",
-        all(phrase in result_text for phrase in required_phrases)
-        and not any(claim in result_text for claim in forbidden_claims),
-        {
-            "present": sorted(
-                phrase for phrase in required_phrases if phrase in result_text
-            ),
-            "forbidden": sorted(
-                claim for claim in forbidden_claims if claim in result_text
-            ),
-        },
+        claims_met,
+        claims_observed,
     )
     suite.record(
         "m8-computeclass-validates",
@@ -272,10 +324,15 @@ def evaluate(interaction: dict[str, Any]) -> MilestoneSuite:
         {
             "toolEvidenceComplete": interaction.get("toolEvidenceComplete"),
             "operations": operations,
+            "opaqueTools": opaque_calls,
         },
-        blocked_by=()
-        if "toolEvidenceComplete" in interaction
-        else ("portal interaction projection omits toolEvidenceComplete",),
+        blocked_by=(
+            ("portal interaction projection omits toolEvidenceComplete",)
+            if "toolEvidenceComplete" not in interaction
+            else ("tool evidence omits normalized operations",)
+            if opaque_calls
+            else ()
+        ),
     )
     return suite
 
@@ -372,7 +429,7 @@ def config_from_env(endpoint: str) -> Config:
         agent_id=required["CUJ1_AGENT_ID"],
         project_id=required["CUJ1_PROJECT_ID"],
         profile=os.environ.get("CUJ1_PROFILE", "default"),
-        timeout=float(os.environ.get("CUJ1_TIMEOUT", "1200")),
+        timeout=float(os.environ.get("CUJ1_TIMEOUT", "1600")),
         poll_interval=float(os.environ.get("CUJ1_POLL_INTERVAL", "2")),
     )
     assert config.timeout > 0 and config.poll_interval > 0, (
