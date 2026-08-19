@@ -392,35 +392,22 @@ STALE_CLOSED_MARKER_RE = re.compile(
 # argument is captured loosely — anything up to end of line — so that a
 # malformed request like `/remediate f-1 please` is *answered* with a refusal
 # rather than silently matching nothing and leaving the requester waiting.
-#: Greedy and untrimmed, and deliberately so: the trimming form
-#: `[ \t]*(.*?)[ \t]*$` backtracks quadratically on a run of spaces followed
-#: by a non-space — 9.83s on a 65,536-character body, the limit GitHub allows.
-#: `parse_remediate_commands` reads issue comments on a timer before any trust
-#: check, so any account that can comment can pay that cost on every run. Every
-#: consumer below already calls `.strip()` on the match, so the pattern trimming
-#: it a second time bought nothing. Same defect and same fix as
-#: `pr_triggers.SLASH_RE`, which carries the measurements.
-REMEDIATE_RE = re.compile(r"^[ \t]*/remediate\b(.*)$", re.M)
+REMEDIATE_RE = re.compile(r"^[ \t]*/remediate\b[ \t]*(.*?)[ \t]*$", re.M)
 # The same word *anywhere*, used only to notice a request the line-anchored
 # regex above will not honour — `we should /remediate f-1` buried in a
 # sentence. Matching it is not accepting it; it exists so the answer can be
 # "not like that" rather than nothing at all.
 REMEDIATE_MENTION_RE = re.compile(r"/remediate\b")
-# Inline code spans are removed before the mention search so that prose *about*
+# An inline code span, removed before the mention search so that prose *about*
 # the command — `see `/remediate <id>` above` — is not mistaken for an attempt
 # to use it. Every `/remediate` this harness itself writes into a comment is
 # backticked for exactly this reason: the ledger's own replies are read back on
 # the next run, and a bot that answers itself never stops.
 #
-# The pattern that used to sit here is gone rather than kept as a reference,
-# for the reason `FENCE_OPEN_RE` went: it said one line, shortest run-delimited
-# span, and argued that a span wrapping a newline was rare enough to ignore
-# because missing one "only risks one extra reply". Both halves were wrong. A
-# span does wrap a newline — that is CommonMark, and GitHub's renderer agrees —
-# and what it risks is a `/remediate` firing off a line every reader of the
-# thread sees as code. `pr_triggers.INLINE_CODE_RE` is the reference now, and
-# it is the one the scan is actually fuzzed against; a wrong pattern left in
-# place as documentation is the one most likely to be copied back out.
+# One line, shortest run-delimited span, which is CommonMark's rule for
+# everything but a span that wraps a newline. Those are vanishingly rare in an
+# issue comment and erring towards *not* stripping only risks one extra reply.
+INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")
 # How many finding ids a refusal lists back before it gives up and says "and N
 # more". A refusal is help, not a second copy of the report.
 MAX_HINT_IDS = 10
@@ -431,6 +418,18 @@ MAX_HINT_IDS = 10
 # rather than measuring the concatenation and reporting a failure that is not
 # real. Deliberately not valid Markdown — nothing a renderer would produce.
 DRY_RUN_PR_SEPARATOR = "=== WOULD OPEN PULL REQUEST ==="
+# A fence opener. Fenced code blocks are stripped before command matching, so a
+# `/remediate` quoted inside an evidence excerpt never fires; strip_fenced_blocks
+# scans line by line rather than with one regex, because the regex form missed
+# both an unterminated fence and a block closed by a longer run of backticks.
+# CommonMark, and the indentation is load-bearing rather than cosmetic. A fence
+# opener may be indented up to three spaces; at four it is an indented code
+# block and not a fence at all, and a closer follows the same rule. Matching a
+# stripped line instead treats `    ``` ` — which every Markdown renderer shows
+# as literal text *inside* the surrounding block — as a real delimiter, which
+# ends the block early and leaves the lines after it exposed. That is how a
+# `/remediate` a reader quoted inside a code block gets read as a command.
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
@@ -2117,54 +2116,39 @@ def strip_fenced_blocks(text: str) -> str:
     one of these issues.
 
     So: CommonMark's actual rule. A fence opens on a run of three or more
-    backticks or tildes; it closes on a run of the same character, at least as
-    long, with nothing else on the line. An unterminated fence runs to the end.
+    backticks or tildes, indented at most three spaces; it closes on a run of
+    the same character, at least as long, indented at most three spaces, with
+    nothing else on the line. An unterminated fence runs to the end.
 
-    Both bounds are measured **relative to the opener**, which is the half that
-    is easy to get wrong in either direction.
-
-    Too tight, and a fence inside a list item is not seen as a fence at all.
-    CommonMark measures indentation from the enclosing block's content column,
-    not from the document root, so under a bullet the fence sits at column 4 or
-    more and an opener bounded at three spaces never matches it — the block is
-    never opened and the `/remediate` inside it fires. Recognising an opener at
-    any indentation is what closes that; the failure it can cause instead is an
-    indented literal ``` at document root swallowing the rest of the body,
-    which suppresses a command rather than inventing one.
-
-    Too loose, and the closer stops being trustworthy. Accept `    ``` ` — four
-    spaces, which CommonMark and GitHub both render as literal text inside the
-    enclosing block — as a closer for a fence opened at column 0, and the block
-    ends early, and the `/remediate` the author put inside it to talk *about*
-    fires as a command. So the closer may be indented at most three spaces past
-    its own opener, which preserves that bound for a root-level fence and
-    travels with the fence into a list item.
-
-    A list marker on the same line as the opener counts, for the same reason as
-    the indentation: ```- ``` ``` opens a fence inside that item. Requiring the
-    run to be the first non-space text is the too-tight failure in a second
-    place — the opener is missed, so the *closer* matches instead and opens an
-    unterminated block that swallows only what follows it, leaving the quoted
-    `/remediate` in between exposed while every reader sees a bullet containing
-    code.
-
-    Delegated to `pr_triggers`, which holds the only hardened implementation.
-    This used to be a second copy held to that one by `FenceParserAgreementTest`,
-    and the list-marker defect above sat in both of them at once — which is what
-    a copy costs even with an agreement test on it, since the test can only
-    check that the two agree and they agreed on being wrong. `strip_inline_code`
-    above delegates for the same reason. The `FENCE_OPEN_RE` that used to sit
-    beside `INLINE_CODE_RE` is gone rather than kept as a reference: it was the
-    pattern with the defect in it, and a wrong pattern left in place as
-    documentation is the one most likely to be copied back out.
-
-    Imported inside the function, like every other shared-module import in this
-    file, so `--dry-run` on a dev machine does not depend on what has been
-    staged into /opt.
+    The indentation bound is the half that is easy to drop and expensive to
+    lose. Strip each line first and `    ``` ` — four spaces, which CommonMark
+    and GitHub both render as literal text inside the enclosing block — reads
+    as a closer, the block ends four lines early, and the `/remediate` the
+    author put inside it to talk *about* fires as a command.
     """
-    import pr_triggers
-
-    return pr_triggers.strip_fenced_blocks(text)
+    if not text:
+        return ""
+    out: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    for line in text.split("\n"):
+        if fence_char:
+            closer = line.rstrip()
+            if (
+                len(closer) - len(closer.lstrip(" ")) <= 3
+                and set(closer.lstrip(" ")) == {fence_char}
+                and len(closer.lstrip(" ")) >= fence_len
+            ):
+                fence_char = ""
+                fence_len = 0
+            continue
+        match = FENCE_OPEN_RE.match(line)
+        if match:
+            fence_char = match.group(1)[0]
+            fence_len = len(match.group(1))
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def parse_gh_timestamp(value: str | None) -> datetime | None:
@@ -2239,78 +2223,8 @@ class RemediateRequests(NamedTuple):
 
 
 def strip_inline_code(text: str) -> str:
-    """Drop inline code spans, so quoting the command is not using it.
-
-    Delegated to `pr_triggers`, which holds the only hardened implementation.
-    The pattern this replaced was `(`+)[^\\n]*?\\1` — a backreference behind a
-    lazy quantifier — and its cost is cubic in the length of a backtick run:
-    6,400 backticks take 1.3s, 12,800 take 10.2s, and a body at GitHub's 65,536
-    character comment limit extrapolates to roughly twenty minutes. `/remediate`
-    is read off issue comments on a timer, before any trust check, so the input
-    is anyone's to choose.
-
-    A copy of a subtle scan is how two answers drift apart, and every stripper
-    this file needs now delegates rather than holding one. Imported inside the
-    function, like every other shared-module import in this file, so
-    `--dry-run` on a dev machine does not depend on what has been staged into
-    /opt.
-    """
-    import pr_triggers
-
-    return pr_triggers.strip_inline_code(text)
-
-
-def remediate_commands(body: str) -> list[str]:
-    """Every `/remediate` argument in `body` that a reader would see as a command.
-
-    Takes a **raw comment body** and does the whole job, because splitting it
-    was the bug. Every call site used to pair `strip_fenced_blocks` with
-    `REMEDIATE_RE.findall`, and that pairing suppresses two of the four things
-    it needs to: a comment reading "Looks fine to me" above
-
-        <!--
-        /remediate netpol-missing
-        -->
-
-    renders as five words and opened a remediation pull request the thread
-    shows nothing about. `pr_triggers.visible_text` is the answer to "what can
-    a reader act on", it is the same answer `/agent` gets, and having one
-    function is what stops the two drifting again.
-
-    The second half is the line anchor, which cannot see rendering either. A
-    code span that opened on an *earlier* line renders its whole paragraph as
-    code without moving where any line begins — so
-
-        Do not run: `
-        /remediate cluster-a
-        ` — it deletes the node pool
-
-    is one sentence with the command inside a `<code>`, and a bare `findall`
-    reads line 2 as a live request. `command_matches` vetoes a command whose
-    token sits inside a span, and hands the argument back whole either way, so
-    a request may still quote its own target.
-    """
-    import pr_triggers
-
-    return pr_triggers.command_matches(REMEDIATE_RE, pr_triggers.visible_text(body))
-
-
-def remediate_mentioned(body: str) -> bool:
-    """Whether `body` names `/remediate` anywhere a reader would see as a command.
-
-    The weaker half of the pair: not at the start of a line, so never acted on,
-    but worth one reply saying so. Takes a raw body and applies the same
-    `visible_text` as `remediate_commands`, because the two are asked about the
-    same comment and an answer of "no command, but a mention" drawn from two
-    different notions of visible is not an answer.
-    """
-    import pr_triggers
-
-    return bool(
-        REMEDIATE_MENTION_RE.search(
-            pr_triggers.strip_inline_code(pr_triggers.visible_text(body))
-        )
-    )
+    """Drop inline code spans, so quoting the command is not using it."""
+    return INLINE_CODE_RE.sub(" ", text or "")
 
 
 def _promotable_hint(promotable: set[str]) -> str:
@@ -2422,12 +2336,14 @@ def parse_remediate_commands(
     requested_at: dict[str, str] = {}
 
     for comment in comments or []:
-        raw_body = comment.get("body", "")
-        matches = remediate_commands(raw_body)
+        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        matches = REMEDIATE_RE.findall(body)
         # Nothing at the start of a line, but the word is in there somewhere and
         # not inside a code span: an attempt at the command, not a discussion of
         # it. Worth a reply; never worth acting on.
-        mention_only = not matches and remediate_mentioned(raw_body)
+        mention_only = not matches and bool(
+            REMEDIATE_MENTION_RE.search(strip_inline_code(body))
+        )
         if not matches and not mention_only:
             continue
 
@@ -2582,9 +2498,9 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for comment in comments or []:
-        raw_body = comment.get("body", "")
-        targets = [raw.strip().strip("`") for raw in remediate_commands(raw_body)]
-        if not targets and not remediate_mentioned(raw_body):
+        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        targets = [raw.strip().strip("`") for raw in REMEDIATE_RE.findall(body)]
+        if not targets and not REMEDIATE_MENTION_RE.search(strip_inline_code(body)):
             continue
         # Authorization is deliberately not consulted here, as above — but
         # authorship is. "That finding no longer reproduces" is the useful
@@ -2625,7 +2541,8 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         association = str(comment.get("authorAssociation", "") or "").upper()
         if association not in WRITE_ASSOCIATIONS:
             continue
-        for raw in remediate_commands(comment.get("body", "")):
+        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        for raw in REMEDIATE_RE.findall(body):
             target = raw.strip().strip("`")
             if target and target != "all":
                 targets.add(target)

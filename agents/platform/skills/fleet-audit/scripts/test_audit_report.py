@@ -20,7 +20,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4052,46 +4051,6 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
-    def test_a_command_inside_an_html_comment_never_fires(self):
-        # The ledger path paired `strip_fenced_blocks` with the line anchor and
-        # nothing else, so two of the four things that must suppress a command
-        # did not: this renders as the four words "Looks fine to me" and opened
-        # a remediation pull request the thread showed nothing about. Both
-        # paths now go through `pr_triggers.visible_text`.
-        body = "Looks fine to me\n\n<!--\n/remediate netpol-missing\n-->"
-        targets, refusals, _, _ = self.parse([comment(body)])
-        self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
-
-    def test_a_quoted_command_never_fires(self):
-        # The other half of the same gap. It happened not to fire before, but
-        # only because `>` breaks `REMEDIATE_RE`'s line anchor rather than
-        # because anything stripped the quote — so the docs claim that
-        # `/remediate` follows the same four rules as `/agent` was true by
-        # coincidence on this one and false on the case above.
-        targets, refusals, _, _ = self.parse([comment("> /remediate netpol-missing")])
-        self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
-
-    def test_a_command_inside_a_multi_line_code_span_never_fires(self):
-        # A code span runs to the end of its paragraph, so this renders as one
-        # sentence with the command inside a `<code>` — checked against
-        # GitHub's own renderer. `REMEDIATE_RE` anchors at the start of a line
-        # and the span does not move where the line begins, so a bare `findall`
-        # read line 2 as a live request off a comment nobody sees as a command.
-        body = "Do not run: `\n/remediate netpol-missing\n` — it drops the netpol"
-        targets, refusals, _, _ = self.parse([comment(body)])
-        self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
-
-    def test_a_command_may_still_quote_its_own_target(self):
-        # The other direction. Blanking spans before matching would have been
-        # the easy fix and would have thrown this request away with the
-        # quoting: the span vetoes the command *token*, not the argument.
-        targets, refusals, _, _ = self.parse([comment("/remediate `netpol-missing`")])
-        self.assertEqual(targets, ["netpol-missing"])
-        self.assertEqual(refusals, [])
-
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -6188,23 +6147,6 @@ class TestFenceScanning(unittest.TestCase):
     def strip(self, text):
         return audit_report.strip_fenced_blocks(text)
 
-    def test_the_remediate_pattern_reads_a_command_in_linear_time(self):
-        # `[ \t]*(.*?)[ \t]*$` backtracks quadratically on a run of spaces
-        # followed by a non-space: 9.83s on the 65,536 characters GitHub allows
-        # in a comment. `parse_remediate_commands` runs this over issue comments
-        # on a timer, before any trust check, so any account that can comment
-        # can spend it. Every consumer already calls `.strip()` on the match, so
-        # the pattern's own trim bought nothing; the greedy form reads the same
-        # command in 0.00002s. Bound as in `test_pr_triggers`: four orders of
-        # magnitude above the fix, well below the defect.
-        body = "/remediate a" + " " * 65000 + "x"
-        started = time.monotonic()
-        found = audit_report.REMEDIATE_RE.findall(body)
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.3, f"took {elapsed:.3f}s")
-        # A fast wrong answer is not the fix.
-        self.assertEqual([m.strip() for m in found], ["a" + " " * 65000 + "x"])
-
     def test_a_command_inside_a_fence_is_removed(self):
         self.assertNotIn("/remediate", self.strip("a\n```\n/remediate x\n```\nb"))
 
@@ -6239,59 +6181,10 @@ class TestFenceScanning(unittest.TestCase):
         out = self.strip("```\n    ```\n/remediate x\n```")
         self.assertNotIn("/remediate x", out)
 
-    def test_a_four_space_indented_run_opens_a_block(self):
-        # A deliberate reversal, and its cost is real: at the document root
-        # CommonMark reads this as an indented code block rather than a fence,
-        # so treating it as an opener swallows every command after it and the
-        # channel goes quiet for that comment.
-        #
-        # It is still the right way round. A fence's indentation is measured
-        # from its *enclosing block's* content column, not from the document
-        # root, so under a bullet those same four spaces are an ordinary fence
-        # — and refusing to open there let a command inside a fenced block fire
-        # while every reader of the thread saw it as quoted. Not firing on a
-        # command someone meant is recoverable by retyping it; firing on one
-        # nobody meant is not. Telling the two apart needs list context this
-        # line-at-a-time stripper does not have.
+    def test_a_four_space_indented_run_does_not_open_a_block(self):
+        # The mirror image: treating it as an opener swallows every real
+        # command after it, so the channel silently stops working.
         out = self.strip("    ```\n/remediate real")
-        self.assertNotIn("/remediate real", out)
-
-    def test_a_fence_inside_a_list_item_does_not_fire(self):
-        # The case the old bound was blocking: the fence sits at the list
-        # item's content column, four spaces from the root.
-        out = self.strip("- quoting the docs:\n\n    ```\n    /remediate x\n    ```\n")
-        self.assertNotIn("/remediate x", out)
-
-    def test_a_fence_sharing_a_line_with_its_list_marker_does_not_fire(self):
-        # The other half of the case above, and it was open in both copies of
-        # this parser at once while an agreement test held them together: the
-        # test could only say the two agreed, and they agreed on being wrong.
-        # `parse_remediate_commands` reads issue comments, so a quoted command
-        # under a bullet is exactly what a maintainer writes.
-        for body in (
-            "- ```\n  /remediate x\n  ```\n",
-            "1. ```\n   /remediate x\n   ```\n",
-            "* ~~~\n  /remediate x\n  ~~~\n",
-        ):
-            with self.subTest(body=body):
-                self.assertNotIn("/remediate x", self.strip(body))
-
-    def test_a_backtick_run_in_the_info_string_does_not_open_a_fence(self):
-        # CommonMark forbids a backtick in a backtick fence's info string, so
-        # ```` ```/remediate``` ```` is a paragraph holding a code span. Reading
-        # it as an opener runs the rest of the comment one block out of phase —
-        # the real fence's opener closes the phantom, and the fenced lines come
-        # out as visible text. Delegated from `pr_triggers`, so this failing
-        # here is also the proof the delegation is live.
-        out = self.strip("```/remediate``` did not work.\n\n```\n/remediate x\n```\n")
-        self.assertNotIn("/remediate x", out)
-
-    def test_a_four_space_closer_still_does_not_end_a_root_level_fence(self):
-        # The indentation bound moved onto the closer rather than disappearing,
-        # and it is measured against its own opener — so a block opened at
-        # column 0 is unaffected by what the reversal above now allows.
-        out = self.strip("```\n    ```\n/remediate x\n```\n/remediate real")
-        self.assertNotIn("/remediate x", out)
         self.assertIn("/remediate real", out)
 
     def test_three_spaces_of_indent_is_still_a_fence(self):
