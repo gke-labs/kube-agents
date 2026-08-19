@@ -46,22 +46,17 @@ class ScenarioConfig:
     def from_env(
         cls,
         endpoint: str,
-        env_prefix: str,
         *,
         default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
         default_poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
     ) -> ScenarioConfig:
-        prefix = env_prefix.strip().upper()
-        if not prefix:
-            raise ValueError("scenario environment prefix must not be empty")
         return cls(
             endpoint=endpoint,
-            agent_id=required_env(f"{prefix}_AGENT_ID"),
-            profile=os.environ.get(f"{prefix}_PROFILE", "default").strip()
-            or "default",
-            timeout=float(os.environ.get(f"{prefix}_TIMEOUT", default_timeout)),
+            agent_id=required_env("CUJ_AGENT_ID"),
+            profile=os.environ.get("CUJ_PROFILE", "default").strip() or "default",
+            timeout=float(os.environ.get("CUJ_TIMEOUT", default_timeout)),
             poll_interval=float(
-                os.environ.get(f"{prefix}_POLL_INTERVAL", default_poll_interval)
+                os.environ.get("CUJ_POLL_INTERVAL", default_poll_interval)
             ),
         )
 
@@ -82,7 +77,7 @@ class Scenario:
         try:
             prompt = self.build_prompt()
             with isolated_portal(log.root) as endpoint:
-                config = ScenarioConfig.from_env(endpoint, self.id)
+                config = ScenarioConfig.from_env(endpoint)
                 interaction = InteractionRunner(config, log).run(
                     prompt,
                     session_prefix=f"portal_{self.id}",

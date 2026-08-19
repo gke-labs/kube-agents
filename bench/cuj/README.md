@@ -7,17 +7,16 @@ scores only evidence returned by the deployed system.
 From the repository root, run every CUJ with pytest:
 
 ```bash
-CUJ1_AGENT_ID=platform-agent \
-CUJ1_PROJECT_ID=test-project \
-CUJ3_AGENT_ID=platform-agent \
-uv run --project bench pytest -x -s bench/cuj
+uv run --project bench pytest -s bench/cuj
 ```
 
+Set `CUJ_AGENT_ID` for the agent under test and `CUJ_PROJECT_ID` for scenarios
+that need a Google Cloud project. `CUJ_PROFILE`, `CUJ_TIMEOUT`, and
+`CUJ_POLL_INTERVAL` are optional overrides shared by the whole suite.
 Pytest reports every journey independently using its normal test discovery.
-Before running a journey, `test_00_agent_responsive.py` requires each distinct
-`CUJ<n>_AGENT_ID` to be discoverable and complete a minimal `READY` interaction
-through the same admin portal path. `-x` stops the suite at this prerequisite
-when the portal target or agent is unhealthy.
+Before running a journey, `test_00_agent_responsive.py` requires the configured
+agent to be discoverable and complete a minimal `READY` interaction through the
+same admin portal path.
 Each test starts an API-only portal on an OS-assigned loopback port and uses a
 unique interaction session, so parallel workers do not share ports or sessions.
 Each journey appends its request, every portal interaction response, acceptance
