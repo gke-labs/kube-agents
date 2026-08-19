@@ -113,10 +113,10 @@ Grain is one problem: one check, at one object, on one cluster.
 | `source`                                     | `inventory` \| `event-watcher` \| `audit`                                                                                                                                                                                  |
 | `check`                                      | the check slug; the same vocabulary the audit streams use (§10)                                                                                                                                                            |
 | `cluster`, `namespace`, `object`             | `namespace` empty for cluster-scoped objects                                                                                                                                                                               |
-| `severity`                                   | `critical` \| `major` \| `minor`. Derived from `rank_score`, not judged separately (§4)                                                                                                                                    |
-| `rank_score`                                 | the ordering key. Written at registration, changed only by a named re-rank event                                                                                                                                           |
-| `rubric`                                     | the per-measure vector behind `rank_score` (§4), stored so the rank is auditable                                                                                                                                           |
-| `provider_managed`, `actionable`             | the two gates (§4)                                                                                                                                                                                                         |
+| `severity`                                   | `critical` \| `major` \| `minor`. Derived from `rank_score`, not judged separately, with one floor for findings that are failing now (§4.2)                                                                                |
+| `rank_score`                                 | the ordering key. Every row has one, gated or not (§4.4). Written at registration, changed only by a named re-rank event                                                                                                   |
+| `rubric`                                     | the per-measure vector behind `rank_score` (§4), stored so the rank is auditable and so §4.2's floor stays a predicate over it rather than a column                                                                        |
+| `provider_managed`, `actionable`             | the two gates (§4.4). They govern surfacing and PR eligibility, never whether a row is scored                                                                                                                              |
 | `title`, `detail`                            |                                                                                                                                                                                                                            |
 | `root_cause`                                 | nullable; the column `incidents` never had                                                                                                                                                                                 |
 | `recommendation`                             | `{action, rationale, risk}`, required and non-empty on every row                                                                                                                                                           |
@@ -219,6 +219,27 @@ is tolerable because nothing selects on the band — the drip orders by `rank_sc
 a label — but it is the first thing to calibrate against a real sweep, and the calibration belongs
 here when it exists.
 
+**One floor overrides the thresholds: a finding that is failing now, on something the user depends
+on, is `critical` whatever it scores.** Formally, `L = 10 ∧ B ≥ 3` floors `severity` at `critical`.
+Without it the arithmetic labels a live outage by its blast radius, and a CrashLoopBackOff taking
+out a third of a three-replica serving Deployment arrives as `major` — the same word as a missing
+readinessProbe on the workload beside it, which the score also puts at 90. A queue that cannot say
+"this one is on fire" in the word it uses for severity has mislabelled the only category the reader
+sorts on by eye.
+
+`B ≥ 3` is where the floor stops, and it is doing real work. It is the rubric's own line between
+something the user depends on — a whole serving workload, degraded capacity on one, anything
+cluster-wide — and a single pod, a batch job, or a non-production workload at B = 2. An OOMKilled
+dev Job is genuinely failing now and genuinely not a `critical`; flooring on `L = 10` alone would
+say otherwise, and a `critical` that fires for a crash-looping scratch pod is a `critical` nobody
+reads twice.
+
+The floor is derived from the stored vector rather than kept in a column of its own. §4.6 persists
+`{B, L, detect, recover, C}` on every row, so "is this actively impacting the user" is a predicate
+over two of those fields and stays correct through a re-rank by construction. A separate `active`
+column would be a second copy of the same fact, free to disagree with the vector the moment §4.6's
+re-rank moves L.
+
 The threshold is load-bearing in one place. `critical` is one of the three conditions on the
 auto-promotion sweep in `finish`, which is what opens a pull request without being asked. It is
 **not** a condition on `remediate`, which passes `auto_promote=False` and "opens what was named and
@@ -226,19 +247,28 @@ nothing else" — and `remediate` is the call §9 puts on this path. So on the q
 threshold decides nothing about promotion; it decides what the surfaced message calls the finding,
 and what a future `finish`-style sweep would pick up if one were ever pointed at this table.
 
+That is also what makes the floor cheap. Widening `critical` would be alarming if `critical` opened
+pull requests, and on the queue's path it does not: promotion is bounded by what the drip surfaces
+(§9), not by the band. The one thing to carry forward is that a `finish`-style sweep pointed at this
+table later would inherit the floor as a promotion trigger — so whoever builds that decides then
+whether an actively-failing finding should auto-promote, rather than acquiring the answer by
+accident from a labelling rule written here.
+
 ### 4.3 Worked examples
 
 These belong in the SOP alongside the anchors. Reproducibility comes from the examples at least as
 much as from the scale.
 
-| finding                                                        | B   | L   | d   | r   | C   | score | severity |
-| -------------------------------------------------------------- | --- | --- | --- | --- | --- | ----- | -------- |
-| static project-editor SA key in a Secret, no Workload Identity | 8   | 6   | 3   | 3   | 1.0 | 288   | critical |
-| CrashLoopBackOff, single-replica serving Deployment            | 5   | 10  | 1   | 2   | 1.0 | 150   | critical |
-| no `readinessProbe`, 3-replica serving Deployment              | 3   | 6   | 3   | 2   | 1.0 | 90    | major    |
-| Shielded Nodes disabled, Standard node pool                    | 8   | 2   | 3   | 3   | 0.9 | 86    | major    |
-| no resource requests, BestEffort QoS                           | 3   | 6   | 2   | 2   | 1.0 | 72    | major    |
-| Managed Service for Prometheus not enabled                     | 1   | 1   | 2   | 1   | 1.0 | 3     | minor    |
+| finding                                                        | B   | L   | d   | r   | C   | score | severity           |
+| -------------------------------------------------------------- | --- | --- | --- | --- | --- | ----- | ------------------ |
+| static project-editor SA key in a Secret, no Workload Identity | 8   | 6   | 3   | 3   | 1.0 | 288   | critical           |
+| CrashLoopBackOff, single-replica serving Deployment            | 5   | 10  | 1   | 2   | 1.0 | 150   | critical           |
+| CrashLoopBackOff, one of three serving replicas                | 3   | 10  | 1   | 2   | 1.0 | 90    | critical — floored |
+| no `readinessProbe`, 3-replica serving Deployment              | 3   | 6   | 3   | 2   | 1.0 | 90    | major              |
+| Shielded Nodes disabled, Standard node pool                    | 8   | 2   | 3   | 3   | 0.9 | 86    | major              |
+| no resource requests, BestEffort QoS                           | 3   | 6   | 2   | 2   | 1.0 | 72    | major              |
+| OOMKilled, nightly batch Job in a dev namespace                | 2   | 10  | 1   | 2   | 1.0 | 60    | major              |
+| Managed Service for Prometheus not enabled                     | 1   | 1   | 2   | 1   | 1.0 | 3     | minor              |
 
 Two of those pairings are the argument for the rubric. The service-account key outranks the live
 CrashLoopBackOff, deliberately: one workload is down and someone can see it, while the other is a
@@ -246,21 +276,51 @@ project-scoped credential nobody is watching and nothing would report. And Shiel
 key's blast radius but scores a third of it, because L is what separates "is handing out access
 right now" from "would be catastrophic if someone first compromised a node."
 
+A third pairing is the argument for §4.2's floor, and it is the row the arithmetic gets wrong on its
+own. The partial CrashLoop and the missing readinessProbe both score 90, on the same kind of
+workload, and they are not the same class of problem: one is failing now and one is a gap that may
+never fire. They still rank adjacently — that is the score doing its job, and reserving the drain
+slot (§7) is what stops the outage crowding out the gap — but they no longer carry the same word.
+The dev Job below them is the floor's other edge: also failing now, also L = 10, and left at `major`
+because B = 2 says nothing the user depends on is down.
+
 This is also why not CVSS. It scores a vulnerability in a product, has no notion of blast radius
 inside a fleet, and says nothing at all about the reliability findings that are most of this queue.
 
-### 4.4 Two gates, applied before scoring
+### 4.4 Two gates, and why they run after scoring
 
-**Ownership.** Step 3's set-aside carries into the queue unchanged: objects in `kube-system`,
-`kube-public`, `kube-node-lease`, and any namespace matching `gke-*` or `gmp-*` are
+**Every row is scored, including the ones no one will ever be asked to fix.** The SOP can set a
+finding aside before ranking because its output is a list; the queue's is an order, and a row with
+no score has no place in one. Both gates therefore run on scored rows and change what happens to a
+finding after it has a rank, never whether it gets one. That also keeps the two gates
+reversible — a namespace stops being provider-managed, a recommendation acquires a concrete next
+step — without a rescoring pass to go and find the rows that were skipped.
+
+**Ownership.** Step 3's set-aside carries into the queue with that one change: objects in
+`kube-system`, `kube-public`, `kube-node-lease`, and any namespace matching `gke-*` or `gmp-*` are
 provider-managed. The operator does not own the manifest, cannot change it, and "a recommendation to
-do so is not weak advice, it is impossible advice." Those rows are flagged, never drip, and never
-get a pull request. The SOP's exception holds: one that is _actively broken_ is scored normally,
-because the action is real even though it is a support case rather than a manifest edit.
+do so is not weak advice, it is impossible advice." Those rows are scored, flagged
+`provider_managed`, and **never get a pull request** — there is no file to change — and they do not
+take a drip slot, arriving instead the way the SOP already delivers them, as a single rolled-up
+observation phrased as an observation rather than an instruction.
+
+**The fault exception is not a scoring exception; it is a surfacing one, and it drips.** The SOP is
+explicit that a provider-managed workload that is _actively broken_ — crash-looping, not ready,
+OOMKilled, a node not registering — "stays rankable and is reported normally", because "the operator
+still cannot patch the spec, but they need to know, and the action is real: it is a support case or
+an upgrade, not a manifest edit." A support case is a next step. So such a finding competes for the
+urgent slot on its score like any other, carries §4.2's floor if it reaches it, and surfaces with
+its recommendation and no PR link. Suppressing it would mean the fleet's own agent watching a
+GKE-managed component fail and saying nothing because the fix is a support ticket, which is the
+failure mode this queue exists to end. §7.2 is the measurement of what that costs and what pays for
+it: an unfixable fire is exactly the case that starves a queue, and reserving the drain slot from
+urgency is what keeps the rest of the backlog moving underneath it.
 
 **Actionability.** A finding with no concrete next step sorts after every actionable finding
 whatever its score. This is a flag rather than a multiplier on purpose — a multiplier lets a B=8
-unactionable observation float back above work someone could actually do.
+unactionable observation float back above work someone could actually do. Note what it does not
+catch: "unactionable" is about the absence of a next step, not about who takes it. A provider-managed
+fault has one, so it is actionable; an SLO-practice observation has none, so it is not.
 
 ### 4.5 What is deliberately not a measure
 
@@ -334,10 +394,22 @@ asks what must be done _today_, and that is L rather than the total. It fills tw
 separate pools:
 
 - **The urgent slot** takes the highest-scoring finding at L = 10 (failing now), or at L = 4 with
-  its deadline inside a seven-day horizon. Empty when nothing is firing.
+  its deadline inside a seven-day horizon. Ownership does not filter this pool: a provider-managed
+  component that is actively broken competes here on its score like anything else (§4.4), because
+  the operator needs to know whether or not the remedy is theirs to apply. Empty when nothing is
+  firing.
 - **The drain slot** takes the highest-scoring finding that has never been surfaced, falling back to
   the highest-scoring one whose re-offer interval has come round. **Urgency cannot take this slot**
   — see §7.2, where letting it do so is what breaks the design.
+
+**The urgent slot is deliberately wider than §4.2's floor**, and the gap between them is the point
+rather than an inconsistency to tidy up. The slot selects on L alone, so everything failing now is
+eligible to be seen; the floor adds `B ≥ 3`, so only what the user depends on is _called_ `critical`.
+An OOMKilled dev batch Job therefore takes the urgent slot on a morning when nothing above it is
+firing — which is right, it is the worst thing happening — and still arrives labelled `major`, which
+is also right. Narrowing the slot to match the floor would buy a tidier rule by going silent about a
+live fault; widening the floor to match the slot would buy it by spending the word `critical` on a
+scratch workload.
 
 A finding is a candidate unless it is `resolved`, `dismissed`, `stale`, `snoozed`, or inside its
 re-offer interval. It is emphatically not restricted to `queued`: a finding moves to `surfaced` the
@@ -412,8 +484,8 @@ recommendation together with an explicit statement that there is no PR for this 
 ### 7.2 What a dry run of the selection rules showed
 
 The rules above were run against a simulated neglected fleet before this document was settled: two
-clusters, 32 findings scored by §4 using real check slugs, 30 of them rankable after §4.4's
-ownership gate, and nobody fixing anything. The ranking held up — the order is defensible end to
+clusters, 32 findings scored by §4 using real check slugs, 30 of them eligible for a drip slot after
+§4.4's ownership gate, and nobody fixing anything. The ranking held up — the order is defensible end to
 end, both gates sort correctly, and the two findings that tie at 90 (`probes-liveness` and
 `probes-readiness` on the same workload) break deterministically on `_finding_sort_key`.
 
@@ -434,10 +506,15 @@ Three things are worth reading off that table.
 **The failure reproduced #774 inside its own fix.** Twenty-four findings never surfaced at all,
 and the highest-scoring of them were not marginal: a `critical` CrashLoopBackOff on a production
 payments workload, a `critical` single-replica session store, an expiring quota. They were starved
-by two findings that outscored them, neither of which the operator could fix — a provider-managed
-`kube-system` CrashLoop, kept rankable by §4.4's active-fault exception, and a certificate whose
-deadline had passed. Both re-offered every morning and neither ever resolved. A queue whose top
-item cannot be actioned must still drain beneath it.
+by two findings that outscored them, neither of which the operator could fix _with a manifest edit_
+— a provider-managed `kube-system` CrashLoop, which §4.4 keeps in the urgent pool on purpose, and a
+certificate whose deadline had passed. Both re-offered every morning and neither ever resolved.
+
+Note which lever the fix is not. Both starving findings were correctly ranked and correctly
+surfaced; the `kube-system` CrashLoop is a real fault on the user's cluster and the queue should say
+so on the day it starts. Suppressing them would have produced the same 30/30 by making the queue
+worse at its job. A queue whose top item cannot be quickly actioned must still drain beneath it, and
+that is a property of the selection rules rather than of which findings are allowed in.
 
 **Reserving the drain slot is the single largest correction** (6 → 26), and widening the L = 10
 interval is what closes the rest (26 → 30). They fix different halves: the first stops urgency
@@ -531,6 +608,11 @@ door.
 `remediation.kind` is `manifest`, `gcloud`, or `manual`. A Workload Identity migration or a
 control-plane upgrade is not a file in a repository. Those findings surface with their
 recommendation and no PR link, stated as such rather than left ambiguous.
+
+A provider-managed fault (§4.4) is always one of these. It is `manual`, its `note` names the support
+case or the upgrade rather than a patch, and it is the case where saying so explicitly matters most:
+this is the one class of finding the drip can rank at the top of a morning and offer no fix for, and
+a reader who is not told why will read the missing PR as the harness having failed to produce one.
 
 **What `remediate` needs from the queue.** Three required arguments, of which one is free. `--finding
 <id>` is the free one: the queue is promoting a row it has already chosen, and §3 makes `id` the
