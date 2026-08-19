@@ -360,13 +360,16 @@ failure family onto one of them: kubelet's `Normal`-type `BackOff` ("Back-off pu
 `ErrImagePull` beside it, and the `Warning`-type `Failed` that follows are one incident. A bad image
 tag can therefore put the routine member in front, and every `Warning` behind it would be deduped
 against an entry held on behalf of an event nobody was told about — permanently, since each sighting
-slides the window forward. So the watcher lets the first event that is not typed `Normal` re-open
-the incident, once per window, counted in `k8s_event_watcher_events_policy_reopened_total` and
-pinned by `TestDispatcherReopensPolicyFilteredKeyForWarning`. That re-opened event arrives with
-`count = 1` rather than the family's accumulated count, so `occurrences` keeps meaning "sightings
-this row stands for" — the invariant the recap relies on when it sums the column into "Forwarded
-_N_ events" and ranks its incident list by it. `TestDispatcherReopenedPayloadCountsFromOne` pins
-that number.
+slides the window forward. So the watcher lets the first event the daemon would post re-open the
+incident, once per window, counted in `k8s_event_watcher_events_policy_reopened_total` and pinned by
+`TestDispatcherReopensPolicyFilteredKeyForWarning`. That is `Warning`, or an empty `Type` — the
+endpoint coerces with `payload.get("type") or "Warning"` before grading — and nothing else: a type
+the daemon would grade `Info` is refused the reopen rather than spending the family's only one on an
+event that comes straight back `filtered`. The watcher README owns that rule in full. That re-opened
+event arrives with `count = 1` rather than the family's accumulated count, so `occurrences` keeps
+meaning "sightings this row stands for" — the invariant the recap relies on when it sums the column
+into "Forwarded _N_ events" and ranks its incident list by it.
+`TestDispatcherReopenedPayloadCountsFromOne` pins that number.
 
 The gate is a plain `severity == "Info"` test, and `get_severity_details` reaches that label on
 `Event.Type` alone: `Warning` grades `Critical` or `Warning` depending on whether the reason matches

@@ -458,12 +458,15 @@ func TestDispatcherReopensPolicyFilteredKeyForWarning(t *testing.T) {
 //
 // The reopen is one-shot per window: ReopenIfPolicyFiltered's guard needs
 // PolicyFiltered set and Reopened clear, and the entry it installs carries
-// Reopened forever. Spend that single firing on an event the daemon then grades
-// Info and the key reaches {PolicyFiltered: true, Reopened: true}, which the
-// guard can never satisfy again — while Observe's Case 3 slides LastSeen on
-// every later sighting, so the entry never expires either. The real Warning
-// behind it is deduplicated into permanent silence, and nothing recovers: all
-// three Forget call sites sit behind an attempted inject that no sighting now
+// Reopened. Spend that single firing on an event the daemon then grades Info
+// and the reopened entry's own inject comes back filtered, at which point
+// MarkPolicyFiltered deletes the key. The family does recover — the next
+// sighting opens a fresh incident — but at one session per sighting until the
+// daemon stops filtering it, which is the churn keeping the entry exists to
+// avoid. Without that delete the key would be dead outright: the guard can
+// never satisfy {PolicyFiltered: true, Reopened: true} again, Observe's Case 3
+// slides LastSeen on every later sighting so it never expires, all three
+// Forget call sites sit behind an attempted inject that no sighting now
 // reaches, and restore rehydrates both flags across a restart.
 //
 // Barring only a literal "Normal" admitted exactly the events that do this: a
