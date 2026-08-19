@@ -69,7 +69,7 @@ Behaviour worth knowing before relying on it:
 - **The suppressed alert is still acknowledged** to the watcher with `200 {"status": "suppressed"}`, rather than an error code. A 4xx or 5xx would land in `k8s_event_watcher_inject_errors_total`, which exists to say the daemon is broken; refusing an alert over a configured ceiling is it working. The watcher reads the body, drops its dedup entry and re-offers the workload on its next sighting — deliberately, because the entry's window is 24h and this ceiling resets at 00:00 UTC, so keeping it would mute the workload long after the reason for it expired. The price is a session row per re-offer until the day rolls over.
 - **The budget survives restarts,** because it is on the `system-metadata` PVC rather than in memory. A crash-looping session server would otherwise hand out a fresh day's quota on every restart, which is precisely the condition the cap exists for.
 - **The day boundary is UTC midnight,** not the operator's local midnight.
-- **The severity gate runs first, and only alerts that survive it are billed.** A budget is a count of alerts sent, so an event that was never going to be posted must not spend one. Claiming first would bill the `Info` bucket for every suppressed image-pull `BackOff` and leave `GET /v1/alert-quota` reporting a day's worth of alerts nobody received. It cannot starve a node-level alert of its budget — `ALWAYS_ALERT_REASONS` are graded `Warning` or `Critical` and draw on a different bucket — so this ordering is bookkeeping, not a safety property.
+- **The severity gate runs first, and only alerts that survive it are billed.** A budget is a count of alerts sent, so an event that was never going to be posted must not spend one. Claiming first would bill the `Info` bucket for every suppressed image-pull `BackOff` and leave `GET /v1/alert-quota` reporting a day's worth of alerts nobody received. It cannot starve a real alert of its budget — anything graded `Warning` or `Critical` draws on a different bucket from the `Info` churn — so this ordering is bookkeeping, not a safety property.
 
 ---
 
@@ -336,17 +336,21 @@ wrong here. An `Info` grade is a property of the event, not of the day — the n
 grade the same way — so sharing the word would re-offer every quiet workload at its own repeat
 cadence, spending a session, an inject and a ledger row per sighting on an alert nobody was ever
 going to receive. On `"filtered"` the watcher keeps the entry and counts
-`k8s_event_watcher_events_policy_filtered_total`. Version skew between the two images is not equally
-safe in both directions. An older daemon says `"suppressed"` for both, which reopens: one redundant
-session, no silence. An older watcher is the harmful direction — it reads the unknown status as
-delivered and keeps the entry, but it cannot flag it, so the re-open described in the next paragraph
-can never fire and the family's `Warning` members stay deduped behind the entry for as long as they
-keep arriving. An ordinary install does not produce that pairing, because the sidecar image is
-derived from the agent image's registry and tag and the two run as containers of one pod; it takes
-an override — `CREDENTIAL_PROXY_IMAGE` pinned to an older tag, or a digest-pinned agent image whose
-sidecar falls back to a mutable tag. `k8s-operator/cmd/k8s-event-watcher/README.md` owns that
-contract in full. The pair is pinned by
-`test_the_gate_and_the_ceiling_do_not_answer_with_the_same_word` and by
+`k8s_event_watcher_events_policy_filtered_total`.
+
+The two halves of that exchange ship on different images — the gate in `session_kv_server.py` on the
+agent image, the `"filtered"` handling in a sidecar binary — so either can be older than the other,
+and the skew is not equally safe in both directions. An older daemon says `"suppressed"` for both,
+which reopens: one redundant session, no silence. An older watcher is the harmful direction, because
+it reads the unknown status as delivered, keeps the entry, and has no `MarkPolicyFiltered` to flag
+it with — so the re-open described in the next paragraph can never fire and the family's `Warning`
+members stay deduped behind the entry for as long as they keep arriving. The daemon therefore does
+not answer `"filtered"` unless the caller asked for it: the watcher sends
+`X-Watcher-Features: policy-filtered`, and a request without that token gets `"suppressed"` and the
+reopen-on-next-sighting behaviour an older watcher already handles correctly.
+`k8s-operator/cmd/k8s-event-watcher/README.md` owns that contract in full. The pair is pinned by
+`test_the_gate_and_the_ceiling_do_not_answer_with_the_same_word`,
+`test_a_watcher_that_cannot_handle_filtered_is_not_sent_it` and by
 `TestDispatcherKeepsDedupOnPolicyFilter`.
 
 Keeping the entry needs one qualification, because the entry is not keyed on the event that was
@@ -363,33 +367,24 @@ this row stands for" — the invariant the recap relies on when it sums the colu
 _N_ events" and ranks its incident list by it. `TestDispatcherReopenedPayloadCountsFromOne` pins
 that number.
 
-For the reasons in `ALWAYS_ALERT_REASONS` the `Event.Type` is not to be trusted, so
-`get_severity_details` ignores it and grades on the reason alone. Kubernetes types several failures
-the watcher forwards as `Normal`: kubelet records node readiness transitions with
+The gate is a plain `severity == "Info"` test, and `get_severity_details` reaches that label on
+`Event.Type` alone: `Warning` grades `Critical` or `Warning` depending on whether the reason matches
+a blocker keyword, and everything else grades `Info`. There is no reason-based exception, which
+means a `Normal`-typed event is filtered however serious its reason sounds.
+
+That is a real limit rather than an oversight, and it sits one layer up. Kubernetes types some
+failures `Normal` — kubelet records node readiness transitions with
 `recordNodeStatusEvent(v1.EventTypeNormal, events.NodeNotReady)`, and the node-lifecycle controller
-records the same transition the same way. Grading on the type would file a node going `NotReady`
-under `Info` — one of the watcher's default reasons precisely because it warrants waking someone —
-and leave it to surface as a number in the next daily recap. Those reasons are therefore graded as
-the same keyword list would grade a `Warning`-typed event, which fixes their severity regardless of
-how the event was typed:
+records the same transition the same way — so a `NodeNotReady` reaching the daemon would be graded
+`Info` and filtered. None does: the `--reason` list the operator passes in
+deploy/shared/start-services.sh does not forward `NodeNotReady`, and neither the daemon nor a second
+copy of a reason list is the place to fix that. `deploy/shared/start-services.sh` decides what the
+daemon sees at all, and widening it is what would make a node loss reportable.
+`test_the_event_type_is_the_only_thing_that_lifts_an_event_above_info` pins the grading rule so it
+is not re-derived by accident.
 
-| Reason                                             | Severity   |
-| -------------------------------------------------- | ---------- |
-| `FailedToDrainNode`, `FailedScheduling`, `Evicted` | `Critical` |
-| `NodeNotReady`, `NetworkNotReady`                  | `Warning`  |
-
-Which of them a given install can actually see is a separate question, decided upstream by the
-watcher's `--reason` gate, and the two lists barely overlap. `defaultReasons` in `filter.go` carries
-four of the five and not `FailedToDrainNode`; the `--reason` list the operator passes in
-deploy/shared/start-services.sh carries `FailedToDrainNode` and none of the other four. So as
-deployed, `NodeNotReady` is graded `Warning` by a code path no event reaches — the table above is
-the grading rule, not a claim about what arrives.
-
-The gate itself is then a plain `severity == "Info"` test with no second list to keep in sync: an
-`ALWAYS_ALERT_REASONS` event can never reach it labelled `Info`. That invariant is what the gate
-depends on, so it is pinned by `test_no_always_alert_reason_can_be_labelled_info` rather than by
-prose. The label also decides which daily ceiling the alert draws on, which is why a node loss is
-billed to `Warning` and not to the informational bucket it is nothing like.
+The label also decides which daily ceiling the alert draws on, so a `Warning`-typed node loss is
+billed to `ALERT_DAILY_LIMIT_WARNING` rather than to the informational bucket.
 
 ---
 

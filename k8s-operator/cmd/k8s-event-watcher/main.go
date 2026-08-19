@@ -562,17 +562,31 @@ func dedupPersistPath(base, cluster string) string {
 	return strings.TrimSuffix(base, ext) + "-" + cluster + ext
 }
 
-// eventTypeNormal is the one Event.Type value that rules out a Warning grade.
-// Tested against rather than for: an emitter that leaves Type empty must not be
-// mistaken for one that positively said this event is routine.
-const eventTypeNormal = "Normal"
+// eventTypeWarning is the only Event.Type the daemon grades above Info on the
+// type alone: get_severity_details tests `event_type.lower() == "warning"` and
+// falls through to Info for everything else, empty and unrecognised included.
+const eventTypeWarning = "Warning"
 
 // reopenPolicyFiltered reports whether a deduplicated event should escape
 // suppression because the entry holding its key was left behind by an event the
-// daemon policy-filtered. Anything not explicitly typed Normal gets that chance,
-// erring towards one extra alert the way the filter's min-count gates do — the
-// alternative is a Warning silenced by an Info that happens to canonicalize onto
-// the same key.
+// daemon policy-filtered. Only a Warning-typed event gets that chance.
+//
+// Testing for Warning rather than against Normal is what keeps the one-shot
+// budget spendable only on an event that can actually use it. The reopen is
+// bounded at one firing per window by the sticky Reopened flag, and the entry it
+// installs is re-flagged if its own inject also comes back filtered. An event
+// this guard admits but the daemon then grades Info therefore spends the budget
+// and hands the key back in a state — PolicyFiltered and Reopened both true —
+// that ReopenIfPolicyFiltered can never satisfy again, while Observe's Case 3
+// slides LastSeen on every later sighting so the entry never expires either. The
+// family is then silenced permanently, which is the outcome this whole path
+// exists to prevent. Barring only a literal "Normal" admitted exactly those
+// events: an empty or lowercase Type passed the guard and came back Info.
+//
+// A Warning-typed event cannot grade Info, so the reopened entry cannot be
+// re-flagged and that state is unreachable. dedupCache.MarkPolicyFiltered
+// declines to re-flag a reopened entry as well, so the invariant does not rest
+// on this guard alone agreeing with a grading rule written in another language.
 //
 // The dedupResult it returns is the one the caller must go on to inject with,
 // and it counts from 1 like any other new incident. The result Observe handed
@@ -581,7 +595,7 @@ const eventTypeNormal = "Normal"
 // that number on the wire would write it to `occurrences` in the ledger, and
 // the recap sums that column to report how many events were forwarded.
 func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent) (dedupResult, bool) {
-	if ev.Type == eventTypeNormal {
+	if ev.Type != eventTypeWarning {
 		return dedupResult{}, false
 	}
 	if !d.dedup.ReopenIfPolicyFiltered(ev.Key, ev.Message, ev.LastSeen) {

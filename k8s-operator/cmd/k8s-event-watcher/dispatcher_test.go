@@ -329,9 +329,9 @@ func TestDispatcherKeepsDedupOnPolicyFilter(t *testing.T) {
 	// filter instead of the dispatcher.
 	//
 	// Type has to be set, and set to exactly what kubelet emits here.
-	// reopenPolicyFiltered treats anything that is not literally "Normal" as a
-	// possible Warning and lets it re-open the incident, so leaving Type unset
-	// would measure that escape hatch instead of the entry surviving.
+	// reopenPolicyFiltered lets a Warning-typed event re-open the incident, so
+	// typing this one Warning would measure that escape hatch instead of the
+	// entry surviving.
 	ev := TriageEvent{
 		Key:       EventKey{UID: "pod-1", Reason: "BackOff"},
 		Cluster:   "test-cluster",
@@ -385,8 +385,8 @@ func TestDispatcherReopensPolicyFilteredKeyForWarning(t *testing.T) {
 		var p InjectPayload
 		_ = json.Unmarshal([]byte(env.Message), &p)
 		w.WriteHeader(http.StatusOK)
-		// Stands in for session_kv_server.get_severity_details: a Normal-type
-		// event whose reason is not in ALWAYS_ALERT_REASONS grades Info.
+		// Stands in for session_kv_server.get_severity_details, which grades on
+		// Event.Type alone: anything not typed Warning comes back Info.
 		if p.Type == "Normal" {
 			_, _ = w.Write([]byte(`{"status":"filtered"}`))
 			return
@@ -449,6 +449,152 @@ func TestDispatcherReopensPolicyFilteredKeyForWarning(t *testing.T) {
 		t.Errorf("got %d Warning image-pull events through to the daemon (%v); want exactly 1 — "+
 			"0 means the policy-filtered BackOff is still swallowing the whole family",
 			len(injected), injected)
+	}
+}
+
+// TestDispatcherUntypedEventCannotBurnTheReopenBudget is the adversarial limit
+// on the test above.
+//
+// The reopen is one-shot per window: ReopenIfPolicyFiltered's guard needs
+// PolicyFiltered set and Reopened clear, and the entry it installs carries
+// Reopened forever. Spend that single firing on an event the daemon then grades
+// Info and the key reaches {PolicyFiltered: true, Reopened: true}, which the
+// guard can never satisfy again — while Observe's Case 3 slides LastSeen on
+// every later sighting, so the entry never expires either. The real Warning
+// behind it is deduplicated into permanent silence, and nothing recovers: all
+// three Forget call sites sit behind an attempted inject that no sighting now
+// reaches, and restore rehydrates both flags across a restart.
+//
+// Barring only a literal "Normal" admitted exactly the events that do this. The
+// daemon grades on `event_type.lower() == "warning"`, so an empty, lowercase or
+// unrecognised Type passed the Go guard and came back Info. Since toTriageEvent
+// passes Event.Type through as given and Decide never inspects it, anyone able
+// to create an Event carrying the victim pod's UID could arm it deliberately.
+func TestDispatcherUntypedEventCannotBurnTheReopenBudget(t *testing.T) {
+	var injected []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-1"})
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var env injectMessageRequest
+		_ = json.Unmarshal(body, &env)
+		var p InjectPayload
+		_ = json.Unmarshal([]byte(env.Message), &p)
+		w.WriteHeader(http.StatusOK)
+		// get_severity_details, faithfully: Info for everything that is not
+		// typed Warning, empty and unrecognised included. That fidelity is the
+		// whole point — the bug was the Go guard and this rule disagreeing.
+		if !strings.EqualFold(p.Type, "Warning") {
+			_, _ = w.Write([]byte(`{"status":"filtered"}`))
+			return
+		}
+		injected = append(injected, p.Reason)
+		_, _ = w.Write([]byte(`{"status":"injected"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+
+	// Every Type the daemon grades Info but a bare "Normal" test would wave
+	// through. Each runs against its own cache: one poisoned key is enough.
+	for _, evType := range []string{"", "normal", "Info", "Unknown"} {
+		t.Run("type="+evType, func(t *testing.T) {
+			injected = nil
+			dedup, err := newDedupCache(24*time.Hour, "")
+			if err != nil {
+				t.Fatalf("failed to build cache: %v", err)
+			}
+			disp := &dispatcher{
+				filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+				dedup:       dedup,
+				pullClasses: newPullClassMemo(0, 0),
+				injector:    inj,
+				metrics:     newMetrics(),
+				mode:        "per-incident",
+			}
+
+			base := time.Now()
+			// 1. kubelet's routine back-off takes the canonical key.
+			disp.Dispatch(context.Background(), TriageEvent{
+				Key: EventKey{UID: "pod-1", Reason: "BackOff"}, Type: "Normal",
+				Cluster: "test-cluster", Namespace: "prod", Name: "api",
+				Message: `Back-off pulling image "repo/api:typo"`, LastSeen: base, Count: 1,
+			})
+
+			// 2. The event that used to spend the reopen for nothing.
+			disp.Dispatch(context.Background(), TriageEvent{
+				Key: EventKey{UID: "pod-1", Reason: "BackOff"}, Type: evType,
+				Cluster: "test-cluster", Namespace: "prod", Name: "api",
+				Message: `Back-off pulling image "repo/api:typo"`,
+				LastSeen: base.Add(5 * time.Minute), Count: 1,
+			})
+
+			// 3. The real failure, which must still get through. ErrImagePull
+			// rather than the `Failed` beside it: `Failed`/"not found" is held
+			// by the filter's own transient-pull debounce, so using it here
+			// would measure that gate rather than the reopen. It is the same
+			// event TestDispatcherReopensPolicyFilteredKeyForWarning's reopen
+			// actually fires on.
+			disp.Dispatch(context.Background(), TriageEvent{
+				Key: EventKey{UID: "pod-1", Reason: "ErrImagePull"}, Type: "Warning",
+				Cluster: "test-cluster", Namespace: "prod", Name: "api",
+				Message: "rpc error: code = NotFound",
+				LastSeen: base.Add(10 * time.Minute), Count: 5,
+			})
+
+			if len(injected) != 1 {
+				t.Errorf("Type=%q: got %d Warnings through (%v); want 1 — 0 means the untyped "+
+					"sighting burned the reopen and silenced the family permanently",
+					evType, len(injected), injected)
+			}
+		})
+	}
+}
+
+// TestMarkPolicyFilteredLeavesAReopenedEntryAlone pins the invariant locally,
+// so it does not rest on reopenPolicyFiltered's guard agreeing with a grading
+// rule written in Python and shipped in a different container image.
+//
+// {PolicyFiltered: true, Reopened: true} is the state nothing recovers from.
+// MarkPolicyFiltered is the only writer that can produce it.
+func TestMarkPolicyFilteredLeavesAReopenedEntryAlone(t *testing.T) {
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	key := EventKey{UID: "pod-1", Reason: "BackOff"}
+	msg := `Back-off pulling image "repo/api:typo"`
+	now := time.Now()
+
+	dedup.Observe(key, msg, now)
+	dedup.MarkPolicyFiltered(key, msg)
+	if !dedup.ReopenIfPolicyFiltered(key, msg, now) {
+		t.Fatal("the first reopen did not fire; the rest of this test measures nothing")
+	}
+
+	// The reopened incident's own inject comes back filtered.
+	dedup.MarkPolicyFiltered(key, msg)
+
+	canonical := key
+	canonical.Reason = canonicalizeReason(key.Reason, msg)
+	entry, ok := dedup.entries[canonical]
+	if !ok {
+		t.Fatalf("the entry for %v is gone", canonical)
+	}
+	if entry.PolicyFiltered {
+		t.Error("a reopened entry was re-flagged PolicyFiltered; with Reopened already set " +
+			"the guard can never fire again and Case 3 keeps the entry alive forever")
 	}
 }
 

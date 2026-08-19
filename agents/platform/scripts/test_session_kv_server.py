@@ -113,58 +113,39 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Normal events -> Info
         self.assertEqual(get_severity_details("Normal", "Scheduled"), ("🔵", "Info"))
 
-    def test_no_always_alert_reason_can_be_labelled_info(self):
-        """The suppression gate is `severity_label == "Info"` and nothing else.
+    def test_the_event_type_is_the_only_thing_that_lifts_an_event_above_info(self):
+        """No reason grades above Info on the reason alone.
 
-        That is only safe while no reason in ALWAYS_ALERT_REASONS can arrive at
-        it labelled Info — one that could would be silently dropped, which is
-        the bug the list exists to prevent. The gate carries no second check of
-        its own, so the property is asserted here rather than described in a
-        comment there.
+        The grader briefly carried a second list of reasons whose `Event.Type`
+        it ignored. It was removed because the watcher's deployed `--reason`
+        flag forwards only one of them, so the exception could not fire; this
+        pins the simpler rule that replaced it, including for the node-level
+        reasons that list named. A `Normal`-typed node event is graded Info and
+        the suppression gate drops it — deliberate, and the reason
+        `deploy/shared/start-services.sh` must stay the place that decides what
+        reaches the daemon at all.
         """
-        for reason in session_kv_server.ALWAYS_ALERT_REASONS:
-            for event_type in ("Normal", "Warning", "", "Unknown"):
-                with self.subTest(reason=reason, event_type=event_type):
-                    _, label = get_severity_details(event_type, reason)
-                    self.assertNotEqual(
-                        label,
-                        "Info",
-                        f"{reason} typed {event_type!r} would be suppressed by the gate",
-                    )
-                    self.assertIn(
-                        label,
-                        session_kv_server.ALERT_DAILY_LIMITS,
-                        f"{reason} bills a severity with no ceiling",
-                    )
-
-    def test_always_alert_reasons_bill_the_bucket_they_are_meant_to(self):
-        """Pin which bucket each reason draws on.
-
-        The split falls out of whether the reason happens to contain one of the
-        blocker keywords, which makes it easy to change by accident: adding
-        `"node"` to that list, say, would move a node loss from Warning to
-        Critical and quietly triple its daily allowance. Naming the expected
-        mapping makes that a failing test rather than a surprise in chat.
-        """
-        expected = {
-            "FailedToDrainNode": ("🔴", "Critical"),
-            "FailedScheduling": ("🔴", "Critical"),
-            "Evicted": ("🔴", "Critical"),
-            "NodeNotReady": ("🟡", "Warning"),
-            "NetworkNotReady": ("🟡", "Warning"),
-        }
-        self.assertEqual(
-            set(expected),
-            set(session_kv_server.ALWAYS_ALERT_REASONS),
-            "a reason was added to or removed from the list without deciding "
-            "which ceiling it spends",
-        )
-        for reason, graded in expected.items():
+        for reason in ("NodeNotReady", "NetworkNotReady", "FailedToDrainNode",
+                       "FailedScheduling", "Evicted"):
             with self.subTest(reason=reason):
-                # Both typings, because the point of the list is that the type
-                # is not consulted for these.
-                self.assertEqual(get_severity_details("Normal", reason), graded)
-                self.assertEqual(get_severity_details("Warning", reason), graded)
+                self.assertEqual(get_severity_details("Normal", reason), ("🔵", "Info"))
+
+    def test_every_label_the_grader_returns_has_a_ceiling(self):
+        """A label with no entry in ALERT_DAILY_LIMITS bills a budget nobody set.
+
+        `_claim_alert_quota` looks the label up to find the day's allowance, so
+        a third label added to the grader without a matching limit would either
+        crash the inject path or run uncapped. Cheap to assert, and it covers
+        every branch of the grader rather than the ones a test happened to name.
+        """
+        for event_type, reason in (
+            ("Warning", "FailedScheduling"),  # Critical
+            ("Warning", "Unhealthy"),  # Warning
+            ("Normal", "Scheduled"),  # Info
+        ):
+            with self.subTest(event_type=event_type, reason=reason):
+                _, label = get_severity_details(event_type, reason)
+                self.assertIn(label, session_kv_server.ALERT_DAILY_LIMITS)
 
 
 class TestSessionKvServerApi(unittest.TestCase):
@@ -287,7 +268,14 @@ class TestInterceptedEventLedger(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
 
-    def _inject(self, session_id, **payload_overrides):
+    def _inject(self, session_id, features="policy-filtered", **payload_overrides):
+        """POST one event the way a current watcher does.
+
+        ``features`` is the ``X-Watcher-Features`` header. It defaults to the
+        value ``injector.go`` sets on every request, so the rest of this suite
+        describes the pairing an install actually runs. Pass ``features=None``
+        to speak as a watcher too old to send the header at all.
+        """
         payload = {
             "reason": "OOMKilled",
             "namespace": "prod-api",
@@ -301,6 +289,7 @@ class TestInterceptedEventLedger(unittest.TestCase):
         return self.client.post(
             f"/sessions/{session_id}/inject",
             json={"message": json.dumps(payload)},
+            headers={} if features is None else {"X-Watcher-Features": features},
         )
 
     def _rows(self, workload):
@@ -394,11 +383,19 @@ class TestInterceptedEventLedger(unittest.TestCase):
         self.assertEqual(rows, [("this-pods-cluster",)])
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
-    def test_normal_typed_node_failure_still_alerts(self, mock_trigger):
-        """kubelet types NodeNotReady `Normal`; suppressing it would mute a node loss.
+    def test_a_normal_typed_node_failure_is_graded_info_and_recorded(self, mock_trigger):
+        """Nothing but `Event.Type` decides severity, node reasons included.
 
-        It reaches chat because it is graded on the reason and comes back
-        Warning, not because the gate makes an exception for it.
+        An earlier revision of this branch graded a set of node-level reasons
+        on the reason alone so a `Normal`-typed `NodeNotReady` came back
+        Warning. It was removed: the watcher's deployed `--reason` flag
+        (deploy/shared/start-services.sh) does not forward `NodeNotReady`, so
+        the exception could never fire and only added a second reason list to
+        keep in sync. Pinned end-to-end because the removal changes what the
+        endpoint answers, not just how the grader scores.
+
+        The event is still ledgered, so the daily recap counts it even though
+        chat is told nothing.
         """
         resp = self._inject(
             "sess-node",
@@ -409,13 +406,27 @@ class TestInterceptedEventLedger(unittest.TestCase):
             type="Normal",
         )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["status"], "injected")
-        mock_trigger.assert_called_once()
+        self.assertEqual(resp.json()["status"], "filtered")
+        mock_trigger.assert_not_called()
 
         rows = self._rows("gke-pool-a-1a2b3c")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][3], "Warning")  # graded on the reason, not the type
-        self.assertEqual(rows[0][5], 1)  # notified
+        self.assertEqual(rows[0][3], "Info")
+        self.assertEqual(rows[0][5], 0)  # not notified
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_warning_typed_node_failure_alerts(self, mock_trigger):
+        """Control for the test above: the type is what was doing the work."""
+        resp = self._inject(
+            "sess-node-warning",
+            name="gke-pool-a-9z8y7x",
+            kind_of_object="Node",
+            reason="NodeNotReady",
+            type="Warning",
+        )
+        self.assertEqual(resp.json()["status"], "injected")
+        mock_trigger.assert_called_once()
+        self.assertEqual(self._rows("gke-pool-a-9z8y7x")[0][3], "Warning")
 
     def _clear_quota(self):
         import sqlite3
@@ -438,9 +449,9 @@ class TestInterceptedEventLedger(unittest.TestCase):
         to post. Claiming first would bill the Info bucket for churn nobody
         received and leave `GET /v1/alert-quota` overstating the day.
 
-        This no longer guards against starving a node loss — those reasons are
-        graded Warning and Critical now, so they do not share a bucket with
-        churn at all. What it still guards is the accounting.
+        This does not guard against churn starving a real alert of its budget:
+        an event that grades Warning or Critical draws on a different bucket
+        from the Info churn either way. What it guards is the accounting.
         """
         self._clear_quota()
         for i in range(3):
@@ -463,14 +474,14 @@ class TestInterceptedEventLedger(unittest.TestCase):
             name="gke-pool-b-4d5e6f",
             kind_of_object="Node",
             reason="NodeNotReady",
-            type="Normal",
+            type="Warning",
         )
         self.assertEqual(resp.json()["status"], "injected")
         mock_trigger.assert_called_once()
         self.assertEqual(
             self._quota_rows(),
             [("Warning", 1, 0)],
-            "the node loss must bill Warning, not the Info bucket it used to",
+            "the alert that posted must be the only one billed",
         )
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
@@ -519,6 +530,88 @@ class TestInterceptedEventLedger(unittest.TestCase):
         # Both still reached the ledger, which is what the recap reads.
         self.assertEqual(self._rows("word-api-1")[0][5], 0)
         self.assertEqual(self._rows("word-api-2")[0][5], 0)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_watcher_that_cannot_handle_filtered_is_not_sent_it(self, mock_trigger):
+        """The skew that silences a real failure, refused at the source.
+
+        A watcher predating `injectStatusFiltered` reads it as delivered and
+        keeps its dedup entry, but has no `MarkPolicyFiltered`, so
+        `ReopenIfPolicyFiltered` can never fire for it. The key is canonical, so
+        that entry is held on behalf of the family's one Info member and every
+        `Failed` behind it takes Case 3 in `Observe`, sliding `LastSeen` on each
+        sighting — a bad image tag then never alerts at all.
+
+        The two halves are deployed by different mechanisms — the daemon from
+        the PVC by the entrypoint, the watcher from the sidecar image — so that
+        pairing is an ordinary state and not an override. Answering "suppressed"
+        gives the old watcher a status it knows how to roll back.
+        """
+        self._clear_quota()
+        old = self._inject(
+            "sess-skew", features=None, name="skew-api-1", reason="BackOff", type="Normal"
+        ).json()
+
+        self.assertEqual(old["status"], "suppressed")
+        # Still recorded as not notified: the fallback changes what the watcher
+        # is told, not whether the recap can count the event.
+        self.assertEqual(self._rows("skew-api-1")[0][5], 0)
+        mock_trigger.assert_not_called()
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_watcher_that_claims_the_feature_gets_filtered(self, mock_trigger):
+        """The control. Without it the fallback above passes on a broken gate."""
+        self._clear_quota()
+        new = self._inject(
+            "sess-skew", features="policy-filtered", name="skew-api-2",
+            reason="BackOff", type="Normal",
+        ).json()
+
+        self.assertEqual(new["status"], "filtered")
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_the_feature_list_is_parsed_not_matched_as_a_string(self, mock_trigger):
+        """A comma-separated header, so a later feature needs no second header.
+
+        Substring matching would accept `not-policy-filtered` and reject
+        `policy-filtered, something-else`, which is backwards on both counts.
+        """
+        self._clear_quota()
+        cases = {
+            "policy-filtered": "filtered",
+            " Policy-Filtered ": "filtered",
+            "something-else,policy-filtered": "filtered",
+            "policy-filtered,something-else": "filtered",
+            "": "suppressed",
+            "something-else": "suppressed",
+            "policy-filtered-v2": "suppressed",
+        }
+        for idx, (header, expected) in enumerate(cases.items()):
+            with self.subTest(header=header):
+                got = self._inject(
+                    "sess-feat", features=header, name=f"feat-api-{idx}",
+                    reason="BackOff", type="Normal",
+                ).json()
+                self.assertEqual(got["status"], expected)
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_the_ceiling_answers_the_same_word_to_either_watcher(self, mock_trigger):
+        """The negotiation covers the Info gate only.
+
+        "suppressed" predates the header, so gating it too would leave an old
+        watcher with no status at all for a ceiling drop.
+        """
+        self._clear_quota()
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Critical": 1}):
+            self._inject("sess-ceil", features=None, name="ceil-api-0")
+            old = self._inject("sess-ceil", features=None, name="ceil-api-1").json()
+        self._clear_quota()
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Critical": 1}):
+            self._inject("sess-ceil", name="ceil-api-2")
+            new = self._inject("sess-ceil", name="ceil-api-3").json()
+
+        self.assertEqual(old["status"], "suppressed")
+        self.assertEqual(new["status"], "suppressed")
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_ledger_rows_expire_with_the_ttl(self, mock_trigger):

@@ -204,11 +204,25 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 //
 // Canonicalizes the reason exactly as Observe does. No-op if the entry
 // is already gone.
+//
+// No-op as well on an entry that has already been reopened, which is what
+// keeps the pair of flags out of the one combination nothing recovers
+// from. ReopenIfPolicyFiltered's guard needs PolicyFiltered set and
+// Reopened clear; an entry carrying both can never satisfy it again, and
+// Observe's Case 3 slides LastSeen on every later sighting so it never
+// expires either. Forget is the only other way out and all three of its
+// callers sit behind an attempted inject, which no sighting reaches once
+// the key is dead — nor does restarting the watcher help, since restore
+// rehydrates both flags verbatim. reopenPolicyFiltered admits only
+// Warning-typed events, which the daemon cannot grade Info, so this
+// should be unreachable from the dispatch path; the check is here so the
+// invariant holds locally rather than resting on a grading rule that
+// lives in another language and another container image.
 func (c *dedupCache) MarkPolicyFiltered(key EventKey, message string) {
 	key.Reason = canonicalizeReason(key.Reason, message)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if entry, ok := c.entries[key]; ok {
+	if entry, ok := c.entries[key]; ok && !entry.Reopened {
 		entry.PolicyFiltered = true
 	}
 }

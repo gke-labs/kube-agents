@@ -291,13 +291,18 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
         self.assertIn("*0 informational events* held back from chat today", report)
 
-    def test_a_withheld_alert_is_reported_nowhere(self):
-        """This recap's subject is informational events, and only those.
+    def test_a_withheld_alert_is_counted_but_not_named(self):
+        """Told, not listed.
 
-        A ceiling-withheld alert is graded Critical or Warning. It is not named,
-        not counted and not alluded to: the quota counter and `GET
-        /v1/alert-quota` are where that signal lives. SOP: "What this recap does
-        not report".
+        A ceiling-withheld alert is graded Critical or Warning, so it is not
+        this recap's subject and does not join the breakdown — the workload and
+        the reason stay out. That it happened at all is a different question,
+        and the answer has to be printed: the recap is the only channel that
+        reaches the on-call unprompted, and alert loss is the one thing this
+        ledger uniquely records. `GET /v1/alert-quota` and the quota counter
+        only help a reader who already suspects it.
+
+        SOP: "What this recap does not report".
         """
         events = [
             event(workload="checkout", reason="CrashLoopBackOff", notified=False)
@@ -309,18 +314,45 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
 
         self.assertEqual(summary["cap_dropped"], 12)
+        self.assertIn("*12 alerts withheld by the daily ceiling and never reached chat.*", report)
+        # Counted, and still not listed: the breakdown is informational events.
         self.assertNotIn("checkout", report)
         self.assertNotIn("CrashLoopBackOff", report)
-        self.assertNotIn("withheld", report)
-        self.assertNotIn("ceiling", report)
 
-    def test_not_reporting_a_withheld_alert_is_not_denying_it(self):
+    def test_a_clean_day_is_not_told_about_alerts_it_did_not_lose(self):
+        """The control. Without it the assertion above passes on a fixed string."""
+        summary = filter_and_aggregate_events([event(), listed()])
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertEqual(summary["cap_dropped"], 0)
+        self.assertEqual(summary["delivery_failed"], 0)
+        self.assertNotIn("withheld by the daily ceiling", report)
+        self.assertNotIn("failed to post to chat", report)
+
+    def test_a_failed_delivery_is_counted_on_its_own_line(self):
+        """Nothing else counts this one at all.
+
+        A ceiling drop is at least in `k8s_event_watcher_events_quota_suppressed_total`.
+        A failed post is recorded as sent by every metric there is; the ledger's
+        `delivery_error` column is its only trace.
+        """
+        summary = filter_and_aggregate_events(
+            [event(notified=True, delivery_error="502 from chat.googleapis.com")
+             for _ in range(3)]
+        )
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertEqual(summary["delivery_failed"], 3)
+        self.assertIn("*3 alerts failed to post to chat.*", report)
+
+    def test_a_withheld_alert_is_never_covered_by_an_all_clear(self):
         """The regression this file exists to prevent, at its sharpest.
 
         Thirty Critical alerts the ceiling ate: chat never saw them and no triage
-        session was opened. Staying silent about them is the choice; printing
-        "nothing was held back" over them is a different thing, and printing a
-        green header over them is the same lie in one character.
+        session was opened. Printing "nothing was held back" over them, or a
+        green header, is the same lie in one character. Now that the count is
+        printed the card says so outright — but the veto stays, because a
+        reader who skims to the ✅ must not find one.
         """
         events = [event(notified=False) for _ in range(30)]
         summary = filter_and_aggregate_events(events)
@@ -329,9 +361,25 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
 
         self.assertEqual(summary["cap_dropped"], 30)
+        self.assertIn("*30 alerts withheld by the daily ceiling and never reached chat.*", report)
         self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("🟢", report)
         self.assertIn("📊", report)
+
+    def test_the_withheld_line_is_above_the_body(self):
+        """Under the breakdown it is a footnote; above it, it is the headline.
+
+        A day with both a listing and a ceiling drop must not bury the drop
+        beneath five rows of informational churn.
+        """
+        events = [listed() for _ in range(6)] + [event(notified=False) for _ in range(4)]
+        summary = filter_and_aggregate_events(events)
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertLess(
+            report.index("withheld by the daily ceiling"),
+            report.index("Forwarded"),
+        )
 
     def test_the_veto_survives_a_threshold_that_lists_nothing(self):
         """`min_event_count` filters the listing, and must not filter the veto.
@@ -1324,18 +1372,25 @@ class TestTheCountsSayWhatTheyCover(unittest.TestCase):
         self.assertIn(f"_{self.SEVERITY_NOTE} {self.SCOPE_NOTE}_", report)
 
 
-class TestAnExclusionBarsTheGreenHeader(unittest.TestCase):
-    """The ✅ can qualify itself in words. The header emoji cannot.
+class TestAnExclusionDoesNotBarTheGreenHeader(unittest.TestCase):
+    """A veto that fires every day is not a veto.
 
-    Excluded informational churn is dropped from `suppressed_info`, so a window
-    whose only withheld traffic was `kube-system` `BackOff` noise clears
-    `all_clear` — honestly, because the recap did not look there, and the ✅
-    beside it says so. Green is read at a glance and carries no such sentence,
-    which makes it the one part of this card that would assert a clean day the
-    report never measured. Any exclusion at all therefore grades the header 📊.
+    Vetoing green on `excluded_occurrences` reads defensible in isolation: the
+    recap did not look in the excluded namespaces, so green overclaims by a
+    little. It does not survive the deployment. `kube-system` ships in
+    `DEFAULT_EXCLUDE_NAMESPACES` and the watcher runs with no namespace filter
+    of its own, so on any real cluster that count is non-zero every day of the
+    year — the header would be pinned to 📊 permanently, 🟢 unreachable outside
+    an empty ledger, and 📊 itself would stop marking the days it exists to
+    mark. Three-state grading that can only emit one state grades nothing.
 
-    The alert tallies are unfiltered, so this changes nothing about a day a
-    ceiling drop or a failed delivery spoiled: those were never green.
+    What carries the caveat instead is the ✅, in words, one line below. That
+    was always the better place for it, and it was the argument for the veto in
+    the first place.
+
+    The alert tallies are unfiltered and still veto, so this changes nothing
+    about a day a ceiling drop or a failed delivery spoiled: those were never
+    green.
     """
 
     report = staticmethod(recap)
@@ -1346,18 +1401,31 @@ class TestAnExclusionBarsTheGreenHeader(unittest.TestCase):
                   notified=False)
         ]
 
-    def test_the_header_is_neutral_when_the_filter_removed_something(self):
+    def test_a_day_of_excluded_churn_is_still_green(self):
         _, report = self.report(self.excluded_churn())
 
-        self.assertNotIn("🟢", report)
-        self.assertIn("📊", report)
-        # Neutral header, but the day was still clear in scope, so the ✅ stays
-        # — carrying the note that says what "in scope" left out.
+        self.assertIn("🟢", report)
+        self.assertNotIn("📊", report)
+        # Green, and the sentence beside it still says what "in scope" left out.
         self.assertIn("Nothing was held back from chat in this window.", report)
         self.assertIn("outside this recap's scope", report)
 
-    def test_an_unfiltered_clean_day_is_still_green(self):
-        """The control. Without it this test passes on a recap that never greens."""
+    def test_a_ceiling_drop_still_bars_green(self):
+        """The control that keeps the veto from being deleted wholesale.
+
+        `excluded_occurrences` stopped vetoing; `cap_dropped` did not. Without
+        this the change above is indistinguishable from removing the gate.
+        """
+        summary, report = self.report(
+            [event(namespace="kube-system", workload="kube-proxy", notified=False)]
+        )
+
+        self.assertEqual(summary["cap_dropped"], 1)
+        self.assertNotIn("🟢", report)
+        self.assertIn("📊", report)
+
+    def test_in_scope_churn_is_neutral_not_green(self):
+        """The other control: green tracks `all_clear`, not the exclusion list."""
         with exclude(""):
             _, report = self.report(self.excluded_churn())
 
@@ -1370,19 +1438,18 @@ class TestAnExclusionBarsTheGreenHeader(unittest.TestCase):
         self.assertIn("Nothing was held back from chat in this window.", empty)
         self.assertNotIn("outside this recap's scope", empty)
 
-    def test_an_excluded_delivered_alert_also_bars_green(self):
-        """`excluded_occurrences` counts the row, whatever became of it.
+    def test_an_excluded_delivered_alert_does_not_bar_green(self):
+        """A delivered alert in an excluded namespace spoils nothing.
 
-        A delivered alert in an excluded namespace spoils nothing and is not
-        withheld, so the ✅ is correct. The header still drops to 📊, because
-        the reader is being told a namespace went unread either way.
+        It is not withheld, so the ✅ is correct, and after this change the
+        header agrees with it instead of contradicting it.
         """
         summary, report = self.report(
             [event(namespace="kube-system", workload="kube-apiserver", notified=True)]
         )
 
         self.assertEqual(summary["cap_dropped"], 0)
-        self.assertNotIn("🟢", report)
+        self.assertIn("🟢", report)
         self.assertIn("Nothing was held back from chat in this window.", report)
 
 

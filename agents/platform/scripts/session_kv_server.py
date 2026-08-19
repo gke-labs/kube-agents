@@ -562,49 +562,19 @@ def clean_event_message(message: str) -> str:
     return msg
 
 
-# Reasons whose `Event.Type` is not to be trusted. kubelet records node
-# readiness transitions as *Normal* events
-# (`recordNodeStatusEvent(v1.EventTypeNormal, events.NodeNotReady)`), and the
-# node-lifecycle controller records the same transition the same way — so
-# grading on the type alone files a node going NotReady under Info, which is
-# the one severity the suppression gate drops. These reasons are on the
-# watcher's default list precisely because someone wants to hear about them now
-# now rather than in the daily recap.
-#
-# get_severity_details grades these on the reason and ignores the type, so they
-# can never come back Info and the gate needs no exception of its own. The gate
-# depends on that invariant, so it is pinned by
-# test_no_always_alert_reason_can_be_labelled_info rather than by this comment.
-ALWAYS_ALERT_REASONS = frozenset(
-    {
-        "NodeNotReady",
-        "NetworkNotReady",
-        "FailedToDrainNode",
-        "FailedScheduling",
-        "Evicted",
-    }
-)
-
-
 def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
     event_lower = event_type.lower()
     reason_lower = reason.lower()
 
-    # For these reasons the type says Normal and means nothing; the reason is
-    # the reliable signal. Grade them as a Warning-typed event would be graded
-    # — the same keyword list below, the same two outcomes — rather than
-    # letting the type demote a node loss to Info. See ALWAYS_ALERT_REASONS.
-    type_is_unreliable = reason in ALWAYS_ALERT_REASONS
-
     # Blocker if it blocks drain, eviction, or scheduling
     is_blocker = (
-        (event_lower == "warning" or type_is_unreliable)
+        event_lower == "warning"
         and any(x in reason_lower for x in ("drain", "evict", "schedul", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
     )
 
     if is_blocker:
         return "🔴", "Critical"
-    elif event_lower == "warning" or type_is_unreliable:
+    elif event_lower == "warning":
         return "🟡", "Warning"
     else:
         return "🔵", "Info"
@@ -1486,10 +1456,30 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         "session_id": session_id,
         "relay": "degraded" if degraded else "ok",
     }
+def _watcher_features(header_value: str) -> set:
+    """The response behaviours the calling watcher said it understands.
+
+    ``X-Watcher-Features`` is a comma-separated list the watcher sets on every
+    inject (``injectFeaturesHeader`` in ``injector.go``). An absent or empty
+    header means a watcher old enough not to send one, which is the case this
+    exists to detect — so the empty set is the safe answer and every
+    feature-gated branch has to treat it as "not supported".
+
+    Tokens are lowercased and stripped. Deliberately no version number: a
+    version would make the daemon track which build learned which behaviour,
+    and the question at each branch is only whether this caller handles this
+    one status.
+    """
+    return {token.strip().lower() for token in (header_value or "").split(",") if token.strip()}
 
 
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
-def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
+def inject_message(
+    session_id: str,
+    request_data: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    x_watcher_features: str = Header(default=""),
+) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""
     raw_message = request_data.get("message", "")
     if not raw_message:
@@ -1517,18 +1507,12 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     clean_reason = clean_reason_label(event_reason)
     clean_msg = clean_event_message(message)
 
-    # Info means Kubernetes did not consider the event a warning and nothing in
-    # ALWAYS_ALERT_REASONS overrode it. The watcher filters on `reason` alone
-    # and never on `Event.Type`, so a Normal-type event whose reason is on its
-    # list arrives here like any other — and used to cost a chat post and a
-    # full triage session each. Neither is worth spending on routine image-pull
-    # churn: the post is noise in the middle of someone's day, and the triage
-    # is an agent turn spent on a non-problem.
-    #
-    # The node-level exception lives in get_severity_details, not here. Those
-    # reasons are graded on the reason rather than the type and so never reach
-    # this line as Info, which is why this is a plain severity test with no
-    # second list to keep in sync.
+    # Info means Kubernetes did not consider the event a warning. The watcher
+    # filters on `reason` alone and never on `Event.Type`, so a Normal-type
+    # event whose reason is on its list arrives here like any other — and used
+    # to cost a chat post and a full triage session each. Neither is worth
+    # spending on routine image-pull churn: the post is noise in the middle of
+    # someone's day, and the triage is an agent turn spent on a non-problem.
     #
     # Suppressed here rather than in the watcher so the event is still counted.
     # The ledger row below is written either way, so the daily recap can report
@@ -1586,11 +1570,27 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
         # its next sighting, so rolling back would re-offer the same routine
         # churn at the event's own repeat cadence — a session, an inject and a
         # ledger row every kubelet resync, all day, for every quiet workload.
-        # A watcher predating this status also keeps the entry, but it cannot
-        # flag it, so it can never re-open the entry either — see the skew
-        # paragraph in k8s-operator/cmd/k8s-event-watcher/README.md, which owns
-        # that contract. The operator pins both images to one tag on one pod, so
-        # only an override produces that pairing.
+        #
+        # Only for a watcher that said it understands the status. One that did
+        # not also keeps its entry, but it has no way to flag it and so can
+        # never reopen it, and the dedup key is canonical — so the entry is held
+        # on behalf of the family's one Info member and the real `Failed` behind
+        # it is deduplicated into silence for as long as the workload keeps
+        # emitting. Answering such a watcher "suppressed" hands it a status it
+        # already knows how to roll back, so the key is released and the
+        # family's Warnings still reach chat. It does not restore the pre-gate
+        # chat post for the Info event itself — nothing here should, that is the
+        # change — and it costs one redundant session per sighting, which is the
+        # price of not silencing a real failure. See the skew paragraph in
+        # k8s-operator/cmd/k8s-event-watcher/README.md, which owns that
+        # contract, and injectFeaturesHeader in injector.go for why the two
+        # halves cannot be assumed to roll together.
+        if "policy-filtered" not in _watcher_features(x_watcher_features):
+            logger.info(
+                f"Suppressed {severity_label} event {event_reason} for {namespace}/{clean_name}; "
+                "answering 'suppressed' because the watcher did not claim policy-filtered support"
+            )
+            return {"status": "suppressed"}
         logger.info(
             f"Suppressed {severity_label} event {event_reason} for {namespace}/{clean_name} "
             f"(no chat alert, no triage session); it will appear in the daily recap"

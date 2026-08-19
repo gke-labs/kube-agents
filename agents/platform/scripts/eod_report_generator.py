@@ -672,17 +672,20 @@ def generate_markdown_report(
     # it; it falls to 📊, neutral, which is honest where green would not be.
     # SOP: "What the header emoji grades".
     #
-    # `excluded_occurrences` bars green for the same reason, and it is the one
-    # veto term the namespace filter reaches. An excluded row's `Info` tally is
-    # skipped, so a window whose only withheld traffic was informational churn
-    # in `kube-system` clears `all_clear` honestly — the recap did not look
-    # there. The qualifier line under the counts says so in words; an emoji
-    # cannot, and green read at a glance is the one part nobody re-reads. The
-    # alert tallies are not filtered, so this changes nothing about a day the
-    # ceiling or a failed post spoiled: those were never green to begin with.
+    # `excluded_occurrences` is deliberately *not* a veto term. It reads like
+    # one — the recap did not look in the excluded namespaces, so green
+    # overclaims by a little — but `kube-system` ships in
+    # `DEFAULT_EXCLUDE_NAMESPACES` and the watcher runs with no namespace filter
+    # of its own, so on a real cluster that count is non-zero every single day.
+    # Vetoing on it pins the header to 📊 forever: 🟢 becomes unreachable outside
+    # an empty ledger, and three-state grading that only ever emits one state
+    # grades nothing. Worse, it costs 📊 its meaning too — the neutral header
+    # stops marking the days it was added to mark. The ✅ line below carries the
+    # scope caveat in words, which is where a caveat belongs and was the
+    # argument for the veto in the first place.
     if problems:
         header_emoji = "🔴"
-    elif entry_count > 0 or not all_clear or summary.get("excluded_occurrences"):
+    elif entry_count > 0 or not all_clear:
         header_emoji = "📊"
     else:
         header_emoji = "🟢"
@@ -709,6 +712,33 @@ def generate_markdown_report(
             "_One ledger serves every watched cluster, so every count below covers "
             f"{named} as well as `{cluster_name}`._"
         )
+
+    # Above the body and outside both arms below, because an alert nobody
+    # received is the one thing in this ledger that no other channel reports
+    # unprompted. `k8s_event_watcher_events_quota_suppressed_total` and
+    # `GET /v1/alert-quota` only help a reader who already suspects it, and a
+    # failed delivery is not counted anywhere at all — the recap is what reaches
+    # the on-call without being asked.
+    #
+    # Before this the two counts were computed, thresholded, sorted and then
+    # only ever read as veto terms on the ✅ and the 🟢. A day whose ceiling ate
+    # thirty Criticals rendered as an ordinary card whose one signal was the
+    # *absence* of the all-clear, under "Alerts Raised: 0" — which reads as good
+    # news. Nobody notices a line that is not there.
+    #
+    # Counts, not listings: `cap_dropped_entries` and `delivery_failed_entries`
+    # carry the workloads for a caller that wants them, and the point here is
+    # that the reader is told at all, in the two lines above the fold.
+    if not problems:
+        if summary.get("cap_dropped"):
+            lines.append(
+                f"⚠️ *{_plural(summary['cap_dropped'], 'alert')} withheld by the daily "
+                "ceiling and never reached chat.*"
+            )
+        if summary.get("delivery_failed"):
+            lines.append(
+                f"⚠️ *{_plural(summary['delivery_failed'], 'alert')} failed to post to chat.*"
+            )
 
     if entry_count > 0:
         # The alert count is a count, not a listing: it says the watcher paged

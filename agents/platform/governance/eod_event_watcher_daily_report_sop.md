@@ -24,6 +24,22 @@ and restores the home-channel routing a `no_agent` child would otherwise lose. T
 itself is shared, not per-profile — the entrypoint links `profiles/platform/scripts` at the shared
 scripts directory. It needs no cluster access.
 
+**The profile needs a home channel, or the recap is generated and delivered to nobody.**
+`home_target_env` reads `platforms.<platform>.home_channel` off the profile's config; with nothing
+there it returns `{}`, the tick has no delivery target, and the roster entry records
+`last_delivery_error: "platform 'google_chat' not configured/enabled"`. That value is set either by
+the CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. This is a
+property of every `no_agent` entry on the roster rather than of this one, and #658 tracks it; it
+matters here because the recap is the only place a filtered event is ever reported, so an install
+without a home channel loses those events entirely rather than seeing them late. Check before
+relying on the recap:
+
+```bash
+kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
+  sh -c 'echo "${GOOGLE_CHAT_HOME_CHANNEL:-<unset>}"'
+```
+
 **The schedule is `0 21 * * 1-5`, and that hour is UTC** — 17:00 US/Eastern in summer, 16:00 in
 winter. Nothing in this repository sets `HERMES_TIMEZONE` or a `config.yaml` `timezone` key, so
 every entry on every roster here runs on UTC whatever the local reading of its hour suggests;
@@ -125,13 +141,12 @@ as the `count` on each listed group and as the headline's events-forwarded figur
 adds up to it. `*N alerts* went to chat` on the line above is a count of chat posts instead — one
 per ledger row, whatever a row stands for.
 
-`ALWAYS_ALERT_REASONS` never land in that count, whatever their `Event.Type`:
-`get_severity_details` grades them on the reason, so they come back `Warning` or `Critical` and are
-alerted rather than muted into a line here. Only one of the five reaches this profile as deployed —
-the watcher's `--reason` list in deploy/shared/start-services.sh forwards `FailedToDrainNode` and
-rejects `NodeNotReady`, `NetworkNotReady`, `FailedScheduling` and `Evicted` at the daemon, so do not
-read their absence from a recap as their absence from the fleet. See the Severity Gate section of
-[`../docs/session_management.md`](../docs/session_management.md).
+What lands in that count is decided by `Event.Type` and nothing else: `get_severity_details` grades
+any non-`Warning` event `Info`, however serious its reason reads. A held-back line is therefore not
+a judgement that the event was minor. Reasons that appear in no recap at all are a separate case —
+the watcher's `--reason` list in deploy/shared/start-services.sh never forwarded them, so nothing
+was recorded to hold back. Do not read absence from a recap as absence from the fleet. See the
+Severity Gate section of [`../docs/session_management.md`](../docs/session_management.md).
 
 The listing is fixed to `Info` in `LISTED_SEVERITIES` in `eod_report_generator.py`, and nothing
 widens it. Widening it would buy a digest of the day's already-delivered alerts, and it still would
