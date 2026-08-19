@@ -55,9 +55,9 @@ variable "ack_deadline_seconds" {
 }
 
 variable "message_retention_duration" {
-  description = "How long unacked messages are retained, as a duration string. The 7-day default is Pub/Sub's maximum, chosen so a detector outage over a weekend does not lose the drift events it was down for."
+  description = "How long Pub/Sub retains unacked messages, as a duration string. Defaults to 2678400s (31 days), the subscription maximum; Pub/Sub's own default is 7 days. Retention that lapses drops drift events silently, hence the ceiling."
   type        = string
-  default     = "604800s"
+  default     = "2678400s"
 }
 
 variable "retry_minimum_backoff" {
