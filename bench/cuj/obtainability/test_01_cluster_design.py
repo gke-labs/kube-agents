@@ -9,6 +9,7 @@ from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterio
 from cuj.utils.interaction import (
     completed_evidence,
     opaque_tool_calls,
+    projected_records,
     projected_tasks,
     tool_operations,
 )
@@ -198,19 +199,6 @@ ACCEPTANCE_CRITERIA = (
 )
 
 
-def _projected_dicts(
-    interaction: dict[str, Any],
-    tasks: list[dict[str, Any]],
-    field: str,
-) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    for source in (interaction, *tasks):
-        values = source.get(field, [])
-        if isinstance(values, list):
-            found.extend(item for item in values if isinstance(item, dict))
-    return found
-
-
 def _completed_capacity_evidence(
     evidence: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
@@ -340,8 +328,8 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     artifacts_projected = "artifacts" in interaction or any(
         "artifacts" in task for task in tasks
     )
-    evidence = _projected_dicts(interaction, tasks, "evidence")
-    artifacts = _projected_dicts(interaction, tasks, "artifacts")
+    evidence = projected_records(interaction, "evidence")
+    artifacts = projected_records(interaction, "artifacts")
     evidence_blocker = (
         () if evidence_projected else ("portal task projection omits evidence",)
     )

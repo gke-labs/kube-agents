@@ -81,6 +81,18 @@ def projected_tasks(
     return tasks
 
 
+def projected_records(
+    interaction: dict[str, Any],
+    field: str,
+) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for source in (interaction, *projected_tasks(interaction)):
+        values = source.get(field, [])
+        if isinstance(values, list):
+            found.extend(item for item in values if isinstance(item, dict))
+    return found
+
+
 def completed_evidence(interaction: dict[str, Any]) -> set[str]:
     found: set[str] = set()
     for task in projected_tasks(interaction):
