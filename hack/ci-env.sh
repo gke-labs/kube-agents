@@ -11,6 +11,8 @@
 # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../k8s-operator/scripts" && pwd)/gke_dns_endpoint.sh"
 
+# TODO(boskos): Once oss-test-infra#2655 merges and deploys Boskos project leasing,
+# consider failing closed if JOB_NAME is set and PROJECT_ID is unset.
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
