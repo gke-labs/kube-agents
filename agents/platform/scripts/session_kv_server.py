@@ -1532,13 +1532,13 @@ def inject_message(
     # Info bucket for every suppressed image-pull `BackOff` and leave
     # `GET /v1/alert-quota` reporting a day's worth of alerts nobody received.
     #
-    # It used to matter more than bookkeeping. While node-level reasons were
-    # graded Info, churn and node loss drew on the same budget, and claiming
-    # first meant five suppressed `BackOff`s could exhaust
-    # `ALERT_DAILY_LIMIT_INFO` and cap-drop a `NodeNotReady`. Grading those
-    # reasons on the reason instead moved them to Warning and Critical, so the
-    # starvation is gone by construction — this ordering is now the accounting
-    # argument alone, which is still reason enough to keep it.
+    # The ordering is also what keeps `ALERT_DAILY_LIMIT_INFO` from being spent
+    # by the churn it is meant to bound. Grading is on `Event.Type` alone, so a
+    # Normal-typed `NodeNotReady` and a Normal-typed `BackOff` are both Info and
+    # would draw on the same budget; because the gate above suppresses every
+    # Info event before this line, neither reaches the claim and the bucket is
+    # never drawn down at all. Move the claim above the gate and five suppressed
+    # `BackOff`s can exhaust it and cap-drop the node event behind them.
     quota_denied = False
     suppressed_today = 0
     if not suppressed:

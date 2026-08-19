@@ -205,26 +205,38 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 // Canonicalizes the reason exactly as Observe does. No-op if the entry
 // is already gone.
 //
-// No-op as well on an entry that has already been reopened, which is what
-// keeps the pair of flags out of the one combination nothing recovers
-// from. ReopenIfPolicyFiltered's guard needs PolicyFiltered set and
-// Reopened clear; an entry carrying both can never satisfy it again, and
-// Observe's Case 3 slides LastSeen on every later sighting so it never
-// expires either. Forget is the only other way out and all three of its
-// callers sit behind an attempted inject, which no sighting reaches once
-// the key is dead — nor does restarting the watcher help, since restore
-// rehydrates both flags verbatim. reopenPolicyFiltered admits only
-// Warning-typed events, which the daemon cannot grade Info, so this
-// should be unreachable from the dispatch path; the check is here so the
-// invariant holds locally rather than resting on a grading rule that
-// lives in another language and another container image.
+// An entry that has already been reopened is *deleted* rather than
+// flagged, because for that entry there is no state left worth holding.
+// ReopenIfPolicyFiltered needs PolicyFiltered set and Reopened clear, and
+// a reopened entry fails the second clause whatever this method writes —
+// so flagging it, or declining to, leaves the same dead key either way,
+// with Observe's Case 3 sliding LastSeen on every later sighting so it
+// never expires and all three Forget callers sitting behind an attempted
+// inject no sighting now reaches. Restarting does not help; restore
+// rehydrates the flags verbatim. Deleting gives the family its way back:
+// the next sighting opens a new incident, at the cost of one session per
+// sighting until the daemon stops filtering it — the same price the
+// "suppressed" path already pays, and cheap against permanent silence.
+//
+// It should not be reachable at all. reopenPolicyFiltered admits only
+// events daemonWouldAlert says the daemon posts, so the reopened entry's
+// own inject should never come back filtered. That mirror is a rule
+// written in another language on another image, which is exactly the kind
+// of agreement that decays without anything failing, so the recovery is
+// here rather than in a comment asserting it cannot happen.
 func (c *dedupCache) MarkPolicyFiltered(key EventKey, message string) {
 	key.Reason = canonicalizeReason(key.Reason, message)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if entry, ok := c.entries[key]; ok && !entry.Reopened {
-		entry.PolicyFiltered = true
+	entry, ok := c.entries[key]
+	if !ok {
+		return
 	}
+	if entry.Reopened {
+		delete(c.entries, key)
+		return
+	}
+	entry.PolicyFiltered = true
 }
 
 // ReopenIfPolicyFiltered re-opens an incident whose entry is held by a

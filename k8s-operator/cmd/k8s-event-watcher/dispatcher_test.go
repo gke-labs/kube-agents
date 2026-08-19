@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -465,11 +466,18 @@ func TestDispatcherReopensPolicyFilteredKeyForWarning(t *testing.T) {
 // three Forget call sites sit behind an attempted inject that no sighting now
 // reaches, and restore rehydrates both flags across a restart.
 //
-// Barring only a literal "Normal" admitted exactly the events that do this. The
-// daemon grades on `event_type.lower() == "warning"`, so an empty, lowercase or
-// unrecognised Type passed the Go guard and came back Info. Since toTriageEvent
-// passes Event.Type through as given and Decide never inspects it, anyone able
-// to create an Event carrying the victim pod's UID could arm it deliberately.
+// Barring only a literal "Normal" admitted exactly the events that do this: a
+// lowercase or unrecognised Type passed the Go guard and came back Info. Since
+// toTriageEvent passes Event.Type through as given and Decide never inspects it,
+// anyone able to create an Event carrying the victim pod's UID could arm it
+// deliberately.
+//
+// The mirror has to be the *endpoint*, not get_severity_details. inject_message
+// runs `event_type = payload.get("type") or "Warning"` first, so an empty type
+// alerts — testing against a bare "Warning" would withhold the reopen from an
+// event that does reach chat. Both directions are covered below, and the fake
+// daemon implements the coercion so a fixture written against the grader alone
+// cannot make either case pass.
 func TestDispatcherUntypedEventCannotBurnTheReopenBudget(t *testing.T) {
 	var injected []string
 
@@ -485,10 +493,16 @@ func TestDispatcherUntypedEventCannotBurnTheReopenBudget(t *testing.T) {
 		var p InjectPayload
 		_ = json.Unmarshal([]byte(env.Message), &p)
 		w.WriteHeader(http.StatusOK)
-		// get_severity_details, faithfully: Info for everything that is not
-		// typed Warning, empty and unrecognised included. That fidelity is the
-		// whole point — the bug was the Go guard and this rule disagreeing.
-		if !strings.EqualFold(p.Type, "Warning") {
+		// inject_message, faithfully — the coercion and then the grade:
+		//   event_type = payload.get("type") or "Warning"
+		//   event_lower == "warning" ? alert : Info
+		// Both lines, because the bug this test exists for was the Go guard
+		// mirroring only the second one.
+		effectiveType := p.Type
+		if effectiveType == "" {
+			effectiveType = "Warning"
+		}
+		if !strings.EqualFold(effectiveType, "Warning") {
 			_, _ = w.Write([]byte(`{"status":"filtered"}`))
 			return
 		}
@@ -506,9 +520,26 @@ func TestDispatcherUntypedEventCannotBurnTheReopenBudget(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	// Every Type the daemon grades Info but a bare "Normal" test would wave
-	// through. Each runs against its own cache: one poisoned key is enough.
-	for _, evType := range []string{"", "normal", "Info", "Unknown"} {
+	// Both sides of the guard. The Info-graded types are the ones a bare
+	// "Normal" test waved through; the empty type is the one a bare "Warning"
+	// test would wrongly withhold the reopen from, since the daemon coerces it
+	// and alerts. Each case runs against its own cache: one poisoned key is
+	// enough, and a shared cache would let the first case decide the rest.
+	// Exactly one alert per family either way — the family is one incident and
+	// dedup is doing its job. What separates a healthy run from the bug is
+	// *which* event it was, so that is what the assertion reads.
+	for _, tc := range []struct {
+		evType string
+		want   []string
+		why    string
+	}{
+		{"normal", []string{"ErrImagePull"}, "graded Info, so it must not spend the reopen the ErrImagePull needs"},
+		{"Info", []string{"ErrImagePull"}, "graded Info, so it must not spend the reopen"},
+		{"Unknown", []string{"ErrImagePull"}, "graded Info, so it must not spend the reopen"},
+		{"", []string{"BackOff"}, "coerced to Warning by inject_message, so it alerts itself; the " +
+			"ErrImagePull behind it is then an ordinary duplicate of a reported incident"},
+	} {
+		evType := tc.evType
 		t.Run("type="+evType, func(t *testing.T) {
 			injected = nil
 			dedup, err := newDedupCache(24*time.Hour, "")
@@ -536,7 +567,7 @@ func TestDispatcherUntypedEventCannotBurnTheReopenBudget(t *testing.T) {
 			disp.Dispatch(context.Background(), TriageEvent{
 				Key: EventKey{UID: "pod-1", Reason: "BackOff"}, Type: evType,
 				Cluster: "test-cluster", Namespace: "prod", Name: "api",
-				Message: `Back-off pulling image "repo/api:typo"`,
+				Message:  `Back-off pulling image "repo/api:typo"`,
 				LastSeen: base.Add(5 * time.Minute), Count: 1,
 			})
 
@@ -549,26 +580,30 @@ func TestDispatcherUntypedEventCannotBurnTheReopenBudget(t *testing.T) {
 			disp.Dispatch(context.Background(), TriageEvent{
 				Key: EventKey{UID: "pod-1", Reason: "ErrImagePull"}, Type: "Warning",
 				Cluster: "test-cluster", Namespace: "prod", Name: "api",
-				Message: "rpc error: code = NotFound",
+				Message:  "rpc error: code = NotFound",
 				LastSeen: base.Add(10 * time.Minute), Count: 5,
 			})
 
-			if len(injected) != 1 {
-				t.Errorf("Type=%q: got %d Warnings through (%v); want 1 — 0 means the untyped "+
-					"sighting burned the reopen and silenced the family permanently",
-					evType, len(injected), injected)
+			if !reflect.DeepEqual(injected, tc.want) {
+				t.Errorf("Type=%q: alerts through = %v, want %v — %s.\n"+
+					"An empty list means the sighting burned the reopen and silenced the family permanently.",
+					evType, injected, tc.want, tc.why)
 			}
 		})
 	}
 }
 
-// TestMarkPolicyFilteredLeavesAReopenedEntryAlone pins the invariant locally,
-// so it does not rest on reopenPolicyFiltered's guard agreeing with a grading
-// rule written in Python and shipped in a different container image.
+// TestMarkPolicyFilteredDropsAReopenedEntry pins the local escape hatch, so a
+// family's recovery does not rest on reopenPolicyFiltered's guard agreeing with
+// a grading rule written in Python and shipped on a different container image.
 //
-// {PolicyFiltered: true, Reopened: true} is the state nothing recovers from.
-// MarkPolicyFiltered is the only writer that can produce it.
-func TestMarkPolicyFilteredLeavesAReopenedEntryAlone(t *testing.T) {
+// A reopened entry is dead to ReopenIfPolicyFiltered whatever PolicyFiltered
+// says: the guard requires Reopened clear, and nothing clears it. Leaving that
+// entry in the map — flagged or not — silences the family for as long as
+// sightings keep arriving, because Case 3 slides LastSeen and the three Forget
+// callers all sit behind an inject no sighting reaches. So the entry must be
+// gone, and the next sighting must open a new incident.
+func TestMarkPolicyFilteredDropsAReopenedEntry(t *testing.T) {
 	dedup, err := newDedupCache(24*time.Hour, "")
 	if err != nil {
 		t.Fatalf("failed to build cache: %v", err)
@@ -588,13 +623,40 @@ func TestMarkPolicyFilteredLeavesAReopenedEntryAlone(t *testing.T) {
 
 	canonical := key
 	canonical.Reason = canonicalizeReason(key.Reason, msg)
+	if _, ok := dedup.entries[canonical]; ok {
+		t.Error("a reopened entry survived a second policy-filter; Reopened is already set, " +
+			"so the guard can never fire again and Case 3 keeps the key alive forever")
+	}
+
+	// The property that actually matters: the family is reportable again.
+	if got := dedup.Observe(key, msg, now.Add(time.Minute)); got.Kind != dedupNewIncident {
+		t.Errorf("next sighting was %v, want dedupNewIncident — the family is still silenced", got.Kind)
+	}
+}
+
+// TestMarkPolicyFilteredFlagsAnEntryThatWasNeverReopened is the control for the
+// test above: the ordinary path must still flag rather than delete, or the
+// filtered-keeps-the-entry design collapses into one session per sighting.
+func TestMarkPolicyFilteredFlagsAnEntryThatWasNeverReopened(t *testing.T) {
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	key := EventKey{UID: "pod-2", Reason: "BackOff"}
+	msg := `Back-off pulling image "repo/api:typo"`
+	now := time.Now()
+
+	dedup.Observe(key, msg, now)
+	dedup.MarkPolicyFiltered(key, msg)
+
+	canonical := key
+	canonical.Reason = canonicalizeReason(key.Reason, msg)
 	entry, ok := dedup.entries[canonical]
 	if !ok {
-		t.Fatalf("the entry for %v is gone", canonical)
+		t.Fatal("the entry was deleted; a first policy-filter must keep it")
 	}
-	if entry.PolicyFiltered {
-		t.Error("a reopened entry was re-flagged PolicyFiltered; with Reopened already set " +
-			"the guard can never fire again and Case 3 keeps the entry alive forever")
+	if !entry.PolicyFiltered {
+		t.Error("the entry was not flagged, so the Warning behind it can never reopen")
 	}
 }
 

@@ -30,7 +30,7 @@ there it returns `{}`, the tick has no delivery target, and the roster entry rec
 `last_delivery_error: "platform 'google_chat' not configured/enabled"`. That value is set either by
 the CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
 `GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. This is a
-property of every `no_agent` entry on the roster rather than of this one, and #658 tracks it; it
+property of every `no_agent` entry on the roster rather than of this one; it
 matters here because the recap is the only place a filtered event is ever reported, so an install
 without a home channel loses those events entirely rather than seeing them late. Check before
 relying on the recap:

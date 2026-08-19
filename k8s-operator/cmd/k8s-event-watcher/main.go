@@ -562,31 +562,51 @@ func dedupPersistPath(base, cluster string) string {
 	return strings.TrimSuffix(base, ext) + "-" + cluster + ext
 }
 
-// eventTypeWarning is the only Event.Type the daemon grades above Info on the
-// type alone: get_severity_details tests `event_type.lower() == "warning"` and
-// falls through to Info for everything else, empty and unrecognised included.
 const eventTypeWarning = "Warning"
+
+// daemonWouldAlert reports whether session_kv_server would grade an event of
+// this Event.Type above Info — that is, post it to chat rather than record it
+// for the daily recap.
+//
+// Two lines decide that, and reading only the second gets it wrong.
+// inject_message coerces the type before grading it:
+//
+//	event_type = payload.get("type") or "Warning"
+//	... event_lower == "warning" ? Warning/Critical : Info
+//
+// So an absent or empty type is graded *Warning*, not Info. `InjectPayload.Type`
+// carries no omitempty, so an empty Go string reaches the daemon as `"type": ""`,
+// which is falsy in Python and takes that coercion. get_severity_details read on
+// its own says the opposite, and a guard written against it alone withholds the
+// reopen from an event the daemon goes on to alert on — the silence this whole
+// path exists to prevent.
+//
+// EqualFold because the daemon lowercases before comparing. One function so the
+// rule has one home: the fake daemon in dispatcher_test.go is written against
+// these same two lines, and a fixture that mirrors the wrong one turns a
+// regression into a passing test.
+func daemonWouldAlert(eventType string) bool {
+	return eventType == "" || strings.EqualFold(eventType, eventTypeWarning)
+}
 
 // reopenPolicyFiltered reports whether a deduplicated event should escape
 // suppression because the entry holding its key was left behind by an event the
-// daemon policy-filtered. Only a Warning-typed event gets that chance.
+// daemon policy-filtered. Only an event the daemon would alert on gets that
+// chance.
 //
-// Testing for Warning rather than against Normal is what keeps the one-shot
-// budget spendable only on an event that can actually use it. The reopen is
-// bounded at one firing per window by the sticky Reopened flag, and the entry it
-// installs is re-flagged if its own inject also comes back filtered. An event
-// this guard admits but the daemon then grades Info therefore spends the budget
-// and hands the key back in a state — PolicyFiltered and Reopened both true —
-// that ReopenIfPolicyFiltered can never satisfy again, while Observe's Case 3
-// slides LastSeen on every later sighting so the entry never expires either. The
-// family is then silenced permanently, which is the outcome this whole path
-// exists to prevent. Barring only a literal "Normal" admitted exactly those
-// events: an empty or lowercase Type passed the guard and came back Info.
+// Admitting anything wider spends a budget that does not come back. The reopen
+// is bounded at one firing per window by the sticky Reopened flag, so an event
+// this guard admits and the daemon then grades Info takes the family's only
+// reopen and returns an entry that no later Warning can reopen, while Observe's
+// Case 3 slides LastSeen on every sighting so it never expires either. Barring
+// only a literal "Normal" admitted exactly those events: an empty or lowercase
+// Type passed and came back Info. Hence daemonWouldAlert rather than a test
+// against one string.
 //
-// A Warning-typed event cannot grade Info, so the reopened entry cannot be
-// re-flagged and that state is unreachable. dedupCache.MarkPolicyFiltered
-// declines to re-flag a reopened entry as well, so the invariant does not rest
-// on this guard alone agreeing with a grading rule written in another language.
+// The mirror is not load-bearing on its own. Grading lives in another language
+// on another image and can drift, so MarkPolicyFiltered drops a reopened entry
+// whose own inject comes back filtered rather than leaving it held — the next
+// sighting then opens a fresh incident instead of the family going quiet.
 //
 // The dedupResult it returns is the one the caller must go on to inject with,
 // and it counts from 1 like any other new incident. The result Observe handed
@@ -595,7 +615,7 @@ const eventTypeWarning = "Warning"
 // that number on the wire would write it to `occurrences` in the ledger, and
 // the recap sums that column to report how many events were forwarded.
 func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent) (dedupResult, bool) {
-	if ev.Type != eventTypeWarning {
+	if !daemonWouldAlert(ev.Type) {
 		return dedupResult{}, false
 	}
 	if !d.dedup.ReopenIfPolicyFiltered(ev.Key, ev.Message, ev.LastSeen) {
