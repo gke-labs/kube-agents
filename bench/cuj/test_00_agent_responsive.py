@@ -6,7 +6,7 @@ import pytest
 
 from cuj.utils.portal import configured_agent_profiles
 
-AGENT_PROFILES = configured_agent_profiles() or (("", ""),)
+AGENT_PROFILES = configured_agent_profiles()
 
 
 @pytest.mark.parametrize(
@@ -19,8 +19,6 @@ def test_00_agent_live_and_responsive(
     profile: str,
     agent_preflight_results: dict[tuple[str, str], str],
 ) -> None:
-    if not agent_id:
-        pytest.fail("CUJ_AGENT_ID is not configured")
     failure = agent_preflight_results.get((agent_id, profile), "not checked")
     if failure:
         pytest.fail(f"agent prerequisite failed: {failure}")

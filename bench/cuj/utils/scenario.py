@@ -13,7 +13,7 @@ from cuj.utils.acceptance_criteria import AcceptanceCriteria
 from cuj.utils.evidence import EvidenceLog
 from cuj.utils.interaction import InteractionRunner
 from cuj.utils.milestones import MilestoneSuite
-from cuj.utils.portal import PortalError, isolated_portal
+from cuj.utils.portal import CANONICAL_AGENT_ID, PortalError, isolated_portal
 
 DEFAULT_TIMEOUT_SECONDS = 1600.0
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
@@ -52,7 +52,7 @@ class ScenarioConfig:
     ) -> ScenarioConfig:
         return cls(
             endpoint=endpoint,
-            agent_id=required_env("CUJ_AGENT_ID"),
+            agent_id=CANONICAL_AGENT_ID,
             profile=os.environ.get("CUJ_PROFILE", "default").strip() or "default",
             timeout=float(os.environ.get("CUJ_TIMEOUT", default_timeout)),
             poll_interval=float(

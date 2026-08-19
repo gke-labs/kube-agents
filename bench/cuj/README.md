@@ -10,8 +10,9 @@ From the repository root, run every CUJ with pytest:
 uv run --project bench pytest -s bench/cuj
 ```
 
-Set `CUJ_AGENT_ID` for the agent under test and `CUJ_PROJECT_ID` for scenarios
-that need a Google Cloud project. `CUJ_PROFILE`, `CUJ_TIMEOUT`, and
+The suite targets the stock `platform-agent` resource created by
+`k8s-operator/scripts/provision.sh`. Set `CUJ_PROJECT_ID` for scenarios that
+need a Google Cloud project. `CUJ_PROFILE`, `CUJ_TIMEOUT`, and
 `CUJ_POLL_INTERVAL` are optional overrides shared by the whole suite.
 Pytest reports every journey independently using its normal test discovery.
 Before running a journey, `test_00_agent_responsive.py` requires the configured

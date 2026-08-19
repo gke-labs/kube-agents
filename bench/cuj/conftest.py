@@ -18,8 +18,6 @@ def agent_preflight_results() -> dict[tuple[str, str], str]:
     """Prove every configured agent/profile before any worker runs a CUJ."""
 
     configured = configured_agent_profiles()
-    if not configured:
-        return {("", ""): "CUJ_AGENT_ID is not configured"}
     results: dict[tuple[str, str], str] = {}
     for agent_id, profile in configured:
         log = EvidenceLog.temporary("kube-agents-prerequisite-")
