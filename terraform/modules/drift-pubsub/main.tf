@@ -68,6 +68,7 @@ locals {
 }
 
 resource "google_pubsub_topic" "drift_audit" {
+  #checkov:skip=CKV_GCP_83:Drift audit topic uses default Google-managed encryption keys
   project = var.project_id
   name    = var.topic_name
 }
