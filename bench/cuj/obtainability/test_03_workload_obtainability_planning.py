@@ -1,4 +1,4 @@
-"""Reproduce CUJ3: CalendarMode planning for a flexible TPU batch job."""
+"""Reproduce CUJ3: workload obtainability planning for a flexible TPU job."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ ALLOWED_REGIONS = {zone.rsplit("-", 1)[0] for zone in ALLOWED_ZONES}
 JOB_DURATION = timedelta(hours=12)
 PLANNING_HORIZON = timedelta(hours=48)
 CALL_DELAY_TOLERANCE = timedelta(minutes=30)
-CALENDAR_METHODS = {
+OBTAINABILITY_PLANNING_METHODS = {
     "compute.alpha.AdviceService.CalendarMode",
     "compute.advice.calendarMode",
 }
@@ -54,7 +54,7 @@ ACCEPTANCE_CRITERIA = (
         "projected user input contains the machine, count, duration, and horizon",
     ),
     AcceptanceCriterion(
-        "ac02-calendar-mode-invoked",
+        "ac02-workload-obtainability-planning-invoked",
         "kube-agents invokes AdviceService.CalendarMode with the machine spec, "
         "count, allowed zones, duration, and horizon.",
         "completed region-scoped CalendarMode calls contain canonical requests",
@@ -102,7 +102,7 @@ ACCEPTANCE_CRITERIA = (
 MILESTONES = (
     Milestone(
         "interaction-completed",
-        "The CalendarMode planning conversation finishes successfully.",
+        "The workload obtainability planning conversation finishes successfully.",
         "terminal completed interaction",
     ),
     Milestone(
@@ -131,7 +131,7 @@ MILESTONES = (
     ),
     Milestone(
         "m5-planning-remains-read-only",
-        "Calendar planning does not submit or apply the generated resources.",
+        "Workload planning does not submit or apply the generated resources.",
         "complete normalized root and worker tool evidence contains no mutation",
         ("interaction-completed",),
     ),
@@ -207,7 +207,7 @@ def _is_tpu_v5e(value: Any) -> bool:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold()) == "tpuv5e"
 
 
-def _valid_calendar_call(
+def _valid_obtainability_planning_call(
     item: dict[str, Any], created_at: datetime | None
 ) -> bool:
     details = _mapping(item.get("details"))
@@ -227,7 +227,7 @@ def _valid_calendar_call(
         _mapping(spec.get("targetResources")).get("aggregateResources")
     )
     return (
-        details.get("apiMethod") in CALENDAR_METHODS
+        details.get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
         and region in ALLOWED_REGIONS
         and bool(zone)
         and str(location.get("preference") or "").upper() == "ALLOW"
@@ -303,15 +303,23 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
 
     evidence = projected_records(interaction, "evidence")
     created_at = _timestamp(interaction.get("createdAt"))
-    calendar_calls = _completed_records(evidence, "advice_service_calendar_mode")
+    advice_calls = _completed_records(
+        evidence,
+        "advice_service_workload_obtainability_planning",
+    )
     valid_calls = [
-        item for item in calendar_calls if _valid_calendar_call(item, created_at)
+        item
+        for item in advice_calls
+        if _valid_obtainability_planning_call(item, created_at)
     ]
     call_regions = {
         str(_mapping(item.get("details")).get("region") or "")
         for item in valid_calls
     }
-    analysis_records = _completed_records(evidence, "calendar_mode_analysis")
+    analysis_records = _completed_records(
+        evidence,
+        "workload_obtainability_planning_analysis",
+    )
     analysis = (
         _mapping(_mapping(analysis_records[0].get("details")).get("analysis"))
         if len(analysis_records) == 1
@@ -389,11 +397,11 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         input_text,
     )
     suite.record(
-        "ac02-calendar-mode-invoked",
-        len(calendar_calls) >= 2
-        and len(valid_calls) == len(calendar_calls)
+        "ac02-workload-obtainability-planning-invoked",
+        len(advice_calls) >= 2
+        and len(valid_calls) == len(advice_calls)
         and call_regions == ALLOWED_REGIONS,
-        {"calls": calendar_calls, "validCallRegions": sorted(call_regions)},
+        {"calls": advice_calls, "validCallRegions": sorted(call_regions)},
         blocked_by=tuple(dict.fromkeys((*interaction_blocker, *evidence_blocker))),
     )
     suite.record(
@@ -557,7 +565,7 @@ def build_prompt() -> str:
     return PROMPT
 
 
-def test_03_calendar_mode() -> None:
+def test_03_workload_obtainability_planning() -> None:
     Scenario(
         "cuj3",
         build_prompt,
