@@ -16,7 +16,7 @@ from typing import Iterator
 from kube_agents_bench.cuj import PortalTransport as Portal
 from kube_agents_bench.cuj import PortalTransportError as PortalError
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def active_gcloud_account() -> str:
