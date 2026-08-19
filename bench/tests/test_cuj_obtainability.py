@@ -25,6 +25,7 @@ def interaction(*, include_future_evidence: bool) -> dict[str, Any]:
         "interactionId": "interaction-1",
         "status": "completed",
         "terminal": True,
+        "output": task["summary"],
         "tasks": [task],
         "toolCalls": [
             {"name": "kanban_create", "status": "completed", "source": "root_run"}
@@ -41,6 +42,7 @@ def interaction(*, include_future_evidence: bool) -> dict[str, Any]:
                     {"type": "computeclass_server_dry_run", "status": "passed"},
                 ],
                 "result": task["summary"],
+                "toolCalls": [],
             }
         )
         observed["toolEvidenceComplete"] = True
@@ -82,6 +84,7 @@ def test_capacity_claims_reject_conflation_and_reversed_guarantee() -> None:
         "ComputeClass. Capacity is guaranteed."
     )
     task["result"] = task["summary"]
+    observed["output"] = task["summary"]
 
     result = cluster_design.evaluate(observed).results[7]
 
@@ -98,6 +101,18 @@ def test_opaque_tool_evidence_cannot_certify_read_only_behavior() -> None:
     assert result.milestone.id == "m9-design-remains-read-only"
     assert result.status is MilestoneStatus.BLOCKED
     assert result.blocked_by == ("tool evidence omits normalized operations",)
+
+
+def test_worker_mutation_fails_read_only_milestone() -> None:
+    observed = interaction(include_future_evidence=True)
+    observed["tasks"][0]["toolCalls"] = [
+        {"operation": "apply_manifest", "status": "completed"}
+    ]
+
+    result = cluster_design.evaluate(observed).results[9]
+
+    assert result.milestone.id == "m9-design-remains-read-only"
+    assert result.status is MilestoneStatus.FAILED
 
 
 def test_default_timeout_covers_portal_root_and_task_budgets(
