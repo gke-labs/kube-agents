@@ -272,11 +272,18 @@ Step 1 of the same SOP measures what re-derivation costs, in the narrower case o
 severity the sweep file already states: it is "the main source of run-to-run instability in this
 stage — measured over three runs on identical input, inferred ranking produced 3, 6 and 6 items with
 only two findings common to all three," and the SOP's response is to preserve the stated severity
-rather than re-infer it. The queue cannot take that option, because most of its rows arrive with no
-severity to preserve. It needs the ranking to be stable when it is genuinely being computed, which
-is a stronger requirement than the SOP faced. A report can absorb the instability; a queue cannot,
-because the drip would offer a different "today's two" each morning from a fleet that had not
-changed.
+rather than re-infer it.
+
+The queue cannot take that option, and not because its rows arrive bare. Most of them arrive with a
+severity — the audit streams write `critical`/`major`/`minor` from `audit_report.py`'s `SEVERITIES`,
+and the sweep file states one either in a `severity=` field or in its `Priority 1 / 2 / 3` grouping.
+The problem is that those are three bars set by three authors, plus a watcher whose events carry no
+severity at all, and nothing makes an audit `critical` and a sweep `Priority 1` the same claim about
+the fleet. Preserving them yields three orderings side by side, which is what the drip cannot use:
+it has to pick today's two out of one order. So the queue computes on a single scale, and needs that
+computation to be stable — a stronger requirement than the SOP faced, since the SOP mostly avoided
+computing at all. A report can absorb the instability; a queue cannot, because the drip would offer
+a different "today's two" each morning from a fleet that had not changed.
 
 Anchored ordinals are the fix. Each measure is a small classification against written text rather
 than a holistic judgement, so the same finding classifies the same way twice. `sort_findings` holds
@@ -941,7 +948,11 @@ The first question is what happens when both sources report the same problem. If
 `probes-readiness` on the object `obtainability-audit` also emits it on, `derive_finding_id` yields
 the same string for both, so they are one row rather than two findings to reconcile. Whichever
 arrives first creates it; the other updates `last_verified` and, if the rubric vector moved, triggers
-a re-rank. The user is told once. Had the sweep kept its own vocabulary, the same problem would carry
+a re-rank. The user is told once. The queue's computed severity governs the row and the stream's
+stated severity governs the ledger issue, and they can differ on the same finding — they are answers
+to different questions, one asking where this ranks against the whole fleet and one asking how bad
+it is for that stream. Promotion carries the queue's, since both use `SEVERITIES`' three words and
+the promoted document is the queue's claim about the finding. Had the sweep kept its own vocabulary, the same problem would carry
 two ids, drip once and appear on a ledger separately, and nothing in the schema could tell that from
 two real problems.
 
