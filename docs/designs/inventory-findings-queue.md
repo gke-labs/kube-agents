@@ -15,8 +15,10 @@ process that did it. Nothing re-reads the remainder, nothing re-verifies it agai
 has since changed, and the only route back to it is the user thinking to ask.
 
 This design turns the discarded remainder into a durable queue: one row per problem, ordered by a
-published rubric, drained a couple of items a day, re-verified at the moment it is surfaced, and
-carrying a prepared fix where a fix can be prepared.
+published rubric, published in full as a list the user can read whenever they want, re-verified
+before anything is asserted about it, and carrying a prepared fix at the top of the order. Chat gets
+a daily line saying what moved and an immediate message when something breaks, rather than being the
+only place the queue exists.
 
 ## 1. Why the delivered report is the wrong container
 
@@ -121,12 +123,12 @@ Grain is one problem: one check, at one object, on one cluster.
 | `root_cause`                                 | nullable; the column `incidents` never had                                                                                                                                                                                 |
 | `recommendation`                             | `{action, rationale, risk}`, required and non-empty on every row                                                                                                                                                           |
 | `remediation`                                | `{kind, path, note}`; `kind` ∈ `manifest` \| `gcloud` \| `manual`. `note` is required and `path` is rejected unless `kind` is `manifest` — the audit validator's rule, kept so §9 can hand a row to `remediate` unmodified |
-| `pr_url`, `pr_state`                         | null where `kind != "manifest"`                                                                                                                                                                                            |
+| `pr_url`, `pr_state`                         | null where `kind != "manifest"`. Opaque to the core: a URL it was handed and a word from `open`/`merged`/`closed`, never parsed and never used to call a repository (§6.2)                                                 |
 | `state`                                      | `queued` → `surfaced` → `accepted` \| `dismissed` \| `resolved`, plus `snoozed` and `stale`                                                                                                                                |
 | `first_seen`, `last_verified`, `surfaced_at` |                                                                                                                                                                                                                            |
-| `surface_count`, `snoozed_until`             | drive the re-offer interval and the explicit silence (§7)                                                                                                                                                                  |
-| `verification`                               | `{kind, command, still_failing_when}` — how to ask the cluster whether this is still true. Written at registration by whoever found it (§7.3)                                                                              |
-| `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not the drip's routing input (§8)                                                                                                              |
+| `surface_count`, `snoozed_until`             | how many nudges have named it, and the explicit silence (§7)                                                                                                                                                               |
+| `verification`                               | `{kind, command, still_failing_when}` — how to ask the cluster whether this is still true. Written at registration by whoever found it (§7.4)                                                                              |
+| `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not a delivery input (§8)                                                                                                                      |
 
 **`id` is derived from the finding's own fields**, by the rule `audit_report.py` already implements
 in `derive_finding_id`: the dotted concatenation of `(check, cluster, namespace, object)`, each
@@ -142,7 +144,7 @@ which §10 depends on.
 **`findings` is exempt from `cleanup_old_records`.** A backlog with a TTL is not a backlog. The
 lifecycle is `state`, not age, and no row is deleted by a timer. A finding that reaches a terminal
 state stays in the table: `dismissed` in particular has to outlive the sweep that found it, or the
-next sweep re-registers what the user already rejected and the drip offers it again (§5.2).
+next sweep re-registers what the user already rejected and it reappears on the list (§5.2).
 
 ### 3.1 The schema
 
@@ -165,15 +167,14 @@ CREATE TABLE IF NOT EXISTS findings (
     recommendation   TEXT NOT NULL,               -- JSON {action, rationale, risk}
     remediation      TEXT NOT NULL,               -- JSON {kind, path, note}
     verification     TEXT NOT NULL,               -- JSON {kind, command, still_failing_when}
-    pr_url           TEXT,
-    pr_state         TEXT,
+    pr_url           TEXT,                        -- opaque; see below
+    pr_state         TEXT,                        -- open | merged | closed
     state            TEXT NOT NULL DEFAULT 'queued',
     first_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_verified    TIMESTAMP,
     surfaced_at      TIMESTAMP,
     surface_count    INTEGER NOT NULL DEFAULT 0,
     snoozed_until    TIMESTAMP,
-    next_offer_after TIMESTAMP,
     chat_id          TEXT,
     thread_id        TEXT,
     likelihood       INTEGER GENERATED ALWAYS AS (json_extract(rubric, '$.L')) VIRTUAL,
@@ -181,42 +182,58 @@ CREATE TABLE IF NOT EXISTS findings (
 )
 ```
 
-Four choices in there are not free.
+Five choices in there are not free.
 
 **`check_slug`, not `check`.** `CHECK` is a SQLite keyword and `CREATE TABLE findings (check TEXT)`
 is a syntax error; `"check"` parses but leaves every query one forgotten quote away from the same
 error. The column is the audit streams' check slug (§10) whatever it is called here.
 
 **`likelihood` and `blast_radius` are generated columns, not stored ones.** §4.2's floor and §7's
-urgent slot both select on L, and a `WHERE json_extract(rubric, '$.L') = 10` cannot use an index.
+§7.2's alarm both select on L, and a `WHERE json_extract(rubric, '$.L') = 10` cannot use an index.
 Generated columns can be indexed and cannot drift from the vector they are computed from, which is
 the objection §4.2 raises against keeping an `active` flag in a column of its own: a second copy of
 a derived fact is free to disagree with the fact. These are not a second copy — SQLite recomputes
 them from `rubric` on read, so a re-rank that moves L moves them in the same statement.
 
-**`next_offer_after` is stored rather than recomputed.** §7.1's intervals are a function of L and
-`surface_count`, so the drip could derive the date every morning. Storing it means the re-offer
-schedule is visible in the row — you can ask why a finding did not appear today and get an answer —
-and it survives a change to the interval rules without silently re-timing every finding already in
-flight.
+**`pr_url` is a URL, not an issue number.** The core stores what it was handed and returns it; it
+never parses the string, never extracts a number from it, and never calls a repository. The compact
+alternative — `pr_number INTEGER`, with the link rebuilt as `github.com/{repo}/pull/{n}` — puts
+GitHub inside the core, so supporting another repository system becomes a schema migration and a
+code change. A URL needs neither, and `open`/`merged`/`closed` are words every repository system
+uses. §6.2 is the general form of this rule.
 
 **`json_extract` over separate columns for the three JSON blobs.** `recommendation` and
 `remediation` carry the audit schema's own shapes so that §9 can hand a row to `remediate`
 unmodified; decomposing them into columns would mean recomposing them at promotion time, which is
 the mapping bug this reuse exists to avoid.
 
-The indexes follow the two queries the drip actually runs:
+**No column says where the list was published.** The backlog document (§7) is one document for the
+whole queue, so its location is not a property of any finding — putting it on the row would write
+the same URL onto thirty of them. It belongs to the publisher, in a table of its own:
 
 ```sql
-CREATE INDEX IF NOT EXISTS findings_drip     ON findings(state, next_offer_after, rank_score DESC);
-CREATE INDEX IF NOT EXISTS findings_urgent   ON findings(likelihood, state, rank_score DESC);
-CREATE INDEX IF NOT EXISTS findings_object   ON findings(cluster, namespace, object);
-CREATE INDEX IF NOT EXISTS findings_pr       ON findings(pr_state) WHERE pr_state IS NOT NULL;
+CREATE TABLE IF NOT EXISTS queue_publications (
+    publisher      TEXT PRIMARY KEY,     -- backlog | nudge
+    target_kind    TEXT NOT NULL,        -- github-issue | repo-file | chat
+    target_ref     TEXT,                 -- URL or path; opaque to the core
+    content_hash   TEXT,                 -- what was last published, for §7.2's change gate
+    last_published TIMESTAMP
+)
 ```
 
-`findings_object` is what makes §7's batching a lookup rather than a scan. `findings_pr` is narrow
-on purpose: it exists only so the promotion reconciler (§3.2) can find rows with a live pull request
-without walking the backlog.
+The indexes follow the queries the publishers actually run:
+
+```sql
+CREATE INDEX IF NOT EXISTS findings_ranked ON findings(state, rank_score DESC);
+CREATE INDEX IF NOT EXISTS findings_urgent ON findings(likelihood, state, rank_score DESC);
+CREATE INDEX IF NOT EXISTS findings_object ON findings(cluster, namespace, object);
+CREATE INDEX IF NOT EXISTS findings_pr     ON findings(pr_state) WHERE pr_state IS NOT NULL;
+```
+
+`findings_ranked` serves the backlog rewrite, which reads every open row in score order, and the
+nudge, which reads the first few of the same list. `findings_object` groups a workload's findings
+together in the rendered list. `findings_pr` is narrow on purpose: it exists only so the promotion
+reconciler (§3.2) can find rows with a live pull request without walking the backlog.
 
 ### 3.2 Lifecycle: who moves a row, and on what
 
@@ -225,15 +242,15 @@ ledger is rendered fresh each time. A queue cannot do that: `snoozed` and `dismi
 person made once and nothing in the cluster records them. So state here is stored, and every
 transition has exactly one actor.
 
-| state       | entered when                                                   | by                           | effect on the drip                                       |
-| ----------- | -------------------------------------------------------------- | ---------------------------- | -------------------------------------------------------- |
-| `queued`    | registration, for an id not already present                    | any source (§5)              | eligible for either slot                                 |
-| `surfaced`  | the drip or an on-demand pull posted it                        | the drip job, after the send | eligible again once `next_offer_after` passes (§7.1)     |
-| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card      | excluded until `snoozed_until`, then back to `surfaced`  |
-| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card      | excluded from both slots; still re-verified              |
-| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card      | excluded permanently, and sticky against re-registration |
-| `resolved`  | re-verification found it no longer reproduces                  | the drip job                 | excluded; kept as the record that it was fixed           |
-| `stale`     | the object it names no longer exists, so it cannot be verified | the drip job                 | excluded; distinct from `resolved` on purpose            |
+| state       | entered when                                                   | by                        | effect on publishing                                         |
+| ----------- | -------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------ |
+| `queued`    | registration, for an id not already present                    | any source (§5)           | on the list, in score order                                  |
+| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send | stays on the list; `surface_count` records how often         |
+| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card   | off the list until `snoozed_until`, then back to `surfaced`  |
+| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card   | its own section of the list; still re-verified               |
+| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card   | off the list permanently, and sticky against re-registration |
+| `resolved`  | re-verification found it no longer reproduces                  | the daily job             | off the list; kept as the record that it was fixed           |
+| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job             | off the list; distinct from `resolved` on purpose            |
 
 **`resolved` and `stale` are different answers and must not be merged.** "The Deployment no longer
 crash-loops" and "the namespace is gone, so nobody can say" look identical to a query that only
@@ -252,12 +269,13 @@ Silence transitions nothing. §7.1 says why: inferring dismissal from an unanswe
 this design would end up back at ignoring its own top item.
 
 **One transition has no actor yet, and it is the gap to close at implementation.** `pr_state` needs
-someone to notice a merge. Nothing in the drip's path polls GitHub, and `remediate`'s own reconcile
-runs on the audit stream's schedule against the ledger rather than against this table. The cheapest
-answer is for the drip to reconcile the rows `findings_pr` returns as part of the run it already
-makes — a handful of `gh pr view` calls bounded by the number of open promotions, not by the size of
-the backlog, which is the same cost principle as §9's surface-time promotion. Whoever builds the
-drip owns this; it is listed in §12.
+someone to notice a merge. The core cannot do it — noticing a merge means talking to a repository,
+which §6.2 puts outside the core — and `remediate`'s own reconcile runs on the audit stream's
+schedule against the ledger rather than against this table. The cheapest answer is for the daily job
+to reconcile the rows `findings_pr` returns as part of the run it already makes, writing the result
+back through `PATCH /v1/findings/{id}`: a handful of `gh pr view` calls bounded by the number of open
+promotions, not by the size of the backlog, which is the same cost principle as §9's promotion rule.
+Whoever builds that job owns this; it is listed in §12.
 
 ## 4. The priority rubric
 
@@ -279,11 +297,11 @@ severity — the audit streams write `critical`/`major`/`minor` from `audit_repo
 and the sweep file states one either in a `severity=` field or in its `Priority 1 / 2 / 3` grouping.
 The problem is that those are three bars set by three authors, plus a watcher whose events carry no
 severity at all, and nothing makes an audit `critical` and a sweep `Priority 1` the same claim about
-the fleet. Preserving them yields three orderings side by side, which is what the drip cannot use:
-it has to pick today's two out of one order. So the queue computes on a single scale, and needs that
-computation to be stable — a stronger requirement than the SOP faced, since the SOP mostly avoided
-computing at all. A report can absorb the instability; a queue cannot, because the drip would offer
-a different "today's two" each morning from a fleet that had not changed.
+the fleet. Preserving them yields three orderings side by side, and the queue's whole output is one
+order. So it computes on a single scale, and needs that computation to be stable — a stronger
+requirement than the SOP faced, since the SOP mostly avoided computing at all. A report can absorb
+the instability; a queue cannot, because the list would reshuffle every morning from a fleet that
+had not changed.
 
 Anchored ordinals are the fix. Each measure is a small classification against written text rather
 than a holistic judgement, so the same finding classifies the same way twice. `sort_findings` holds
@@ -338,7 +356,7 @@ read from live object state; 0.6 inferred from absence or a heuristic.
 **Severity is derived, not judged separately:** `critical` at 150 and above, `major` from 40 to 149,
 `minor` below 40. These are initial thresholds, and §7.2 records what a dry run against a simulated
 fleet says about them: the bands are wide in the middle, with `major` holding half the queue. That
-is tolerable because nothing selects on the band — the drip orders by `rank_score` and the band is
+is tolerable because nothing selects on the band — the list orders by `rank_score` and the band is
 a label — but it is the first thing to calibrate against a real sweep, and the calibration belongs
 here when it exists.
 
@@ -371,8 +389,8 @@ threshold decides nothing about promotion; it decides what the surfaced message 
 and what a future `finish`-style sweep would pick up if one were ever pointed at this table.
 
 That is also what makes the floor cheap. Widening `critical` would be alarming if `critical` opened
-pull requests, and on the queue's path it does not: promotion is bounded by what the drip surfaces
-(§9), not by the band. The one thing to carry forward is that a `finish`-style sweep pointed at this
+pull requests, and on the queue's path it does not: promotion is bounded by the top slice (§9), not
+by the band. The one thing to carry forward is that a `finish`-style sweep pointed at this
 table later would inherit the floor as a promotion trigger — so whoever builds that decides then
 whether an actively-failing finding should auto-promote, rather than acquiring the answer by
 accident from a labelling rule written here.
@@ -423,21 +441,22 @@ step — without a rescoring pass to go and find the rows that were skipped.
 `kube-system`, `kube-public`, `kube-node-lease`, and any namespace matching `gke-*` or `gmp-*` are
 provider-managed. The operator does not own the manifest, cannot change it, and "a recommendation to
 do so is not weak advice, it is impossible advice." Those rows are scored, flagged
-`provider_managed`, and **never get a pull request** — there is no file to change — and they do not
-take a drip slot, arriving instead the way the SOP already delivers them, as a single rolled-up
-observation phrased as an observation rather than an instruction.
+`provider_managed`, and **never get a pull request** — there is no file to change — and they are not
+named in a nudge, arriving instead the way the SOP already delivers them, as a single rolled-up
+observation phrased as an observation rather than an instruction. They stay on the list, where a
+reader can see them without being told to act on them.
 
-**The fault exception is not a scoring exception; it is a surfacing one, and it drips.** The SOP is
+**The fault exception is not a scoring exception; it is a surfacing one.** The SOP is
 explicit that a provider-managed workload that is _actively broken_ — crash-looping, not ready,
 OOMKilled, a node not registering — "stays rankable and is reported normally", because "the operator
 still cannot patch the spec, but they need to know, and the action is real: it is a support case or
-an upgrade, not a manifest edit." A support case is a next step. So such a finding competes for the
-urgent slot on its score like any other, carries §4.2's floor if it reaches it, and surfaces with
-its recommendation and no PR link. Suppressing it would mean the fleet's own agent watching a
-GKE-managed component fail and saying nothing because the fix is a support ticket, which is the
-failure mode this queue exists to end. §7.2 is the measurement of what that costs and what pays for
-it: an unfixable fire is exactly the case that starves a queue, and reserving the drain slot from
-urgency is what keeps the rest of the backlog moving underneath it.
+an upgrade, not a manifest edit." A support case is a next step. So such a finding sits on the list at
+its score like any other, carries §4.2's floor if it reaches it, and appears with its recommendation
+and no PR link. Suppressing it would mean the fleet's own agent watching a GKE-managed component
+fail and saying nothing because the fix is a support ticket, which is the failure mode this queue
+exists to end. §7.3 measures what that used to cost: under the chat-only design an unfixable fire
+was exactly the case that starved the queue, since it held the one channel indefinitely. On a
+published list it holds the top row and nothing underneath it is hidden.
 
 **Actionability.** A finding with no concrete next step sorts after every actionable finding
 whatever its score. This is a flag rather than a multiplier on purpose — a multiplier lets a B=8
@@ -448,13 +467,13 @@ fault has one, so it is actionable; an SLO-practice observation has none, so it 
 ### 4.5 What is deliberately not a measure
 
 **How hard the fix is.** You do not demote a critical problem because its remedy is expensive; that
-is how important work never gets done. Fix cost enters exactly once, as a tie-break within a drip
-slot: between two findings of comparable score, prefer the one whose `remediation.kind` is
-`manifest`, because that one can be handed over today as a reviewable diff.
+is how important work never gets done. Fix cost enters exactly once, as a tie-break: between two
+findings of comparable score, prefer the one whose `remediation.kind` is `manifest`, because that
+one can be handed over today as a reviewable diff.
 
 ### 4.6 Persist the vector, not just the total
 
-Store `{B, L, detect, recover, C}` on the row. It makes the rank auditable, lets the drip explain
+Store `{B, L, detect, recover, C}` on the row. It makes the rank auditable, lets a list entry explain
 itself in one line — "failing now, whole workload, nothing alerts on it" — and turns a re-rank into
 a single-measure edit rather than a re-judgement of the whole finding.
 
@@ -528,15 +547,15 @@ Every source re-runs, so every registration is an upsert against an id that may 
 rule is per state, and two of the seven are the whole point of writing it down:
 
 - `queued`, `surfaced`, `snoozed`, `accepted` — update `detail`, `last_verified`, and the rubric
-  vector; **do not touch `state`, `surface_count`, `next_offer_after`, or `snoozed_until`.** A
-  re-registration is the same problem seen again, not a new one, and resetting the re-offer clock is
-  how a queue starts nagging.
+  vector; **do not touch `state`, `surface_count`, or `snoozed_until`.** A re-registration is the
+  same problem seen again, not a new one, and clearing a snooze the user set is how a queue starts
+  nagging.
 - `dismissed` — **stays dismissed, and the sweep does not resurrect it.** This is the sticky case.
   Without it the next sweep re-registers what the user explicitly rejected, the row goes back to
-  `queued`, and the drip offers it again — which is not a queue with a dismissal, it is a queue that
+  `queued`, and it reappears on the list — which is not a queue with a dismissal, it is a queue that
   forgets. Record the re-observation on the row so the count is honest; do not act on it.
 - `resolved`, `stale` — a re-registration means it came back. Move to `queued`, keep `first_seen`,
-  reset `surface_count` to zero. A recurrence is news and should be allowed to reach the urgent slot
+  reset `surface_count` to zero. A recurrence is news and should be allowed to trigger the alarm
   again, but it is the same problem with a history, not a new one.
 
 **A finding that stops being reported is not thereby resolved.** This is the reciprocal case and the
@@ -549,7 +568,7 @@ it announces fixes that did not happen.
 So absence downgrades confidence rather than deciding anything: on a completed run, a `queued` row
 the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
-from §7.3's verification when the row next reaches a slot. Only a run that reports its own scope as
+from §7.4's verification when the row next reaches the top slice. Only a run that reports its own scope as
 complete for that cluster may do even this much; a partial run touches nothing.
 
 ## 6. Who reads it
@@ -579,21 +598,21 @@ gets the same treatment, for two reasons that are not stylistic:
 
 - **The event watcher cannot call an MCP tool.** It is Go, it speaks HTTP to this server today, and
   §5.1 makes it a first-class writer. An endpoint has to exist whatever the agent uses.
-- **The selection rules have to be code.** §4.1 rejects model-side scoring because three runs on
-  identical input produced 3, 6 and 6 items; selection has the same exposure and a worse blast
-  radius, because it decides what a person sees rather than what order a list is in. A drip that
-  re-derives "today's two" from prose each morning is that instability wearing a different hat. So
-  the two-slot pick is a Python function beside the table, reached as an endpoint that returns rows
-  already chosen — not a prompt that asks a model to choose.
+- **The ordering has to be code.** §4.1 rejects model-side scoring because three runs on identical
+  input produced 3, 6 and 6 items. Ordering has the same exposure and a worse blast radius, because
+  it decides what a person reads first rather than what a report happens to say. So the sort is a
+  Python function beside the table, reached as an endpoint that returns rows already ordered — not a
+  prompt that asks a model to rank.
 
-| endpoint                          | caller                            | does                                                                                       |
-| --------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------ |
-| `POST /v1/findings`               | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id     |
-| `GET /v1/findings/drip`           | the drip job                      | the urgent and drain picks, batching applied (§7), selection in code                       |
-| `GET /v1/findings`                | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                                 |
-| `POST /v1/findings/{id}/surfaced` | the drip job                      | after the send: `surface_count`, `surfaced_at`, `next_offer_after`, `chat_id`, `thread_id` |
-| `PATCH /v1/findings/{id}`         | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation                |
-| `POST /v1/findings/{id}/verified` | the drip job                      | the three-outcome result of §7.3, with what was observed                                   |
+| endpoint                                         | caller                            | does                                                                                   |
+| ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
+| `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
+| `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in score order, grouped by object; the whole list, ordering in code     |
+| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                             |
+| `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
+| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation            |
+| `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                               |
+| `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                     |
 
 Then, and only then, the MCP layer: thin tools on `platform_mcp_server.py` that call those endpoints
 on loopback. That is not a new pattern — `send_notification` and `report_to_chat` are already
@@ -607,160 +626,164 @@ and a reader will ask why the queue does not follow suit. That script is a CLI b
 opposite on both counts: its state is a database another process already owns, and a second writer
 to that file is a locking problem rather than a convenience.
 
-## 7. The drip
+### 6.2 The core knows nothing about repositories
 
-A new job on the Platform Agent roster in
-[`jobs.json`](../../agents/platform/cron/jobs.json) with `deliver: "chat"`, the same shape as the
-agent-driven watchdogs already on it.
+That endpoint list is the boundary, and it is worth stating what the boundary is for. **Storing and
+ranking findings is one job; putting the ranked list where a human sees it is another.** The first
+is the core — the `findings` table, the rubric, verification, the state machine — and it produces a
+ranked list and nothing else. The second is a publisher: it reads that list and renders it into
+chat, a GitHub issue, a file in a repository, or something not yet written. Publishers are
+interchangeable and the core does not know which one is running.
 
-**The drip asks a different question from the queue.** The queue's order is `rank_score`; the drip
-asks what must be done _today_, and that is L rather than the total. It fills two slots from two
-separate pools:
+The core therefore contains no repository concepts at all. No issue numbers, no `gh` calls, no
+branch names, no string that only parses on one host. This is not speculative tidiness: the install
+already depends on GitHub in two heavier places — the seven audit ledgers are GitHub issues, and
+`remediate` opens GitHub pull requests — and work to support other repository systems has to
+abstract both. The queue's core should have nothing in it for that work to touch, and its publishers
+should adopt whatever abstraction that work produces rather than growing a second one.
 
-- **The urgent slot** takes the highest-scoring finding at L = 10 (failing now), or at L = 4 with
-  its deadline inside a seven-day horizon. Ownership does not filter this pool: a provider-managed
-  component that is actively broken competes here on its score like anything else (§4.4), because
-  the operator needs to know whether or not the remedy is theirs to apply. Empty when nothing is
-  firing.
-- **The drain slot** takes the highest-scoring finding that has never been surfaced, falling back to
-  the highest-scoring one whose re-offer interval has come round. **Urgency cannot take this slot**
-  — see §7.2, where letting it do so is what breaks the design.
+Three things follow, and they are cheap now and migrations later:
 
-**The urgent slot is deliberately wider than §4.2's floor**, and the gap between them is the point
-rather than an inconsistency to tidy up. The slot selects on L alone, so everything failing now is
-eligible to be seen; the floor adds `B ≥ 3`, so only what the user depends on is _called_ `critical`.
-An OOMKilled dev batch Job therefore takes the urgent slot on a morning when nothing above it is
-firing — which is right, it is the worst thing happening — and still arrives labelled `major`, which
-is also right. Narrowing the slot to match the floor would buy a tidier rule by going silent about a
-live fault; widening the floor to match the slot would buy it by spending the word `critical` on a
-scratch workload.
+- **`pr_url`/`pr_state` are opaque** (§3.1). The core stores what it was handed.
+- **Where the list was published is publisher state**, in `queue_publications`, not a column on
+  thirty findings.
+- **A publisher needs only three operations of its target**: create it once, rewrite its contents in
+  place, close it. Every repository system can do all three, and so can a file in git.
 
-A finding is a candidate unless it is `resolved`, `dismissed`, `stale`, `snoozed`, or inside its
-re-offer interval. It is emphatically not restricted to `queued`: a finding moves to `surfaced` the
-first time it is posted, and §7.1 is about the ones that must keep coming back after that.
+**§9 is the one exception, and it is deliberate.** Promoting a finding to a pull request means
+talking to a repository, and it is triggered by the core's own ordering. It stays outside the core
+proper — the daily job shells out to `remediate` and writes the resulting URL back through the API —
+so the core still holds no repository code. A reader who expected promotion to be a core feature
+should read §9 as a publisher-side action with a core-side record.
 
-**The drain slot batches by object.** When the drain pick is one of several findings queued against
-the same `(cluster, namespace, object)`, it brings the others with it as sub-items of a single
-message. They are one visit to one manifest and usually one pull request; splitting them across
-three weeks of mornings asks the user to open the same file three times. This does not widen the
-message beyond one object, and it does not apply to the urgent slot, where the point is that one
-thing is on fire.
+## 7. Publishing the queue
 
-**Two is a ceiling, not a quota.** The argument is Step 4's, about its five, and it transfers
-intact: "Report the number of distinct problems the cluster actually has… Never pad toward five…
-Padding is the failure this stage was built to fix; a short report is the success case, not an
-incomplete one." A drip that posts two items every morning because two is the number teaches the
-user to stop reading it, which costs more than the backlog does. It posts what genuinely warrants
-today — often one, sometimes none. An empty queue produces no message at all, consistent with the
-`[SILENT]` convention the governance jobs already use.
+The core produces one ranked list. Getting it in front of a person is a separate job, done by
+publishers reading `GET /v1/findings/ranked` (§6.2). Three ship:
 
-**Re-verify at surface time, not on a sweep.** The job re-checks only the candidates it is about to
-post, updating `last_verified` and resolving anything already fixed. Verification cost then scales
-with what is surfaced rather than with the size of the backlog, and it answers the staleness half of
-#774 directly: nothing reaches a human without having been checked against the live cluster in the
-same run.
+| publisher       | what it is                                                 | cadence                                     |
+| --------------- | ---------------------------------------------------------- | ------------------------------------------- |
+| **the backlog** | the whole ranked list, as one document, rewritten in place | after every sweep and every daily run       |
+| **the nudge**   | a three-line chat message: count, top three, link          | daily, when the list changed (§7.2)         |
+| **the alarm**   | a chat message about one finding that is failing now       | the run that finds it crossing §4.2's floor |
 
-**The cap is the only limiter, and it is enough.** `_claim_alert_quota` is spent in `inject_message`
-alone; the cron relay path does not touch `alert_quota`, so the drip neither consumes nor is
-constrained by the per-severity daily budget. A two-item ceiling is one chat message a day, which is
-self-limiting by construction.
+**The backlog is the queue; chat is how you hear about it.** That split is the whole of §7, and it
+is a deliberate reversal of the obvious design, in which a cron job posts a couple of findings into
+chat every morning and chat is the only place the queue is ever visible. §7.3 is the measurement
+that killed that version.
 
-### 7.1 Re-offering, and why it is not "surfaced once, then quiet"
+### 7.1 The backlog document
 
-The tempting rule — a finding leaves contention once it has been surfaced — is wrong for the case
-that matters most. Something failing now and still unfixed is still today's most important thing,
-and going quiet about it is the queue failing at its only job. What actually needs guarding against
-is nagging someone daily about a missing probe. L already separates those, so it sets the re-offer
-interval. This is Alertmanager's `repeat_interval` applied to a backlog.
+One document per install, holding every open finding in `rank_score` order — id, score, severity,
+object, the one-line recommendation, `last_verified`, and the pull request link where there is one.
+Grouped by `(cluster, namespace, object)`, because findings cluster hard on objects and a workload's
+five problems are one visit to one manifest. Rewritten in place after each run rather than appended
+to, so what a reader sees is the queue as it is now.
 
-- **L = 10, failing now: tomorrow, then easing** — the next drip, the one after, then two days,
-  four, and weekly from there. A firing critical is an unacknowledged page and it keeps the urgent
-  slot for as long as it burns, but the interval widens, because by the fourth identical morning
-  the message has stopped being news and started being the reason the user skims past it. §7.2 is
-  the measurement: an unfixable fire on a flat interval is what starves the rest of the queue.
-- **L = 4, dated: an interval that tightens toward the deadline** — weekly while it is far, daily
-  inside the last two days. The deadline is the reason the finding has a date on it. **A deadline
-  that has passed is no longer dated; it is failing now**, so the finding becomes L = 10 and takes
-  that row's interval. Without this it matches "inside the last two days" forever and re-offers
-  daily for good.
-- **Everything else: exponential backoff** on the drain slot — one day, three, seven, twenty-one,
-  then quarterly. Not never, but not every morning.
+**Today that document is a GitHub issue**, an eighth alongside the seven the audit streams already
+keep. `audit_report.py` states the pattern at the top of the file — each stream "owns exactly ONE
+open GitHub **issue** — its ledger — rewritten in place" — and the queue owns one more of the same
+kind. It cannot reuse the seven: §10 makes a finding one row whatever source saw it, and the point
+is a single order across all of them, which seven ledgers cannot express.
 
-**A re-offer is a reminder, not a re-explanation.** The first surface gets the full shape: the
-issue, its root cause, the recommendation, and the pull request. Every re-offer after it is one line
-— what it is, how long it has been failing, and the PR link. Repeating the full treatment verbatim
-each morning is the thing that teaches someone to stop reading, and it is avoidable without going
-silent.
+**Where there is no usable issue tracker, it is a `FINDINGS.md` committed to the GitOps repository**,
+rewritten each run. That needs nothing but git, which is the real common denominator, and every
+repository system renders markdown. It loses the per-finding comment thread — no great loss, since
+§6.1's API already owns accept, dismiss and snooze, and §3.2 routes them through kanban cards rather
+than through comments.
+
+**Why a document and not more chat.** Almost every mechanism the chat-only design needed exists to
+compensate for chat forgetting: a re-offer interval per severity band, a stored next-offer date, a
+count of how many times a finding had been shown, an interval that widens as a message stops being
+news, and a rule for batching a workload's findings into one message so they would not consume three
+separate mornings. All of it answers one question — _will the user ever see the thing we did not
+show today_ — and a list that stays on screen answers it by construction. What is left is the
+ranking, which is §4, and telling someone the list moved, which is §7.2.
+
+### 7.2 The nudge
+
+One chat message a day: how many findings are open, the top three by `rank_score`, and a link to the
+backlog. Three lines. It is a status line, not a report, and specifically not a re-offer — it names
+the top of a list the reader can open in full, so nothing is hidden by not being named.
+
+**It posts only when the list changed, with a weekly message regardless.** Changed means a finding
+entered, left, or moved into or out of the top three. An identical message every morning is one the
+reader stops opening inside a fortnight, which is #774 arriving by a different route; a silent week
+is indistinguishable from a broken job, which the weekly message fixes. An empty queue produces the
+weekly line and nothing else, consistent with the `[SILENT]` convention the governance jobs already
+use.
+
+**The alarm does not wait for the gate.** A finding that crosses §4.2's floor — `L = 10` and
+`B ≥ 3`, failing now on something the user depends on — gets its own message, carrying the full
+shape: the issue, its root cause, the recommendation, and the pull request. It posts whether or not
+the list changed by §7.2's definition, and the nudge omits what the alarm has just sent rather than
+naming it twice in one morning. Where the finding came from the event watcher, that watcher's
+existing `inject_message` path already reports the fault within the minute, and the alarm's job is
+to attach the queue's ranking and its prepared fix to something the user has already heard about.
+
+The floor is narrower than the list's own top, deliberately: it requires `B ≥ 3`, so an OOMKilled
+dev batch Job can head the list on a quiet morning without waking anyone. It appears in the nudge,
+which is the right volume for it.
+
+`_claim_alert_quota` is spent in `inject_message` alone, so neither publisher consumes nor is
+constrained by the per-severity daily budget. Their own cadences are the limit.
 
 **Silence is not consent; `snooze` is.** The user needs an explicit way to say "I know, not now" — a
 `snoozed` state with a `snoozed_until`, the backlog equivalent of an alert silence. Inferring
 dismissal from an unanswered message is how this design would end up back at ignoring its own top
-item.
+item. Inferring it from an unopened list would be the same mistake in a new medium.
 
-**A finding re-offered many times without action is itself a finding.** After several unactioned
-re-offers of a `critical`, the drip should say so. Either the rubric mis-scored it or the fix is
-blocked on something, and both are worth surfacing instead of a sixth identical reminder.
+**A finding stuck at the top is itself a finding.** When the same `critical` heads the list for
+several weeks with no state change, the nudge should say so rather than name it a fifteenth time.
+Either the rubric mis-scored it or the fix is blocked on something, and both are worth surfacing.
+`surface_count` and `first_seen` are what make that detectable.
 
-Specify the message shape once and have the on-demand pull reuse it: the issue, its root cause, the
-`recommendation`, and the pull request link — or, where `remediation.kind` is not `manifest`, the
-recommendation together with an explicit statement that there is no PR for this one.
+### 7.3 What a dry run showed, and why there is no selection
 
-### 7.2 What a dry run of the selection rules showed
+An earlier draft of §7 chose two findings a morning and posted them into chat, and nothing else was
+published anywhere. Those rules were run against a simulated neglected fleet: two clusters, 32 findings scored by
+§4 using real check slugs, 30 of them past §4.4's ownership gate, and nobody fixing anything.
 
-The rules above were run against a simulated neglected fleet before this document was settled: two
-clusters, 32 findings scored by §4 using real check slugs, 30 of them eligible for a drip slot after
-§4.4's ownership gate, and nobody fixing anything. The ranking held up — the order is defensible end to
-end, both gates sort correctly, and the two findings that tie at 90 (`probes-liveness` and
-`probes-readiness` on the same workload) break deterministically on `_finding_sort_key`.
-
-The selection did not. An earlier draft of this section gave urgency both slots ("fires displace
-the drain, deliberately") and re-offered L = 10 findings on a flat daily interval. Over ninety days
-that draft surfaced **6 of 30 findings**, and one of them 90 times:
+The ranking held up. The order is defensible end to end, both gates sort correctly, and the two
+findings that tie at 90 (`probes-liveness` and `probes-readiness` on the same workload) break
+deterministically on `_finding_sort_key`. **The selection did not.** An earlier draft gave urgency
+both slots and re-offered `L = 10` findings on a flat daily interval; over ninety days it surfaced
+**6 of 30 findings**, one of them 90 times.
 
 | selection rule                             | findings surfaced | whole queue seen | worst repeat |
 | ------------------------------------------ | ----------------- | ---------------- | ------------ |
 | fires take both slots, flat daily re-offer | 6 / 30            | never            | 90×          |
 | \+ elapsed deadline becomes L = 10         | 6 / 30            | never            | 90×          |
-| \+ drain slot reserved from urgency        | 26 / 30           | never            | 90×          |
+| \+ second slot reserved from urgency       | 26 / 30           | never            | 90×          |
 | \+ re-offer interval widens for L = 10 too | 30 / 30           | day 25           | 16×          |
-| \+ drain batches by object                 | 30 / 30           | day 12           | 16×          |
+| \+ that slot batches by object             | 30 / 30           | day 12           | 16×          |
 
-Three things are worth reading off that table.
-
-**The failure reproduced #774 inside its own fix.** Twenty-four findings never surfaced at all,
-and the highest-scoring of them were not marginal: a `critical` CrashLoopBackOff on a production
+**The failure reproduced #774 inside its own fix.** Twenty-four findings never surfaced at all, and
+the highest-scoring of them were not marginal: a `critical` CrashLoopBackOff on a production
 payments workload, a `critical` single-replica session store, an expiring quota. They were starved
-by two findings that outscored them, neither of which the operator could fix _with a manifest edit_
-— a provider-managed `kube-system` CrashLoop, which §4.4 keeps in the urgent pool on purpose, and a
-certificate whose deadline had passed. Both re-offered every morning and neither ever resolved.
+by two findings that outscored them, neither of which the operator could fix with a manifest edit —
+a provider-managed `kube-system` CrashLoop, which §4.4 keeps rankable on purpose, and a certificate
+whose deadline had passed. Both re-offered every morning and neither ever resolved.
 
-Note which lever the fix is not. Both starving findings were correctly ranked and correctly
-surfaced; the `kube-system` CrashLoop is a real fault on the user's cluster and the queue should say
-so on the day it starts. Suppressing them would have produced the same 30/30 by making the queue
-worse at its job. A queue whose top item cannot be quickly actioned must still drain beneath it, and
-that is a property of the selection rules rather than of which findings are allowed in.
+Note which lever the fix was not. Both starving findings were correctly ranked and correctly
+surfaced; the `kube-system` CrashLoop is a real fault and the queue should say so on the day it
+starts. Suppressing them would have reached 30/30 by making the queue worse at its job.
 
-**Reserving the drain slot is the single largest correction** (6 → 26), and widening the L = 10
-interval is what closes the rest (26 → 30). They fix different halves: the first stops urgency
-consuming the backlog's throughput, the second stops one permanent fire consuming urgency. Neither
-alone is enough.
+Four rounds of selection rules got the number from 6/30 to 30/30 and the fastest full pass down to
+day 12. **A published list is 30/30 on day one**, and needs none of them. That is the argument for
+§7.1 stated as a measurement rather than a preference: every rule in that table is machinery for
+rationing a scarce channel, and the scarcity was self-inflicted. What survives from the exercise is
+the ranking it validated and the grouping-by-object it found — one workload in the simulated fleet
+carried seven findings and two cluster objects carried five and three, which is why §7.1 groups
+rather than lists flat.
 
-**Batching by object doubles throughput for free** (day 25 → day 12) because findings cluster hard
-on objects — one workload in the simulated fleet carried seven, and the two cluster objects carried
-five and three. That is not an artifact of the simulation; a workload with no probes usually has no
-requests and no PDB either.
+The simulation is a design aid, not a test. It assumes the rubric's own scores are right and models
+a fleet rather than measuring one. What it can show is a delivery rule starving its own queue, which
+it did.
 
-The elapsed-deadline rule changed no throughput number, because the certificate it fixes was
-outranked anyway. It is in §7.1 as a correctness fix: without it a finding whose deadline has passed
-re-offers daily forever, which is the nagging behaviour §7.1 exists to prevent.
+### 7.4 Re-verification, and why the finding has to carry its own check
 
-The simulation is a design aid, not a test — it assumes the rubric's own scores are right and
-models a fleet rather than measuring one. What it can show is a selection rule starving its own
-queue, which it did.
-
-### 7.3 Re-verification, and why the finding has to carry its own check
-
-"Re-check the candidates before posting" is one line of §7 and the hardest thing in this document to
+Re-checking before publishing is one line of §7 and the hardest thing in this document to
 build, because there is no generic way to ask a cluster whether a finding is still true. What
 "still failing" means is a property of the individual finding: for a CrashLoopBackOff it is a pod
 phase, for an expiring certificate a date, for a missing NetworkPolicy the absence of an object, for
@@ -788,13 +811,22 @@ reason map in §5.1.
 
 The stored check is the default and the model turn is the bounded fallback, not the other way round.
 Where `kind` is `manual` — a Workload Identity migration, an SLO practice observation — no command
-can settle it, and the drip says so rather than guessing.
+can settle it, and the list says so rather than guessing.
+
+**What gets verified, now that everything gets published.** Not the whole backlog: verification runs
+commands against live clusters, and doing it for thirty findings every morning makes the cost scale
+with fleet neglect. The daily job verifies three sets — anything the nudge is about to name, anything
+crossing §4.2's floor, and anything about to be promoted (§9) — which is a handful, bounded by what
+is being asserted rather than by what is stored. Everything else on the list carries its
+`last_verified` timestamp beside it, so a reader can see how fresh each row is. **A list that shows
+its own staleness is honest in a way a two-item message cannot be**, which is the one thing
+publishing everything makes easier rather than harder.
 
 **Three outcomes, never two.** This is the part that has to survive contact with implementation.
 
 | outcome              | means                                                | effect                                                        |
 | -------------------- | ---------------------------------------------------- | ------------------------------------------------------------- |
-| still reproduces     | the command ran and `still_failing_when` held        | `last_verified` advances; surface it                          |
+| still reproduces     | the command ran and `still_failing_when` held        | `last_verified` advances; publish it                          |
 | no longer reproduces | the command ran and the condition did not hold       | `resolved` (§3.2); close any open PR through `remediate`      |
 | could not verify     | the command failed, timed out, or the object is gone | `last_verified` **does not advance**; stay queued, or `stale` |
 
@@ -809,28 +841,32 @@ A finding that cannot be verified for several consecutive attempts is worth surf
 usually means the queue has lost access to something it used to be able to see, which is a fleet
 problem wearing a queue problem's clothes.
 
-### 7.4 The job, and the SOP it runs
+### 7.5 The job, and the SOP it runs
 
-The drip is a job in [`jobs.json`](../../agents/platform/cron/jobs.json) and an SOP under
-`agents/platform/governance/`, in the shape every other job on that roster already takes: the entry
-schedules it and names the profile, the SOP is what the turn actually does. Naming both matters
-because §7's behaviour has to live somewhere, and "a new job" on its own leaves the largest piece of
-this design — read the queue, verify, promote, compose — with no file to be written into.
+All three publishers run from one job in [`jobs.json`](../../agents/platform/cron/jobs.json), with an
+SOP under `agents/platform/governance/`, in the shape every other job on that roster already takes:
+the entry schedules it and names the profile, the SOP is what the turn actually does. One job rather
+than three because they share the same input and the same verification pass, and splitting them
+would run it three times.
 
-- **`findings_drip_sop.md`**, beside `inventory_prioritize_sop.md`. Four steps: fetch the picks from
-  `GET /v1/findings/drip`; run §7.3's verification on each and post the results back; promote what
-  §9 says to promote; compose the message in §7.1's shape — full treatment on a first surface, one
-  line on a re-offer — and exit `[SILENT]` when the picks are empty.
-- **The roster entry**, `deliver: "chat"` like the seven audits. Daily rather than weekly, because
-  §7's premise is "what must be done today". Scheduled _after_ the daily audit jobs rather than
-  before: the latest of them lands at 09:20, they are themselves a source (§5), and a drip that runs
-  first shows the user a queue that is a day behind its own inputs.
+- **`findings_publish_sop.md`**, beside `inventory_prioritize_sop.md`. Six steps: fetch the list
+  from `GET /v1/findings/ranked`; reconcile `pr_state` for rows with a live pull request (§3.2); run
+  §7.4's verification on the top slice and post the results back; promote what §9 says to promote;
+  rewrite the backlog document (§7.1); then post the nudge, or the alarm, or neither (§7.2).
+- **The roster entry**, `deliver: "chat"` like the seven audits — the nudge and the alarm are chat
+  messages, and the backlog rewrite is something the turn does with its own tools. Daily, scheduled
+  _after_ the daily audit jobs: the latest lands at 09:20, they are themselves a source (§5), and a
+  run that goes first publishes a list a day behind its own inputs.
 
-The SOP is deliberately thin on judgement. Selection is already decided by the endpoint (§6.1),
-verification by the stored check (§7.3), promotion by §9, and the ranking by §4 — so what is left
-for the turn is running commands and writing English, which is what a model should be doing here.
-An SOP that re-opens any of those four decisions has reintroduced the instability each of them was
-written to remove.
+The SOP is deliberately thin on judgement. The ordering is decided by the endpoint (§6.1),
+verification by the stored check (§7.4), promotion by §9, the ranking by §4, and whether to post at
+all by the change gate (§7.2) — so what is left for the turn is running commands and writing
+English, which is what a model should be doing here. An SOP that re-opens any of those decisions has
+reintroduced the instability each of them was written to remove.
+
+**Two `queue_publications` rows** (§3.1) carry what the job needs to remember between runs: the
+backlog's `target_ref`, so the rewrite finds the document it wrote last time rather than opening a
+second one, and the nudge's `content_hash`, which is what "the list changed" compares against.
 
 ## 8. How a queued finding reaches a human
 
@@ -842,7 +878,7 @@ routes through the relay, whose routing and send-then-store ordering
 [`cron-report-relay.md`](cron-report-relay.md) owns; what matters here is that `_send_to_chat`
 called with no `chat_id`/`thread_id` posts to the bare
 active platform, resolved by `get_active_platform` from `config.yaml` and landing in the install's
-home channel. No job on the roster carries a chat id; neither does the drip.
+home channel. No job on the roster carries a chat id; neither does this one.
 
 **The columns are an output.** The relay's own ordering is the pattern: send first, read back the
 thread the send resolved to, store only then. On a finding those columns record where it was
@@ -853,15 +889,18 @@ surfaced, which is what lets a reply in that thread resolve back to the finding 
 findings when no chat session need exist. A destination captured then is either absent or stale by
 the time the finding is surfaced.
 
-**Why the one-shot report needed more, and the drip does not.** The
+**Why the one-shot report needed more, and the nudge does not.** The
 [`bootstrap_onboarding` plugin](../../agents/chat/defaults/plugins/bootstrap_onboarding/plugin.py)
 exists because the single-use delivery job could not fall back to a home channel: it pins the job to
 an origin captured from a live human turn and declines to mark the profile aligned when there is
-none, so the one copy of the report is never lost. A recurring drip carries no such risk — a day
-with no reachable channel costs nothing, because the finding stays `queued` and is offered again.
-That contrast is the reason the drip may use the home channel when the bootstrap delivery may not.
+none, so the one copy of the report is never lost. A recurring nudge carries no such risk — a day
+with no reachable channel costs nothing, because the list is still there and tomorrow's message
+names the same top three. That contrast is the reason the nudge may use the home channel when the
+bootstrap delivery may not, and it is stronger here than it was for the daily drip §7 replaced:
+the backlog document does not go through chat at all, so a broken channel delays the notification
+rather than losing the finding.
 
-**One consequence to name.** A finding surfaced by the drip lands in the home channel; one surfaced
+**One consequence to name.** A finding named in a nudge lands in the home channel; one surfaced
 by an on-demand pull lands in the asking user's thread. Both write their own `chat_id`/`thread_id`,
 so a finding surfaced twice needs a rule: the most recent surface wins, because the point of the
 columns is to route a follow-up reply, and the most recent surface is the one someone is replying
@@ -871,7 +910,7 @@ to.
 job needs `platforms` present in the profile config to reach chat at all, and the Google Chat
 home-channel configuration can silently fail gateway delivery if written in the wrong shape. Both
 are properties of the deployed config rather than of this design, and both should be checked against
-a running install before the drip is declared working.
+a running install before the job is declared working.
 
 ## 9. The fix arrives with the finding
 
@@ -887,30 +926,37 @@ human's rejection; and closes the PR when the finding stops reproducing. The dis
 those two closes is the `audit:stale-closed` label, which marks **the harness's own** close: strip
 it and the close becomes a human veto.
 
-**Prepare at surface time, not at scan time.** The two timings are identical from the user's seat —
-the fix is waiting when they hear about the problem — and enormously different in cost on a first
-scan of a neglected fleet. Scan-time promotion lands dozens of pull requests before the user has
-read one finding. Surface-time promotion prepares a fix only for what the drip is about to post, so
-the ordering bounds the cost rather than fleet health doing it. This is the same principle as
-re-verifying at surface time, and the design should state them together: **cost follows what is
-surfaced, not what was found.**
+**Promote the top slice, not the list.** Publishing everything makes this the question it was not
+before: if the whole backlog is visible, does the whole backlog get a pull request? No. Scan-time
+promotion on a neglected fleet lands dozens of PRs before the user has read one finding, and a
+visible list does not change that arithmetic. So promotion is bounded the same way verification is
+(§7.4) — the findings the nudge names, and anything crossing §4.2's floor — and the rest sit on the
+list with their recommendation and no PR until they reach the top. **Cost follows what is asserted,
+not what was found.**
+
+The list should say so, per row, rather than leaving a reader to infer that a missing PR means the
+harness failed to produce one. A finding below the slice reads "no fix prepared yet"; one whose
+`remediation.kind` is not `manifest` reads that no fix can be prepared at all. Those are different
+statements and conflating them is how a reader stops trusting the column.
 
 **No `/remediate` command on this path.** The word has two senses worth separating. The CLI
 subcommand is the mechanism; `/remediate <finding-id>` on a ledger issue is one caller of it, and
 auto-promotion inside `finish` is the other. Fleet-audit gates its long tail behind the human
 trigger because seven streams reporting at once would otherwise be "a notification firehose". The
-drip's two-item ceiling is already that gate, so the trigger would be a second lock on the same
-door.
+top-slice bound above is already that gate, so the trigger would be a second lock on the same door.
+The firehose argument does not transfer to the backlog document either: it is one document that
+replaces its own contents, so a fleet with sixty findings produces the same single notification as
+one with six.
 
-**Not every finding can have a pull request, and the drip must say which it is giving.**
+**Not every finding can have a pull request, and the list must say which it is giving.**
 `remediation.kind` is `manifest`, `gcloud`, or `manual`. A Workload Identity migration or a
 control-plane upgrade is not a file in a repository. Those findings surface with their
 recommendation and no PR link, stated as such rather than left ambiguous.
 
 A provider-managed fault (§4.4) is always one of these. It is `manual`, its `note` names the support
 case or the upgrade rather than a patch, and it is the case where saying so explicitly matters most:
-this is the one class of finding the drip can rank at the top of a morning and offer no fix for, and
-a reader who is not told why will read the missing PR as the harness having failed to produce one.
+this is the one class of finding that can head the list and offer no fix, and a reader who is not
+told why will read the missing PR as the harness having failed to produce one.
 
 **What `remediate` needs from the queue.** Three required arguments, of which one is free. `--finding
 <id>` is the free one: the queue is promoting a row it has already chosen, and §3 makes `id` the
@@ -953,7 +999,7 @@ stated severity governs the ledger issue, and they can differ on the same findin
 to different questions, one asking where this ranks against the whole fleet and one asking how bad
 it is for that stream. Promotion carries the queue's, since both use `SEVERITIES`' three words and
 the promoted document is the queue's claim about the finding. Had the sweep kept its own vocabulary, the same problem would carry
-two ids, drip once and appear on a ledger separately, and nothing in the schema could tell that from
+two ids, appear once on the list and again on a ledger, and nothing in the schema could tell that from
 two real problems.
 
 The second is which `--audit` id a promoted finding uses, given the allowlist. It uses the stream
@@ -992,9 +1038,11 @@ anyway — a startup probe is an obtainability concern whether or not the bootst
 Until it is done, those three findings queue and surface as `kind: manual`, with the recommendation
 spelled out and no PR.
 
-This keeps the fleet-audit ledger out of the queue's job. `findings` remains the ranked surface and
-the thing the drip reads; the audit streams keep their ledger issues as their own reporting
-surface; the only thing crossing between them is a PR's label and its `Part of #` backlink.
+This keeps the fleet-audit ledgers out of the queue's job. `findings` remains the ranked source and
+§7.1's backlog document its published form; the audit streams keep their own ledger issues, one per
+stream, reporting on their own scans. The queue's document sits alongside them and is not one of
+them — same mechanism, different owner and different question. The only thing crossing between them
+is a PR's label and its `Part of #` backlink.
 
 _Rejected alternative:_ an eighth `AuditSpec` for bootstrap inventory, holding whatever no other
 stream owns. It would solve §10.1 without touching the existing SOPs, which is its real appeal. It
@@ -1017,23 +1065,46 @@ full-detail record of what a sweep saw, which the queue references rather than r
 Collected from the sections above so an implementation can be scoped and split, in dependency order.
 Each item names the section that specifies it; nothing here is new.
 
-| #   | deliverable                                                                                                                       | where      |
-| --- | --------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| 1   | `findings` table, indexes, and exemption from `cleanup_old_records`, in `session_kv_server.py`                                    | §3.1       |
-| 2   | Upsert rules per existing state, including sticky `dismissed`, and the absence-lowers-confidence rule                             | §5.2       |
-| 3   | The six HTTP endpoints, with the two-slot selection as a tested Python function rather than a prompt                              | §6.1, §7   |
-| 4   | Thin MCP tools over those endpoints on `platform_mcp_server.py`                                                                   | §6.1       |
-| 5   | `inventory_prioritize_sop.md` extended to register the full collapsed set with rubric vectors                                     | §5         |
-| 6   | The rubric's anchors and worked examples written into that SOP                                                                    | §4.2, §4.3 |
-| 7   | Reason-to-check map in `k8s-event-watcher`, plus its registration call                                                            | §5.1       |
-| 8   | `findings_drip_sop.md` and its `jobs.json` entry, scheduled after the daily audits                                                | §7.4       |
-| 9   | Verification execution and its three outcomes, including "could not verify"                                                       | §7.3       |
-| 10  | Surface-time promotion through `remediate`, and `pr_state` reconciliation for open promotions                                     | §9, §3.2   |
-| 11  | Three `####` sections — `startupProbe`, `readOnlyRootFilesystem`, ResourceQuota/LimitRange — in the SOPs of their nearest streams | §10.1      |
+| #                                                      | deliverable | where |
+| ------------------------------------------------------ | ----------- | ----- |
+| **The core — no repository code in any of it (§6.2).** |
 
-Items 1–4 are the storage layer and stand alone; 5–7 are the writers and can land in any order once
-4 exists; 8–10 are the drip and need everything above. Item 11 is independent of all of it and is
-work the audit streams arguably owe anyway.
+| #   | deliverable                                                                                           | where |
+| --- | ----------------------------------------------------------------------------------------------------- | ----- |
+| 1   | `findings` and `queue_publications` tables, indexes, and exemption from `cleanup_old_records`         | §3.1  |
+| 2   | Upsert rules per existing state, including sticky `dismissed`, and the absence-lowers-confidence rule | §5.2  |
+| 3   | The seven HTTP endpoints, with the ordering as a tested Python function rather than a prompt          | §6.1  |
+| 4   | Thin MCP tools over those endpoints on `platform_mcp_server.py`                                       | §6.1  |
+
+**The writers.**
+
+| #   | deliverable                                                                                   | where      |
+| --- | --------------------------------------------------------------------------------------------- | ---------- |
+| 5   | `inventory_prioritize_sop.md` extended to register the full collapsed set with rubric vectors | §5         |
+| 6   | The rubric's anchors and worked examples written into that SOP                                | §4.2, §4.3 |
+| 7   | Reason-to-check map in `k8s-event-watcher`, plus its registration call                        | §5.1       |
+
+**The publishers and the job that runs them.**
+
+| #   | deliverable                                                                                        | where    |
+| --- | -------------------------------------------------------------------------------------------------- | -------- |
+| 8   | `findings_publish_sop.md` and its `jobs.json` entry, scheduled after the daily audits              | §7.5     |
+| 9   | The backlog publisher: render the ranked list, create-or-rewrite its document, record `target_ref` | §7.1     |
+| 10  | The nudge and the alarm, including the `content_hash` change gate and the weekly floor             | §7.2     |
+| 11  | Verification of the top slice and its three outcomes, including "could not verify"                 | §7.4     |
+| 12  | Top-slice promotion through `remediate`, and `pr_state` reconciliation for open promotions         | §9, §3.2 |
+
+**Independent.**
+
+| #   | deliverable                                                                                                                       | where |
+| --- | --------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| 13  | Three `####` sections — `startupProbe`, `readOnlyRootFilesystem`, ResourceQuota/LimitRange — in the SOPs of their nearest streams | §10.1 |
+
+Items 1–4 stand alone and can be built and tested with no repository and no cluster, which is the
+practical point of §6.2's boundary. Items 5–7 can land in any order once 4 exists. Items 8–12 need
+everything above; 9 is the only one that talks to a repository, and 10 works against chat alone, so
+an install with no GitOps repository can run the nudge without the backlog. Item 13 is independent of
+all of it and is work the audit streams arguably owe anyway.
 
 Two things to settle against a running install rather than on paper, both already flagged: the
 `platforms` key a named-profile cron job needs in order to reach chat at all, and the Google Chat
