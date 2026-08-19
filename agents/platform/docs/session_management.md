@@ -202,11 +202,12 @@ row written afterwards would be lost outright if the process died mid-flight. A 
 comes back and clears the flag, recording why in `delivery_error` — without that correction the row
 reads as delivered, and the recap prints its ✅ all-clear over a day an alert never reached anyone.
 It is a separate column rather than a fourth `severity` reading because a ceiling drop and a failed
-send prescribe opposite remedies: raise the ceiling, or fix the chat credentials. The recap itself
-no longer draws that distinction — it reports neither class and counts both only to withhold the
-all-clear — so this column is the sole record that a delivery failed anywhere in the system. No
-metric counts them; the SOP's "What this recap does not report" says so, and says what to query
-instead. Like `cluster`, it postdates the first draft of this table, and the recap selects it only
+send prescribe opposite remedies: raise the ceiling, or fix the chat credentials. The recap keeps
+that distinction in its counts and drops it from its listing: it names neither class, and prints a
+separate ⚠️ total for each above the body. No metric counts the delivery-failure class at all, so
+that line and this column are together the only record that a delivery failed anywhere in the
+system. The SOP's "What this recap does not report" owns the naming-versus-counting line and says
+what to query for the detail. Like `cluster`, it postdates the first draft of this table, and the recap selects it only
 when `PRAGMA table_info` says it is there — see "A pre-release table, and no migration" below for
 why that tolerance is in the reader and not in `init_db`, and why `cluster` does not get it.
 

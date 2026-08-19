@@ -179,24 +179,30 @@ Three properties of the listing follow from what a suppressed event is:
 
 ## What this recap does not report
 
-Two classes of event are graded `Critical` or `Warning`, never reached chat, and are **not reported
-here at all** — not named, not counted, not alluded to:
+Two classes of event are graded `Critical` or `Warning` and never reached chat. Neither is **named**
+here — no workload, no reason, no message — because the listing has one subject and that subject is
+informational churn. Each is **counted**, on its own line above the body:
 
-- **Alerts the daily ceiling withheld.** `ALERT_DAILY_LIMITS` stopped them. The
-  `k8s_event_watcher_events_quota_suppressed_total` counter and `GET /v1/alert-quota` both report
-  these immediately and severity-accurately, so the signal exists outside this report.
+- **Alerts the daily ceiling withheld.** `ALERT_DAILY_LIMITS` stopped them. Reported as
+  `⚠️ *N alerts withheld by the daily ceiling and never reached chat.*` The
+  `k8s_event_watcher_events_quota_suppressed_total` counter and `GET /v1/alert-quota` report these
+  immediately and severity-accurately, so the detail lives outside this report.
 - **Alerts whose delivery failed.** `notified = 1` is written before the chat post is attempted, so
   on its own it records an intention to deliver rather than a delivery. When the post fails the
-  ingestion side clears the flag and records why in `delivery_error`. **No metric counts this**, and
-  the alert is not in chat, so the ledger column is the only trace and nothing reads it. That is a
-  real gap, accepted deliberately to keep this report to one subject; see the follow-up issue for
-  the metric that would close it.
+  ingestion side clears the flag and records why in `delivery_error`. Reported as
+  `⚠️ *N alerts failed to post to chat.*` **No metric counts this class**, so that line and the
+  ledger column are its only trace anywhere — which is why it is counted here rather than left to a
+  metric that does not exist.
 
-What the recap does instead is refuse to _deny_ them. Both counts are read, and either one blocks
-the ✅ all-clear and the 🟢 header: "Nothing was held back from chat today" printed over a day the
-ceiling ate thirty `Critical` alerts is not silence about the drops, it is a denial of them. Such a
-day reports as 📊 with no all-clear line — the reader is told nothing about what went wrong, and is
-not told that nothing did.
+Both lines are printed only when the ledger was readable; an unreadable one reports as 🔴 and the
+counts would be meaningless. Beyond counting, both totals veto the ✅ all-clear and the 🟢 header:
+"Nothing was held back from chat today" printed over a day the ceiling ate thirty `Critical` alerts
+is not silence about the drops, it is a denial of them. So such a day reports as 📊, with a count of
+what went wrong and no all-clear over it.
+
+The line between naming and counting is the contract. A count tells the reader to go and look; a
+name would make this report the second place the incident is described, which is the duplication the
+recap exists to avoid.
 
 Such a day also prints "counts cover every severity; only informational events are listed" under the
 headline. The headline totals are the whole ledger, the listing below them is `Info` alone, and on a

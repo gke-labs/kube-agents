@@ -522,10 +522,12 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         and e["count"] >= min_count
     ]
 
-    # Aggregated, never rendered. `generate_markdown_report` reports informational
-    # events only, so neither list reaches the chat message; they are part of the
-    # summary because callers other than the report read it, and because the two
-    # counts beside them veto the ✅ all-clear and the 🟢 header — a recap may
+    # Aggregated; counted in the report, never itemised in it.
+    # `generate_markdown_report` lists informational events only, so neither list
+    # reaches the chat message — but the two counts beside them do, on their own
+    # ⚠️ lines above the body. The lists are part of the summary because callers
+    # other than the report read it, and because those two counts also veto the
+    # ✅ all-clear and the 🟢 header — a recap may
     # decline to report a withheld alert, but it may not assert the day was clean
     # over one. Kept as lists rather than bare counters so a consumer can say which
     # workloads, and so restoring a listing is a rendering change and not a
@@ -652,12 +654,14 @@ def generate_markdown_report(
         qualifiers.append("Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope.")
     scope_line = "_" + " ".join(qualifiers) + "_" if qualifiers else ""
     # This recap reports informational events and nothing else. A ceiling-withheld
-    # or undelivered alert is graded Critical or Warning, was never this report's
-    # subject, and is not named, counted or hinted at anywhere below — see the SOP,
-    # "What this recap does not report", for the gap that leaves and where the
-    # remaining signal lives.
+    # or undelivered alert is graded Critical or Warning and was never this
+    # report's subject, so it is never *named* below — no workload, no reason, no
+    # message. It is counted: the two ⚠️ lines further down carry the totals, and
+    # for the delivery-failure class that line is the only unprompted report of it
+    # anywhere, since no metric counts that one. See the SOP, "What this recap does
+    # not report", which owns the naming/counting line.
     #
-    # Both counts are still read, for one purpose: they veto the ✅ all-clear and
+    # Both counts are also read for a second purpose: they veto the ✅ all-clear and
     # the 🟢 header. Not reporting an alert is the choice; asserting it did not
     # happen is a different thing, and a recap that prints "nothing was held back
     # from chat" over a day the ceiling ate 30 Criticals is not silent about them,
