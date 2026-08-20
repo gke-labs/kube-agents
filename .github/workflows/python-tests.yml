@@ -114,9 +114,8 @@ jobs:
           # does not have.
           fetch-depth: 0
           # Nothing after checkout needs git credentials (diff-cover diffs
-          # locally, gh reads GH_TOKEN from the env), and this job executes
-          # the pull request's own Makefile and tests -- don't leave a token
-          # on disk for them to read.
+          # locally), and this job executes the pull request's own Makefile
+          # and tests -- don't leave a token on disk for them to read.
           persist-credentials: false
 
       - name: Set up Python
