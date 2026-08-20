@@ -32,10 +32,24 @@ ATTRIBUTION_COLORS = {
     AttributionLevel.MISSING: "#FF6B7A",
 }
 
-AGENT_SELECTOR_HELP = (
-    "Select the deployed agent runtime. Today each entry is backed by a "
-    "Kubernetes PlatformAgent custom resource."
-)
+def render_command_evidence(item: dict, *, expanded: bool = False) -> None:
+    """Render one raw external-command result consistently across pages."""
+    source = str(item.get("source") or "Evidence")
+    returncode = int(item.get("returncode", 0))
+    with st.expander(f"{source} · exit {returncode}", expanded=expanded):
+        command = str(item.get("command") or "")
+        if command:
+            st.caption(command)
+        stdout = str(item.get("stdout") or "")
+        stderr = str(item.get("stderr") or "")
+        if stdout:
+            st.code(stdout, language="text", wrap_lines=True)
+        if stderr:
+            st.code(stderr, language="text", wrap_lines=True)
+        if item.get("timed_out"):
+            st.caption("timed_out=true")
+        if not stdout and not stderr:
+            st.code("", language="text")
 
 
 def selectable_table(

@@ -5,20 +5,28 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from admin_console import agent_runtime
-from admin_console.api.models import ApprovalRequest, StartInteractionRequest
+from admin_console.api.authorization import portal_api_token
+from admin_console.api.models import (
+    ApprovalRequest,
+    LlmConfigurationRequest,
+    StartInteractionRequest,
+)
 from admin_console.chat.backend import persisted_backend_factory
 from admin_console.chat.service import ChatService
 from admin_console.chat.store import SQLiteInteractionStore, interaction_state_path
 from admin_console.connection_persistence import load_connection
+from admin_console.llm_gateway import LlmGatewayService
 from admin_console.project_config import (
     TARGET_SCOPE_HEADERS,
     DeploymentTarget,
@@ -26,6 +34,7 @@ from admin_console.project_config import (
 )
 
 RuntimeProviderFactory = Callable[[], agent_runtime.AgentRuntimeProvider]
+LlmGatewayFactory = Callable[[DeploymentTarget], LlmGatewayService]
 
 
 def _error(code: str, message: str, *, retryable: bool = False) -> dict:
@@ -55,6 +64,8 @@ def create_app(
     service: ChatService | None = None,
     *,
     runtime_provider_factory: RuntimeProviderFactory | None = None,
+    llm_gateway_factory: LlmGatewayFactory | None = None,
+    bound_target: DeploymentTarget | None = None,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager] | None = None,
 ) -> FastAPI:
     account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "").strip()
@@ -65,16 +76,51 @@ def create_app(
     runtime_provider_factory = runtime_provider_factory or _persisted_runtime_factory(
         account
     )
+    llm_gateway_factory = llm_gateway_factory or LlmGatewayService
     app = FastAPI(
         title="kube-agents admin portal",
         version="1.0.0",
         lifespan=lifespan,
     )
     app.state.chat_service = service
+    expected_api_token = portal_api_token()
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, exc: RequestValidationError):
+        # FastAPI's default 422 body repeats the rejected input. Commands can
+        # contain prompts or write-only provider credentials, so retain the
+        # field path and diagnostic while omitting caller-supplied values.
+        errors = [
+            {
+                key: value
+                for key, value in issue.items()
+                if key not in {"input", "ctx"}
+            }
+            for issue in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": errors},
+        )
 
     @app.middleware("http")
-    async def reject_stale_target(request: Request, call_next):
+    async def authorize_and_reject_stale_target(request: Request, call_next):
         if request.url.path.startswith("/api/v1/"):
+            scheme, _, supplied_token = request.headers.get(
+                "authorization", ""
+            ).partition(" ")
+            if scheme.lower() != "bearer" or not secrets.compare_digest(
+                supplied_token, expected_api_token
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": _error(
+                            "portal_api_unauthorized",
+                            "This request is not authorized for the current portal launch.",
+                        )
+                    },
+                )
             supplied = {
                 header: request.headers.get(header, "")
                 for header, _ in TARGET_SCOPE_HEADERS
@@ -90,19 +136,22 @@ def create_app(
                             )
                         },
                     )
-                connection = load_connection(account)
-                if connection is None or not connection.usable:
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "detail": _error(
-                                "connection_unavailable",
-                                "No verified portal connection is available.",
-                                retryable=True,
-                            )
-                        },
-                    )
-                expected = deployment_target_headers(connection.target)
+                if bound_target is not None:
+                    expected = deployment_target_headers(bound_target)
+                else:
+                    connection = load_connection(account)
+                    if connection is None or not connection.usable:
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "detail": _error(
+                                    "connection_unavailable",
+                                    "No verified portal connection is available.",
+                                    retryable=True,
+                                )
+                            },
+                        )
+                    expected = deployment_target_headers(connection.target)
                 if supplied != expected:
                     return JSONResponse(
                         status_code=409,
@@ -123,6 +172,70 @@ def create_app(
     @app.get("/readyz")
     def ready() -> dict:
         return {"status": "ready"}
+
+    def request_target(request: Request) -> DeploymentTarget:
+        values = {
+            attribute: request.headers.get(header, "").strip()
+            for header, attribute in TARGET_SCOPE_HEADERS
+        }
+        if all(values.values()):
+            return DeploymentTarget(**values, source="portal request")
+        if bound_target is not None:
+            return bound_target
+        connection = load_connection(account)
+        if connection is None or not connection.usable:
+            raise HTTPException(
+                status_code=503,
+                detail=_error(
+                    "connection_unavailable",
+                    "No verified portal connection is available.",
+                    retryable=True,
+                ),
+            )
+        return connection.target
+
+    @app.get("/api/v1/llm-gateway")
+    def inspect_llm_gateway(request: Request) -> dict:
+        try:
+            return llm_gateway_factory(request_target(request)).status()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("llm_gateway_unavailable", str(exc), retryable=True),
+            ) from exc
+
+    @app.get("/api/v1/llm-gateway/device-status")
+    def llm_gateway_device_status(request: Request) -> dict:
+        try:
+            return llm_gateway_factory(request_target(request)).device_status()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("llm_device_status_failed", str(exc), retryable=True),
+            ) from exc
+
+    @app.post("/api/v1/llm-gateway/configuration")
+    def configure_llm_gateway(
+        request: Request,
+        payload: LlmConfigurationRequest,
+    ) -> dict:
+        try:
+            return llm_gateway_factory(request_target(request)).configure(
+                payload.provider_id,
+                payload.model,
+                credential=payload.credential,
+                settings=payload.settings,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=_error("invalid_llm_configuration", str(exc)),
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("llm_configuration_failed", str(exc), retryable=True),
+            ) from exc
 
     @app.get("/api/v1/agents")
     def list_agents() -> dict:

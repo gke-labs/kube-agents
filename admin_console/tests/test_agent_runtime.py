@@ -12,6 +12,7 @@ from pathlib import Path
 
 from admin_console.agent_runtime import (
     _READ_SCRIPT,
+    AgentRuntimeError,
     AgentRuntimeProvider,
     KubeCommandResult,
 )
@@ -24,30 +25,36 @@ class AgentRuntimeRunner:
 
     def run(self, arguments: list[str], *, timeout: int = 20) -> KubeCommandResult:
         self.calls.append(arguments)
-        if (
-            "pods" in arguments
-            and "kubeagents.x-k8s.io/has-credential-proxy=true" in arguments
-        ):
+        if "platformagents" in arguments:
+            return KubeCommandResult(
+                0,
+                json.dumps({"items": [{"metadata": {"name": "platform-agent"}}]}),
+            )
+        if "pods" in arguments:
             return KubeCommandResult(
                 0,
                 json.dumps(
                     {
                         "items": [
                             {
-                                "metadata": {
-                                    "name": "test-agent-01-gateway-1",
-                                    "labels": {"app": "test-agent-01-gateway"},
-                                }
+                                "metadata": {"name": "platform-agent-gateway-1"},
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "runtime-from-pod",
+                                            "ports": [
+                                                {
+                                                    "name": "api",
+                                                    "containerPort": 8642,
+                                                }
+                                            ],
+                                        },
+                                        {"name": "credential-proxy"},
+                                    ]
+                                },
                             }
                         ]
                     }
-                ),
-            )
-        if "pods" in arguments:
-            return KubeCommandResult(
-                0,
-                json.dumps(
-                    {"items": [{"metadata": {"name": "test-agent-01-gateway-1"}}]}
                 ),
             )
         if "conversations" in arguments:
@@ -279,7 +286,7 @@ class AgentRuntimeRunner:
         return KubeCommandResult(1, stderr="unexpected command")
 
 
-class LegacyGatewayRunner:
+class NonCanonicalAgentRunner:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
@@ -289,26 +296,15 @@ class LegacyGatewayRunner:
             return KubeCommandResult(
                 0,
                 json.dumps(
-                    {"items": [{"metadata": {"name": "platform-agent"}}]}
+                    {
+                        "items": [
+                            {"metadata": {"name": "ux-e2e"}},
+                            {"metadata": {"name": "custom-agent"}},
+                        ]
+                    }
                 ),
             )
-        if "kubeagents.x-k8s.io/has-credential-proxy=true" in arguments:
-            return KubeCommandResult(0, json.dumps({"items": []}))
-        return KubeCommandResult(
-            0,
-            json.dumps(
-                {
-                    "items": [
-                        {
-                            "metadata": {
-                                "name": "platform-agent-gateway-1",
-                                "labels": {"app": "platform-agent-gateway"},
-                            }
-                        }
-                    ]
-                }
-            ),
-        )
+        return KubeCommandResult(1, stderr="unexpected command")
 
 
 class EmbeddedReadScriptTest(unittest.TestCase):
@@ -552,9 +548,9 @@ class AgentRuntimeProviderTest(unittest.TestCase):
         )
 
     def test_reads_real_conversation_metadata_and_redacts_preview(self):
-        self.assertEqual(self.provider.list_agents(), ("test-agent-01",))
+        self.assertEqual(self.provider.list_agents(), ("platform-agent",))
         result = self.provider.list_conversations(
-            "test-agent-01", cutoff=datetime(2023, 1, 1, tzinfo=UTC)
+            "platform-agent", cutoff=datetime(2023, 1, 1, tzinfo=UTC)
         )
 
         conversation = result.conversations[0]
@@ -563,17 +559,21 @@ class AgentRuntimeProviderTest(unittest.TestCase):
         self.assertIn("[REDACTED]", conversation.preview)
         self.assertNotIn("secret-value", conversation.preview)
 
-    def test_discovers_legacy_gateway_through_bounded_platformagent_fallback(self):
-        runner = LegacyGatewayRunner()
+    def test_missing_canonical_agent_lists_discovered_resources(self):
+        runner = NonCanonicalAgentRunner()
         provider = AgentRuntimeProvider(self.provider.target, runner=runner)
 
-        self.assertEqual(provider.list_agents(), ("platform-agent",))
-        fallback = runner.calls[-1]
-        self.assertIn("app in (platform-agent-gateway)", fallback)
+        with self.assertRaises(AgentRuntimeError) as caught:
+            provider.canonical_agent()
+
+        message = str(caught.exception)
+        self.assertIn("platform-agent", message)
+        self.assertIn("custom-agent, ux-e2e", message)
+        self.assertNotIn("test-cluster-01", message)
 
     def test_reads_only_user_and_assistant_projection(self):
         result = self.provider.get_messages(
-            "test-agent-01", profile="default", session_id="session-1"
+            "platform-agent", profile="default", session_id="session-1"
         )
 
         self.assertEqual(
@@ -589,13 +589,14 @@ class AgentRuntimeProviderTest(unittest.TestCase):
             ],
         )
         self.assertNotIn("sh", exec_call)
+        self.assertEqual(exec_call[exec_call.index("-c") + 1], "runtime-from-pod")
 
     def test_connection_probe_returns_only_counts(self):
-        self.assertEqual(self.provider.check_connection("test-agent-01"), (2, 5))
+        self.assertEqual(self.provider.check_connection("platform-agent"), (2, 5))
 
     def test_reads_linked_agent_work_and_redacts_summary(self):
         result = self.provider.get_task_updates(
-            "test-agent-01",
+            "platform-agent",
             session_id="portal_session_1",
         )
 
@@ -610,7 +611,7 @@ class AgentRuntimeProviderTest(unittest.TestCase):
         self.assertNotIn("hunter2", task.summary)
 
     def test_reads_bounded_kanban_board(self):
-        result = self.provider.list_kanban_tasks("test-agent-01")
+        result = self.provider.list_kanban_tasks("platform-agent")
 
         self.assertEqual(len(result.tasks), 1)
         task = result.tasks[0]
@@ -619,7 +620,7 @@ class AgentRuntimeProviderTest(unittest.TestCase):
         self.assertEqual(task.child_count, 1)
 
     def test_reads_kanban_task_detail_and_redacts_evidence(self):
-        detail = self.provider.get_kanban_task("test-agent-01", "t_12345678")
+        detail = self.provider.get_kanban_task("platform-agent", "t_12345678")
 
         self.assertEqual(detail.task.status, "done")
         self.assertEqual(detail.task.run_count, 101)
@@ -631,7 +632,7 @@ class AgentRuntimeProviderTest(unittest.TestCase):
         self.assertIn("[REDACTED]", detail.events[0].payload)
 
     def test_reads_cron_jobs_executions_and_scheduler_health(self):
-        snapshot = self.provider.get_cron_snapshot("test-agent-01")
+        snapshot = self.provider.get_cron_snapshot("platform-agent")
 
         self.assertEqual(snapshot.jobs[0].name, "unique-visitors")
         self.assertEqual(snapshot.jobs[0].scheduler, "missing")
