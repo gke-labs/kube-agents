@@ -257,10 +257,14 @@ func (c *dedupCache) MarkPolicyFiltered(key EventKey, message string) {
 // failure, with only k8s_event_watcher_events_policy_filtered_total to
 // show for it.
 //
-// Bounded at one firing per window by the sticky Reopened flag. Without
-// it, a family whose members all grade Info — an emitter that leaves
-// Event.Type empty, say — would open a session on every sighting, which
-// is the churn keeping the entry exists to avoid.
+// Bounded at one firing per entry by the sticky Reopened flag, so the
+// escape hatch cannot turn into a session per sighting — the churn
+// keeping the entry exists to avoid. reopenPolicyFiltered admits only
+// events daemonWouldAlert says the daemon posts, which rules out the
+// obvious way to spend the firing repeatedly; the flag is what holds if
+// that mirror is ever wrong. An emitter leaving Event.Type empty is not
+// an example of such a family: inject_message coerces an absent type to
+// Warning, so the daemon posts those rather than grading them Info.
 func (c *dedupCache) ReopenIfPolicyFiltered(key EventKey, message string, eventLastTS time.Time) bool {
 	key.Reason = canonicalizeReason(key.Reason, message)
 	now := c.clock()
