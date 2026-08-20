@@ -5,9 +5,19 @@ on:
     tags:
       - "staging/**"
 
+# The payload here is a `helm upgrade` on the shared `kube-agents` release.
+# Cancelling one mid-flight strands the release in pending-upgrade and every
+# later deploy fails until someone rolls it back by hand, so a running deploy
+# is never cancelled. A queued one has not reached the cluster and is safe to
+# supersede.
+#
+# Keep this group one component wide. GitHub holds only a single run pending
+# per group, so a group shared with the sibling redeploys would let them evict
+# each other and silently drop a deploy. They contend on the release lock
+# instead, which scripts/helm_upgrade_retry.sh waits out.
 concurrency:
   group: staging-redeploy-agent
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read

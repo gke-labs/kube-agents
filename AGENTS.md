@@ -10,7 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Planning Agent front door — the `default` Hermes profile that receives chat ingress, plans the work, and delegates each piece to a specialist.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
-- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
+- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -260,6 +260,9 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   looked for, what it found, and the disposition of each finding. This is a required pre-PR step
   for AI agents working in this repository: you are the change's first hostile reader, and a
   reviewer who has to find what you could have found spends their attention on the wrong things.
+  The section carries every pre-PR pass, not this one alone — the docs-drift pass below runs on
+  every change too — merged into one list, so a reviewer reads what was looked for in one place
+  rather than inferring which passes ran from which findings appeared.
   This bullet is the canonical statement of the requirement; the site's
   [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
   [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
@@ -271,6 +274,14 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
     talks you into approving it, and the blind spot sits exactly where you were already wrong. It
     is why `.claude/commands/pr-review-batch.md` gives every pull request its own subagent, and a
     self-review earns it for the same reason.
+  - **`/pr-preflight` is how you get one**, and it covers the docs-drift pass below at the same
+    time. It wraps
+    [`.agents/skills/review-preflight/SKILL.md`](.agents/skills/review-preflight/SKILL.md), which
+    holds the plumbing: one diff range, the mechanical gate first, one subagent per pass, and what to
+    withhold from each. Read the skill directly if your harness has no slash commands. Invoking the
+    command is also the request to delegate that an agent is otherwise told to wait for — coding
+    agents are instructed not to spawn subagents on their own initiative, so an
+    agent that reads only the rule above finds its one route closed and takes the silent fallback.
   - **If your harness will not spawn one without a human's approval, go and get the approval.** A
     setting that requires sign-off before starting a subagent blocks this step; it does not waive
     it. Ask when you hit it, not after the review, and say what you are blocked on. Quietly running
@@ -286,12 +297,16 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   - **"No findings" is an answer only alongside what you looked for.** The skill's angles are the
     vocabulary for that, and a pass that names none of them is indistinguishable from no pass.
   - **Do not claim more than you did.** A self-review the diff contradicts is worse than none: it
-    spends the reviewer's trust before they reach the code.
+    spends the reviewer's trust before they reach the code. Name the kind of context each pass ran
+    in — subagent, fresh session, or the one that wrote the change — so the claim above it is
+    something a reviewer can weigh rather than take on trust.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
-  map coverage), while the skill also verifies that doc prose still matches the source.
+  map coverage), while the skill also verifies that doc prose still matches the source. Its
+  dispositions go in **Self-Review** with the adversarial pass's, not in a section of their own.
+  `/pr-preflight` runs this pass alongside the adversarial one, each in its own context.
 - **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
   request fills in the template's **Testing → Live validation** section with how the change was
   exercised against a real, running kube-agents installation — see [INSTALL.md](INSTALL.md) if
@@ -343,7 +358,7 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
   - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install the version CI pins (see the Install Prettier step in `.github/workflows/prettier.yml`), e.g. `npm install -g prettier@<that version>` — the manifests gate in `k8s-operator-test.yml` asserts byte-equality against that version's output, so a skew fails CI on files you did not touch. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .`). Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
-  - **Image Layer Budget:** If you add a `RUN` or `COPY` to `deploy/docker/Dockerfile`, build the `credential-proxy` target with `-t credential-proxy:latest` and run `python3 scripts/check_image_layers.py`. Docker's overlay2 driver stops mounting at 128 layers and that chain is the longest in the file; because buildx has no such limit, an over-budget image passes every PR build and fails only in Cloud Build, on main, after merge (#658). CI runs the same check in `docker-build.yml`.
+  - **Image Layer Budget:** If you add a `RUN` or `COPY` to `deploy/docker/Dockerfile`, build the `platform` target with `-t platform-agent:latest` and run `python3 scripts/check_image_layers.py`. Docker's overlay2 driver stops mounting at 128 layers and `agent-base` → `platform` is the deepest chain the file ships; because buildx has no such limit, an over-budget image passes every PR build and fails only in Cloud Build, on main, after merge (#658). CI runs the same check in `docker-build.yml`. The docstring in `scripts/check_image_layers.py` owns which image the gate points at and why — read it before changing the target here.
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
 
 ## Automated Review After Opening a Pull Request

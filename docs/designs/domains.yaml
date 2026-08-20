@@ -1,0 +1,66 @@
+# The ten domains the Platform Agent operates in, as data. Each is a job area
+# with its own SOP, cron stream, and journeys (the testing-strategy design
+# document, in review, is the source of the list; until it lands this file is
+# self-contained).
+#
+# scripts/test_domain_coverage.py reads this file and fails when a domain has
+# no bench task carrying a deterministic verification_spec -- the rule "a
+# domain with no blocking scenario is uncovered, not passing" as a build
+# failure rather than a sentence in a document.
+#
+# A task claims a domain with a top-level `domain: <slug>` field in its
+# task.yaml. It counts as covering the domain only when it also carries a
+# non-empty verification_spec.
+#
+# `allowlist` names the domains that are known-uncovered today. Delete entries
+# as Phase 2 lands scenarios; the lint refuses both an uncovered domain that
+# is not listed (a regression) and a listed domain that is covered (a stale
+# entry hiding progress). The shrinking allowlist is the tier-2 progress
+# metric of the testing implementation plan, as line coverage is the tier-1
+# one.
+
+domains:
+  - slug: chat-and-routing
+    name: Chat and routing
+    journey: Ask the fleet a question; routed to the right specialist, answered from observed evidence
+  - slug: reliability
+    name: Reliability (obtainability-audit)
+    journey: Daily reliability sweep names the workload that breaks on a drain or an upgrade
+  - slug: capacity
+    name: Capacity (stockout-prevention)
+    journey: Stockout audit names the pool at risk and the shortfall
+  - slug: cost
+    name: Cost (fleet-wide-cost-analysis)
+    journey: Weekly waste audit names the idle resource in resource units
+  - slug: security
+    name: Security (compliance-audit, ai-security-audit)
+    journey: RBAC and AI workload posture findings, each carrying a remediation
+  - slug: upgrades
+    name: Upgrades (security-patch-orchestrator)
+    journey: Upgrade readiness reports the versions and blockers it actually read
+  - slug: consistency
+    name: Consistency (fleet-consistency-drift)
+    journey: Drift sweep compares each cluster against the live-fleet majority
+  - slug: remediation
+    name: Remediation (github-issue-resolver)
+    journey: Triages a planted issue and files its report; nothing applied directly
+  - slug: cluster-debugging
+    name: Cluster debugging
+    journey: Debugs a workload; the Cluster Agent stays read-only and inside its own cluster
+  - slug: incident-triage
+    name: Incident triage (autoops)
+    journey: A warning event is triaged to a root cause and a pull request, never a cluster write
+
+# Known-uncovered. Today no bench task carries a verification_spec at all, so
+# every domain starts here. Phase 2's exit criterion is an empty list.
+allowlist:
+  - chat-and-routing
+  - reliability
+  - capacity
+  - cost
+  - security
+  - upgrades
+  - consistency
+  - remediation
+  - cluster-debugging
+  - incident-triage

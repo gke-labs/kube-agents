@@ -79,13 +79,14 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.litellm == 'true' || needs.detect-changes.outputs.github == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-secrets
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       NAMESPACE: "kubeagents-system"
     steps:
@@ -159,7 +160,7 @@ jobs:
           # bumped in the checkout's chart (the image pins this workflow
           # triggers on) would never reach the cluster again. Reset-then-reuse
           # keeps the release's own values and lets chart defaults refresh.
-          helm upgrade kube-agents charts/kube-agents -n kubeagents-system \
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
             --reset-then-reuse-values --set "platformAgent.credentials.create=true" \
             "${args[@]}" --wait --timeout 10m
 
@@ -168,13 +169,14 @@ jobs:
     needs: [detect-changes, provision-secrets]
     if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-litellm
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       NAMESPACE: "kubeagents-system"
     steps:
@@ -224,7 +226,7 @@ jobs:
           # this job's main trigger is a litellm.image.tag bump in values.yaml
           # / images.json, which --reuse-values would shadow forever behind
           # the previous release's snapshot of the old default.
-          helm upgrade kube-agents charts/kube-agents -n kubeagents-system \
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
             --reset-then-reuse-values "${args[@]}" --wait --timeout 10m
 
       - name: Verify LiteLLM Deployment Rollout
@@ -292,13 +294,14 @@ jobs:
       [detect-changes, provision-secrets, check-github-config, deploy-litellm]
     if: ${{ !cancelled() && needs.provision-secrets.result == 'success' && needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-github
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       GITHUB_PEM_PATH: "/tmp/github_app_pem_path"
       NAMESPACE: "kubeagents-system"
@@ -378,7 +381,7 @@ jobs:
           # --reset-then-reuse-values for the same reason as deploy-litellm:
           # a githubMinter.image.tag bump is this job's trigger, and only a
           # refreshed chart default can deliver it.
-          helm upgrade kube-agents charts/kube-agents -n kubeagents-system \
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
             --reset-then-reuse-values --set "githubMinter.enabled=true" \
             --set-string "githubMinter.org=$GITHUB_ORG" \
             --set-string "githubMinter.repo=$GITHUB_REPO" \

@@ -4,17 +4,28 @@
 # import at module scope, so without them the test modules that import those
 # scripts fail to load at all. Everything else in the suite is stdlib unittest.
 #
-# This file is the single source of truth for the list. Both installers read it
-# -- `make test-python-deps` locally and .github/workflows/python-tests.yml in
-# CI -- because a hand-copied second list is how the two drift into a suite that
-# passes on a runner and cannot be run on a laptop.
+# This file is the single source of truth for the list. Every installer reads
+# it -- `make test-python-deps` locally, and in CI both
+# .github/workflows/python-tests.yml, which pins its Python, and
+# .github/workflows/k8s-operator-test.yml, which takes the runner's default --
+# because a hand-copied second list is how they drift into a suite that passes
+# on a runner and cannot be run on a laptop. No other workflow installs this
+# file; the ones on other Python versions install pyyaml or
+# tests/e2e/requirements.txt, neither of which pulls in anything below.
 #
 # Deliberately unpinned apart from the one constraint that matters. These stand
 # in for what the runtime image gets transitively from hermes-agent
 # (deploy/docker/Dockerfile), which is far too heavy to install for a unit-test
 # run, so pinning them here would be pinning a fiction rather than what ships.
 #
-# If the install fails with "No matching distribution found for mcp<3", pip is
+# For mcp that stand-in is checked rather than assumed, and it holds on the
+# major line only: the ceiling below keeps this file on the same 1.x line as
+# the image, which is what `mcp.server.fastmcp` needs and all it needs. The
+# patch versions differ and nothing makes the two environments identical -- CI
+# runs Python 3.12, the image 3.13 -- so a failure that turns on a patch
+# release or an interpreter version will not reproduce from this file.
+#
+# If the install fails with "No matching distribution found for mcp<2", pip is
 # pointed at a mirror that does not carry it -- check `pip config debug`. The
 # package is on PyPI, so the fix is to name the index for this one install
 # rather than to reconfigure the machine:
@@ -28,9 +39,28 @@
 # change to the console's requirements cannot silently break it.
 fastapi
 
-# agent_common_server.py does `from mcp.server.fastmcp import FastMCP`, which
-# 2.x moved. Held below 2.0 until that import is updated.
-mcp<3
+# This one mirrors the image rather than standing in for it, and it is the
+# reason the paragraph above can claim what it claims.
+#
+# agent_common_server.py, platform_mcp_server.py and router_server.py all do
+# `from mcp.server.fastmcp import FastMCP`, and 2.x deletes that module in
+# favour of `mcp.server.mcpserver.MCPServer`. The runtime image cannot follow.
+# mcp reaches /opt/hermes/.venv from the digest-pinned Hermes base in tags.env;
+# deploy/docker/Dockerfile names no mcp requirement of its own, and the
+# unpinned `uv pip install "hermes-agent[...]"` into that venv is a resolution
+# step that leaves an already-satisfied mcp where it is. That base ships 1.28.1
+# on Python 3.13.5, and hermes-agent's own code imports the same module
+# (mcp_serve.py, agent/transports/hermes_tools_mcp_server.py), so upgrading the
+# venv breaks the harness and not just our three scripts. Those last facts are
+# read out of the image, not out of this repo -- the digest they came from is
+# HERMES_AGENT_TAG in tags.env, and re-check them there if it moves. The
+# ceiling comes off when the base image ships 2.x, not when those three are
+# ported (#800).
+#
+# It bounds the package and not the interpreter -- 1.x and 2.x both declare
+# requires-python >=3.10 and ship one pure-Python wheel -- so it rules out no
+# Python version CI runs.
+mcp<2
 
 python-dotenv
 pyyaml

@@ -107,6 +107,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-platform-security",
     ],
     "Networking and storage": [
+        "gcp-networking-fabric-audit",
         "gke-networking",
         "gke-service-networking",
         "gke-storage",

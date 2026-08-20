@@ -17,15 +17,25 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 # session_kv_server imports agent_common_server, which imports mcp.server.fastmcp.
-# That symbol is absent from some installed versions of the mcp package, and when
-# it is, this whole module fails to import -- so every test in it silently does
-# not run. That is how three denial tests for the /inject authentication came to
-# be passing-by-not-existing. Stub only when the real import fails, so a working
-# environment still exercises the real path.
+# When that import fails this whole module fails to import -- so every test in it
+# silently does not run. That is how three denial tests for the /inject
+# authentication came to be passing-by-not-existing.
+#
+# ABSENT is not BROKEN: stub only when no mcp distribution is installed -- see
+# test_mcp_package_contract.py.
 try:  # pragma: no cover - depends on the installed mcp version
     import mcp.server.fastmcp  # noqa: F401
 except Exception:  # pragma: no cover
+    import importlib.metadata
     import types
+
+    # importlib.metadata, not find_spec -- see test_mcp_package_contract.py.
+    try:
+        importlib.metadata.distribution("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        pass  # absent: a bare checkout, which is what the stub is for
+    else:
+        raise  # installed and incompatible: the ImportError is the finding
 
     _stub = types.ModuleType("mcp.server.fastmcp")
 

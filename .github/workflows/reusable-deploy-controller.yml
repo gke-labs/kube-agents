@@ -42,6 +42,7 @@ jobs:
   deploy:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
@@ -110,5 +111,5 @@ jobs:
           # CRD schema changes never ride a helm upgrade (Helm's documented
           # behaviour for crds/), so apply them first.
           kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/
-          helm upgrade kube-agents charts/kube-agents -n kubeagents-system \
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
             --reset-then-reuse-values --set "operator.image.tag=${IMAGE_TAG}" --wait --timeout 10m

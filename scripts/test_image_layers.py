@@ -63,10 +63,10 @@ class LayerCountTest(unittest.TestCase):
         as for anything else, and a developer reading "over budget" after
         forgetting to build would go and consolidate COPYs for nothing.
         """
-        failed = mock.Mock(returncode=1, stdout="", stderr="No such image: credential-proxy:latest")
+        failed = mock.Mock(returncode=1, stdout="", stderr="No such image: platform-agent:latest")
         with mock.patch.object(subprocess, "run", return_value=failed):
             with self.assertRaises(SystemExit) as raised:
-                checker.layer_count("credential-proxy:latest")
+                checker.layer_count("platform-agent:latest")
         message = str(raised.exception)
         self.assertIn("No such image", message)
         self.assertIn("docker build", message)

@@ -104,3 +104,9 @@ variable "node_image" {
   default     = "kindest/node:v1.29.2"
 }
 
+variable "orphan_max_age_hours" {
+  type        = number
+  description = "Age in hours past which a managed-by=kube-agents-bench cluster is reaped as an orphan (GCP-only)"
+  default     = 4
+}
+

@@ -45,7 +45,12 @@ def check_branch(branch_name: str) -> str:
     branch = (branch_name or "").strip()
     if not branch:
         raise ValueError("--branch is required and must not be empty")
-    if branch.lower() in PROTECTED_BRANCHES:
+    # Compare the short name: "refs/heads/main" is not in PROTECTED_BRANCHES,
+    # but pushing it moves main all the same.
+    short = branch.lower()
+    if short.startswith("refs/heads/"):
+        short = short[len("refs/heads/"):]
+    if short in PROTECTED_BRANCHES:
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch_name}' is strictly blocked by GKE SRE guardrails!"

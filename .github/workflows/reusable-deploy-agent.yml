@@ -46,6 +46,7 @@ jobs:
   deploy:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
@@ -125,7 +126,7 @@ jobs:
             exit 1
           fi
           echo "Redeploying platform-agent via helm upgrade with image: ${AGENT_IMAGE}:${IMAGE_TAG}"
-          helm upgrade kube-agents charts/kube-agents -n kubeagents-system \
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
             --reset-then-reuse-values --set "platformAgent.deployment.image.tag=${IMAGE_TAG}" --wait --timeout 10m
 
       - name: Verify Agent Deployment Rollout

@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check tf-apply tf-destroy coverage coverage-check
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check tf-apply tf-destroy coverage coverage-check
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -109,8 +109,9 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # glob, so they had never once run in CI. defaults/hooks is here for the same
 # reason -- the plugins glob does not reach it, so the chat_message_audit hook
 # was untestable-by-CI however many tests it grew. Discovery is then run once
-# per directory rather than once over the tree, because none of them are
-# packages -- `unittest discover` pointed at agents/platform/skills finds
+# per directory rather than once over the tree, because most of them are not
+# packages (incident_context is the exception, and per-directory discovery
+# still collects it) -- `unittest discover` pointed at agents/platform/skills finds
 # nothing and still exits 0, which reads as a passing suite. That also keeps
 # deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
 # separate, which they must be: those tests import their subject by bare module
@@ -141,7 +142,11 @@ test-python-deps: ## Install the third-party imports `make test-python` needs.
 #
 # Added because the answer used to be three commands nobody could remember, and
 # a handoff doc had to carry the recipe. If you add a suite, add it here.
-verify: ## Run everything a PR must pass: go build, go vet, go test, python tests.
+# test-bench is deliberately not here: its deps target installs bench/
+# editable, which pulls devops-bench from a pinned git SHA over the network.
+# verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
+# and runs locally with `make test-bench`.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -247,11 +252,20 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 	else \
 		$(MAKE) -C k8s-operator setup-envtest && \
 		(cd k8s-operator && \
-			KUBEBUILDER_ASSETS="$$(bin/setup-envtest use 1.31.0 --bin-dir bin -p path)" \
+			ENVTEST_V="$$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)" && \
+			test -n "$$ENVTEST_V" && \
+			KUBEBUILDER_ASSETS="$$(bin/setup-envtest use "$$ENVTEST_V" --bin-dir bin -p path)" && \
+			test -n "$$KUBEBUILDER_ASSETS" && \
+			KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" \
 			go test -coverpkg=./... $$(go list ./... | grep -v /e2e) -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/go-cover.out && \
 			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(CURDIR)/coverage-go.xml) \
 		|| echo "Go coverage failed; the Python half above is unaffected."; \
 	fi
+# The envtest version is read from k8s-operator/Makefile's own pin rather than
+# repeated here: a hardcoded copy drifted once already (1.31.0 against the
+# operator's 1.36.0), and the empty-string failure mode -- setup-envtest
+# failing, KUBEBUILDER_ASSETS="" exported, every suite red, all of it
+# swallowed by the || echo above -- is why both reads are guarded with test -n.
 
 # 55 is a deliberately loose placeholder: the real floor gets committed from
 # the first green CI run of the coverage job, not from a laptop measurement,
@@ -267,6 +281,17 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc --fail-under=$(COVERAGE_FLOOR) >/dev/null \
 		&& echo "Coverage is at or above the $(COVERAGE_FLOOR)% floor." \
 		|| { echo "Coverage fell below the $(COVERAGE_FLOOR)% floor."; exit 1; }
+
+# bench/tests is the one Python suite that cannot join PYTHON_TEST_DIRS: it is
+# pytest-native (fixtures, parametrize), and `unittest discover` collects two
+# of its tests and errors on both. So it runs under its own target, and
+# scripts/test_test_discovery.py keeps the exclusion explicit rather than an
+# accident of the globs above.
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
+	@python3 -m pip install -e bench/ pytest
+
+test-bench: ## Run the bench harness tests under pytest.
+	@python3 -m pytest bench/tests/
 
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean

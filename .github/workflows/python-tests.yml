@@ -6,6 +6,16 @@ on:
   push:
     branches: [main]
 
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -44,15 +54,45 @@ jobs:
       - name: Run Python unit tests
         run: make test-python
 
+  # Separate job because bench/tests is pytest-native and cannot run under the
+  # unittest discovery `make test-python` uses -- it sat outside every glob and
+  # had never once run in CI. Installing bench/ resolves devops-bench from the
+  # git SHA pinned in bench/pyproject.toml.
+  bench-tests:
+    name: Run Bench Harness Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install bench and its test runner
+        run: |
+          python3 -m pip install --upgrade pip
+          make test-bench-deps
+
+      - name: Run the bench harness tests
+        run: make test-bench
+
   # Report-only for now: it posts numbers on the pull request and blocks
   # nothing. The blocking rules (diff-coverage floor, no-test detector, total
   # ratchet) turn on in stages once a baseline of merged-PR data exists --
   # first the no-test detector, then the floor and the ratchet, with the
   # thresholds set from the observed distribution rather than this file.
+  #
+  # The job also runs on pushes to main -- measurement only, no diff, no
+  # comment. Those runs are what give the total ratchet a per-commit baseline
+  # and the coverage-check floor a number measured in CI rather than on a
+  # laptop; without them "commit the first green run's total" has no run to
+  # read.
   coverage:
     name: Coverage report
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
 
     permissions:
       contents: read
@@ -98,7 +138,13 @@ jobs:
       # plain relative matching -- diff-cover is deliberately unpinned in
       # requirements-test.txt, so the patterns must not depend on which of the
       # two an upstream release uses.
+      #
+      # The same six paths are omitted in .coveragerc, so the diff number and
+      # the repository total in the comment are computed over one file set --
+      # otherwise a PR adding uncovered lines under an excluded path reads
+      # 100% on the diff while dragging down a total the floor is blind to.
       - name: Diff coverage against the merge base
+        if: github.event_name == 'pull_request'
         env:
           # Through the environment rather than interpolated into the script:
           # zizmor flags template expansion inside `run:` as an injection
@@ -121,12 +167,17 @@ jobs:
       # Plain gh api rather than a third-party action: the logic is ten lines,
       # and it is one less pinned SHA to keep current.
       #
-      # Same-repo pull requests only: on a fork PR GitHub forces the token to
-      # read-only whatever `permissions:` asks for, so the POST would 403 and
-      # red a job whose whole point is to block nothing. Fork PRs get the
-      # artifact upload below instead.
+      # Same-repo pull requests only, and not Dependabot's: on a fork PR
+      # GitHub forces the token to read-only whatever `permissions:` asks
+      # for, and it does the same when the actor is dependabot[bot] even on
+      # a same-repo branch -- either way the POST would 403 and red a job
+      # whose whole point is to block nothing. Those runs get the artifact
+      # upload below instead.
       - name: Post the coverage comment
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.actor != 'dependabot[bot]'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -149,17 +200,20 @@ jobs:
           } > comment.md
           # Only consider comments this workflow's identity wrote: anyone can
           # start a comment with the marker, and PATCHing theirs would render
-          # the report under their name.
+          # the report under their name. tail rather than head: tail reads to
+          # EOF, so it cannot SIGPIPE a still-paginating gh under a pipefail
+          # shell; there is at most one matching comment either way.
           cid=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
                 --jq ".[] | select(.user.login == \"github-actions[bot]\")
-                          | select(.body | startswith(\"$marker\")) | .id" | head -1)
+                          | select(.body | startswith(\"$marker\")) | .id" | tail -1)
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@comment.md
           else
             gh api "repos/$REPO/issues/$PR/comments" -F body=@comment.md
           fi
 
-      # The fork-PR (and belt-and-braces same-repo) copy of the report.
+      # The copy of the report for every run the comment step skips: fork
+      # PRs, Dependabot, and the measurement-only pushes to main.
       - name: Upload the diff coverage report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

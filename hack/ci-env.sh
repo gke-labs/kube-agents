@@ -19,7 +19,9 @@ export REGION="${REGION:-us-central1}"
 
 export HOST_CLUSTER_NAME="platform-agent-host"
 export CLUSTER_NAME="${HOST_CLUSTER_NAME}"
-export GKE_CLUSTER_NAME="test-cluster"
+# GKE_CLUSTER_NAME (the per-run task cluster devops-bench provisions) is set by
+# ci-eval-pr.sh, derived from the Prow BUILD_ID so concurrent runs never share
+# a name. Deploy and teardown never touch a task cluster, so it is not set here.
 
 export TARGET_NAMESPACE="kubeagents-system"
 export NAMESPACE="${TARGET_NAMESPACE}"

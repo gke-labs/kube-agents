@@ -92,6 +92,19 @@
       "deliver": "chat"
     },
     {
+      "id": "gcp-networking-fabric-audit",
+      "name": "GCP Networking Fabric & VPC IPAM Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 8 * * *",
+        "display": "0 8 * * *"
+      },
+      "prompt": "Run the daily GCP networking fabric and VPC IPAM audit. Read the SOP at 'governance/gcp_networking_fabric_sop.md' in your profile home — all 202 lines of it, before you run anything. Its five checks are section 2, lines 33-72, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
       "id": "github-repo-watcher",
       "name": "GitHub Repo Watcher",
       "schedule": {
