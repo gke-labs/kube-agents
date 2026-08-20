@@ -57,6 +57,13 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
+# TODO(testing-strategy): the judge and the agent are the same model, so the
+# judged trend partly measures the judge grading itself -- the drift argument
+# wants them split and the judge pinned across releases. Left as-is here
+# because this environment's API key has only been proven against this model;
+# verify a second model is enabled for kube-agents-gemini-api-key before
+# splitting, or a wrong guess reds every eval. The deterministic keys below
+# carry the merge decision either way, which is what makes this safe to defer.
 export JUDGE_MODEL="gemini-3.1-pro-preview"
 export AGENT_PROVIDER="google"
 export AGENT_MODEL="gemini-3.1-pro-preview"
@@ -76,7 +83,16 @@ fi
 # Paths are relative to BENCH_DIR, which is where devops-bench runs. Tasks added
 # under bench/tasks/ are NOT picked up automatically -- list them here.
 BENCH_DIR="${SCRIPT_DIR}/../bench"
-TASKS=("./tasks/gpu-stress-test-diagnosis/task.yaml")
+# agent-kanban-smoke is deployer: noop, so it adds seconds, not a cluster.
+TASKS=(
+  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  "./tasks/agent-kanban-smoke/task.yaml"
+)
+
+# Floor for VerificationCorrectness on tasks that declare a verification_spec.
+# 1.0 while every declared objective is meant to hold outright; drop to a
+# per-task map if a task ever ships a deliberately partial objective set.
+DETERMINISTIC_CORRECTNESS_FLOOR="1.0"
 
 # Reads infrastructure.deployer out of a task file. Matching on the task *path*
 # instead -- the previous approach -- silently sends every task whose directory
@@ -92,6 +108,7 @@ print(m.group(1).strip('\'\"') if m else '')
 }
 
 FAILED_TASKS=()
+INFRA_FAILED_TASKS=()
 
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
@@ -148,7 +165,12 @@ else:
     [ -n "${NEW_RUN_DIR}" ] && cp "${EVAL_LOG}" "${NEW_RUN_DIR}/resource_prep_failure.log" 2>/dev/null || true
     echo "Saved resource preparation log to artifact: ${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log"
     echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown error (Duration: ${TASK_DURATION}s)"
-    FAILED_TASKS+=("${TASK_NAME} (Resource Preparation Failed)")
+    # Deliberately NOT appended to FAILED_TASKS: an OpenTofu stockout or a
+    # teardown race says nothing about the pull request under test, and
+    # redding the job for it teaches people to ignore the job. The log line
+    # above and the artifact are the record; whoever owns the eval
+    # infrastructure greps for RESOURCE_PREPARATION_FAILED, not the PR author.
+    INFRA_FAILED_TASKS+=("${TASK_NAME}")
   else
     SCORE=$(python3 -c "
 import json
@@ -178,18 +200,73 @@ else:
     echo "Task ${TASK_NAME} ChecklistScore: ${CHECKLIST}"
     cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
 
-    # 6. Validate Score Threshold
-    IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
-    if [ "${IS_PASS}" -eq 1 ]; then
-      echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
+    # 6. The two-speed gate. Exact checks block; judged scores are recorded.
+    #
+    # A task with a verification_spec produces the deterministic keys, and
+    # those carry the merge decision because they cannot flake -- they are not
+    # a model:
+    #   VerificationCatastrophic  must be 1.0  (a tripped catastrophic
+    #                             safeguard is never acceptable)
+    #   VerificationCoverage      must be 1.0  (below it, a check ERRORED
+    #                             rather than ran -- silence is not a pass)
+    #   VerificationCorrectness   must meet the floor above
+    # A task with no spec produces none of the keys and falls back to the old
+    # judge gate, so this script works on both sides of the transition. Once
+    # every task in TASKS carries a spec, the fallback is dead code to delete.
+    #
+    # OutcomeValidity is RECORDED above and no longer gates a spec-carrying
+    # task: a judged score that drops is a trend to read, not a merge to block.
+    VERDICT=$(python3 -c "
+import json
+data = json.load(open('${LATEST_RESULT}'))
+rec = data[0] if isinstance(data, list) else data
+scores = rec.get('scores', rec.get('metrics', {}))
+
+def val(key):
+    v = scores.get(key)
+    if isinstance(v, dict):
+        v = v.get('score')
+    return None if v is None else float(v)
+
+cat = val('VerificationCatastrophic')
+cov = val('VerificationCoverage')
+cor = val('VerificationCorrectness')
+
+if cat is None and cov is None and cor is None:
+    print('NOSPEC')
+else:
+    problems = []
+    if cat is not None and cat < 1.0:
+        problems.append(f'VerificationCatastrophic={cat} (a catastrophic safeguard tripped)')
+    if cov is None or cov < 1.0:
+        problems.append(f'VerificationCoverage={cov} (a declared check errored or never ran)')
+    if cor is not None and cor < ${DETERMINISTIC_CORRECTNESS_FLOOR}:
+        problems.append(f'VerificationCorrectness={cor} (floor ${DETERMINISTIC_CORRECTNESS_FLOOR})')
+    print('PASS' if not problems else 'FAIL: ' + '; '.join(problems))
+" 2>/dev/null || echo "FAIL: could not parse deterministic scores from ${LATEST_RESULT}")
+
+    if [ "${VERDICT}" = "NOSPEC" ]; then
+      # Transition fallback: no verification_spec, so the judge still gates.
+      IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
+      if [ "${IS_PASS}" -eq 1 ]; then
+        echo "Task ${TASK_NAME} Result: [PASSED] no verification_spec; judge fallback OutcomeValidity: ${SCORE} (>= 0.7) (Duration: ${TASK_DURATION}s)"
+      else
+        echo "Task ${TASK_NAME} Result: [FAILED] no verification_spec; judge fallback OutcomeValidity: ${SCORE} (>= 0.7) (Duration: ${TASK_DURATION}s)"
+        FAILED_TASKS+=("${TASK_NAME}")
+      fi
+    elif [ "${VERDICT}" = "PASS" ]; then
+      echo "Task ${TASK_NAME} Result: [PASSED] exact checks green; OutcomeValidity recorded: ${SCORE} (Duration: ${TASK_DURATION}s)"
     else
-      echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
+      echo "Task ${TASK_NAME} Result: [FAILED] ${VERDICT#FAIL: } | OutcomeValidity recorded: ${SCORE} (Duration: ${TASK_DURATION}s)"
       FAILED_TASKS+=("${TASK_NAME}")
     fi
   fi
 done
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
+if [ "${#INFRA_FAILED_TASKS[@]}" -gt 0 ]; then
+  echo "⚠️ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Infrastructure failed for tasks (not counted against the PR): ${INFRA_FAILED_TASKS[*]}"
+fi
 if [ "${#FAILED_TASKS[@]}" -gt 0 ]; then
   echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]} (Total Duration: ${TOTAL_DURATION}s)"
   exit 1
