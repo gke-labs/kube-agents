@@ -127,7 +127,7 @@ Grain is one problem: one check, at one object, on one cluster.
 | `state`                                      | `queued` → `surfaced` → `accepted` \| `dismissed` \| `resolved`, plus `snoozed` and `stale`                                                                                                                                |
 | `first_seen`, `last_verified`, `surfaced_at` |                                                                                                                                                                                                                            |
 | `surface_count`, `snoozed_until`             | how many nudges have named it, and the explicit silence (§7)                                                                                                                                                               |
-| `alarmed_at`                                 | the alarm's edge trigger: when it last fired for this row, null when the row is not over §4.2's floor (§7.2)                                                                                                               |
+| `alarmed_at`                                 | when the alarm last fired for this row, and the edge trigger that stops it firing again while the same fault persists. §7.2 owns the rule                                                                                  |
 | `verification`                               | `{kind, command, still_failing_when}` — how to ask the cluster whether this is still true. Written at registration by whoever found it (§7.4)                                                                              |
 | `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not a delivery input (§8)                                                                                                                      |
 
@@ -176,7 +176,7 @@ CREATE TABLE IF NOT EXISTS findings (
     surfaced_at      TIMESTAMP,
     surface_count    INTEGER NOT NULL DEFAULT 0,
     snoozed_until    TIMESTAMP,
-    alarmed_at       TIMESTAMP,                   -- edge trigger for §7.2's alarm; null when off the floor
+    alarmed_at       TIMESTAMP,                   -- §7.2's alarm edge trigger
     chat_id          TEXT,
     thread_id        TEXT,
     likelihood       INTEGER GENERATED ALWAYS AS (json_extract(rubric, '$.L')) VIRTUAL,
@@ -227,15 +227,16 @@ The indexes follow the queries the publishers actually run:
 
 ```sql
 CREATE INDEX IF NOT EXISTS findings_ranked ON findings(state, rank_score DESC);
-CREATE INDEX IF NOT EXISTS findings_urgent ON findings(likelihood, state, rank_score DESC);
+CREATE INDEX IF NOT EXISTS findings_urgent ON findings(likelihood, blast_radius, alarmed_at);
 CREATE INDEX IF NOT EXISTS findings_object ON findings(cluster, namespace, object);
 CREATE INDEX IF NOT EXISTS findings_pr     ON findings(pr_state) WHERE pr_state IS NOT NULL;
 ```
 
 `findings_ranked` serves the backlog rewrite, which reads every open row in score order, and the
 nudge, which reads the first few of the same list. `findings_object` groups a workload's findings
-together in the rendered list. `findings_pr` is narrow on purpose: it exists only so the promotion
-reconciler (§3.2) can find rows with a live pull request without walking the backlog.
+together as §7.1 renders them. `findings_urgent` serves the alarm, which selects on L and
+`alarmed_at` rather than on score. `findings_pr` is narrow on purpose: it exists only so the
+promotion reconciler (§3.2) can find rows with a live pull request without walking the backlog.
 
 ### 3.2 Lifecycle: who moves a row, and on what
 
@@ -244,15 +245,15 @@ ledger is rendered fresh each time. A queue cannot do that: `snoozed` and `dismi
 person made once and nothing in the cluster records them. So state here is stored, and every
 transition has exactly one actor.
 
-| state       | entered when                                                   | by                        | effect on publishing                                         |
-| ----------- | -------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------ |
-| `queued`    | registration, for an id not already present                    | any source (§5)           | on the list, in score order                                  |
-| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send | stays on the list; `surface_count` records how often         |
-| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card   | off the list until `snoozed_until`, then back to `surfaced`  |
-| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card   | its own section of the list; still re-verified               |
-| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card   | off the list permanently, and sticky against re-registration |
-| `resolved`  | re-verification found it no longer reproduces                  | the daily job             | off the list; kept as the record that it was fixed           |
-| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job             | off the list; distinct from `resolved` on purpose            |
+| state       | entered when                                                   | by                                                | effect on publishing                                         |
+| ----------- | -------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------ |
+| `queued`    | registration, for an id not already present                    | any source (§5)                                   | on the list, in score order                                  |
+| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                         | stays on the list; `surface_count` records how often         |
+| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the daily job returns it | off the list until `snoozed_until`, then back to `surfaced`  |
+| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                           | its own section of the list; still re-verified               |
+| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                           | off the list permanently, and sticky against re-registration |
+| `resolved`  | re-verification found it no longer reproduces                  | the daily job                                     | off the list; kept as the record that it was fixed           |
+| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job                                     | off the list; distinct from `resolved` on purpose            |
 
 **`resolved` and `stale` are different answers and must not be merged.** "The Deployment no longer
 crash-loops" and "the namespace is gone, so nobody can say" look identical to a query that only
@@ -391,7 +392,7 @@ threshold decides nothing about promotion; it decides what the surfaced message 
 and what a future `finish`-style sweep would pick up if one were ever pointed at this table.
 
 That is also what makes the floor cheap. Widening `critical` would be alarming if `critical` opened
-pull requests, and on the queue's path it does not: promotion is bounded by the top slice (§9), not
+pull requests, and on the queue's path it does not: promotion is bounded by the promotion slice (§9), not
 by the band. The one thing to carry forward is that a `finish`-style sweep pointed at this
 table later would inherit the floor as a promotion trigger — so whoever builds that decides then
 whether an actively-failing finding should auto-promote, rather than acquiring the answer by
@@ -422,8 +423,9 @@ right now" from "would be catastrophic if someone first compromised a node."
 A third pairing is the argument for §4.2's floor, and it is the row the arithmetic gets wrong on its
 own. The partial CrashLoop and the missing readinessProbe both score 90, on the same kind of
 workload, and they are not the same class of problem: one is failing now and one is a gap that may
-never fire. They still rank adjacently — that is the score doing its job, and reserving the drain
-slot (§7) is what stops the outage crowding out the gap — but they no longer carry the same word.
+never fire. They still rank adjacently — that is the score doing its job, and publishing the whole
+list (§7.1) is what stops the outage crowding out the gap — but they no longer carry the same
+word.
 The dev Job below them is the floor's other edge: also failing now, also L = 10, and left at `major`
 because B = 2 says nothing the user depends on is down.
 
@@ -479,9 +481,17 @@ Store `{B, L, detect, recover, C}` on the row. It makes the rank auditable, lets
 itself in one line — "failing now, whole workload, nothing alerts on it" — and turns a re-rank into
 a single-measure edit rather than a re-judgement of the whole finding.
 
-Re-ranking is a **named event**, never a silent recomputation. Three events move a score:
+Re-ranking is a **named event**, never a silent recomputation. Four events move a score:
 re-verification at surface time finds the finding now firing (L 6 → 10); a watcher incident lands on
-an object a queued finding already names; a dated deadline crosses into the horizon. Nothing else.
+an object a queued finding already names; a dated deadline crosses into the horizon; and
+re-verification finds the fault has stopped firing while the gap behind it remains (L 10 → 6), which
+is the only one of the four that lowers a score and the one that clears `alarmed_at` (§7.2).
+Nothing else.
+
+That fourth event is not `resolved`. A CrashLoopBackOff that stops crash-looping because someone
+raised its memory limit is fixed; one that stops because the Deployment was scaled to zero is a
+missing `readinessProbe` that is no longer firing, and §7.4's re-verification answers only the
+narrow question its stored command asks.
 
 **Cross-source ordering needs no special rule.** A watcher incident is by definition failing now, so
 L places it above posture gaps by construction. Say this where the rubric is documented, because the
@@ -549,8 +559,9 @@ Every source re-runs, so every registration is an upsert against an id that may 
 rule is per state, and two of the seven are the whole point of writing it down:
 
 - `queued`, `surfaced`, `snoozed`, `accepted` — update `detail`, `last_verified`, and the rubric
-  vector; **do not touch `state`, `surface_count`, or `snoozed_until`.** A re-registration is the
-  same problem seen again, not a new one, and clearing a snooze the user set is how a queue starts
+  vector; **do not touch `state`, `surface_count`, `snoozed_until`, or `alarmed_at`.** A
+  re-registration is the same problem seen again, not a new one, and clearing a snooze the user set
+  is how a queue starts
   nagging.
 - `dismissed` — **stays dismissed, and the sweep does not resurrect it.** This is the sticky case.
   Without it the next sweep re-registers what the user explicitly rejected, the row goes back to
@@ -570,7 +581,7 @@ it announces fixes that did not happen.
 So absence downgrades confidence rather than deciding anything: on a completed run, a `queued` row
 the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
-from §7.4's verification when the row next reaches the top slice. Only a run that reports its own scope as
+from §7.4's verification the next time the row is named in a nudge. Only a run that reports its own scope as
 complete for that cluster may do even this much; a partial run touches nothing.
 
 ## 6. Who reads it
@@ -606,22 +617,26 @@ gets the same treatment, for two reasons that are not stylistic:
   Python function beside the table, reached as an endpoint that returns rows already ordered — not a
   prompt that asks a model to rank.
 
-| endpoint                                         | caller                            | does                                                                                     |
-| ------------------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------------- |
-| `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id   |
-| `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue, grouped by object and ordered as below; the whole list, ordering in code |
-| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                               |
-| `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                   |
-| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation              |
-| `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                                 |
-| `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                       |
+| endpoint                                         | caller                            | does                                                                                   |
+| ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
+| `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
+| `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in the order below; the whole list, ordering in code                    |
+| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                             |
+| `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
+| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation            |
+| `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                               |
+| `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                     |
 
-**What `/ranked` means by "open", and how grouping and ordering coexist.** Open is `queued`,
-`surfaced`, `accepted`, and a `snoozed` row whose `snoozed_until` has passed. The sort key is
-`(actionable, the group's highest score, rank_score, _finding_sort_key)`, grouping on
-`(cluster, namespace, object)` — so one `critical` outranks a workload carrying seven `minor`s, the
-seven still arrive together, and §4.4's gate keeps unactionable findings below everything someone
-could act on.
+**What `/ranked` means by "open", and what order it returns.** Open is `queued`, `surfaced`, and
+`accepted`; a `snoozed` row rejoins them when the daily job's expiry sweep returns it to `surfaced`
+(§3.2), which is a stored transition rather than a predicate the query evaluates — otherwise the
+backlog shows a row that `GET /v1/findings` still reports as snoozed.
+
+The order is `actionable` descending, then `rank_score` descending, then `_finding_sort_key`
+ascending, which is §4.4's gate followed by the rubric followed by a deterministic tie-break. No
+grouping: `/ranked` answers "what is worst", and grouping a workload's findings together is how the
+backlog is _rendered_ (§7.1), not what the order means. Putting it here would have cost the property
+that the first three rows are the three highest-scoring findings, which is what §7.2's nudge names.
 
 Then, and only then, the MCP layer: thin tools on `platform_mcp_server.py` that call those endpoints
 on loopback. That is not a new pattern — `send_notification` and `report_to_chat` are already
@@ -683,11 +698,13 @@ that killed that version.
 
 ### 7.1 The backlog document
 
-One document per install, holding every open finding in `rank_score` order — id, score, severity,
-object, the one-line recommendation, `last_verified`, and the pull request link where there is one.
-Grouped by `(cluster, namespace, object)`, because findings cluster hard on objects and a workload's
-five problems are one visit to one manifest. Rewritten in place after each run rather than appended
-to, so what a reader sees is the queue as it is now.
+One document per install, holding every open finding — id, score, severity, object, the one-line
+recommendation, `last_verified`, and the pull request link where there is one. This publisher is
+where grouping happens: it takes `/ranked`'s flat score order and gathers each
+`(cluster, namespace, object)` together, ordering the groups by their highest-scoring member,
+because findings cluster hard on objects and a workload's five problems are one visit to one
+manifest. Rewritten in place after each run rather than appended to, so what a reader sees is the
+queue as it is now.
 
 **Today that document is a GitHub issue**, an eighth alongside the seven the audit streams already
 keep. `audit_report.py` states the pattern at the top of the file — each stream "owns exactly ONE
@@ -732,10 +749,11 @@ ranking and its prepared fix to something the user has already heard about.
 
 **It fires on the crossing, not on the condition.** A CrashLoopBackOff stays over the floor until
 someone fixes it, so "post whenever `L = 10 ∧ B ≥ 3`" is a message every morning about a fault the
-user heard about on day one — the 90× repeat §7.3 measured, rebuilt in the one publisher that has no
-change gate. So the run alarms on rows over the floor whose `alarmed_at` is null and stamps it; a
-re-rank that takes a row back under the floor clears it, as does §5.2's recurrence. A fault that
-persists alarms once and then lives on the list; a fault that clears and comes back alarms again.
+user heard about on day one — the 90× repeat §7.3 measured, rebuilt in the one publisher that posts
+without a change gate to stop it. So the run alarms on rows over the floor whose `alarmed_at` is
+null and stamps it; §4.6's fourth re-rank event clears it when the fault stops firing, as does
+§5.2's recurrence. A fault that persists alarms once and then lives on the list; a fault that clears
+and comes back alarms again.
 
 The floor is narrower than the list's own top, deliberately: it requires `B ≥ 3`, so an OOMKilled
 dev batch Job can head the list on a quiet morning without waking anyone. It appears in the nudge,
@@ -867,7 +885,7 @@ would run it three times.
 
 - **`findings_publish_sop.md`**, beside `inventory_prioritize_sop.md`. Six steps: fetch the list
   from `GET /v1/findings/ranked`; reconcile `pr_state` for rows with a live pull request (§3.2); run
-  §7.4's verification on the top slice and post the results back; promote what §9 says to promote;
+  §7.4's verification on its three sets and post the results back; promote what §9 says to promote;
   rewrite the backlog document (§7.1); then post the nudge, or the alarm, or neither (§7.2).
 - **The roster entry**, `deliver: "chat"` like the seven audits — the nudge and the alarm are chat
   messages, and the backlog rewrite is something the turn does with its own tools. Daily, scheduled
@@ -942,23 +960,34 @@ human's rejection; and closes the PR when the finding stops reproducing. The dis
 those two closes is the `audit:stale-closed` label, which marks **the harness's own** close: strip
 it and the close becomes a human veto.
 
-**Promote the top slice, not the list.** Publishing everything makes this the question it was not
+**Promote a slice, not the list.** Publishing everything makes this the question it was not
 before: if the whole backlog is visible, does the whole backlog get a pull request? No. Scan-time
 promotion on a neglected fleet lands dozens of PRs before the user has read one finding, and a
-visible list does not change that arithmetic. So promotion is bounded: the three highest-scoring
-findings a pull request can actually be written for, plus anything crossing §4.2's floor that
-qualifies. The rest sit on the list with their recommendation and no PR until they reach the top.
-**Cost follows what is asserted, not what was found.**
+visible list does not change that arithmetic. So promotion is bounded to three findings a run: the
+three highest-scoring rows that are `actionable`, whose `remediation.kind` is `manifest`, and whose
+`pr_url` is null. The rest sit on the list with their recommendation and no PR until they reach the
+top. **Cost follows what is asserted, not what was found.**
 
-**The slice is the top three _promotable_ findings, not the top three.** Those differ, and the
-difference is not an edge case: a provider-managed fault is `manual` by the rule below, and it can
-head the list for as long as the support case takes. Bounding on the nudge's top three would let
-three findings nobody can write a patch for hold the fix pipeline shut behind them — a workload
-whose missing `readinessProbe` is a four-line diff waits on a GKE support ticket. §7.2's stuck-at-top
-rule notices that state and says so in the nudge; it does not clear it. So the promotion query skips
-rows that are `provider_managed` or whose `remediation.kind` is not `manifest` and takes the next
-three, which is the same bound and a different three. Verification (§7.4) already covers "anything
-about to be promoted", so it follows the slice without a rule of its own.
+**Each of those three conditions excludes a way the slice would otherwise jam.** Bounding on the
+nudge's top three alone would let three findings that cannot move hold the pipeline shut behind
+them, and the workload whose missing `readinessProbe` is a four-line diff would wait on them
+indefinitely. §7.2's stuck-at-top rule notices that state and says so in the nudge; it does not
+clear it.
+
+- **`kind = manifest`** excludes what no pull request can express — a Workload Identity migration, a
+  control-plane upgrade, a provider-managed fault, which §4.4 keeps at the top of the list on
+  purpose and which can sit there for as long as a support case takes.
+- **`pr_url IS NULL`** makes promotion one-shot per finding. A row leaves the slice the moment it
+  has a pull request and does not come back, whatever becomes of it: `remediate` "leaves a live PR
+  untouched rather than force-pushing over a reviewer", so three findings under review — the normal
+  steady state of a working install — would otherwise occupy every slot until someone merged them.
+  A human-rejected PR is the same shape and worse, because `remediate` "never [re-proposes] after a
+  human's rejection", so that row could never yield anything and would hold a slot forever. Nothing
+  is lost by dropping it: re-proposal after a harness stale-close happens on `remediate`'s own
+  branch, on the audit stream's schedule, and needs no slot here.
+
+Verification (§7.4) already covers "anything about to be promoted", so it follows the slice without
+a rule of its own.
 
 The list should say so, per row, rather than leaving a reader to infer that a missing PR means the
 harness failed to produce one. A finding below the slice reads "no fix prepared yet"; one whose
@@ -1082,10 +1111,15 @@ the smaller change and leaves one vocabulary.
 ## 11. What this does not do
 
 It does not replace the audit ledgers. It builds no new remediation-PR machinery, reusing
-`remediate` wholesale. It leaves the first-time report as it is — the delivered `INVENTORY.md`
-keeps its cap and is still posted verbatim, and the only change is that its `Also found: N items`
-line gains a link to the backlog (§5). And `INVENTORY.raw.md` stays where it is as the
-full-detail record of what a sweep saw, which the queue references rather than replaces.
+`remediate` wholesale. It leaves the shape of the first-time report alone — the delivered
+`INVENTORY.md` keeps its five-item cap and is still posted verbatim, and its `Also found: N items`
+line gains a link to the backlog (§5). What does change is which five: §5 renders the report from
+what the sweep registered, so §4's single scale decides the order and §4.2's thresholds supply the
+severity word, where `inventory_prioritize_sop.md` today preserves the severity each finding was
+found with. That is the point of computing on one scale (§4.1) and not a side effect, but it is a
+change to the report and this section should not claim otherwise. And `INVENTORY.raw.md` stays where
+it is as the full-detail record of what a sweep saw, which the queue references rather than
+replaces.
 
 ## 12. What building this consists of
 
@@ -1116,8 +1150,8 @@ Each item names the section that specifies it; nothing here is new.
 | 8   | `findings_publish_sop.md` and its `jobs.json` entry, scheduled after the daily audits              | §7.5     |
 | 9   | The backlog publisher: render the ranked list, create-or-rewrite its document, record `target_ref` | §7.1     |
 | 10  | The nudge's `content_hash` change gate and weekly floor, and the alarm's `alarmed_at` edge trigger | §7.2     |
-| 11  | Verification of the top slice and its three outcomes, including "could not verify"                 | §7.4     |
-| 12  | Top-slice promotion through `remediate`, and `pr_state` reconciliation for open promotions         | §9, §3.2 |
+| 11  | Verification of §7.4's three sets, and its three outcomes including "could not verify"             | §7.4     |
+| 12  | Promotion-slice promotion through `remediate`, and `pr_state` reconciliation for open promotions   | §9, §3.2 |
 
 **Independent.**
 
