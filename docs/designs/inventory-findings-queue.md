@@ -1,12 +1,15 @@
 # A Findings Queue for the Bootstrap Inventory Scan
 
-> **STATUS — design of record; not yet implemented.** Nothing in this repository stores a finding
-> beyond the run that produced it. The pipeline this design extends does ship: the sweep in
+> **STATUS — partly implemented.** §12 items 1–4 ship in
+> `agents/platform/scripts/findings_queue.py` and the Session KV server: the two tables and their
+> indexes (§3.1), the rubric and the severity it derives (§4), the upsert rules (§5.2), and the
+> seven endpoints and MCP tools (§6.1). Items 5–13 do not, so nothing writes to the queue, nothing
+> publishes it, and no finding reaches a pull request — §7 through §9 remain design. The pipeline
+> this design extends does ship: the sweep in
 > [`inventory.md`](../../agents/platform/governance/inventory.md), the ranking in
 > [`inventory_prioritize_sop.md`](../../agents/platform/governance/inventory_prioritize_sop.md), and
 > the remediation-PR machinery described in
-> [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md). Treat everything below as the
-> reference design.
+> [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md).
 
 The first-time environment sweep finds everything and reports five things. On a neglected fleet the
 gap between those numbers is the whole problem: the sweep ranks dozens of findings, renders the top
@@ -173,6 +176,7 @@ CREATE TABLE IF NOT EXISTS findings (
     state            TEXT NOT NULL DEFAULT 'queued',
     first_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_verified    TIMESTAMP,
+    last_verification TEXT,                       -- JSON {outcome, observed, at}; see §7.4
     surfaced_at      TIMESTAMP,
     surface_count    INTEGER NOT NULL DEFAULT 0,
     snoozed_until    TIMESTAMP,
@@ -184,7 +188,13 @@ CREATE TABLE IF NOT EXISTS findings (
 )
 ```
 
-Five choices in there are not free.
+Six choices in there are not free.
+
+**`last_verification` is a column, not a line in a log.** §7.4 asks the verifier to record what it
+observed, and the three outcomes are only distinguishable to a later reader if the observation
+survives: `unverifiable` with "Error from server (Forbidden)" and `unverifiable` with a timeout are
+the same row otherwise, and neither is the same as a check that ran. `last_verified` answers when,
+not what.
 
 **`check_slug`, not `check`.** `CHECK` is a SQLite keyword and `CREATE TABLE findings (check TEXT)`
 is a syntax error; `"check"` parses but leaves every query one forgotten quote away from the same
@@ -354,7 +364,7 @@ State this explicitly in any SOP that applies the rubric, because the natural re
 **C — confidence**, a multiplier: 1.0 measured, where the fault or object was observed directly; 0.9
 read from live object state; 0.6 inferred from absence or a heuristic.
 
-**`rank_score = round(B × L × (detect + recover) × C)`**, giving a range of 1 to 480.
+**`rank_score = round(B × L × (detect + recover) × C)`**, giving a range of 1 to 480. `findings_queue.py` normalises C to an integer percent before the multiply and rounds half up, so the whole score is integer arithmetic — Python's `round()` is banker's rounding and would send two rubrics that differ only in C to the same score at an exact half. The percent is a storage detail of the `rubric` column; the endpoints take and return C as 1.0, 0.9 or 0.6.
 
 **Severity is derived, not judged separately:** `critical` at 150 and above, `major` from 40 to 149,
 `minor` below 40. These are initial thresholds, and §7.2 records what a dry run against a simulated
@@ -632,8 +642,11 @@ gets the same treatment, for two reasons that are not stylistic:
 (§3.2), which is a stored transition rather than a predicate the query evaluates — otherwise the
 backlog shows a row that `GET /v1/findings` still reports as snoozed.
 
-The order is `actionable` descending, then `rank_score` descending, then `_finding_sort_key`
-ascending, which is §4.4's gate followed by the rubric followed by a deterministic tie-break. No
+The order is `actionable` descending, then `rank_score` descending, then cluster, namespace, object,
+title and id ascending — §4.4's gate, then the rubric, then a deterministic tie-break. It is one
+function, `findings_queue.ranked_sort_key`, which is also what `GET /v1/findings` sorts by before it
+applies `limit`, so a capped list returns the worst rows rather than whichever ones SQLite reached
+first. No
 grouping: `/ranked` answers "what is worst", and grouping a workload's findings together is how the
 backlog is _rendered_ (§7.1), not what the order means. Putting it here would have cost the property
 that the first three rows are the three highest-scoring findings, which is what §7.2's nudge names.
