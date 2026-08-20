@@ -11,11 +11,11 @@
 # FailedScheduling warning, and the agent triages. This is the one presubmit
 # scenario that mutates, which is why it is namespace-scoped rather than
 # read-only: the fresh namespace comes from BUILD_ID and is deleted after
-# (plan §5.1).
+# (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible).
 # Isolation class: namespace-scoped. Eligible tier: presubmit, after the
 # plan's §5.0 infrastructure fix lands.
 #
-# Depends on the three AutoOps seams working (plan §5.2 item 4); until those
+# Depends on the three AutoOps seams working (the planned AutoOps seam tests); until those
 # seam tests exist, a red here cannot say which layer failed.
 id: autoops-warning-event-triage
 name: AutoOps triages a scheduling failure without touching the cluster

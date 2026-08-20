@@ -10,7 +10,7 @@
 # with no PodDisruptionBudget. Any node drain takes it to zero replicas; the
 # audit must find it and say so. We chose both names, so the exact match is
 # fair (strategy §4.2: "we planted the noun").
-# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
 # The SOP (agents/platform/governance/obtainability_audit_sop.md) forbids any
 # write path outside the audit helper: the agent never runs git/gh itself and
@@ -42,9 +42,7 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # "checkout-gateway" is the planted name; "disruption" is the forgiving
-      # substring of PodDisruptionBudget/PDB-phrasing a correct report uses
-      # when it explains WHY a drain kills the workload.
+      # The planted deployment name.
       required_phrases: ["checkout-gateway"]
   - name: report-names-the-missing-budget
     role: objective

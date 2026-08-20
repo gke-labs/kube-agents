@@ -17,7 +17,7 @@
 # components fully enabled and one does not. NOTE: this scenario is the
 # reason the seeded fleet needs THREE clusters, not two; two clusters have
 # no majority and no outlier.
-# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 id: consistency-drift-outlier
 name: Drift audit names the cluster that does not match its peers
 prompt: >-
@@ -45,6 +45,17 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["seeded-c"]
+  - name: report-names-the-drift-facet
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # "seeded-c" alone is a substring of the seeded-capacity namespace, so
+      # the name check cannot stand alone; the facet check binds the finding
+      # to the planted difference (Cloud Logging components).
+      any_of_phrases: ["logging", "SYSTEM_COMPONENTS"]
   # No deterministic mutation safeguard, documented: the planted defect is a
   # GKE logging-config facet, not a cluster object.
   # tool_called is structurally blind to worker mutations (the trajectory

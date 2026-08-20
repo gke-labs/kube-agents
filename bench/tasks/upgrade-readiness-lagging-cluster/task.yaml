@@ -9,7 +9,7 @@
 # reconcile must pin this, or GKE auto-upgrade quietly heals the defect and
 # the scenario stops proving anything — the exact drift risk strategy §6
 # open question 2 names).
-# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
 # The SOP has no vulnerability feed and forbids naming CVEs; a CVE id in the
 # report is an invention. That rule becomes an exact forbidden-phrase check.
@@ -21,9 +21,11 @@ prompt: >-
   answer.
 expected_output: >-
   The report names the lagging cluster, states its current control-plane
-  version and the version its release channel offers, and reports readiness
-  only — it recommends, it does not upgrade anything, and it cites no CVE
-  identifiers because it has no vulnerability feed.
+  version and a newer version available to it (the cluster is pinned with no
+  release channel, so "available" means the location's valid master
+  versions), and reports readiness only — it recommends, it does not upgrade
+  anything, and it cites no CVE identifiers because it has no vulnerability
+  feed.
 infrastructure:
   deployer: noop
 validated: false
@@ -43,6 +45,15 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["seeded-b"]
+  - name: report-says-the-cluster-lags
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # Discriminates a lag finding from a mere mention of the cluster name.
+      any_of_phrases: ["behind", "outdated", "lag", "older"]
   - name: no-invented-cves
     role: objective
     # assert, not the converge default: the transcript is immutable once the

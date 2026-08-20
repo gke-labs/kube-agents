@@ -195,11 +195,12 @@ cluster.
 
 A task that covers one of the ten testing domains also carries a top-level
 `domain: <slug>` field naming it. The slugs live in `docs/designs/domains.yaml`, and
-`scripts/test_domain_coverage.py` counts a domain as covered only when a task carries both
-its slug and a non-empty `verification_spec` — a spec without the field leaves the domain
-reported as uncovered, and the domain's allowlist entry in that file can then never be
-removed. devops-bench ignores the extra key (`extra: "ignore"` on its task model), so the
-field is free to carry.
+`scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
+slug AND a non-empty `verification_spec` AND is an active (uncommented) entry in
+`hack/ci-eval-pr.sh`'s `TASKS` array — covered means running, so a spec-ready task
+registered commented-out leaves its domain honestly uncovered until it activates, and
+activating it forces the allowlist edit in `domains.yaml` in the same change. devops-bench
+ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
 
 A new task must also be registered: the presubmit runs only what the `TASKS` array in
 `hack/ci-eval-pr.sh` names, and `scripts/test_task_registration.py` fails the build for a

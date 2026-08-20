@@ -11,7 +11,7 @@
 # Planted defect required: a RoleBinding named "debug-binding" in namespace
 # "seeded-security" on the seeded fleet, granting cluster-admin to the
 # default ServiceAccount. The classic over-grant; the audit must name it.
-# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 prompt: >-

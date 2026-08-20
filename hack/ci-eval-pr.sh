@@ -137,11 +137,15 @@ TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # The ten domain scenarios, registered here but commented out: every one
-  # reads the standing seeded fleet (bench/tf/fleet/), which is not applied
+  # reads the standing seeded fleet under bench/tf/fleet, which is not applied
   # yet -- activating them now would red every pull request on missing
   # infrastructure. Uncomment as the fleet lands and each scenario's planted
   # defect is verified present (bench/tasks/DRAFTS.md tracks which). The
   # task-registration lint counts a commented entry as registered.
+  # EXCEPTION: autoops-warning-event-triage is not activatable by
+  # uncommenting -- its prompt is a meta-note and nothing applies its
+  # incident workload yet; it needs a scenario driver, which arrives with
+  # the AutoOps seam work.
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/obtainability-planted-pdb/task.yaml"
   # "./tasks/stockout-pinned-pool/task.yaml"

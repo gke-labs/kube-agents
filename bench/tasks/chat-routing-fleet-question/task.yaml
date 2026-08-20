@@ -8,7 +8,7 @@
 # Planted defect required: none. Needs the deployed chat agent (front door)
 # and at least one platform specialist registered, plus the seeded fleet for
 # the specialist to read.
-# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
 # The front door holds no infrastructure tools by design (agents/chat/SOUL.md),
 # so the safeguard here is the delegation boundary: substantive work must go
