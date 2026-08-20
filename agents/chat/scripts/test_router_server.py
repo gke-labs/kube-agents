@@ -1,4 +1,5 @@
 import importlib
+import importlib.metadata
 import sys
 import types
 import unittest
@@ -17,13 +18,38 @@ def _load_router_server():
 
     These tests exercise only stdlib logic (delegation to agent_roster + the
     absence of the removed relay). When the hermes runtime deps (FastMCP /
-    pydantic) aren't importable, fall back to minimal stubs so the module still
-    imports in a bare checkout. `FastMCP().tool()` returns identity, so the
-    decorated tools remain plain callables.
+    pydantic) aren't installed at all, fall back to minimal stubs so the module
+    still imports in a bare checkout. `FastMCP().tool()` returns identity, so
+    the decorated tools remain plain callables.
+
+    ABSENT is not BROKEN: stub only when no mcp distribution is installed, and
+    ask importlib.metadata rather than importlib.util.find_spec. Why is in
+    agents/platform/scripts/test_mcp_package_contract.py, which covers this
+    module too.
+
+    Stub per module rather than by bulk sys.modules.update: overwriting a real,
+    importable module with a stub is wrong even where nothing else in this
+    directory would notice. Nothing here does today -- discovery runs one
+    process per directory and this module currently sorts last of its own --
+    but agents/platform/scripts/test_agent_common_server.py has the case where
+    a leaked stub is what a later module finds.
     """
     try:
         return importlib.import_module("router_server")
     except Exception:
+        try:
+            importlib.metadata.distribution("mcp")
+        except importlib.metadata.PackageNotFoundError:
+            pass  # absent: a bare checkout, which is what the stubs are for
+        else:
+            raise  # installed and incompatible: the ImportError is the finding
+
+        def _stub_if_missing(name, module):
+            try:
+                importlib.import_module(name)
+            except Exception:
+                sys.modules[name] = module
+
         mcp = types.ModuleType("mcp"); mcp.__path__ = []
         mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
         fastmcp = types.ModuleType("mcp.server.fastmcp")
@@ -31,10 +57,10 @@ def _load_router_server():
             tool=lambda *a, **k: (lambda f: f), run=lambda: None)
         pydantic = types.ModuleType("pydantic")
         pydantic.Field = lambda *a, **k: None
-        sys.modules.update({
-            "mcp": mcp, "mcp.server": mcp_server, "mcp.server.fastmcp": fastmcp,
-            "pydantic": pydantic,
-        })
+        _stub_if_missing("mcp", mcp)
+        _stub_if_missing("mcp.server", mcp_server)
+        _stub_if_missing("mcp.server.fastmcp", fastmcp)
+        _stub_if_missing("pydantic", pydantic)
         return importlib.import_module("router_server")
 
 

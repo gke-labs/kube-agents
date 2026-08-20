@@ -19,6 +19,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -192,6 +193,39 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 					"hostPath volumes are forbidden for security reasons",
 				))
 			}
+		}
+
+		// 2e. Validate ImagePullSecrets name a Secret, each of them exactly once.
+		// Neither shape is caught anywhere below: corev1.LocalObjectReference
+		// makes Name optional, so the CRD schema admits `- {}` and `- name: ""`,
+		// and core PodSpec validation does not reliably reject them either — on
+		// GKE 1.35.6 an empty name is a warning rather than an error. The kubelet
+		// then looks for a Secret named "", fails, and pulls anonymously, so the
+		// agent lands in ImagePullBackOff against a CR that looks like it
+		// configured a pull identity. A repeat fails further away still:
+		// PodSpec.imagePullSecrets is a server-side-apply list-map keyed on name,
+		// so two identical entries make every apply of the generated Deployment
+		// fail with `duplicate entries for key` — a reconcile error on an object
+		// the author never wrote. The controller normalizes both away for installs
+		// running without this webhook (resolveImagePullSecrets, which the chart's
+		// default leaves as the only line of defence); rejecting here puts the
+		// error on the object that has the typo.
+		seenPullSecrets := make(map[string]struct{}, len(platformAgent.Spec.Deployment.ImagePullSecrets))
+		for i, ref := range platformAgent.Spec.Deployment.ImagePullSecrets {
+			namePath := depPath.Child("imagePullSecrets").Index(i).Child("name")
+			name := strings.TrimSpace(ref.Name)
+			if name == "" {
+				allErrs = append(allErrs, field.Required(
+					namePath,
+					"an imagePullSecrets entry must name a Secret in the agent's namespace",
+				))
+				continue
+			}
+			if _, dup := seenPullSecrets[name]; dup {
+				allErrs = append(allErrs, field.Duplicate(namePath, name))
+				continue
+			}
+			seenPullSecrets[name] = struct{}{}
 		}
 	}
 

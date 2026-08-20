@@ -586,6 +586,63 @@ func TestPlatformAgentValidation(t *testing.T) {
 			t.Errorf("expected create validation to succeed for bare owner/repo gitRepo, got: %v", err)
 		}
 	})
+
+	// corev1.LocalObjectReference makes Name optional and the CRD schema defaults
+	// it to "", so a blank entry is admitted by the API server's structural
+	// validation and the kubelet then pulls anonymously. A repeat is admitted
+	// too, and fails further away still: the generated Deployment's PodSpec has
+	// imagePullSecrets as a server-side-apply list-map keyed on name, so every
+	// apply errors with "duplicate entries for key" — a reconcile failure on an
+	// object the CR's author never wrote.
+	t.Run("rejects malformed imagePullSecrets", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		for _, tc := range []struct {
+			name string
+			refs []corev1.LocalObjectReference
+		}{
+			{name: "empty name", refs: []corev1.LocalObjectReference{{Name: ""}}},
+			{name: "whitespace name", refs: []corev1.LocalObjectReference{{Name: "  "}}},
+			{name: "one good one blank", refs: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: ""}}},
+			{name: "duplicate", refs: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "regcred"}}},
+			{
+				name: "duplicate only after trimming",
+				refs: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: " regcred "}},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{
+							Deployment: &agentv1alpha1.DeploymentSpec{ImagePullSecrets: tc.refs},
+						},
+					},
+				}
+				if _, err := val.ValidateCreate(ctx, agent); err == nil {
+					t.Error("expected validation to reject the imagePullSecrets list")
+				}
+			})
+		}
+	})
+
+	t.Run("allows named imagePullSecrets", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "harbor-pull"}},
+					},
+				},
+			},
+		}
+		if _, err := val.ValidateCreate(ctx, agent); err != nil {
+			t.Errorf("expected named imagePullSecrets to pass validation, got: %v", err)
+		}
+	})
 }
 
 func TestPlatformAgentDefaulter(t *testing.T) {

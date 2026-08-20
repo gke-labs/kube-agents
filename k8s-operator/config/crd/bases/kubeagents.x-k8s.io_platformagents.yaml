@@ -3320,6 +3320,42 @@ spec:
                         - Never
                         - IfNotPresent
                       type: string
+                    imagePullSecrets:
+                      description: |-
+                        ImagePullSecrets references Secrets in the agent's namespace holding
+                        registry credentials, for installs whose mirror needs authenticating to
+                        (Harbor, Artifactory) rather than being readable with the nodes' own
+                        credentials. The Secrets are referenced, not created: each must already
+                        exist in the agent's namespace when the pod is scheduled.
+
+                        One pod means one pull identity — Kubernetes has no per-container split —
+                        so this covers every image in the pod: the agent, the credential-proxy and
+                        fluent-bit sidecars, any initContainers or sidecars set alongside, and the
+                        OCI image volumes AgentPlugins mount.
+
+                        Setting this REPLACES the operator's IMAGE_PULL_SECRETS default rather than
+                        adding to it, on the same terms as Image against PLATFORM_AGENT_IMAGE. A CR
+                        that names its own registry identity is stating it completely, and a
+                        silently merged fleet default would hand the kubelet credentials this agent
+                        never asked for.
+                      items:
+                        description: |-
+                          LocalObjectReference contains enough information to let you locate the
+                          referenced object inside the same namespace.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      type: array
+                      x-kubernetes-list-type: atomic
                     initContainers:
                       description:
                         InitContainers specifies standard Kubernetes initContainers

@@ -5,13 +5,13 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu). Both are opt-in and default to disabled.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
 ## Google Chat
 
-Google Chat is the reference channel. Setup is automated by the provisioner (`provision_05_gcp_gchat.sh`), which runs when `GOOGLE_CHAT_ENABLED=true`.
+Google Chat is the reference channel. Setup is automated by the install: the [`chat-pubsub` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) provisions the backend when Google Chat is enabled (the installer's `--enable-google-chat`, or `enable_google_chat = true` in `terraform.tfvars`).
 
 ### How it's wired
 
@@ -22,13 +22,13 @@ Google Chat is the reference channel. Setup is automated by the provisioner (`pr
 
 ### Allowed users
 
-Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separated list of user emails, collected by the provisioner as `ALLOWED_USERS`). Leaving it empty allows all users — the operator sets `GOOGLE_CHAT_ALLOW_ALL_USERS=true` in that case.
+Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separated list of user emails, collected by the installer as `ALLOWED_USERS`). Leaving it empty allows all users — the operator sets `GOOGLE_CHAT_ALLOW_ALL_USERS=true` in that case.
 
 ### Home channel
 
 `spec.integration.googleChat.homeChannel` on the PlatformAgent (surfaced to the pod as `GOOGLE_CHAT_HOME_CHANNEL`) is the space a notification lands in when there is no thread to reply into — which is every alert-driven investigation, since nobody started the conversation.
 
-Unlike Slack's, this one is not covered by `/sethome`. That command writes the **Planning Agent** profile, which is enough for the gateway's own delivery, but a specialist runs as a kanban worker against its own profile and reads the value from the pod environment instead. Set the field on the resource. `provision_05_gcp_gchat.sh` does not collect it today, so on a stock install it is empty and alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
+Unlike Slack's, this one is not covered by `/sethome`. That command writes the **Planning Agent** profile, which is enough for the gateway's own delivery, but a specialist runs as a kanban worker against its own profile and reads the value from the pod environment instead. Set the field on the resource. The installer does not collect it today, so on a stock install it is empty and alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
 
 ### What it looks like end to end
 
@@ -48,11 +48,11 @@ Every Chat message carries session context (space, user, thread) that flows thro
 
 ## Slack
 
-Slack is opt-in. Configure with `SLACK_ENABLED=true` during provisioning; the provisioner will prompt for the token values below.
+Slack is opt-in. Enable it in the installer's chat menu; the installer prompts for the token values below.
 
 ### How it's wired
 
-- `provision_06_slack.sh` collects `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USERS`, `SLACK_HOME_CHANNEL`, and `SLACK_HOME_CHANNEL_NAME`, and stores them as Kubernetes secrets.
+- The installer's Slack interview collects `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USERS`, `SLACK_HOME_CHANNEL`, and `SLACK_HOME_CHANNEL_NAME`; the chart stores the tokens in the credentials Secret and wires the CR's `slack` section.
 - The Slack listener itself lives inside the Hermes runtime; it uses Socket Mode (no public webhook required) driven by the app token.
 - Setup for the Slack app itself (creating the app, generating tokens, installing to workspace) is documented in the Hermes docs: [hermes-agent.nousresearch.com/docs/user-guide/messaging/slack](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack).
 
@@ -62,7 +62,7 @@ Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack
 
 ### Slash commands
 
-Slack only routes a leading-slash message to the app's slash handler if that slash is **registered on the Slack app**, and provisioning creates the app from tokens alone. Registering them is an optional post-provisioning step — see [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) for the procedure.
+Slack only routes a leading-slash message to the app's slash handler if that slash is **registered on the Slack app**, and the install configures the integration from tokens alone. Registering them is an optional post-install step — see [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) for the procedure.
 
 Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel message rather than a command. The `legacy_slash_commands` plugin on the Planning Agent profile unwraps that form before the gateway resolves it, so `/hermes sethome` behaves as `/sethome` either way — registering the slashes adds Slack's autocomplete, not the behaviour. The plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) is the design of record.
 
@@ -70,7 +70,7 @@ Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel mess
 
 `SLACK_HOME_CHANNEL` designates the channel an unprompted message lands in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
 
-It is optional at provisioning time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
+It is optional at install time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
 

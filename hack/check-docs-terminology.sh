@@ -101,7 +101,7 @@ if [ -n "$WRONG_GO" ]; then
 fi
 
 # --- cert-manager version -------------------------------------------------
-# Ground truth: images.json, which provision_03 also reads to build the release
+# Ground truth: images.json, which the mirror tooling also reads to build the release
 # URL it applies. Three pages quote the version back — two of them inside a
 # copy-pasteable `kubectl apply` URL — and there is nothing else to catch them,
 # because the pin has no other consumer to disagree with. Left unguarded, the

@@ -41,9 +41,9 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 Short-lived GitHub App installation tokens signed via GCP KMS and delivered through Workload Identity. This lets the `submit-suggestion` skill (and the `github-issue-resolver` watchdog) open pull requests against your GitOps repo without a long-lived PAT. Source: [`k8s-operator/config/integrations/github/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github).
 
-## What actually runs after `./provision.sh`
+## What actually runs after `./install.sh`
 
-Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, you have:
+Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 
 - A GKE cluster with Workload Identity.
 - The operator controller manager Deployment.
@@ -51,16 +51,16 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 - A LiteLLM Deployment (or vLLM if you opted in).
 - A Minty Deployment plus a GCP KMS keyring and key.
 - A Google Chat Pub/Sub topic + subscription and a Kubernetes `Secret` holding your model provider API key.
-- Optionally: Slack tokens as a `Secret` (only if `SLACK_ENABLED=true` during provisioning) and the inference-replay proxy (only if `INFERENCE_REPLAY_ENABLED=true`).
+- Optionally: Slack tokens in the credentials `Secret` (only if Slack was enabled at install).
 
 ## What is _not_ included
 
-- **No local Kind path** — there is no `kind` workflow in the repo and no scripted installer outside `k8s-operator/scripts/`. You need a real GKE cluster. (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
+- **No local Kind path** — there is no `kind` workflow in the repo; the installer and the Terraform composition it drives both target GKE. You need a real GKE cluster. (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
 - **No web UI or CLI beyond `kubectl` port-forward + the Hermes API** — chat is the primary user interface.
-- **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and provisioning scripts all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
+- **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and install path all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 
 ## Where to go next
 
 - [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) — the background watchdogs and how they close loops.
 - [Architecture](/kube-agents/overview/architecture/) — how requests and cron ticks flow through the components.
-- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run `make gcp-provision` end-to-end.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run `./install.sh` end-to-end.

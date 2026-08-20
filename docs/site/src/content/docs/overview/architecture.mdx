@@ -72,13 +72,12 @@ flowchart TB
 ### 1. Chat request → reply
 
 <Aside type="note">
-  Google Chat is fully wired and end-to-end tested. Slack is opt-in via
-  `SLACK_ENABLED=true` during provisioning; see
-  [ChatOps](/kube-agents/concepts/chatops/).
+  Google Chat is fully wired and end-to-end tested. Slack is opt-in via the
+  installer's chat menu; see [ChatOps](/kube-agents/concepts/chatops/).
 </Aside>
 
 1. A user posts in a Google Chat space (or DMs the Slack app).
-2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. `provision_05_gcp_gchat.sh` sets up the topic and subscription.
+2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. The install's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) sets up the topic and subscription.
 3. The **Planning Agent** (the pod's `default` Hermes profile, image `nousresearch/hermes-agent`) consumes the event through Hermes' bundled Google Chat adapter, patched for credential-free operation by `google_chat_relay_patch.py` (Slack uses `slack_relay_patch.py` in Socket Mode).
 4. The Planning Agent holds no infrastructure tools. It discovers the available specialists via its `router` MCP tool (`list_agents`, descriptions from each agent's `CAPABILITIES.md`) and files a kanban card with the full request context (`kanban_create`); the originating chat session is auto-subscribed to the card.
 5. The gateway's kanban dispatcher spawns the **Platform Agent** (`hermes -p platform chat -q "work kanban task <id>"`), which runs the tool-calling loop: system prompt (`SOUL.md`) + card body + available tools. Cluster reads go through the `gke` MCP server; mutations that touch infra route through the `submit-suggestion` skill (see flow 3) rather than direct `kubectl`. Work scoped to one cluster's live runtime is delegated onward as a nested kanban card to that cluster's read-only [Cluster Agent](/kube-agents/concepts/cluster-agents/) (`SOUL.md §6`).
@@ -107,15 +106,15 @@ Everything except the LLM (and, for hosted providers, the LLM API endpoint) runs
 
 - **Namespace**: `kubeagents-system`.
 - **Node pools**: default node pool is enough for the operator, Platform Agent, LiteLLM, and Minty. If you use vLLM, provision a GPU node pool separately.
-- **Optional gVisor node pool** for sandboxed skill execution (`provision_02_gvisor_nodepool.sh`, opt-in via `ENABLE_GVISOR=true`).
-- **Workload Identity** bindings are pre-provisioned in `provision_04_gcp_iam.sh` — the operator gets cluster management scope, the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`). See [Security & IAM](/kube-agents/reference/security-and-iam/).
+- **Optional gVisor node pool** for sandboxed skill execution (the `gke-cluster` module's `enable_gvisor_node_pool`, opt-in via the installer's `--gvisor=true`).
+- **Workload Identity** bindings are pre-provisioned by the [`kube-agents-iam` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) — the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`). See [Security & IAM](/kube-agents/reference/security-and-iam/).
 
 ### Capacity and isolation
 
 The hub footprint (operator, Platform Agent, LiteLLM, Minty) is small and roughly fixed — it doesn't grow with the number of clusters the agent manages, since those are read remotely through the GKE MCP server. What actually drives node capacity:
 
 - **vLLM.** Local inference needs a GPU node pool; hosted LiteLLM does not.
-- **gVisor.** Sandboxed skill execution runs the agent pod on the optional `gvisor-pool` (`ENABLE_GVISOR=true`).
+- **gVisor.** Sandboxed skill execution runs the agent pod on the optional `gvisor-pool` (the installer's `--gvisor=true`).
 
 For production, prefer a **dedicated cluster** for the harness. The agent GSA can hold broad GKE permissions in the `gke-admin` set, so a hard cluster boundary limits blast radius if the execution sandbox is ever compromised. A shared cluster (with the `kubeagents-system` namespace for logical isolation) is fine for development.
 

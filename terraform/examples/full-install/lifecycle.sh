@@ -28,6 +28,12 @@
 #   ./lifecycle.sh destroy  [extra terraform args...]
 #   ./lifecycle.sh adopt-kms
 #
+# Remote state (opt-in): set KUBE_AGENTS_STATE_BUCKET to a GCS bucket name, or
+# to "auto" for <project_id>-kube-agents-tfstate. The bucket is created if
+# missing (versioned, uniform access) and a gitignored backend_override.tf
+# points Terraform at gs://<bucket>/<KUBE_AGENTS_STATE_PREFIX, default
+# kube-agents/<cluster_name>>. Unset, state stays local as before.
+#
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -35,10 +41,69 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
 
+# Remote state, opt-in. The composition ships no backend block — a hand-driven
+# example works fine on local state — but an installer-driven one cannot:
+# install.sh may run from a disposable clone, and uninstall.sh and upgrade.sh
+# clone fresh temporary directories, so state left on disk is state lost. With
+# KUBE_AGENTS_STATE_BUCKET set, this writes a gitignored backend override
+# (backend_override.tf) pointing at a GCS bucket and creates the bucket if it
+# does not exist — versioned, uniform bucket-level access, in the install's
+# region. "auto" derives the bucket name as <project_id>-kube-agents-tfstate;
+# the prefix defaults to kube-agents/<cluster_name> so two installs in one
+# project do not collide. Without the variable nothing here runs and local
+# state behaves exactly as before.
+BACKEND_OVERRIDE_FILE="backend_override.tf"
+
+ensure_backend() {
+  [[ -n "${KUBE_AGENTS_STATE_BUCKET:-}" ]] || return 0
+
+  # project/cluster/location come from tfvars, which terraform console only
+  # serves from an initialized directory — so init once without a backend
+  # before the backend can be described.
+  terraform init -backend=false -input=false >/dev/null || {
+    warn "terraform init -backend=false failed; run it by hand to see why"
+    exit 1
+  }
+
+  local project bucket prefix region
+  project=$(tfvar project_id)
+  bucket="$KUBE_AGENTS_STATE_BUCKET"
+  [[ "$bucket" == "auto" ]] && bucket="${project}-kube-agents-tfstate"
+  prefix="${KUBE_AGENTS_STATE_PREFIX:-kube-agents/$(tfvar cluster_name)}"
+  # The bucket lives where the cluster does; strip a zone suffix to its region.
+  region=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
+
+  if ! gcloud storage buckets describe "gs://$bucket" --project "$project" >/dev/null 2>&1; then
+    log "creating Terraform state bucket gs://$bucket in $region (versioned, uniform access)"
+    gcloud storage buckets create "gs://$bucket" --project "$project" \
+      --location "$region" --uniform-bucket-level-access >/dev/null
+    # Versioning is what makes a corrupted or mistakenly-overwritten state
+    # recoverable; a state bucket without it is a single point of failure.
+    gcloud storage buckets update "gs://$bucket" --versioning >/dev/null
+  fi
+
+  local desired
+  desired=$(printf 'terraform {\n  backend "gcs" {\n    bucket = "%s"\n    prefix = "%s"\n  }\n}\n' \
+    "$bucket" "$prefix")
+  if [[ ! -f "$BACKEND_OVERRIDE_FILE" ]] || [[ "$(cat "$BACKEND_OVERRIDE_FILE")" != "$desired" ]]; then
+    printf '%s' "$desired" >"$BACKEND_OVERRIDE_FILE"
+    log "state backend: gs://$bucket/$prefix"
+    # -reconfigure, not -migrate-state: the installer path never has local
+    # state worth carrying, and migrating whatever happens to sit in a reused
+    # checkout into the bucket is how an unrelated experiment overwrites a
+    # real install's state.
+    terraform init -input=false -reconfigure >/dev/null || {
+      warn "terraform init -reconfigure against gs://$bucket failed"
+      exit 1
+    }
+  fi
+}
+
 # Runs before anything reads the configuration. init is idempotent and cheap
 # when nothing changed, and skipping it is how a routine `git pull` that adds a
 # module turns every subcommand below into a failure.
 ensure_init() {
+  ensure_backend
   terraform init -input=false >/dev/null || {
     warn "terraform init failed; run it by hand to see why"
     exit 1
@@ -127,12 +192,17 @@ adopt_kms() {
   local project location keyring key
   load_state
   project=$(tfvar project_id)
-  location=$(tfvar location)
+  # KMS locations are regional; a zonal cluster location maps to its region,
+  # matching the modules' own derivation.
+  location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
 
   # address <TAB> gcloud-kind <TAB> resource id
   local -a targets=()
 
-  if [[ "$(tfvar enable_database_encryption)" != "false" ]]; then
+  # With create_cluster = false the module manages no KMS resources — CMEK on
+  # an existing cluster is the caller's gcloud step — so there is nothing to
+  # adopt for the cluster half.
+  if [[ "$(tfvar create_cluster)" != "false" && "$(tfvar enable_database_encryption)" != "false" ]]; then
     keyring=$(tfvar kms_keyring_name)
     key=$(tfvar kms_key_name)
     targets+=(
@@ -142,11 +212,12 @@ adopt_kms() {
   fi
 
   if [[ "$(tfvar enable_github_minter)" == "true" ]]; then
-    # Not surfaced as composition variables; these are the github-minter module's
-    # defaults, which mirror k8s-operator/scripts/common.sh.
+    local minter_keyring minter_key
+    minter_keyring=$(tfvar github_minter_kms_keyring)
+    minter_key=$(tfvar github_minter_kms_key)
     targets+=(
-      "module.github_minter[0].google_kms_key_ring.minter	keyring	projects/$project/locations/$location/keyRings/github-token-minter-keyring"
-      "module.github_minter[0].google_kms_crypto_key.minter	key	projects/$project/locations/$location/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key"
+      "module.github_minter[0].google_kms_key_ring.minter	keyring	projects/$project/locations/$location/keyRings/$minter_keyring"
+      "module.github_minter[0].google_kms_crypto_key.minter	key	projects/$project/locations/$location/keyRings/$minter_keyring/cryptoKeys/$minter_key"
     )
   fi
 
@@ -183,6 +254,29 @@ adopt_kms() {
   log "KMS adoption complete: $adopted imported"
 }
 
+# create_cluster = false means "somebody else's cluster" — but if THIS state
+# already manages the cluster, flipping the variable off does not hand the
+# cluster back: it removes the resource from configuration, and the next apply
+# plans the cluster's destruction. The installer derives create_cluster from a
+# liveness probe, so a re-run against an install whose cluster Terraform
+# created is exactly the run that would hit this.
+guard_cluster_ownership() {
+  [[ "$(tfvar create_cluster)" == "false" ]] || return 0
+  load_state
+  local addr
+  for addr in \
+    "module.gke_cluster.google_container_cluster.autopilot[0]" \
+    "module.gke_cluster.google_container_cluster.standard[0]" \
+    "module.gke_cluster.google_container_cluster.autopilot"; do
+    if in_state "$addr"; then
+      warn "create_cluster is false, but this state already manages the cluster ($addr)."
+      warn "Applying now would plan the cluster's DESTRUCTION. Set create_cluster = true"
+      warn "in terraform.tfvars — this state created the cluster, so it is Terraform's to keep."
+      exit 1
+    fi
+  done
+}
+
 delete_agent_cr() {
   local namespace cluster location project names
   namespace=$(tfvar namespace)
@@ -190,7 +284,7 @@ delete_agent_cr() {
   location=$(tfvar location)
   project=$(tfvar project_id)
 
-  if ! gcloud container clusters get-credentials "$cluster" --region "$location" \
+  if ! gcloud container clusters get-credentials "$cluster" --location "$location" \
         --project "$project" >/dev/null 2>&1; then
     log "cluster unreachable; nothing to delete in-cluster"
     return 0
@@ -233,7 +327,8 @@ purge_backups() {
   # flipped off, and the describe below already handles the plan-absent case.
   local project location plan
   project=$(tfvar project_id)
-  location=$(tfvar location)
+  # Backup for GKE plans are regional, whatever the cluster location is.
+  location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
   plan="$(tfvar cluster_name)-backup-plan"
 
   gcloud beta container backup-restore backup-plans describe "$plan" \
@@ -256,9 +351,23 @@ purge_backups() {
 }
 
 disable_deletion_protection() {
-  local address="module.gke_cluster.google_container_cluster.autopilot"
+  # The cluster's state address depends on cluster_mode, and on whether the
+  # state predates the mode switch (the autopilot resource used to carry no
+  # index; the moved block renames it on the first plan, but this script can
+  # run against a state that has not planned yet). create_cluster = false has
+  # no cluster in state at all and falls through to return 0.
+  local address="" candidate
   load_state
-  in_state "$address" || return 0
+  for candidate in \
+    "module.gke_cluster.google_container_cluster.autopilot[0]" \
+    "module.gke_cluster.google_container_cluster.standard[0]" \
+    "module.gke_cluster.google_container_cluster.autopilot"; do
+    if in_state "$candidate"; then
+      address="$candidate"
+      break
+    fi
+  done
+  [[ -n "$address" ]] || return 0
 
   # Read what STATE records, not what the variable is configured to: state is
   # what the provider enforces on delete. The two disagree exactly when it
@@ -306,6 +415,7 @@ case "${1:-}" in
   apply)
     shift
     ensure_init
+    guard_cluster_ownership
     adopt_kms
     log "terraform apply"
     # No -input=false: this prompts like plain `terraform apply` does. Pass
@@ -349,7 +459,7 @@ case "${1:-}" in
     log "delete them. The next 'lifecycle.sh apply' adopts them automatically."
     ;;
   *)
-    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

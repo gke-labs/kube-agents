@@ -17,13 +17,13 @@ A proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by 
 
 **Modes:** `off` (passthrough), `on` (cache hits, forward misses). Toggle via `ConfigMap` patch — see [Inference gateway → Inference replay](/kube-agents/concepts/inference-gateway/#inference-replay).
 
-**Deploy via provisioner:** `INFERENCE_REPLAY_ENABLED=true ./provision.sh`.
+**Deploy (development only):** `make -C k8s-operator deploy-inference-replay` — the replay proxy is a dev tool and is never part of the installer.
 
 ## `litellm-gemini`
 
 [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini)
 
-LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (`provision_09_deploy_litellm.sh`) deploys an equivalent LiteLLM + Gemini config from `k8s-operator/config/integrations/litellm/base` rather than this example directory.
+LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (the chart's `litellm.*` values) deploys an equivalent LiteLLM + Gemini config rather than this example directory; the dev copy lives at `k8s-operator/config/integrations/litellm/base`.
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 

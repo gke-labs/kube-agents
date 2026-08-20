@@ -1991,9 +1991,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			ShareProcessNamespace:        shareProcessNamespace,
-			RuntimeClassName:             runtimeClassName,
-			InitContainers:               initContainers,
+			ShareProcessNamespace: shareProcessNamespace,
+			RuntimeClassName:      runtimeClassName,
+			InitContainers:        initContainers,
+			// Pod-scoped, so it covers the agent, both operator-injected sidecars,
+			// anything in spec.deployment.sidecars/initContainers, and the OCI image
+			// volumes AgentPlugins mount. nil when nothing is configured, which is
+			// what keeps a default install's pod template byte-identical.
+			ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 			ServiceAccountName:           saName,
 			AutomountServiceAccountToken: ptr.To(false),
 			SecurityContext: &corev1.PodSecurityContext{

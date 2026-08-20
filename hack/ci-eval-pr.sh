@@ -40,9 +40,45 @@ export BENCH_TF_ROOT="./tf"
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
-export GKE_CLUSTER_NAME="test-cluster"
-export CLUSTER_NAME="test-cluster"
-export TF_VAR_cluster_name="test-cluster"
+
+# Per-run task-cluster name, derived from the Prow run identity. Within a
+# project, two runs can never race on one cluster because they never share a
+# name, and a "409 Already Exists" between runs is impossible by construction.
+# The old fixed name ("test-cluster") was unsafe the moment two runs shared the
+# project.
+#
+# This alone does NOT make raising the Prow job's max_concurrency safe: every
+# run also installs cluster-wide singletons (CRDs, webhooks, ClusterRoles) on
+# the shared platform-agent-host cluster. Real concurrency arrives with issue
+# #637 (Boskos one-project-per-run leasing); do not raise max_concurrency
+# before it. Unique names still matter under #637 -- a retried run in a
+# freshly-leased project must not collide with what its predecessor left.
+#
+# GKE caps names at 40 chars matching [a-z]([-a-z0-9]*[a-z0-9])?. The name is
+# lowercased and non-alphanumerics collapse to hyphens; locally it falls back
+# to a stable "eval-pr0-<user>" so two laptops sharing a project do not
+# collide, and the persistent tofu state under bench/tf makes reuse across
+# local runs the intended behaviour.
+#
+# NEVER clamp an overlong name: the run discriminator (BUILD_ID) sits at the
+# tail, so truncation keeps the shared prefix and drops exactly the part that
+# differs -- two long BUILD_IDs with a common prefix would collapse to one
+# name and resurrect the shared-name race. When the readable form does not
+# fit, swap the tail for a hash of the full identity instead.
+EVAL_RUN_IDENT="${PULL_NUMBER:-0}-${BUILD_ID:-${USER:-local}}"
+EVAL_CLUSTER_NAME="eval-pr${EVAL_RUN_IDENT}"
+EVAL_CLUSTER_NAME="$(printf '%s' "${EVAL_CLUSTER_NAME}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/-*$//')"
+if [ "${#EVAL_CLUSTER_NAME}" -gt 40 ]; then
+  EVAL_IDENT_HASH="$(printf '%s' "${EVAL_RUN_IDENT}" | { md5sum 2>/dev/null || md5 -q; } | tr -d ' -' | cut -c1-8)"
+  # The PR component is bounded to 24 chars so the 8-char hash -- the only
+  # part guaranteed to differ -- can never be squeezed out of the 40.
+  EVAL_PR_PART="$(printf '%s' "${PULL_NUMBER:-0}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-24 | sed 's/-*$//')"
+  EVAL_CLUSTER_NAME="eval-pr${EVAL_PR_PART:-0}-${EVAL_IDENT_HASH}"
+fi
+export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
+echo "Task cluster for this run: ${EVAL_CLUSTER_NAME}"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
 
 # Stamp the run onto every labelable GCP resource the stacks create, alongside

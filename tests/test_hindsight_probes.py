@@ -14,18 +14,22 @@ t=50s and the kubelet killed the container mid-load; each kill restarts the
 load from nothing, and the install's rollout gate is what eventually fails.
 
 Three budgets have to stay ordered for a cold roll to survive, and they live in
-three files in three languages:
+two files in two languages:
 
-    startupProbe budget  <  rollout gate  <  progressDeadlineSeconds
-    (api.yaml)              (common.sh)      (api.yaml)
+    startupProbe budget  <  rollout gate            <  progressDeadlineSeconds
+    (api.yaml)              (helm_release timeout,     (api.yaml)
+                             full-install main.tf)
 
 Below the first, the kubelet kills a pod that is loading normally. Above the
-second, the install gives up on one. Above the third, `kubectl rollout status`
-reports "exceeded its progress deadline" and stops waiting whatever timeout it
-was passed, so a gate raised past it buys nothing. Nothing in YAML or bash
+second, the install gives up on one. Above the third, the Deployment reports
+"exceeded its progress deadline" and helm's wait stops early whatever timeout
+it was given, so a gate raised past it buys nothing. Nothing in YAML or HCL
 keeps the three in that order, and each one alone looks reasonable — which is
 what these tests are for. The rationale for the individual numbers belongs to
 `api.yaml`'s probe comment, not here.
+
+The gate is the `helm_release.kube_agents` wait in the full-install
+composition, whose timeout these tests read from main.tf.
 """
 
 import pathlib
@@ -36,8 +40,7 @@ import yaml
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _API_YAML = _ROOT / "k8s-operator" / "config" / "integrations" / "hindsight" / "api.yaml"
-_PROVISION_13 = _ROOT / "k8s-operator" / "scripts" / "provision_13_deploy_hindsight.sh"
-_COMMON_SH = _ROOT / "k8s-operator" / "scripts" / "common.sh"
+_FULL_INSTALL_MAIN_TF = _ROOT / "terraform" / "examples" / "full-install" / "main.tf"
 
 # What the gate must have over the startupProbe budget, in seconds, for the
 # pull that precedes the container starting at all. The pinned image is 1.4 GB
@@ -81,15 +84,24 @@ def _budget_seconds(probe):
     )
 
 
-def _default_gate_seconds():
-    """The rollout budget step 13 waits for, from its single source in common.sh.
+def _kube_agents_release_block():
+    """The helm_release.kube_agents block from the full-install composition."""
+    text = _FULL_INSTALL_MAIN_TF.read_text()
+    match = re.search(r'resource "helm_release" "kube_agents" \{.*?\n\}\n', text, re.DOTALL)
+    assert match, "could not find helm_release.kube_agents in full-install main.tf"
+    return match.group(0)
 
-    Read rather than hardcoded so raising the shared default cannot leave this
-    suite asserting against a number no install uses.
+
+def _default_gate_seconds():
+    """The rollout budget the install waits for: the helm_release timeout.
+
+    Read rather than hardcoded so raising the timeout cannot leave this suite
+    asserting against a number no install uses. The helm provider's timeout is
+    plain seconds, no unit suffix.
     """
-    match = re.search(r'AGENT_READY_TIMEOUT="\$\{AGENT_READY_TIMEOUT:-(\d+)([smh])\}"', _COMMON_SH.read_text())
-    assert match, "could not find the AGENT_READY_TIMEOUT default in common.sh"
-    return int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+    match = re.search(r"^\s*timeout\s*=\s*(\d+)\s*$", _kube_agents_release_block(), re.MULTILINE)
+    assert match, "could not find the timeout on helm_release.kube_agents"
+    return int(match.group(1))
 
 
 class StartupProbeTest(unittest.TestCase):
@@ -147,12 +159,13 @@ class RolloutBudgetTest(unittest.TestCase):
             self.gate,
             self.startup + _PULL_ALLOWANCE_SECONDS,
             f"a {self.gate}s gate leaves {self.gate - self.startup}s for a 1.4 GB pull "
-            f"on top of a {self.startup}s startupProbe budget; provision.sh exits 1 when "
-            "it expires, so this fails the install on a slow node rather than tolerating it",
+            f"on top of a {self.startup}s startupProbe budget; the terraform apply "
+            "errors when it expires, so this fails the install on a slow node "
+            "rather than tolerating it",
         )
 
     def test_the_progress_deadline_outlasts_the_gate(self):
-        # Without this the gate is decorative above 600s: kubectl returns
+        # Without this the gate is decorative above 600s: helm's wait returns
         # "exceeded its progress deadline" the moment the Deployment gives up,
         # however long the caller asked to wait.
         self.assertIsNotNone(
@@ -162,22 +175,23 @@ class RolloutBudgetTest(unittest.TestCase):
         )
         self.assertGreater(self.deadline, self.gate)
 
-    def test_step_13_waits_on_the_shared_budget(self):
-        # Not a literal: a hardcoded --timeout here is how the gate and the
-        # probe budget drifted apart in the first place.
-        script = _PROVISION_13.read_text()
-        waits = re.findall(
-            r"kubectl rollout status deploy/hindsight-api[^\n]*\n?[^\n]*--timeout=(\S+)",
-            script,
+    def test_the_release_waits_with_an_explicit_gate(self):
+        # wait defaulted-on is not enough: the provider's default timeout is
+        # 300s, below the startup budget plus a slow pull, so leaving the
+        # attribute implicit is how the gate and the probe budget drift apart.
+        block = _kube_agents_release_block()
+        self.assertRegex(
+            block,
+            r"(?m)^\s*wait\s*=\s*true\s*$",
+            "helm_release.kube_agents must wait explicitly; the wait is the "
+            "install's only rollout gate",
         )
-        self.assertTrue(waits, "no hindsight-api rollout gate found in provision_13")
-        for timeout in waits:
-            with self.subTest(timeout=timeout):
-                self.assertIn("AGENT_READY_TIMEOUT", timeout)
-        self.assertIn(
-            "init_agent_ready_timeout",
-            script,
-            "AGENT_READY_TIMEOUT is unset and unvalidated unless the step initialises it",
+        self.assertRegex(
+            block,
+            r"(?m)^\s*timeout\s*=\s*\d+\s*$",
+            "helm_release.kube_agents needs an explicit timeout; the provider "
+            "default (300s) gives up on a cold hindsight-api roll that is "
+            "loading normally",
         )
 
 

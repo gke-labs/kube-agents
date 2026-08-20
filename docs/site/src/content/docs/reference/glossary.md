@@ -89,7 +89,7 @@ An in-pod sidecar (Envoy plus `credential_proxy.py`) that mediates credentialed 
 
 ### Inference Replay Proxy
 
-An optional caching proxy that sits in front of the `litellm` gateway. It hashes each request (prompt + available skills + target model), serves cache hits from a Persistent Disk, and forwards misses upstream. Used for deterministic, low-cost replay of agent trajectories. Provisioned by `make gcp-provision-11-inference-replay`; example in `examples/inference-replay/`.
+An optional caching proxy that sits in front of the `litellm` gateway. It hashes each request (prompt + available skills + target model), serves cache hits from a Persistent Disk, and forwards misses upstream. Used for deterministic, low-cost replay of agent trajectories. Development-only: deployed by `make -C k8s-operator deploy-inference-replay`, never by the installer; example in `examples/inference-replay/`.
 
 ## Related Kubernetes-native agent projects
 

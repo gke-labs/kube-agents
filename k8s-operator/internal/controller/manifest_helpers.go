@@ -58,6 +58,12 @@ const (
 	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	fluentBitImageEnvVar       = "FLUENT_BIT_IMAGE"
 
+	// The fleet-wide pull identity for those mirrors, as a comma-separated list
+	// of Secret names in the agent's namespace. Set on the controller-manager
+	// Deployment like the three above; a CR's spec.deployment.imagePullSecrets
+	// replaces it outright.
+	imagePullSecretsEnvVar = "IMAGE_PULL_SECRETS" // #nosec G101 -- Environment variable name, not hardcoded credentials
+
 	defaultSurgePercent = "25%"
 
 	// fieldOwner identifies this controller in Server-Side Apply managedFields.
@@ -216,6 +222,80 @@ func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage st
 		}
 	}
 	return image
+}
+
+// normalizeImagePullSecrets trims each name, drops the blanks, and collapses
+// repeats, returning nil when nothing survives.
+//
+// Both halves are load-bearing, and nothing below this layer does either. A
+// blank or space-padded name sends the kubelet looking for a Secret that
+// cannot exist; it gives up and pulls anonymously, so the agent lands in
+// ImagePullBackOff against a spec that looks like it configured a pull
+// identity. Core PodSpec validation does not reliably stop that — measured
+// against GKE 1.35.6, `name: ""` is a warning rather than an error and
+// `name: " regcred "` passes clean. A repeat is worse, because it fails
+// somewhere else entirely: PodSpec.imagePullSecrets is a server-side-apply
+// list-map keyed on name, so two identical entries make every apply of the
+// generated Deployment fail with `duplicate entries for key`, several layers
+// from whatever wrote them.
+//
+// Both inputs make these ordinary typos. IMAGE_PULL_SECRETS is hand-written
+// onto a Deployment or joined by a Helm template, where "a,,b" and a trailing
+// comma cost nothing to produce; the CR's list is hand-written YAML that the
+// admission webhook rejects for exactly these two shapes — but the chart
+// leaves that webhook off by default, so this is the layer that has to hold.
+func normalizeImagePullSecrets(refs []corev1.LocalObjectReference) []corev1.LocalObjectReference {
+	var secrets []corev1.LocalObjectReference
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		secrets = append(secrets, corev1.LocalObjectReference{Name: name})
+	}
+	return secrets
+}
+
+// defaultImagePullSecrets returns the pull identity for agents whose CR omits
+// spec.deployment.imagePullSecrets: the comma-separated IMAGE_PULL_SECRETS env
+// var, or nil.
+func defaultImagePullSecrets() []corev1.LocalObjectReference {
+	raw := os.Getenv(imagePullSecretsEnvVar)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	refs := make([]corev1.LocalObjectReference, 0, len(parts))
+	for _, name := range parts {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return normalizeImagePullSecrets(refs)
+}
+
+// resolveImagePullSecrets picks the pod's pull identity: the CR's list when it
+// has one, otherwise the operator-wide default.
+//
+// Replacement, not merge — the same precedence resolveAgentImage gives
+// spec.deployment.image over PLATFORM_AGENT_IMAGE, and for the same reason. The
+// field is documented that way on DeploymentSpec.ImagePullSecrets.
+//
+// A list that normalizes away to nothing counts as unset and falls through to
+// the default, because a CR carrying only `- name: ""` has not named an
+// identity — it has a typo, and the fleet default is likelier to pull than
+// nothing at all.
+func resolveImagePullSecrets(deployment *agentv1alpha1.DeploymentSpec) []corev1.LocalObjectReference {
+	if deployment != nil {
+		if secrets := normalizeImagePullSecrets(deployment.ImagePullSecrets); len(secrets) > 0 {
+			return secrets
+		}
+	}
+	return defaultImagePullSecrets()
 }
 
 // mergeEnvVars merges custom env vars into defaults. Custom env vars override defaults with the same name.

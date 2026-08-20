@@ -103,8 +103,8 @@ Options:
   --project-id ID               GCP Target Project ID
   --cluster-name NAME           GKE Target Cluster Name (default: platform-agent-host)
   --region REGION               GKE GCP Region
-  --source-ref REF              Release tag or commit SHA to fetch the teardown scripts from
-                                when not run from a local checkout (default: main)
+  --source-ref REF              Tag or commit SHA of the release that made the install; that
+                                release's own uninstall.sh is fetched and run in place of this one
   --help, -h, -?                Show this help message
 
 Examples:
@@ -163,6 +163,41 @@ persist_state_var() {
   chmod 600 "$state_file" 2>/dev/null || true
 }
 
+# Decide WHERE the state lives before pinning the backend. Exporting
+# KUBE_AGENTS_STATE_BUCKET first would make lifecycle.sh's ensure_backend
+# `terraform init -reconfigure` onto the (possibly empty) remote prefix —
+# abandoning a hand-driven install's local state, so the destroy plans
+# nothing and reports success with the CR and backups already gone and
+# every GCP resource still live.
+#
+# Needs installer_common.sh sourced (tf_state_bucket/tf_state_prefix) and the
+# target coordinates exported. Unit-tested in tests/test_uninstall_script.py;
+# keep the branch order — remote state wins, an explicitly named bucket with
+# no state is an error, local state is honoured only when nothing is remote,
+# and no state anywhere refuses rather than guesses.
+resolve_state_location() {
+  local compose_dir="$1"
+  if gcloud storage cat "gs://$(tf_state_bucket)/$(tf_state_prefix)/default.tfstate" >/dev/null 2>&1; then
+    # Remote state where the installer keeps it (or where the caller pointed
+    # us): pin the backend for lifecycle.sh.
+    export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
+  elif [ -n "${KUBE_AGENTS_STATE_BUCKET:-}" ]; then
+    # The caller named a bucket and it holds no state for this cluster:
+    # error out rather than fall back to guessing.
+    print_error "No Terraform state at gs://$(tf_state_bucket)/$(tf_state_prefix) (KUBE_AGENTS_STATE_BUCKET was set explicitly)."
+    return 1
+  elif [ -f "${compose_dir}/terraform.tfstate" ] || [ -f "${compose_dir}/backend_override.tf" ]; then
+    # A hand-driven install: local state, or an existing backend override
+    # pointing wherever its author keeps state. Leave the backend variable
+    # unset so lifecycle.sh touches neither.
+    print_info "Using the composition's own state (local terraform.tfstate or existing backend_override.tf)."
+  else
+    print_error "No Terraform state found for '${CLUSTER_NAME}' (gs://$(tf_state_bucket)/$(tf_state_prefix)) and none locally."
+    print_info "If this install was made by a pre-Terraform release, re-run with --source-ref=<that release> so its own teardown runs."
+    return 1
+  fi
+}
+
 main() {
   parse_args "$@"
   print_banner
@@ -171,23 +206,57 @@ main() {
 
   local script_dir repo_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "${script_dir}/k8s-operator/scripts/teardown.sh" ]; then
+  if [ -n "$PARAM_SOURCE_REF" ]; then
+    # The pinned release owns its own teardown: clone it and hand over
+    # wholesale. This script's engine (installer_common.sh, lifecycle.sh
+    # destroy) exists only at post-Terraform refs, and --source-ref exists
+    # precisely for the installs those refs did not make — so continuing in
+    # this main() would source files the clone does not carry. The exec also
+    # releases the flock for the dispatched script and skips the temp-dir
+    # cleanup trap, which must not delete a tree that is still executing.
+    TEMP_REPO_DIR="$(mktemp -d)"
+    repo_dir="${TEMP_REPO_DIR}/kube-agents"
+    print_info "Fetching the teardown engine pinned at '${PARAM_SOURCE_REF}'..."
+    git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
+    git -C "$repo_dir" fetch --depth=1 origin "$PARAM_SOURCE_REF"
+    git -C "$repo_dir" checkout --detach FETCH_HEAD
+    if [ ! -f "${repo_dir}/uninstall.sh" ]; then
+      print_error "'${PARAM_SOURCE_REF}' carries no uninstall.sh; tear the install down with that release's documented procedure."
+      exit 1
+    fi
+    local dispatch_args=()
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      dispatch_args+=(--non-interactive)
+    fi
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      dispatch_args+=(--dry-run)
+    fi
+    if [ -n "$PARAM_PROJECT_ID" ]; then
+      dispatch_args+=(--project-id="$PARAM_PROJECT_ID")
+    fi
+    if [ -n "$PARAM_CLUSTER_NAME" ]; then
+      dispatch_args+=(--cluster-name="$PARAM_CLUSTER_NAME")
+    fi
+    if [ -n "$PARAM_REGION" ]; then
+      dispatch_args+=(--region="$PARAM_REGION")
+    fi
+    print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
+    TEMP_REPO_DIR=""
+    exec bash "${repo_dir}/uninstall.sh" "${dispatch_args[@]}"
+  elif [ -f "${script_dir}/terraform/examples/full-install/lifecycle.sh" ]; then
     repo_dir="$script_dir"
-  elif [ -f "$(pwd)/k8s-operator/scripts/teardown.sh" ]; then
+  elif [ -f "$(pwd)/terraform/examples/full-install/lifecycle.sh" ]; then
     repo_dir="$(pwd)"
   else
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
-    if [ -n "$PARAM_SOURCE_REF" ]; then
-      print_info "Fetching the teardown scripts pinned at '${PARAM_SOURCE_REF}'..."
-      git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
-      git -C "$repo_dir" fetch --depth=1 origin "$PARAM_SOURCE_REF"
-      git -C "$repo_dir" checkout --detach FETCH_HEAD
-    else
-      print_warning "No --source-ref given; fetching the teardown scripts from main, which may be newer than your installed release."
-      git clone --depth=1 https://github.com/gke-labs/kube-agents.git "$repo_dir"
-    fi
+    print_warning "No --source-ref given; fetching the teardown engine from main, which may be newer than your installed release."
+    git clone --depth=1 https://github.com/gke-labs/kube-agents.git "$repo_dir"
   fi
+  # Defaults, validators, and the terraform.tfvars generator shared with
+  # install.sh. Print helpers are already defined above, as the file expects.
+  # shellcheck disable=SC1091
+  source "${repo_dir}/k8s-operator/scripts/installer_common.sh"
   if [ -f "${repo_dir}/k8s-operator/scripts/vars.sh" ]; then
     # shellcheck disable=SC1091
     if ! source "${repo_dir}/k8s-operator/scripts/vars.sh"; then
@@ -235,10 +304,9 @@ main() {
 
   print_step "2. Executing Automated Teardown Engine"
 
-  # The delegated teardown steps re-source vars.sh via ensure_teardown_state,
-  # so exporting alone is not enough: an explicit CLI target override must be
-  # written into the state file, or teardown would silently act on the saved
-  # project/cluster/region instead of the target confirmed above.
+  # Keep the state file agreeing with the confirmed target: the tfvars
+  # generator below reads the environment, but a saved vars.sh that names a
+  # different cluster would mislead the next tool that sources it.
   local state_file="${repo_dir}/k8s-operator/scripts/vars.sh"
   if [ -f "$state_file" ]; then
     if [ -n "$PARAM_PROJECT_ID" ]; then
@@ -257,15 +325,37 @@ main() {
   export REGION="$target_region"
   export NO_CONFIRM="1"
 
-  cd "${repo_dir}/k8s-operator"
-  bash scripts/teardown.sh -y --no-confirm
-  rm -f scripts/vars.sh
-  cd "$repo_dir"
+  # The engine is `lifecycle.sh destroy` against the install's Terraform state
+  # in GCS (derived from the coordinates, so a fresh clone finds it). An
+  # install with no state anywhere predates the Terraform engine — this
+  # uninstaller cannot take it apart, but the release that installed it
+  # can, which is exactly what --source-ref pins.
+  local compose_dir="${repo_dir}/terraform/examples/full-install"
+  export KUBE_AGENTS_STATE_PREFIX
+  KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+  resolve_state_location "$compose_dir" || exit 1
+
+  # terraform destroy still evaluates the configuration, so required variables
+  # must be present even from a fresh clone; the placeholder key feeds nothing
+  # that survives the destroy.
+  export API_SERVER_KEY="${API_SERVER_KEY:-uninstall-placeholder}"
+  write_tfvars_from_state "${compose_dir}/terraform.tfvars"
+  (
+    cd "$compose_dir"
+    ./lifecycle.sh destroy -auto-approve -input=false
+  )
+  rm -f "$state_file"
 
   write_report "SUCCESS"
 
   print_step "🎉 Uninstall Complete!"
   echo -e "${C_GREEN}${C_BOLD}🏆 All kube-agents infrastructure elements have been safely removed.${C_RESET}"
+  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them) and the Terraform state bucket gs://$(tf_state_bucket)."
+  print_info "If this project will not host kube-agents again, delete the bucket yourself: gcloud storage rm -r gs://$(tf_state_bucket)"
 }
 
-main "$@"
+if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then
+  main "$@"
+else
+  echo "ℹ️ Sourced uninstall.sh functions without executing main (KUBE_AGENTS_SOURCE_ONLY=true)." >&2
+fi

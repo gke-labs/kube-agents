@@ -14,7 +14,7 @@ variable "location" {
 }
 
 variable "name" {
-  description = "Name of the BackupPlan. Null derives <cluster_name>-backup-plan, the name provision_12_gke_backup_plan.sh uses."
+  description = "Name of the BackupPlan. Null derives <cluster_name>-backup-plan."
   type        = string
   default     = null
 }
@@ -53,19 +53,19 @@ variable "backup_retain_days" {
 }
 
 variable "paused" {
-  description = "Whether the schedule is paused. The provisioning script always un-pauses the plan it reconciles."
+  description = "Whether the schedule is paused."
   type        = bool
   default     = false
 }
 
 variable "include_secrets" {
-  description = "Whether backups include Kubernetes Secrets. True mirrors the provisioning script — the agent's credentials Secret is otherwise lost on restore. Restrict backup/restore IAM accordingly."
+  description = "Whether backups include Kubernetes Secrets. Defaults true — the agent's credentials Secret is otherwise lost on restore. Restrict backup/restore IAM accordingly."
   type        = bool
   default     = true
 }
 
 variable "include_volume_data" {
-  description = "Whether backups include persistent volume data (mirrors the provisioning script's --include-volume-data)"
+  description = "Whether backups include persistent volume data"
   type        = bool
   default     = true
 }

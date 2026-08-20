@@ -1,7 +1,6 @@
 locals {
-  # A deliberate superset of what the scripts enable: iam, monitoring, and
-  # logging are here because Terraform must enable every API its own resources
-  # call, where gcloud enables them implicitly. On the divergence lists.
+  # iam, monitoring, and logging are here because Terraform must enable every
+  # API its own resources call, where gcloud enables them implicitly.
   base_apis = [
     "container.googleapis.com",
     "cloudkms.googleapis.com",
@@ -9,9 +8,9 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
-    # Unconditional, like provision_01_gcp_cluster.sh: the cluster is created
-    # with the Backup for GKE agent enabled whether or not a BackupPlan
-    # follows, and the addon cannot be enabled without the API.
+    # Unconditional: the cluster is created with the Backup for GKE agent
+    # enabled whether or not a BackupPlan follows, and the addon cannot be
+    # enabled without the API.
     "gkebackup.googleapis.com",
   ]
   chat_apis = var.enable_google_chat ? [
@@ -25,9 +24,18 @@ locals {
   vertex_location = var.vertex_location != "" ? var.vertex_location : var.location
   litellm_ksa     = "kubeagents-litellm"
 
+  # The minter chart values need the GitOps repository split into owner and
+  # name. Accepts the same forms integration.github.gitRepo takes: owner/repo,
+  # or a github.com URL. Anything else leaves both parts empty, which the
+  # helm_release precondition rejects when the minter is enabled.
+  github_repo_path  = trimsuffix(trimprefix(trimprefix(trimprefix(var.github_repo, "https://"), "http://"), "github.com/"), ".git")
+  github_repo_parts = split("/", local.github_repo_path)
+  github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
+  github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
+
   required_apis = toset(concat(local.base_apis, local.chat_apis))
 
-  # The permission sets provision_04_gcp_iam.sh grants, kept verbatim so the
+  # The agent's GCP IAM permission-set bundles, kept verbatim so the
   # two install paths hand the agent the same authority. Kubernetes RBAC is
   # read-only in both; see the security-and-iam reference.
   read_only_roles = [
@@ -71,9 +79,13 @@ locals {
       # rather than left to the chart's own generation so that `terraform apply`
       # is idempotent without needing a cluster read — rotating the salt would
       # re-anonymise every user, breaking the link between their past sessions
-      # and their future ones.
-      SESSION_KV_API_KEY = random_password.session_kv_api_key.result
-      SESSION_KV_SALT    = random_password.session_kv_salt.result
+      # and their future ones. The variables outrank the generation for the
+      # one case state cannot cover: adopting a cluster whose Secret already
+      # holds live values (the installer recovers them from it). With empty
+      # state and empty variables, a fresh salt here would sever every user's
+      # session history.
+      SESSION_KV_API_KEY = var.session_kv_api_key != "" ? var.session_kv_api_key : random_password.session_kv_api_key.result
+      SESSION_KV_SALT    = var.session_kv_salt != "" ? var.session_kv_salt : random_password.session_kv_salt.result
       ANTHROPIC_API_KEY  = var.anthropic_api_key
       GEMINI_API_KEY     = var.gemini_api_key
       OPENAI_API_KEY     = var.openai_api_key
@@ -87,8 +99,7 @@ locals {
   # Slack, it holds the whole agent pod in CreateContainerConfigError. The
   # tokens legitimately arrive after the first apply, because creating the
   # Slack app is a manual step, so an empty value has to reach the Secret as
-  # an empty value. provision_07_gcp_k8s_secrets.sh writes the pair
-  # unconditionally for the same reason.
+  # an empty value.
   slack_credentials = var.enable_slack ? {
     SLACK_BOT_TOKEN = var.slack_bot_token
     SLACK_APP_TOKEN = var.slack_app_token
@@ -96,10 +107,8 @@ locals {
 
   credentials = merge(local.optional_credentials, local.slack_credentials)
 
-  # Verbatim from the resources patch provision_03_gcp_gke_operator.sh applies
-  # to all three cert-manager Deployments. Kept as one local because the script
-  # applies one patch to all three, and three copies here could drift apart
-  # where the script's cannot.
+  # One resources block for all three cert-manager Deployments, kept as a
+  # single local so the three copies cannot drift apart.
   cert_manager_resources = {
     requests = {
       cpu    = "10m"
@@ -110,6 +119,29 @@ locals {
       memory = "128Mi"
     }
   }
+
+  # The registry third-party images are pulled from on a mirrored install:
+  # third_party_image_registry, falling back to image_registry, the same
+  # precedence the chart's kube-agents.thirdPartyImageRegistry helper applies.
+  # Empty means the upstream registries.
+  third_party_registry = trimsuffix(
+    var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
+  "/")
+
+  # Mirrored image overrides for helm_release.cert_manager below. Destination
+  # names follow images.json (<prefix>/<name>:<tag>) — the contract
+  # `make mirror-images` writes. The tag stays the chart's own appVersion,
+  # which is what images.json pins for the cert-manager entries. Empty when not mirroring,
+  # so a default install's release values are byte-identical.
+  cert_manager_mirror_values = local.third_party_registry == "" ? [] : [yamlencode({
+    image      = { repository = "${local.third_party_registry}/cert-manager-controller" }
+    webhook    = { image = { repository = "${local.third_party_registry}/cert-manager-webhook" } }
+    cainjector = { image = { repository = "${local.third_party_registry}/cert-manager-cainjector" } }
+    acmesolver = { image = { repository = "${local.third_party_registry}/cert-manager-acmesolver" } }
+    startupapicheck = {
+      image = { repository = "${local.third_party_registry}/cert-manager-startupapicheck" }
+    }
+  })]
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -151,6 +183,8 @@ module "gke_cluster" {
 
   project_id                 = var.project_id
   cluster_name               = var.cluster_name
+  cluster_mode               = var.cluster_mode
+  create_cluster             = var.create_cluster
   location                   = var.location
   deletion_protection        = var.deletion_protection
   release_channel            = var.release_channel
@@ -159,6 +193,8 @@ module "gke_cluster" {
   kms_key_name               = var.kms_key_name
   allow_external_dns_traffic = var.allow_external_dns_traffic
   enable_backup_agent        = var.enable_backup_agent
+  enable_gvisor_node_pool    = var.enable_gvisor_node_pool
+  gvisor_pool_name           = var.gvisor_pool_name
 
   resource_labels = {
     "kube-agents-host" = "true"
@@ -238,6 +274,8 @@ module "chat_pubsub" {
 
   project_id                  = var.project_id
   agent_service_account_email = module.kube_agents_iam.service_account_email
+  topic_name                  = var.chat_topic_name
+  subscription_name           = var.chat_subscription_name
 
   depends_on = [google_project_service.required]
 }
@@ -246,25 +284,24 @@ module "github_minter" {
   source = "../../modules/github-minter"
   count  = var.enable_github_minter ? 1 : 0
 
-  project_id = var.project_id
-  location   = var.location
-  namespace  = var.namespace
+  project_id       = var.project_id
+  location         = var.location
+  namespace        = var.namespace
+  kms_keyring_name = var.github_minter_kms_keyring
+  kms_key_name     = var.github_minter_kms_key
 
   depends_on = [google_project_service.required]
 }
 
 # cert-manager, the certificate source for the operator's admission webhooks.
-# provision_03_gcp_gke_operator.sh installs the same version from the release
-# manifest and then patches it; the chart expresses those patches as values.
 #
-# Two divergences from the script, both deliberate:
-#   - the script disables leader election on Autopilot because cert-manager
-#     leases default to kube-system, which Autopilot restricts. Moving the lease
-#     into the cert-manager namespace clears the same restriction without giving
-#     up the lock, so that is what this does.
-#   - the script is idempotent (verify_cert_manager skips an existing install).
-#     Terraform is not: pointing this at a cluster that already runs cert-manager
-#     fails on the existing CRDs. Set enable_cert_manager = false there.
+# Two deliberate choices:
+#   - leader election runs in the cert-manager namespace rather than its
+#     kube-system default, which Autopilot restricts. Moving the lease clears
+#     that restriction without giving up the lock.
+#   - pointing this at a cluster that already runs cert-manager fails on the
+#     existing CRDs rather than adopting them. Set enable_cert_manager = false
+#     there.
 resource "helm_release" "cert_manager" {
   count = var.enable_cert_manager ? 1 : 0
 
@@ -282,7 +319,10 @@ resource "helm_release" "cert_manager" {
   wait    = true
   timeout = 600
 
-  values = [yamlencode({
+  # Helm deep-merges the docs in order, so the mirror overrides (second doc,
+  # present only on a mirrored install) reach the image repositories without
+  # disturbing the resource patches here.
+  values = concat([yamlencode({
     # cert-manager 1.15+'s spelling; 1.14 and earlier called it installCRDs.
     # Dropping cert_manager_version below 1.15.x means changing this key too.
     crds = {
@@ -295,9 +335,8 @@ resource "helm_release" "cert_manager" {
       }
     }
 
-    # The quotas provision_03 patches in, so the two installs ask the scheduler
-    # for the same thing. Autopilot bills what is requested, and its defaults
-    # are several times these.
+    # Small explicit requests: Autopilot bills what is requested, and its
+    # defaults are several times these.
     resources = local.cert_manager_resources
     cainjector = {
       resources = local.cert_manager_resources
@@ -305,7 +344,7 @@ resource "helm_release" "cert_manager" {
     webhook = {
       resources = local.cert_manager_resources
     }
-  })]
+  })], local.cert_manager_mirror_values)
 
   depends_on = [module.gke_cluster]
 }
@@ -316,6 +355,17 @@ resource "helm_release" "kube_agents" {
   namespace        = var.namespace
   create_namespace = true
 
+  # This wait is the install's rollout gate, and 600 is not the provider
+  # default (300) restated: hindsight-api budgets 300s of startupProbe for its
+  # in-process model load on top of a 1.4 GB image pull, so the provider
+  # default gives up on a cold node that is loading normally. Keep it above
+  # the startup budget plus a slow pull (300+240) and below hindsight-api's
+  # progressDeadlineSeconds (900) — past that the Deployment reports failure
+  # and waiting longer buys nothing. tests/test_hindsight_probes.py asserts
+  # the ordering.
+  wait    = true
+  timeout = 600
+
   values = [yamlencode({
     # Reaches every image this release pulls, including the two the chart does
     # not render itself — the agent Deployment and the fluent-bit sidecar the
@@ -323,13 +373,16 @@ resource "helm_release" "kube_agents" {
     # "Installing from a mirrored registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
-    # release of an upstream chart, and these values are not passed to it. An
-    # approved-registry cluster needs enable_cert_manager = false and
-    # cert-manager installed by hand from the mirror. The composition's README
-    # says so under "Installing from a mirrored registry".
+    # release of an upstream chart, and these values are not passed to it.
+    # local.cert_manager_mirror_values carries the same registry to that
+    # release's image repositories, so a mirrored install pulls every image —
+    # cert-manager's included — from the mirror.
     global = {
       imageRegistry           = var.image_registry
       thirdPartyImageRegistry = var.third_party_image_registry
+      # Secret names only. The Secrets themselves are created out of band, so
+      # no registry credential is ever written to Terraform state.
+      imagePullSecrets = var.image_pull_secrets
     }
     operator = {
       image = {
@@ -364,10 +417,25 @@ resource "helm_release" "kube_agents" {
         clusterName = module.gke_cluster.cluster_name
         location    = module.gke_cluster.cluster_location
         projectId   = var.project_id
+        # null leaves a field out of the CR so the CRD default applies — the
+        # chart's compactFields drops nulls and empty strings.
+        hermes = {
+          dashboardEnabled = var.hermes_dashboard_enabled
+        }
+        memory = {
+          enabled            = var.memory_enabled
+          provider           = var.memory_provider
+          userProfileEnabled = var.user_profile_enabled
+        }
       }
       deployment = {
         image = {
           tag = var.image_tag
+        }
+        availability = {
+          # The gVisor pool only exists to run the agent sandboxed, so the
+          # pool and the runtimeClass move together.
+          runtimeClassName = var.enable_gvisor_node_pool ? "gvisor" : ""
         }
       }
       security = {
@@ -406,6 +474,21 @@ resource "helm_release" "kube_agents" {
         } : {}
       )
     }
+    # The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA,
+    # minty rule ConfigMap, github-app-credentials Secret); the GCP half is
+    # module.github_minter above. The App private key still has to be imported
+    # into the module's KMS key before the Deployment goes Ready — see the
+    # github-minter module README.
+    githubMinter = {
+      enabled = var.enable_github_minter
+      org     = local.github_org
+      repo    = local.github_repo_name
+      appId   = var.github_app_id
+      kms = {
+        keyring = var.github_minter_kms_keyring
+        key     = var.github_minter_kms_key
+      }
+    }
     }),
     # Second document rather than a merge() into the first: Helm deep-merges
     # successive values documents, so a caller can reach a single leaf
@@ -426,4 +509,11 @@ resource "helm_release" "kube_agents" {
     google_project_iam_member.litellm_vertex_user,
     helm_release.cert_manager,
   ]
+
+  lifecycle {
+    precondition {
+      condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
+      error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
+    }
+  }
 }

@@ -25,7 +25,7 @@ Every agent action can be traced back to a requester. The full design rationale 
 
 ## Enable Managed OpenTelemetry on an existing cluster
 
-The provisioner enables Managed OTel on new clusters. For an existing cluster:
+The installer enables Managed OTel on the clusters it installs to. For a cluster it did not touch:
 
 ```bash
 gcloud container clusters update "$CLUSTER_NAME" \
@@ -47,7 +47,7 @@ Runtime follow-up will set these on objects the agent creates:
 
 Annotations (not labels) because label values reject characters common in email addresses, and annotations avoid placing PII in selector indexes.
 
-These are per-requester attribution on objects the agent creates, and are distinct from the project-identity labels the operator, kustomizations, and provisioner stamp on the infrastructure kube-agents installs — see [Resource labels](/kube-agents/reference/resource-labels/).
+These are per-requester attribution on objects the agent creates, and are distinct from the project-identity labels the operator, kustomizations, and Helm chart stamp on the infrastructure kube-agents installs — see [Resource labels](/kube-agents/reference/resource-labels/).
 
 ## Trust boundary
 

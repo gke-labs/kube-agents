@@ -38,7 +38,7 @@ spec:
   # default, `kubectl rollout status` stops waiting and reports
   # "exceeded its progress deadline" on a pod that is still starting normally,
   # whatever timeout the caller passed — the deadline is a ceiling over it, so
-  # provisioning step 13's wait has to sit under this number to mean anything.
+  # any caller's rollout wait has to sit under this number to mean anything.
   progressDeadlineSeconds: 900
   selector:
     matchLabels:
@@ -137,7 +137,8 @@ spec:
               drop:
                 - ALL
           # This is the canonical account of the probe timings; the design doc
-          # and provisioning step 13 defer to it.
+          # and the chart's copy (charts/kube-agents/templates/hindsight.yaml)
+          # defer to it.
           #
           # Model loading dominates cold start: the embedding and reranking
           # models load in-process before the API binds :8888. So startup gets

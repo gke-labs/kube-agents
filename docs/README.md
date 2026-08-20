@@ -62,7 +62,7 @@ kube-agents/
 ├── examples/                                      gitops-repo template + inference/
 │                                                  integration READMEs
 ├── k8s-operator/                                  operator, event watcher, Minty,
-│                                                  provisioning-scripts READMEs
+│                                                  installer-helper READMEs
 ├── scripts/release/                               Release Candidate automation scripts README
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
@@ -79,7 +79,7 @@ Which file owns which category of content is defined once, in the
 canonical-home table in [`AGENTS.md`](../AGENTS.md) — do not duplicate a fact
 outside its home; link to it.
 
-Five artifacts are **generated, not hand-written** — four regions inside
+Four artifacts are **generated, not hand-written** — three regions inside
 hand-written documents, plus one whole file. `scripts/generate_docs.py` (run
 via `make docs-generate`) rewrites everything between the markers; everything
 outside them is hand-written. Never edit inside the markers — edit the source
@@ -90,7 +90,6 @@ and regenerate.
 | --- | --- | --- |
 | `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->` | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
 | `docs/site/src/content/docs/skills/index.mdx` | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
-| `k8s-operator/scripts/README.md` | `<!-- BEGIN GENERATED: provisioning-steps -->` | The comment banner in each `k8s-operator/scripts/provision_*.sh` / `teardown_*.sh` script |
 | `docs/site/src/content/docs/deploy/docker-images.md` | `<!-- BEGIN GENERATED: container-images -->` | `images.json` |
 | `docs/family-roster.txt` | whole file (`family-roster`) | The collapsed-family globs in this map's section 4, resolved against `git ls-files` |
 
@@ -305,7 +304,7 @@ only what the title does not say.
 | `concepts/declarative-workflow.md` | Site page | All infrastructure changes route through Git; how `submit-suggestion` and Minty enforce it. | No direct mutation, short-lived tokens, anti-patterns | — |
 | `concepts/inference-gateway.md` | Site page | Model access as a config toggle: LiteLLM for hosted models, vLLM for local, optional replay caching. | Provider choice, replay modes | — |
 | `concepts/observability.md` | Site page | OTel traces, Prometheus metrics, and Cloud Logging routing for agent and gateway. | Exports per component, console links, tool-call audit | — |
-| `install/quickstart-gke.mdx` | Site page | One-command bootstrap of cluster, operator, and Platform Agent; what just happened; common flags. | `provision.sh`, toggles, uninstall pointer | — |
+| `install/quickstart-gke.mdx` | Site page | One-command bootstrap of cluster, operator, and Platform Agent; what just happened; common flags. | `install.sh`, toggles, uninstall pointer | — |
 | `install/prerequisites.md` | Site page | What must be in place before provisioning: tooling, GCP project, cert-manager, chat platform, LLM credentials. | Prerequisites | — |
 | `install/manual.md` | Site page | Installing the Platform Agent workspace into an existing Hermes-compatible harness by hand. | Copy workspace, register, wire infra | — |
 | `install/helm-and-kind.md` | Site page | Points to the canonical Helm chart and Terraform modules in `main` (published from the first `X.Y.Z` tag) and states Kind is unsupported. | Chart/module pointers, no Kind | — |
@@ -317,11 +316,11 @@ only what the title does not say.
 | `deploy/token-minter.md` | Site page | Minty: the in-cluster broker minting short-lived GitHub App installation tokens; no long-lived secret on disk. | Token flow, KMS-held key, setup | Operator-side README: `k8s-operator/config/integrations/github/README.md` |
 | `deploy/telemetry.md` | Site page | Where OTel, Prometheus, and Cloud Logging fit in the shipping deploy, and how to point it at a collector other than the GKE-managed one. | What runs where, OTLP endpoint precedence and discovery, non-GKE clusters | — |
 | `deploy/gitops-argocd.md` | Site page | Standing up ArgoCD and Config Connector as the pull-based reconciler that applies what the agent proposes. | Pull vs push, read-only repo App, fleet auth, prune gates | Reference repo layout: `examples/gitops-repo/README.md` |
+| `deploy/ci-pool-projects.md` | Site page | Prerequisites and setup for GCP projects in the Boskos evaluation pool. | Enabled APIs, host cluster, IAM, AR cleanup policy, Boskos registration | CI engineers |
 | `operator/index.md` | Site page | Overview of the Kubebuilder controller reconciling `PlatformAgent` CRs and the resources it manages. | Managed resources, webhooks, layout | — |
 | `operator/platformagent-crd.md` | Site page | Reference for the `PlatformAgent` custom resource shape and reconcile behavior. | `spec.harness`/`deployment`/`security`/`integration`, `status` | — |
 | `operator/agentplugin-crd.md` | Site page | Reference for the `AgentPlugin` custom resource shape, OCI image volume mounting, and security allowlisting. | `spec.agentRef`/`image`/`env`/`config`, `status` | — |
 | `operator/development.md` | Site page | Building, testing, and iterating on the operator locally. | Kubebuilder workflow, fast iteration | — |
-| `operator/provisioning-scripts.md` | Site page | Narrative around the modular provisioning sub-scripts and their teardown counterparts. | Orchestrator, idempotent steps, gotchas | Canonical per-script list is `k8s-operator/scripts/README.md` (generated) |
 | `reference/index.mdx` | Site page | Card-grid hub for the reference section. | Navigation | — |
 | `reference/config.md` | Site page | `agents/platform/config.yaml` annotated: MCP servers, toolsets, memory, plugins. | Config keys | — |
 | `reference/cron-jobs.md` | Site page | Annotated cron reference; the jobs table is a **generated region** sourced from `agents/chat/defaults/cron/jobs.json`. | Job schema, editing | Do not hand-edit the table; `make docs-generate` |
@@ -353,20 +352,21 @@ only what the title does not say.
 | `bench/README.md` | Component README | The evaluation harness that runs `kubernetes-sigs/devops-bench` against the Platform Agent as a pip-installed library: layout, running evals, harness registration, offline tests. | Eval invocation, `BENCH_TF_ROOT` stacks | Developers writing or running evals |
 | `bench/CUSTOM-TASKS.md` | How-to | Authoring new devops-bench tasks and agent harnesses, here or in a private repository: layout convention, the `devops-bench` SHA pin, OpenTofu stacks, `task.yaml` and `verification_spec`, custom `AgentHarness`. | Task authoring, verification spec, harnesses | Developers writing evals |
 | `charts/kube-agents/README.md` | Component README | Canonical GKE-oriented Helm chart (`kube-agents`) for deploying the Kube-Agents operator and PlatformAgent CR via GitOps. | Chart configuration, values, CRD installation | Deployment operators and GitOps pipelines |
-| `k8s-operator/README.md` | Component README | The Go/Kubebuilder operator managing the `PlatformAgent` CRD: prerequisites, the `make gcp-provision` workflow, teardown. | CRD lifecycle, provisioning entry point | Operator developers |
+| `k8s-operator/README.md` | Component README | The Go/Kubebuilder operator managing the `PlatformAgent` CRD: prerequisites, pointers to the installer/composition, dev iteration. | CRD lifecycle, dev workflow | Operator developers |
 | `k8s-operator/cmd/k8s-event-watcher/README.md` | Component README | The Go daemon that streams, filters, and deduplicates GKE warning events and forwards unique incidents to trigger autonomous diagnostic sessions. | Event filtering, dedup windows, snapshots | Watcher developers/operators |
 | `k8s-operator/config/integrations/github/README.md` | Component README | The GitHub Token Minter (Minty) integration: short-lived GitHub App tokens brokered against Workload Identity OIDC, App key held in Cloud KMS. | Token flow, App setup, KMS import | Operators wiring GitOps write access; site page `deploy/token-minter.md` is the narrative |
-| `k8s-operator/config/integrations/hindsight/README.md` | Component README | The Hindsight API and its Postgres/pgvector database — the memory store behind the Chat Agent: how provisioning step 13 installs it (and when it skips), why it needs no credentials, and the in-cluster URL the agent image bakes in. | Passwordless Postgres, NetworkPolicy, digest pinning, no HF egress | Operators installing the memory store; the design rationale is `docs/designs/memory.md` |
-| `k8s-operator/scripts/README.md` | Component README | **Canonical** description of every provisioning/teardown script and the shared `vars.sh` state model. The step tables are a **generated region** sourced from each script's comment banner. | Script inventory, state model | Do not hand-edit the tables; `make docs-generate` |
+| `k8s-operator/config/integrations/hindsight/README.md` | Component README | The Hindsight API and its Postgres/pgvector database — the memory store behind the Chat Agent: the kustomize dev copy of what the chart renders, why it needs no credentials, and the in-cluster URL the agent image bakes in. | Passwordless Postgres, NetworkPolicy, digest pinning, no HF egress | Operators installing the memory store; the design rationale is `docs/designs/memory.md` |
+| `k8s-operator/scripts/README.md` | Component README | **Canonical** home for the shared installer defaults (`installer_common.sh`), the `vars.sh` state model, and the helper scripts the installer front doors still share. | Shared defaults, state model, helper inventory | Installer and dev-tooling developers |
 | `k8s-operator/scripts/dev/README.md` | Component README | The script automating GCP Workload Identity Federation so GitHub Actions can deploy keylessly. | WIF/OIDC CI auth | Repo maintainers |
 | `k8s-operator/testing/staging_workloads/README.md` | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators. | Cluster maps, workload bundle, load shapes | Developers building staging fleets |
 | `scripts/release/README.md` | Component README | Overview of Release Candidate (RC) pipeline scripts: candidate tag creation (Step 1), environment provisioning (Step 2), GKE readiness & E2E test execution (Step 3), and validated tag promotion (Step 4). | Release Candidate scripts, RC automation | CI maintainers and release operators |
-| `terraform/examples/full-install/README.md` | Component README | Single-apply root composition of all four modules plus a helm_release of the canonical chart — the IaC counterpart of `./provision.sh`; covers image-tag overrides, Chat/GitHub integration wiring, teardown order. | One-command IaC install, composed values | Infrastructure engineers |
-| `terraform/modules/gke-cluster/README.md` | Component README | Reusable Terraform module for provisioning a regional GKE Autopilot cluster configured for Kube-Agents workloads. | GKE Autopilot, Workload Identity, regional | Infrastructure engineers |
-| `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set; mutually exclusive with `provision_04_gcp_iam.sh`. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
-| `terraform/modules/chat-pubsub/README.md` | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM; mutually exclusive with `provision_05_gcp_gchat.sh`. | Chat Pub/Sub, service identities, IAM | Infrastructure engineers |
-| `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (PEM import stays with `provision_10_deploy_github_minter.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
-| `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; mutually exclusive with `provision_12_gke_backup_plan.sh`, and opt-in in both paths for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
+| `terraform/examples/full-install/README.md` | Component README | Single-apply root composition of the modules plus a helm_release of the canonical chart — the install engine `./install.sh` drives via `lifecycle.sh`; covers image-tag overrides, Chat/GitHub integration wiring, teardown order. | Install engine, composed values | Infrastructure engineers |
+| `terraform/modules/gke-cluster/README.md` | Component README | Reusable Terraform module for the GKE cluster hosting Kube-Agents: Autopilot or Standard (`cluster_mode`), existing-cluster mode, optional gVisor pool and CMEK. | Cluster shapes, Workload Identity, CMEK | Infrastructure engineers |
+| `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
+| `terraform/modules/chat-pubsub/README.md` | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM. | Chat Pub/Sub, service identities, IAM | Infrastructure engineers |
+| `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (the one-shot PEM import via the Minty CLI is documented there and run by `install.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
+| `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; opt-in for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
+| `terraform/modules/drift-pubsub/README.md` | Component README | Reusable Terraform module for the drift detector's audit-log ingress: Log Router sink, drift-audit topic and pull subscription, sink-writer and subscriber IAM; not yet part of the full-install composition. | Audit-log sink, Pub/Sub, writer identity | Infrastructure engineers |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
 
 ## 5. Keeping this map fresh

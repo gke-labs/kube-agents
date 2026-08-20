@@ -11,6 +11,7 @@ failed the way it did rather than reaching the network with a bad key.
 """
 
 import importlib
+import importlib.metadata
 import os
 import sys
 import time
@@ -25,18 +26,33 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 from session_manager import SessionManager
 
 
+def _mcp_distribution_installed():
+    try:
+        importlib.metadata.distribution("mcp")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
 def _load_agent_common_server():
     """Import the module under test.
 
     These tests run in CI via `make test-python`, and the credential logic under
     test (resolve_agent_credentials) depends only on the stdlib. When the hermes
-    runtime deps (FastMCP / pydantic / session_manager) aren't importable, fall
-    back to minimal stubs so the module still imports in a bare checkout. Each
-    stub package sets __path__ so it is treated as a real package.
+    runtime deps (FastMCP / pydantic / session_manager) aren't installed at all,
+    fall back to minimal stubs so the module still imports in a bare checkout.
+    Each stub package sets __path__ so it is treated as a real package.
+
+    ABSENT is not BROKEN: stub only when no mcp distribution is installed, and
+    ask importlib.metadata rather than importlib.util.find_spec. Why, and what
+    an installed-but-incompatible mcp means, is in test_mcp_package_contract.py.
     """
     try:
         return importlib.import_module("agent_common_server")
     except Exception:
+        if _mcp_distribution_installed():
+            raise
+
         import session_manager as real_session_manager
 
         def _stub_if_missing(name, module):

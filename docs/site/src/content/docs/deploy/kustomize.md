@@ -143,7 +143,7 @@ The exposed ports:
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.
 - `config/integrations/github/` — Minty deployment and its `PodDisruptionBudget`.
-- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `PodDisruptionBudget`, `NetworkPolicy`, `PodMonitoring`, and `chatgpt` and `vertex_ai` overlays).
+- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `PodDisruptionBudget`, `NetworkPolicy`, `PodMonitoring`, and a `vertex_ai` overlay).
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, PVC, and `PodDisruptionBudget`.
 - `config/integrations/hindsight/` — the Planning Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `PodDisruptionBudget`s, `NetworkPolicy`, and `PodMonitoring`.
 
@@ -152,7 +152,12 @@ Each is built and applied on its own; there is no aggregate kustomization over
 output before it can be applied — each carries its image as a `${…}` variable so
 a mirrored install can redirect it, and most need other substitutions besides.
 
-Deploy these via `make deploy-*` from `k8s-operator/`:
+These copies are the **development path**: a stock install gets the same
+components rendered by the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents)
+(via the Terraform engine `./install.sh` drives), while `k8s-operator/config/`
+remains the source of truth for the CRDs and operator RBAC the chart copies
+(`make chart-check` enforces that). Deploy the dev copies via `make deploy-*`
+from `k8s-operator/`:
 
 ```bash
 make deploy                     # operator

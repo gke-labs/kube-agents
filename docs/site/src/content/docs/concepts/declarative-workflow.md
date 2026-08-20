@@ -112,7 +112,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 ### How it works
 
 1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`, `issues:write` — `fleet-audit` publishes its ledger as an issue) and installed on the target repo.
-2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `github-token-minter-keyring`, key `github-token-minter-key`, created by `provision_10_deploy_github_minter.sh`) — the raw key material never lives outside KMS.
+2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `github-token-minter-keyring`, key `github-token-minter-key`, created by the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter)) — the raw key material never lives outside KMS.
 3. When `submit-suggestion` needs a token, the credential broker calls Minty (default endpoint `http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token`) using the agent's Workload Identity.
 4. Minty asks KMS to sign a JWT with the imported private key.
 5. Minty exchanges the JWT with GitHub for a **short-lived installation token scoped to the target repository**.
