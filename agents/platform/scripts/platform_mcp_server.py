@@ -9,6 +9,7 @@ import socket
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 import subprocess
 import ipaddress
 import tempfile
@@ -835,6 +836,220 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {payload.get('session_id', '?')}). "
         "The Chat Agent posts it; do not also call send_notification for this report."
+    )
+
+
+# =============================================================================
+# The findings queue (docs/designs/inventory-findings-queue.md §6.1)
+#
+# Thin wrappers over the Session KV routes, in the shape send_notification and
+# report_to_chat already use. The ranking, the rubric and the state machine all
+# live behind those routes: nothing here decides anything.
+# =============================================================================
+
+FINDINGS_TIMEOUT_SECONDS = 20.0
+
+
+def _findings_request(method: str, path: str, body: dict | None = None) -> Any:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = _session_kv_headers({"Content-Type": "application/json"} if data else None)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:8699{path}", data=data, headers=headers, method=method
+    )
+    with urllib.request.urlopen(req, timeout=FINDINGS_TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _findings_call(method: str, path: str, body: dict | None = None) -> str:
+    try:
+        return json.dumps(_findings_request(method, path, body), indent=2)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("detail")
+        except Exception:
+            detail = None
+        return f"ERROR: the findings queue refused this ({exc.code}): {detail or exc.reason}"
+    except Exception as exc:
+        return f"ERROR: could not reach the findings queue: {exc}"
+
+
+@mcp.tool()
+def register_findings(findings: list, scope: dict | None = None) -> str:
+    """
+    Register findings in the durable queue, or update ones already there.
+
+    Identity is derived from (check, cluster, namespace, object), so registering
+    the same problem twice updates one row rather than creating two. A finding
+    the user dismissed stays dismissed and is reported back as 'suppressed'.
+
+    Each finding needs: source ('inventory' | 'event-watcher' | 'audit'), check
+    (the audit stream's own slug), cluster, namespace (omit for cluster-scoped),
+    object, title, rubric, recommendation {action, rationale, risk},
+    remediation {kind, path, note} and verification {kind, command,
+    still_failing_when}. Optional: detail, root_cause, actionable,
+    provider_managed.
+
+    rubric is {B, L, detect, recover, C} against the anchors in the prioritize
+    SOP: B in 1/2/3/5/8, L in 1/2/4/6/10, detect and recover in 1/2/3, C in
+    1.0/0.9/0.6. Severity and rank score are computed from it and must not be
+    passed.
+
+    Args:
+        findings: The findings to register.
+        scope: Pass {'cluster': '<name>', 'complete': true} only when this run
+            covered that cluster in full. It lowers the confidence of queued
+            rows the run did not re-report. Omit it for a partial or failed run.
+    """
+    return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
+
+
+@mcp.tool()
+def get_ranked_findings() -> str:
+    """
+    The whole open backlog, ordered worst first: actionable before unactionable,
+    then by rank score, then a deterministic tie-break.
+
+    This is what the backlog document and the daily nudge are rendered from. The
+    order is decided here — do not re-rank it.
+    """
+    return _findings_call("GET", "/v1/findings/ranked")
+
+
+@mcp.tool()
+def get_findings(cluster: str = "", state: str = "", severity: str = "", limit: int = 200) -> str:
+    """
+    Look up findings by cluster, state or severity — the on-demand pull.
+
+    Args:
+        cluster: Restrict to one cluster.
+        state: One of queued, surfaced, snoozed, accepted, dismissed, resolved, stale.
+        severity: One of critical, major, minor.
+        limit: Maximum rows to return (default 200).
+    """
+    query = urllib.parse.urlencode(
+        {k: v for k, v in (("cluster", cluster), ("state", state), ("severity", severity), ("limit", limit)) if v}
+    )
+    return _findings_call("GET", f"/v1/findings?{query}" if query else "/v1/findings")
+
+
+@mcp.tool()
+def mark_finding_surfaced(finding_id: str, chat_id: str = "", thread_id: str = "") -> str:
+    """
+    Record that a finding was named in a message that has already been sent.
+
+    Call this after the send, not before: it advances the surface count a
+    publisher uses to decide what to repeat.
+
+    Args:
+        finding_id: The finding's id.
+        chat_id: The chat the message landed in, if any.
+        thread_id: The thread the message landed in, if any.
+    """
+    return _findings_call(
+        "POST", f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}/surfaced", {"chat_id": chat_id, "thread_id": thread_id}
+    )
+
+
+@mcp.tool()
+def update_finding(
+    finding_id: str,
+    state: str = "",
+    snoozed_until: str = "",
+    pr_url: str = "",
+    pr_state: str = "",
+) -> str:
+    """
+    Apply a decision the user made about a finding, or reconcile its pull request.
+
+    The user's three decisions are 'accepted' (they are working it), 'snoozed'
+    (not now, with a date) and 'dismissed' (won't fix — permanent, and the next
+    sweep will not resurrect it). Use 'surfaced' to return a snooze that has
+    expired to the list. A finding that no longer reproduces is not set here:
+    that is a verification outcome.
+
+    Args:
+        finding_id: The finding's id.
+        state: accepted | snoozed | dismissed | surfaced.
+        snoozed_until: Required with 'snoozed'. An ISO date or timestamp.
+        pr_url: The pull request opened for this finding.
+        pr_state: open | merged | closed.
+    """
+    patch = {
+        key: value
+        for key, value in (
+            ("state", state),
+            ("snoozed_until", snoozed_until),
+            ("pr_url", pr_url),
+            ("pr_state", pr_state),
+        )
+        if value
+    }
+    return _findings_call("PATCH", f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}", patch)
+
+
+@mcp.tool()
+def record_finding_verification(
+    finding_id: str,
+    outcome: str,
+    observed: str = "",
+    rubric: dict | None = None,
+    object_missing: bool = False,
+) -> str:
+    """
+    Report what running a finding's own verification command showed.
+
+    Three outcomes, and the third is not the second:
+
+    - 'still_failing': the command ran and the failing condition held.
+    - 'resolved': the command ran and the condition did not hold. The finding
+      leaves the queue, so use this only when the command actually ran.
+    - 'unverifiable': the command failed, timed out, was denied, or the object
+      is gone. Pass object_missing=true for the last of those. Nothing is
+      concluded about the finding and its freshness does not advance.
+
+    Args:
+        finding_id: The finding's id.
+        outcome: still_failing | resolved | unverifiable.
+        observed: What the command actually returned.
+        rubric: A corrected {B, L, detect, recover, C} when verification changed
+            what the finding is — a gap now firing, or a fault that has stopped.
+        object_missing: True when the object the finding names no longer exists.
+    """
+    return _findings_call(
+        "POST",
+        f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}/verified",
+        {"outcome": outcome, "observed": observed, "rubric": rubric, "object_missing": object_missing},
+    )
+
+
+@mcp.tool()
+def findings_publication(
+    publisher: str,
+    target_kind: str = "",
+    target_ref: str = "",
+    content_hash: str = "",
+) -> str:
+    """
+    Read or write what a publisher remembers between runs.
+
+    Two publishers: 'backlog' keeps the target_ref of the document it rewrites,
+    so the next run edits that one instead of opening a second; 'nudge' keeps
+    the content_hash it last posted, which is what 'the list changed' compares
+    against. Called with only a publisher, this reads; called with target_kind,
+    it writes.
+
+    Args:
+        publisher: backlog | nudge.
+        target_kind: github-issue | repo-file | chat. Required to write.
+        target_ref: The URL or path published to.
+        content_hash: A hash of what was published.
+    """
+    if not target_kind:
+        return _findings_call("GET", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}")
+    return _findings_call(
+        "PUT",
+        f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}",
+        {"target_kind": target_kind, "target_ref": target_ref, "content_hash": content_hash},
     )
 
 

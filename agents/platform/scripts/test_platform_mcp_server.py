@@ -991,5 +991,78 @@ class TestSanitizationAndMutationRemoval(unittest.TestCase):
         self.assertIn("[token_start]system", result)
 
 
+class TestFindingsQueueTools(unittest.TestCase):
+    """The seven findings tools are thin wrappers over the loopback KV server."""
+
+    def setUp(self):
+        self.captured = []
+
+        def fake_request(method, path, body=None):
+            self.captured.append((method, path, body))
+            return {"ok": True}
+
+        self._patch = patch.object(platform_mcp_server, "_findings_request", fake_request)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def test_each_tool_calls_its_route(self):
+        platform_mcp_server.register_findings([{"check": "x"}], {"cluster": "c", "complete": True})
+        platform_mcp_server.get_ranked_findings()
+        platform_mcp_server.get_findings(cluster="prod-eu", severity="critical")
+        platform_mcp_server.mark_finding_surfaced("f-1", "spaces/AAA")
+        platform_mcp_server.update_finding("f-1", state="accepted")
+        platform_mcp_server.record_finding_verification("f-1", "still_failing", "0/3 ready")
+        platform_mcp_server.findings_publication("backlog")
+        platform_mcp_server.findings_publication("backlog", "github-issue", "https://example.invalid/i/1")
+
+        self.assertEqual(
+            [(method, path) for method, path, _ in self.captured],
+            [
+                ("POST", "/v1/findings"),
+                ("GET", "/v1/findings/ranked"),
+                ("GET", "/v1/findings?cluster=prod-eu&severity=critical&limit=200"),
+                ("POST", "/v1/findings/f-1/surfaced"),
+                ("PATCH", "/v1/findings/f-1"),
+                ("POST", "/v1/findings/f-1/verified"),
+                ("GET", "/v1/findings/publication/backlog"),
+                ("PUT", "/v1/findings/publication/backlog"),
+            ],
+        )
+
+    def test_update_sends_only_the_fields_the_caller_set(self):
+        platform_mcp_server.update_finding("f-1", pr_state="merged")
+        self.assertEqual(self.captured[-1][2], {"pr_state": "merged"})
+
+    def test_a_finding_id_cannot_reroute_the_call(self):
+        platform_mcp_server.update_finding("../../v1/sessions", state="accepted")
+        self.assertEqual(self.captured[-1][1], "/v1/findings/..%2F..%2Fv1%2Fsessions")
+
+    def test_a_refusal_comes_back_as_text_not_a_traceback(self):
+        import io
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:8699/v1/findings", 400, "Bad Request", {},
+            io.BytesIO(json.dumps({"detail": "rubric.B must be one of (1, 2, 3, 5, 8)"}).encode()),
+        )
+        with patch.object(platform_mcp_server, "_findings_request", side_effect=error):
+            result = platform_mcp_server.register_findings([{"check": "x"}])
+        self.assertEqual(
+            result, "ERROR: the findings queue refused this (400): rubric.B must be one of (1, 2, 3, 5, 8)"
+        )
+
+    def test_a_refusal_with_no_json_body_still_reports(self):
+        import io
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:8699/v1/findings", 503, "Service Unavailable", {}, io.BytesIO(b"")
+        )
+        with patch.object(platform_mcp_server, "_findings_request", side_effect=error):
+            result = platform_mcp_server.get_ranked_findings()
+        self.assertIn("(503)", result)
+        self.assertIn("Service Unavailable", result)
+
+
 if __name__ == '__main__':
     unittest.main()

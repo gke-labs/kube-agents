@@ -21,6 +21,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import findings_queue
 
 # Configure logging
 logging.basicConfig(
@@ -382,10 +383,14 @@ def init_db() -> None:
                 )
                 """
             )
+            findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
 
 def cleanup_old_records(conn: sqlite3.Connection) -> None:
+    # `findings` and `queue_publications` are deliberately absent: a backlog
+    # with a TTL is not a backlog, and a `dismissed` row that ages out is one
+    # the next sweep re-offers. Their lifecycle is `state`, not age.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -1827,6 +1832,100 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
         if limit > 0
     }
     return {"day": day, "severities": severities}
+
+
+# --------------------------------------------------------------------------
+# The findings queue: docs/designs/inventory-findings-queue.md §6.1.
+#
+# HTTP rather than MCP tools alone because the event watcher is a first-class
+# writer (§5.1) and it is Go. `findings_queue` holds the schema, the rubric and
+# the ordering; these routes are the transport, and the MCP tools in
+# platform_mcp_server.py are a wrapper over them.
+# --------------------------------------------------------------------------
+
+
+def _findings_write(operation, *args, **kwargs) -> Any:
+    """Run one queue operation in a transaction, mapping its errors to status."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                return operation(conn, *args, **kwargs)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"no finding {exc.args[0]!r}") from None
+
+
+@app.post("/v1/findings", dependencies=[Depends(verify_api_key)])
+def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Upsert a batch of findings under §5.2's per-state rules.
+
+    `scope` is how a source says its run was complete for one cluster, which is
+    the only condition under which absence may lower a row's confidence. A
+    partial run must omit it: a sweep that died halfway looks exactly like a
+    fleet that got healthier.
+    """
+    return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
+
+
+@app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
+def get_ranked_findings() -> Dict[str, Any]:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        return {"findings": findings_queue.ranked_findings(conn)}
+
+
+@app.get("/v1/findings", dependencies=[Depends(verify_api_key)])
+def get_findings(cluster: str = "", state: str = "", severity: str = "", limit: int = 200) -> Dict[str, Any]:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            findings = findings_queue.list_findings(conn, cluster, state, severity, limit)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"findings": findings}
+
+
+@app.post("/v1/findings/{finding_id}/surfaced", dependencies=[Depends(verify_api_key)])
+def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    body = body or {}
+    return _findings_write(
+        findings_queue.mark_surfaced,
+        finding_id,
+        str(body.get("chat_id") or ""),
+        str(body.get("thread_id") or ""),
+    )
+
+
+@app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])
+def patch_finding(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """The three human transitions (§3.2), the snooze expiry, and PR reconciliation."""
+    return _findings_write(findings_queue.patch_finding, finding_id, body)
+
+
+@app.post("/v1/findings/{finding_id}/verified", dependencies=[Depends(verify_api_key)])
+def record_finding_verification(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """§7.4's three outcomes: still_failing, resolved, unverifiable."""
+    return _findings_write(
+        findings_queue.record_verification,
+        finding_id,
+        str(body.get("outcome") or ""),
+        str(body.get("observed") or ""),
+        body.get("rubric"),
+        bool(body.get("object_missing")),
+    )
+
+
+@app.get("/v1/findings/publication/{publisher}", dependencies=[Depends(verify_api_key)])
+def get_queue_publication(publisher: str) -> Dict[str, Any]:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = findings_queue.get_publication(conn, publisher)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"no publication row for {publisher!r}")
+    return row
+
+
+@app.put("/v1/findings/publication/{publisher}", dependencies=[Depends(verify_api_key)])
+def put_queue_publication(publisher: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    return _findings_write(findings_queue.put_publication, publisher, body)
 
 
 init_db()
