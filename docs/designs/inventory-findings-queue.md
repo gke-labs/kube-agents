@@ -127,6 +127,7 @@ Grain is one problem: one check, at one object, on one cluster.
 | `state`                                      | `queued` → `surfaced` → `accepted` \| `dismissed` \| `resolved`, plus `snoozed` and `stale`                                                                                                                                |
 | `first_seen`, `last_verified`, `surfaced_at` |                                                                                                                                                                                                                            |
 | `surface_count`, `snoozed_until`             | how many nudges have named it, and the explicit silence (§7)                                                                                                                                                               |
+| `alarmed_at`                                 | the alarm's edge trigger: when it last fired for this row, null when the row is not over §4.2's floor (§7.2)                                                                                                               |
 | `verification`                               | `{kind, command, still_failing_when}` — how to ask the cluster whether this is still true. Written at registration by whoever found it (§7.4)                                                                              |
 | `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not a delivery input (§8)                                                                                                                      |
 
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS findings (
     surfaced_at      TIMESTAMP,
     surface_count    INTEGER NOT NULL DEFAULT 0,
     snoozed_until    TIMESTAMP,
+    alarmed_at       TIMESTAMP,                   -- edge trigger for §7.2's alarm; null when off the floor
     chat_id          TEXT,
     thread_id        TEXT,
     likelihood       INTEGER GENERATED ALWAYS AS (json_extract(rubric, '$.L')) VIRTUAL,
@@ -188,8 +190,8 @@ Five choices in there are not free.
 is a syntax error; `"check"` parses but leaves every query one forgotten quote away from the same
 error. The column is the audit streams' check slug (§10) whatever it is called here.
 
-**`likelihood` and `blast_radius` are generated columns, not stored ones.** §4.2's floor and §7's
-§7.2's alarm both select on L, and a `WHERE json_extract(rubric, '$.L') = 10` cannot use an index.
+**`likelihood` and `blast_radius` are generated columns, not stored ones.** §4.2's floor and §7.2's
+alarm both select on L, and a `WHERE json_extract(rubric, '$.L') = 10` cannot use an index.
 Generated columns can be indexed and cannot drift from the vector they are computed from, which is
 the objection §4.2 raises against keeping an `active` flag in a column of its own: a second copy of
 a derived fact is free to disagree with the fact. These are not a second copy — SQLite recomputes
@@ -555,8 +557,8 @@ rule is per state, and two of the seven are the whole point of writing it down:
   `queued`, and it reappears on the list — which is not a queue with a dismissal, it is a queue that
   forgets. Record the re-observation on the row so the count is honest; do not act on it.
 - `resolved`, `stale` — a re-registration means it came back. Move to `queued`, keep `first_seen`,
-  reset `surface_count` to zero. A recurrence is news and should be allowed to trigger the alarm
-  again, but it is the same problem with a history, not a new one.
+  clear `surface_count` and `alarmed_at`. A recurrence is news and should be allowed to trigger the
+  alarm again, but it is the same problem with a history, not a new one.
 
 **A finding that stops being reported is not thereby resolved.** This is the reciprocal case and the
 one an upsert cannot express, because it is about the rows a run did _not_ mention. The temptation
@@ -604,15 +606,22 @@ gets the same treatment, for two reasons that are not stylistic:
   Python function beside the table, reached as an endpoint that returns rows already ordered — not a
   prompt that asks a model to rank.
 
-| endpoint                                         | caller                            | does                                                                                   |
-| ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
-| `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
-| `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in score order, grouped by object; the whole list, ordering in code     |
-| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                             |
-| `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
-| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation            |
-| `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                               |
-| `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                     |
+| endpoint                                         | caller                            | does                                                                                     |
+| ------------------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------------- |
+| `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id   |
+| `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue, grouped by object and ordered as below; the whole list, ordering in code |
+| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                               |
+| `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                   |
+| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation              |
+| `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                                 |
+| `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                       |
+
+**What `/ranked` means by "open", and how grouping and ordering coexist.** Open is `queued`,
+`surfaced`, `accepted`, and a `snoozed` row whose `snoozed_until` has passed. The sort key is
+`(actionable, the group's highest score, rank_score, _finding_sort_key)`, grouping on
+`(cluster, namespace, object)` — so one `critical` outranks a workload carrying seven `minor`s, the
+seven still arrive together, and §4.4's gate keeps unactionable findings below everything someone
+could act on.
 
 Then, and only then, the MCP layer: thin tools on `platform_mcp_server.py` that call those endpoints
 on loopback. That is not a new pattern — `send_notification` and `report_to_chat` are already
@@ -716,10 +725,17 @@ use.
 **The alarm does not wait for the gate.** A finding that crosses §4.2's floor — `L = 10` and
 `B ≥ 3`, failing now on something the user depends on — gets its own message, carrying the full
 shape: the issue, its root cause, the recommendation, and the pull request. It posts whether or not
-the list changed by §7.2's definition, and the nudge omits what the alarm has just sent rather than
-naming it twice in one morning. Where the finding came from the event watcher, that watcher's
-existing `inject_message` path already reports the fault within the minute, and the alarm's job is
-to attach the queue's ranking and its prepared fix to something the user has already heard about.
+the list changed, and the nudge omits what the alarm has just sent rather than naming it twice in
+one morning. Where the finding came from the event watcher, that watcher's existing `inject_message`
+path already reports the fault within the minute, and the alarm's job is to attach the queue's
+ranking and its prepared fix to something the user has already heard about.
+
+**It fires on the crossing, not on the condition.** A CrashLoopBackOff stays over the floor until
+someone fixes it, so "post whenever `L = 10 ∧ B ≥ 3`" is a message every morning about a fault the
+user heard about on day one — the 90× repeat §7.3 measured, rebuilt in the one publisher that has no
+change gate. So the run alarms on rows over the floor whose `alarmed_at` is null and stamps it; a
+re-rank that takes a row back under the floor clears it, as does §5.2's recurrence. A fault that
+persists alarms once and then lives on the list; a fault that clears and comes back alarms again.
 
 The floor is narrower than the list's own top, deliberately: it requires `B ≥ 3`, so an OOMKilled
 dev batch Job can head the list on a quiet morning without waking anyone. It appears in the nudge,
@@ -929,10 +945,20 @@ it and the close becomes a human veto.
 **Promote the top slice, not the list.** Publishing everything makes this the question it was not
 before: if the whole backlog is visible, does the whole backlog get a pull request? No. Scan-time
 promotion on a neglected fleet lands dozens of PRs before the user has read one finding, and a
-visible list does not change that arithmetic. So promotion is bounded the same way verification is
-(§7.4) — the findings the nudge names, and anything crossing §4.2's floor — and the rest sit on the
-list with their recommendation and no PR until they reach the top. **Cost follows what is asserted,
-not what was found.**
+visible list does not change that arithmetic. So promotion is bounded: the three highest-scoring
+findings a pull request can actually be written for, plus anything crossing §4.2's floor that
+qualifies. The rest sit on the list with their recommendation and no PR until they reach the top.
+**Cost follows what is asserted, not what was found.**
+
+**The slice is the top three _promotable_ findings, not the top three.** Those differ, and the
+difference is not an edge case: a provider-managed fault is `manual` by the rule below, and it can
+head the list for as long as the support case takes. Bounding on the nudge's top three would let
+three findings nobody can write a patch for hold the fix pipeline shut behind them — a workload
+whose missing `readinessProbe` is a four-line diff waits on a GKE support ticket. §7.2's stuck-at-top
+rule notices that state and says so in the nudge; it does not clear it. So the promotion query skips
+rows that are `provider_managed` or whose `remediation.kind` is not `manifest` and takes the next
+three, which is the same bound and a different three. Verification (§7.4) already covers "anything
+about to be promoted", so it follows the slice without a rule of its own.
 
 The list should say so, per row, rather than leaving a reader to infer that a missing PR means the
 harness failed to produce one. A finding below the slice reads "no fix prepared yet"; one whose
@@ -1056,8 +1082,9 @@ the smaller change and leaves one vocabulary.
 ## 11. What this does not do
 
 It does not replace the audit ledgers. It builds no new remediation-PR machinery, reusing
-`remediate` wholesale. It does not change what the first-time report looks like — the delivered
-`INVENTORY.md` keeps its cap and stays verbatim. And `INVENTORY.raw.md` stays where it is as the
+`remediate` wholesale. It leaves the first-time report as it is — the delivered `INVENTORY.md`
+keeps its cap and is still posted verbatim, and the only change is that its `Also found: N items`
+line gains a link to the backlog (§5). And `INVENTORY.raw.md` stays where it is as the
 full-detail record of what a sweep saw, which the queue references rather than replaces.
 
 ## 12. What building this consists of
@@ -1065,9 +1092,7 @@ full-detail record of what a sweep saw, which the queue references rather than r
 Collected from the sections above so an implementation can be scoped and split, in dependency order.
 Each item names the section that specifies it; nothing here is new.
 
-| #                                                      | deliverable | where |
-| ------------------------------------------------------ | ----------- | ----- |
-| **The core — no repository code in any of it (§6.2).** |
+**The core — no repository code in any of it (§6.2).**
 
 | #   | deliverable                                                                                           | where |
 | --- | ----------------------------------------------------------------------------------------------------- | ----- |
@@ -1090,7 +1115,7 @@ Each item names the section that specifies it; nothing here is new.
 | --- | -------------------------------------------------------------------------------------------------- | -------- |
 | 8   | `findings_publish_sop.md` and its `jobs.json` entry, scheduled after the daily audits              | §7.5     |
 | 9   | The backlog publisher: render the ranked list, create-or-rewrite its document, record `target_ref` | §7.1     |
-| 10  | The nudge and the alarm, including the `content_hash` change gate and the weekly floor             | §7.2     |
+| 10  | The nudge's `content_hash` change gate and weekly floor, and the alarm's `alarmed_at` edge trigger | §7.2     |
 | 11  | Verification of the top slice and its three outcomes, including "could not verify"                 | §7.4     |
 | 12  | Top-slice promotion through `remediate`, and `pr_state` reconciliation for open promotions         | §9, §3.2 |
 
