@@ -538,8 +538,15 @@ def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) ->
     session row supersedes the sum when it is reachable.
     """
     answer = str(turn.metadata.get("final_message") or turn.output)
-    if settled and answer.strip() and answer.strip() not in base.output:
-        base.output = "\n\n".join(filter(None, [base.output, answer]))
+    if settled and answer.strip():
+        if answer.strip() not in base.output:
+            base.output = "\n\n".join(filter(None, [base.output, answer]))
+        # Run-level final_message tracks the LAST settled turn's closer: on a
+        # delegated investigation that is where the actual answer lives, and
+        # the transcript verifiers' default scope reads it (a check against
+        # the delegating turn's "created, working on it" would grade the
+        # wrong sentence).
+        base.metadata["final_message"] = answer
     _sum_tokens(base.tokens, turn.tokens)
     for key in ("response_id", "response_status"):
         if turn.metadata.get(key) is not None:
@@ -624,7 +631,12 @@ class KubeAgentsHarness(AgentHarness):
         """
         transcript.clear()
         result = super().run(prompt, workspace_path)
-        transcript.set(result.output, result.trajectory, prompt=prompt)
+        transcript.set(
+            result.output,
+            result.trajectory,
+            prompt=prompt,
+            final_message=str(result.metadata.get("final_message") or ""),
+        )
         return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:

@@ -205,6 +205,52 @@ def test_any_of_passes_on_either_spelling_and_fails_on_neither():
     assert "alternative phrasings" in res.reason
 
 
+def test_scope_final_ignores_a_quoted_phrase_in_the_accumulated_output():
+    # The accumulated output quotes the planted log line; the actual answer
+    # names something else. Default scope must not pass on the quotation.
+    transcript.set(
+        output="evidence: 'GCS FUSE buffer exhaustion' log line\n\nroot cause: network",
+        trajectory=[],
+        final_message="root cause: network",
+    )
+    v = ReportContainsVerifier(type="report_contains", any_of_phrases=["gcs fuse", "gcsfuse"])
+    assert v.verify(5.0).status == "fail"
+    full = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["gcs fuse", "gcsfuse"], scope="full"
+    )
+    assert full.verify(5.0).status == "pass"
+
+
+def test_scope_final_does_not_false_red_a_forbidden_phrase_only_quoted():
+    transcript.set(
+        output="the audit log said 'cost: $40' verbatim\n\nno figures to report",
+        trajectory=[],
+        final_message="no figures to report",
+    )
+    v = ReportContainsVerifier(type="report_contains", forbidden_phrases=["$"])
+    assert v.verify(5.0).status == "pass"
+    full = ReportContainsVerifier(
+        type="report_contains", forbidden_phrases=["$"], scope="full"
+    )
+    assert full.verify(5.0).status == "fail"
+
+
+def test_final_message_falls_back_to_output_when_unset():
+    transcript.set("the whole answer", [])
+    assert transcript.get().final_message == "the whole answer"
+    v = ReportContainsVerifier(type="report_contains", required_phrases=["whole answer"])
+    assert v.verify(5.0).status == "pass"
+
+
+def test_the_fuse_alternates_do_not_match_refused():
+    transcript.set("the request was refused; root cause: HPA saturation", [],
+                   final_message="the request was refused; root cause: HPA saturation")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["gcs fuse", "gcsfuse"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
 def test_snapshots_are_stamped_with_a_monotonic_seq_and_prompt_head():
     transcript.set("a", [], prompt="first prompt")
     first = transcript.get()
@@ -249,7 +295,14 @@ def test_parse_node_builds_a_report_contains_check_like_a_task_yaml_would():
 
 
 def _safeguard_entry() -> VerificationEntry:
-    """The exact shape the gpu task's read-only safeguard uses."""
+    """The none-wrapped tool_called safeguard shape.
+
+    Kept as machinery coverage even though the gpu task's own safeguard is
+    cluster-state now (the trajectory is router-only, so a trace-based
+    mutation safeguard is blind to worker calls): the shape stays supported
+    for router-level invariants, and the tool name below is a fixture, not a
+    claim that the tool exists.
+    """
     return VerificationEntry(
         name="read-only-in-a-post-incident-task",
         role="safeguard",

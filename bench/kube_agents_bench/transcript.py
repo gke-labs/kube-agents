@@ -79,6 +79,11 @@ class TranscriptSnapshot:
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     seq: int = 0
     prompt_head: str = ""
+    # The last settled turn's closing message -- the sentence that IS the
+    # answer. ``output`` accumulates every settled closer plus delegated card
+    # text and worker artifacts (up to 20KB), so a phrase check against it
+    # passes on a quotation; checks default to this field instead.
+    final_message: str = ""
 
 
 _current: TranscriptSnapshot | None = None
@@ -86,7 +91,10 @@ _seq = 0
 
 
 def set(  # noqa: A001 - deliberate, matches get/clear
-    output: str, trajectory: list[dict[str, Any]], prompt: str = ""
+    output: str,
+    trajectory: list[dict[str, Any]],
+    prompt: str = "",
+    final_message: str = "",
 ) -> None:
     """Stash the just-finished run's transcript for the verifiers."""
     global _current, _seq
@@ -96,6 +104,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
         trajectory=list(trajectory),
         seq=_seq,
         prompt_head=prompt[:64],
+        final_message=final_message or output,
     )
 
 

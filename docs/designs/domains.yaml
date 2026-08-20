@@ -51,10 +51,8 @@ domains:
     name: Incident triage (autoops)
     journey: A warning event is triaged to a root cause and a pull request, never a cluster write
 
-# Known-uncovered. The first two exact-check tasks cover chat-and-routing
-# (both kanban probes) and incident-triage (gpu-stress-test-diagnosis), so
-# those two are already off the list. Phase 2's exit criterion is an empty
-# list.
+# Known-uncovered. The two kanban probes cover chat-and-routing, so it is
+# already off the list. Phase 2's exit criterion is an empty list.
 allowlist:
   - reliability
   - capacity
@@ -64,3 +62,7 @@ allowlist:
   - consistency
   - remediation
   - cluster-debugging
+  # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
+  # post-incident RCA, and incident-triage means event-fired autoops triage.
+  # Real coverage arrives with the autoops-warning-event-triage scenario.
+  - incident-triage

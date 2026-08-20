@@ -49,12 +49,21 @@ _NO_TRANSCRIPT_REASON = (
 
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
-    """Exact phrase checks against the agent's final response text.
+    """Exact phrase checks against the agent's answer.
 
     Case-insensitive substring matching, deliberately: the task author chose
     the phrase (a planted defect's name, a required noun), so an exact match
     is fair, and case is the one variation a correct report may legitimately
     introduce. Anything fuzzier belongs to the judge, not to a blocking check.
+
+    ``scope`` picks the text under test. The default, ``final``, is the last
+    settled turn's closing message — the sentence that IS the answer. ``full``
+    is the accumulated output: every settled closer, delegated card text, and
+    up to 20KB of worker artifacts. ``full`` therefore passes a required
+    phrase the agent merely QUOTED (a planted log line pasted into evidence
+    reads as "named the defect") and false-fails a forbidden phrase that only
+    appears in quoted material — reach for it only when the check genuinely
+    concerns the whole transcript.
     """
 
     type: Literal["report_contains"]
@@ -64,6 +73,7 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    scope: Literal["final", "full"] = "final"
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -75,7 +85,7 @@ class ReportContainsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
-        text = snap.output.lower()
+        text = (snap.final_message if self.scope == "final" else snap.output).lower()
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]
         any_of_miss = bool(self.any_of_phrases) and not any(
@@ -110,11 +120,21 @@ class ReportContainsVerifier(BaseVerifier):
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
 
+    THE TRAJECTORY IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
+    design, ``result.trajectory`` holds only the delegating turn's calls:
+    poll-turn calls are the harness's own bookkeeping and are kept out
+    (``_fold_status_turn``), and a delegated worker's calls never reach it
+    at all. This verifier can therefore assert what the ROUTER did
+    (``kanban_create`` is the router's own call) and nothing about what a
+    worker did on a cluster — a mutation safeguard built on it would be
+    blind to the very calls it fears. Use a cluster-state check
+    (``resource_property``) for those.
+
     Passes when at least ``minimum_calls`` matching calls were made. Wrapped
     in a ``none`` compound, it is the safeguard shape "this tool was never
-    called". Names match the harness's canonical trajectory entries
-    (``ToolCall.to_dict()["name"]``), e.g. ``kanban_create`` or
-    ``mcp_platform_control_provision_operator``.
+    called", within the router-only limits above. Names match the harness's
+    canonical trajectory entries (``ToolCall.to_dict()["name"]``), e.g.
+    ``kanban_create``.
     """
 
     type: Literal["tool_called"]

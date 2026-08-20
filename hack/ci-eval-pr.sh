@@ -174,8 +174,15 @@ if not path or not os.path.exists(path):
 else:
     try:
         data = json.load(open(path))
-        rec = data[0] if isinstance(data, list) else data
-        print('OK' if rec and isinstance(rec, dict) and rec.get('scores') else 'BROKEN')
+        # An empty list is the documented resource-preparation signature:
+        # devops-bench wrote a record file but evaluated zero tasks. Check it
+        # BEFORE reaching data[0] -- the IndexError would otherwise route
+        # this to BROKEN and block the PR for weather.
+        if isinstance(data, list) and not data:
+            print('INFRA')
+        else:
+            rec = data[0] if isinstance(data, list) else data
+            print('OK' if rec and isinstance(rec, dict) and rec.get('scores') else 'BROKEN')
     except Exception:
         print('BROKEN')
 " 2>/dev/null || echo "BROKEN")
