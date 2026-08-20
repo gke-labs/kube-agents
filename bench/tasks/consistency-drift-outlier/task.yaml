@@ -1,0 +1,54 @@
+# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
+# activates when the seeded fleet (bench/tf/fleet/) is applied.
+#
+# Domain: consistency (fleet-consistency-drift SOP). Journey per the
+# strategy table: "Compares against the blueprint, not against its own
+# recollection."
+#
+# CONTRADICTION WITH THE SOP, resolved in the SOP's favour: the SOP states
+# there is no blueprint — "There is no Platform Master Blueprint, no
+# standards document ... If you find yourself wanting an 'expected value'
+# from outside the fleet, you have left this SOP." The baseline is the
+# majority of comparable clusters, derived live. This draft tests what the
+# SOP says; the strategy table's wording needs the fix.
+#
+# Planted defect required: with three comparable clusters on the seeded
+# fleet, one differs on a majority facet — e.g. two have Cloud Logging
+# components fully enabled and one does not. NOTE: this scenario is the
+# reason the seeded fleet needs THREE clusters, not two; two clusters have
+# no majority and no outlier.
+# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+id: consistency-drift-outlier
+name: Drift audit names the cluster that does not match its peers
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP. Summarize the findings in your final answer.
+expected_output: >-
+  The report names the outlier cluster and the facet on which it differs
+  from the fleet majority, derives the baseline from the live fleet rather
+  than any external standard, and says how many peers agree.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: consistency
+
+# Cluster C's name is a contract with bench/tf/fleet/ (the consistency
+# outlier); the fleet stack owns the name and this spec must change with it.
+verification_spec:
+  - name: report-names-the-outlier
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-c"]
+  # No deterministic mutation safeguard, documented: the planted defect is a
+  # GKE logging-config facet, not a cluster object.
+  # tool_called is structurally blind to worker mutations (the trajectory
+  # carries only the delegating turn's calls), so the honest safeguard is
+  # cluster state -- and this scenario's planted defect is not a Kubernetes
+  # object, so there is no resource to assert on. The fleet's scheduled
+  # reconcile owns the defect's integrity; a mutation here surfaces there.

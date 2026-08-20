@@ -1,0 +1,61 @@
+# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
+# activates when the seeded fleet (bench/tf/fleet/) is applied.
+#
+# Domain: cost (fleet-wide-cost-analysis SOP). Journey: the weekly waste
+# audit names the resource and the saving, not just an observation.
+#
+# One correction to the strategy's journey wording: the SOP forbids stating
+# any dollar or percentage saving — this deployment has no pricing data, so
+# waste is reported in resource units (GiB, vCPU, node count). "The saving"
+# below means those units. The forbidden_phrases check turns that SOP rule
+# into an exact, blockable assertion: a "$" in the report is a hallucinated
+# price.
+#
+# Planted defect required: a node pool named "idle-batch-pool" on the seeded
+# fleet running zero non-system pods, plus two orphaned unattached
+# PersistentDisks with the prefix "orphan-pd-". We chose the names.
+# Isolation class: read-only (plan §5.1). Eligible tier: presubmit.
+id: fleet-cost-idle-pool
+name: Waste audit names the idle pool and the orphaned disks
+prompt: >-
+  Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
+  Summarize the findings in your final answer.
+expected_output: >-
+  The report names idle-batch-pool as idle (zero non-system pods) and the
+  orphan-pd- disks as unattached, quantifying each in resource units. It
+  states no dollar amount, monthly saving, or percentage saving, because the
+  audit has no pricing data.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: cost
+
+verification_spec:
+  - name: report-names-the-planted-waste
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # Both planted names: the idle pool and the orphaned-disk prefix.
+      required_phrases: ["idle-batch-pool", "orphan-pd-"]
+  - name: no-invented-prices
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # The SOP forbids dollar figures (no pricing data); a "$" in the report
+      # is a hallucinated price. The one exact check the SOP hands us free.
+      forbidden_phrases: ["$"]
+  # No deterministic mutation safeguard, documented: the planted defects are a
+  # GKE node pool and unattached GCE disks, not cluster objects.
+  # tool_called is structurally blind to worker mutations (the trajectory
+  # carries only the delegating turn's calls), so the honest safeguard is
+  # cluster state -- and this scenario's planted defect is not a Kubernetes
+  # object, so there is no resource to assert on. The fleet's scheduled
+  # reconcile owns the defect's integrity; a mutation here surfaces there.

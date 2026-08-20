@@ -136,6 +136,22 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
+  # The ten domain scenarios, registered here but commented out: every one
+  # reads the standing seeded fleet (bench/tf/fleet/), which is not applied
+  # yet -- activating them now would red every pull request on missing
+  # infrastructure. Uncomment as the fleet lands and each scenario's planted
+  # defect is verified present (bench/tasks/DRAFTS.md tracks which). The
+  # task-registration lint counts a commented entry as registered.
+  # "./tasks/chat-routing-fleet-question/task.yaml"
+  # "./tasks/obtainability-planted-pdb/task.yaml"
+  # "./tasks/stockout-pinned-pool/task.yaml"
+  # "./tasks/fleet-cost-idle-pool/task.yaml"
+  # "./tasks/compliance-rbac-overgrant/task.yaml"
+  # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
+  # "./tasks/consistency-drift-outlier/task.yaml"
+  # "./tasks/rca-remediation-pr/task.yaml"
+  # "./tasks/cluster-agent-crashloop-debug/task.yaml"
+  # "./tasks/autoops-warning-event-triage/task.yaml"
 )
 
 # Floor for VerificationCorrectness on tasks that declare a verification_spec.
