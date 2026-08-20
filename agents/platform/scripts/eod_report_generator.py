@@ -608,6 +608,7 @@ def generate_markdown_report(
     cluster_name: Optional[str] = None,
     report_date: Optional[str] = None,
     problems: Optional[List[str]] = None,
+    window_hours: int = DEFAULT_WINDOW_HOURS,
 ) -> str:
     """Renders a clean, chat-optimized markdown activity digest without awkward line breaks.
 
@@ -615,6 +616,11 @@ def generate_markdown_report(
     ledger. They are rendered in place of the all-clear, because an unreadable
     ledger and a quiet fleet produce the same empty summary and the quiet-day
     wording is the one an operator will believe.
+
+    `window_hours` is disclosed in the header on any run that is not the daily
+    default. `report_date` is a single date, so Monday's 72-hour catch-up would
+    otherwise print a weekend's churn under one day's heading with nothing on
+    the card to say so.
     """
     if not cluster_name:
         cluster_name = resolve_cluster_name()
@@ -709,9 +715,10 @@ def generate_markdown_report(
     # cluster's name. Named, not filtered. SOP: "Which clusters a recap covers".
     other_clusters = [c for c in summary.get("clusters", []) if c and c != cluster_name]
     fleet_suffix = f" +{_plural(len(other_clusters), 'cluster')}" if other_clusters else ""
+    window_suffix = "" if window_hours == DEFAULT_WINDOW_HOURS else f", last {window_hours}h"
     lines.append(
         f"{header_emoji} *k8s-event-watcher Daily Activity Recap* — "
-        f"`{cluster_name}`{fleet_suffix} ({report_date})"
+        f"`{cluster_name}`{fleet_suffix} ({report_date}{window_suffix})"
     )
     if other_clusters:
         named = ", ".join(f"`{c}`" for c in other_clusters[:_CLUSTER_LIMIT])
@@ -834,8 +841,8 @@ def generate_markdown_report(
             lines.pop()
         lines.append("")
         lines.append(
-            f"📉 _*{_plural(suppressed, 'informational event')}* held back from chat today, "
-            "across every workload counted here._"
+            f"📉 _*{_plural(suppressed, 'informational event')}* held back from chat in this "
+            "window, across every workload counted here._"
         )
 
     return "\n".join(lines)
@@ -863,7 +870,9 @@ def main() -> None:
     cluster = resolve_cluster_name(args.cluster_name)
 
     summary = filter_and_aggregate_events(events)
-    report = generate_markdown_report(summary, cluster_name=cluster, problems=problems)
+    report = generate_markdown_report(
+        summary, cluster_name=cluster, problems=problems, window_hours=window_hours
+    )
     print(report)
 
 

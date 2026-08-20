@@ -15,6 +15,7 @@
 
 """Unit tests for the deterministic k8s-event-watcher daily activity summary."""
 
+import contextlib
 import datetime
 import io
 import os
@@ -179,7 +180,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         # The alert is still accounted for as a number, so a digest of nothing
         # but routine cannot be mistaken for a fleet that had a quiet day.
         self.assertIn("*1 alert* went to chat as it happened", report)
-        self.assertIn("*1 informational event* held back from chat today", report)
+        self.assertIn("*1 informational event* held back from chat in this window", report)
 
     def test_one_reason_at_two_grades_does_not_share_a_group(self):
         """`BackOff` is Info when typed Normal and Warning when it is not.
@@ -255,14 +256,14 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertEqual(summary["entries"][0]["count"], 9)
         self.assertEqual([e["count"] for e in listing_of(report)], [9])
         self.assertIn("*0 alerts* went to chat", report)
-        self.assertIn("*9 informational events* held back from chat today", report)
+        self.assertIn("*9 informational events* held back from chat in this window", report)
 
     def test_the_held_back_total_survives_a_day_with_nothing_listable(self):
         """Zero listed groups must not mean zero accounting for what was held back."""
         with min_count(999):
             summary = filter_and_aggregate_events([event(severity="Info", notified=False)])
         report = generate_markdown_report(summary)
-        self.assertIn("*1 informational event* held back from chat today", report)
+        self.assertIn("*1 informational event* held back from chat in this window", report)
         # And the all-clear must not appear two lines above that total, which
         # is the contradiction the `suppressed` term in its condition prevents.
         self.assertNotIn("Nothing was held back from chat in this window", report)
@@ -289,7 +290,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         report = generate_markdown_report(
             summary, cluster_name="test-cluster"
         )
-        self.assertIn("*0 informational events* held back from chat today", report)
+        self.assertIn("*0 informational events* held back from chat in this window", report)
 
     def test_a_withheld_alert_is_counted_but_not_named(self):
         """Told, not listed.
@@ -501,7 +502,12 @@ class TestEODWatcherRecap(unittest.TestCase):
 
 
 class TestReportWindow(unittest.TestCase):
-    """Monday has to reach back over a weekend the cron never ran on."""
+    """Monday has to reach back over a weekend the cron never ran on.
+
+    And the card has to say when it did. `report_date` is a single date, so a
+    72-hour run headed by Monday's date attributes three days of churn to one
+    unless the header discloses the window.
+    """
 
     def test_monday_covers_the_weekend(self):
         # 2026-08-10 is a Monday.
@@ -511,6 +517,73 @@ class TestReportWindow(unittest.TestCase):
     def test_other_weekdays_look_back_a_day(self):
         tuesday = datetime.datetime(2026, 8, 11, 17, 0, tzinfo=datetime.timezone.utc)
         self.assertEqual(eod_report_generator.default_window_hours(tuesday), 24)
+
+    def _render(self, **kwargs):
+        return generate_markdown_report(
+            filter_and_aggregate_events([listed()]),
+            cluster_name="c1",
+            report_date="2026-08-10",
+            **kwargs,
+        )
+
+    def test_a_weekend_catch_up_names_its_window_in_the_header(self):
+        report = self._render(window_hours=72)
+
+        self.assertIn("(2026-08-10, last 72h)", report.splitlines()[0])
+
+    def test_an_ordinary_day_leaves_the_header_alone(self):
+        """The control. Stating the default on every card is noise."""
+        report = self._render(window_hours=24)
+
+        self.assertIn("(2026-08-10)", report.splitlines()[0])
+        self.assertNotIn("last 24h", report)
+
+    def test_a_hand_run_window_is_named_too(self):
+        """`--window-hours` is an operator override, and it moves the same scope."""
+        report = self._render(window_hours=6)
+
+        self.assertIn("(2026-08-10, last 6h)", report.splitlines()[0])
+
+    def test_the_closing_total_does_not_call_the_window_today(self):
+        """It is summed over `window_hours`, which on Mondays is three days.
+
+        The ✅ line beside it is worded for the window, and this one has to
+        agree: a card cannot label a weekend's count with a single day.
+        """
+        report = self._render(window_hours=72)
+
+        self.assertIn("held back from chat in this window", report)
+        self.assertNotIn("today", report)
+
+    def test_main_hands_the_window_to_the_renderer(self):
+        """The header can only disclose a window `main` bothers to pass down.
+
+        Driven end to end because the renderer's default hides a broken wire:
+        a `main` that resolves the window for the query and forgets to pass it
+        on still prints a plausible card, and every unit test still passes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "session_kv.db")
+            conn = sqlite3.connect(path)
+            with conn:
+                conn.execute(
+                    "CREATE TABLE intercepted_events ("
+                    " id INTEGER PRIMARY KEY AUTOINCREMENT, cluster TEXT DEFAULT '',"
+                    " namespace TEXT, workload TEXT,"
+                    " object_kind TEXT, reason TEXT, message TEXT, severity TEXT,"
+                    " occurrences INTEGER, notified INTEGER, created_at TIMESTAMP)"
+                )
+            conn.close()
+
+            argv = ["eod_report_generator.py", "--db", path, "--cluster-name", "c1"]
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(eod_report_generator, "default_window_hours",
+                                      return_value=72), \
+                    contextlib.redirect_stdout(out):
+                eod_report_generator.main()
+
+        self.assertIn(", last 72h)", out.getvalue().splitlines()[0])
 
 
 class TestLedgerLoading(unittest.TestCase):
@@ -825,7 +898,7 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
         # The zeroes are the absence of a measurement, not a measurement of
         # zero; printed bare they read as a quiet day.
         self.assertNotIn("Events Forwarded", report)
-        self.assertNotIn("held back from chat today", report)
+        self.assertNotIn("📉", report)
 
     def test_a_missing_table_is_named_in_the_report_body(self):
         """The rollback path: the volume predates the ledger, so the DB is there."""
@@ -876,7 +949,7 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertTrue(report.startswith("🟢"), report.splitlines()[0])
         self.assertIn("Nothing was held back from chat in this window", report)
-        self.assertIn("*0 informational events* held back from chat today", report)
+        self.assertIn("*0 informational events* held back from chat in this window", report)
         self.assertNotIn("could not read the event ledger", report)
 
 
@@ -939,9 +1012,9 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
     def test_a_failed_delivery_still_withholds_the_all_clear(self):
         """Not reported is not the same as did not happen.
 
-        A report that ends "nothing was held back from chat today" over a day
-        whose alerts never arrived is not silence about the failure, it is a
-        denial of it — and 🟢 says the same thing in one character.
+        A report that ends "nothing was held back from chat in this window"
+        over a day whose alerts never arrived is not silence about the failure,
+        it is a denial of it — and 🟢 says the same thing in one character.
         """
         report = generate_markdown_report(
             filter_and_aggregate_events([self.undelivered()]),
@@ -1356,7 +1429,7 @@ class TestTheCountsSayWhatTheyCover(unittest.TestCase):
         self.assertEqual(report.count(self.SCOPE_NOTE), 1)
         # Still on the card, and still above both lines that used to carry it.
         self.assertIn("Nothing was held back from chat in this window.", report)
-        self.assertIn("held back from chat today", report)
+        self.assertIn("📉", report)
         self.assertLess(report.index(self.SCOPE_NOTE), report.index("✅"))
 
     def test_both_qualifications_share_one_line(self):
