@@ -16,6 +16,12 @@ cd /tmp/minty && go run ./cmd/minty tools import-pk \
 
 `install.sh` runs this import for you when it collects a PEM path. The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA, minty rule ConfigMap) is the chart's `githubMinter.*` values; the minter pod fails its readiness probe until the key version imported here is ENABLED.
 
+The clone-and-run needs a Go toolchain that can build and execute a binary, which is not a given on a locked-down workstation. `gcloud` and `openssl` do the same wrapping in four commands — [Importing Without the Minty CLI](../../../k8s-operator/config/integrations/github/README.md#importing-without-the-minty-cli) is canonical for that path, including the wait for the import job to reach `ACTIVE` and the `CLOUDSDK_PYTHON_SITEPACKAGES=1` that the wrapping step needs. `<region>` there is the KMS location, which is this module's `location` with any zone suffix stripped: `us-central1-a` becomes `us-central1`.
+
+### Moving the install to another region means a new App key
+
+The keyring follows `var.location`, which the full-install composition passes straight from the cluster's location — so changing `location` on an install that has the minter enabled creates a **new, empty** keyring in the new region. The key is `import_only` and KMS never releases private key material, so the existing App key cannot be exported or copied across; generate a fresh private key for the GitHub App and import that one. The old keyring and key stay in the project forever, per the warning below.
+
 > **KMS resources cannot be deleted.** Cloud KMS key rings and keys are never actually
 > destroyed — `terraform destroy` only removes them from state, and a subsequent apply
 > with the same names fails with a 409. Recover by importing the existing resources
