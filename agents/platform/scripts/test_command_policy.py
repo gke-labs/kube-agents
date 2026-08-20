@@ -857,10 +857,6 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 self.assertEqual(expected_rule_id, decision.rule_id)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
     """Refusals that are outages rather than controls.
 
@@ -1015,3 +1011,6 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
+
+if __name__ == "__main__":
+    unittest.main()
