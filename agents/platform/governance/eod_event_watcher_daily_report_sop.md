@@ -30,16 +30,20 @@ and restores the home-channel routing a `no_agent` child would otherwise lose. T
 itself is shared, not per-profile — the entrypoint links `profiles/platform/scripts` at the shared
 scripts directory. It needs no cluster access.
 
-**The profile needs a home channel, or the recap is generated and delivered to nobody.**
-`home_target_env` reads `platforms.<platform>.home_channel` off the profile's config; with nothing
-there it returns `{}`, the tick has no delivery target, and the roster entry records
-`last_delivery_error: "platform 'google_chat' not configured/enabled"`. That value is set either by
-the CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. This is a
-property of every `no_agent` entry on the roster rather than of this one; it
-matters here because the recap is the only place a filtered event is ever reported, so an install
-without a home channel loses those events entirely rather than seeing them late. Check before
-relying on the recap:
+**The install needs a home channel, or the recap is composed and delivered to nobody.**
+The `deliver: "chat"` route does not go through `home_target_env`: `profile_cron_tick.spawn_tick`
+sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target always resolves and the
+relay is always attempted. The home channel is needed one hop later, where the Session KV server
+posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
+chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
+there is none the send fails and the roster entry records
+`last_delivery_error: "composed but not delivered to google_chat"`. The value is set either by the
+CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
+`no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
+so an install without a home channel loses those events entirely rather than seeing them late.
+Check before relying on the recap:
 
 ```bash
 kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
