@@ -621,8 +621,23 @@ warn_unless_api_key_is_pinned() {
     fi
     # -x and -F together: a line that merely CONTAINS the value is a different pin, and a
     # key whose value happens to look like a pattern is still just a string.
-    if ! grep -qxF "API_SERVER_KEY=$_wuakip_key" "$_wuakip_managed_env"; then
-        echo "WARN: $_wuakip_managed_env does not pin API_SERVER_KEY to this container's value — the PVC .env wins and every authenticated call to this agent's API will 401 (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit the same value as the container env." >&2
+    if grep -qxF "API_SERVER_KEY=$_wuakip_key" "$_wuakip_managed_env"; then
+        return 0
+    fi
+    # The two remaining shapes are both broken, but they are NOT broken the same way, and
+    # the difference is which file an operator should go and read. Say which one wins.
+    if grep -q '^API_SERVER_KEY=' "$_wuakip_managed_env"; then
+        # The managed scope is applied last with override=True, so a file that pins some
+        # OTHER value is the value the gateway will accept — and it will then 401 this
+        # container's env, which is what the sidecar, the startup probe and every in-pod
+        # caller present.
+        echo "WARN: $_wuakip_managed_env pins API_SERVER_KEY to a different value than this container's env — the managed file is applied last, so the gateway will accept ITS key and 401 the credential proxy, the startup probe and every in-pod caller (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit the same value as the container env." >&2
+    else
+        # No pin for this key at all: the managed file overrides nothing, so the winner is
+        # $TARGET_DIR/.env — where Hermes' stage2 hook generates a random key that nothing
+        # outside the gateway process knows. This is the pre-fix shape exactly, and it is
+        # what a stale (chat-only) ConfigMap still renders.
+        echo "WARN: $_wuakip_managed_env does not pin API_SERVER_KEY — with no managed pin the PVC's $TARGET_DIR/.env wins, and Hermes' stage2 hook generates a random key there that the credential proxy, the startup probe and every in-pod caller will 401 against (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit API_SERVER_KEY." >&2
     fi
     return 0
 }

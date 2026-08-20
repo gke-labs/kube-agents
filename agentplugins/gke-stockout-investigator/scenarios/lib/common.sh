@@ -596,6 +596,28 @@ cleanup_workload() {
 
 # ---------------------------------------------------------------------- watching
 
+# One line per run, not one per poll.
+#
+# watch_investigation calls the readers below every 10 seconds for up to WATCH_TIMEOUT —
+# 600s by default, so sixty times — and prints a `\r` progress counter between calls. An
+# unlatched warning is therefore both repeated sixty times and half-erased by the next
+# tick, which buries the one message it exists to surface under its own repeats.
+#
+# The latch is a file rather than a variable for the same reason scenario_memo above is
+# one: these readers run inside `$( )` and on the left of a pipe, both subshells, so an
+# assignment would be discarded along with the subshell that made it.
+warn_once() {
+    local key="$1"; shift
+    local latch="${SCENARIO_RUN_DIR}/warned.${key}"
+
+    if [ -e "$latch" ]; then
+        return 0
+    fi
+    : > "$latch"
+    # `warn` prints to stdout, and both callers have their stdout consumed by a parser.
+    warn "$@" >&2
+}
+
 # Returns the gateway's session list as JSON, or `{}` — and says which, on stderr, when
 # it is the second one.
 #
@@ -613,8 +635,8 @@ cleanup_workload() {
 _sessions_json() {
     local out
     # The diagnostic goes to stdout inside the pod and is CAPTURED, not printed: this
-    # function's stdout is piped straight into a json.load, and `warn` writes to stdout
-    # too. Only the failure branch un-captures it, onto stderr.
+    # function's stdout is piped straight into a json.load. Only the failure branch
+    # un-captures it, onto stderr, via warn_once.
     if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         python3 -c "
 import os, sys, requests
@@ -628,7 +650,7 @@ print(r.text)
 " 2>/dev/null)"; then
         printf '%s\n' "$out"
     else
-        warn "could not read the agent's session list; treating it as empty — ${out:-no response} (issue #786)" >&2
+        warn_once sessions "could not read the agent's session list; treating it as empty — ${out:-no response} (issue #786)"
         echo '{}'
     fi
 }
@@ -639,22 +661,44 @@ _task_after() {
     # the alert as a task owned by the specialist profile and never create a gateway
     # session, so watching only for sessions reports "nothing happened" while the
     # investigation runs to completion.
-    local since="$1"
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        env HOME=/tmp hermes kanban ls --json 2>/dev/null | python3 -c "
+    #
+    # Distinguishes a failed read from an empty board for the same reason _sessions_json
+    # does, and it is the same bug: `2>/dev/null` plus `except Exception: sys.exit(0)`
+    # turned a pod that could not be exec'd into, a `hermes kanban` that errored, and a
+    # board with nothing on it into one answer — no output — which watch_investigation
+    # reads as "nothing has happened yet" until it times out. The two exec paths are the
+    # only ones this watcher has, so leaving this one silent would have fixed the report
+    # for `dispatch: api` routes and left `dispatch: kanban` routes lying.
+    local since="$1" out
+    # 2>&1 rather than discarded: on the failure path the command's own message is the
+    # only account of what went wrong, and on the success path anything it wrote to
+    # stderr would have broken the parse regardless — now it says so instead.
+    if ! out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+        env HOME=/tmp hermes kanban ls --json 2>&1)"; then
+        warn_once tasks "could not read the agent's kanban board; treating it as empty — ${out:-no response}"
+        return 0
+    fi
+    printf '%s\n' "$out" | python3 -c "
 import json, sys
 since = float('$since')
 try:
     data = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
+    # 3, not 0: the board answered with something that is not JSON, which is a broken
+    # read and not an empty one. The caller turns this into one warning per run.
+    sys.exit(3)
 tasks = data.get('tasks') if isinstance(data, dict) else data
 for t in sorted(tasks or [], key=lambda x: x.get('created_at') or 0, reverse=True):
     if (t.get('created_at') or 0) >= since and str(t.get('title','')).startswith('${ROUTE_NAME}'):
         print('%s\t%s\t%s' % (t.get('id',''), t.get('status') or 'running',
                               (t.get('title') or '')[:70]))
         break
-"
+" || {
+        # Only the parser's own 3 is a broken read; anything else (a SIGPIPE, an
+        # interpreter that is not there) stays as quiet as it was before.
+        [ "$?" -eq 3 ] && warn_once taskjson "the agent's kanban board did not return JSON; treating it as empty — $(printf '%s' "$out" | head -c 200)"
+        return 0
+    }
 }
 
 _session_after() {

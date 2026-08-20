@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import sys
@@ -845,6 +846,50 @@ class TestGatewayApiToken(unittest.TestCase):
         self.assertEqual(session_kv_server._gateway_api_token(), "first")
         self._write("API_SERVER_KEY=rotated\n")
         self.assertEqual(session_kv_server._gateway_api_token(), "rotated")
+
+
+class TestManagedDotenvPath(unittest.TestCase):
+    """Where the managed layer is looked for.
+
+    Its own class because the constant is resolved at import: the tests above
+    patch it away, so nothing there can see how it was built. What it resolves
+    to matters more than usual — it is consulted at the HIGHEST precedence, so
+    a wrong path does not fail closed, it hands back a bearer token from a file
+    nobody administers.
+    """
+
+    def _resolve(self, value):
+        """Re-import the module under a given HERMES_MANAGED_DIR."""
+        env = dict(os.environ)
+        if value is None:
+            env.pop("HERMES_MANAGED_DIR", None)
+        else:
+            env["HERMES_MANAGED_DIR"] = value
+        with patch.dict(os.environ, env, clear=True):
+            return importlib.reload(session_kv_server).MANAGED_DOTENV_PATH
+
+    def tearDown(self):
+        # The reloads above rebind the module object the other tests hold; put
+        # it back the way the file was imported.
+        importlib.reload(session_kv_server)
+
+    def test_the_operator_set_directory_is_honoured(self):
+        self.assertEqual(self._resolve("/mnt/managed"), "/mnt/managed/.env")
+
+    def test_it_defaults_to_the_posix_managed_dir(self):
+        self.assertEqual(self._resolve(None), "/etc/hermes/.env")
+
+    def test_a_set_but_empty_value_is_not_a_relative_path(self):
+        """The hole this guards: `os.path.join("", ".env")` == ".env".
+
+        managed_scope.py treats a set-but-empty value as unset, and a resolver
+        that did not would read whatever `.env` sits in the server's working
+        directory — an agent workspace, say — and prefer it to every real
+        layer. Whitespace counts as empty for the same reason.
+        """
+        for value in ("", "   ", "\n"):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(self._resolve(value), "/etc/hermes/.env")
 
 
 class TestCronReportRelay(unittest.TestCase):

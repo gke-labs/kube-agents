@@ -73,8 +73,15 @@ GATEWAY_AUTH_ENV = "API_SERVER_KEY"
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
 # sets HERMES_MANAGED_DIR to the same path explicitly; managed_scope.py's POSIX
 # default is that path too, so the fallback is not a guess.
+#
+# `.strip() or` rather than a plain `get(..., default)`: managed_scope.py treats
+# a set-but-empty value as unset and falls back, and matching that is not
+# pedantry here — `os.path.join("", ".env")` is the RELATIVE path ".env", so the
+# resolver would read whatever .env happens to sit in the server's working
+# directory and hand it back at the highest precedence of all. A stray file in
+# an agent workspace would become the bearer.
 MANAGED_DOTENV_PATH = os.path.join(
-    os.environ.get("HERMES_MANAGED_DIR", "/etc/hermes"), ".env"
+    os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", ".env"
 )
 
 

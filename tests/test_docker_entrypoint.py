@@ -1401,17 +1401,28 @@ class ApiKeyPinCheckTest(unittest.TestCase):
         self.assertIn("NOT pinned", proc.stderr)
 
     def test_a_pin_that_disagrees_is_named(self):
-        """The regression itself: a stale ConfigMap pinning a key nobody presents."""
+        """A stale ConfigMap pinning a key nobody presents.
+
+        Distinct from "no pin at all" in the one way an operator acts on: managed scope is
+        applied last, so HERE the managed file is the winner and the container's env is
+        what loses. Told the PVC won, they would go and read the wrong file.
+        """
         proc = self._run("API_SERVER_KEY=" + "a1b2" * 16 + "\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("786", proc.stderr)
-        self.assertIn("does not pin API_SERVER_KEY", proc.stderr)
+        self.assertIn("to a different value", proc.stderr)
+        self.assertNotIn(".env wins", proc.stderr)
 
     def test_a_managed_env_that_pins_other_keys_is_a_disagreement(self):
-        """A chat-only render is exactly the file this shipped with before the fix."""
+        """A chat-only render is exactly the file this shipped with before the fix.
+
+        Nothing overrides the key, so the winner is the PVC's stage2-generated one — the
+        opposite file from the branch above, and the message has to say so.
+        """
         proc = self._run("GOOGLE_CHAT_ALLOW_ALL_USERS=false\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("does not pin API_SERVER_KEY", proc.stderr)
+        self.assertIn(".env wins", proc.stderr)
 
     def test_a_line_that_merely_contains_the_value_is_not_the_pin(self):
         """`grep -x`, not a substring: a different key holding the same value agrees
