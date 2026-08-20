@@ -730,5 +730,104 @@ class TestPublications(QueueTestCase):
             fq.put_publication(self.conn, "nudge", {"target_kind": "pigeon"})
 
 
+PRIORITIZE_SOP = (
+    Path(__file__).resolve().parents[1] / "governance" / "inventory_prioritize_sop.md"
+)
+
+
+def _table_after(text: str, marker: str) -> list[list[str]]:
+    """Cells of the first Markdown table following `marker`, separator dropped."""
+    body = text.split(marker, 1)[1]
+    rows = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            if rows:
+                break
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if all(set(cell) <= set("-: ") for cell in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+class SopRubricParityTests(unittest.TestCase):
+    """The SOP is where a model reads the rubric from; this is where it stops drifting.
+
+    Nothing at runtime compares the two: the worker classifies from the SOP's
+    tables and `findings_queue` scores from its own constants, so a scale edited
+    in one place and not the other produces findings that validate and rank
+    wrong.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = PRIORITIZE_SOP.read_text(encoding="utf-8")
+
+    def _anchors(self, marker):
+        rows = _table_after(self.text, marker)
+        return tuple(sorted(int(row[0]) for row in rows if row[0].isdigit()))
+
+    def test_anchor_scales_match_the_module(self):
+        self.assertEqual(self._anchors("**B — blast radius"), tuple(sorted(fq.B_ANCHORS)))
+        self.assertEqual(self._anchors("**L — likelihood"), tuple(sorted(fq.L_ANCHORS)))
+        self.assertEqual(self._anchors("**detect and recover"), tuple(sorted(fq.E_ANCHORS)))
+        for confidence in fq.C_PERCENTS:
+            self.assertIn(f"`{confidence / 100}`", self.text)
+
+    def test_thresholds_and_floor_match_the_module(self):
+        self.assertIn(f"`critical` at {fq.SEVERITY_CRITICAL_AT} and above", self.text)
+        self.assertIn(f"`major` from {fq.SEVERITY_MAJOR_AT} to {fq.SEVERITY_CRITICAL_AT - 1}", self.text)
+        self.assertIn(f"below {fq.SEVERITY_MAJOR_AT}", self.text)
+        self.assertIn(
+            f"**`L = {fq.FLOOR_LIKELIHOOD}` together with `B ≥ {fq.FLOOR_BLAST_RADIUS}`", self.text
+        )
+
+    def test_worked_examples_score_as_the_sop_prints_them(self):
+        rows = _table_after(self.text, "### Worked examples")
+        self.assertEqual(rows[0][:6], ["finding", "B", "L", "detect", "recover", "C"])
+        self.assertGreater(len(rows) - 1, 5)
+        for finding, b, likelihood, detect, recover, confidence, score, severity in rows[1:]:
+            with self.subTest(finding=finding):
+                rubric = fq.validate_rubric(
+                    {
+                        "B": int(b),
+                        "L": int(likelihood),
+                        "detect": int(detect),
+                        "recover": int(recover),
+                        "C": float(confidence),
+                    }
+                )
+                computed = fq.rank_score(rubric)
+                self.assertEqual(computed, int(score))
+                self.assertEqual(fq.severity_for(computed, rubric), severity.split(" — ")[0])
+
+    def test_the_floored_example_is_still_a_floored_example(self):
+        # The row exists to show the floor overriding the bands. If a threshold
+        # moves so that it clears `critical` on score alone, it stops
+        # demonstrating anything and the SOP needs a new row.
+        rows = _table_after(self.text, "### Worked examples")
+        floored = [row for row in rows[1:] if row[7].endswith("floored")]
+        self.assertEqual(len(floored), 1)
+        self.assertLess(int(floored[0][6]), fq.SEVERITY_CRITICAL_AT)
+
+    def test_provider_namespaces_match_the_module(self):
+        for namespace in fq.PROVIDER_NAMESPACES:
+            self.assertIn(f"`{namespace}`", self.text)
+        for prefix in ("gke-*", "gmp-*"):
+            self.assertIn(f"`{prefix}`", self.text)
+
+    def test_the_sop_names_the_tools_and_enum_values_it_tells_the_worker_to_send(self):
+        self.assertIn("register_findings", self.text)
+        self.assertIn("get_ranked_findings", self.text)
+        self.assertIn('`source`', self.text)
+        self.assertIn('`"inventory"`', self.text)
+        for kind in fq.REMEDIATION_KINDS:
+            self.assertIn(f"`{kind}`", self.text)
+        for kind in fq.VERIFICATION_KINDS:
+            self.assertIn(f"`{kind}`", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()
