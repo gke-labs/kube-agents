@@ -14,6 +14,14 @@
 
 terraform {
   required_version = ">= 1.5.0"
+
+  # Partial config on purpose: the reconcile model is re-apply from any
+  # checkout, which only works against shared remote state -- a fresh local
+  # state would plan full creates and 409 against the live fleet. The bucket
+  # and prefix arrive at init time (see README.md); local validation uses
+  # `tofu init -backend=false`.
+  backend "gcs" {}
+
   required_providers {
     google = {
       source  = "hashicorp/google"

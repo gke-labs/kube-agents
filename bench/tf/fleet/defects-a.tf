@@ -147,9 +147,14 @@ resource "kubernetes_deployment_v1" "payments_api" {
   wait_for_rollout = false
 }
 
-# Defect (capacity): the workload half of pinned-inference-pool. The
-# deployment fills the one permitted node; the HPA is allowed to want ten
-# replicas the pool can never fit. Asserted by stockout-pinned-pool.
+# Defect (capacity): the workload half of pinned-inference-pool, and the
+# live signal the audit reads. The container burns a full core against a
+# 400m request (capped at 500m), so CPU utilization sits at ~125% of request
+# against the HPA's 60% target and the HPA pins at max_replicas wanting
+# pods the pool can never place: an e2-small allocates ~940m CPU, system
+# daemonsets take ~250m, so one 400m replica fits and the second does not --
+# with the autoscaler pinned at one node, replicas 2..10 sit Pending. That
+# standing Pending backlog is the shortfall the audit must quantify.
 resource "kubernetes_deployment_v1" "inference_server" {
   metadata {
     name      = "inference-server"
@@ -168,17 +173,32 @@ resource "kubernetes_deployment_v1" "inference_server" {
         node_selector = {
           "seeded-role" = "pinned-inference"
         }
+        toleration {
+          key      = "seeded-role"
+          operator = "Equal"
+          value    = "pinned-inference"
+          effect   = "NoSchedule"
+        }
         container {
-          name  = "server"
-          image = "registry.k8s.io/pause:3.9"
+          name    = "server"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "while true; do :; done"]
           resources {
-            # Sized so one replica fits an e2-small node and ten never can:
-            # the pool's autoscaler is pinned at one node.
-            requests = { cpu = "400m", memory = "256Mi" }
+            requests = { cpu = "400m", memory = "64Mi" }
+            limits   = { cpu = "500m", memory = "128Mi" }
           }
         }
       }
     }
+  }
+
+  # The HPA owns replicas from the moment it syncs, and most of what it asks
+  # for can never become Ready -- both halves are the defect. Ignoring the
+  # drift keeps the reconcile from resetting the HPA's count, and skipping
+  # the rollout wait keeps an apply from blocking on Pending pods forever.
+  wait_for_rollout = false
+  lifecycle {
+    ignore_changes = [spec[0].replicas]
   }
 }
 
