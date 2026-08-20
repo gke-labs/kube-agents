@@ -62,6 +62,7 @@ from typing import Any
 
 from devops_bench.agents import AgentHarness, AgentResult
 
+from kube_agents_bench import transcript
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -609,6 +610,22 @@ class KubeAgentsHarness(AgentHarness):
     return an ``AgentResult`` with ``errors`` populated; the base class's safety
     net covers anything unexpected.
     """
+
+    def run(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        """Run the agent, then stash the transcript for the text/trace verifiers.
+
+        Wraps :meth:`AgentHarness.run` rather than ``_execute``: ``_execute``
+        has five early error-returns and the base's safety net converts
+        unexpected exceptions to ``AgentResult.errored(...)``, and every one of
+        those paths must still reach the stash — an errored run's (possibly
+        empty) transcript is the truthful input for the verifiers, not the
+        previous task's. The clear() up front is the other half of that: see
+        the staleness caveat in :mod:`kube_agents_bench.transcript`.
+        """
+        transcript.clear()
+        result = super().run(prompt, workspace_path)
+        transcript.set(result.output, result.trajectory)
+        return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
