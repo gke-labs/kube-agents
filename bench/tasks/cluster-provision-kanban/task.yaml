@@ -46,3 +46,6 @@ verification_spec:
     check:
       type: tool_called
       tool_names: ["kanban_create"]
+      # An errored kanban_create filed no card, so only successful
+      # calls count toward this objective.
+      require_success: true

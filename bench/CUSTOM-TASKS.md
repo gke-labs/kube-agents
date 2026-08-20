@@ -263,10 +263,12 @@ Placeholders are substituted in the prompt, the expected output, and the verific
 ### 4. Write the verification spec
 
 The judge grades prose, which makes it the wrong instrument for "did the deployment actually come
-back". The verification spec is the deterministic half: it runs against the live cluster after the
-agent finishes and before teardown, and it produces scores the judge never touches. Split the two on
-that line — `expected_output` keeps the subjective part (reasoning, diagnosis, what the report should
-say), and anything a `kubectl` call could settle belongs here.
+back". The verification spec is the deterministic half: it runs after the agent finishes and before
+teardown — the cluster verifiers against the live cluster, the transcript verifiers against the
+run's recorded output and tool trace — and it produces scores the judge never touches. Split the
+two on that line: `expected_output` keeps the subjective part (reasoning, diagnosis, what the
+report should read like), and anything a `kubectl` call or an exact phrase/trace match could settle
+belongs here.
 
 #### Anatomy of an entry
 
@@ -304,6 +306,17 @@ silently running the check with defaults.
 | `pod_healthy`       | `selector` (required), `namespace`                                                                       | Waits for matched pods to be Ready, falling back to a Running-phase check when the readiness condition never propagates.                               |
 | `resource_property` | `kind` (required), `resource_name` _or_ `selector`, `namespace`, `path`, `op`, `value`, `across_matches` | Compares a JSONPath property of the matched objects. The general-purpose one.                                                                          |
 | `scaling_complete`  | `deployment` (required), `min_replicas`, `max_replicas`, `namespace`                                     | Polls `status.readyReplicas` into `[min, max]`. Leaving `max_replicas` unset checks scale-up only; setting it catches scale-down and cost targets too. |
+| `report_contains`   | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may) | Case-insensitive substring checks against the agent's **final response text**, not the cluster. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point. |
+| `tool_called`       | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                   | Counts trajectory entries whose tool name matches. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in safeguards, where an attempt should trip the check. Wrapped in a `none` compound it is the "this tool was never called" safeguard. |
+
+The two transcript verifiers read the run's stashed output and trajectory
+(`kube_agents_bench/transcript.py`), so unlike the cluster verifiers they need no cluster and set
+`mode: assert` (the transcript is immutable; converging on it only waits out the budget). They fail
+closed: when no transcript was stashed — the harness never completed an execution — they return
+`status: "error"`, which surfaces as `VerificationCoverage < 1.0` rather than a pass or a fail. One
+interaction to know about: `BENCH_NO_INFRA=true` makes the eval harness skip **all** verification,
+transcript checks included, so a `deployer: noop` task that relies on these must run without it —
+the noop deployer alone already skips provisioning.
 
 `resource_property` names its target with `resource_name`, not `name` — `name` is already the
 check's own label — and takes `resource_name` or `selector`, never both.

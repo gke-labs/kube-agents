@@ -159,13 +159,76 @@ def test_tool_called_empty_stash_is_error():
     assert v.verify(5.0).status == "error"
 
 
+def test_require_success_skips_errored_calls():
+    transcript.set(
+        "tried",
+        [
+            {"name": "kanban_create", "args": {}, "status": "error"},
+            {"name": "kanban_create", "args": {}, "status": "completed"},
+        ],
+    )
+    strict = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create"], minimum_calls=2, require_success=True
+    )
+    lax = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create"], minimum_calls=2
+    )
+    assert strict.verify(5.0).status == "fail"  # only one call took effect
+    assert lax.verify(5.0).status == "pass"  # both attempts count
+
+
+def test_an_attempted_forbidden_call_still_counts_without_require_success():
+    # The safeguard asymmetry: an errored provisioning ATTEMPT must trip.
+    transcript.set(
+        "denied",
+        [{"name": "mcp_platform_control_provision_operator", "args": {}, "status": "error"}],
+    )
+    v = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp_platform_control_provision_operator"]
+    )
+    assert v.verify(5.0).status == "pass"  # the attempt is visible...
+    res = VerifierAgent().run_entry(_safeguard_entry(), timeout_sec=10.0)
+    assert res.status == "fail"  # ...so the none-wrapped safeguard trips
+
+
+def test_any_of_passes_on_either_spelling_and_fails_on_neither():
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["HPA", "HorizontalPodAutoscaler"]
+    )
+    transcript.set("the HorizontalPodAutoscaler hit max replicas", [])
+    assert v.verify(5.0).status == "pass"
+    transcript.set("the hpa hit max replicas", [])
+    assert v.verify(5.0).status == "pass"
+    transcript.set("the autoscaler hit max replicas", [])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "alternative phrasings" in res.reason
+
+
+def test_snapshots_are_stamped_with_a_monotonic_seq_and_prompt_head():
+    transcript.set("a", [], prompt="first prompt")
+    first = transcript.get()
+    transcript.set("b", [], prompt="p" * 100)
+    second = transcript.get()
+    assert second.seq == first.seq + 1
+    assert first.prompt_head == "first prompt"
+    assert len(second.prompt_head) == 64
+
+
 # -------------------------------------------- registry and spec plumbing
 
 
 def test_both_verifiers_are_published_as_entry_points():
     """Read pyproject.toml, not installed metadata: the editable install's
     dist-info lags the tree until the next `pip install -e`, and this test
-    must fail on a missing declaration, not on a stale environment."""
+    must fail on a missing declaration, not on a stale environment.
+
+    Registration itself is exercised through the OTHER path in this module:
+    importing kube_agents_bench.verifiers fires the @VERIFIERS.register
+    decorators, which is what the registry tests below actually test. The
+    entry-point path (a cold devops-bench process that never imported this
+    package) is only reachable in an installed environment; this test pins
+    the declaration that path depends on."""
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
         eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]

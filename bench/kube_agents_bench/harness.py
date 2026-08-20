@@ -624,7 +624,7 @@ class KubeAgentsHarness(AgentHarness):
         """
         transcript.clear()
         result = super().run(prompt, workspace_path)
-        transcript.set(result.output, result.trajectory)
+        transcript.set(result.output, result.trajectory, prompt=prompt)
         return result
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:

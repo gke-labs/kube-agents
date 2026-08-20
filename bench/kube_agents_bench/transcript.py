@@ -28,14 +28,22 @@ iterates tasks serially and ``execute_agent`` / ``_run_verification`` run
 sequentially on the same thread (the only thread upstream spawns anywhere is
 the chaos-scenario daemon). One process, one task in flight, one stash.
 
-One caveat, and it is why consumers must fail closed: on the harness's
-exception path, verification still runs when infrastructure came up but the
-harness raised *before* ``execute_agent`` — and the stash then holds the
-PREVIOUS task's transcript. :meth:`KubeAgentsHarness.run` clears the stash
-before executing so that window holds ``None`` rather than stale data, and a
-verifier finding ``None`` must return ``status="error"`` (never pass, never
-fail) so the miss surfaces as ``VerificationCoverage < 1.0`` instead of a
-silently graded wrong transcript.
+One caveat, and it is why consumers must fail closed: in a multi-task
+process, when the eval harness raises AFTER task A completed but BEFORE task
+B's ``execute_agent`` ever calls :meth:`KubeAgentsHarness.run`, B's
+verification still runs and the stash still holds A's transcript. The
+``clear()`` at the top of ``run()`` cannot help there, because ``run()``
+never fired for B — the stale window is real and this module cannot close it
+from below. Two mitigations, neither a fix: a verifier finding ``None`` must
+return ``status="error"`` (never pass, never fail) so the *empty* case
+surfaces as ``VerificationCoverage < 1.0``; and every snapshot carries
+``seq`` plus the prompt's head, so harness-side code that knows the current
+task (this module's consumers do not — a verifier is constructed from the
+spec alone and never sees the prompt) can detect the mismatch, and a human
+reading a suspicious result can see at a glance which prompt produced it. A
+prompt-hash comparison inside the verifiers is NOT feasible for that reason;
+the docstring is the mitigation until the upstream ``verify()`` context
+argument exists.
 
 The clean long-term fix is an upstream ``verify()`` context argument; this
 module is the seam to delete when that lands.
@@ -58,19 +66,37 @@ class TranscriptSnapshot:
         trajectory: Ordered ``ToolCall.to_dict()`` entries from
             ``AgentResult.trajectory``; each carries ``name`` / ``args`` /
             ``result`` / ``status``.
+        seq: Monotonic per-process counter, stamped at ``set()`` time. The
+            staleness marker for the module-docstring caveat: verifiers
+            cannot check it (a verifier never sees the prompt or the task),
+            but harness-side code that knows the current task can, and it
+            dates a snapshot unambiguously in a debug session.
+        prompt_head: First 64 characters of the prompt that produced this
+            transcript, for human correlation only — never matched against.
     """
 
     output: str
     trajectory: list[dict[str, Any]] = field(default_factory=list)
+    seq: int = 0
+    prompt_head: str = ""
 
 
 _current: TranscriptSnapshot | None = None
+_seq = 0
 
 
-def set(output: str, trajectory: list[dict[str, Any]]) -> None:  # noqa: A001 - deliberate, matches get/clear
+def set(  # noqa: A001 - deliberate, matches get/clear
+    output: str, trajectory: list[dict[str, Any]], prompt: str = ""
+) -> None:
     """Stash the just-finished run's transcript for the verifiers."""
-    global _current
-    _current = TranscriptSnapshot(output=output, trajectory=list(trajectory))
+    global _current, _seq
+    _seq += 1
+    _current = TranscriptSnapshot(
+        output=output,
+        trajectory=list(trajectory),
+        seq=_seq,
+        prompt_head=prompt[:64],
+    )
 
 
 def get() -> TranscriptSnapshot | None:
