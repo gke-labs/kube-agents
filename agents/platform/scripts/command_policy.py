@@ -340,6 +340,13 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--billing-project", "--sort-by", "--limit", "--trace-token",
         "--flatten", "--access-token-file", "-z", "--page-size", "--freshness",
         "--cluster", "--model",
+        # `logging read` selectors. The command was allowlisted without them,
+        # which refused every spelling the repo actually ships: both
+        # log-autoscaler-events.sh scripts pass `--order=asc`, and the two
+        # gke-workload-troubleshooting skills pass `--start-time`/`--end-time`.
+        # Those scripts also discard stderr and treat empty output as "no
+        # events yet", so the refusal was silent — the poll loop slept forever.
+        "--order", "--start-time", "--end-time",
     }
 )
 

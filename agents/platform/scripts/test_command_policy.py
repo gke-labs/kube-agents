@@ -903,6 +903,34 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_logging_read_works_as_the_shipped_scripts_spell_it(self):
+        # `logging read` was allowlisted while every flag the repo passes to it
+        # was not, and an unlisted flag refuses the command before the allowlist
+        # entry is consulted. Both log-autoscaler-events.sh scripts spell it
+        # `--order=asc` and swallow stderr, so the refusal presented as "no
+        # autoscaler events, forever". The workload-troubleshooting skills use
+        # the --start-time/--end-time pair. These argvs are those call sites'.
+        for argv, desc in (
+            (["gcloud", "logging", "read", 'resource.type="k8s_cluster"',
+              "--order=asc", "--format=json"], "log-autoscaler-events.sh"),
+            (["gcloud", "logging", "read", 'resource.type="k8s_cluster"',
+              "--start-time=2026-08-20T00:00:00Z", "--end-time=2026-08-20T01:00:00Z",
+              "--project=p"], "gke-workload-troubleshooting attached"),
+            (["gcloud", "logging", "read", "q",
+              "--order", "asc", "--start-time", "t", "--end-time", "t"],
+             "detached spellings"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_a_flag_the_parser_does_not_know_still_refuses_logging_read(self):
+        # The fix for the above is three arity entries, not a relaxation: a
+        # flag absent from both tables still makes the command unreadable,
+        # even on an allowlisted read.
+        self.assertFalse(
+            evaluate(["gcloud", "logging", "read", "q", "--frobnicate=x"]).allowed
+        )
+
     def test_listing_a_beta_read_does_not_open_the_beta_tree(self):
         # The `beta` entries are full paths, not a prefix. Asserting the
         # writes next to them stay refused is the point: a rule that granted
