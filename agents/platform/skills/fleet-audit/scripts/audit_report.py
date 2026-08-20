@@ -223,6 +223,17 @@ AUDITS: dict[str, AuditSpec] = {
             "dangling-compute-class",
         ),
     ),
+    "gke-runtime-telemetry-audit": AuditSpec(
+        "GKE Runtime Telemetry Audit",
+        "gke_runtime_telemetry_sop.md",
+        (
+            "cfs-quota-throttling",
+            "conntrack-saturation",
+            "ingress-502-drain",
+            "ephemeral-growth-rate",
+            "ulimit-exhaustion",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")

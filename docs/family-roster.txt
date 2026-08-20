@@ -41,6 +41,7 @@ agents/platform/governance/*.md
   agents/platform/governance/compliance_audit_sop.md
   agents/platform/governance/fleet_consistency_drift_sop.md
   agents/platform/governance/fleet_wide_cost_analysis_sop.md
+  agents/platform/governance/gke_runtime_telemetry_sop.md
   agents/platform/governance/global_capacity_orchestrator_sop.md
   agents/platform/governance/inventory.md
   agents/platform/governance/inventory_prioritize_sop.md
@@ -76,6 +77,7 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/gke-platform-security/SKILL.md
   agents/platform/skills/gke-productionize/SKILL.md
   agents/platform/skills/gke-reliability/SKILL.md
+  agents/platform/skills/gke-runtime-telemetry-audit/SKILL.md
   agents/platform/skills/gke-service-networking/SKILL.md
   agents/platform/skills/gke-storage/SKILL.md
   agents/platform/skills/gke-tpu-dynamic-slices-monitoring/SKILL.md
