@@ -276,6 +276,10 @@ _KUBECTL_FILE_WRITE_FLAGS = frozenset(
 # rather than a regex someone widens in a hurry.
 GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
     {
+        # Image metadata read; gke-app-onboarding reads a digest with it
+        # before proposing a manifest. `images delete` shares three of the
+        # four words and stays refused -- the tests hold the door.
+        ("artifacts", "docker", "images", "describe"),
         ("auth", "list"),
         ("config", "get"),
         ("config", "get-value"),
@@ -286,6 +290,10 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
         ("beta", "compute", "advice", "capacity-history"),
+        # Budget reads for the cost skills. list only: budgets are written
+        # by humans, and `billing accounts list` is deliberately absent --
+        # the skills take the account id from configuration, not discovery.
+        ("billing", "budgets", "list"),
         ("compute", "addresses", "describe"),
         ("compute", "addresses", "list"),
         ("compute", "backend-services", "list"),
@@ -293,6 +301,22 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "disks", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
+        # The daily `gcp-networking-fabric-audit` cron executes
+        # governance/gcp_networking_fabric_sop.md exactly, and of the reads
+        # that SOP issues only forwarding-rules list was in this set --
+        # four of its five checks had no data source. Same shape as the
+        # stockout gap below: the job runs, reports, and measures nothing.
+        # `compute project-info describe` is the stockout SOP's quota
+        # remediation read. The writes one word away (networks create,
+        # security-policies create, project-info add-metadata) stay
+        # refused, and the tests assert it.
+        ("compute", "networks", "list"),
+        ("compute", "networks", "subnets", "describe"),
+        ("compute", "networks", "subnets", "list"),
+        ("compute", "networks", "subnets", "list-usable"),
+        ("compute", "project-info", "describe"),
+        ("compute", "routers", "get-nat-mapping-info"),
+        ("compute", "security-policies", "list"),
         # The daily `stockout-prevention` cron reads these three and nothing
         # else can stand in for them: reservations list is the committed
         # capacity, regions describe is the quota headroom, machine-types
@@ -347,6 +371,13 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # Those scripts also discard stderr and treat empty output as "no
         # events yet", so the refusal was silent — the poll loop slept forever.
         "--order", "--start-time", "--end-time",
+        # The spellings the stockout SOP actually passes to the two entries
+        # added for it: capacity-history carries the first three, and
+        # machine-types list uses --zones (plural; --zone alone was listed).
+        # An allowlist entry whose flags are not here is unreachable.
+        "--instance-selection-machine-types", "--size", "--types", "--zones",
+        # `billing budgets list` requires it.
+        "--billing-account",
     }
 )
 
@@ -824,7 +855,10 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="gcp.read-only",
                 message=(
                     "Agents hold read-only access to Google Cloud. Propose this "
-                    "change as a pull request instead."
+                    "change as a pull request instead. If this is a read the "
+                    "product runs on its own, it is missing from "
+                    "GCLOUD_READ_COMMANDS in command_policy.py -- report it "
+                    "rather than working around it."
                 ),
                 verb_tuple=tuple(words[:3]),  # Cap at 3 words to exclude positionals
             )

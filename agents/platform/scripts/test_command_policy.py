@@ -903,6 +903,77 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_the_daily_networking_fabric_audit_can_run_its_reads(self):
+        # agents/platform/cron/jobs.json schedules `gcp-networking-fabric-audit`
+        # daily, enabled, deliver: all, executing
+        # governance/gcp_networking_fabric_sop.md exactly. Of the gcloud reads
+        # that SOP issues, only forwarding-rules list was allowlisted; four of
+        # its five checks had no data source. These argvs are the SOP's own
+        # spellings.
+        for argv, desc in (
+            (["gcloud", "compute", "networks", "list", "--project=p",
+              "--format=json"], "SOP:60 VPC inventory"),
+            (["gcloud", "compute", "networks", "subnets", "list",
+              "--format=json"], "SOP:26 subnet inventory"),
+            (["gcloud", "compute", "networks", "subnets", "list-usable",
+              "--project=p", "--format=json"], "SOP:38 usable ranges"),
+            (["gcloud", "compute", "networks", "subnets", "describe",
+              "gke-pods-subnet", "--region=us-central1"], "SOP:164 subnet detail"),
+            (["gcloud", "compute", "routers", "get-nat-mapping-info", "r",
+              "--region=us-central1", "--project=p"], "SOP:45 NAT mappings"),
+            (["gcloud", "compute", "security-policies", "list", "--project=p",
+              "--format=json"], "SOP:68 Cloud Armor inventory"),
+            (["gcloud", "compute", "project-info", "describe"],
+             "stockout SOP:199 quota remediation read"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_the_stockout_sop_spellings_reach_their_allowlist_entries(self):
+        # The capacity-history and machine-types entries were added for this
+        # cron in an earlier commit, but the flags the SOP passes were not in
+        # the arity table, so both refused as unreadable before their entries
+        # were consulted. These are the SOP's spellings (lines 73 and 220).
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--region=r", "--instance-selection-machine-types=g2-standard-4",
+              "--size=1", "--types=PREEMPTION,PRICE", "--format=json"],
+             "capacity forecast as the SOP spells it"),
+            (["gcloud", "compute", "machine-types", "list", "--zones=z"],
+             "machine-types with --zones (plural)"),
+            (["gcloud", "billing", "budgets", "list", "--billing-account=A",
+              "--quiet"], "gke-cost-analysis SKILL.md:83"),
+            (["gcloud", "artifacts", "docker", "images", "describe",
+              "r-docker.pkg.dev/p/repo/img:tag"], "gke-app-onboarding SKILL.md:88"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
+        # Each new entry has a mutating sibling that shares all but the last
+        # word. The entries are full paths, so the siblings must still refuse.
+        for argv, desc in (
+            (["gcloud", "compute", "networks", "create", "n"], "networks create"),
+            (["gcloud", "compute", "networks", "delete", "n"], "networks delete"),
+            (["gcloud", "compute", "networks", "subnets", "create", "s"],
+             "subnets create"),
+            (["gcloud", "compute", "networks", "subnets", "expand-ip-range", "s"],
+             "subnets expand-ip-range"),
+            (["gcloud", "compute", "project-info", "add-metadata",
+              "--metadata=k=v"], "project-info add-metadata"),
+            (["gcloud", "compute", "routers", "create", "r"], "routers create"),
+            (["gcloud", "compute", "routers", "update", "r"], "routers update"),
+            (["gcloud", "compute", "security-policies", "create", "p"],
+             "security-policies create"),
+            (["gcloud", "billing", "budgets", "create", "--billing-account=A"],
+             "budgets create"),
+            (["gcloud", "billing", "budgets", "delete", "b"], "budgets delete"),
+            (["gcloud", "artifacts", "docker", "images", "delete", "img"],
+             "images delete"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
     def test_logging_read_works_as_the_shipped_scripts_spell_it(self):
         # `logging read` was allowlisted while every flag the repo passes to it
         # was not, and an unlisted flag refuses the command before the allowlist
