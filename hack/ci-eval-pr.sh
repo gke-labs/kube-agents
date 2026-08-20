@@ -40,9 +40,26 @@ export BENCH_TF_ROOT="./tf"
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
-export GKE_CLUSTER_NAME="test-cluster"
-export CLUSTER_NAME="test-cluster"
-export TF_VAR_cluster_name="test-cluster"
+
+# Per-run task-cluster name, derived from the Prow run identity. Uniqueness is
+# what makes concurrent presubmit runs safe: two runs can never race on one
+# cluster because they never share a name, and a "409 Already Exists" between
+# runs is impossible by construction. The old fixed name ("test-cluster") was
+# safe only while the Prow job's max_concurrency was 1 -- a setting that lives
+# in test-infra where nobody editing this repository would see it.
+#
+# GKE caps names at 40 chars matching [a-z]([-a-z0-9]*[a-z0-9])?, so the name
+# is lowercased, non-alphanumerics collapse to hyphens, and it is clamped with
+# no trailing hyphen. BUILD_ID and PULL_NUMBER are set by Prow; locally the
+# name falls back to a stable "eval-pr0-local", where the persistent tofu state
+# under bench/tf makes reuse across runs the intended behaviour.
+EVAL_CLUSTER_NAME="eval-pr${PULL_NUMBER:-0}-${BUILD_ID:-local}"
+EVAL_CLUSTER_NAME="$(printf '%s' "${EVAL_CLUSTER_NAME}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
+EVAL_CLUSTER_NAME="$(printf '%s' "${EVAL_CLUSTER_NAME:0:40}" | sed 's/-*$//')"
+export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
+echo "Task cluster for this run: ${EVAL_CLUSTER_NAME}"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
 
 # Stamp the run onto every labelable GCP resource the stacks create, alongside

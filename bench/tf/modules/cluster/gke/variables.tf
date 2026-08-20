@@ -81,3 +81,9 @@ variable "gpu_count" {
   default     = 1
 }
 
+variable "orphan_max_age_hours" {
+  description = "Age in hours past which a managed-by=kube-agents-bench cluster is considered orphaned and reaped before this run provisions"
+  type        = number
+  default     = 4
+}
+
