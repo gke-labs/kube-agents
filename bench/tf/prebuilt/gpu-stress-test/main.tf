@@ -83,21 +83,52 @@ resource "null_resource" "write_synthetic_logs" {
       # bounded, and fail the apply if they never do: a fixture that is
       # not queryable is an infrastructure failure, and it should die
       # here, loudly, rather than surface as a judged zero that reads as
-      # the agent's mistake. The filter leans on the cluster name, which
-      # is unique per run, so a concurrent run's entries cannot satisfy
-      # this one's wait.
+      # the agent's mistake.
+      #
+      # The filter pins all three axes the writes control: the logName
+      # (the writes above use log id "container"; GKE's own agents log
+      # under different logNames, so without this a busy cluster's system
+      # entries flood the newest-first --limit window and starve the
+      # fixture pair out of it forever -- a healthy apply failing on a
+      # noisy neighbour), the cluster name (unique per run, so a
+      # concurrent run's entries cannot satisfy this one's wait), and the
+      # two seeded message strings themselves.
+      #
+      # A failing poll is not a slow poll: gcloud erroring (IAM, API)
+      # would otherwise read as "not ingested yet" for the full 120s and
+      # bury the real cause. Three consecutive command failures fail
+      # fast with gcloud's own stderr; a timeout prints it too.
+      err_file="$${TMPDIR:-/tmp}/synthetic-log-poll-$$$$.err"
       elapsed=0
+      poll_errs=0
       while :; do
-        found="$$(gcloud logging read "resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"${module.cluster.cluster_name}\"" --project=${var.project_id} --freshness=10m --limit=10 --format='value(jsonPayload.message)' 2>/dev/null)" || found=""
+        if found="$$(gcloud logging read "logName=\"projects/${var.project_id}/logs/container\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"${module.cluster.cluster_name}\" AND (jsonPayload.message:\"GCS FUSE buffer exhaustion\" OR jsonPayload.message:\"HPA max-replica saturation\")" --project=${var.project_id} --freshness=10m --limit=10 --format='value(jsonPayload.message)' 2>"$$err_file")"; then
+          poll_errs=0
+        else
+          poll_errs=$$((poll_errs + 1))
+          found=""
+          if [ "$$poll_errs" -ge 3 ]; then
+            echo "ERROR: the ingestion poll itself failed $$poll_errs times running -- this is not an ingestion delay. Check logging.logEntries.list on the calling service account. gcloud said:" >&2
+            cat "$$err_file" >&2
+            rm -f "$$err_file"
+            exit 1
+          fi
+        fi
         ok=0
         printf '%s' "$$found" | grep -q "GCS FUSE buffer exhaustion" && ok=$$((ok + 1))
         printf '%s' "$$found" | grep -q "HPA max-replica saturation" && ok=$$((ok + 1))
         if [ "$$ok" -eq 2 ]; then
           echo "Synthetic log entries queryable after $${elapsed}s."
+          rm -f "$$err_file"
           break
         fi
         if [ "$$elapsed" -ge 120 ]; then
           echo "ERROR: synthetic log entries not queryable after $${elapsed}s (found $$ok of 2); the post-incident fixture does not exist and the evaluation must not start." >&2
+          if [ -s "$$err_file" ]; then
+            echo "Last poll stderr:" >&2
+            cat "$$err_file" >&2
+          fi
+          rm -f "$$err_file"
           exit 1
         fi
         sleep 5
