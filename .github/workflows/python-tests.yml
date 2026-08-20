@@ -94,9 +94,14 @@ jobs:
     name: Coverage report
     runs-on: ubuntu-latest
 
+    # No pull-requests: write here, deliberately. This job runs the pull
+    # request's own Makefile and tests, and on a fork PR the token is
+    # read-only whatever this block asks for -- which in this repository is
+    # every PR, since branches live on forks. The comment is posted by
+    # coverage-comment.yml on the workflow_run trigger, which runs in the
+    # base repository's context; this job's whole hand-off is the artifact.
     permissions:
       contents: read
-      pull-requests: write
 
     env:
       HERMES_HOME: ${{ github.workspace }}/.hermes-home
@@ -163,57 +168,23 @@ jobs:
               "*deploy/docker/patches/slack_code_emphasis*.py" \
               "*examples/*"
 
-      # One sticky comment rewritten in place, never a new comment per push.
-      # Plain gh api rather than a third-party action: the logic is ten lines,
-      # and it is one less pinned SHA to keep current.
-      #
-      # Same-repo pull requests only, and not Dependabot's: on a fork PR
-      # GitHub forces the token to read-only whatever `permissions:` asks
-      # for, and it does the same when the actor is dependabot[bot] even on
-      # a same-repo branch -- either way the POST would 403 and red a job
-      # whose whole point is to block nothing. Those runs get the artifact
-      # upload below instead.
-      - name: Post the coverage comment
-        if: >-
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository &&
-          github.actor != 'dependabot[bot]'
+      # The hand-off to coverage-comment.yml, which posts the sticky PR
+      # comment from the base repository's context (this job's fork token
+      # cannot). The PR number rides inside the artifact because the
+      # workflow_run event on the poster's side does not reliably carry it
+      # for fork PRs; the poster validates it before use rather than
+      # trusting it. Skipped on the measurement-only pushes to main: there
+      # is no PR to hand off to, and the poster ignores runs without one.
+      - name: Write the comment hand-off data
+        if: github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
         run: |
-          marker='<!-- coverage-report -->'
-          total=$(COVERAGE_ROOT="$PWD" COVERAGE_FILE="$PWD/.coverage-data/.coverage" \
-                  python3 -m coverage report --rcfile=.coveragerc --format=total)
-          {
-            echo "$marker"
-            echo "## Coverage"
-            echo
-            echo "Repository total (Python): **${total}%**"
-            echo
-            # GitHub caps a comment body at 65,536 characters; a huge PR's
-            # diff-cover table can exceed it, and a 422 here reds the job.
-            head -c 60000 diff-cover.md
-            echo
-            echo "_Report-only: nothing here blocks this pull request yet._"
-          } > comment.md
-          # Only consider comments this workflow's identity wrote: anyone can
-          # start a comment with the marker, and PATCHing theirs would render
-          # the report under their name. tail rather than head: tail reads to
-          # EOF, so it cannot SIGPIPE a still-paginating gh under a pipefail
-          # shell; there is at most one matching comment either way.
-          cid=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq ".[] | select(.user.login == \"github-actions[bot]\")
-                          | select(.body | startswith(\"$marker\")) | .id" | tail -1)
-          if [ -n "$cid" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@comment.md
-          else
-            gh api "repos/$REPO/issues/$PR/comments" -F body=@comment.md
-          fi
+          echo "$PR" > pr-number.txt
+          COVERAGE_ROOT="$PWD" COVERAGE_FILE="$PWD/.coverage-data/.coverage" \
+            python3 -m coverage report --rcfile=.coveragerc --format=total \
+            > coverage-total.txt
 
-      # The copy of the report for every run the comment step skips: fork
-      # PRs, Dependabot, and the measurement-only pushes to main.
       - name: Upload the diff coverage report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -222,4 +193,6 @@ jobs:
           path: |
             diff-cover.md
             coverage.xml
+            pr-number.txt
+            coverage-total.txt
           if-no-files-found: ignore
