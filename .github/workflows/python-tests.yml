@@ -95,9 +95,14 @@ jobs:
       # full path, so every one must lead with `*`. A bare
       # `deploy/docker/patches/...` matches nothing and fails open.
       - name: Diff coverage against the merge base
+        env:
+          # Through the environment rather than interpolated into the script:
+          # zizmor flags template expansion inside `run:` as an injection
+          # surface, and the env var is inert text to the shell parser.
+          BASE_REF: ${{ github.base_ref }}
         run: |
           diff-cover coverage.xml \
-            --compare-branch origin/${{ github.base_ref }} \
+            --compare-branch "origin/${BASE_REF}" \
             --markdown-report diff-cover.md \
             --fail-under 0 \
             --exclude \
