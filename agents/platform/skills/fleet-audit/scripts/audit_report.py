@@ -223,6 +223,17 @@ AUDITS: dict[str, AuditSpec] = {
             "dangling-compute-class",
         ),
     ),
+    "gce-compute-fleet-audit": AuditSpec(
+        "GCE Compute Engine and MIG Fleet Audit",
+        "gce_compute_fleet_sop.md",
+        (
+            "gce-startup-script-status",
+            "mig-autoscaler-flapping",
+            "ops-agent-guest-health",
+            "sole-tenant-headroom",
+            "orphaned-snapshots",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
