@@ -506,6 +506,18 @@ class TestTransitions(QueueTestCase):
         with self.assertRaises(fq.FindingNotFound):
             fq.patch_finding(self.conn, "no-such-finding", {"state": "accepted"})
 
+    def test_a_person_can_reverse_their_own_dismissal(self):
+        # Deliberate, not a hole in the sticky rule. Registration and
+        # verification are both blocked from reviving a dismissed row, so
+        # without this door a mis-click is unrecoverable by any route.
+        fq.patch_finding(self.conn, self.fid, {"state": "dismissed"})
+        self.assertEqual(self.ids(), [])
+
+        row = fq.patch_finding(self.conn, self.fid, {"state": "accepted"})
+
+        self.assertEqual(row["state"], "accepted")
+        self.assertEqual(self.ids(), [self.fid])
+
     def test_leaving_a_snooze_by_any_door_clears_its_deadline(self):
         for state in ("accepted", "dismissed", "surfaced"):
             fq.patch_finding(self.conn, self.fid, {"state": "snoozed", "snoozed_until": "2026-09-01"})
