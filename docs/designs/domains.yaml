@@ -1,4 +1,7 @@
-# The ten domains of docs/designs/testing-strategy.md §4.2, as data.
+# The ten domains the Platform Agent operates in, as data. Each is a job area
+# with its own SOP, cron stream, and journeys (the testing-strategy design
+# document, in review, is the source of the list; until it lands this file is
+# self-contained).
 #
 # scripts/test_domain_coverage.py reads this file and fails when a domain has
 # no bench task carrying a deterministic verification_spec -- the rule "a

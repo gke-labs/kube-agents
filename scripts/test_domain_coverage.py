@@ -1,8 +1,8 @@
 """A domain with no blocking scenario is uncovered, not passing.
 
-docs/designs/testing-strategy.md §3 states the rule; docs/designs/domains.yaml
-holds the ten domains and the allowlist of known-uncovered ones. This test is
-what makes the rule a build failure:
+docs/designs/domains.yaml holds the ten domains and the allowlist of
+known-uncovered ones (its header states the rule and where it comes from).
+This test is what makes the rule a build failure:
 
 * a domain with no bench task carrying a non-empty ``verification_spec`` must
   be on the allowlist -- otherwise coverage regressed silently;

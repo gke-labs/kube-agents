@@ -2,8 +2,8 @@
 
 `make test-python` discovers tests from PYTHON_TEST_DIRS, a fixed list of
 wildcards. A test directory the wildcards miss does not fail anything -- it
-just never runs, and the suite reports green around it. That is how six test
-files (the memory provider's four and bench's two) sat unexecuted on every
+just never runs, and the suite reports green around it. That is how eight test
+files (the memory provider's six and bench's two) sat unexecuted on every
 pull request for months: nothing owned the difference between "excluded on
 purpose" and "missed by a glob".
 
@@ -17,6 +17,7 @@ parsing the Makefile's text: the value that matters is the one make expands,
 and a regex re-implementation would drift from it.
 """
 
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -59,13 +60,16 @@ def discovered_dirs():
     with tempfile.NamedTemporaryFile("w", suffix=".mk", delete=False) as wrapper:
         wrapper.write("include Makefile\nprint-test-dirs:\n\t@echo $(PYTHON_TEST_DIRS)\n")
         wrapper_path = wrapper.name
-    out = subprocess.run(
-        ["make", "-f", wrapper_path, "print-test-dirs"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
+    try:
+        out = subprocess.run(
+            ["make", "-f", wrapper_path, "print-test-dirs"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    finally:
+        os.unlink(wrapper_path)
     return {d.rstrip("/") for d in out.split()}
 
 

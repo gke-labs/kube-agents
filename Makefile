@@ -141,7 +141,11 @@ test-python-deps: ## Install the third-party imports `make test-python` needs.
 #
 # Added because the answer used to be three commands nobody could remember, and
 # a handoff doc had to carry the recipe. If you add a suite, add it here.
-verify: ## Run everything a PR must pass: go build, go vet, go test, python tests.
+# test-bench is deliberately not here: its deps target installs bench/
+# editable, which pulls devops-bench from a pinned git SHA over the network.
+# verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
+# and runs locally with `make test-bench`.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
