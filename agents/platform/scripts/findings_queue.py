@@ -14,10 +14,12 @@ import hashlib
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 __all__ = [
     "FindingError",
+    "FindingNotFound",
     "init_findings_schema",
     "derive_finding_id",
     "rank_score",
@@ -36,6 +38,12 @@ __all__ = [
 
 class FindingError(ValueError):
     """A registration or transition the queue refuses, with the reason."""
+
+
+class FindingNotFound(KeyError):
+    """No row with that id. A distinct type because the caller maps it to 404,
+    and a bare `KeyError` from a missing dict key anywhere in the call tree
+    would then be reported to the agent as a finding that does not exist."""
 
 
 SOURCES = ("inventory", "event-watcher", "audit")
@@ -145,6 +153,35 @@ MAX_LABEL_CHARS = 500
 MAX_TEXT_CHARS = 4000
 MAX_BATCH = 500
 
+# Rejected values are quoted back so the caller can see what it sent, but the
+# rejection happens before any length cap, and the message ends up verbatim in
+# an agent's context window. 80 characters is enough to recognise a value and
+# not enough to carry a payload.
+MAX_ECHO_CHARS = 80
+
+
+def _brief(value: Any) -> str:
+    shown = repr(value)
+    return shown if len(shown) <= MAX_ECHO_CHARS else f"{shown[:MAX_ECHO_CHARS]}... ({len(shown)} chars)"
+
+
+def _parse_timestamp(raw: Any, field: str) -> str:
+    """An ISO 8601 instant, normalised to what SQLite's `datetime()` compares against.
+
+    The expiry sweep asks `snoozed_until <= datetime('now')`, which is a string
+    comparison against UTC `YYYY-MM-DD HH:MM:SS`. An ISO string with a `T` or an
+    offset sorts wrong against that, so a snooze stored as the caller typed it
+    would expire at the wrong time or never.
+    """
+    value = _text(raw, field)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise FindingError(f"{field} is {_brief(value)}; must be an ISO 8601 date or timestamp") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _rubric_percent(value: Any) -> int:
     if isinstance(value, bool):
@@ -156,7 +193,7 @@ def _rubric_percent(value: Any) -> int:
     except (TypeError, ValueError):
         raise FindingError("rubric.C must be one of 1.0, 0.9, 0.6") from None
     if as_float not in _C_FROM_FLOAT:
-        raise FindingError(f"rubric.C is {value!r}; anchors are 1.0 (measured), 0.9 (live state), 0.6 (inferred)")
+        raise FindingError(f"rubric.C is {_brief(value)}; anchors are 1.0 (measured), 0.9 (live state), 0.6 (inferred)")
     return _C_FROM_FLOAT[as_float]
 
 
@@ -173,7 +210,7 @@ def validate_rubric(raw: Any) -> dict:
     for key, anchors in (("B", B_ANCHORS), ("L", L_ANCHORS), ("detect", E_ANCHORS), ("recover", E_ANCHORS)):
         value = raw.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value not in anchors:
-            raise FindingError(f"rubric.{key} is {value!r}; anchors are {list(anchors)}")
+            raise FindingError(f"rubric.{key} is {_brief(value)}; anchors are {list(anchors)}")
         out[key] = value
     out["C"] = _rubric_percent(raw.get("C"))
     return out
@@ -207,9 +244,14 @@ def ranked_sort_key(finding: dict) -> tuple:
     findings the rubric cannot separate come out in the same order the fleet
     audit renders them.
     """
+    remediation = finding.get("remediation") or {}
     return (
         0 if finding.get("actionable") else 1,
         -int(finding.get("rank_score") or 0),
+        # §4.5: fix cost enters the order exactly once, here. Two findings the
+        # rubric scores the same are not equally useful to surface — the one
+        # with a manifest to change can be handed over today as a diff.
+        0 if remediation.get("kind") == "manifest" else 1,
         str(finding.get("cluster") or ""),
         str(finding.get("namespace") or ""),
         str(finding.get("object") or ""),
@@ -318,10 +360,10 @@ def _validate_remediation(raw: Any) -> dict:
         raise FindingError("remediation must be an object with kind, path and note")
     kind = _text(raw.get("kind"), "remediation.kind")
     if kind not in REMEDIATION_KINDS:
-        raise FindingError(f"remediation.kind is {kind!r}; must be one of {list(REMEDIATION_KINDS)}")
+        raise FindingError(f"remediation.kind is {_brief(kind)}; must be one of {list(REMEDIATION_KINDS)}")
     path = _text(raw.get("path"), "remediation.path", required=False)
     if path and kind != "manifest":
-        raise FindingError(f"remediation.path is only meaningful when kind is 'manifest', not {kind!r}")
+        raise FindingError(f"remediation.path is only meaningful when kind is 'manifest', not {_brief(kind)}")
     out = {"kind": kind, "note": _text(raw.get("note"), "remediation.note", limit=MAX_TEXT_CHARS)}
     if path:
         out["path"] = path
@@ -333,7 +375,7 @@ def _validate_verification(raw: Any) -> dict:
         raise FindingError("verification must be an object with kind, command and still_failing_when")
     kind = _text(raw.get("kind"), "verification.kind")
     if kind not in VERIFICATION_KINDS:
-        raise FindingError(f"verification.kind is {kind!r}; must be one of {list(VERIFICATION_KINDS)}")
+        raise FindingError(f"verification.kind is {_brief(kind)}; must be one of {list(VERIFICATION_KINDS)}")
     # A `manual` finding is one no command can settle (§7.4), so it is the one
     # kind that may arrive without one.
     command = _text(raw.get("command"), "verification.command", required=kind != "manual", limit=MAX_TEXT_CHARS)
@@ -359,7 +401,7 @@ def validate_finding(raw: Any) -> dict:
 
     source = _text(raw.get("source"), "source")
     if source not in SOURCES:
-        raise FindingError(f"source is {source!r}; must be one of {list(SOURCES)}")
+        raise FindingError(f"source is {_brief(source)}; must be one of {list(SOURCES)}")
 
     check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check")
     cluster = _text(raw.get("cluster"), "cluster")
@@ -447,12 +489,12 @@ def list_findings(
         params.append(cluster)
     if state:
         if state not in STATES:
-            raise FindingError(f"state is {state!r}; must be one of {list(STATES)}")
+            raise FindingError(f"state is {_brief(state)}; must be one of {list(STATES)}")
         clauses.append("state = ?")
         params.append(state)
     if severity:
         if severity not in SEVERITIES:
-            raise FindingError(f"severity is {severity!r}; must be one of {list(SEVERITIES)}")
+            raise FindingError(f"severity is {_brief(severity)}; must be one of {list(SEVERITIES)}")
         clauses.append("severity = ?")
         params.append(severity)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -534,15 +576,24 @@ def _downgrade_absent(conn: sqlite3.Connection, cluster: str, seen: set[str]) ->
     rubric's own value for "inferred from absence" and left on the list for
     §7.4 to settle.
     """
+    # Matched case-insensitively because the caller's `scope.cluster` and the
+    # row's `cluster` reach here by different routes, and a byte-for-byte miss
+    # is silent: the sweep reports zero downgrades, which reads as a clean run.
     rows = conn.execute(
-        "SELECT id, rubric FROM findings WHERE cluster = ? AND state = 'queued'", (cluster,)
+        "SELECT id, rubric FROM findings WHERE cluster = ? COLLATE NOCASE AND state = 'queued'",
+        (cluster,),
     ).fetchall()
     downgraded = 0
     for finding_id, raw in rows:
         if finding_id in seen:
             continue
-        rubric = json.loads(raw)
-        if rubric.get("C") == 60:
+        try:
+            rubric = validate_rubric(json.loads(raw))
+        except (FindingError, ValueError):
+            # One unreadable row must not fail the batch of new findings it
+            # arrived with; leaving it at its old score is the safe direction.
+            continue
+        if rubric["C"] == 60:
             continue
         rubric["C"] = 60
         score = rank_score(rubric)
@@ -588,7 +639,7 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
 def mark_surfaced(conn: sqlite3.Connection, finding_id: str, chat_id: str = "", thread_id: str = "") -> dict:
     """Record that a publisher named this row, after the send."""
     if get_finding(conn, finding_id) is None:
-        raise KeyError(finding_id)
+        raise FindingNotFound(finding_id)
     conn.execute(
         "UPDATE findings SET surface_count = surface_count + 1, surfaced_at = datetime('now'), "
         "state = CASE WHEN state = 'queued' THEN 'surfaced' ELSE state END, "
@@ -603,8 +654,9 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
     """The three human transitions, the snooze expiry, and PR reconciliation."""
     if not isinstance(patch, dict):
         raise FindingError("patch must be an object")
-    if get_finding(conn, finding_id) is None:
-        raise KeyError(finding_id)
+    current = get_finding(conn, finding_id)
+    if current is None:
+        raise FindingNotFound(finding_id)
 
     assignments, values = [], []
 
@@ -612,19 +664,27 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
         state = _text(patch.get("state"), "state")
         if state not in PATCHABLE_STATES:
             raise FindingError(
-                f"state is {state!r}; this route sets {list(PATCHABLE_STATES)}. "
+                f"state is {_brief(state)}; this route sets {list(PATCHABLE_STATES)}. "
                 "'resolved' and 'stale' are verification outcomes and 'queued' is registration's"
             )
         assignments.append("state = ?")
         values.append(state)
         if state == "snoozed":
-            until = _text(patch.get("snoozed_until"), "snoozed_until")
             assignments.append("snoozed_until = ?")
-            values.append(until)
-        elif state == "surfaced":
+            values.append(_parse_timestamp(patch.get("snoozed_until"), "snoozed_until"))
+        else:
+            # Leaving the snooze by any door clears its deadline. Only the exit
+            # to 'surfaced' used to, which left an accepted row carrying a
+            # wake-up time the expiry sweep would act on.
             assignments.append("snoozed_until = NULL")
     elif "snoozed_until" in patch:
         raise FindingError("snoozed_until is set by the transition to 'snoozed'")
+
+    if ("pr_url" in patch or "pr_state" in patch) and current["provider_managed"]:
+        raise FindingError(
+            f"{finding_id} is provider-managed: there is no file to change, so it never "
+            "gets a pull request (§4.4)"
+        )
 
     if "pr_url" in patch:
         assignments.append("pr_url = ?")
@@ -632,7 +692,7 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
     if "pr_state" in patch:
         pr_state = _text(patch.get("pr_state"), "pr_state", required=False)
         if pr_state and pr_state not in PR_STATES:
-            raise FindingError(f"pr_state is {pr_state!r}; must be one of {list(PR_STATES)}")
+            raise FindingError(f"pr_state is {_brief(pr_state)}; must be one of {list(PR_STATES)}")
         assignments.append("pr_state = ?")
         values.append(pr_state or None)
 
@@ -654,10 +714,10 @@ def record_verification(
     """§7.4's three outcomes. "Could not verify" is not "no longer reproduces"."""
     current = get_finding(conn, finding_id)
     if current is None:
-        raise KeyError(finding_id)
+        raise FindingNotFound(finding_id)
     outcome = _text(outcome, "outcome")
     if outcome not in VERIFY_OUTCOMES:
-        raise FindingError(f"outcome is {outcome!r}; must be one of {list(VERIFY_OUTCOMES)}")
+        raise FindingError(f"outcome is {_brief(outcome)}; must be one of {list(VERIFY_OUTCOMES)}")
 
     assignments = ["last_verification = ?"]
     values: list[Any] = [
@@ -667,15 +727,21 @@ def record_verification(
         )
     ]
 
+    # A dismissed row records that it was checked and moves nowhere. `resolved`
+    # and `stale` are both in RECURRENCE_STATES, so letting verification write
+    # either would arm the next sweep to re-queue the one row the user took off
+    # the list — the same revival §5.2 blocks on the registration path.
+    sticky = current["state"] in STICKY_STATES
+
     if outcome == "unverifiable":
         # `last_verified` deliberately does not advance: the queue did not
         # manage to ask, and a row that looks freshly checked is the lie this
         # third outcome exists to prevent.
-        if object_missing:
+        if object_missing and not sticky:
             assignments.append("state = 'stale'")
     else:
         assignments.append("last_verified = datetime('now')")
-        if outcome == "resolved":
+        if outcome == "resolved" and not sticky:
             assignments.append("state = 'resolved'")
 
     if rubric is not None:
@@ -685,7 +751,7 @@ def record_verification(
         values += [json.dumps(new_rubric, sort_keys=True), score, severity_for(score, new_rubric)]
         # §4.6's fourth re-rank event, the only one that lowers a score: the
         # fault stopped firing, so the alarm may fire again if it comes back.
-        if current["rubric"]["L"] == FLOOR_LIKELIHOOD and new_rubric["L"] < FLOOR_LIKELIHOOD:
+        if (current["rubric"] or {}).get("L") == FLOOR_LIKELIHOOD and new_rubric["L"] < FLOOR_LIKELIHOOD:
             assignments.append("alarmed_at = NULL")
 
     conn.execute(f"UPDATE findings SET {', '.join(assignments)} WHERE id = ?", (*values, finding_id))
@@ -710,12 +776,17 @@ def get_publication(conn: sqlite3.Connection, publisher: str) -> dict | None:
 
 def put_publication(conn: sqlite3.Connection, publisher: str, body: Any) -> dict:
     if publisher not in PUBLISHERS:
-        raise FindingError(f"publisher is {publisher!r}; must be one of {list(PUBLISHERS)}")
+        raise FindingError(f"publisher is {_brief(publisher)}; must be one of {list(PUBLISHERS)}")
     if not isinstance(body, dict):
         raise FindingError("body must be an object with target_kind, target_ref and content_hash")
     target_kind = _text(body.get("target_kind"), "target_kind")
     if target_kind not in PUBLICATION_TARGET_KINDS:
-        raise FindingError(f"target_kind is {target_kind!r}; must be one of {list(PUBLICATION_TARGET_KINDS)}")
+        raise FindingError(f"target_kind is {_brief(target_kind)}; must be one of {list(PUBLICATION_TARGET_KINDS)}")
+    # An omitted key leaves its column alone rather than nulling it. The two
+    # publishers write for different reasons -- the backlog to remember the
+    # document it rewrites, the nudge to remember the hash it posted -- and a
+    # full-row replace lets either erase the other's memory.
+    existing = get_publication(conn, publisher) or {}
     conn.execute(
         "INSERT INTO queue_publications (publisher, target_kind, target_ref, content_hash, last_published) "
         "VALUES (?, ?, ?, ?, datetime('now')) "
@@ -725,8 +796,12 @@ def put_publication(conn: sqlite3.Connection, publisher: str, body: Any) -> dict
         (
             publisher,
             target_kind,
-            _text(body.get("target_ref"), "target_ref", required=False, limit=MAX_TEXT_CHARS) or None,
-            _text(body.get("content_hash"), "content_hash", required=False) or None,
+            _text(body.get("target_ref"), "target_ref", required=False, limit=MAX_TEXT_CHARS) or None
+            if "target_ref" in body
+            else existing.get("target_ref"),
+            _text(body.get("content_hash"), "content_hash", required=False) or None
+            if "content_hash" in body
+            else existing.get("content_hash"),
         ),
     )
     return get_publication(conn, publisher)

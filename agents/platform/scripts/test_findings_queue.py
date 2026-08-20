@@ -344,6 +344,17 @@ class TestRegistration(QueueTestCase):
 
         self.assertEqual(fq.get_finding(self.conn, accepted_id)["rubric"]["C"], 1.0)
 
+    def test_the_scope_cluster_matches_whatever_case_it_arrives_in(self):
+        # A miss here is silent: the sweep reports zero downgrades, which is
+        # indistinguishable from a run that found everything still failing.
+        other = sample(object="Deployment/ledger")
+        self.register(sample(), other)
+
+        result = self.register(sample(), scope={"cluster": "Prod-EU", "complete": True})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, fq.validate_finding(other)["id"])["rubric"]["C"], 0.6)
+
     def test_a_batch_is_bounded(self):
         with self.assertRaises(fq.FindingError):
             self.register(*[sample(object=f"Deployment/d{i}") for i in range(fq.MAX_BATCH + 1)])
@@ -389,23 +400,56 @@ class TestOrdering(QueueTestCase):
         )
 
     def test_ranked_returns_the_open_states_only(self):
+        # §3.2's table, transcribed rather than read back from fq.OPEN_STATES:
+        # an expectation derived from the constant under test passes for any
+        # value of that constant.
         states = {
-            "queued": None,
-            "surfaced": {"state": "surfaced"},
-            "accepted": {"state": "accepted"},
-            "snoozed": {"state": "snoozed", "snoozed_until": "2026-09-01"},
-            "dismissed": {"state": "dismissed"},
+            "queued": (None, True),
+            "surfaced": ({"state": "surfaced"}, True),
+            "accepted": ({"state": "accepted"}, True),
+            "snoozed": ({"state": "snoozed", "snoozed_until": "2026-09-01"}, False),
+            "dismissed": ({"state": "dismissed"}, False),
         }
         expected = []
-        for name, patch in states.items():
+        for name, (patch, is_open) in states.items():
             finding = sample(object=f"Deployment/{name}")
             self.register(finding)
             fid = fq.validate_finding(finding)["id"]
             if patch:
                 fq.patch_finding(self.conn, fid, patch)
-            if name in fq.OPEN_STATES:
+            if is_open:
                 expected.append(fid)
         self.assertEqual(sorted(self.ids()), sorted(expected))
+
+    def test_a_manifest_fix_breaks_a_tie_at_an_equal_score(self):
+        # §4.5: fix cost enters the order exactly once, as a tie-break.
+        # Named so the object tie-break that follows would order them the other
+        # way round; without §4.5 applied first, 'aaa-manual' comes out on top.
+        manual = sample(
+            object="Deployment/aaa-manual",
+            remediation={"kind": "manual", "note": "Ask the platform team"},
+        )
+        manifest = sample(
+            object="Deployment/zzz-manifest",
+            remediation={"kind": "manifest", "path": "apps/a.yaml", "note": "Add the probe"},
+        )
+        self.register(manual, manifest)
+        ranked = fq.ranked_findings(self.conn)
+        self.assertEqual([f["rank_score"] for f in ranked], [90, 90])
+        self.assertEqual(ranked[0]["object"], "Deployment/zzz-manifest")
+
+    def test_the_manifest_tie_break_never_outranks_the_score(self):
+        manual = sample(
+            object="Deployment/manual",
+            rubric={"B": 8, "L": 10, "detect": 3, "recover": 3, "C": 1.0},
+            remediation={"kind": "manual", "note": "Ask the platform team"},
+        )
+        manifest = sample(
+            object="Deployment/manifest",
+            rubric={"B": 1, "L": 1, "detect": 1, "recover": 1, "C": 1.0},
+        )
+        self.register(manual, manifest)
+        self.assertEqual(fq.ranked_findings(self.conn)[0]["object"], "Deployment/manual")
 
     def test_an_expired_snooze_rejoins_the_list(self):
         self.register(sample())
@@ -459,8 +503,53 @@ class TestTransitions(QueueTestCase):
             fq.patch_finding(self.conn, self.fid, {"pr_state": "draft"})
 
     def test_patch_on_an_unknown_finding_raises(self):
-        with self.assertRaises(KeyError):
+        with self.assertRaises(fq.FindingNotFound):
             fq.patch_finding(self.conn, "no-such-finding", {"state": "accepted"})
+
+    def test_leaving_a_snooze_by_any_door_clears_its_deadline(self):
+        for state in ("accepted", "dismissed", "surfaced"):
+            fq.patch_finding(self.conn, self.fid, {"state": "snoozed", "snoozed_until": "2026-09-01"})
+            self.assertIsNotNone(fq.get_finding(self.conn, self.fid)["snoozed_until"])
+            row = fq.patch_finding(self.conn, self.fid, {"state": state})
+            self.assertIsNone(row["snoozed_until"], f"{state} left a wake-up time behind")
+
+    def test_a_snooze_deadline_must_be_a_real_timestamp(self):
+        for bad in ("when hell freezes over", "2026-13-01", "next tuesday"):
+            with self.assertRaises(fq.FindingError):
+                fq.patch_finding(self.conn, self.fid, {"state": "snoozed", "snoozed_until": bad})
+
+    def test_a_snooze_deadline_is_stored_as_sqlite_compares_it(self):
+        # `snoozed_until <= datetime('now')` is a string comparison, so the
+        # stored form has to be UTC 'YYYY-MM-DD HH:MM:SS' whatever was sent.
+        for sent, stored in (
+            ("2026-09-01", "2026-09-01 00:00:00"),
+            ("2026-09-01T12:30:00Z", "2026-09-01 12:30:00"),
+            ("2026-09-01T12:30:00+02:00", "2026-09-01 10:30:00"),
+        ):
+            row = fq.patch_finding(self.conn, self.fid, {"state": "snoozed", "snoozed_until": sent})
+            self.assertEqual(row["snoozed_until"], stored)
+
+    def test_a_provider_managed_finding_takes_no_pull_request(self):
+        # §4.4: nothing in kube-system has a manifest the operator owns.
+        self.register(sample(namespace="kube-system", object="DaemonSet/fluentbit"))
+        fid = fq.validate_finding(sample(namespace="kube-system", object="DaemonSet/fluentbit"))["id"]
+        self.assertTrue(fq.get_finding(self.conn, fid)["provider_managed"])
+        for patch in ({"pr_url": "https://example.invalid/pull/7"}, {"pr_state": "open"}):
+            with self.assertRaises(fq.FindingError):
+                fq.patch_finding(self.conn, fid, patch)
+
+    def test_a_pull_request_link_can_be_cleared(self):
+        fq.patch_finding(self.conn, self.fid, {"pr_url": "https://example.invalid/pull/7", "pr_state": "open"})
+        row = fq.patch_finding(self.conn, self.fid, {"pr_url": "", "pr_state": ""})
+        self.assertIsNone(row["pr_url"])
+        self.assertIsNone(row["pr_state"])
+
+    def test_a_rejected_value_is_not_echoed_back_whole(self):
+        payload = "A" * 20000
+        with self.assertRaises(fq.FindingError) as caught:
+            fq.patch_finding(self.conn, self.fid, {"pr_state": payload})
+        self.assertLess(len(str(caught.exception)), 200)
+        self.assertNotIn(payload, str(caught.exception))
 
 
 class TestVerification(QueueTestCase):
@@ -505,6 +594,31 @@ class TestVerification(QueueTestCase):
         )
         self.assertEqual(row["rank_score"], 150)
         self.assertEqual(row["severity"], "critical")
+
+    def test_verification_cannot_resurrect_a_dismissed_finding(self):
+        # The direct revival is blocked by §5.2's sticky rule, but 'resolved'
+        # and 'stale' are both recurrence states: writing either here would
+        # arm the *next* sweep to re-queue the row the user took off the list.
+        fq.patch_finding(self.conn, self.fid, {"state": "dismissed"})
+
+        for outcome, kwargs in (
+            ("resolved", {}),
+            ("unverifiable", {"object_missing": True}),
+            ("still_failing", {}),
+        ):
+            row = fq.record_verification(self.conn, self.fid, outcome, "observed", **kwargs)
+            self.assertEqual(row["state"], "dismissed", f"{outcome} moved a dismissed row")
+
+        # Re-registering after the round trip still finds it dismissed.
+        self.assertEqual(self.register(sample())["results"][0]["outcome"], "suppressed")
+        self.assertEqual(fq.get_finding(self.conn, self.fid)["state"], "dismissed")
+        self.assertEqual(self.ids(), [])
+
+    def test_a_dismissed_finding_still_records_that_it_was_checked(self):
+        fq.patch_finding(self.conn, self.fid, {"state": "dismissed"})
+        row = fq.record_verification(self.conn, self.fid, "still_failing", "0/3 ready")
+        self.assertNotEqual(row["last_verified"], "2020-01-01 00:00:00")
+        self.assertEqual(row["last_verification"]["observed"], "0/3 ready")
 
     def test_a_fault_that_stops_firing_clears_the_alarm(self):
         fq.record_verification(
@@ -577,6 +691,24 @@ class TestPublications(QueueTestCase):
         self.assertEqual(fq.get_publication(self.conn, "backlog")["content_hash"], "def")
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM queue_publications").fetchone()[0], 1
+        )
+
+    def test_an_omitted_field_is_left_alone_not_nulled(self):
+        # The backlog publisher's whole job is remembering the document it
+        # rewrites; a hash-only update must not lose it.
+        fq.put_publication(
+            self.conn,
+            "backlog",
+            {"target_kind": "github-issue", "target_ref": "https://example.invalid/i/1", "content_hash": "abc"},
+        )
+        row = fq.put_publication(self.conn, "backlog", {"target_kind": "github-issue", "content_hash": "def"})
+        self.assertEqual(row["target_ref"], "https://example.invalid/i/1")
+        self.assertEqual(row["content_hash"], "def")
+
+        self.assertIsNone(
+            fq.put_publication(
+                self.conn, "backlog", {"target_kind": "github-issue", "target_ref": ""}
+            )["target_ref"]
         )
 
     def test_unknown_publishers_and_targets_are_refused(self):
