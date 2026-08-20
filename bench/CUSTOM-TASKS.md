@@ -201,6 +201,13 @@ reported as uncovered, and the domain's allowlist entry in that file can then ne
 removed. devops-bench ignores the extra key (`extra: "ignore"` on its task model), so the
 field is free to carry.
 
+A new task must also be registered: the presubmit runs only what the `TASKS` array in
+`hack/ci-eval-pr.sh` names, and `scripts/test_task_registration.py` fails the build for a
+task that appears nowhere. A commented-out `TASKS` entry counts as registered, pending
+activation — that is how scenarios wait for infrastructure that does not exist yet — and a
+task that deliberately must not run needs a reviewed entry in that lint's
+`KNOWN_UNREGISTERED` with the reason.
+
 ```yaml
 # tasks/<task-name>/task.yaml
 id: my-provisioned-task

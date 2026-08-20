@@ -10,8 +10,18 @@ same failure as a domain nobody covered.
 
 This test owns that difference. A task passes by being named in TASKS (a
 commented-out entry counts: it is registered, pending activation, which is how
-scenarios wait for the seeded fleet), by declaring `tier: nightly` in its
-task.yaml, or by a reviewed entry in KNOWN_UNREGISTERED with the reason.
+scenarios wait for the seeded fleet) or by a reviewed entry in
+KNOWN_UNREGISTERED with the reason. There is deliberately no nightly
+exemption yet: no nightly runner exists anywhere in the tree, and an
+exemption into a runner that does not exist is an exemption into nothing.
+It returns with the nightly tier (testing implementation plan, Phase 4).
+
+Pending is not covered: scripts/test_domain_coverage.py counts a domain
+covered only when its task's path is an ACTIVE, uncommented TASKS entry, so
+a scenario parked here as commented-out keeps its domain on that lint's
+allowlist until someone activates it. The two lints ratchet together --
+this one guarantees every task is at least registered, that one guarantees
+a registered-but-dormant task never counts as coverage.
 
 TASKS is read from the script's text rather than by executing it: the script
 provisions clusters and reads secrets, so running it to ask a question is not
@@ -48,16 +58,15 @@ KNOWN_UNREGISTERED = {
 def registered_tasks():
     """Task names in the TASKS array, commented entries included."""
     text = EVAL_SCRIPT.read_text()
-    match = re.search(r"^TASKS=\((.*?)\)", text, re.M | re.S)
+    # Multi-line arrays end at a line holding only ")": stopping at the first
+    # bare ")" character instead would truncate the block at a parenthesis
+    # inside a comment and silently drop every entry below it.
+    match = re.search(r"^TASKS=\((.*?)^\)", text, re.M | re.S) or re.search(
+        r"^TASKS=\((.*)\)\s*$", text, re.M
+    )
     if match is None:
         return None
     return set(re.findall(r"tasks/([A-Za-z0-9_-]+)/task\.yaml", match.group(1)))
-
-
-def declared_tier(task_yaml):
-    """The task's top-level tier field, or None."""
-    match = re.search(r"^tier:\s*[\"']?([A-Za-z0-9_-]+)", task_yaml.read_text(), re.M)
-    return match.group(1) if match else None
 
 
 def bench_tasks():
@@ -74,10 +83,8 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         )
         orphans = sorted(
             name
-            for name, yaml_path in bench_tasks().items()
-            if name not in registered
-            and declared_tier(yaml_path) != "nightly"
-            and name not in KNOWN_UNREGISTERED
+            for name in bench_tasks()
+            if name not in registered and name not in KNOWN_UNREGISTERED
         )
         self.assertEqual(
             orphans,
@@ -85,9 +92,8 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
             "\n\nThese bench tasks are registered nowhere and never run:\n  "
             + "\n  ".join(orphans)
             + "\n\nEither add each to TASKS in hack/ci-eval-pr.sh (a commented "
-            "entry counts as registered, pending activation), declare "
-            "`tier: nightly` in its task.yaml, or add it to KNOWN_UNREGISTERED "
-            "in this file with the reason it must not run.",
+            "entry counts as registered, pending activation), or add it to "
+            "KNOWN_UNREGISTERED in this file with the reason it must not run.",
         )
 
     def test_the_exclusion_list_does_not_rot(self):
@@ -111,6 +117,19 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
             registered,
             "The TASKS array in hack/ci-eval-pr.sh parsed to no tasks -- "
             "either the array is empty or this test's parse has drifted.",
+        )
+
+    def test_the_array_is_declared_exactly_once(self):
+        # The parse reads the first TASKS=( ... ) block. A later reassignment
+        # would silently win in the shell while this test kept reading the
+        # first -- the one escape that would not fail loudly red.
+        # Anchored to line start: FAILED_TASKS=( contains the bare substring.
+        count = len(re.findall(r"^TASKS=\(", EVAL_SCRIPT.read_text(), re.M))
+        self.assertEqual(
+            count,
+            1,
+            f"hack/ci-eval-pr.sh declares TASKS=( {count} times; this test "
+            "reads the first, the shell obeys the last -- keep it to one.",
         )
 
 
