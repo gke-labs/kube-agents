@@ -43,3 +43,91 @@ jobs:
       # never started a job at all.
       - name: Run Python unit tests
         run: make test-python
+
+  # Report-only for now: it posts numbers on the pull request and blocks
+  # nothing. The blocking rules (diff-coverage floor, no-test detector, total
+  # ratchet) turn on in later stages once a baseline of merged-PR data exists;
+  # docs/designs/testing-implementation-plan.md section 2.7 is the schedule.
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      HERMES_HOME: ${{ github.workspace }}/.hermes-home
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # diff-cover diffs against the merge base, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the third-party imports the modules under test need
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-test.txt
+
+      # COVERAGE_SKIP_GO=1: k8s-operator-test.yml already runs the Go suite,
+      # and the envtest setup is not worth repeating for a report-only job.
+      # `make coverage` tolerates failing test directories by design -- the
+      # `test` job above is the gate, this one is the meter.
+      - name: Measure coverage
+        run: make coverage COVERAGE_SKIP_GO=1
+
+      # fnmatch quirk written out in the plan: exclusion patterns match the
+      # full path, so every one must lead with `*`. A bare
+      # `deploy/docker/patches/...` matches nothing and fails open.
+      - name: Diff coverage against the merge base
+        run: |
+          diff-cover coverage.xml \
+            --compare-branch origin/${{ github.base_ref }} \
+            --markdown-report diff-cover.md \
+            --fail-under 0 \
+            --exclude \
+              "*/deploy/docker/patches/verify_*.py" \
+              "*/deploy/docker/patches/kanban*.py" \
+              "*/deploy/docker/patches/cron*.py" \
+              "*/deploy/docker/patches/channel_directory_threads*.py" \
+              "*/deploy/docker/patches/slack_code_emphasis*.py" \
+              "*/examples/*"
+
+      # One sticky comment rewritten in place, never a new comment per push.
+      # Plain gh api rather than a third-party action: the logic is ten lines,
+      # and it is one less pinned SHA to keep current.
+      - name: Post the coverage comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          marker='<!-- coverage-report -->'
+          total=$(COVERAGE_ROOT="$PWD" COVERAGE_FILE="$PWD/.coverage-data/.coverage" \
+                  python3 -m coverage report --rcfile=.coveragerc --format=total)
+          {
+            echo "$marker"
+            echo "## Coverage"
+            echo
+            echo "Repository total (Python): **${total}%**"
+            echo
+            cat diff-cover.md
+            echo
+            echo "_Report-only: nothing here blocks this pull request yet._"
+          } > comment.md
+          cid=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@comment.md
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -F body=@comment.md
+          fi

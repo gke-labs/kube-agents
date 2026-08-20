@@ -198,6 +198,72 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 		exit 1; \
 	fi
 
+# Coverage runs the same suite the same way -- the loop below is test-python's
+# loop with `coverage run` in place of `python3`. That mirroring is the point:
+# a coverage target that discovers tests any other way measures a different
+# suite. Two things differ. COVERAGE_ROOT pins the measured tree to the
+# repository root (the loop cd's into each directory, and .coveragerc reads the
+# variable because `source` cannot be relative from seventeen places), and
+# COVERAGE_FILE parks every per-directory data file in one place for
+# `coverage combine`. Failing directories are reported but do not stop the
+# measurement: test-python is the gate, this is the meter, and the 13
+# pre-existing failures must not hide the number for the other directories.
+COVERAGE_DIR := .coverage-data
+
+coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
+	@rm -rf $(COVERAGE_DIR) coverage.xml coverage-go.xml
+	@mkdir -p $(COVERAGE_DIR)
+	@failed=""; \
+	for dir in $(PYTHON_TEST_DIRS); do \
+		echo "==> $$dir"; \
+		(cd $$dir && COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+			PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" \
+			python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py") \
+			|| failed="$$failed $$dir"; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "Note: failing test directories (their coverage is still recorded):$$failed"; \
+	fi
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage combine --rcfile=$(CURDIR)/.coveragerc
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o coverage.xml
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | tail -1
+# The Go half is best-effort: it needs gocover-cobertura for the XML diff-cover
+# reads, and the operator's envtest binaries to run at all. CI skips it with
+# COVERAGE_SKIP_GO=1 because k8s-operator-test.yml already runs that suite.
+# -coverpkg=./... matters: without it, packages with no test files of their own
+# drop out of the denominator and the number reads ~10 points high.
+	@if [ "$(COVERAGE_SKIP_GO)" = "1" ]; then \
+		echo "Skipping Go coverage (COVERAGE_SKIP_GO=1)."; \
+	elif ! command -v gocover-cobertura >/dev/null 2>&1; then \
+		echo "Skipping Go coverage: gocover-cobertura not installed."; \
+		echo "  go install github.com/boumenot/gocover-cobertura@latest"; \
+	else \
+		$(MAKE) -C k8s-operator setup-envtest && \
+		(cd k8s-operator && \
+			KUBEBUILDER_ASSETS="$$(bin/setup-envtest use 1.31.0 --bin-dir bin -p path)" \
+			go test -coverpkg=./... $$(go list ./... | grep -v /e2e) -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/go-cover.out && \
+			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(CURDIR)/coverage-go.xml) \
+		|| echo "Go coverage failed; the Python half above is unaffected."; \
+	fi
+
+# 55 is a deliberately loose placeholder: the real floor gets committed from
+# the first green CI run of the coverage job, not from a laptop measurement,
+# because CI's Python and dependency set produce a different number.
+COVERAGE_FLOOR ?= 55
+
+coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `make coverage` first.
+	@if [ ! -f $(COVERAGE_DIR)/.coverage ]; then \
+		echo "No coverage data. Run: make coverage"; \
+		exit 1; \
+	fi
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc --fail-under=$(COVERAGE_FLOOR) >/dev/null \
+		&& echo "Coverage is at or above the $(COVERAGE_FLOOR)% floor." \
+		|| { echo "Coverage fell below the $(COVERAGE_FLOOR)% floor."; exit 1; }
+
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean
 # and fails at 06:20 inside an agent, as a slightly worse answer rather than an
