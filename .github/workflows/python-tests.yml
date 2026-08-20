@@ -91,9 +91,13 @@ jobs:
       - name: Measure coverage
         run: make coverage COVERAGE_SKIP_GO=1
 
-      # fnmatch quirk written out in the plan: exclusion patterns match the
-      # full path, so every one must lead with `*`. A bare
-      # `deploy/docker/patches/...` matches nothing and fails open.
+      # fnmatch quirk: diff-cover matches exclusions against the basename and
+      # then the ABSOLUTE path (diff_cover/diff_reporter.py, _is_path_excluded),
+      # so a bare repo-relative pattern matches nothing and fails open. A `*`
+      # prefix with no slash matches under absolute-path semantics AND under
+      # plain relative matching -- diff-cover is deliberately unpinned in
+      # requirements-test.txt, so the patterns must not depend on which of the
+      # two an upstream release uses.
       - name: Diff coverage against the merge base
         env:
           # Through the environment rather than interpolated into the script:
@@ -106,12 +110,12 @@ jobs:
             --markdown-report diff-cover.md \
             --fail-under 0 \
             --exclude \
-              "*/deploy/docker/patches/verify_*.py" \
-              "*/deploy/docker/patches/kanban*.py" \
-              "*/deploy/docker/patches/cron*.py" \
-              "*/deploy/docker/patches/channel_directory_threads*.py" \
-              "*/deploy/docker/patches/slack_code_emphasis*.py" \
-              "*/examples/*"
+              "*deploy/docker/patches/verify_*.py" \
+              "*deploy/docker/patches/kanban*.py" \
+              "*deploy/docker/patches/cron*.py" \
+              "*deploy/docker/patches/channel_directory_threads*.py" \
+              "*deploy/docker/patches/slack_code_emphasis*.py" \
+              "*examples/*"
 
       # One sticky comment rewritten in place, never a new comment per push.
       # Plain gh api rather than a third-party action: the logic is ten lines,
