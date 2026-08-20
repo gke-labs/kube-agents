@@ -67,11 +67,21 @@ jobs:
             || { echo "artifact download failed (expired?); not posting."; exit 0; }
           mkdir report
           # -j flattens paths so a crafted entry cannot traverse out of the
-          # directory, and any symlink that survives extraction is deleted
-          # before anything reads the tree.
-          unzip -qj artifact.zip -d report \
-            || { echo "artifact unusable; not posting."; exit 0; }
+          # directory. The symlink sweep runs unconditionally BEFORE the exit
+          # code is looked at: unzip exits nonzero on a duplicate-entry
+          # prompt (</dev/null so it can never hang) AFTER extracting the
+          # earlier entries, so an early exit here would leave a partial
+          # tree -- symlinks included -- for later steps to read through.
+          # On any failure the whole tree goes too; no partial extraction
+          # survives this step.
+          rc=0
+          unzip -qj artifact.zip -d report </dev/null || rc=$?
           find report -type l -delete
+          if [ "$rc" -ne 0 ]; then
+            rm -rf report
+            echo "artifact unusable; not posting."
+            exit 0
+          fi
 
       # The PR number rides in the artifact because workflow_run does not
       # reliably carry it for fork PRs. The artifact is PR-authored, so the
@@ -149,14 +159,27 @@ jobs:
           MARKER = "<!-- coverage-report -->"
 
           no_lines = "No lines with coverage information in this diff." in diff_md
+
+          # Captures feeding int() are bounded to 7 digits: int() on Python
+          # 3.11+ raises on numeric strings past ~4300 digits, so an
+          # unbounded capture would crash exactly the fail-soft path. The
+          # try/except is belt-and-braces for the same reason.
           pct = None
-          m = re.search(r"^- \*\*Coverage\*\*: (\d+)%", diff_md, re.M)
-          if m and 0 <= int(m.group(1)) <= 100:
-              pct = int(m.group(1))
-          missing = 0
-          m = re.search(r"^- \*\*Missing\*\*: (\d+) ", diff_md, re.M)
+          m = re.search(r"^- \*\*Coverage\*\*: (\d{1,7})%", diff_md, re.M)
           if m:
-              missing = int(m.group(1))
+              try:
+                  v = int(m.group(1))
+                  if 0 <= v <= 100:
+                      pct = v
+              except Exception:
+                  pass
+          missing = 0
+          m = re.search(r"^- \*\*Missing\*\*: (\d{1,7}) ", diff_md, re.M)
+          if m:
+              try:
+                  missing = int(m.group(1))
+              except Exception:
+                  missing = 0
 
           # One row per file with misses. diff-cover escapes dots as &#46;.
           rows = []
@@ -232,9 +255,17 @@ jobs:
           # Only comments this workflow's identity wrote: anyone can start a
           # comment with the marker, and PATCHing theirs would render the
           # report under their name.
-          cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+          #
+          # gh runs alone rather than piped into head: in a pipeline its
+          # failure is invisible (no pipefail here, and pipefail would
+          # SIGPIPE --paginate when head closes early), so a transient 5xx
+          # would read as "no comment yet" and POST a duplicate the lookup
+          # then pins forever. Standing alone under -e, a lookup failure
+          # fails the step -- a red run beats a permanent duplicate.
+          comments=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
                 --jq ".[] | select(.user.login == \"github-actions[bot]\")
-                          | select(.body | startswith(\"$marker\")) | .id" | head -1)
+                          | select(.body | startswith(\"$marker\")) | .id")
+          cid=$(head -1 <<<"$comments")
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@comment.md
           else
