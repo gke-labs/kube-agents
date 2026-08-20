@@ -223,6 +223,20 @@ AUDITS: dict[str, AuditSpec] = {
             "dangling-compute-class",
         ),
     ),
+    "gcp-recommender-audit": AuditSpec(
+        "GCP Recommender & Cloud Notifications Ingest",
+        "gcp_recommender_sop.md",
+        (
+            "iam-least-privilege",
+            "gke-upgrade-available",
+            "idle-compute-instance",
+            "unattached-persistent-disk",
+            "gke-webhook-readiness",
+            "gke-security-posture-cve",
+            "idle-ip-address",
+            "cost-optimization-rightsizing",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
