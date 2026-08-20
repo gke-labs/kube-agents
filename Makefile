@@ -109,8 +109,9 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # glob, so they had never once run in CI. defaults/hooks is here for the same
 # reason -- the plugins glob does not reach it, so the chat_message_audit hook
 # was untestable-by-CI however many tests it grew. Discovery is then run once
-# per directory rather than once over the tree, because none of them are
-# packages -- `unittest discover` pointed at agents/platform/skills finds
+# per directory rather than once over the tree, because most of them are not
+# packages (incident_context is the exception, and per-directory discovery
+# still collects it) -- `unittest discover` pointed at agents/platform/skills finds
 # nothing and still exits 0, which reads as a passing suite. That also keeps
 # deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
 # separate, which they must be: those tests import their subject by bare module

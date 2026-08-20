@@ -7,9 +7,10 @@ of them defines a main() to import, so each test executes its subject with
 `gcloud` and `urllib.request.urlopen` stubbed. Nothing here ever touches the
 network.
 
-The tests live in this directory rather than beside the scripts for the same
-reason test_submit_suggestion.py does: CI discovers tests per directory in
-PYTHON_TEST_DIRS, and the skill's scripts/ directory is not one of them.
+The tests live in this directory to sit beside test_submit_suggestion.py and
+share this harness. PYTHON_TEST_DIRS would also discover them next to the
+scripts (the `agents/*/skills/*/scripts/test_*.py` glob is how the fleet-audit
+tests run), so this placement is a choice, not a constraint.
 """
 
 import io
