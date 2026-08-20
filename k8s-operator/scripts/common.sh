@@ -18,6 +18,19 @@ VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 # shellcheck source=k8s-operator/scripts/min_versions.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/min_versions.sh"
 
+# gke_dns_endpoint_flag, shared with hack/ci-env.sh and scripts/release/common.sh.
+# Resolved from BASH_SOURCE for the same reason as the line above.
+# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
+
+# Defaults, validators, vars.sh persistence, and the terraform.tfvars
+# generator, shared with the installer front-ends (install.sh, uninstall.sh,
+# upgrade.sh). The definitions moved there so the installers do not have to
+# source this whole pipeline helper; this file keeps only what the numbered
+# provision/teardown steps need on top.
+# shellcheck source=k8s-operator/scripts/installer_common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/installer_common.sh"
+
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 # Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
 # is routinely redirected — install.sh tees it to a log, CI captures it — and
@@ -63,26 +76,6 @@ wait_for_a_bit() {
   tput cnorm 2>/dev/null || true
 }
 
-retry() {
-  local max_retries=$1
-  local delay=$2
-  shift 2
-  local count=0
-
-  while [ $count -lt $max_retries ]; do
-    count=$((count + 1))
-    if "$@"; then
-      return 0
-    fi
-    if [ $count -lt $max_retries ]; then
-      echo -e "  ${C_YELLOW}⚠ [Retry $count/$max_retries] Waiting ${delay}s before next attempt...${C_RESET}" >&2
-      sleep "$delay"
-    fi
-  done
-
-  return 1
-}
-
 cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -96,90 +89,8 @@ for arg in "$@"; do
   esac
 done
 
-save_var() {
-  local var_name=$1
-  local var_val=$2
-  export "${var_name}=${var_val}"
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    return 0
-  fi
-
-  local old_umask
-  old_umask=$(umask)
-  umask 077
-
-  if [ -f "$VARS_FILE" ]; then
-    chmod 600 "$VARS_FILE" 2>/dev/null || true
-    grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
-    chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
-    mv "$VARS_FILE.tmp" "$VARS_FILE"
-  fi
-  printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
-  chmod 600 "$VARS_FILE" 2>/dev/null || true
-
-  umask "$old_umask"
-}
-
-save_secret_var() {
-  local var_name=$1
-  local var_val=$2
-  export "${var_name}=${var_val}"
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    return 0
-  fi
-  if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
-    save_var "$var_name" "$var_val"
-  else
-    if [ -f "$VARS_FILE" ]; then
-      local old_umask
-      old_umask=$(umask)
-      umask 077
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
-      chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
-      mv "$VARS_FILE.tmp" "$VARS_FILE"
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      umask "$old_umask"
-    fi
-  fi
-}
-
-# ─── Boolean Parsing ──────────────────────────────────────────────────────────
-# Interpret a value as a boolean toggle. Returns 0 (success) for common
-# affirmative spellings and 1 otherwise. Matching is case-insensitive and
-# surrounding whitespace is ignored, so all of the following are truthy:
-#   true, yes, y, 1, on  (in any letter case, e.g. "True", "YES", "On")
-# Everything else — including false, no, n, 0, off, and empty/unset — is falsy.
-is_truthy() {
-  local val="${1:-}"
-  val="${val//[[:space:]]/}"
-  case "$val" in
-    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 is_ci_pipeline() {
   is_truthy "${CI:-}"
-}
-
-# Checks if GKE databaseEncryption.state is a valid CMEK-encrypted state.
-# Accepts an array of valid active encryption states:
-#   - ENCRYPTED: Standard CMEK database encryption state in GKE
-#   - ALL_OBJECTS_ENCRYPTION_ENABLED: Present in GKE 1.35+ when Application-layer Secrets Encryption is active
-is_valid_cmek_encryption_state() {
-  local state="${1:-}"
-  local valid_states=(
-    "ENCRYPTED"
-    "ALL_OBJECTS_ENCRYPTION_ENABLED"
-  )
-
-  for valid in "${valid_states[@]}"; do
-    if [ "$state" = "$valid" ]; then
-      return 0
-    fi
-  done
-  return 1
 }
 
 init_var() {
@@ -201,40 +112,9 @@ init_var() {
   fi
 }
 
-# ─── Shared Provisioning Defaults ─────────────────────────────────────────────
-# The values the per-step provision scripts and the zero-friction installer must
-# agree on. install.sh sources this file rather than restating them, so each
-# default has exactly one home and the two entry points cannot drift apart.
-DEFAULT_CLUSTER_NAME="platform-agent-host"
-DEFAULT_REGION="us-central1"
-DEFAULT_MODEL_PROVIDER="gemini"
-
-# Model provider → the model the pipeline defaults to for that provider.
-default_model_for_provider() {
-  case "${1:-}" in
-    chatgpt | openai) echo "gpt-5.4" ;;
-    anthropic) echo "claude-opus-5" ;;
-    *) echo "gemini-3.5-flash" ;;
-  esac
-}
-
-is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|chatgpt|openai)$ ]]
-}
-
-# The GCP IAM role bundles provision_04_gcp_iam.sh knows how to grant. Kubernetes
-# RBAC is read-only in every one of them; see the site's reference/security-and-iam.
-is_valid_permission_set() {
-  [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
-}
-
 # ─── Container Registry ───────────────────────────────────────────────────────
-# All kube-agents images (k8s-operator, platform-agent, credential-proxy,
-# replay-proxy) default to this public registry prefix. Behind-the-firewall
-# installs export REGISTRY_PREFIX to pull the mirrored images from a private
-# registry instead; individual *_IMAGE variables still win over the prefix.
-DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
-
+# DEFAULT_REGISTRY_PREFIX comes from installer_common.sh; individual *_IMAGE
+# variables still win over the prefix.
 registry_prefix() {
   local prefix="${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   echo "${prefix%/}"
@@ -251,6 +131,126 @@ init_var_registry_prefix() {
   # init_var only saves values it prompted for; persist an env-exported
   # prefix too, so the remaining steps and later re-runs reuse it.
   save_var "REGISTRY_PREFIX" "$REGISTRY_PREFIX"
+
+  # Deliberately not prompted for: leaving third-party images upstream is the
+  # supported default, so a prompt would ask every installer to answer a
+  # question only a mirrored install has. Export-only — persisted like every
+  # other knob once it has been given.
+  if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
+    case "$THIRD_PARTY_REGISTRY_PREFIX" in
+      *"://"*)
+        print_error "THIRD_PARTY_REGISTRY_PREFIX must be a bare registry path without a scheme (got '$THIRD_PARTY_REGISTRY_PREFIX'). Use e.g. 'registry.example.com/mirror'."
+        exit 1
+        ;;
+    esac
+    save_var "THIRD_PARTY_REGISTRY_PREFIX" "$THIRD_PARTY_REGISTRY_PREFIX"
+  fi
+
+  warn_unmirrored_third_party
+}
+
+# ─── Third-party images ───────────────────────────────────────────────────────
+# Images an install pulls that this project does not build: the LiteLLM
+# gateway, the fluent-bit logging sidecar, the GitHub token minter, and
+# cert-manager. A mirror commonly keeps those under a different path from the
+# kube-agents images, and an install may mirror one set without the other, so
+# they get their own prefix rather than sharing REGISTRY_PREFIX.
+#
+# Their upstream references and pins live in images.json at the repo root — the
+# same file `make mirror-images` copies from — so the pin the mirror was
+# populated with and the pin an install asks for cannot drift apart. That is
+# not hypothetical: the chart and the LiteLLM kustomization each carried their
+# own pin, and one upgrade moved only one of them.
+IMAGES_JSON="${IMAGES_JSON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/images.json}"
+
+# The prefix third-party images resolve under, or empty for "leave them
+# upstream". Set by THIRD_PARTY_REGISTRY_PREFIX and by nothing else.
+#
+# Deliberately not inherited from REGISTRY_PREFIX. That variable predates this
+# inventory and has always meant "the registry holding the images this project
+# builds"; a mirror populated to it holds those four and nothing more. Widening
+# it to cert-manager, LiteLLM, fluent-bit, the token minter and Hindsight would redirect an
+# existing install to references its mirror was never given — cert-manager first,
+# where the wait in execute_cert_manager times out on ImagePullBackOff with the
+# cluster already created. A single-prefix mirror is still one export away; it is
+# just no longer assumed. warn_unmirrored_third_party below says so at the point
+# the assumption used to fire.
+third_party_registry_prefix() {
+  local prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+  echo "${prefix%/}"
+}
+
+# Warn once when a custom REGISTRY_PREFIX is set but third-party images are
+# still resolving upstream. That combination is legitimate — it is what every
+# pre-inventory install did — but it is also what a user who expected one
+# prefix to cover everything would see, and the symptom otherwise arrives much
+# later as a pull from a registry they thought they had left behind.
+warn_unmirrored_third_party() {
+  local prefix
+  prefix="$(registry_prefix)"
+  [ "$prefix" = "$DEFAULT_REGISTRY_PREFIX" ] && return 0
+  [ -n "$(third_party_registry_prefix)" ] && return 0
+  print_warning "REGISTRY_PREFIX is '${prefix}', but the third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter and Hindsight) will still be pulled from their upstream registries. Export THIRD_PARTY_REGISTRY_PREFIX (commonly the same value) to mirror those too — see 'make mirror-images'."
+}
+
+# Resolve a third-party image by its images.json name: the upstream reference
+# for a default install, or "<prefix>/<name>:<tag>" once the images have been
+# mirrored. The mirrored form is named after the inventory entry, matching what
+# scripts/mirror_images.sh writes — the entry's .name, not the repository's
+# trailing segment. The two differ for hindsight-postgresql
+# (docker.io/ankane/pgvector), which is exactly the case this line used to get
+# wrong: it said "the trailing image name only" while the code below has always
+# used $name.
+third_party_image() {
+  local name=$1
+  local repository tag prefix
+
+  if [ ! -f "$IMAGES_JSON" ]; then
+    print_error "images.json not found at '${IMAGES_JSON}'; cannot resolve the '${name}' image."
+    return 1
+  fi
+
+  repository="$(jq -r --arg n "$name" '.images[] | select(.name == $n) | .repository' "$IMAGES_JSON")"
+  tag="$(jq -r --arg n "$name" '.images[] | select(.name == $n) | .tag' "$IMAGES_JSON")"
+  if [ -z "$repository" ] || [ "$repository" = "null" ] || [ -z "$tag" ] || [ "$tag" = "null" ]; then
+    print_error "No image named '${name}' with a pinned tag in ${IMAGES_JSON}."
+    return 1
+  fi
+
+  prefix="$(third_party_registry_prefix)"
+  if [ -n "$prefix" ]; then
+    # A pin can carry a digest in the tag position ("0.9.1@sha256:..."), which
+    # names the upstream manifest. It cannot name the mirrored copy: you push
+    # to a tag, never to a digest, so scripts/mirror_images.sh writes
+    # "<prefix>/<name>:<tag>" with the digest stripped. Ask for the copy the
+    # same way it was pushed — keeping the digest here would work only when the
+    # mirror was populated with crane or skopeo, and resolve against nothing at
+    # all after the docker fallback the script warns about.
+    echo "${prefix}/${name}:${tag%%@*}"
+  else
+    echo "${repository}:${tag}"
+  fi
+}
+
+# Export VAR with the resolved reference for an images.json entry, unless it is
+# already set, and warn when an explicitly-set value sits outside the mirror.
+#
+# Deliberately not init_var: that would prompt for, and persist to vars.sh, a
+# pin that images.json already owns. A saved pin is a second copy of the
+# version, and a second copy is what let the chart sit on LiteLLM v1.92.0 for
+# an entire release after the kustomize base moved to v1.95.0. Resolving on
+# every run instead means upgrading the repo upgrades the pin. An operator who
+# genuinely wants a different image still exports the variable, and that value
+# wins here exactly as a saved one would.
+init_third_party_image() {
+  local var_name=$1
+  local image_name=$2
+  if [ -z "${!var_name:-}" ]; then
+    local resolved
+    resolved="$(third_party_image "$image_name")" || return 1
+    export "${var_name}=${resolved}"
+  fi
+  warn_on_third_party_prefix_mismatch "$var_name"
 }
 
 # Warn when a persisted *_IMAGE value no longer lives under the effective
@@ -270,16 +270,60 @@ warn_on_registry_prefix_mismatch() {
   esac
 }
 
-# Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
-# "us-central1-c") is not a valid key location. REGION doubles as the cluster
-# location, which for a zonal cluster must stay the zone, so KMS needs its own
-# variable. Default to the enclosing region and allow an explicit override.
-derive_kms_location() {
-  local loc="${1:-}"
-  if [[ "$loc" =~ ^(.+)-[a-z]$ ]]; then
-    loc="${BASH_REMATCH[1]}"
+# The same check for an image this project does not build, which belongs under
+# the third-party prefix rather than REGISTRY_PREFIX. A default install leaves
+# that prefix empty and the image upstream, so there is nothing to compare.
+warn_on_third_party_prefix_mismatch() {
+  local var_name=$1
+  local image_val="${!var_name:-}"
+  local prefix
+  prefix="$(third_party_registry_prefix)"
+  if [ -z "$image_val" ] || [ -z "$prefix" ]; then
+    return 0
   fi
-  echo "$loc"
+  case "$image_val" in
+    "$prefix"/*) ;;
+    *)
+      print_warning "${var_name}='${image_val}' is not under the third-party registry prefix '${prefix}'. That value still wins; unset ${var_name} (or edit ${VARS_FILE} if it was persisted there) to pull this image from the mirror."
+      ;;
+  esac
+}
+
+# Attach IMAGE_TAG to an image reference that carries neither a tag nor a
+# digest. The saved *_IMAGE values are deliberately bare repository paths:
+# IMAGE_TAG is scoped to one pipeline run and is never persisted to vars.sh
+# (see init_var_image_tag), so the tag has to be re-attached where the
+# reference is used. Handing a bare path to Kubernetes resolves it to
+# ':latest', which the provisioner never builds or pushes.
+# A reference that already names a tag or digest is returned untouched, so
+# this is safe to apply to a user-supplied override.
+#
+# This is the shell twin of resolveAgentImage() in
+# k8s-operator/internal/controller/manifest_helpers.go, which applies the same
+# split-at-the-last-slash rule to CR-supplied images. The two differ on purpose
+# when no tag is available: the operator is serving a live CR and falls back to
+# "latest", while a provisioning run can still fail and so does, loudly. Change
+# one and check the other.
+qualify_image_ref() {
+  local ref="$1"
+  local tag="${2:-${IMAGE_TAG:-}}"
+  if [ -z "$ref" ]; then
+    print_error "qualify_image_ref: called with an empty image reference"
+    return 1
+  fi
+  # Only the final path segment can hold the tag — a registry host may carry
+  # a port, as in 'registry.example.com:5000/kube-agents/platform-agent'.
+  case "${ref##*/}" in
+    *:* | *@*) ;;
+    *)
+      if [ -z "$tag" ]; then
+        print_error "qualify_image_ref: no tag available for bare reference '${ref}' (IMAGE_TAG is unset). Set IMAGE_TAG, or pin the reference with an explicit tag or digest."
+        return 1
+      fi
+      ref="${ref}:${tag}"
+      ;;
+  esac
+  echo "$ref"
 }
 
 init_var_kms_location() {
@@ -287,11 +331,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, chatgpt, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai."
     exit 1
   fi
 
@@ -380,7 +424,7 @@ init_var_memory_provider() {
 
 # True when the selected provider is backed by the in-cluster Hindsight service.
 # `kube_agents_memory` wraps the upstream `hindsight` plugin, so both talk to the
-# same API server and both need step 13 to have run; nothing else does.
+# same API server and both need the Hindsight store deployed; nothing else does.
 memory_provider_uses_hindsight() {
   local provider
   provider=$(echo "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
@@ -395,9 +439,8 @@ is_non_interactive() {
 }
 
 # IMAGE_TAG is deliberately NOT persisted to vars.sh: the tag usually changes
-# between deploys, so it is scoped to a single pipeline execution. provision.sh
-# prompts once up front and exports it; the per-step scripts inherit it from
-# the environment and only prompt when run standalone.
+# between deploys, so it is scoped to a single execution. Callers export it
+# (or are prompted when run standalone).
 #
 # Only the steps that deploy an image built from this repo need one, and they
 # say so by setting REQUIRES_IMAGE_TAG=1 before calling load_state. Demanding it
@@ -420,6 +463,7 @@ init_var_image_tag() {
 
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
+  local env_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
@@ -438,6 +482,13 @@ load_state() {
   if [ -n "$env_registry_prefix" ] && [ -n "${REGISTRY_PREFIX:-}" ] \
     && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
     print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
+  fi
+  # And the same for the third-party prefix, which is the one an operator is
+  # most likely to export on a re-run after pointing cert-manager and
+  # fluent-bit at a different mirror.
+  if [ -n "$env_third_party_prefix" ] && [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ] \
+    && [ "$env_third_party_prefix" != "$THIRD_PARTY_REGISTRY_PREFIX" ]; then
+    print_warning "Ignoring exported THIRD_PARTY_REGISTRY_PREFIX='${env_third_party_prefix}': the saved value '${THIRD_PARTY_REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} to change it."
   fi
   if [ "${REQUIRES_IMAGE_TAG:-0}" -eq 1 ]; then
     init_var_image_tag
@@ -591,101 +642,6 @@ check_prereqs() {
   done
 }
 
-# Classifies a GitHub account name against the public API, echoing exactly one
-# of: organization | user | missing | unknown.
-#
-# "unknown" is the catch-all for every inconclusive answer — curl absent, the
-# network down, rate limiting, an unexpected payload — so a caller can tell
-# "GitHub says no" apart from "we could not ask". Never exits and never prints,
-# so it is safe to call from an interactive prompt loop; callers decide whether
-# an answer is fatal. install.sh uses it to validate before provisioning starts.
-github_account_type() {
-  local name="${1:-}"
-  if [ -z "$name" ] || ! command -v curl &>/dev/null; then
-    echo "unknown"
-    return 0
-  fi
-
-  # Status is appended on its own line so a transport failure (curl non-zero)
-  # stays distinguishable from an HTTP error (curl zero, status in the body).
-  local response status body
-  if ! response=$(curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
-      -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
-    echo "unknown"
-    return 0
-  fi
-  status="${response##*$'\n'}"
-  body="${response%$'\n'*}"
-
-  if [ "$status" = "404" ]; then
-    echo "missing"
-    return 0
-  fi
-  if [ "$status" != "200" ]; then
-    echo "unknown"
-    return 0
-  fi
-
-  # Organization is matched first so it wins even if the payload somehow carries
-  # both spellings. Both spacings are covered because the API is not guaranteed
-  # to keep pretty-printing, and no script here depends on jq.
-  case "$body" in
-    *'"type": "Organization"'*|*'"type":"Organization"'*) echo "organization" ;;
-    *'"type": "User"'*|*'"type":"User"'*) echo "user" ;;
-    *) echo "unknown" ;;
-  esac
-}
-
-# Minty resolves App installations with GET /orgs/{org}/installation and has no
-# fallback to the /users/{user}/installation endpoint that serves personal
-# accounts, so a user-owned GitOps repo can never mint a token. Left unchecked
-# that surfaces far downstream, as an HTTP 500 from a Minty that deployed and
-# passed its readiness probes, so catch it while GITHUB_ORG is still being set.
-#
-# This exits, so it is the wrong entry point for anything that can still
-# re-prompt: install.sh calls github_account_type directly and settles the value
-# before provisioning starts. An inconclusive lookup is never fatal — an
-# unreachable api.github.com must not block a provision that is otherwise fine.
-check_github_org_is_organization() {
-  local org="${1:-}"
-  [ -z "$org" ] && return 0
-
-  if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
-    print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
-    return 0
-  fi
-
-  case "$(github_account_type "$org")" in
-    organization) return 0 ;;
-    user)
-      print_error "GITHUB_ORG='${org}' is a GitHub user account, not an organization."
-      print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
-      print_error "which does not exist for personal accounts, so every token request would"
-      print_error "fail with a 404 after deployment."
-      print_error "Move the GitOps repository to an organization (a free one is enough) and set"
-      print_error "GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh} to it, or re-run with"
-      print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
-      print_error "See k8s-operator/config/integrations/github/README.md."
-      exit 1
-      ;;
-    missing)
-      print_error "GITHUB_ORG='${org}' does not exist on GitHub."
-      print_error "Check the spelling. The Token Minter resolves installations at"
-      print_error "/orgs/${org}/installation, so a name that does not exist fails every"
-      print_error "token request after deployment."
-      print_error "Edit GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh}, or re-run with"
-      print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
-      print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
-      print_error "both talk to api.github.com.)"
-      exit 1
-      ;;
-    *)
-      print_warning "Could not determine whether '${org}' is an organization; continuing."
-      return 0
-      ;;
-  esac
-}
-
 cluster_exists() {
   gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }
@@ -715,28 +671,13 @@ execute_host_label() {
 
 connect_cluster() {
   print_info "Fetching cluster credentials..."
-  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
-}
-
-# Shared readiness budget for stages 08 and 13. Accepts a bare number of
-# seconds or an s/m/h suffix. kubectl rejects a bare integer for --timeout
-# ("time: missing unit in duration"), and without this normalization that
-# parse error would be reported as the rollout having failed.
-init_agent_ready_timeout() {
-  AGENT_READY_TIMEOUT="${AGENT_READY_TIMEOUT:-600s}"
-  if [[ "$AGENT_READY_TIMEOUT" =~ ^[0-9]+$ ]]; then
-    AGENT_READY_TIMEOUT="${AGENT_READY_TIMEOUT}s"
+  gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
+  if [ -n "$GKE_DNS_ENDPOINT_FLAG" ]; then
+    print_info "Cluster '$CLUSTER_NAME' publishes an external DNS endpoint; using it."
   fi
-  if [[ ! "$AGENT_READY_TIMEOUT" =~ ^[0-9]+[smh]$ ]]; then
-    print_error "AGENT_READY_TIMEOUT must be a duration like 600s, 10m or 1h (got '${AGENT_READY_TIMEOUT}')."
-    exit 1
-  fi
-  case "$AGENT_READY_TIMEOUT" in
-    *s) AGENT_READY_TIMEOUT_SECONDS="${AGENT_READY_TIMEOUT%s}" ;;
-    *m) AGENT_READY_TIMEOUT_SECONDS="$(( ${AGENT_READY_TIMEOUT%m} * 60 ))" ;;
-    *h) AGENT_READY_TIMEOUT_SECONDS="$(( ${AGENT_READY_TIMEOUT%h} * 3600 ))" ;;
-  esac
-  export AGENT_READY_TIMEOUT AGENT_READY_TIMEOUT_SECONDS
+  # Unquoted on purpose: empty must contribute no argument at all.
+  # shellcheck disable=SC2086
+  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet $GKE_DNS_ENDPOINT_FLAG
 }
 
 ensure_k8s_resource_exists() {
@@ -823,27 +764,4 @@ confirm_action() {
       echo -e "  ${C_YELLOW}ℹ Aborted.${C_RESET}"
       exit 0
   fi
-}
-
-get_chatgpt_auth_info() {
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    return 0
-  fi
-
-  # Wait for the deployment to be rolled out first
-  kubectl rollout status deployment/litellm -n "${NAMESPACE:-kubeagents-system}" --timeout=60s >/dev/null 2>&1 || true
-
-  # Retry a few times to allow LiteLLM to initialize and print the device code
-  _check_litellm_logs() {
-    local auth_info
-    auth_info=$(kubectl logs deployment/litellm -n "${NAMESPACE:-kubeagents-system}" 2>/dev/null | awk '/Visit https:/ {u=$NF} /Enter code:/ {c=$NF} END {print u, c}') || true
-    read -r CHATGPT_URL CHATGPT_CODE <<< "$auth_info"
-    if [ -n "$CHATGPT_URL" ] && [ -n "$CHATGPT_CODE" ]; then
-      export CHATGPT_URL CHATGPT_CODE
-      return 0
-    fi
-    return 1
-  }
-
-  retry 15 1 _check_litellm_logs >/dev/null 2>&1 || true
 }

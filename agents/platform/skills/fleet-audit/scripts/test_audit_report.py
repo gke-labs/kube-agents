@@ -50,6 +50,7 @@ SOP_FILENAMES = {
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
     "ai-security-audit": "ai_security_audit_sop.md",
     "stockout-prevention": "stockout_prevention_sop.md",
+    "gcp-networking-fabric-audit": "gcp_networking_fabric_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
@@ -1610,16 +1611,20 @@ class TestAuditCatalogue(unittest.TestCase):
     def test_every_watchdog_declares_all_delivery(self):
         """A watchdog whose run fails has to be audible.
 
-        `"all"` sends the outcome to the configured target; `"local"` resolves
-        to no target at all (`scheduler.py:_deliver_result`), so a run that
-        failed would be built into a message and then dropped — leaving a
-        watchdog that has stopped working indistinguishable from a fleet with
-        nothing to report.
+        `"all"` sends the outcome to the configured target and `"chat"` hands it
+        to the Chat Agent (`deploy/docker/plugins/chat/adapter.py`); both
+        carry a failure, because the scheduler builds one into a message
+        (`_summarize_cron_failure_for_delivery`) and delivers it on the same leg
+        as a report. `"local"` resolves to no target at all
+        (`scheduler.py:_deliver_result`), so that message would be built and
+        then dropped — leaving a watchdog that has stopped working
+        indistinguishable from a fleet with nothing to report.
 
         The audit's own findings do not travel this leg — Tier 1 is the ledger
         issue — so this is not the route for reports, only for the failure of
         the thing that produces them.
         """
+        audible = {"all", "chat"}
         watchdogs = self.governance_jobs()
         self.assertTrue(
             watchdogs,
@@ -1628,9 +1633,9 @@ class TestAuditCatalogue(unittest.TestCase):
         )
         for job_id, job in sorted(watchdogs.items()):
             with self.subTest(job=job_id):
-                self.assertEqual(
+                self.assertIn(
                     job.get("deliver"),
-                    "all",
+                    audible,
                     f"platform roster[{job_id}] declares "
                     f"deliver={job.get('deliver')!r}; a failed run would then "
                     f"resolve to no delivery target and vanish",
@@ -1673,10 +1678,16 @@ class TestAuditCatalogue(unittest.TestCase):
 
         The Chat Agent's roster must not carry them at the same time — two
         rosters both firing is the same audit running against itself.
+
+        `github-repo-watcher` rides along in the expected set because it shares
+        the roster, not the argument above: it is a `no_agent` poller that fires
+        no model at all and files a kanban card on the rare tick that finds
+        work. It is named here so that adding a job to this roster stays a
+        deliberate act rather than something a set comparison absorbs quietly.
         """
         live = self.governance_jobs()
         self.assertEqual(
-            set(audit_report.AUDITS) | {"github-issue-resolver"},
+            set(audit_report.AUDITS) | {"github-repo-watcher"},
             set(live),
             "the platform roster's enabled entries are not the governance set; "
             "a stream switched off here simply stops running",
@@ -7888,8 +7899,9 @@ class TestDispatchAndHandover(unittest.TestCase):
         """On demand means trigger the job, never run the audit inline.
 
         `hermes cron run` marks the job due and the next tick runs it in its
-        own process; `cronjob(action='run')` executes it inside the calling
-        session, which is the one turn budget five audits used to share.
+        own process; `cronjob(action='run')` falls back to executing it inside
+        the calling session — which is the one turn budget five audits used to
+        share — wherever the runtime cannot take a detached result.
         """
         bullet = self.bullet("trigger the schedule, do not re-enact it")
         self.assertIn("hermes cron run", bullet)

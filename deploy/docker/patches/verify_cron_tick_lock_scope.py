@@ -2,7 +2,7 @@
 """Build gate for the cron tick-lock-scope patch.
 
 Run by deploy/docker/Dockerfile from /opt/hermes after
-apply_cron_tick_lock_scope.py. The applier only proves eleven anchors matched;
+apply_cron_tick_lock_scope.py. The applier only proves twelve anchors matched;
 it proves nothing about WHERE the release landed, and a release placed one
 statement too early would silently break at-most-once.
 
@@ -27,11 +27,22 @@ harmful:
    ``cron_tick_lock_scope.py``. The binding is also what keeps the lock object
    alive for the run's duration.
 
-3. THE DISPATCH PATH CLAIMS BEFORE THE CAS. Assert
-   ``tools/cronjob_tools.py::_execute_job_now`` claims the per-job flock on a
-   line strictly before ``claim_job_for_fire`` -- after would leave
-   ``next_run_at`` advanced for a run that was then refused -- and releases in
-   a ``finally``, which is the only path out that a BaseException cannot skip.
+3. EVERY DISPATCH PATH CLAIMS THE FLOCK. Assert
+   ``tools/cronjob_tools.py::_run_claimed_job`` claims the per-job flock before
+   it calls ``run_one_job``, releases it in a ``finally`` -- the only path out
+   that a BaseException cannot skip -- and that nothing else in the module
+   calls ``run_one_job`` at all, which is what makes one guard cover all four
+   of v2026.8.13's dispatch paths.
+
+   This is where the flock lives *because* of that last assertion. Before the
+   split it sat in ``_execute_job_now`` and ran strictly before the store CAS,
+   so a refused claim cost nothing; now the CAS is one frame up and
+   ``next_run_at`` is already advanced when the flock is refused. The trade is
+   deliberate -- guarding the run body covers every caller, guarding one caller
+   covers one -- and it is the trade upstream already makes for its own
+   ``try_register_running_job``, which sits directly above the claim, after the
+   same CAS. The checks pin both halves: the CAS stays with the caller and the
+   caller takes no second flock.
 
 4. THE SPAWNED TICK SWEEPS FIRST. Assert ``hermes_cli/cron.py::cron_tick``
    calls ``recover_interrupted_executions`` before ``tick``, and inside a
@@ -219,28 +230,61 @@ def check_claim_is_carried() -> None:
 
 
 # --- 3. tools/cronjob_tools.py ----------------------------------------------
-def check_dispatch_claims_before_the_cas() -> None:
-    print("dispatch gate (tools/cronjob_tools.py::_execute_job_now):")
+def check_dispatch_claims_the_flock() -> None:
+    print("dispatch gate (tools/cronjob_tools.py::_run_claimed_job):")
     path = HERMES / "tools" / "cronjob_tools.py"
-    _tree, fn = function_named(path, "_execute_job_now")
-    check("_execute_job_now still exists", fn is not None)
-    if fn is None:
+    tree, fn = function_named(path, "_run_claimed_job")
+    check("_run_claimed_job still exists", fn is not None,
+          "v2026.8.13 split the fire path into a claim half and a run half; "
+          "the flock belongs to the run half because that is the one every "
+          "dispatch path executes")
+    if fn is None or tree is None:
         return
 
-    claims = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
-              and getattr(n.func, "attr", None) == "claim"
-              and getattr(getattr(n.func, "value", None), "id", None) == "_job_locks"]
-    cas = call_linenos(fn, named_call("claim_job_for_fire"))
+    def job_lock_claims(node) -> list[int]:
+        return [n.lineno for n in ast.walk(node) if isinstance(n, ast.Call)
+                and getattr(n.func, "attr", None) == "claim"
+                and getattr(getattr(n.func, "value", None), "id", None)
+                == "_job_locks"]
+
+    claims = job_lock_claims(fn)
+    runs = call_linenos(fn, named_call("run_one_job"))
     check("it claims the per-job flock", len(claims) == 1, f"found {len(claims)}")
-    check("it still performs the store CAS", len(cas) == 1, f"found {len(cas)}")
-    if claims and cas:
-        check("the flock is claimed BEFORE the CAS", claims[0] < cas[0],
-              f"claim at {claims[0]}, claim_job_for_fire at {cas[0]} — a "
-              "refusal discovered after the CAS leaves next_run_at advanced "
-              "for a run that never happened")
+    check("it still runs the job", len(runs) == 1, f"found {len(runs)}")
+    if claims and runs:
+        check("the flock is claimed BEFORE the run", claims[0] < runs[0],
+              f"claim at {claims[0]}, run_one_job at {runs[0]}")
+
+    # Every dispatch path inherits the flock because every dispatch path runs
+    # the job here. v2026.8.13 reaches this body from four call sites (the
+    # synchronous tool, the background worker, the pool-rejection fallback and
+    # the inline fallback); a fifth that called run_one_job directly would run
+    # unguarded, and this is what would catch it.
+    module_runs = call_linenos(tree, named_call("run_one_job"))
+    check("nothing else in the module runs a job", len(module_runs) == 1,
+          f"found {len(module_runs)} run_one_job call(s) — a dispatch path "
+          "that does not go through _run_claimed_job takes no per-job flock")
+
+    # The CAS now happens in the caller, one frame up, so a lost flock is
+    # discovered after next_run_at has already advanced. That is a real cost
+    # and it is deliberate: guarding _run_claimed_job covers all four dispatch
+    # paths, guarding _execute_job_now covers one, and it is the same trade
+    # upstream already makes for its own try_register_running_job — which sits
+    # directly above the claim, after the same CAS. Asserted so the claim
+    # cannot drift back into a single caller unnoticed.
+    _tree2, outer = function_named(path, "_execute_job_now")
+    check("_execute_job_now still exists", outer is not None)
+    if outer is not None:
+        check("the CAS stays with the caller",
+              len(call_linenos(outer, named_call("claim_job_for_fire"))) == 1,
+              "found none — the store CAS is what makes this a *claimed* job")
+        check("and the caller takes no flock of its own",
+              not job_lock_claims(outer),
+              "two claims of one job on one thread is a self-deadlock, not "
+              "a stronger guard")
 
     tries = [n for n in fn.body if isinstance(n, ast.Try) and n.finalbody]
-    check("_execute_job_now has exactly one try/finally", len(tries) == 1,
+    check("_run_claimed_job has exactly one try/finally", len(tries) == 1,
           f"found {len(tries)}")
     if len(tries) == 1:
         finally_src = "\n".join(ast.unparse(s) for s in tries[0].finalbody)
@@ -483,7 +527,7 @@ if __name__ == "__main__":
     print("verify_cron_tick_lock_scope")
     check_release_placement()
     check_claim_is_carried()
-    check_dispatch_claims_before_the_cas()
+    check_dispatch_claims_the_flock()
     check_spawned_tick_sweeps_first()
     check_behaviour()
     check_recovery_sweep()

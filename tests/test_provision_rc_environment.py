@@ -10,14 +10,17 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.installer_test_data import (
+from tests.testing.common import (
+    MOCK_GOOGLE_CHAT_MODE,
+    get_isolated_test_env,
+)
+from tests.testing.release import (
     MOCK_CALLS_LOG,
     MOCK_CHAT_TOPIC_NAME,
     MOCK_GCP_PROJECT_ID,
     MOCK_GCP_REGION,
     MOCK_GEMINI_API_KEY,
     MOCK_GKE_CLUSTER_NAME,
-    MOCK_GOOGLE_CHAT_MODE,
     MOCK_IMAGE_TAG_SEMVER,
     MOCK_IMAGE_TAG_SHA,
     MOCK_INSTALL_SCRIPT,
@@ -68,24 +71,25 @@ exit 0
 """)
             mock_install.chmod(0o755)
 
-            env = {
-                "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
-                "GCP_REGION": MOCK_GCP_REGION,
-                "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
-                "IMAGE_TAG": MOCK_IMAGE_TAG_SHA,
-                "GOOGLE_CHAT_ENABLED": "true",
-                "GOOGLE_CHAT_MODE": MOCK_GOOGLE_CHAT_MODE,
-                "CHAT_TOPIC_NAME": MOCK_CHAT_TOPIC_NAME,
-                "MODEL_PROVIDER": MOCK_MODEL_PROVIDER,
-                "MODEL_DEFAULT_NAME": MOCK_MODEL_DEFAULT_NAME,
-                "GEMINI_API_KEY": MOCK_GEMINI_API_KEY,
-                "ENABLE_GVISOR": "true",
-                "PLATFORM_AGENT_PERMISSION_SET": MOCK_PERMISSION_SET,
-                "REGISTRY_PREFIX": MOCK_REGISTRY_PREFIX,
-                "MEMORY_PROVIDER": "kube_agents_memory",
-                "USER_PROFILE_ENABLED": MOCK_USER_PROFILE_ENABLED,
-                "PATH": os.environ["PATH"],
-            }
+            env = get_isolated_test_env(
+                overrides={
+                    "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
+                    "GCP_REGION": MOCK_GCP_REGION,
+                    "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
+                    "IMAGE_TAG": MOCK_IMAGE_TAG_SHA,
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "GOOGLE_CHAT_MODE": MOCK_GOOGLE_CHAT_MODE,
+                    "CHAT_TOPIC_NAME": MOCK_CHAT_TOPIC_NAME,
+                    "MODEL_PROVIDER": MOCK_MODEL_PROVIDER,
+                    "MODEL_DEFAULT_NAME": MOCK_MODEL_DEFAULT_NAME,
+                    "GEMINI_API_KEY": MOCK_GEMINI_API_KEY,
+                    "ENABLE_GVISOR": "true",
+                    "PLATFORM_AGENT_PERMISSION_SET": MOCK_PERMISSION_SET,
+                    "REGISTRY_PREFIX": MOCK_REGISTRY_PREFIX,
+                    "MEMORY_PROVIDER": "kube_agents_memory",
+                    "USER_PROFILE_ENABLED": MOCK_USER_PROFILE_ENABLED,
+                }
+            )
 
             proc = subprocess.run(
                 ["bash", str(_PROVISION_RC_SCRIPT)],
@@ -153,14 +157,15 @@ exit 0
 """)
                     mock_install.chmod(0o755)
 
-                    env = {
-                        "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
-                        "GCP_REGION": MOCK_GCP_REGION,
-                        "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
-                        "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
-                        "PATH": os.environ["PATH"],
-                        **env_overrides,
-                    }
+                    env = get_isolated_test_env(
+                        overrides={
+                            "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
+                            "GCP_REGION": MOCK_GCP_REGION,
+                            "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
+                            "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
+                            **env_overrides,
+                        }
+                    )
 
                     proc = subprocess.run(
                         ["bash", str(_PROVISION_RC_SCRIPT)],
@@ -194,13 +199,14 @@ exit 0
 """)
             mock_install.chmod(0o755)
 
-            env = {
-                "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
-                "GCP_REGION": MOCK_GCP_REGION,
-                "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
-                "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
-                "PATH": os.environ["PATH"],
-            }
+            env = get_isolated_test_env(
+                overrides={
+                    "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
+                    "GCP_REGION": MOCK_GCP_REGION,
+                    "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
+                    "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
+                }
+            )
 
             proc = subprocess.run(
                 ["bash", str(_PROVISION_RC_SCRIPT)],

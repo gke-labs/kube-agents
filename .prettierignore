@@ -22,3 +22,5 @@ agentplugins/*/templates/*.yaml
 agents/*/skills/gke-*
 agents/*/skills/gke-*/**
 
+# Monolithic custom semgrep rules bundle
+.github/semgrep-security-audit.yml

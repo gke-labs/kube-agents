@@ -5,7 +5,15 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check iac-parity-check tf-apply tf-destroy
+# Base-image overrides for rebuilding where the public registries are
+# unreachable. Each names a full mirrored reference without a tag (the tags
+# stay pinned in the Dockerfile and images.json); unset ones are simply not
+# passed, so an ordinary build is unchanged:
+#   make docker-build HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent
+BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
+BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check tf-apply tf-destroy
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -34,10 +42,10 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build t
 # otherwise resolve to the build host — an arm64 machine would silently produce
 # an image that crashloops on the cluster (#560).
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --platform linux/amd64 --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
-	docker build --platform linux/amd64 --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 # Docker pushes
 docker-push: docker-push-agents docker-push-credential-proxy ## Build and push every image to $$REPO.
@@ -52,6 +60,15 @@ docker-push-credential-proxy: docker-build-credential-proxy ## Build and push th
 
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
+
+# Copy every image in images.json into a registry of your own, for installs
+# that may only pull from an approved one. Run `./scripts/mirror_images.sh
+# --help` for the full set of knobs.
+mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents).
+	@./scripts/mirror_images.sh $(ARGS)
+
+images-check: ## Verify images.json still matches every pin it mirrors, and that the chart renders nothing off a public registry when mirrored (CI runs this).
+	@./hack/check-image-inventory.sh
 
 
 status: ## Show the working tree status.
@@ -92,20 +109,23 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # glob, so they had never once run in CI. defaults/hooks is here for the same
 # reason -- the plugins glob does not reach it, so the chat_message_audit hook
 # was untestable-by-CI however many tests it grew. Discovery is then run once
-# per directory rather than once over the tree, because none of them are
-# packages -- `unittest discover` pointed at agents/platform/skills finds
+# per directory rather than once over the tree, because most of them are not
+# packages (incident_context is the exception, and per-directory discovery
+# still collects it) -- `unittest discover` pointed at agents/platform/skills finds
 # nothing and still exits 0, which reads as a passing suite. That also keeps
-# deploy/docker and deploy/docker/patches separate, which they must be: the
-# patch tests import their subject by bare module name, which only resolves
-# with their own directory as the discovery root.
+# deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
+# separate, which they must be: those tests import their subject by bare module
+# name, which only resolves with their own directory as the discovery root.
 PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
+	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
+	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/test_*.py)))
 
@@ -116,6 +136,23 @@ PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicor
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
+
+# One command for "is this branch landable": everything a PR must pass, ordered
+# so the cheapest check fails first.
+#
+# Added because the answer used to be three commands nobody could remember, and
+# a handoff doc had to carry the recipe. If you add a suite, add it here.
+# test-bench is deliberately not here: its deps target installs bench/
+# editable, which pulls devops-bench from a pinned git SHA over the network.
+# verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
+# and runs locally with `make test-bench`.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
+	@echo "==> go build"; cd k8s-operator && go build ./...
+	@echo "==> go vet";   cd k8s-operator && go vet ./...
+	@echo "==> go test";  cd k8s-operator && go test ./...
+	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
+	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> verify OK"
 
 test-python: ## Run the Python unit tests outside k8s-operator/.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
@@ -166,6 +203,17 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 		exit 1; \
 	fi
 
+# bench/tests is the one Python suite that cannot join PYTHON_TEST_DIRS: it is
+# pytest-native (fixtures, parametrize), and `unittest discover` collects two
+# of its tests and errors on both. So it runs under its own target, and
+# scripts/test_test_discovery.py keeps the exclusion explicit rather than an
+# accident of the globs above.
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
+	@python3 -m pip install -e bench/ pytest
+
+test-bench: ## Run the bench harness tests under pytest.
+	@python3 -m pytest bench/tests/
+
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean
 # and fails at 06:20 inside an agent, as a slightly worse answer rather than an
@@ -181,7 +229,7 @@ prompt-check: ## Verify the agent's instructions cite skills and files that exis
 	@python3 scripts/check_prompt_assets.py
 
 # Documentation that mirrors a machine-readable source is generated rather than
-# hand-kept: the cron jobs, the skill catalogue and the provisioning steps as
+# hand-kept: the cron jobs, the skill catalogue and the image inventory as
 # <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
 	@python3 scripts/generate_docs.py
@@ -206,9 +254,6 @@ chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules f
 
 chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
 	@./hack/sync-chart-manifests.sh --check
-
-iac-parity-check: ## Verify the provisioning scripts, Terraform, and the Helm chart agree (CI runs this).
-	@python3 scripts/check_iac_parity.py
 
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)

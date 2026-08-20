@@ -20,6 +20,9 @@ spec:
         kubectl.kubernetes.io/default-container: manager
     spec:
       serviceAccountName: {{ .Release.Name }}-operator-sa
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       terminationGracePeriodSeconds: 10
       securityContext:
         runAsNonRoot: true
@@ -33,7 +36,7 @@ spec:
             - --leader-elect
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
-          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
+          image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.operator.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           env:
             # The manager reads this as a string and treats anything other than
@@ -44,6 +47,29 @@ spec:
             # apply time on the missing Certificate CRD. See the chart README.
             - name: ENABLE_WEBHOOKS
               value: {{ .Values.operator.webhooks.enabled | quote }}
+            # The two images the operator resolves for pods the chart never
+            # renders: an agent Deployment whose PlatformAgent omits
+            # spec.deployment.image, and the logging sidecar it injects into
+            # every agent pod. Without these a mirrored install still reaches
+            # ghcr.io and Docker Hub at reconcile time, long after `helm
+            # install` reported success. CREDENTIAL_PROXY_IMAGE is absent by
+            # design — the operator derives that sidecar from the agent image
+            # by swapping the trailing name, so it follows the value below.
+            - name: PLATFORM_AGENT_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
+            - name: FLUENT_BIT_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
+            {{- /* The pull identity for those same pods. Redundant for the CR
+                   this release renders, which carries the secrets itself, and
+                   load-bearing for any OTHER PlatformAgent written against this
+                   install: without it that agent reaches an authenticated
+                   mirror with no credentials at all. */}}
+            {{- with (include "kube-agents.imagePullSecretNames" .) }}
+            - name: IMAGE_PULL_SECRETS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- /* Last occurrence of a name wins in a container's env, so an
+                   operator.extraEnv entry still overrides anything above. */}}
             {{- with .Values.operator.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

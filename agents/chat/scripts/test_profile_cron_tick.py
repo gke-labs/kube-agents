@@ -35,6 +35,7 @@ import profile_cron_tick as pct  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 ROOT_ROSTER = REPO / "agents" / "chat" / "defaults" / "cron" / "jobs.json"
+PLATFORM_ROSTER = REPO / "agents" / "platform" / "cron" / "jobs.json"
 # Both directories are copied into /opt/defaults/scripts by the Dockerfile, and
 # the entrypoint force-syncs that onto $HERMES_HOME/scripts — the one directory
 # the scheduler will run a `no_agent` script from.
@@ -221,12 +222,13 @@ class DispatchTest(unittest.TestCase):
         path = self.tmp / f"hermes-{exit_code}"
         path.write_text(
             "#!/bin/sh\n"
-            # Fields 4 and 5 are the home target. The child resolves
-            # `deliver=all` from its environment alone, so the only way to see
-            # whether it can post anywhere is to have the stub report what it
-            # was handed.
-            'printf "%s|%s|%s|%s|%s\\n" "$HERMES_HOME" "$*" "$PWD" '
+            # Fields 4 and 5 are the home target, field 6 the chat-relay
+            # switch. The child resolves `deliver=all` and `deliver=chat` from
+            # its environment alone, so the only way to see whether it can post
+            # anywhere is to have the stub report what it was handed.
+            'printf "%s|%s|%s|%s|%s|%s\\n" "$HERMES_HOME" "$*" "$PWD" '
             '"$SLACK_HOME_CHANNEL" "$SLACK_HOME_CHANNEL_THREAD_ID" '
+            '"$CHAT_HOME_CHANNEL" '
             '>> "$PROFILE_CRON_TICK_RECORD"\n'
             'echo "stub hermes says hello"\n'
             f"exit {exit_code}\n",
@@ -288,6 +290,9 @@ class DispatchTest(unittest.TestCase):
 
     def home_targets(self):
         return [(row[3], row[4]) for row in self.invocations()]
+
+    def chat_relay_switches(self):
+        return [row[5] for row in self.invocations()]
 
     @staticmethod
     def reap(children) -> None:
@@ -455,6 +460,39 @@ class DispatchTest(unittest.TestCase):
 
         self.assertEqual(sorted(self.home_targets()), [("D0BKGRBM6RH", "")] * 2)
 
+    # --- the chat relay switch ---------------------------------------------
+
+    def test_every_cron_child_can_deliver_to_the_chat_agent(self):
+        """`deliver: "chat"` resolves to nothing unless the child has this.
+
+        It is both the `cron_deliver_env_var` the scheduler reads to find a
+        target and the flag the plugin's `is_connected` uses to have the
+        platform enabled at all — so an unset one is a job that runs and
+        reports nowhere, which is the failure the relay exists to end.
+        """
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.profile("other", job("sweep", None))
+
+        self.run_main()
+
+        self.assertEqual(
+            self.chat_relay_switches(), [pct.CHAT_RELAY_ENV_VALUE] * 2
+        )
+
+    def test_the_switch_does_not_depend_on_the_pod_having_it(self):
+        """The gateway must NOT carry it — see `CHAT_RELAY_ENV_KEY`.
+
+        The plugin has no inbound adapter, so a `chat` platform enabled in the
+        gateway process is a delivery target it could try to start and cannot.
+        Setting it per-spawn is what keeps the gateway free of it.
+        """
+        self._patch_env(pct.CHAT_RELAY_ENV_KEY, None)
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+
+        self.run_main()
+
+        self.assertEqual(self.chat_relay_switches(), [pct.CHAT_RELAY_ENV_VALUE])
+
     def test_no_home_set_still_ticks(self):
         # Delivery is not the point of a tick: jobs with an explicit target
         # must still run when nobody has set a home.
@@ -584,15 +622,35 @@ class ShippedRosterTest(unittest.TestCase):
         )
 
     def test_every_no_agent_job_names_a_script_the_image_carries(self):
-        for entry in self.jobs:
-            if not entry.get("no_agent"):
-                continue
-            name = entry.get("script")
-            self.assertTrue(name, f"{entry.get('id')}: no_agent with no script never runs")
-            self.assertTrue(
-                any((d / name).is_file() for d in SCRIPT_DIRS),
-                f"{entry.get('id')}: {name} is in neither directory copied to $HERMES_HOME/scripts",
-            )
+        """Both rosters, because both now carry `no_agent` entries.
+
+        This used to read the Chat Agent's roster alone, which was true of the
+        day it was written and stopped being true the moment the Platform
+        Agent's roster grew one. A renamed script on the roster this test does
+        not load is green here and "Script not found" once every ten minutes in
+        production, inside a job whose whole point is that a quiet tick is
+        normal.
+        """
+        rosters = {
+            "chat": json.loads(ROOT_ROSTER.read_text(encoding="utf-8"))["jobs"],
+            "platform": json.loads(PLATFORM_ROSTER.read_text(encoding="utf-8"))["jobs"],
+        }
+        checked = 0
+        for roster, entries in rosters.items():
+            for entry in entries:
+                if not entry.get("no_agent"):
+                    continue
+                checked += 1
+                name = entry.get("script")
+                self.assertTrue(
+                    name, f"{roster}/{entry.get('id')}: no_agent with no script never runs"
+                )
+                self.assertTrue(
+                    any((d / name).is_file() for d in SCRIPT_DIRS),
+                    f"{roster}/{entry.get('id')}: {name} is in neither directory "
+                    "copied to $HERMES_HOME/scripts",
+                )
+        self.assertTrue(checked, "no no_agent job on either roster — the test found nothing")
 
 
 class HomeTargetEnvTest(unittest.TestCase):

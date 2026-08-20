@@ -51,9 +51,10 @@ laptop reliably has, and the installers have to work there.
 
 `AR_LOCATION`, `AR_PROJECT` and `AR_REPOSITORY` each pin one part of the reference and
 switch discovery off for that part alone. `REGION` and `GCP_ARTIFACT_REGISTRY_REPO_NAME` —
-the variables the provisioning scripts export, and the last fallbacks for the location and
-the repository — are deliberately not pins: one left in your shell by `dev_rebuild_agent.sh`
-must not outrank the registry the agent is demonstrably being pulled from.
+the variables the installer and dev tooling save into `vars.sh`, and the last fallbacks for
+the location and the repository — are deliberately not pins: one left in your shell by
+`dev_rebuild_agent.sh` must not outrank the registry the agent is demonstrably being pulled
+from.
 
 What the image leaves out is the plugin's `.dockerignore`, read once and applied to the
 content tag, to `docker build` and to the crane layer alike. It is the only place to write
@@ -85,7 +86,7 @@ Two defaults are load-bearing:
   has no reader binding of its own.
 
   There is only something to copy when the agent runs from Artifact Registry, which is the
-  provisioning scripts' install but not the chart's: `charts/kube-agents` defaults the agent
+  dev-rebuild path but not the chart's default: `charts/kube-agents` defaults the agent
   to `ghcr.io/gke-labs/kube-agents/platform-agent`, and an agent pulled from ghcr.io says
   nothing about where a plugin image should go. The fallbacks then apply — `$REGION` or
   `us-central1`, `$GCP_ARTIFACT_REGISTRY_REPO_NAME` or `kube-agents`, the install project —

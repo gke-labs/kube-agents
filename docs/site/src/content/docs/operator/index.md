@@ -18,10 +18,10 @@ k8s-operator/
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler + admission webhook logic
 ├── examples/               # sample PlatformAgent CR
-├── scripts/                # provision + teardown scripts
+├── scripts/                # shared installer helpers (vars.sh state, tfvars generator)
 ├── testing/staging_workloads/  # multi-cluster staging PoC
 ├── Dockerfile              # controller manager image
-└── Makefile                # generate, build, test, deploy, gcp-provision
+└── Makefile                # generate, build, test, deploy
 ```
 
 ## What the operator manages
@@ -35,9 +35,10 @@ The controller reconciles a `PlatformAgent` into:
 
 - A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar.
 - A `Service` fronting the Deployment (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
+- A `PodDisruptionBudget` selecting the Deployment's pods, `maxUnavailable: 1` at every replica count. That declares the agent evictable rather than blocking node drains, and it stays correct when the agent is scaled — a budget keyed to the replica count would deadlock drains the first time someone scaled back to one.
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
-- `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Chat Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope / GitOps repo) mounted into `/opt/data/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
+- `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope / GitOps repo) mounted into `/opt/data/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (GitOps repo, with the GitHub Token Minter endpoint injected as an env var).
 
 ## Custom resource shape
@@ -167,4 +168,4 @@ That leaves the cluster with the same validation coverage a chart install has. R
 - [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
 - [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
 - [Development](/kube-agents/operator/development/) — build, test, and run the operator locally.
-- [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — the `provision_*.sh` sub-scripts.
+- [`k8s-operator/scripts/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/README.md) — the installer helper scripts that live beside the operator.

@@ -54,7 +54,7 @@ fi
 # 3. Prompt user for confirmation
 echo "The script will perform the setup for GitHub Actions WIF in the following project: $PROJECT_ID"
 if [ "$IS_ADMIN" = true ]; then
-  echo "Mode: ADMIN (Includes extended IAM roles for teardown.sh + provision.sh cycles)"
+  echo "Mode: ADMIN (Includes extended IAM roles for full install/uninstall cycles)"
 else
   echo "Mode: STANDARD (Base roles only. Use --admin for autonomous E2E pipeline support)"
 fi
@@ -76,6 +76,7 @@ gcloud services enable iamcredentials.googleapis.com \
   container.googleapis.com \
   storage.googleapis.com \
   pubsub.googleapis.com \
+  gkebackup.googleapis.com \
   --project="${PROJECT_ID}"
 
 # 3. Create Service Account
@@ -90,22 +91,29 @@ echo "Granting necessary roles to the Service Account..."
 ROLES=(
   "roles/cloudkms.admin"
   "roles/container.admin"
+  "roles/compute.viewer"
   "roles/serviceusage.serviceUsageAdmin"
   "roles/serviceusage.serviceUsageConsumer"
 )
 
-# Extended roles required for full autonomous E2E lifecycle (teardown.sh + provision.sh):
+# Extended roles required for full autonomous E2E lifecycle (install.sh + uninstall.sh):
 if [ "$IS_ADMIN" = true ]; then
   echo "Admin mode selected. Adding extended lifecycle administration roles..."
   ROLES+=(
-    # Required by provision_04_gcp_iam.sh & teardown_04_gcp_iam.sh to create and manage Service Accounts
+    # The kube-agents-iam module creates and deletes the agent's service accounts
     "roles/iam.serviceAccountAdmin"
 
-    # Required by provision_04_gcp_iam.sh & teardown_04_gcp_iam.sh to bind/unbind IAM policies on GCP resources
+    # The kube-agents-iam module binds and unbinds project IAM policies
     "roles/resourcemanager.projectIamAdmin"
 
-    # Required by provision_05_gcp_gchat.sh & teardown_05 for Google Chat Pub/Sub topic and subscription management
+    # The chat-pubsub module manages the Google Chat Pub/Sub topic and subscription
     "roles/pubsub.admin"
+
+    # The gke-backup-plan module manages Backup for GKE plans
+    "roles/gkebackup.admin"
+
+    # Terraform remote state management (creating and managing gs://<project>-kube-agents-tfstate)
+    "roles/storage.admin"
   )
 fi
 

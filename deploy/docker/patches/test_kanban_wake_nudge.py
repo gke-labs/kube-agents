@@ -292,7 +292,11 @@ def unblock_task(conn, task_id):
             return False
         _append_event(
             conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
+            (
+                {"status": new_status, "resume_status": resume_status}
+                if new_status != "ready" or resume_status != "ready"
+                else None
+            ),
         )
         return True
 '''
@@ -303,6 +307,9 @@ class GatewayKanbanWatchersMixin:
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
+
+        _GC_INTERVAL_SECONDS = 3600.0
+        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup
 
         while self._running:
             try:
@@ -453,6 +460,7 @@ class PatchedProducerBehaviourTest(unittest.TestCase):
             "parents": (),
             "now": 0,
             "new_status": "ready",
+            "resume_status": "ready",
         }
         import contextlib
 

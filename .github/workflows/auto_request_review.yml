@@ -1,20 +1,103 @@
 name: Auto Request Review
 
+# A human reviewer is requested once kube-agents-bot's `AI Review` check goes
+# green -- not when the pull request opens. Before this, the reviewer was pinged
+# minutes ahead of the bot's read and re-read a diff the author was about to
+# change.
+#
+# Neither trigger can be a `pull_request` one. Every pull request here comes
+# from a fork, and on a fork pull request `pull_request` and
+# `pull_request_review` hand the workflow a read-only `GITHUB_TOKEN` that
+# `permissions:` cannot raise, so it could not request a reviewer at all.
+# `check_run` and `issue_comment` run in the base repository's context with a
+# writable token, and `check_run` does not fire for check suites Actions itself
+# created, so there is no recursion to guard against.
 on:
-  # zizmor: ignore[dangerous-triggers] - requesting a reviewer needs pull-requests: write, which pull_request cannot grant on fork PRs; no checkout, no other secrets
-  pull_request_target:
-    types: [opened, ready_for_review, reopened]
+  check_run:
+    types: [completed]
+  # zizmor: ignore[dangerous-triggers] - the escape hatch has to run on fork PRs, and only
+  # issue_comment keeps a write token there; the checkout is the default branch, so no
+  # pull-request code is fetched or executed and no other secret is exposed
+  issue_comment:
+    types: [created]
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
+
+# One run at a time per commit, queued rather than cancelled: a `/review`
+# re-read completes a second `AI Review` check, and two runs reading "has this
+# pull request got a reviewer yet?" at the same moment would both answer no.
+#
+# The check run's *name* is in the key because the group is evaluated before the
+# `if:` below, so every one of the ~16 checks on a commit lands in it. Keyed on
+# the commit alone they queue behind each other, and GitHub keeps only one run
+# pending per group -- so the `AI Review` run, the only one that does anything,
+# can be cancelled before it starts by the next check to finish.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event.check_run.name || 'request-review' }}-${{
+    github.event.check_run.head_sha || github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   auto-request-review:
     name: Auto Request Review
+    permissions:
+      contents: read # check out the default branch: the script and its config
+      pull-requests: write # request the reviewer
+      issues: write # 👀 on the /request-review comment that asked for it
+    # Two entry points, and nothing else gets a runner:
+    #   - the bot's own `AI Review` check finishing (app id 4437198 -- the name
+    #     alone is not an identity, any App can post a check run called
+    #     anything);
+    #   - `/request-review` from someone with write access, the override for a
+    #     finding the author has pushed back on, or a bot that never reported.
+    if: >-
+      (github.event_name == 'check_run' &&
+        github.event.check_run.name == 'AI Review' &&
+        github.event.check_run.app.id == 4437198) ||
+      (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        startsWith(github.event.comment.body, '/request-review') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     steps:
-      - name: Request review based on files changes and/or groups the author belongs to
-        uses: necojackarc/auto-request-review@e89da1a8cd7c8c16d9de9c6e763290b6b0e3d424 # v0.13.0
+      # The default branch, never the pull request head: this job holds a
+      # writable token and must not run code from a fork.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the script's one third-party import
+        run: python3 -m pip install pyyaml
+
+      # The check run's id rather than a pull request number: a `check_run`
+      # payload has no pull request on it, and `check_run.pull_requests` is
+      # empty for fork pull requests. The script reads the check run back from
+      # the API for the commit and the verdict, then finds the pull request that
+      # commit belongs to.
+      - name: Request a reviewer now the AI review has passed
+        if: github.event_name == 'check_run'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment, not interpolated into the script: event
+          # fields are attacker-controlled input on a pull-request trigger.
+          CHECK_RUN_ID: ${{ github.event.check_run.id }}
+        run: |
+          python3 scripts/request_reviewers.py --check-run-id "$CHECK_RUN_ID" --require-ai-review-pass
+
+      # No `--require-ai-review-pass`: bypassing the gate is what the command is
+      # for. The `if:` above already checked who is asking.
+      - name: Request a reviewer on request
+        if: github.event_name == 'issue_comment'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          python3 scripts/request_reviewers.py --pr "$PR_NUMBER" --react-to "$COMMENT_ID"

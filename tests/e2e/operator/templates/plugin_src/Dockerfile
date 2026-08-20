@@ -1,4 +1,4 @@
-FROM alpine:3.19
+FROM alpine:3.24
 WORKDIR /
 # Plain COPY, not COPY --chmod: --chmod is a BuildKit-only flag that the classic builder
 # rejects outright ("the --chmod option requires BuildKit"). Staying builder-agnostic also

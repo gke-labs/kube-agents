@@ -76,6 +76,14 @@ makes this line wrong? Inverted or wrong conditions, off-by-one, nil/undefined d
 `await`, unchecked `err`, falsy-zero checks, wrong-variable copy-paste, an error swallowed in a
 catch, unescaped regex metacharacters.
 
+**Audit error handlers and fallback values**: for every `catch`, `except`, `if err != nil`,
+`if ! cmd` (or `$? != 0`), or fallback assignment on a failed resolution, trace the fallback value.
+Does it preserve the invariant downstream code assumes — a normalized 40-character SHA, a validated
+SemVer, an absolute path, a non-nil struct — or does it pass a raw, unvalidated input forward? Check
+if error suppression (`|| true`, `_ = err`, `except: pass`) transforms a failed lookup on a
+malformed input into a benign empty result (`nil`, `""`, `[]`), silently disabling downstream
+collision, uniqueness, or security guards.
+
 **Angle B — removed-behavior auditor.** For every line the diff deletes or replaces, name the
 invariant it enforced, then find where the new code re-establishes it. If you cannot find it,
 that's a candidate: a removed guard, a dropped error path, a narrowed validation, a deleted test
@@ -97,6 +105,12 @@ precondition, a changed return shape, a renamed key a manifest still reads, a ti
 Trace runtime wiring through to the source — which container an env var lands in, which process
 reads a port, which service account a binding actually grants — rather than inferring it from
 names.
+
+**Audit sibling contract symmetry**: when reviewing code in a family of components (reconcilers,
+CLI tools, admission webhooks, API handlers), compare how identical domain inputs (a commit, a
+cluster name, a tag, credentials) are validated and handled across siblings. An unmotivated
+asymmetry — where one component hard-fails on an unresolvable entity while a sibling falls back
+silently — is an immediate candidate.
 
 Then trace the other direction, because a change written by an agent can call things that do not
 exist: for every symbol, method, flag, chart value, CRD field, environment variable, or file path
@@ -147,6 +161,13 @@ Then check that the intent is actually tested: for each behaviour the change cla
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
 regression test, and new error paths nothing exercises, are the usual cases.
+
+**Do not treat green test suites as proof of correctness**: a passing suite proves only that the
+paths it exercises work on the fixtures it supplies. For every validation check, gate, and error
+path, check whether **negative inputs** (unresolvable identifiers, malformed strings, absent fields)
+are tested against the gate, or if the tests only pass valid fixtures through the happy path. Treat
+previously resolved findings in PR history as high-risk areas where adjacent defects and edge cases
+cluster.
 
 For a change that fixes something, naming the test is not enough — **run it against the pre-change
 behaviour and watch it fail.** A test that passes with the fix reverted is testing something else,

@@ -100,6 +100,31 @@ if [ -n "$WRONG_GO" ]; then
   FAILED=1
 fi
 
+# --- cert-manager version -------------------------------------------------
+# Ground truth: images.json, which the mirror tooling also reads to build the release
+# URL it applies. Three pages quote the version back — two of them inside a
+# copy-pasteable `kubectl apply` URL — and there is nothing else to catch them,
+# because the pin has no other consumer to disagree with. Left unguarded, the
+# next cert-manager bump would hand readers a manifest the install does not use.
+CERT_MANAGER_VERSION=$(jq -r '.images[] | select(.name == "cert-manager-controller") | .tag' images.json)
+if [ -z "$CERT_MANAGER_VERSION" ] || [ "$CERT_MANAGER_VERSION" = "null" ]; then
+  echo "ERROR: no cert-manager-controller pin in images.json; the version guard cannot run." >&2
+  exit 1
+fi
+
+# `v1.13.0+` is a floor — the oldest release the operator's webhook works
+# against — not a claim about what provisioning installs, so the trailing `+`
+# form is exempt. A line carrying both a floor and a pin is exempted too; that
+# has not happened, and the alternative is a regex nobody can maintain.
+WRONG_CERT_MANAGER=$(search 'cert-manager[^.]{0,40}v[0-9]+\.[0-9]+\.[0-9]+([^+]|$)' \
+  | grep -Ev 'v[0-9]+\.[0-9]+\.[0-9]+\+' \
+  | grep -vF "$CERT_MANAGER_VERSION" || true)
+if [ -n "$WRONG_CERT_MANAGER" ]; then
+  echo "::error::Documented cert-manager version does not match images.json (${CERT_MANAGER_VERSION})."
+  printf '%s\n\n' "$WRONG_CERT_MANAGER" | sed 's/^/    /'
+  FAILED=1
+fi
+
 # --- fleet-audit finding id pattern ---------------------------------------
 # Ground truth: FINDING_ID_RE in the fleet-audit harness. Two documents quote
 # this pattern back to the model — SKILL.md and the ledger design doc — and an

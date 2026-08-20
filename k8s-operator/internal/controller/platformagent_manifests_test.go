@@ -1302,7 +1302,9 @@ func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
 	}
 }
 
-func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
+// fqdnPatternsFromPolicy returns the egress match patterns buildFQDNNetworkPolicy emits.
+func fqdnPatternsFromPolicy(t *testing.T) []string {
+	t.Helper()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "platform-agent",
@@ -1323,14 +1325,79 @@ func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
 	if !ok || len(matchesList) == 0 {
 		t.Fatalf("expected matches list in FQDN policy")
 	}
-	var goPatterns []string
+	var patterns []string
 	for _, m := range matchesList {
 		if mMap, isMap := m.(map[string]interface{}); isMap {
 			if p, isStr := mMap["pattern"].(string); isStr {
-				goPatterns = append(goPatterns, p)
+				patterns = append(patterns, p)
 			}
 		}
 	}
+	return patterns
+}
+
+// fqdnPatternToRegexp compiles an FQDNNetworkPolicy match pattern the way the
+// Dataplane V2 (Cilium) engine does: dots are literal and a wildcard spans DNS
+// characters only, so it stops at a label boundary. GKE documents the same rule
+// — "*.company.com" matches "api.company.com" but not "eu.api.company.com".
+func fqdnPatternToRegexp(t *testing.T, pattern string) *regexp.Regexp {
+	t.Helper()
+	escaped := strings.ReplaceAll(pattern, ".", "[.]")
+	escaped = strings.ReplaceAll(escaped, "*", "[-a-zA-Z0-9_]*")
+	re, err := regexp.Compile("^" + escaped + "$")
+	if err != nil {
+		t.Fatalf("pattern %q does not compile: %v", pattern, err)
+	}
+	return re
+}
+
+// TestFQDNPatternList_MatchesRealHostnames pins the egress allowlist against
+// hostnames the gateway actually dials. TestFQDNPatternList_MatchesKustomizeManifest
+// only proves the two copies of the list agree — it would pass just as happily
+// if both were wrong, which is how "*.gke.goog" was first shipped one label
+// short of every DNS control-plane endpoint it was added to allow.
+func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
+	patterns := fqdnPatternsFromPolicy(t)
+
+	hostnames := []string{
+		// GKE DNS-based control plane endpoint: <cluster-hash>-<project-number>.<region>.gke.goog
+		//
+		// Synthetic, but the shape is copied from live clusters: a 36-character
+		// hash, a project number, and a location label. Do not paste a real
+		// endpoint in — the hostname carries the project number of whoever's
+		// cluster it came from, and what this test needs is the shape.
+		"gke-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b-123456789012.us-central1.gke.goog",
+		// A zonal cluster puts the zone where the region sits, so the label is
+		// longer but the shape is unchanged. Keeping both means a pattern
+		// narrowed to a region-shaped label fails here rather than in the field.
+		"gke-9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e-210987654321.us-central1-a.gke.goog",
+		"container.googleapis.com",
+		"oauth2.googleapis.com",
+		"accounts.google.com",
+		"us-central1-docker.pkg.dev",
+		"us.gcr.io",
+		"github.com",
+		"api.github.com",
+		"objects.githubusercontent.com",
+		"slack.com",
+	}
+
+	for _, host := range hostnames {
+		matched := false
+		for _, p := range patterns {
+			if fqdnPatternToRegexp(t, p).MatchString(host) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("no FQDN egress pattern matches %q; the gateway cannot reach it under FQDN network policy (patterns: %v)", host, patterns)
+		}
+	}
+}
+
+func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
+	goPatterns := fqdnPatternsFromPolicy(t)
 
 	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
 	data, err := os.ReadFile(path)
@@ -2941,7 +3008,7 @@ func TestProfileOverlayDeduplicatesPluginsEnabled(t *testing.T) {
 	p2 := pluginWithProfile("sessionstore", "platform", "")
 
 	var parsed map[string]any
-	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{p1, p2}, nil, nil)), &parsed); err != nil {
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{p1, p2}, nil, nil, nil)), &parsed); err != nil {
 		t.Fatalf("unmarshal overlay: %v", err)
 	}
 
@@ -3216,7 +3283,7 @@ platform_toolsets:
     - {name: three}
 `)
 
-	rendered := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{first, second}, nil, nil)
+	rendered := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{first, second}, nil, nil, nil)
 	if rendered == "" {
 		t.Fatalf("expected the overlay to render")
 	}
@@ -3438,7 +3505,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
 		pluginWithProfile("second", "platform", ""),
-	}, nil, nil)
+	}, nil, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3462,7 +3529,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\nlogging:\n  level: debug\napprovals:\n  cron_mode: approve\n"),
-	}, nil, nil)
+	}, nil, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3482,7 +3549,7 @@ func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\n"),
-	}, limits(8, 200), nil)
+	}, limits(8, 200), nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3517,7 +3584,7 @@ func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 // nothing left for that comparison to compare.
 
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
-	if got := renderProfileOverlayYAML(nil, nil, nil); got != "" {
+	if got := renderProfileOverlayYAML(nil, nil, nil, nil); got != "" {
 		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
 	}
 }
@@ -3947,7 +4014,7 @@ approvals:
 		t.Errorf("targeted plugin's pubsub subscription must reach the DEFAULT profile, got %v", rendered["platforms"])
 	}
 	var overlay map[string]any
-	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil, nil)), &overlay); err != nil {
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil, nil, nil)), &overlay); err != nil {
 		t.Fatalf("unmarshal overlay: %v", err)
 	}
 	if _, ok := overlay["platforms"]; ok {
@@ -4233,6 +4300,513 @@ func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
 	if !sawClusterName || !sawSessionKey {
 		t.Errorf("disabling the watcher must not strip its configuration, got %#v", off.Env)
 	}
+}
+
+// --- spec.harness.experimental.platformFrontDoor -----------------------------------
+
+// frontDoorAgent builds a PlatformAgent with Google Chat on and the experimental flag
+// set as given, so the on/off pair differs in exactly one field.
+func frontDoorAgent(name string, replicas int32, on bool) *agentv1alpha1.PlatformAgent {
+	agent := haAgent(name, replicas)
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	if on {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+			Experimental: &agentv1alpha1.ExperimentalSpec{PlatformFrontDoor: ptr.To(true)},
+		}
+	}
+	return agent
+}
+
+// platformOverlay parses the platform profile's overlay out of the ConfigMap.
+func platformOverlay(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+	t.Helper()
+	raw, ok := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if !ok {
+		t.Fatalf("no %s in the ConfigMap", profileOverlayKey(platformProfileName))
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	return parsed
+}
+
+func lookup(m map[string]any, path []string) (any, bool) {
+	var cur any = m
+	for _, key := range path {
+		asMap, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if cur, ok = asMap[key]; !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+func listAt(t *testing.T, m map[string]any, path []string) []any {
+	t.Helper()
+	v, _ := lookup(m, path)
+	list, _ := v.([]any)
+	return list
+}
+
+func sortedStrings(t *testing.T, list []any) []string {
+	t.Helper()
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		out = append(out, fmt.Sprint(v))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestPlatformFrontDoorArgsSelectTheProfile pins where the profile name reaches the
+// gateway from, which differs by replica count.
+//
+// `--profile` is a GLOBAL flag: hermes_cli/main.py::_apply_profile_override pre-parses it
+// out of argv before any import and re-points HERMES_HOME. `hermes gateway run --profile
+// platform` is a different command — the subcommand has no such flag — so the position
+// here is load-bearing, not stylistic.
+//
+// Above one replica the argv belongs to leader_elect.py, which starts the gateway as a
+// child; the profile reaches it through HERMES_GATEWAY_PROFILE instead, and putting it in
+// the container args there would replace the wrapper and lose leader election entirely.
+func TestPlatformFrontDoorArgsSelectTheProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		replicas int32
+		on       bool
+		want     []string
+	}{
+		{"off at one replica keeps the image CMD", 1, false, nil},
+		{"on at one replica names the profile", 1, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
+		{"off above one replica keeps the wrapper", 2, false, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+		{"on above one replica keeps the wrapper", 2, true, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := buildDeployment(frontDoorAgent("fd-agent", tc.replicas, tc.on), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			gateway := containerNamed(t, dep, "platform-agent")
+
+			if len(gateway.Command) != 0 {
+				t.Errorf("Command must stay unset so the image ENTRYPOINT still runs the "+
+					"shared-state setup; got %v", gateway.Command)
+			}
+			if len(tc.want) == 0 {
+				if len(gateway.Args) != 0 {
+					t.Errorf("expected the image CMD to stand, got args=%v", gateway.Args)
+				}
+				return
+			}
+			if !reflect.DeepEqual(gateway.Args, tc.want) {
+				t.Errorf("args = %v, want %v", gateway.Args, tc.want)
+			}
+		})
+	}
+}
+
+// TestPlatformFrontDoorProfileEnvIsGatewayOnly pins the variable to the one container
+// that has readers for it.
+//
+// In the gateway it has two: leader_elect.py builds its argv from it, and
+// docker-entrypoint.sh step 2.6 reads it to stop force-syncing profiles/platform/config.yaml
+// from the image, because as the front door that file is one the agent itself writes to.
+//
+// The dashboard sidecar must NOT get it. It carries AGENT_SHARED_STATE_SETUP=skip and execs
+// out of the entrypoint at the step-1.5 gate, so it would never act on it — but it also does
+// not mount the operator's overlay directory, and a container that reached step 2.6b without
+// one would back-fill the platform config from image defaults alone while the primary was
+// writing the same file.
+//
+// On the gateway it is present either way, and the off case is the half worth pinning: the
+// operator emitting nothing leaves an AgentPlugin's spec.env — copied verbatim, no allowlist
+// — as the only writer of the name, and last-wins cannot settle a duplicate that does not
+// exist. Empty is the off answer both readers already understand.
+func TestPlatformFrontDoorProfileEnvIsGatewayOnly(t *testing.T) {
+	for _, replicas := range []int32{1, 2} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			on := buildDeployment(frontDoorAgent("fd-env", replicas, true), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			got, found := envValue(containerNamed(t, on, "platform-agent"), gatewayProfileEnvVar)
+			if !found || got != platformProfileName {
+				t.Errorf("gateway %s = %q (found=%v), want %q", gatewayProfileEnvVar, got, found, platformProfileName)
+			}
+			if _, found := envValue(containerNamed(t, on, "platform-agent-dashboard"), gatewayProfileEnvVar); found {
+				t.Errorf("the dashboard sidecar must not carry %s: it has no overlay mount, so "+
+					"acting on it would mean rebuilding the platform config from image defaults alone",
+					gatewayProfileEnvVar)
+			}
+
+			off := buildDeployment(frontDoorAgent("fd-env", replicas, false), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			got, found = envValue(containerNamed(t, off, "platform-agent"), gatewayProfileEnvVar)
+			if !found || got != "" {
+				t.Errorf("gateway %s = %q (found=%v) with the flag off, want an empty value that "+
+					"is still emitted: a name the operator never writes is one an AgentPlugin's "+
+					"spec.env can claim outright", gatewayProfileEnvVar, got, found)
+			}
+			if _, found := envValue(containerNamed(t, off, "platform-agent-dashboard"), gatewayProfileEnvVar); found {
+				t.Errorf("the dashboard sidecar must not carry %s with the flag off either",
+					gatewayProfileEnvVar)
+			}
+		})
+	}
+}
+
+// TestPlatformFrontDoorOverlayCarriesTheIngressKeys covers the config half: the profile the
+// gateway is now homed at has to have the toolsets and the ingress plugins that until now
+// only the default profile's rendering carried.
+func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
+	overlay := platformOverlay(t, frontDoorAgent("fd-overlay", 1, true))
+
+	// The toolsets key is the one that cannot be left to the fallback: an absent key puts
+	// the platform on the auto-generated `hermes-google_chat` composite and unions in every
+	// enabled MCP server, which is broader than the worker surface this pins, not narrower.
+	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
+	for _, platform := range []string{"google_chat", "slack"} {
+		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
+		want := slices.Sorted(slices.Values(frontDoorToolsets))
+		if !slices.Equal(got, want) {
+			t.Errorf("platform_toolsets.%s = %v, want %v", platform, got, want)
+		}
+	}
+	if len(toolsets) == 0 {
+		t.Error("platform_toolsets is empty")
+	}
+
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, plugin := range frontDoorPlugins {
+		if !slices.Contains(enabled, plugin) {
+			t.Errorf("plugins.enabled is missing %q; it hooks ingress, so a message reaching "+
+				"this profile without it silently loses the behaviour. Got %v", plugin, enabled)
+		}
+	}
+}
+
+// TestPlatformFrontDoorOverlayLeavesTheAdaptersToTheManagedScope is the other half of the
+// same contract, and the one that is easy to get wrong: the adapters the gateway needs are
+// already on this profile, so rendering them here too is a second writer, not a fix.
+//
+// managed-config.yaml is machine-global — get_managed_dir() takes no profile argument — so
+// `platforms.*` and `display.platforms` land on every profile including this one, and a
+// managed leaf REPLACES rather than merges. An overlay copy would either lose to it or
+// silently diverge from it depending on which config the reader resolves first.
+func TestPlatformFrontDoorOverlayLeavesTheAdaptersToTheManagedScope(t *testing.T) {
+	overlay := platformOverlay(t, frontDoorAgent("fd-adapters", 1, true))
+	for _, key := range []string{"platforms", "display"} {
+		if _, present := overlay[key]; present {
+			t.Errorf("%s is rendered into the platform overlay; the managed scope already "+
+				"lands it on every profile, and two writers for one key is what its contract "+
+				"forbids:\n%v", key, overlay)
+		}
+	}
+
+	// Same reasoning, different reader: nothing consumes `leader_election` from config at
+	// all any more. Leadership is the Lease held by leader_elect.py, driven by container env.
+	if _, present := platformOverlay(t, frontDoorAgent("fd-adapters", 2, true))["leader_election"]; present {
+		t.Error("leader_election is rendered into the platform overlay, but no reader remains " +
+			"for it; leadership is the Lease leader_elect.py holds")
+	}
+}
+
+// The flag is only worth having if it comes back off. profile_overlay.py unapplies a
+// withdrawn key from its last-applied record, so the revert is exactly "the operator stops
+// rendering these" — which is worth a test of its own, because the platform overlay is
+// written unconditionally and it would be easy to leave the keys in it.
+func TestPlatformFrontDoorOverlayIsEmptyWhenOff(t *testing.T) {
+	overlay := platformOverlay(t, frontDoorAgent("fd-off", 1, false))
+	for _, key := range []string{"platform_toolsets", "kanban"} {
+		if _, present := overlay[key]; present {
+			t.Errorf("%s is rendered into the platform overlay with the flag off, so turning "+
+				"the flag off would not undo it:\n%v", key, overlay)
+		}
+	}
+	if plugins, ok := overlay["plugins"].(map[string]any); ok {
+		t.Errorf("plugins is rendered with no plugin targeting the profile: %v", plugins)
+	}
+}
+
+// TestPlatformFrontDoorOverlayKeepsTargetedPlugins guards a clobber that only appears when
+// both features are in use. The overlay's plugins.enabled used to be ASSIGNED after the
+// front-door keys were merged, so an AgentPlugin targeting the platform profile replaced the
+// ingress plugins wholesale — and the symptom is not a missing plugin but chat sessions that
+// stop persisting, on an install where the flag had been working.
+func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-plugins", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("extratool", platformProfileName, ""),
+	})[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "extratool") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
+// TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
+// clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
+//
+// `platform_toolsets` is allowlisted and not gateway-scoped, so a plugin targeting this
+// profile reaches the same merge — and mergeMaps only recurses into a nested map that
+// toStrMap recognises. Built as map[string][]string the front door's own subtree was
+// REPLACED rather than merged, and the symptom is not a missing key: the chat platforms fall
+// back to the auto-generated `hermes-google_chat` composite — the full core bundle plus every
+// enabled MCP server (see frontDoorToolsets) — so the front door quietly widens rather than
+// failing shut, on an install where the flag had been working.
+func TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets(t *testing.T) {
+	agent := frontDoorAgent("fd-toolsets", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("pubsubtool", platformProfileName,
+			"platform_toolsets:\n  pubsub:\n    - kanban\n  google_chat:\n    - mcp-extra\n"),
+	})[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+
+	// The plugin's own key arrives, and the front door's survive alongside it.
+	if got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", "pubsub"})); !slices.Equal(got, []string{"kanban"}) {
+		t.Errorf("platform_toolsets.pubsub = %v, want the plugin's own list", got)
+	}
+	if got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", "slack"})); !slices.Equal(got, slices.Sorted(slices.Values(frontDoorToolsets))) {
+		t.Errorf("platform_toolsets.slack = %v, want the front door's toolsets left intact", got)
+	}
+
+	// Within a subtree the two sides union, which is the contract the AgentPlugin CRD page
+	// states: "list values are unioned with the operator's own entries rather than
+	// replacing them".
+	want := slices.Sorted(slices.Values(append(slices.Clone(frontDoorToolsets), "mcp-extra")))
+	if got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", "google_chat"})); !slices.Equal(got, want) {
+		t.Errorf("platform_toolsets.google_chat = %v, want %v", got, want)
+	}
+}
+
+// TestFrontDoorKanbanMatchesChatConfig is the drift guard frontDoorKanban names.
+//
+// The dispatcher and the notifier run in the gateway process and read `kanban` through
+// load_config(), which resolves from get_hermes_home() — so the block has to be on whichever
+// profile the gateway is homed at, and it has to say the same thing there. The image copy
+// lives in agents/chat/config.yaml and reaches the default profile only; neither
+// agents/platform/config.yaml nor the managed scope declares the key, so a block that fails
+// to follow the gateway does not fall back to the chat profile's: it falls back to upstream,
+// where dispatch is unbounded, the tick is 60s, and spec.harness.tuning.maxInProgress
+// silently stops meaning anything.
+//
+// The comparison is against the image file rather than against the default profile's
+// overlay because the operator does not render the block there at all — it defers to
+// agents/chat/config.yaml, which is what makes that file the one source to track.
+func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var image struct {
+		Kanban map[string]any `yaml:"kanban"`
+	}
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	if len(image.Kanban) == 0 {
+		t.Fatalf("kanban is gone from %s; frontDoorKanban has no source to track and this test "+
+			"would pass against nothing", path)
+	}
+
+	got, ok := platformOverlay(t, frontDoorAgent("fd-kanban", 1, true))["kanban"].(map[string]any)
+	if !ok {
+		t.Fatal("the front-door overlay carries no kanban block, so the dispatcher reverts to " +
+			"upstream's unbounded behaviour")
+	}
+	if !reflect.DeepEqual(got, image.Kanban) {
+		t.Errorf("the front door's kanban block differs from the one the chat profile gets "+
+			"from %s:\n  overlay: %v\n  image:   %v", path, got, image.Kanban)
+	}
+
+	// The CR field is the reason equality with the image is not enough on its own: it is
+	// documented as "board-wide cap on concurrent kanban workers", and reaching only a
+	// profile the gateway is not homed at is the same as not reaching anything.
+	withCap := frontDoorAgent("fd-kanban-cap", 1, true)
+	withCap.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(7)}
+	capped, _ := platformOverlay(t, withCap)["kanban"].(map[string]any)
+	if capped["max_in_progress"] != 7 {
+		t.Errorf("max_in_progress = %v, want spec.harness.tuning.maxInProgress (7) to reach the "+
+			"profile the gateway runs as", capped["max_in_progress"])
+	}
+}
+
+// TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
+//
+// The list is derived, not chosen: every ingress plugin the chat profile enables, less the
+// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// ingress plugin to the chat profile and not here is the drift that matters — it hooks a
+// message the front door is the one receiving, so the behaviour is simply lost, with
+// nothing logged.
+//
+// The two exclusions are listed here rather than assumed, so that adding a third is a
+// deliberate edit to a test that states its reason and not a quiet trim of a var.
+func TestFrontDoorPluginsMatchChatConfig(t *testing.T) {
+	read := func(name string) []string {
+		t.Helper()
+		path := filepath.Join("..", "..", "..", "agents", name, "config.yaml")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		var image struct {
+			Plugins struct {
+				Enabled []string `yaml:"enabled"`
+			} `yaml:"plugins"`
+		}
+		if err := yaml.Unmarshal(raw, &image); err != nil {
+			t.Fatalf("unmarshaling %s: %v", path, err)
+		}
+		if len(image.Plugins.Enabled) == 0 {
+			t.Fatalf("plugins.enabled is gone from %s; this test would pass against nothing", path)
+		}
+		return image.Plugins.Enabled
+	}
+
+	// agent_roster: delegation only, and the front door does the work itself.
+	// bootstrap_onboarding: its markers and its delivery job both resolve from the home
+	// the flag moves away from, so enabling it here greets an onboarded install and
+	// promises a report the dead `default` roster can never deliver.
+	excluded := []string{"agent_roster", "bootstrap_onboarding"}
+
+	onPlatform := read("platform")
+	want := []string{}
+	for _, plugin := range read("chat") {
+		if slices.Contains(excluded, plugin) || slices.Contains(onPlatform, plugin) {
+			continue
+		}
+		want = append(want, plugin)
+	}
+	for _, plugin := range excluded {
+		if !slices.Contains(read("chat"), plugin) {
+			t.Errorf("%q is excluded from frontDoorPlugins but the chat profile no longer "+
+				"enables it; the exclusion and its reasoning are now stale", plugin)
+		}
+	}
+	if got := slices.Sorted(slices.Values(frontDoorPlugins)); !slices.Equal(got, slices.Sorted(slices.Values(want))) {
+		t.Errorf("frontDoorPlugins is no longer the chat profile's ingress plugins:\n"+
+			"  operator: %v\n  derived:  %v", got, slices.Sorted(slices.Values(want)))
+	}
+}
+
+// TestFrontDoorToolsetsMatchPlatformConfig is the drift guard frontDoorToolsets names.
+//
+// The list is the image's own `cli` toolsets verbatim, and that equality IS the contract:
+// a chat message should reach the surface a kanban worker on this profile already has, no
+// more. Add an MCP server to agents/platform/config.yaml and chat ingress would otherwise
+// silently not get it, which reads as the agent choosing not to use a tool.
+func TestFrontDoorToolsetsMatchPlatformConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "platform", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var image struct {
+		PlatformToolsets map[string][]string `yaml:"platform_toolsets"`
+	}
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	want, ok := image.PlatformToolsets["cli"]
+	if !ok {
+		t.Fatalf("platform_toolsets.cli is gone from %s; frontDoorToolsets has no source to "+
+			"track and this test would pass against nothing", path)
+	}
+	if got, want := slices.Sorted(slices.Values(frontDoorToolsets)), slices.Sorted(slices.Values(want)); !slices.Equal(got, want) {
+		t.Errorf("frontDoorToolsets differs from platform_toolsets.cli in %s:\n  operator: %v\n  image:    %v",
+			path, got, want)
+	}
+}
+
+// TestImagePullSecretsReachThePodSpec is the end-to-end check for #499: an
+// authenticated private registry is only usable if the pull identity lands on
+// the pod, and the pod is where it has to land — Kubernetes has no
+// per-container pull identity, so one field covers the agent, both
+// operator-injected sidecars, and anything the CR adds beside them.
+func TestImagePullSecretsReachThePodSpec(t *testing.T) {
+	agent := func(secrets ...string) *agentv1alpha1.PlatformAgent {
+		var refs []corev1.LocalObjectReference
+		for _, s := range secrets {
+			refs = append(refs, corev1.LocalObjectReference{Name: s})
+		}
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{ImagePullSecrets: refs},
+				},
+			},
+		}
+	}
+	names := func(refs []corev1.LocalObjectReference) []string {
+		var out []string
+		for _, r := range refs {
+			out = append(out, r.Name)
+		}
+		return out
+	}
+
+	t.Run("from the CR", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		dep := buildDeployment(agent("harbor-pull", "extra-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull", "extra-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("from the operator-wide default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildDeployment(agent(), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"fleet-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v — IMAGE_PULL_SECRETS must reach a CR that names none", got, want)
+		}
+	})
+
+	t.Run("the CR wins over the default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildDeployment(agent("harbor-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+
+	// The default install must render exactly as it did before this field
+	// existed; an empty slice instead of nil would show up as `imagePullSecrets:
+	// []` on every agent Deployment in the fleet.
+	t.Run("absent when nothing is configured", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		bare := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"}}
+		dep := buildDeployment(bare, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got := dep.Spec.Template.Spec.ImagePullSecrets; got != nil {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want nil", got)
+		}
+	})
+
+	// buildStatefulSet shares buildPodTemplateSpec with buildDeployment, and the
+	// RWO storage path is the only way to reach it — an agent with custom RWO
+	// storage must not be the one install that cannot pull from its mirror.
+	t.Run("on the StatefulSet path too", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		sts := buildStatefulSet(agent("harbor-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(sts.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("StatefulSet pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
 }
 
 // The read-only kill switch. Unlike the two above it is not appended by

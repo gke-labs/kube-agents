@@ -9,10 +9,11 @@ import pathlib
 import subprocess
 import unittest
 
-from tests.installer_test_data import (
+from tests.testing.common import (
     INVALID_IMMUTABLE_REFS,
     UPGRADER_HELP_BANNER,
     VALID_IMMUTABLE_REFS,
+    get_isolated_test_env,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -26,8 +27,7 @@ class UpgradeScriptValidationTest(unittest.TestCase):
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
 {func_call}
 """
-        full_env = dict(os.environ)
-        full_env.update(env or {})
+        full_env = get_isolated_test_env(overrides=env)
         return subprocess.run(
             ["bash", "-c", setup],
             capture_output=True,

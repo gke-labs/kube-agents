@@ -1,0 +1,7 @@
+skip-path:
+  - "agentplugins/"
+  - "bench/"
+  - "(?<!terraform/)examples/"
+  - "k8s-operator/internal/testing/"
+  - "k8s-operator/testing/"
+  - "tests/"

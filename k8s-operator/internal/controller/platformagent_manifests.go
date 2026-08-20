@@ -34,6 +34,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,6 +74,22 @@ const (
 	sharedStateSetupOwner  = "owner"
 	sharedStateSetupSkip   = "skip"
 )
+
+// Which Hermes profile the gateway runs as, when it is not the default one.
+//
+// Two readers, and both are in the gateway container. leader_elect.py builds the
+// `hermes gateway run` argv it supervises, so above one replica the --profile flag
+// cannot come from the container args. docker-entrypoint.sh reads it to stop
+// force-syncing that profile's config.yaml from the image: as the front door it becomes
+// a file the agent itself writes to (`/sethome`, monitoring.install_id), and the
+// force-sync would discard those on every restart.
+//
+// The dashboard sidecar deliberately does NOT get it. It carries
+// AGENT_SHARED_STATE_SETUP=skip, so it execs out of the entrypoint before any of the
+// setup steps and never touches a profile config; the cost is that `hermes dashboard`
+// still shows the default profile while the front door is the platform one, which is
+// recorded as a known limit rather than fixed by re-homing a second container.
+const gatewayProfileEnvVar = "HERMES_GATEWAY_PROFILE"
 
 // The single model name LiteLLM is configured to serve, used both in the profile
 // config the gateway reads and in the API server's own default. The two must agree:
@@ -121,6 +138,7 @@ var defaultAccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnc
 // The broker currently receives a shell command string, so these rules allow
 // flags between command components. If the protocol is extended to carry argv,
 // replace this regex matching with tool-specific argument parsing.
+// #nosec G101 -- Policy JSON schema definition, not credentials
 const credentialProxyPolicyJSON = `{
   "apiVersion": "cli.proxy.kubeagents.io/v1alpha1",
   "blockedMessage": "Command blocked for security reasons.",
@@ -215,12 +233,15 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 			continue
 		}
 		var limits *agentv1alpha1.AgentLimits
-		var memory map[string]any
+		var memory, frontDoor map[string]any
 		if profile == platformProfileName {
 			limits = platformProfileLimits(agent)
 			memory = memoryOverlay(agent)
+			// Only this profile can be the front door: it is the one the gateway is
+			// re-homed onto in buildBaseContainers.
+			frontDoor = frontDoorOverlay(agent)
 		}
-		if overlay := renderProfileOverlayYAML(targeted[profile], limits, memory); strings.TrimSpace(overlay) != "" {
+		if overlay := renderProfileOverlayYAML(targeted[profile], limits, memory, frontDoor); strings.TrimSpace(overlay) != "" {
 			data[profileOverlayKey(profile)] = overlay
 		}
 	}
@@ -229,7 +250,7 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 	// all of them rather than a file each. No memory subtree: agents/cluster/config.yaml
 	// configures no provider at all, on purpose — a cluster agent is spawned by the
 	// kanban dispatcher and carries no human identity to scope a store by.
-	if overlay := renderProfileOverlayYAML(nil, clusterProfileLimits(agent), nil); strings.TrimSpace(overlay) != "" {
+	if overlay := renderProfileOverlayYAML(nil, clusterProfileLimits(agent), nil, nil); strings.TrimSpace(overlay) != "" {
 		data[clusterProfileClassKey] = overlay
 	}
 	return data
@@ -520,10 +541,12 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // process: a burst of cards spawns them until the cgroup OOM killer intervenes, which
 // kills a child rather than the container and so produces no restart and no event.
 //
-// The operator does NOT render this default — agents/chat/config.yaml carries the same
-// number, which is what caps an install that runs the image without the operator too.
-// The constant exists so the CR override below can be compared against it, and so the
-// two files can be kept in step.
+// The operator does NOT render this default for the default profile —
+// agents/chat/config.yaml carries the same number, which is what caps an install that
+// runs the image without the operator too. The constant exists so the CR override below
+// can be compared against it, and so the two files can be kept in step. The one place it
+// IS rendered is frontDoorKanban, where there is no image copy to defer to: the platform
+// profile's config declares no `kanban` key at all.
 const defaultKanbanMaxInProgress = 2
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
@@ -648,6 +671,180 @@ func memoryOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	}
 }
 
+// platformFrontDoorEnabled reports whether spec.harness.experimental.platformFrontDoor
+// asks for the Platform Agent to be the profile the gateway runs as.
+func platformFrontDoorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Harness == nil || agent.Spec.Harness.Experimental == nil {
+		return false
+	}
+	return ptr.Deref(agent.Spec.Harness.Experimental.PlatformFrontDoor, false)
+}
+
+// frontDoorToolsets is the toolset list given to each chat platform key when the
+// Platform Agent is the front door.
+//
+// It is agents/platform/config.yaml's `cli` list verbatim, and that is the whole
+// intent: a chat message should reach the same surface a kanban worker on this
+// profile already has, no more. `hermes-cli` is what _get_platform_tools expands to
+// infer the configurable toolsets; the `mcp-` names pass through as MCP server names,
+// and `memory` is the provider gate (see the note in agents/platform/config.yaml).
+//
+// Declaring the key is a NARROWING, and being exact about that matters because the
+// error is fail-OPEN. With no list saved for the platform key, hermes_cli's
+// _get_platform_tools falls back to `hermes-<platform>`, and toolsets.resolve_toolset
+// AUTO-GENERATES that name for a plugin platform such as google_chat once the adapter
+// registers: _HERMES_CORE_TOOLS plus whatever tools the plugin contributed — terminal,
+// write_file, execute_code, browser, delegation. The same absence also drops the MCP
+// allowlist, so every globally enabled server is unioned in rather than the three named
+// here. The fallback is therefore the full base bundle plus everything, on a profile
+// whose overlay renders no `agent.disabled_toolsets` to bound it — which is why
+// agents/chat/config.yaml pins its own `google_chat` key with the same reasoning ("so it
+// never falls back to a full base bundle").
+//
+// TestFrontDoorToolsetsMatchPlatformConfig fails the build when this drifts from the
+// image's copy.
+var frontDoorToolsets = []string{
+	"hermes-cli",
+	"mcp-platform_control",
+	"mcp-developer_knowledge",
+	"mcp-gke",
+	"memory",
+}
+
+// frontDoorPlugins are the plugins the profile receiving chat ingress has to run, on
+// top of the three agents/platform/config.yaml already enables.
+//
+// They are agents/chat/config.yaml's list, less two. legacy_slash_commands unwraps a typed
+// "/hermes sethome" before the gateway dispatcher sees it, and session_store and
+// session_otel_bridge are what make an inbound chat session persist and trace at all —
+// each hooks ingress, so enabling them on a profile no message reaches does nothing, and
+// NOT enabling them on the profile every message reaches loses the behaviour outright.
+//
+// agent_roster is left off because it exists only to delegate: it injects the
+// routable-specialist roster into every turn, which a front door that does the work
+// itself does not consult.
+//
+// bootstrap_onboarding is left off because its state does not follow it. The hook resolves
+// its markers from HERMES_HOME, which the flag moves, so on the platform profile the
+// once-per-deployment gate reads a home where `.bootstrap_completed`/`.bootstrap_greeted`
+// have never been written while the assets check still passes on the absolute
+// /opt/defaults/onboarding — and the delivery job it binds to lives on the `default`
+// roster, which the flag stops ticking. Enabling it would greet an already-onboarded
+// install with the scan-in-progress text and promise a report nothing can deliver. Its
+// own README states the rule ("Do not relocate any part of this flow"), and the CRD page
+// carries the cost as a known limit.
+//
+// hermes_otel, tool_call_audit and incident_context are the three the image's own copy
+// already enables; the overlay unions lists, so naming them again would be inert rather
+// than wrong, and leaving them out keeps the list to what the flag actually adds.
+var frontDoorPlugins = []string{
+	"session_store",
+	"session_otel_bridge",
+	"legacy_slash_commands",
+}
+
+// kanbanDispatchIntervalSeconds and kanbanWakeOnEvents mirror the `kanban` block
+// agents/chat/config.yaml declares, which is the profile the gateway is homed at until
+// the front-door flag moves it. They exist in Go only so frontDoorKanban can carry that
+// block to the platform profile; nothing renders them for the default profile, whose
+// copy is the image's. TestFrontDoorKanbanMatchesChatConfig fails the build when the two
+// drift, and the note beside each key in that file is the reasoning for its value.
+const kanbanDispatchIntervalSeconds = 5
+
+var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
+
+// resolveKanbanMaxInProgress is the live board-wide worker cap: the CR's
+// spec.harness.tuning.maxInProgress, or the number agents/chat/config.yaml already
+// carries for an install that does not set it.
+func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
+	if limits := agentTuning(agent); limits != nil && limits.MaxInProgress != nil {
+		return *limits.MaxInProgress
+	}
+	return defaultKanbanMaxInProgress
+}
+
+// frontDoorKanban renders the `kanban` subtree for the platform profile when the gateway
+// runs as it.
+//
+// The dispatcher and the notifier run inside the gateway process and read their settings
+// through hermes_cli.config.load_config(), which resolves from get_hermes_home() — so
+// these keys have to live on the profile the gateway is homed at, not on a profile that
+// merely exists. agents/chat/config.yaml holds them for the default profile and no
+// operator render is involved there; here there is no image copy to hold them, because
+// agents/platform/config.yaml declares no `kanban` key at all — that file is written for
+// a kanban WORKER, for which every key in this block is inert.
+//
+// Which is also why the block is rendered rather than added to that file: with the flag
+// off it would be dead config on every install, and the whole claim of an experimental
+// flag is that an install which does not set it is untouched.
+//
+// Without it the front door silently reverts to upstream Hermes: unbounded dispatch, a
+// 60s tick, and `completed` back in the wake set, with spec.harness.tuning.maxInProgress
+// quietly having no effect at all.
+func frontDoorKanban(agent *agentv1alpha1.PlatformAgent) map[string]any {
+	return map[string]any{
+		"dispatch_in_gateway":       true,
+		"auto_subscribe_on_create":  true,
+		"dispatch_interval_seconds": kanbanDispatchIntervalSeconds,
+		"wake_on_events":            slices.Clone(kanbanWakeOnEvents),
+		"max_in_progress":           resolveKanbanMaxInProgress(agent),
+	}
+}
+
+// frontDoorOverlay renders the keys that turn the platform profile into the gateway's
+// front door: the toolsets each chat platform key resolves, the ingress plugins, and the
+// kanban block the dispatcher and the notifier read.
+//
+// It returns nil unless the experimental flag is on, which is what makes the flag
+// reversible: profile_overlay.py records what it applied, so withdrawing these keys
+// unapplies them rather than leaving a half-configured front door behind.
+//
+// The chat adapters are deliberately absent, and their absence is not a gap. The managed
+// scope is machine-global — `platforms.google_chat`, `platforms.slack` and `display` land
+// on this profile exactly as they land on the default one, whichever of them the gateway
+// is homed at (see renderConfigYAML). Only the profile-shaped half has to follow the
+// gateway: what a session arriving from each platform may reach, which plugins load, and
+// how the dispatcher behaves. Rendering the adapters here as well would duplicate an
+// operator-owned setting across both routes, which is the one thing the managed scope's
+// contract asks callers not to do.
+//
+// What it deliberately does NOT carry is the Chat Agent's lockdown —
+// `agent.disabled_toolsets`, the three-toolset `platform_toolsets`, `toolsets: [kanban]`
+// as a ceiling. That lockdown is the Chat Agent's contract, and copying it here would
+// leave the Platform Agent unable to do the work the flag exists to let it do
+// directly. The trade is stated on the CRD field.
+func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
+	if !platformFrontDoorEnabled(agent) {
+		return nil
+	}
+
+	// map[string]any, not map[string][]string, and the type is load-bearing. This subtree
+	// is written before the targeted plugins' own config is merged over it, and mergeMaps
+	// recurses into a nested map only when toStrMap recognises it — which it does for
+	// map[string]any alone. As map[string][]string it fell through to a plain assignment,
+	// so a plugin targeting this profile with a `platform_toolsets:` block of its own
+	// REPLACED the chat keys instead of unioning with them, dropping the front door onto
+	// the auto-generated `hermes-google_chat` fallback — the full core bundle plus every
+	// enabled MCP server, per the note on frontDoorToolsets, which is why the symptom was
+	// an over-broad surface rather than a visibly toolless agent. That also broke the
+	// union contract the AgentPlugin CRD page states outright. The []string values below
+	// are fine: toSlice already handles them.
+	//
+	// Both platform keys unconditionally, matching the adapters the managed scope pins
+	// whether or not each is enabled: a platform turned on later must not also need its
+	// toolsets remembered, and a key for a platform with no adapter is never resolved.
+	platformToolsets := map[string]any{
+		"google_chat": slices.Clone(frontDoorToolsets),
+		"slack":       slices.Clone(frontDoorToolsets),
+	}
+
+	return map[string]any{
+		"platform_toolsets": platformToolsets,
+		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
+		"kanban":            frontDoorKanban(agent),
+	}
+}
+
 // memoryProviderIsHindsightBacked reports whether a provider talks to the in-cluster
 // Hindsight service. Keep in sync with memory_provider_uses_hindsight in
 // k8s-operator/scripts/common.sh, which decides whether to deploy it.
@@ -711,7 +908,7 @@ func partitionPluginsByProfile(agentPlugins []*agentv1alpha1.AgentPlugin) ([]*ag
 // deploy/shared/defaults/config.yaml with the profile's own overlay, content the operator
 // does not have. Rendering it in full would fork the source of truth; a cluster profile
 // additionally carries a runtime `cluster_identity` stamp that overwriting would strip.
-func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agentv1alpha1.AgentLimits, memory map[string]any) string {
+func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agentv1alpha1.AgentLimits, memory, frontDoor map[string]any) string {
 	overlay := map[string]any{}
 
 	// Operator-owned execution limits from spec.harness.tuning. Written before the
@@ -726,6 +923,13 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 		overlay = mergeMaps(overlay, memory)
 	}
 
+	// The front-door keys, when this profile is the one the gateway runs as. Written
+	// before the plugin contributions for the same reason, and mergeMaps unions the
+	// `plugins.enabled` list below rather than replacing it.
+	if frontDoor != nil {
+		overlay = mergeMaps(overlay, frontDoor)
+	}
+
 	enabled := make([]string, 0, len(plugins))
 	for _, p := range plugins {
 		if !slices.Contains(enabled, p.Name) {
@@ -733,7 +937,10 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 		}
 	}
 	if len(enabled) > 0 {
-		overlay["plugins"] = map[string]any{"enabled": enabled}
+		// Merged, not assigned: the front-door overlay above may already have written
+		// `plugins.enabled`, and an assignment here would drop the ingress plugins the
+		// moment a plugin happens to target this profile.
+		overlay = mergeMaps(overlay, map[string]any{"plugins": map[string]any{"enabled": enabled}})
 	}
 
 	for _, p := range plugins {
@@ -787,7 +994,7 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 // agents/chat/config.yaml (defaultKanbanMaxInProgress), so an unset CR leaves the image's
 // number in force rather than having the operator restate it on every reconcile.
 func renderDefaultProfileOverlayYAML(agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) string {
-	overlay := renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil)
+	overlay := renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, nil)
 
 	tuning := agentTuning(agent)
 	if tuning == nil || tuning.MaxInProgress == nil {
@@ -1722,9 +1929,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			ShareProcessNamespace:        shareProcessNamespace,
-			RuntimeClassName:             runtimeClassName,
-			InitContainers:               initContainers,
+			ShareProcessNamespace: shareProcessNamespace,
+			RuntimeClassName:      runtimeClassName,
+			InitContainers:        initContainers,
+			// Pod-scoped, so it covers the agent, both operator-injected sidecars,
+			// anything in spec.deployment.sidecars/initContainers, and the OCI image
+			// volumes AgentPlugins mount. nil when nothing is configured, which is
+			// what keeps a default install's pod template byte-identical.
+			ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 			ServiceAccountName:           saName,
 			AutomountServiceAccountToken: ptr.To(false),
 			SecurityContext: &corev1.PodSecurityContext{
@@ -2065,8 +2277,28 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
 			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
+			// The GKE_DNS_FLAG step decides whether the harness cluster has to be
+			// reached over its DNS endpoint rather than its IP one. The reconciler
+			// cannot answer that when it renders the manifest — the answer is a
+			// property of the cluster, read at bootstrap time — so the describe is
+			// inlined here. agents/platform/scripts/gke_endpoint.py and
+			// k8s-operator/scripts/gke_dns_endpoint.sh implement the same predicate;
+			// keep all three in step.
+			//
+			// Deciding on the configuration rather than trying --dns-endpoint and
+			// falling back is deliberate: for a caller Google recognises as internal,
+			// gcloud downgrades the allowExternalTraffic rejection to a warning and
+			// still writes a kubeconfig naming the DNS endpoint, which then 403s on
+			// every request. A failed probe would look like success.
+			//
+			// The assignment is safe inside the && chain even when the cluster cannot
+			// be described: awk ends the pipeline, and it exits 0 on empty input, so
+			// an unreadable cluster yields an empty flag and the get-credentials that
+			// shipped before this existed. $GKE_DNS_FLAG is unquoted so that empty
+			// contributes no argument at all.
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", Value: `gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
-gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
+GKE_DNS_FLAG="$(gcloud container clusters describe "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" --format='value(controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)' 2>/dev/null | awk -F'\t' '$1 != "" && $2 == "True" { print "--dns-endpoint" }')" &&
+gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" $GKE_DNS_FLAG &&
 kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
 kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null`},
 		)
@@ -2244,6 +2476,55 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	return prefix + name + suffix
 }
 
+// agentAPIProbe returns a probe that asks the Hermes API on loopback for one
+// session. Callers supply periodSeconds and failureThreshold, which is the only
+// difference between the gateway's startup and readiness probes: the startup
+// one has to cover a cold boot that scaffolds every profile onto a fresh PVC,
+// while readiness afterwards should withdraw the pod quickly.
+//
+// /api/sessions is the endpoint the agent's own callers use — see the pubsub
+// adapter and admin_console — and the Authorization: Bearer form is theirs too.
+// Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
+// 1-second default timeout is far too tight for a container this busy at boot.
+//
+// The exit-7 branch is what makes this probe safe above one replica. At
+// replicas > 1 the container runs leader_elect.py, and a pod that does not hold
+// the lease never starts `hermes gateway run` at all — nothing binds 8642, so a
+// plain curl probe would fail every attempt and kubelet would kill a standby
+// that is doing exactly its job. curl exits 7 for "could not connect", which is
+// precisely that state, so it counts as healthy while leader election is on.
+// It is deliberately not tolerated on a single-replica agent, where nothing
+// listening means the gateway is down.
+//
+// Tolerating 7 does not hide a dead leader: leader_elect.py exits with the
+// gateway's own status when the process it started dies, so the container
+// restarts rather than lingering unreachable. And it is a connection refusal
+// only — a gateway that answers with 5xx exits 22, and a hung one 28, both of
+// which still fail. Detecting the standby by looking for the process instead
+// would not work: `hermes` is a shim that execs `s6-suid hermes $REAL "$@"`, so
+// the string "hermes gateway run" never appears in any command line to match.
+func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"sh", "-c",
+					`curl --fail --silent --show-error -o /dev/null ` +
+						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
+						`http://127.0.0.1:8642/api/sessions?limit=1; rc=$?; ` +
+						`[ "$rc" -eq 0 ] && exit 0; ` +
+						`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0; ` +
+						`exit "$rc"`,
+				},
+			},
+		},
+		InitialDelaySeconds: 5,
+		PeriodSeconds:       periodSeconds,
+		TimeoutSeconds:      5,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
 // buildBaseContainers generates the base containers for PlatformAgent.
 func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
 	homeDir := defaultAgentHome
@@ -2285,8 +2566,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	var args []string
 
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	if replicas > 1 {
+	switch {
+	case replicas > 1:
+		// The wrapper starts the gateway itself, so the profile reaches it through
+		// gatewayProfileEnvVar rather than through this argv.
 		args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
+	case platformFrontDoorEnabled(agent):
+		// Overrides the image's CMD, which is a bare `hermes gateway run`. The flag is
+		// global and pre-parsed: hermes_cli/main.py strips -p/--profile out of argv
+		// before any import and re-points HERMES_HOME at the profile's home, so the
+		// gateway comes up as the Platform Agent. `hermes gateway run --profile` would
+		// not work — the subcommand has no such flag — and the position therefore
+		// matters.
+		args = []string{"hermes", "--profile", platformProfileName, "gateway", "run"}
 	}
 
 	if isImageVolumeSupported {
@@ -2321,6 +2613,29 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Value: agentModelName,
 	})
 
+	// Appended last for the same reason as the two above: an AgentPlugin's spec.env
+	// reaches envVars verbatim, and a plugin that named this variable would re-home the
+	// gateway — or, worse, un-home it while the overlay still configures the platform
+	// profile as the front door, leaving chat on the default profile while the toolsets,
+	// ingress plugins and kanban settings meant for it sit on a profile receiving none.
+	//
+	// Which is why it is appended UNCONDITIONALLY, empty when the flag is off, rather
+	// than only when there is a profile to name. Last-wins only settles a duplicate; a
+	// name the operator never emits is not a duplicate, so a plugin declaring
+	// HERMES_GATEWAY_PROFILE=platform on a flag-off install would be the only writer and
+	// would re-home the gateway to a profile whose overlay carries no ingress keys at
+	// all. Both readers treat empty as off — leader_elect.py falls back to the default
+	// profile, and the entrypoint's platform_is_front_door tests for `platform`
+	// exactly — so the off value is a real answer rather than a placeholder.
+	frontDoorProfile := ""
+	if platformFrontDoorEnabled(agent) {
+		frontDoorProfile = platformProfileName
+	}
+	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
+		Name:  gatewayProfileEnvVar,
+		Value: frontDoorProfile,
+	})
+
 	containers := []corev1.Container{
 		{
 			Name:            "platform-agent",
@@ -2336,6 +2651,22 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			Env:          gatewayEnvVars,
 			Resources:    resources,
 			VolumeMounts: volumeMounts,
+			// Without these the Service publishes this pod the moment the container
+			// process starts, minutes before the Hermes API binds :8642 — the
+			// entrypoint scaffolds every profile onto the PVC before it execs the
+			// gateway. Callers that resolve the Service in that window get
+			// connection-refused from a pod Kubernetes calls Ready.
+			//
+			// exec, not httpGet: API_SERVER_HOST is 127.0.0.1 (the sidecar's Envoy on
+			// :8643 is what the Service targets), and kubelet dials the pod IP, so an
+			// httpGet or tcpSocket probe would never reach a loopback listener. This
+			// is the same shape as the credential proxy's own probe below.
+			//
+			// The bearer key is the non-secret loopback sentinel already in this
+			// container's env, and API_SERVER_ENABLED is unconditionally true above,
+			// so the probe is valid in every configuration.
+			StartupProbe:   agentAPIProbe(10, 60),
+			ReadinessProbe: agentAPIProbe(15, 3),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -2457,6 +2788,24 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
+			// The Service publishes :9119 whenever the dashboard is enabled, so
+			// without this the UI port is advertised before anything listens on it.
+			//
+			// tcpSocket rather than httpGet: this one binds all interfaces, so kubelet
+			// can reach it on the pod IP, but `hermes dashboard` exposes no health
+			// path we have verified — and a probe against a guessed path that 404s
+			// would hold the whole pod unready, taking the API down with it.
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromString("dashboard"),
+					},
+				},
+				InitialDelaySeconds: 5,
+				PeriodSeconds:       15,
+				TimeoutSeconds:      5,
+				FailureThreshold:    3,
+			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -2869,6 +3218,50 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	}
 }
 
+// buildPlatformPDB generates the PodDisruptionBudget manifest for PlatformAgent.
+//
+// maxUnavailable: 1 at every replica count, which is the shape the Workload
+// Reliability Audit this project ships requires:
+// agents/platform/governance/obtainability_audit_sop.md §3.3 — "Always
+// maxUnavailable, never minAvailable ... maxUnavailable: 1 is structurally safe
+// at any replica count >= 2."
+//
+// The reason it is unconditional rather than derived from the replica count is
+// that a budget keyed to replicas is only safe while the replica count holds.
+// minAvailable: 1 against one replica leaves zero allowed disruptions, so
+// `kubectl drain` never completes and node-pool upgrades, auto-repair, and
+// autoscaler scale-down all stall until a human deletes this object — the
+// critical `blocking-pdb` finding of §3.4. Deriving the field from the resolved
+// count avoids that on the way up but not on the way down: a scaled-out agent
+// carrying minAvailable: 1 that is later scaled back to one produces exactly
+// that deadlock, and nothing reconciles the budget at the moment someone runs
+// `kubectl scale`.
+//
+// The selector is the Deployment's, NOT the Service's. Above, a multi-replica
+// Service narrows to kubeagents.io/is-leader so only the leader serves; a PDB
+// carrying that label would budget the single leader pod rather than the
+// Deployment's pods.
+func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "policy/v1",
+			Kind:       "PodDisruptionBudget",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": agent.Name + "-gateway",
+				},
+			},
+		},
+	}
+}
+
 // buildPlatformLeaderRole generates the Role manifest for leader election leases in the agent namespace
 func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
@@ -2944,6 +3337,21 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.googleapis.com",
 		"accounts.google.com",
 		"*.gstatic.com",
+		// GKE DNS-based control plane endpoints. get-credentials prefers these
+		// over the IP endpoint wherever a cluster publishes one that accepts
+		// external traffic, so the kubeconfig names a Google frontend rather
+		// than an address in apiCIDRs. Without this the pod authenticates
+		// against the control plane it can no longer reach: rule 6 covers the
+		// IP endpoints only, and FQDN mode is exactly when the blanket
+		// 0.0.0.0/0:443 rule is withheld.
+		//
+		// A pattern wildcard spans one label and no dots, so the two-label
+		// form is what actually matches an endpoint: the hostname is
+		// <cluster-hash>-<project-number>.<region>.gke.goog. Every other
+		// wildcard in this list needs exactly one label, so nothing here
+		// exercises the deeper shape — see TestFQDNPatternList_MatchesRealHostnames.
+		"*.gke.goog",
+		"*.*.gke.goog",
 		// Container & Artifact Registries (Plugin OCI images)
 		"gcr.io",
 		"*.gcr.io",
@@ -3083,7 +3491,7 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string, metadataNodeIPs []string) *networkingv1.NetworkPolicy {
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
@@ -3106,9 +3514,9 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
 
 	// Everything the rewritten packet can be addressed to, all of it on port 988:
-	// the metadata daemon's own link-local address on the iptables datapath, and the
-	// hosting node's internal IP on Dataplane V2. See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers(append([]string{metadataLinkLocalIP, metadataDaemonIP}, metadataNodeIPs...), true)
+	// the metadata daemon's own link-local address on the iptables datapath.
+	// See metadataDaemonIP.
+	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, metadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{

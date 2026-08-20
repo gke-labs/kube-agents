@@ -56,6 +56,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
+| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                             |
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
 milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
@@ -87,19 +88,19 @@ Hermes' empty string, which cannot be expressed here: an absent field takes the 
 
 Only a Hindsight-backed provider reaches the specialist profiles, because only that one can be made
 read-only and scoped by tag. Under any other value the specialists get no provider at all and the
-Chat Agent keeps the store to itself.
+Planning Agent keeps the store to itself.
 
 `memoryEnabled` and `userProfileEnabled` are a **different** mechanism — Hermes' built-in
 `MEMORY.md` / `USER.md` files, which have no per-user scoping. Both providers above replace that
 store rather than supplement it, so both run with `memoryEnabled: false`.
 
-The installer's `MEMORY_ENABLED` variable is that same built-in store and nothing more; provisioning
-step 8 copies it into this field unchanged. It is not a master switch — whether the agent remembers
+The installer's `MEMORY_ENABLED` variable is that same built-in store and nothing more; the install
+copies it into this field unchanged. It is not a master switch — whether the agent remembers
 anything is `provider`'s question, and `none` is how that answers no.
 
-The provisioning scripts read only the provider: step 13 deploys Hindsight when `MEMORY_PROVIDER` is
-Hindsight-backed, which is what a stock install gets, and nothing when it is `multiuser_memory` or
-`none`. See
+The install reads only the provider: the chart's `hindsight.*` values deploy the Hindsight store
+when the provider is Hindsight-backed (`--memory=hindsight`), and nothing when it is
+`multiuser_memory` or `none`. See
 [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md).
 
 ### `spec.harness.eventWatcher`
@@ -158,7 +159,7 @@ turns it off.
 
 ### `spec.harness.tuning`
 
-Execution limits per agent persona, where `<persona>` is one of `default` (the Chat Agent front
+Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
@@ -240,6 +241,124 @@ delays a delegated task, too high loses it silently. Raise it once you know your
 and your model quota — that quota is the other shared resource, and for most deployments it binds
 before memory does.
 
+### `spec.harness.experimental`
+
+Opt-in switches with no compatibility promise. A field here may change meaning, change its default,
+or be removed outright in any release; an install that depends on one is expected to re-check it at
+every upgrade. Fields live here while the question they answer is still open — once it is settled
+the switch either graduates into a supported block or goes away.
+
+#### `platformFrontDoor`
+
+Makes the **Platform Agent** the profile the Hermes gateway runs as, so a chat message is handled by
+the agent that has the tools instead of arriving at the Planning Agent, which delegates through the
+router MCP server and the kanban board.
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
+  -p '{"spec":{"harness":{"experimental":{"platformFrontDoor":true}}}}'
+```
+
+Three things change while it is on:
+
+- The gateway container runs `hermes --profile platform gateway run`. Above one replica the container
+  still runs `leader_elect.py`, which reads the same choice from `HERMES_GATEWAY_PROFILE` and builds
+  that command line for the process it supervises.
+- `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
+  carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
+  `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
+  machine-global, so `platforms.*` and `display.platforms` already land on this profile. `kanban`
+  does have to follow the gateway, because the dispatcher and the notifier run in the gateway
+  process and read their settings from its own home; that is what keeps
+  [`tuning.maxInProgress`](#specharnesstuning) applying. The board itself does not move — Hermes
+  anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
+  dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
+- The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
+  it instead, on the same terms as the `default` profile's own file, so `/sethome` and
+  `monitoring.install_id` survive a restart — see
+  [How config reaches each profile](#how-config-reaches-each-profile).
+
+Setting the field back to `false` reverses all three. The overlay records what it applied, so the
+keys are unapplied rather than left behind, and the force-sync resumes.
+
+**What it costs.** The Planning Agent's lockdown is its whole reason for existing: a front door
+with three toolsets, so an inbound message cannot reach the full Platform Agent tool surface before a
+card and a worker turn have framed it. With this on, an inbound message reaches that surface
+directly. The lockdown is deliberately **not** copied onto the platform profile — copying it would
+leave the Platform Agent unable to do the work the flag exists to let it do.
+
+**Known limits.**
+
+- One gateway means one profile, so this is not additive. While it is on, the Planning Agent persona sees
+  no chat at all and the router MCP path is simply unused. Kanban delegation is not: the front door
+  keeps `dispatch_in_gateway`, so it can still hand a card to a spawned worker — it just does so as
+  the agent that could also have done the work itself.
+- `gateway.multiplex_profiles` is still off, so a `/p/<profile>/` prefix on an API request is
+  ignored. Those requests now land on the Platform Agent rather than the Planning Agent.
+- The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
+  shows that profile's sessions while the front door is the platform one.
+- **An [`AgentPlugin`](./agentplugin-crd.md) without a `spec.targetProfile` does not follow the
+  gateway.** The two halves that decide whether it loads at all stay on the `default` profile: the
+  image volume is mounted at `$HERMES_HOME/plugins/<name>`, and the name is added to that profile's
+  `plugins.enabled`. With the flag on, the gateway is homed at `profiles/platform` and reads
+  neither, so the plugin never registers — silently, since nothing errors, and its `platforms:`
+  block does arrive here through the machine-global managed scope, configuring an adapter that has
+  nothing to configure. The `pubsub-platform` adapter and the `gke-stockout-investigator` alert
+  route that depends on it are both affected. Setting `spec.targetProfile: platform` moves the
+  plugin and its `platform_toolsets` across.
+- **The `default` profile's cron roster stops ticking.** Hermes binds its cron ticker to one
+  `HERMES_HOME` — the job store, the execution ledger and `.tick.lock` all resolve from the gateway
+  process's own home — so the one roster that ticks becomes `profiles/platform/cron/jobs.json`. The
+  Platform Agent's own watchdogs therefore tick natively, which is the upside; the cost is that the
+  four jobs on the `default` roster never come due. Those are `cluster-agent-reconcile`, which
+  scaffolds a profile for a newly onboarded cluster and prunes one for a deleted cluster;
+  `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`, which are first-run onboarding; and
+  `profile-cron-tick`, the only thing that ticks a **named** profile's own store — so every
+  `cluster-*` roster goes quiet with it. Nothing errors and nothing is logged: a job that is never
+  ticked simply stays `scheduled` with a `next_run_at` in the past.
+- **Per-user memory does not follow the gateway either.** The front door's provider is
+  `multiuser_memory`, committed in `agents/chat/config.yaml` and reaching the `default` profile
+  alone. The platform profile is configured as a specialist instead: `read_only: true` from the
+  image, and a `memory.provider` its overlay blanks unless
+  [`spec.harness.memory`](#specharnessmemory) names a Hindsight-backed store. With the flag on the
+  front door is that profile, so chat has no recall, no per-user profile and no retention — while
+  `memory` stays in the profile's toolsets advertising all three. The keys cannot simply be copied
+  across, because `profiles/platform/config.yaml` is shared: it is also the home of every
+  kanban-spawned specialist and every job on the platform cron roster. Lifting `read_only` there
+  would let a specialist write the shared corpus, and un-blanking the provider would collapse those
+  writes into one anonymous bucket, since a specialist carries no gateway identity to scope a
+  per-user store by. Carrying memory to the front door needs those settings to be per-process
+  rather than per-profile.
+- **First-run onboarding does not follow the gateway.** Its two jobs are on the `default` roster the
+  bullet above stops ticking, and its greeting hook — the `bootstrap_onboarding` plugin — resolves
+  its once-per-deployment markers from the gateway's home, so on the platform profile it would greet
+  an already-onboarded install and promise a report nothing can deliver. The operator therefore
+  leaves that plugin off the front door deliberately. Bring an install up with the flag off, let
+  onboarding finish, then turn it on.
+- **A home channel set with `/sethome` stays on the profile it was set on.** The operator renders no
+  `home_channel` of its own, so on an install that did not populate the CR's Google Chat or Slack
+  `homeChannel` the value lives only in the config file the gateway last wrote. Flipping the flag
+  changes which file that is, and nothing carries it across. The Platform Agent's own `deliver: all`
+  watchdogs then tick in-process, where the delivery target is read from the environment alone —
+  so every scheduled report posts nowhere while chat replies stay healthy and the install looks
+  fine. Either populate `homeChannel` on the CR before flipping, or re-run `/sethome` after.
+- **`chat_message_audit` stops recording.** It is a hook rather than a plugin, and hooks are only
+  ever copied into the root home — nothing puts them on a named profile, and Hermes reads
+  `$HERMES_HOME/hooks` and returns silently when the directory is absent. `tool_call_audit` is a
+  plugin, is enabled on this profile and still records the inbound message with its session and
+  pseudonymised user id, so what is actually lost is the record carrying the agent's **response**
+  text. Response content remains in the session store.
+- **The platform profile's `config.yaml` stops being restored from the image on every restart.**
+  Handing the file to the agent is the point — that is what lets `/sethome` and
+  `monitoring.install_id` survive — but the same change means a key the running agent writes there
+  is not reverted at boot. Keys the image adds still arrive through the back-fill; keys already in
+  the file stay as they were last written. Operator-owned settings are unaffected: they come from
+  the overlay and the `/etc/hermes` pins, both re-applied every boot.
+- Cluster profiles that already exist are otherwise unaffected — their config, skills and
+  scaffolding on disk are unchanged and they keep working. What stops is the scheduled work above,
+  which includes `cluster-agent-reconcile`, so a cluster onboarded while the flag is on gets no
+  profile until the flag goes back off.
+
 ## `spec.deployment`
 
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
@@ -247,6 +366,10 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `image` — container image repository.
 - `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's build-injected default version applies instead.
 - `imagePullPolicy` — one of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.
+- `imagePullSecrets` — Secrets in the agent's namespace holding registry credentials, as
+  `- name: <secret>` entries. Referenced, not created: each must exist before the pod is
+  scheduled. Pod-scoped, so it covers the agent, both injected sidecars, anything in
+  `initContainers`/`sidecars`, and the OCI image volumes `AgentPlugin`s mount.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
 - `runtimeClassName` — pod runtime class (e.g. `gvisor`).
 - `env` — additional container environment variables.
@@ -258,16 +381,18 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
 Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:<operator release version>` (release builds inject the version; development builds fall back to `latest`), overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)). Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
 
+`imagePullSecrets` has the same operator-wide form, `IMAGE_PULL_SECRETS` on the controller manager, taking comma-separated Secret names. It differs from the image overrides in one way: a CR that sets `imagePullSecrets` **replaces** the operator's list rather than merging with it, so an agent that names its own registry identity is stating it completely. See [Docker images § Registry authentication](/kube-agents/deploy/docker-images/#registry-authentication).
+
 ## `spec.security`
 
 - `serviceAccountName` — the KSA the pod runs as. `kubeagents-platform-agent` by convention.
 - `serviceAccountAnnotations` — passed through to the KSA. Typically holds `iam.gke.io/gcp-service-account` for Workload Identity binding.
 
-The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
+The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by the [`kube-agents-iam` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) with one of these permission sets:
 
 - `read-only` (default)
 - `gke-admin`
-- `custom` (roles supplied via `PLATFORM_AGENT_CUSTOM_ROLES`)
+- `custom` (roles supplied via the installer's `--custom-roles`, the composition's `project_roles`)
 
 ## `spec.telemetry`
 
@@ -279,9 +404,9 @@ Optional, and omitting it is the point: with the field absent the operator disco
 
 Enables external integrations. Only the enabled ones need to be present.
 
-- **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by `provision_05_gcp_gchat.sh`.
-- **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by `provision_06_slack.sh` when `SLACK_ENABLED=true`.
-- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment (up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@...`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand (e.g. `gke-labs/kube-agents`). Rejects URLs containing whitespace, control characters, or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL is encountered during reconciliation, `SETTINGS.md` defaults to `None` and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. Populated by `provision_10_deploy_github_minter.sh`.
+- **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by the installer when Google Chat is enabled.
+- **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by the installer when Slack is enabled.
+- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment (up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@...`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand (e.g. `gke-labs/kube-agents`). Rejects URLs containing whitespace, control characters, or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL is encountered during reconciliation, `SETTINGS.md` defaults to `None` and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. Populated by the installer when a GitOps repository is connected.
 
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.
 
@@ -327,17 +452,18 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 
 ## How config reaches each profile
 
-A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
+A deployment runs several Hermes **profiles** from one pod: `default` (the Planning Agent front door),
 `platform`, and one `cluster-*` profile per managed cluster. The named profiles are each configured
 by an overlay merged into an image-built base at startup. The `default` profile is the exception: it
 takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
 read-only **managed scope** pinned over it.
 
-| Profile     | Delivery                                                                                                                                          | Who owns the file                         |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `default`   | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes` | Agent owns the file, operator the pins    |
-| `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                              | Image owns the base, operator the overlay |
-| `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists                                          | Image owns the base, operator the overlay |
+| Profile                                                       | Delivery                                                                                                                                                   | Who owns the file                                      |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `default`                                                     | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes`          | Agent owns the file, operator the pins                 |
+| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                       | Image owns the base, operator the overlay              |
+| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global | Agent owns the file, operator the overlay and the pins |
+| `cluster-*`                                                   | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists                                                   | Image owns the base, operator the overlay              |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
@@ -421,6 +547,15 @@ on a fresh volume, and thereafter only back-filled — keys the image declares a
 lost are restored, keys it already holds are left alone. Its overlay is merged after that
 back-fill, so the operator's settings are not undone by it.
 
+The platform profile's `config.yaml` becomes a second exception under
+[`platformFrontDoor`](#platformfrontdoor), and for the same reason: the gateway is homed there, so
+that file is now the one `/sethome` and the monitoring policy write to. It leaves the force-sync
+list and is back-filled from the image template instead, on exactly the terms `default` gets — keys
+the template declares and the live file has lost are restored, keys it already holds are left
+alone. Its overlay merges after that back-fill as it always did. Everything else the image owns in
+that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
+force-syncs either way.
+
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
 lists union, and scalars are replaced by the overlay; precedence, lowest to highest, is Hermes
@@ -441,11 +576,11 @@ one reviewable place.
 
 - On create/update, the controller ensures the Deployment, Service, ServiceAccount, and ConfigMaps match the spec.
 - On delete, it garbage-collects owned resources.
-- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
+- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), requires each `imagePullSecrets` entry to name a Secret, and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
-- `provision_08_deploy_platform_agent.sh` renders and applies the CR; you can also edit it directly with `kubectl edit`.
+- The Helm chart renders and applies the CR (the install engine drives it through `terraform apply`); you can also edit it directly with `kubectl edit`.
 
 ## Where to go next
 
 - [Development](/kube-agents/operator/development/) — build and test the controller locally.
-- [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — how the CR gets applied in a fresh install.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — how the CR gets applied in a fresh install.

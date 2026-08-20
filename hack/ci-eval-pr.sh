@@ -3,7 +3,8 @@
 # Prow CI Evaluation Pipeline Script
 # ==============================================================================
 # Runs devops-bench evaluation against deployed platform-agent.
-# Evaluates task 'gpu-stress-test-diagnosis' asserting OutcomeValidity score >= 0.7.
+# Evaluates the task matrix in section 6, asserting OutcomeValidity score >= 0.7
+# per task. ChecklistScore is reported alongside but does not gate the build.
 # ==============================================================================
 
 set -euo pipefail
@@ -19,7 +20,11 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation fo
 # 2. Cluster Auth
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
+# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+# shellcheck disable=SC2086
+gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
+  $GKE_DNS_ENDPOINT_FLAG
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # 3. Agent & Harness Configuration
@@ -68,7 +73,23 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
+# Paths are relative to BENCH_DIR, which is where devops-bench runs. Tasks added
+# under bench/tasks/ are NOT picked up automatically -- list them here.
+BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=("./tasks/gpu-stress-test-diagnosis/task.yaml")
+
+# Reads infrastructure.deployer out of a task file. Matching on the task *path*
+# instead -- the previous approach -- silently sends every task whose directory
+# does not spell "noop" off to provision a cluster it never uses. Nothing
+# requires a generation-only task to say "noop" in its directory name.
+task_deployer() {
+  python3 -c "
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r'^\s*deployer:\s*(.+?)\s*\$', text, re.M)
+print(m.group(1).strip('\'\"') if m else '')
+" "$1" 2>/dev/null || echo ""
+}
 
 FAILED_TASKS=()
 
@@ -77,15 +98,18 @@ for TASK in "${TASKS[@]}"; do
   TASK_START=$SECONDS
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) <<<"
 
-  # Enable BENCH_NO_INFRA=true for noop tasks (skip OpenTofu); set false for real infra evaluation tasks
-  if [[ "${TASK}" == *"noop"* ]]; then
+  # Skip OpenTofu for generation-only tasks; provision for everything else. An
+  # unreadable or absent deployer field yields "", which provisions -- the safe
+  # direction, since a task that needed infrastructure and did not get it fails
+  # in a way that looks like an agent regression.
+  DEPLOYER="$(task_deployer "${BENCH_DIR}/${TASK}")"
+  if [[ "${DEPLOYER}" == "noop" ]]; then
     export BENCH_NO_INFRA="true"
   else
     export BENCH_NO_INFRA="false"
   fi
-  echo "Executing with BENCH_NO_INFRA=${BENCH_NO_INFRA}"
+  echo "Executing with deployer=${DEPLOYER:-unknown} BENCH_NO_INFRA=${BENCH_NO_INFRA}"
 
-  BENCH_DIR="${SCRIPT_DIR}/../bench"
   # Snapshot existing result directories before running to prevent stale score leakage
   PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
   EVAL_LOG="/tmp/eval_${TASK_NAME}.log"
@@ -135,6 +159,23 @@ ov = scores.get('OutcomeValidity [GEval]', scores.get('OutcomeValidity', 0))
 score_val = ov.get('score', ov) if isinstance(ov, dict) else ov
 print(score_val if score_val is not None else 0)
 " 2>/dev/null || echo "0")
+    # Reported, not gated. Per-requirement checks are the finer-grained signal,
+    # but individual judge calls hang and devops-bench counts a hung check as a
+    # failed one, so gating here would turn a flaky judge into a red build.
+    CHECKLIST=$(python3 -c "
+import json
+data = json.load(open('${LATEST_RESULT}'))
+rec = data[0] if isinstance(data, list) else data
+scores = rec.get('scores', rec.get('metrics', {}))
+cs = scores.get('ChecklistScore')
+if isinstance(cs, dict):
+    print(f\"{cs.get('score')} ({cs.get('reason', '').strip()})\")
+elif cs is not None:
+    print(cs)
+else:
+    print('n/a')
+" 2>/dev/null || echo "n/a")
+    echo "Task ${TASK_NAME} ChecklistScore: ${CHECKLIST}"
     cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
 
     # 6. Validate Score Threshold

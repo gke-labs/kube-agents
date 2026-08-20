@@ -84,6 +84,16 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: {{ .Release.Name }}-cr-cleanup
+      {{- /*
+        The most load-bearing of the chart's four pod specs. This Job is a
+        pre-delete hook, so a pull it cannot authenticate fails the uninstall at
+        the one moment the operator is still around to clear the CR's finalizer
+        — the stranded-CR, namespace-stuck-Terminating outcome the whole file
+        exists to prevent.
+      */}}
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -91,7 +101,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: cleanup
-          image: {{ .Values.platformAgent.cleanupHook.image | quote }}
+          image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.cleanupHook.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.platformAgent.cleanupHook.image.tag }}"
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

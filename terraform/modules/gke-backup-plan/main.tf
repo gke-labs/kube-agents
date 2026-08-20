@@ -2,15 +2,15 @@ locals {
   backup_plan_name = coalesce(var.name, "${var.cluster_name}-backup-plan")
 }
 
-# Mirrors the BackupPlan k8s-operator/scripts/provision_12_gke_backup_plan.sh
-# creates: the same default name, schedule, retention, namespace scope, and
-# include-secrets/include-volume-data choices. Pick one path per cluster —
-# both create the same resource, and the script's check-then-create would
-# adopt a Terraform-managed plan without Terraform knowing.
+# The BackupPlan the full-install composition schedules: default name,
+# schedule, retention, namespace scope, and
+# include-secrets/include-volume-data choices.
 resource "google_gke_backup_backup_plan" "this" {
-  name     = local.backup_plan_name
-  project  = var.project_id
-  location = var.location
+  name    = local.backup_plan_name
+  project = var.project_id
+  # Backup for GKE plans are regional; the cluster path keeps the cluster's
+  # own location, which for a zonal Standard cluster is the zone.
+  location = replace(var.location, "/-[a-z]$/", "")
   cluster  = "projects/${var.project_id}/locations/${var.location}/clusters/${var.cluster_name}"
 
   backup_config {
@@ -25,8 +25,8 @@ resource "google_gke_backup_backup_plan" "this" {
     # in-place, not a replacement (verified against hashicorp/google v7.44:
     # adding a key to a live plan shows "will be updated in-place"), but the
     # new key governs only backups taken after the change — each existing
-    # backup keeps the key it was encrypted with. provision_12 warns and
-    # preserves the existing key rather than swapping it for the same reason.
+    # backup keeps the key it was encrypted with, so swapping keys on a live
+    # plan leaves the fleet of backups encrypted under a mix of keys.
     dynamic "encryption_key" {
       for_each = var.encryption_key == "" ? [] : [var.encryption_key]
       content {

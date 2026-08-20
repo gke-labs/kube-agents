@@ -1,0 +1,38 @@
+# Both Hindsight workloads run a single replica, so neither budget can protect
+# anything — a minAvailable of 1 against one replica leaves zero allowed
+# disruptions and hangs every node drain, which is the critical `blocking-pdb`
+# finding in agents/platform/governance/obtainability_audit_sop.md §3.4.
+# maxUnavailable: 1 states the intent instead: these may be evicted. The API is
+# stateless and restarts; the database is disk-bound and single-member by
+# design, and holding a node drain hostage to it would be worse than the short
+# gap while it reschedules.
+#
+# Selectors are copied from each workload's own immutable spec.selector — §3.3
+# of that audit matches a PDB to its workload by selector, never by name.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hindsight-api
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hindsight-postgresql
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: postgresql

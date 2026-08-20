@@ -219,7 +219,7 @@ restating them here is how the count goes stale, which it had (this section clai
 a file holding seven).
 
 Target cadence tiers, which the roster is expected to fill out: hourly for policy propagation and global
-capacity orchestration, every 30 minutes for issue triage, daily for the compliance and security audits,
+capacity orchestration, every ten minutes for issue triage, daily for the compliance and security audits,
 weekly for cost and consistency sweeps, and monthly for lifecycle/deprecation.
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update

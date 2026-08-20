@@ -174,10 +174,21 @@ ALREADY_PATCHED = (
 
 # --- 1. block_task: repair inverted fan-out edges before declaring the wait ---
 
+# v2026.8.13 added a second ``dependency_wait`` event, in claim_task's
+# parent-reopened demotion. The two are told apart by the call's own layout:
+# that one puts ``conn``, ``task_id`` and the kind on three lines, this one on
+# one. Kept as a literal rather than narrowed to the one-line fragment, because
+# the insertion point is the whole call and this is the only edit in the file
+# whose target upstream has two of.
 DEPENDENCY_ANCHOR = (
     '            _append_event(\n'
     '                conn, task_id, "dependency_wait",\n'
-    '                {"reason": reason, "kind": kind}, run_id=run_id,\n'
+    '                {\n'
+    '                    "reason": reason,\n'
+    '                    "kind": kind,\n'
+    '                    "source_status": source_status,\n'
+    '                },\n'
+    '                run_id=run_id,\n'
 )
 
 DEPENDENCY_PATCHED = (
@@ -193,7 +204,8 @@ DEPENDENCY_PATCHED = (
 
 FENCE_ANCHOR = (
     '        rows = conn.execute(\n'
-    '            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "\n'
+    '            "SELECT id, worker_pid, claim_lock, started_at, assignee "\n'
+    '            "FROM tasks "\n'
     '            "WHERE status = \'running\' AND worker_pid IS NOT NULL"\n'
     '        ).fetchall()\n'
     '        host_prefix = f"{_claimer_id().split(\':\', 1)[0]}:"\n'
@@ -218,7 +230,8 @@ FENCE_PATCHED = (
     '            conn, _kanban_claimer, _pid_alive, _resolve_crash_grace_seconds\n'
     '        )\n'
     '        rows = conn.execute(\n'
-    '            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "\n'
+    '            "SELECT id, worker_pid, claim_lock, started_at, assignee "\n'
+    '            "FROM tasks "\n'
     '            "WHERE status = \'running\' AND worker_pid IS NOT NULL"\n'
     '        ).fetchall()\n'
     '        for row in rows:\n'
@@ -302,24 +315,24 @@ TRIP_PATCHED = (
 # the preceding WHERE clause is load-bearing for uniqueness -- it is what
 # distinguishes this branch from its sibling.
 SPAWN_BIND_ANCHOR = (
-    "                    \"WHERE id = ? AND status IN ('running', 'ready')\",\n"
+    "                    \"WHERE id = ? AND status IN ('running', 'ready', 'review')\",\n"
     "                    (failures, error[:500], task_id),\n"
 )
 
 SPAWN_BIND_PATCHED = (
-    "                    \"WHERE id = ? AND status IN ('running', 'ready')\",\n"
+    "                    \"WHERE id = ? AND status IN ('running', 'ready', 'review')\",\n"
     "                    (persisted_failures, error[:500], task_id),\n"
 )
 
 # --- 6. the timeout/crash branch bind tuple -----------------------------------
 
 CRASH_BIND_ANCHOR = (
-    "                    \"WHERE id = ? AND status IN ('ready', 'running')\",\n"
+    "                    \"WHERE id = ? AND status IN ('ready', 'review', 'running')\",\n"
     "                    (failures, error[:500], task_id),\n"
 )
 
 CRASH_BIND_PATCHED = (
-    "                    \"WHERE id = ? AND status IN ('ready', 'running')\",\n"
+    "                    \"WHERE id = ? AND status IN ('ready', 'review', 'running')\",\n"
     "                    (persisted_failures, error[:500], task_id),\n"
 )
 

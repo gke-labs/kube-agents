@@ -99,7 +99,7 @@ Four exclusions matter, and all of them are load-bearing:
   ``heartbeat_current_worker_from_env`` reads it on every kanban call to keep a
   15-minute claim alive across a 20-minute audit. So the env var this backstop
   keys off names a card the cron run is explicitly *barred* from terminating
-  (``resolve_default_task_id`` returns ``None`` inside a run, and
+  (upstream's ``_default_task_id`` returns ``None`` inside a run, and
   ``cron_ownership_violation`` rejects it by name). Its not having called a
   terminal tool is the design, not a leak. Record it and the dispatcher — still
   blocked on the run — has its claim released and a ``timed_out`` charged to its

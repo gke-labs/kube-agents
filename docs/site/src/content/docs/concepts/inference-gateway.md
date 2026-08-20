@@ -20,7 +20,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ## LiteLLM (hosted models)
 
-[LiteLLM](https://litellm.ai) is an OpenAI-Completions-compatible proxy in front of every major model provider. `provision_09_deploy_litellm.sh` deploys it with the API key you provide.
+[LiteLLM](https://litellm.ai) is an OpenAI-Completions-compatible proxy in front of every major model provider. The `kube-agents` Helm chart deploys it with the API key you provide (the dev copy is `make -C k8s-operator deploy-litellm`).
 
 ### What ships
 
@@ -42,31 +42,55 @@ model_list:
 
 Two things have to name that alias, not one. The profile config covers Chat, which resolves the model on every message; sessions created through the agent's HTTP API instead take a model resolved once at gateway startup, and that path reads `API_SERVER_MODEL_NAME`. The operator sets both from the same constant so they cannot drift — if they do, Chat keeps working while every API-created session (autonomous event triage, for one) dies asking LiteLLM for a model it does not serve.
 
-The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, cached in `vars.sh`). Supported providers and their shipping defaults:
+The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `vars.sh` and carried into the chart values). Supported providers and their shipping defaults:
 
 | `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
 | ------------------ | ---------------------------- | ------------------------------------------ |
 | `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
 | `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
 | `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
-| `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth).     |
 | `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
-To change the default, set the variables and re-run the LiteLLM step (or `make deploy-litellm`):
+To change the default on an installed system, re-run `./install.sh` (or its `--menu` panel's model-provider entry followed by **Save & Apply**) — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
 
 ```bash
 export MODEL_PROVIDER=gemini
 export MODEL_DEFAULT_NAME=gemini-3.5-flash
-cd k8s-operator/scripts && ./provision_09_deploy_litellm.sh
+make -C k8s-operator deploy-litellm
 ```
 
-This rewrites the LiteLLM `ConfigMap` and rolls the gateway; the agent picks up the new model on its next request without any change to its own config.
+Either way the agent picks up the new model on its next request without any change to its own config.
+
+### Prompt caching
+
+Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in the shipped `config.yaml`:
+
+```yaml
+router_settings:
+  default_litellm_params:
+    cache_control_injection_points:
+      - location: message
+        role: system
+        control:
+          type: ephemeral
+          ttl: 1h
+      - location: message
+        index: -3
+      - location: message
+        index: -1
+```
+
+The agent cannot do this itself, and that is the point of putting it here. It asks for `model-default` over the Completions API and never learns what is behind the alias, while the harness only emits its own cache markers when it recognises a Claude-named model — so on an Anthropic backend it caches nothing. Teaching it otherwise would mean naming the model in the agent config, which is exactly the coupling the gateway exists to prevent. A 45-call agent session measured 3.5M input tokens and zero cache reads before this block; the first cron tick after it re-ran the same 83k-token prompt as a cache write, and subsequent ticks read it back.
+
+The system prompt takes the 1h tier because it is the largest static span, every profile and cron tick shares it, and a read refreshes the TTL — so a half-hourly cron schedule keeps it warm instead of missing a 5-minute window every time. The two rolling points ride the conversation tail on the default 5-minute tier. Anthropic allows four breakpoints per request; LiteLLM counts any the caller supplied and never overwrites them, so a client with its own layout still wins.
+
+Nothing here is provider-specific. Non-Anthropic backends drop the markers in their provider transforms — Gemini and Gemma routes answer normally with unchanged token counts — and Gemini's own implicit caching, which needs no markers at all, is unaffected. Leaving the block in place on a Gemini install costs nothing and means switching to `MODEL_PROVIDER=anthropic` doesn't quietly switch caching off.
 
 ### Vertex AI and Model Garden
 
-`MODEL_PROVIDER=vertex` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster.
+`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster.
 
 Two things differ from the API-key providers:
 
@@ -76,12 +100,14 @@ Two things differ from the API-key providers:
 `MODEL_DEFAULT_NAME` is the Vertex **publisher model ID**, which is not always the same string the provider's own API uses — Model Garden Claude models, for instance, carry an `@`-suffixed version (`claude-sonnet-4-5@20250929`). Check the model's Model Garden card for the exact ID; a wrong one surfaces as a 404 from the gateway rather than a provisioning error.
 
 ```bash
-export MODEL_PROVIDER=vertex_ai
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
-export VERTEX_PROJECT_ID=my-gcp-project   # optional; defaults to PROJECT_ID
-export VERTEX_LOCATION=us-east4           # optional; defaults to REGION
-cd k8s-operator/scripts && ./provision_04_gcp_iam.sh && ./provision_09_deploy_litellm.sh
+./install.sh \
+  --model-provider=vertex_ai \
+  --model-default-name=gemini-3.5-flash \
+  --vertex-project-id=my-gcp-project \
+  --vertex-location=us-east4   # both Vertex flags optional; default to the install's project/region
 ```
+
+A re-run against an existing install reconciles the switch in one `terraform apply` — the gateway's IAM pair, its KSA, and the rolled ConfigMap land together.
 
 ## vLLM (local models)
 
@@ -116,14 +142,15 @@ The proxy uses a `PersistentVolumeClaim` for the cache so replays survive pod re
 - CI tests against the agent's tool loop where LLM cost or non-determinism would be a problem.
 - Cost containment during development.
 
-Deploy it as part of the provisioner by setting `INFERENCE_REPLAY_ENABLED=true`.
+Deploy it with `make -C k8s-operator deploy-inference-replay` — it is a development tool, never part of the installer.
 
 ## What the agent doesn't care about
 
-The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and provisioning decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
+The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
 
 - Swapping Gemini for Anthropic is a LiteLLM `ConfigMap` change.
-- Turning on replay is a `INFERENCE_REPLAY_ENABLED=true` reprovision.
+- So is [prompt caching](#prompt-caching) — the breakpoints are injected gateway-side, because only the gateway knows which model they are for.
+- Turning on replay is a `make -C k8s-operator deploy-inference-replay` on a dev cluster.
 - Neither touches the agent's persona, skills, or governance layer.
 
 ## Where to go next

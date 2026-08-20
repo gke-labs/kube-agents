@@ -16,6 +16,9 @@ on:
         type: string
         description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -43,6 +46,9 @@ jobs:
   deploy:
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     env:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -103,15 +109,24 @@ jobs:
 
       - name: Perform Agent Redeployment
         env:
-          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
-          REGION: ${{ env.GCP_REGION }}
-          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
           AGENT_IMAGE: "${{ env.AGENT_IMAGE }}"
           IMAGE_TAG: "${{ env.IMAGE_TAG }}"
         run: |
-          echo "Redeploying platform-agent via provision_08 with image: ${AGENT_IMAGE}:${IMAGE_TAG}"
-          cd k8s-operator
-          make gcp-provision-08-deploy ARGS="--no-confirm"
+          # Helm re-tags the agent image on the live release; the operator
+          # reconciles the PlatformAgent CR and rolls the Deployment.
+          # --reset-then-reuse-values keeps the release's own values while
+          # letting the checkout's chart defaults refresh — plain
+          # --reuse-values would snapshot old defaults into the release
+          # config and shadow every later default bump. An
+          # environment without the release predates the Terraform + Helm
+          # engine and needs a one-time re-install from the composition.
+          if ! helm status kube-agents -n kubeagents-system >/dev/null 2>&1; then
+            echo "::error::No Helm release 'kube-agents' in kubeagents-system — this environment predates the Terraform + Helm engine and must be re-installed from terraform/examples/full-install before redeploys can run."
+            exit 1
+          fi
+          echo "Redeploying platform-agent via helm upgrade with image: ${AGENT_IMAGE}:${IMAGE_TAG}"
+          helm upgrade kube-agents charts/kube-agents -n kubeagents-system \
+            --reset-then-reuse-values --set "platformAgent.deployment.image.tag=${IMAGE_TAG}" --wait --timeout 10m
 
       - name: Verify Agent Deployment Rollout
         run: |

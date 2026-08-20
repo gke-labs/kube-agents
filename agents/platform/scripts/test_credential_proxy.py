@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import queue
@@ -17,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import credential_proxy
+import gke_endpoint
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
@@ -499,6 +501,12 @@ class CommandExecutorTest(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        # gke_endpoint memoises "does this gcloud support --dns-endpoint" for the
+        # life of the process, which is right in the sidecar and wrong here: the
+        # first test to reach it caches the answer for a stub gcloud, and every
+        # later test inherits it. Reset so each test decides on its own.
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -779,6 +787,61 @@ class CommandExecutorTest(unittest.TestCase):
 
         self.assertEqual(1, len(seen))
         self.assertFalse(executor._within_workspace(seen[0]))
+
+    # ---- Choosing the control-plane endpoint --------------------------------
+
+    def test_cache_miss_passes_dns_endpoint_when_the_cluster_needs_it(self):
+        # The cold path: a restart empties the state dir, so the proxy refetches
+        # on its own rather than reusing what the agent's get-credentials filed.
+        # A DNS-only cluster has to survive that refetch.
+        executor = self.fake_gcloud(self.executor())
+        pinned = self.caller_kubeconfig(executor)
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--dns-endpoint"]),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor._resolve_kubeconfig(str(pinned))
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertEqual("--dns-endpoint", fetches[0][-1])
+
+    def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
+        # gke_endpoint builds argv starting with the literal "gcloud". In the
+        # sidecar the only gcloud that may run is the resolved executable, so the
+        # adapter has to substitute it.
+        executor = self.fake_gcloud(self.executor())
+        resolved = executor.executables["gcloud"]
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        seen = []
+
+        def fake_args(project, cluster, location, *, run=None, env=None):
+            seen.append(run(["gcloud", "container", "clusters", "describe", cluster]))
+            return []
+
+        with mock.patch("gke_endpoint.dns_endpoint_args", fake_args):
+            executor._dns_endpoint_args(resolved, target)
+
+        self.assertEqual(1, len(seen))
+        # The stub exits non-zero without KUBECONFIG set, which is all this needs
+        # to prove: the adapter ran *something*, and it ran it through _execute.
+        self.assertIsInstance(seen[0], tuple)
+
+    def test_missing_gke_endpoint_falls_back_instead_of_failing_the_fetch(self):
+        # credential_proxy is otherwise stdlib-only. Losing a sibling module must
+        # cost the flag, not the whole credential proxy.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        with mock.patch.dict(sys.modules, {"gke_endpoint": None}):
+            self.assertEqual([], executor._dns_endpoint_args("gcloud", target))
 
     def test_timeout_kills_command(self):
         result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])
@@ -1061,6 +1124,100 @@ class RepositoryValidationTest(unittest.TestCase):
         # The length guard rejects unbounded untrusted input before the regex
         # runs (defense-in-depth against regex denial-of-service).
         self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
+
+
+class GitHubRefreshHandlerTest(unittest.TestCase):
+    """A failed refresh splits its diagnosis: detail to the log, none to the reply.
+
+    The reply crosses back into the agent sandbox and the caller renders the
+    resulting reason code into a chat room, so it stays output-free. The
+    helper's stderr carries the broker's actual refusal and is the only thing
+    an operator has to read, so it has to reach the sidecar's own log.
+    """
+
+    def _refresh(self, result):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        body = json.dumps({"repository": "gke-agentic/adamparco-infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(execute_internal=lambda argv: result)
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            handler._handle_github_refresh()
+        return replies, logs.output
+
+    @staticmethod
+    def _failure(stderr):
+        return credential_proxy.ExecutionResult(
+            exit_code=1,
+            stdout="",
+            stderr=stderr,
+            duration_ms=5,
+            truncated=False,
+            timed_out=False,
+        )
+
+    def test_logs_broker_refusal_but_keeps_it_out_of_the_reply(self):
+        refusal = "Minty returned error (HTTP 403): installation not found"
+        replies, logs = self._refresh(self._failure(refusal + "\n"))
+
+        self.assertIn(refusal, "\n".join(logs))
+        self.assertEqual(
+            replies,
+            [(HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"})],
+        )
+        self.assertNotIn(refusal, json.dumps(replies[0][1]))
+
+    def test_truncates_oversized_stderr(self):
+        # `_execute` bounds output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
+        # default, which is not a log line -- and this path runs on every failed
+        # cron tick.
+        _, logs = self._refresh(self._failure("x" * 5000))
+
+        detail = logs[0].split("GitHub credential refresh exited 1: ", 1)[1]
+        self.assertEqual(detail, "x" * 1000)
+
+    def test_omits_the_detail_when_stderr_is_empty(self):
+        _, logs = self._refresh(self._failure("   \n"))
+
+        self.assertTrue(logs[0].endswith("GitHub credential refresh exited 1"))
+
+    def test_redacts_token_shapes_out_of_the_detail(self):
+        token = "ghs_" + "A" * 36
+        _, logs = self._refresh(self._failure(f"HTTP 403 echoed {token} back"))
+
+        self.assertNotIn(token, logs[0])
+        self.assertIn("[REDACTED]", logs[0])
+
+    def test_redacts_before_truncating(self):
+        # Truncating first would slice a token in half and leave the prefix in
+        # the log, where the shape no longer matches.
+        token = "ghs_" + "B" * 36
+        _, logs = self._refresh(self._failure("y" * 990 + token))
+
+        self.assertNotIn("ghs_", logs[0])
+        self.assertNotIn("B" * 20, logs[0])
+
+
+class RedactCredentialsTest(unittest.TestCase):
+    def test_redacts_github_and_jwt_shapes(self):
+        for secret in (
+            "ghs_" + "a" * 36,
+            "ghp_" + "b" * 36,
+            "github_pat_" + "c" * 30,
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlX2hlcmU",
+        ):
+            with self.subTest(secret=secret):
+                self.assertEqual(
+                    credential_proxy.redact_credentials(f"before {secret} after"),
+                    "before [REDACTED] after",
+                )
+
+    def test_leaves_ordinary_diagnostics_alone(self):
+        message = "Minty returned error (HTTP 403): installation not found"
+        self.assertEqual(credential_proxy.redact_credentials(message), message)
 
 
 class GoogleChatRelayTest(unittest.TestCase):

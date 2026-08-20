@@ -316,9 +316,9 @@ type profileConfig struct {
 // Any other read error — permissions, I/O — is not something a restart will
 // fix, so those degrade rather than crashloop forever.
 //
-// Finding none is not an error either. A single-cluster install has no Cluster
-// Agent profiles at all — reconcile only creates them for clusters other than
-// the management one — so an empty result is a normal steady state, not a
+// Finding none is not an error either. A freshly installed harness has no
+// Cluster Agent profiles until the first cluster-agent-reconcile tick creates
+// them, so an empty result is a normal startup state rather than a
 // misconfiguration. The caller decides whether the combined watch set is empty.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
 	entries, err := os.ReadDir(dir)
@@ -488,7 +488,7 @@ func useGoogleTokenSource(cfg *rest.Config, ts oauth2.TokenSource) {
 // cluster_agent_profile.read_cluster_identity treats as absent. A config.yaml
 // that exists but cannot be parsed is a real error.
 func readClusterIdentity(path string) (*clusterIdentity, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- Path to profile config file supplied via flag / discovery
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -863,13 +863,50 @@ func realMain(argv []string) error {
 //     Absent --profiles-dir this is the only source, which is the original
 //     single-cluster behavior.
 //
-// The operator passes both. The management cluster never gets a Cluster Agent
-// profile — cluster_agent_reconcile.py excludes it, and prunes one if it ever
-// appears — but it runs the platform agent itself, so watching only the
-// profiles would silently stop monitoring the very cluster whose failure
-// breaks everything else.
+// The operator passes both, and the management cluster is reached through both:
+// it runs the platform agent, so --in-cluster covers it from the first second of
+// a fresh install, and cluster_agent_reconcile.py now also gives it a Cluster
+// Agent profile like every other cluster in the project.
+//
+// Which means the two sources overlap, and the overlap has to be resolved here.
+// Each watched cluster gets its OWN dedup cache (see the loop in run), and
+// EventKey is (UID, reason) with no cluster in it, so two entries for one
+// cluster are not deduplicated anywhere downstream: the same pod crash would
+// raise two alerts, open two sessions, and burn two slots of the daily ceiling.
+//
+// The two entries are not interchangeable, so which one survives matters. The
+// profile carries the project/location/cluster identity that stamps the payload
+// and labels every metric; the direct entry knows only a name. But the profile
+// also carries a credential that can be refused: it authenticates as the GSA
+// through a get-credentials kubeconfig, so a permission set without
+// roles/container.viewer, or master authorized networks that exclude the pod's
+// egress, denies it. The direct entry uses the pod's own service account against
+// kubernetes.default.svc and never leaves the cluster.
+//
+// Nothing here would notice the difference. discoverClusterProfiles builds a
+// client without contacting an API server, so a profile displaces on the
+// strength of a well-formed kubeconfig and the credential is not exercised until
+// the informer's initial list — by which time the entry it displaced is gone. On
+// a single-cluster install that leaves a watch set of one, and a watch set of one
+// that never syncs trips the initialSyncGrace check in run: the process exits and
+// the pod crashloops watching nothing. On a fleet it is quieter and worse — the
+// peers sync, nothing restarts, and the one cluster whose failure breaks
+// everything else is silently unmonitored.
+//
+// So the direct entry wins and takes the profile's identity triple with it.
+// Reachability is the half that cannot be reconstructed; project and location are
+// the half that can. The profile is untouched — it is still the agent that
+// answers the triage, it is just not how the events are read.
+//
+// Unless the name is ambiguous. The direct entry can only match on the bare
+// name, and two profiles can share one, so a collision makes the match a guess:
+// the watch set then keeps every profile and drops the direct entry instead.
 func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, error) {
 	var clusters []targetCluster
+	// Cluster name -> every profile with that name. A slice because the name is
+	// not unique: GKE names are unique per (project, location), so one project
+	// with two regions is enough to collide.
+	profilesNamed := make(map[string][]targetCluster)
 
 	if f.profilesDir != "" {
 		discovered, err := discoverClusterProfiles(ctx, f.profilesDir, m)
@@ -877,9 +914,12 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			return nil, err
 		}
 		if len(discovered) == 0 {
-			// Normal for a single-cluster install: reconcile only creates
-			// profiles for clusters other than the management one.
+			// Normal before the first reconcile tick of a fresh install, and
+			// the reason --in-cluster is still passed at all.
 			log.Printf("k8s-event-watcher: no Cluster Agent profiles in %s (nothing to fan out to yet)", f.profilesDir)
+		}
+		for _, tc := range discovered {
+			profilesNamed[tc.Name] = append(profilesNamed[tc.Name], tc)
 		}
 		clusters = append(clusters, discovered...)
 	}
@@ -887,21 +927,66 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 	// Add the directly-reachable cluster when asked for explicitly, or when
 	// --profiles-dir was not given at all (the single-cluster default).
 	if f.profilesDir == "" || f.inCluster || f.kubeconfig != "" {
-		client, err := buildKubeClient(f)
-		if err != nil {
-			return nil, err
+		// Matched on the bare name: --in-cluster reads no cluster_identity, so
+		// there is no triple to compare.
+		candidates := profilesNamed[f.clusterName]
+		if len(candidates) > 1 {
+			// Ambiguous, so absorb nothing and add no direct entry. Picking one
+			// would unwatch the other cluster and stamp this one with its
+			// location, and the duplicate would survive through the profile not
+			// picked. Safe only here: two or more profiles means the watch set
+			// cannot be the single never-syncing entry initialSyncGrace guards.
+			log.Printf("k8s-event-watcher: %d profiles are named %q (%s) and the in-cluster client cannot say which one it is; watching them through their profiles and adding no direct entry",
+				len(candidates), f.clusterName, identities(candidates))
+		} else {
+			// Profile stays "direct" whether or not a profile was absorbed: it is
+			// the per-cluster filename for dedup snapshots, and every install
+			// already on disk has this cluster's cache under that name. Renaming
+			// it would silently resume from an empty cache after an upgrade.
+			direct := targetCluster{Name: f.clusterName, Profile: "direct"}
+			if len(candidates) == 1 {
+				covered := candidates[0]
+				clusters = removeProfile(clusters, covered.Profile)
+				direct.ProjectID, direct.Location = covered.ProjectID, covered.Location
+				log.Printf("k8s-event-watcher: %s is covered by profile %s and by the direct client; watching it once, directly, as %s (the pod's own credential cannot be denied by IAM or by master authorized networks)",
+					f.clusterName, covered.Profile, direct.identity())
+			}
+			client, err := buildKubeClient(f)
+			if err != nil {
+				return nil, err
+			}
+			direct.Client = client
+			clusters = append(clusters, direct)
 		}
-		clusters = append(clusters, targetCluster{
-			Name:    f.clusterName,
-			Profile: "direct",
-			Client:  client,
-		})
 	}
 
 	if len(clusters) == 0 {
 		return nil, fmt.Errorf("no clusters to watch: %s contained no Cluster Agent profiles and neither --in-cluster nor --kubeconfig was given", f.profilesDir)
 	}
 	return clusters, nil
+}
+
+// identities renders clusters as "profile=project/location/name" for a log line.
+func identities(clusters []targetCluster) string {
+	parts := make([]string, 0, len(clusters))
+	for _, tc := range clusters {
+		parts = append(parts, tc.Profile+"="+tc.identity())
+	}
+	return strings.Join(parts, ", ")
+}
+
+// removeProfile drops the entry discovered from profile, preserving the order of
+// the rest. Profile directory names are unique by construction (the Python side
+// derives them from the whole project/location/cluster triple), so this removes
+// exactly one entry.
+func removeProfile(clusters []targetCluster, profile string) []targetCluster {
+	kept := make([]targetCluster, 0, len(clusters))
+	for _, tc := range clusters {
+		if tc.Profile != profile {
+			kept = append(kept, tc)
+		}
+	}
+	return kept
 }
 
 // runSnapshotLoop periodically triggers a cache persistence snapshot.

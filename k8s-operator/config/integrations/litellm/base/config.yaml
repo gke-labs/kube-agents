@@ -10,3 +10,32 @@ model_list:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
 litellm_settings:
   callbacks: ["otel", "prometheus"]
+# Prompt caching, injected gateway-side so the agent config stays free of model
+# identity. Hermes reaches us as `provider: custom` on the OpenAI wire asking
+# for "model-default", and its own Anthropic cache_control layout only engages
+# for a Claude-named model on the Anthropic wire — so on an Anthropic-family
+# backend every turn re-prefilled the entire prompt. One 45-call agent session
+# measured 3.5M input tokens with zero cache reads before this block.
+#
+# The system prompt takes the 1h tier: it is the largest static span, every
+# profile and cron tick shares it, and a read refreshes the TTL, so half-hourly
+# cron traffic keeps it warm instead of missing a 5m window every time. The two
+# rolling points ride the conversation tail on the default 5m tier.
+#
+# Anthropic allows four breakpoints per request. LiteLLM counts client-supplied
+# ones and never overwrites them, so a caller that sends its own layout still
+# wins. Non-Anthropic backends drop the markers in their provider transforms —
+# gemini and gemma routes answer 200 with unchanged token counts, and their
+# implicit caching is untouched.
+router_settings:
+  default_litellm_params:
+    cache_control_injection_points:
+      - location: message
+        role: system
+        control:
+          type: ephemeral
+          ttl: 1h
+      - location: message
+        index: -3
+      - location: message
+        index: -1

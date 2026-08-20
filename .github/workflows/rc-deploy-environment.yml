@@ -1,6 +1,10 @@
 name: RC Step 2 - Deploy Environment
 
+permissions:
+  contents: read
+
 on:
+  #checkov:skip=CKV_GHA_7:Standalone launch requires release candidate tag or commit SHA input
   workflow_dispatch:
     inputs:
       rc_tag:
@@ -68,6 +72,7 @@ jobs:
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
@@ -106,6 +111,7 @@ jobs:
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
