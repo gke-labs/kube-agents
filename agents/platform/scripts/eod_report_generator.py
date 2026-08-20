@@ -70,25 +70,6 @@ def excluded_namespaces() -> FrozenSet[str]:
     return frozenset(ns.strip() for ns in raw.split(",") if ns.strip())
 
 
-def min_event_count() -> int:
-    """Group-level threshold below which a workload is not listed.
-
-    Applied after grouping, not per row: it is a threshold on how much noise a
-    workload made today, so a workload that tripped ten times is over a
-    threshold of three even though no single row is. A non-integer or negative
-    value falls back to the default rather than failing the run, because this
-    job's stdout is the chat message and a traceback reaches nobody.
-    """
-    raw = os.getenv("EOD_MIN_EVENT_COUNT")
-    if not raw:
-        return 1
-    try:
-        return max(int(raw), 1)
-    except ValueError:
-        sys.stderr.write(f"Warning: EOD_MIN_EVENT_COUNT={raw!r} is not an integer; using 1\n")
-        return 1
-
-
 def default_db_paths() -> List[str]:
     """Where to look for the session KV database, most authoritative first.
 
@@ -349,7 +330,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     of the fleet.
     """
 
-    min_count = min_event_count()
     exclude_ns = excluded_namespaces()
 
     total_occurrences = 0
@@ -509,17 +489,10 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # `notified = 1`, so nothing this version produces reaches the else-branch
     # — which is the point. The listing has one subject and the three lines
     # about it agree.
-    #
-    # min_event_count is applied after grouping, not per row: it is a threshold
-    # on how much noise a workload made today, and a workload that tripped ten
-    # times is over a threshold of three even though no single row is.
     filtered_entries = [
         e
         for e in workload_map.values()
-        if not e["excluded"]
-        and e["severity"] in LISTED_SEVERITIES
-        and not e["notified"]
-        and e["count"] >= min_count
+        if not e["excluded"] and e["severity"] in LISTED_SEVERITIES and not e["notified"]
     ]
 
     # Aggregated; counted in the report, never itemised in it.
@@ -535,20 +508,12 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     #
     # `EOD_EXCLUDE_NAMESPACES` deliberately does not apply to either: that filter drops
     # routine churn from the breakdown, and an alert nobody received is not churn.
-    #
-    # Thresholded on `cap_dropped_count`, not on `count`: against the group total a
-    # workload with one withheld alert and nine delivered ones would clear a
-    # threshold of five on the strength of nine events that are not withheld.
-    cap_dropped_entries = [
-        e
-        for e in workload_map.values()
-        if e["cap_dropped"] and e["cap_dropped_count"] >= min_count
-    ]
+    cap_dropped_entries = [e for e in workload_map.values() if e["cap_dropped"]]
 
-    # No `min_event_count` either, and for a stronger reason than the ceiling has:
-    # a ceiling drop is still counted by `k8s_event_watcher_events_quota_suppressed_total`
-    # and `GET /v1/alert-quota`, whereas nothing anywhere counts a failed delivery —
-    # the alert is not in chat and the metric recorded it as sent. The ledger's
+    # Letting the namespace filter reach this one would be worse still: a ceiling drop
+    # is counted by `k8s_event_watcher_events_quota_suppressed_total` and
+    # `GET /v1/alert-quota`, whereas nothing anywhere counts a failed delivery — the
+    # alert is not in chat and the metric recorded it as sent. The ledger's
     # `delivery_error` column is the only trace, and this list is the only thing
     # that reads it.
     delivery_failed_entries = [e for e in workload_map.values() if e["delivery_failed"]]
@@ -816,9 +781,9 @@ def generate_markdown_report(
         # two classes this recap does not report. That is the whole point: the
         # claim is about the fleet, not about the recap's subject, so a day the
         # ceiling ate 30 Criticals stays silent rather than printing an all-clear
-        # over them. `suppressed` is in the condition for the same reason, since
-        # the closing 📉 total reports events `min_event_count` kept out of the
-        # listing.
+        # over them. `suppressed` is in the condition rather than `entry_count`
+        # for the same reason: the listing is cut at `_ENTRY_LIMIT`, so a day with
+        # informational events can still be a day this section does not name.
         #
         # The wording claims only what was measured, which is the ledger and
         # not the watcher. SOP: "What the ✅ all-clear does and does not claim".

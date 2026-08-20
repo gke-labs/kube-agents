@@ -2376,8 +2376,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// notifications the session server posts in a day and nothing else. A
 	// path, a credential or an image reference would not.
 	//
-	// The two EOD_* names are the end-of-day recap's only tunables. They
-	// narrow what its listing prints and reach nothing the notifier does: no
+	// EOD_EXCLUDE_NAMESPACES is the end-of-day recap's only tunable. It
+	// narrows what its listing prints and reaches nothing the notifier does: no
 	// event stops being forwarded, no alert stops being posted, and a ceiling
 	// drop or a failed delivery in an excluded namespace is still counted and
 	// still withholds the recap's all-clear — `eod_report_generator.py` flags
@@ -2396,15 +2396,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// informational churn; the two alert tallies above are what an operator
 	// setting this variable cannot touch.
 	//
-	// A value that is not a namespace list or an integer is warned about on
-	// stderr and ignored, so the worst an arbitrary one can do is leave the
-	// defaults in place.
+	// Any value parses: `excluded_namespaces` comma-splits the string and
+	// matches the parts literally, so an arbitrary one names namespaces that do
+	// not exist and excludes nothing. There is no validation to fail.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
-		"EOD_MIN_EVENT_COUNT":         {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},

@@ -216,11 +216,7 @@ those two counts rather than printed always: a delivered alert also sits in the 
 the listing, but "_N alerts_ went to chat" in the sentence above already accounts for it, and a note
 printed every day is read on none of them.
 
-Neither filter reaches those counts. `min_event_count` applies to the listing only, and where it
-does apply it measures the withheld rows rather than the group's total: a group is one
-cluster/namespace/workload/reason/severity key and may hold rows with different outcomes, so a
-workload with one withheld alert and nine delivered ones would otherwise clear a threshold of five
-on the strength of nine events that were not withheld. `EOD_EXCLUDE_NAMESPACES` removes a namespace from
+The filter does not reach those counts. `EOD_EXCLUDE_NAMESPACES` removes a namespace from
 the workload breakdown, the headline counts and the closing informational total, and **the two alert
 tallies are exempt from it**: a ceiling drop or a failed delivery in an excluded namespace is counted
 and still vetoes the ✅ and the 🟢. `kube-system` ships in the exclusion list and the watcher forwards
@@ -254,15 +250,14 @@ different session database, and `--cluster-name` overrides the name resolved fro
 `GKE_CLUSTER_NAME`. With no `--db`, the script reads `SESSION_KV_DB_PATH` — the same variable
 `session_kv_server.py` and the operator use — before falling back to the packaged path.
 
-The two filters are environment variables on the agent container:
+The filter is an environment variable on the agent container:
 
-| Variable                 | Default                                   | Effect                                                      |
-| ------------------------ | ----------------------------------------- | ----------------------------------------------------------- |
-| `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing.           |
-| `EOD_MIN_EVENT_COUNT`    | `1`                                       | Groups below it are dropped from the listing, not the veto. |
+| Variable                 | Default                                   | Effect                                            |
+| ------------------------ | ----------------------------------------- | ------------------------------------------------- |
+| `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing. |
 
-Set them the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR,
-under `spec.deployment.env`:
+Set it the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR, under
+`spec.deployment.env`:
 
 ```yaml
 spec:
@@ -270,14 +265,12 @@ spec:
     env:
       - name: EOD_EXCLUDE_NAMESPACES
         value: kube-system,kube-public,kube-node-lease,istio-system
-      - name: EOD_MIN_EVENT_COUNT
-        value: "5"
 ```
 
 **The CR is the only route that works, and this is why.** Environment on that container is rendered
 by the operator and filtered through `safeSandboxEnvOverrides`, an allowlist — a name that is not on
 it is dropped with no error, no event and no status condition, so the edit appears to succeed and
-changes nothing. Both `EOD_*` names are on it. Editing the Deployment with `kubectl set env` is not
+changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the Deployment with `kubectl set env` is not
 a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
 Deployment from the CR and reverts it.
 

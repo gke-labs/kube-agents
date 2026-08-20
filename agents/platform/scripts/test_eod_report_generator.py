@@ -37,16 +37,6 @@ from eod_report_generator import (
 )
 
 
-def min_count(value):
-    """Raise the listing threshold for the duration of a `with` block.
-
-    The threshold is read from `EOD_MIN_EVENT_COUNT` at each call rather than
-    held in a config object, so a test that wants a different one patches the
-    environment the same way production sets it.
-    """
-    return mock.patch.dict(os.environ, {"EOD_MIN_EVENT_COUNT": str(value)})
-
-
 def exclude(*namespaces):
     """Replace the excluded-namespace set for the duration of a `with` block."""
     return mock.patch.dict(os.environ, {"EOD_EXCLUDE_NAMESPACES": ",".join(namespaces)})
@@ -258,16 +248,6 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertIn("*0 alerts* went to chat", report)
         self.assertIn("*9 informational events* held back from chat in this window", report)
 
-    def test_the_held_back_total_survives_a_day_with_nothing_listable(self):
-        """Zero listed groups must not mean zero accounting for what was held back."""
-        with min_count(999):
-            summary = filter_and_aggregate_events([event(severity="Info", notified=False)])
-        report = generate_markdown_report(summary)
-        self.assertIn("*1 informational event* held back from chat in this window", report)
-        # And the all-clear must not appear two lines above that total, which
-        # is the contradiction the `suppressed` term in its condition prevents.
-        self.assertNotIn("Nothing was held back from chat in this window", report)
-
     def test_a_cap_dropped_alert_is_not_an_informational_event(self):
         """`notified = 0` covers two outcomes; counting them as one hides alerts.
 
@@ -382,22 +362,6 @@ class TestEODWatcherRecap(unittest.TestCase):
             report.index("Forwarded"),
         )
 
-    def test_the_veto_survives_a_threshold_that_lists_nothing(self):
-        """`min_event_count` filters the listing, and must not filter the veto.
-
-        Gating the ✅ on `cap_dropped_entries` rather than the count would move
-        the same denial behind the threshold.
-        """
-        events = [event(notified=False) for _ in range(2)]
-        with min_count(5):
-            summary = filter_and_aggregate_events(events)
-        report = generate_markdown_report(summary, cluster_name="test-cluster")
-
-        self.assertEqual(summary["cap_dropped"], 2)
-        self.assertEqual(summary["cap_dropped_entries"], [])
-        self.assertNotIn("Nothing was held back from chat in this window", report)
-        self.assertNotIn("🟢", report)
-
     def test_an_unreadable_ledger_is_not_a_quiet_day_either(self):
         """An unopened table measures nothing, so it cannot clear the day.
 
@@ -448,15 +412,6 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertEqual(summary["total_occurrences"], 1)
         self.assertEqual(summary["unique_incidents"], 1)
         self.assertEqual(summary["forwarded"], 1)
-
-    def test_min_event_count_applies_to_the_grouped_total(self):
-        """Twelve forwarded events for one workload clear a threshold of ten."""
-        events = [listed() for _ in range(12)]
-        with min_count(10):
-            summary = filter_and_aggregate_events(events)
-
-        self.assertEqual(len(summary["entries"]), 1)
-        self.assertEqual(summary["entries"][0]["count"], 12)
 
     def test_ledger_workload_names_are_used_as_stored(self):
         """The server already stripped the replica hash; a second pass merges services.
@@ -1025,20 +980,6 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
         self.assertNotIn("🟢", report)
         self.assertIn("📊", report)
 
-    def test_the_undelivered_tally_ignores_the_noise_threshold(self):
-        """`min_event_count` is a threshold on routine churn.
-
-        One undelivered Critical is not churn. The aggregate keeps it whatever
-        the threshold says, because it is what vetoes the all-clear.
-        """
-        with min_count(5):
-            summary = filter_and_aggregate_events([self.undelivered()])
-
-        self.assertEqual(summary["delivery_failed"], 1)
-        self.assertEqual(len(summary["delivery_failed_entries"]), 1)
-        report = generate_markdown_report(summary, cluster_name="test-cluster")
-        self.assertNotIn("Nothing was held back from chat in this window", report)
-
     def test_a_delivered_alert_is_unaffected(self):
         """The control. Without it every assertion above passes on a no-op."""
         summary = filter_and_aggregate_events([event(notified=True)])
@@ -1164,10 +1105,9 @@ class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
 
     `cap_dropped` and `delivery_failed` are ORs over the same rows, so one
     withheld alert in a group of ten delivered ones marks the whole group. The
-    recap no longer renders these, but the per-group counts are still what
-    `min_event_count` is measured against, so a group total standing in for the
-    withheld subtotal still admits rows on the strength of events that were
-    delivered.
+    recap does not render these, so the per-group subtotals are the only place
+    the distinction between "this group holds a withheld alert" and "how many"
+    survives.
     """
 
     def test_the_undelivered_subtotal_counts_only_the_undelivered_rows(self):
@@ -1201,31 +1141,6 @@ class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
         self.assertEqual(len(summary["cap_dropped_entries"]), 1)
         self.assertEqual(summary["cap_dropped_entries"][0]["cap_dropped_count"], 1)
         self.assertEqual(summary["cap_dropped_entries"][0]["count"], 1)
-
-    def test_the_threshold_measures_the_withheld_rows_too(self):
-        """`min_event_count` asks how much of the measured thing there was.
-
-        Against the group total, one withheld alert rides in on nine delivered
-        events that are not withheld.
-        """
-        events = [event(notified=True) for _ in range(9)]
-        events.append(event(notified=False))
-
-        with min_count(5):
-            summary = filter_and_aggregate_events(events)
-
-        self.assertEqual(summary["cap_dropped"], 1)
-        self.assertEqual(summary["cap_dropped_entries"], [])
-
-    def test_a_group_that_is_wholly_withheld_still_clears_the_threshold(self):
-        """The control: the threshold must still admit a genuinely noisy group."""
-        with min_count(5):
-            summary = filter_and_aggregate_events(
-                [event(notified=False) for _ in range(6)]
-            )
-
-        self.assertEqual(len(summary["cap_dropped_entries"]), 1)
-        self.assertEqual(summary["cap_dropped_entries"][0]["cap_dropped_count"], 6)
 
 
 class TestTheListingIsFixedToInfo(unittest.TestCase):
@@ -1684,27 +1599,11 @@ class TestTheEnvironmentKnobsFailSoft(unittest.TestCase):
                 eod_report_generator.excluded_namespaces(),
                 frozenset({"kube-system", "kube-public", "kube-node-lease"}),
             )
-            self.assertEqual(eod_report_generator.min_event_count(), 1)
 
     def test_an_empty_exclusion_list_excludes_nothing(self):
         """`""` means "exclude nothing", which is not the same as saying nothing."""
         with exclude(""):
             self.assertEqual(eod_report_generator.excluded_namespaces(), frozenset())
-
-    def test_a_non_integer_threshold_warns_and_falls_back(self):
-        stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"EOD_MIN_EVENT_COUNT": "ten"}), \
-                mock.patch.object(eod_report_generator.sys, "stderr", stderr):
-            self.assertEqual(eod_report_generator.min_event_count(), 1)
-            report = self.render()
-
-        self.assertIn("EOD_MIN_EVENT_COUNT", stderr.getvalue())
-        # The warning goes to stderr and the recap still reaches chat.
-        self.assertIn("Daily Activity Recap", report)
-
-    def test_a_threshold_below_one_is_clamped(self):
-        with min_count(0):
-            self.assertEqual(eod_report_generator.min_event_count(), 1)
 
     def test_whitespace_around_a_namespace_is_ignored(self):
         with mock.patch.dict(os.environ, {"EOD_EXCLUDE_NAMESPACES": " prod , , staging "}):

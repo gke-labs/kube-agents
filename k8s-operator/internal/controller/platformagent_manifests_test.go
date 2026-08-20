@@ -1029,15 +1029,14 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 }
 
 func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
-	// These two are the end-of-day recap's whole configuration surface — the
-	// script reads them from the environment on every run and there is no
-	// config file behind them. Off the allowlist, the SOP's documented
-	// override renders, validates, and silently does nothing, and a fleet
-	// whose noisy namespace is not one of the three shipped exclusions has no
-	// supported way to quiet it.
+	// This is the end-of-day recap's whole configuration surface — the script
+	// reads it from the environment on every run and there is no config file
+	// behind it. Off the allowlist, the SOP's documented override renders,
+	// validates, and silently does nothing, and a fleet whose noisy namespace
+	// is not one of the three shipped exclusions has no supported way to quiet
+	// it.
 	custom := []corev1.EnvVar{
 		{Name: "EOD_EXCLUDE_NAMESPACES", Value: "kube-system,istio-system"},
-		{Name: "EOD_MIN_EVENT_COUNT", Value: "5"},
 		{Name: "GKE_CLUSTER_NAME", Value: "impostor"},
 		{
 			Name: "EOD_EXCLUDE_NAMESPACES",
@@ -1059,9 +1058,6 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 
 	if values["EOD_EXCLUDE_NAMESPACES"] != "kube-system,istio-system" {
 		t.Errorf("expected the recap's namespace filter to be overridable, got %q", values["EOD_EXCLUDE_NAMESPACES"])
-	}
-	if values["EOD_MIN_EVENT_COUNT"] != "5" {
-		t.Errorf("expected the recap's group threshold to be overridable, got %q", values["EOD_MIN_EVENT_COUNT"])
 	}
 	// The recap resolves its own cluster name; letting the CR relabel every
 	// row would make one cluster's noise read as another's.
