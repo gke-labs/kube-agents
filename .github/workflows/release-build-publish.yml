@@ -16,7 +16,10 @@ jobs:
   # ─── GATE 1: Static, OSV Security & Code Verification ────────────────────────
   gate-1-static-build-verification:
     name: "Gate 1: Static, Security & Build Verification"
+    if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,8 +56,11 @@ jobs:
   # ─── GATE 2: Packaging (.tar.gz, .tgz, .zip, Helm & SBOM) ───────────────────
   gate-2-packaging-verification:
     name: "Gate 2: Container, Helm, Archive & SBOM Packaging"
+    if: github.repository == 'gke-labs/kube-agents'
     needs: gate-1-static-build-verification
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -127,8 +133,11 @@ jobs:
   # ─── GATE 3: Ephemeral E2E & Smoke Test Suite ────────────────────────────────
   gate-3-e2e-smoke-tests:
     name: "Gate 3: Ephemeral E2E Smoke Tests"
+    if: github.repository == 'gke-labs/kube-agents'
     needs: gate-2-packaging-verification
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -184,6 +193,7 @@ jobs:
   # ─── PUBLISH: GitHub Release & Artifact Distribution ─────────────────────────
   create-github-release:
     name: "Publish Official GA Release"
+    if: github.repository == 'gke-labs/kube-agents'
     needs:
       [
         gate-1-static-build-verification,
