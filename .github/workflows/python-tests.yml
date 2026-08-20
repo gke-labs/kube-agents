@@ -46,8 +46,9 @@ jobs:
 
   # Report-only for now: it posts numbers on the pull request and blocks
   # nothing. The blocking rules (diff-coverage floor, no-test detector, total
-  # ratchet) turn on in later stages once a baseline of merged-PR data exists;
-  # docs/designs/testing-implementation-plan.md section 2.7 is the schedule.
+  # ratchet) turn on in stages once a baseline of merged-PR data exists --
+  # first the no-test detector, then the floor and the ratchet, with the
+  # thresholds set from the observed distribution rather than this file.
   coverage:
     name: Coverage report
     runs-on: ubuntu-latest
@@ -67,6 +68,11 @@ jobs:
           # diff-cover diffs against the merge base, which a shallow clone
           # does not have.
           fetch-depth: 0
+          # Nothing after checkout needs git credentials (diff-cover diffs
+          # locally, gh reads GH_TOKEN from the env), and this job executes
+          # the pull request's own Makefile and tests -- don't leave a token
+          # on disk for them to read.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -105,7 +111,13 @@ jobs:
       # One sticky comment rewritten in place, never a new comment per push.
       # Plain gh api rather than a third-party action: the logic is ten lines,
       # and it is one less pinned SHA to keep current.
+      #
+      # Same-repo pull requests only: on a fork PR GitHub forces the token to
+      # read-only whatever `permissions:` asks for, so the POST would 403 and
+      # red a job whose whole point is to block nothing. Fork PRs get the
+      # artifact upload below instead.
       - name: Post the coverage comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -120,14 +132,31 @@ jobs:
             echo
             echo "Repository total (Python): **${total}%**"
             echo
-            cat diff-cover.md
+            # GitHub caps a comment body at 65,536 characters; a huge PR's
+            # diff-cover table can exceed it, and a 422 here reds the job.
+            head -c 60000 diff-cover.md
             echo
             echo "_Report-only: nothing here blocks this pull request yet._"
           } > comment.md
+          # Only consider comments this workflow's identity wrote: anyone can
+          # start a comment with the marker, and PATCHing theirs would render
+          # the report under their name.
           cid=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+                --jq ".[] | select(.user.login == \"github-actions[bot]\")
+                          | select(.body | startswith(\"$marker\")) | .id" | head -1)
           if [ -n "$cid" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@comment.md
           else
             gh api "repos/$REPO/issues/$PR/comments" -F body=@comment.md
           fi
+
+      # The fork-PR (and belt-and-braces same-repo) copy of the report.
+      - name: Upload the diff coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diff-cover-report
+          path: |
+            diff-cover.md
+            coverage.xml
+          if-no-files-found: ignore

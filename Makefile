@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check tf-apply tf-destroy
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check tf-apply tf-destroy coverage coverage-check
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -213,6 +213,10 @@ COVERAGE_DIR := .coverage-data
 coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
 	@rm -rf $(COVERAGE_DIR) coverage.xml coverage-go.xml
 	@mkdir -p $(COVERAGE_DIR)
+	@if [ -z "$(strip $(PYTHON_TEST_DIRS))" ]; then \
+		echo "ERROR: PYTHON_TEST_DIRS expanded to nothing; the globs above are stale."; \
+		exit 1; \
+	fi
 	@failed=""; \
 	for dir in $(PYTHON_TEST_DIRS); do \
 		echo "==> $$dir"; \
@@ -229,7 +233,7 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
 		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o coverage.xml
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
-		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | tail -1
+		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | grep '^TOTAL'
 # The Go half is best-effort: it needs gocover-cobertura for the XML diff-cover
 # reads, and the operator's envtest binaries to run at all. CI skips it with
 # COVERAGE_SKIP_GO=1 because k8s-operator-test.yml already runs that suite.
