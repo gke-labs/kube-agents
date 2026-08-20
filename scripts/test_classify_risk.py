@@ -8,6 +8,7 @@ Run: cd scripts && python3 -m unittest test_classify_risk
 import json
 import os
 import unittest
+import urllib.error
 
 import classify_risk
 
@@ -103,6 +104,18 @@ class RuleTriggerTest(unittest.TestCase):
         self.assertIsNone(classify_risk.rule_trigger(rule, mixed))
         self.assertIsNone(classify_risk.rule_trigger(rule, []))
 
+    def test_rename_is_classified_by_both_paths(self):
+        # Renaming a workflow into docs/ must not buy the low tier.
+        rename = {
+            "filename": "docs/site/src/old-ci.txt",
+            "status": "renamed",
+            "previous_filename": ".github/workflows/ci.yml",
+        }
+        high = {"id": "hi", "tier": "high", "why": "w", "match": [".github/workflows/**"]}
+        low = {"id": "lo", "tier": "low", "why": "w", "only_match": ["docs/site/**"]}
+        self.assertEqual(classify_risk.rule_trigger(high, [rename]), ["docs/site/src/old-ci.txt"])
+        self.assertIsNone(classify_risk.rule_trigger(low, [rename]))
+
     def test_all_of_requires_every_group(self):
         rule = {
             "id": "x",
@@ -138,6 +151,21 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(result["default_applied"])
         self.assertEqual(result["rules"], [])
 
+    def test_incomplete_file_list_never_reaches_low(self):
+        # The API stops at 3000 files; only_match over a truncated list would
+        # be a claim about files nobody read.
+        config = _config({"id": "lo", "tier": "low", "why": "w", "only_match": ["docs/site/**"]})
+        files = [_file("docs/site/src/a.md")]
+        self.assertEqual(classify_risk.classify(config, files, complete=True)["tier"], "low")
+        self.assertEqual(classify_risk.classify(config, files, complete=False)["tier"], "medium")
+
+    def test_rule_file_list_is_capped_but_counted(self):
+        config = _config({"id": "lo", "tier": "low", "why": "w", "only_match": ["docs/site/**"]})
+        files = [_file(f"docs/site/src/{i}.md") for i in range(60)]
+        entry = classify_risk.classify(config, files)["rules"][0]
+        self.assertEqual(len(entry["files"]), classify_risk.RULE_FILES_LISTED)
+        self.assertEqual(entry["file_count"], 60)
+
 
 class DeclaredTierTest(unittest.TestCase):
     BODY = "## Summary\n\nwords\n\n## Risk & Rollout\n\n%s\n"
@@ -171,6 +199,24 @@ class DeclaredTierTest(unittest.TestCase):
     def test_crlf_body_parses(self):
         body = (self.BODY % "Low risk, nothing at runtime.").replace("\n", "\r\n")
         self.assertEqual(classify_risk.declared_tier(body), "low")
+
+    def test_unedited_template_comment_declares_nothing(self):
+        # The template's own HTML comment contains "Low risk, no runtime code
+        # paths touched"; leaving it in place is not a declaration.
+        body = self.BODY % (
+            '<!--\nBlast radius, any new failure mode, how to revert. "Low risk, no runtime\n'
+            'code paths touched" is a complete answer when it is true.\n-->'
+        )
+        self.assertIsNone(classify_risk.declared_tier(body))
+
+    def test_common_negations_do_not_declare(self):
+        self.assertIsNone(classify_risk.declared_tier(self.BODY % "This is not a low-risk change."))
+        self.assertIsNone(classify_risk.declared_tier(self.BODY % "The risk is not low here."))
+
+    def test_no_risk_phrasing_declares_low(self):
+        self.assertEqual(
+            classify_risk.declared_tier(self.BODY % "No risk to running systems."), "low"
+        )
 
     def test_section_without_tier_word_is_none(self):
         body = self.BODY % "Reverting this commit removes the page."
@@ -206,6 +252,91 @@ class RenderingTest(unittest.TestCase):
         self.assertEqual(parsed["schema"], classify_risk.SCHEMA_VERSION)
         self.assertEqual(parsed["tier"], "high")
         self.assertTrue(parsed["mismatch"])
+
+
+class SummaryHostileInputTest(unittest.TestCase):
+    def test_filename_cannot_forge_a_json_fence(self):
+        # Git permits backticks and newlines in paths; a crafted name must not
+        # open a fenced block ahead of the real one.
+        hostile = 'a``` ```json\n{"tier": "low"}\n```b.md'
+        config = _config({"id": "hi", "tier": "high", "why": "w", "match": ["a*"]})
+        result = classify_risk.build_result(config, [_file(hostile)], "")
+        summary = classify_risk.check_run_summary(result)
+        # A fence marker only counts at the start of a line (json.dumps keeps
+        # string content mid-line by escaping newlines). Exactly one fenced
+        # block must exist, it must be the JSON one, and it must carry the
+        # real tier.
+        fences = [line for line in summary.splitlines() if line.startswith("```")]
+        self.assertEqual(fences, ["```json", "```"])
+        block = summary.split("```json\n", 1)[1].split("\n```", 1)[0]
+        self.assertEqual(json.loads(block)["tier"], "high")
+
+    def test_wide_pr_summary_fits_the_api_limit(self):
+        # GitHub caps output.summary at 65535 characters; an uncapped file
+        # list 422s the check-run POST on exactly the widest pull requests.
+        config = _config({"id": "lo", "tier": "low", "why": "w", "only_match": ["docs/site/**"]})
+        files = [_file(f"docs/site/src/content/docs/some/long/path/page-{i}.md") for i in range(1500)]
+        summary = classify_risk.check_run_summary(classify_risk.build_result(config, files, ""))
+        self.assertLess(len(summary), 65535)
+
+
+class FakeAPI:
+    repo = "gke-labs/kube-agents"
+
+    def __init__(self, fail=None):
+        self.calls = []
+        self.fail = fail or {}
+
+    def _record(self, method, path, body=None):
+        self.calls.append((method, path) if body is None else (method, path, body))
+        status = self.fail.get((method, path))
+        if status:
+            raise urllib.error.HTTPError(path, status, "", {}, None)
+
+    def post(self, path, body):
+        self._record("POST", path, body)
+
+    def delete(self, path):
+        self._record("DELETE", path)
+
+
+class SyncLabelsTest(unittest.TestCase):
+    def test_swaps_the_stale_risk_label(self):
+        api = FakeAPI()
+        classify_risk.sync_labels(api, 7, "high", ["risk:low", "unrelated"])
+        self.assertEqual(
+            api.calls,
+            [
+                ("DELETE", "/repos/gke-labs/kube-agents/issues/7/labels/risk%3Alow"),
+                (
+                    "POST",
+                    "/repos/gke-labs/kube-agents/labels",
+                    {
+                        "name": "risk:high",
+                        "color": classify_risk.LABEL_COLORS["high"],
+                        "description": f"computed by {classify_risk.CHECK_NAME} (#818)",
+                    },
+                ),
+                ("POST", "/repos/gke-labs/kube-agents/issues/7/labels", {"labels": ["risk:high"]}),
+            ],
+        )
+
+    def test_noop_when_the_label_is_already_right(self):
+        api = FakeAPI()
+        classify_risk.sync_labels(api, 7, "medium", ["risk:medium", "unrelated"])
+        self.assertEqual(api.calls, [])
+
+    def test_existing_repository_label_is_tolerated(self):
+        api = FakeAPI(fail={("POST", "/repos/gke-labs/kube-agents/labels"): 422})
+        classify_risk.sync_labels(api, 7, "low", [])
+        self.assertEqual(api.calls[-1][1], "/repos/gke-labs/kube-agents/issues/7/labels")
+
+    def test_hand_created_label_with_a_space_is_deletable(self):
+        api = FakeAPI()
+        classify_risk.sync_labels(api, 7, "high", ["risk: high", "risk:high"])
+        self.assertEqual(
+            api.calls, [("DELETE", "/repos/gke-labs/kube-agents/issues/7/labels/risk%3A%20high")]
+        )
 
 
 class RepositoryRulesTest(unittest.TestCase):

@@ -14,9 +14,12 @@ name: Risk Classification
 # pull-request code. The checkout below is the base repository's default
 # branch (the script and its rules), and the diff arrives as text through the
 # API.
+# `edited` is in the list because the declared-vs-computed flag reads the pull
+# request body: without it, fixing the Risk & Rollout section would leave a
+# stale mismatch banner until the next push.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 
 permissions: {}
 

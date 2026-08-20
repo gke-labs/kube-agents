@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 
 import yaml
 
@@ -60,13 +61,15 @@ RISK_SECTION = re.compile(
 
 # What authors actually write in the section, from the open pull requests the
 # heuristic was replayed against: "Low risk, ...", "Risk: none to any running
-# system", and a bare leading verdict -- "Low. No runtime code paths" (#770),
-# "Moderate, and concentrated in one place" (#733). Deliberately loose in one
-# direction: when a section mentions more than one tier, the highest counts as
-# the declaration, so a cautious sentence ("high-risk paths are untouched")
-# only ever suppresses the mismatch flag, never raises a false one.
+# system", "No risk to running systems", and a bare leading verdict -- "Low.
+# No runtime code paths" (#770), "Moderate, and concentrated in one place"
+# (#733). A heuristic, loose in one direction by design: when a section
+# mentions more than one tier, the highest counts as the declaration, and the
+# lookbehinds guard only the common negations ("not low-risk"), so a phrasing
+# it misreads errs toward suppressing the mismatch flag rather than accusing
+# an author of a declaration they did not make.
 DECLARED_WORDS = {
-    "low": "low|none|minimal|negligible",
+    "low": "low|none|no|minimal|negligible",
     "medium": "medium|moderate",
     "high": "high",
 }
@@ -75,8 +78,8 @@ DECLARED = {
         # "<word> risk" / "<word>-risk", or "risk ... <word>" in one clause,
         # or the section opening with the bare word ("Low." / "Moderate,").
         # The lookahead keeps "High-level overview" from declaring high.
-        rf"\b(?:{words})[- ]risk\b"
-        rf"|\brisk\b[^.!?\n]{{0,40}}?\b(?:{words})\b"
+        rf"(?<!not )(?<!not a )\b(?:{words})[- ]risk\b"
+        rf"|\brisk\b[^.!?\n]{{0,40}}?(?<!not )\b(?:{words})\b"
         rf"|\A[\s>*_-]*(?:\*\*)?(?:{words})(?=[\s.,:;!)])",
         re.IGNORECASE,
     )
@@ -172,18 +175,28 @@ def _matching_paths(globs, paths):
     return [path for path in paths if any(regex.match(path) for regex in regexes)]
 
 
+def _entry_paths(entry):
+    """Both sides of a rename. Classifying only the destination would let a
+    rename out of a guarded tree buy a lower tier -- deleting a workflow by
+    renaming it into docs/site/ must still read as a workflow change."""
+    paths = [entry["filename"]]
+    if entry.get("previous_filename"):
+        paths.append(entry["previous_filename"])
+    return paths
+
+
 def rule_trigger(rule, files):
     """The changed files that trigger `rule`, or None when it does not.
 
-    `files` is the GitHub `pulls/{n}/files` shape: dicts with `filename` and,
-    for text diffs the API is willing to inline, `patch`. A file without a
-    patch never satisfies `patch_contains`.
+    `files` is the GitHub `pulls/{n}/files` shape: dicts with `filename`,
+    `previous_filename` on renames, and, for text diffs the API is willing to
+    inline, `patch`. A file without a patch never satisfies `patch_contains`.
     """
-    paths = [entry["filename"] for entry in files]
+    paths = [path for entry in files for path in _entry_paths(entry)]
 
     if "only_match" in rule:
         if paths and len(_matching_paths(rule["only_match"], paths)) == len(paths):
-            return paths
+            return [entry["filename"] for entry in files]
         return None
 
     if "all_of" in rule:
@@ -195,7 +208,7 @@ def rule_trigger(rule, files):
     candidates = files
     if "match" in rule:
         matched = set(_matching_paths(rule["match"], paths))
-        candidates = [entry for entry in files if entry["filename"] in matched]
+        candidates = [entry for entry in files if matched.intersection(_entry_paths(entry))]
         if not candidates:
             return None
 
@@ -212,14 +225,39 @@ def rule_trigger(rule, files):
     return [entry["filename"] for entry in candidates]
 
 
-def classify(config, files):
-    """The tier and the rules behind it: {tier, default_applied, rules}."""
+# Per rule, how many triggering paths the JSON block lists. Uncapped, a
+# 1500-file docs pull request renders a summary past GitHub's 65535-character
+# limit and the check-run POST 422s -- on exactly the pull requests a reviewer
+# most wants triaged. `file_count` always carries the real number.
+RULE_FILES_LISTED = 50
+
+# The files endpoint stops at 3000 entries however far you page. Past that the
+# list is a truncated view, and a `low` verdict from `only_match` over a
+# truncated list is a claim about files nobody read.
+API_FILES_CAP = 3000
+
+
+def classify(config, files, complete=True):
+    """The tier and the rules behind it: {tier, default_applied, rules}.
+
+    `complete=False` says `files` is a truncated view (the API's 3000-file
+    cap); `only_match` rules -- the only way to reach `low` -- are skipped,
+    because they quantify over every changed file.
+    """
     triggered = []
     for rule in config["rules"]:
+        if "only_match" in rule and not complete:
+            continue
         hits = rule_trigger(rule, files)
         if hits is not None:
             triggered.append(
-                {"id": rule["id"], "tier": rule["tier"], "why": rule["why"], "files": hits}
+                {
+                    "id": rule["id"],
+                    "tier": rule["tier"],
+                    "why": rule["why"],
+                    "files": hits[:RULE_FILES_LISTED],
+                    "file_count": len(hits),
+                }
             )
 
     if triggered:
@@ -234,7 +272,11 @@ def classify(config, files):
 
 def declared_tier(body):
     """The tier the Risk & Rollout section claims, or None without one."""
-    section = RISK_SECTION.search(body or "")
+    # HTML comments first: the PR template's own comment contains the literal
+    # phrase "Low risk, no runtime code paths touched", so an author who left
+    # the template unedited would otherwise declare low without writing a word.
+    body = re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
+    section = RISK_SECTION.search(body)
     if not section:
         return None
     text = section.group("text")
@@ -242,14 +284,15 @@ def declared_tier(body):
     return max(found, key=TIER_ORDER.get) if found else None
 
 
-def build_result(config, files, body, pr_number=None, head_sha=None):
-    result = classify(config, files)
+def build_result(config, files, body, pr_number=None, head_sha=None, complete=True):
+    result = classify(config, files, complete=complete)
     declared = declared_tier(body)
     result.update(
         {
             "schema": SCHEMA_VERSION,
             "pr": pr_number,
             "head_sha": head_sha,
+            "file_list_complete": complete,
             "declared_tier": declared,
             "mismatch": declared == "low" and result["tier"] == "high",
         }
@@ -270,6 +313,14 @@ def check_run_title(result):
     return f"risk: {result['tier']} ({detail})"
 
 
+def _display_path(path):
+    """A filename, defanged for the markdown summary. Git permits backticks
+    and newlines in paths, and a crafted filename could otherwise open its own
+    fenced block ahead of the real JSON one and forge the machine-readable
+    verdict for anything that parses the first fence it sees."""
+    return re.sub(r"[`\r\n]", "?", path)
+
+
 def check_run_summary(result):
     lines = [f"## Risk: {result['tier']}", ""]
 
@@ -281,6 +332,14 @@ def check_run_summary(result):
             "",
         ]
 
+    if not result.get("file_list_complete", True):
+        lines += [
+            f"The API lists at most {API_FILES_CAP} files and this pull request "
+            "hit that cap, so the tier was computed on a truncated view and "
+            "`low` rules were not evaluated.",
+            "",
+        ]
+
     if result["default_applied"]:
         lines += [
             f"No rule in `{DEFAULT_RULES_PATH}` matched, so the default tier applies. "
@@ -289,8 +348,8 @@ def check_run_summary(result):
         ]
     else:
         for entry in result["rules"]:
-            files = ", ".join(f"`{path}`" for path in entry["files"][:5])
-            more = f" (+{len(entry['files']) - 5} more)" if len(entry["files"]) > 5 else ""
+            files = ", ".join(f"`{_display_path(path)}`" for path in entry["files"][:5])
+            more = f" (+{entry['file_count'] - 5} more)" if entry["file_count"] > 5 else ""
             lines.append(f"- `{entry['id']}` → **{entry['tier']}** — {entry['why']} ({files}{more})")
         lines.append("")
 
@@ -338,10 +397,15 @@ def sync_labels(api, pr_number, tier, current):
 
     for name in current:
         if name.startswith(LABEL_PREFIX) and name != desired:
-            # 404: someone removed it between our read and this call.
+            # 404: someone removed it between our read and this call. Quoted:
+            # a hand-created label like "risk: high" (space) would otherwise
+            # raise InvalidURL from the stdlib, which _tolerate does not catch,
+            # and fail every run until someone deleted the label.
             _tolerate(
                 404,
-                lambda name=name: api.delete(f"/repos/{api.repo}/issues/{pr_number}/labels/{name}"),
+                lambda name=name: api.delete(
+                    f"/repos/{api.repo}/issues/{pr_number}/labels/{urllib.parse.quote(name, safe='')}"
+                ),
             )
 
     if desired not in current:
@@ -412,7 +476,12 @@ def main(argv=None):
     files = api.get_all(f"/repos/{args.repo}/pulls/{args.pr}/files")
 
     result = build_result(
-        config, files, pull_request.get("body"), pr_number=args.pr, head_sha=head_sha
+        config,
+        files,
+        pull_request.get("body"),
+        pr_number=args.pr,
+        head_sha=head_sha,
+        complete=len(files) < API_FILES_CAP,
     )
     log(f"#{args.pr} at {head_sha[:7]}: {check_run_title(result)}")
     print(json.dumps(result, indent=2, sort_keys=True))
