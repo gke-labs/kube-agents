@@ -2265,6 +2265,73 @@ class TestFindingsQueueApi(unittest.TestCase):
             self.client.post("/v1/findings/nope/verified", json={"outcome": "resolved"}).status_code, 404
         )
 
+    def test_two_writers_registering_the_same_finding_do_not_collide(self):
+        # The event watcher (Go) and the agent are both first-class writers, so
+        # a check-then-act INSERT under a deferred transaction is the designed
+        # concurrency here, not an edge case.
+        import sqlite3
+        import threading
+
+        from fastapi.testclient import TestClient
+
+        barrier = threading.Barrier(2)
+        codes = []
+
+        def register():
+            client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+            barrier.wait()
+            codes.append(client.post("/v1/findings", json={"findings": [self._finding()]}).status_code)
+
+        threads = [threading.Thread(target=register) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sorted(codes), [200, 200], "a concurrent registration was rejected")
+        self.assertEqual(len(self.client.get("/v1/findings/ranked").json()["findings"]), 1)
+
+    def test_a_broken_stored_rubric_is_not_reported_as_a_missing_finding(self):
+        # A bare KeyError anywhere in the call tree used to surface as
+        # "no finding 'L'", telling the agent to drop a row that is right there.
+        import sqlite3
+
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute('UPDATE findings SET rubric = \'{"B": 3}\' WHERE id = ?', (fid,))
+
+        response = self.client.post(
+            f"/v1/findings/{fid}/verified",
+            json={
+                "outcome": "still_failing",
+                "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+            },
+        )
+
+        self.assertNotEqual(response.status_code, 404, response.text)
+
+    def test_a_rejected_value_is_not_echoed_back_whole(self):
+        payload = "A" * 20000
+        responses = (
+            self.client.post(
+                "/v1/findings",
+                json={
+                    "findings": [
+                        self._finding(rubric={"B": payload, "L": 6, "detect": 3, "recover": 2, "C": 1.0})
+                    ]
+                },
+            ),
+            self.client.get("/v1/findings", params={"state": payload}),
+            self.client.put(f"/v1/findings/publication/{payload}", json={"target_kind": "chat"}),
+        )
+        for response in responses:
+            self.assertEqual(response.status_code, 400, response.text[:200])
+            detail = response.json()["detail"]
+            self.assertLess(len(detail), 300, detail[:200])
+            self.assertNotIn(payload, detail)
+
     def test_list_filters_pass_through(self):
         self._register(
             self._finding(),

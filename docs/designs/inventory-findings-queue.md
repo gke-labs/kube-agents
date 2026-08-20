@@ -233,6 +233,17 @@ CREATE TABLE IF NOT EXISTS queue_publications (
 )
 ```
 
+One row per publisher, but the two publishers write it for different reasons — the backlog to
+remember the document it rewrites, the nudge to remember the hash it posted — so a write that omits
+a column leaves it alone rather than nulling it. A full-row replace would let the nudge's hash update
+erase the URL the backlog needs on its next run, and the symptom of that is a second backlog document
+rather than an error.
+
+`snoozed_until` is stored as UTC `YYYY-MM-DD HH:MM:SS`, whatever form the caller sent, because the
+expiry sweep asks `snoozed_until <= datetime('now')` and that is a string comparison. An ISO
+timestamp with a `T` or an offset sorts wrong against it, so a snooze kept in the shape it arrived in
+would expire at the wrong hour or never.
+
 The indexes follow the queries the publishers actually run:
 
 ```sql
@@ -255,15 +266,24 @@ ledger is rendered fresh each time. A queue cannot do that: `snoozed` and `dismi
 person made once and nothing in the cluster records them. So state here is stored, and every
 transition has exactly one actor.
 
-| state       | entered when                                                   | by                                                | effect on publishing                                         |
-| ----------- | -------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------ |
-| `queued`    | registration, for an id not already present                    | any source (§5)                                   | on the list, in score order                                  |
-| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                         | stays on the list; `surface_count` records how often         |
-| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the daily job returns it | off the list until `snoozed_until`, then back to `surfaced`  |
-| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                           | its own section of the list; still re-verified               |
-| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                           | off the list permanently, and sticky against re-registration |
-| `resolved`  | re-verification found it no longer reproduces                  | the daily job                                     | off the list; kept as the record that it was fixed           |
-| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job                                     | off the list; distinct from `resolved` on purpose            |
+| state       | entered when                                                   | by                                                | effect on publishing                                          |
+| ----------- | -------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------- |
+| `queued`    | registration, for an id not already present                    | any source (§5)                                   | on the list, in score order                                   |
+| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                         | stays on the list; `surface_count` records how often          |
+| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the daily job returns it | off the list until `snoozed_until`, then back to `surfaced`   |
+| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                           | its own section of the list; still re-verified                |
+| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                           | off the list permanently; sticky against every automated path |
+| `resolved`  | re-verification found it no longer reproduces                  | the daily job                                     | off the list; kept as the record that it was fixed            |
+| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job                                     | off the list; distinct from `resolved` on purpose             |
+
+**`dismissed` is a sink, and the leak out of it is two steps long.** §5.2 blocks the obvious
+revival — the next sweep re-registering what the user rejected — but verification is a second
+automated writer on the same row, and `resolved` and `stale` are precisely the two states §5.2 then
+treats as "it came back". A daily job allowed to write either onto a dismissed row does not resurrect
+it that day; it arms the _following_ sweep to do so, which is the same bug with a night's delay and
+no obvious cause. So verification records its observation and its freshness on a dismissed row and
+moves nothing. The one actor that may reverse a dismissal is the person who made it, through the
+same kanban card they made it with.
 
 **`resolved` and `stale` are different answers and must not be merged.** "The Deployment no longer
 crash-loops" and "the namespace is gone, so nobody can say" look identical to a query that only

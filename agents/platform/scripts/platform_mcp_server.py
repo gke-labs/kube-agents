@@ -953,10 +953,10 @@ def mark_finding_surfaced(finding_id: str, chat_id: str = "", thread_id: str = "
 @mcp.tool()
 def update_finding(
     finding_id: str,
-    state: str = "",
-    snoozed_until: str = "",
-    pr_url: str = "",
-    pr_state: str = "",
+    state: str | None = None,
+    snoozed_until: str | None = None,
+    pr_url: str | None = None,
+    pr_state: str | None = None,
 ) -> str:
     """
     Apply a decision the user made about a finding, or reconcile its pull request.
@@ -971,9 +971,12 @@ def update_finding(
         finding_id: The finding's id.
         state: accepted | snoozed | dismissed | surfaced.
         snoozed_until: Required with 'snoozed'. An ISO date or timestamp.
-        pr_url: The pull request opened for this finding.
-        pr_state: open | merged | closed.
+        pr_url: The pull request opened for this finding. Pass "" to unlink one.
+        pr_state: open | merged | closed. Pass "" to clear it.
     """
+    # `is not None`, not truthiness: an omitted argument means "leave it alone"
+    # and an empty string means "clear it", which is the only way to undo a
+    # pull request link written against the wrong finding.
     patch = {
         key: value
         for key, value in (
@@ -982,7 +985,7 @@ def update_finding(
             ("pr_url", pr_url),
             ("pr_state", pr_state),
         )
-        if value
+        if value is not None
     }
     return _findings_call("PATCH", f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}", patch)
 
@@ -1046,10 +1049,13 @@ def findings_publication(
     """
     if not target_kind:
         return _findings_call("GET", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}")
+    body = {"target_kind": target_kind}
+    if target_ref:
+        body["target_ref"] = target_ref
+    if content_hash:
+        body["content_hash"] = content_hash
     return _findings_call(
-        "PUT",
-        f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}",
-        {"target_kind": target_kind, "target_ref": target_ref, "content_hash": content_hash},
+        "PUT", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}", body
     )
 
 

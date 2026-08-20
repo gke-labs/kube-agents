@@ -1847,13 +1847,28 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
 def _findings_write(operation, *args, **kwargs) -> Any:
     """Run one queue operation in a transaction, mapping its errors to status."""
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            with conn:
-                return operation(conn, *args, **kwargs)
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            # BEGIN IMMEDIATE, as the alert ceiling above does and for the same
+            # reason: every operation here reads a row before deciding what to
+            # write. Under a deferred transaction two sources registering the
+            # same finding both read "absent" and both INSERT, and the loser's
+            # entire batch dies on the UNIQUE constraint.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = operation(conn, *args, **kwargs)
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+            return result
     except findings_queue.FindingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
-    except KeyError as exc:
+    except findings_queue.FindingNotFound as exc:
         raise HTTPException(status_code=404, detail=f"no finding {exc.args[0]!r}") from None
+    except sqlite3.OperationalError as exc:
+        # `database is locked`, once the 5s budget is spent. Retryable, and 503
+        # says so; a 500 would tell the caller its payload was the problem.
+        raise HTTPException(status_code=503, detail=f"the findings queue is busy: {exc}") from None
 
 
 @app.post("/v1/findings", dependencies=[Depends(verify_api_key)])
