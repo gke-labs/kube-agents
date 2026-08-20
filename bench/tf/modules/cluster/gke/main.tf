@@ -44,10 +44,15 @@ locals {
 # orphan_max_age_hours rather than forever.
 #
 # This is a cost sweep, not a correctness precondition. Cluster names are
-# derived from the Prow BUILD_ID (hack/ci-eval-pr.sh), so two concurrent runs
-# can never share a name and a "409 Already Exists" between runs is impossible
-# by construction -- the sweep no longer has to clear the way for this run's
-# own name, and raising the Prow job's max_concurrency above 1 is safe.
+# derived from the Prow BUILD_ID (hack/ci-eval-pr.sh), so within a project two
+# runs can never share a name and a "409 Already Exists" between runs is
+# impossible by construction -- the sweep no longer has to clear the way for
+# this run's own name. That alone does NOT make raising the Prow job's
+# max_concurrency safe: every run installs cluster-wide singletons on the
+# shared platform-agent-host cluster, so concurrency itself arrives with
+# issue #637 (Boskos one-project-per-run leasing) -- do not raise it before
+# that lands. Under #637 this sweep matters MORE, not less: leasing turns the
+# Boskos janitor off, so this is the only cleanup a leased project gets.
 #
 # What keeps a live concurrent run's cluster out of the sweep is the AND of
 # two server-side conditions: it must carry the managed-by=kube-agents-bench
@@ -59,6 +64,13 @@ locals {
 # here, this resource is created, and the sweep runs every time. Locally,
 # state persists under bench/tf, so it re-runs only when cluster_name,
 # location or project_id change; a laptop is not where orphans accumulate.
+# A local run that lost its state file and 409s on its own stable name
+# self-heals the same way: the leftover cluster ages out and the next sweep
+# removes it.
+#
+# Residual the sweep does not cover: the allow-iap-ssh-<cluster> firewall
+# rule (created only when enable_iap_ssh=true) is not labelable and is left
+# behind for a scheduled janitor.
 resource "terraform_data" "reap_orphans" {
   triggers_replace = [var.cluster_name, var.location, var.project_id, var.orphan_max_age_hours]
 
@@ -80,12 +92,16 @@ resource "terraform_data" "reap_orphans" {
       while read -r name location; do
         [[ -n "$name" && -n "$location" ]] || continue
 
-        # The cluster goes first: its nodes authenticate as the service
-        # account derived below, so deleting that account first would strand
-        # them mid-teardown.
+        # The cluster delete is fired --async: a synchronous delete is ~5
+        # minutes, runs serially ahead of provisioning, and a handful of
+        # orphans would eat the Prow job's budget before this run's own
+        # cluster exists. Deleting the service account below while the
+        # teardown is still in flight loses little -- an orphan's nodes have
+        # nothing left to do. </dev/null keeps gcloud from ever reading the
+        # orphan list on stdin if a future version decides to prompt.
         echo "reaping orphaned cluster $name ($location), older than ${var.orphan_max_age_hours}h"
-        if ! gcloud container clusters delete "$name" \
-               --location "$location" --project "$project" --quiet; then
+        if ! gcloud container clusters delete "$name" --async \
+               --location "$location" --project "$project" --quiet </dev/null; then
           echo "WARNING: could not delete orphaned cluster $name; the next sweep retries it"
           continue
         fi
@@ -120,7 +136,7 @@ resource "terraform_data" "reap_orphans" {
         while read -r role member; do
           [[ -n "$role" && -n "$member" ]] || continue
           if gcloud projects remove-iam-policy-binding "$project" \
-               --member "$member" --role "$role" --condition=None --quiet >/dev/null; then
+               --member "$member" --role "$role" --condition=None --quiet >/dev/null </dev/null; then
             echo "removed stale binding $role for $member"
           else
             failed=$((failed + 1))
@@ -133,7 +149,7 @@ resource "terraform_data" "reap_orphans" {
 
         if gcloud iam service-accounts describe "$sa" --project "$project" >/dev/null 2>&1; then
           echo "reaping orphaned service account $sa"
-          gcloud iam service-accounts delete "$sa" --project "$project" --quiet \
+          gcloud iam service-accounts delete "$sa" --project "$project" --quiet </dev/null \
             || echo "WARNING: could not delete service account $sa; the next sweep retries it"
         fi
       done <<< "$orphans"
@@ -159,7 +175,7 @@ resource "terraform_data" "reap_orphans" {
       while read -r role member; do
         [[ -n "$role" && -n "$member" ]] || continue
         if gcloud projects remove-iam-policy-binding "$project" \
-             --member "$member" --role "$role" --condition=None --quiet >/dev/null; then
+             --member "$member" --role "$role" --condition=None --quiet >/dev/null </dev/null; then
           echo "removed tombstone binding $role for $member"
         else
           echo "WARNING: could not remove tombstone binding $role for $member"
