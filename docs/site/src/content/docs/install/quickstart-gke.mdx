@@ -74,6 +74,8 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
 
    You should see one `PlatformAgent` resource plus pods for the operator (`kubeagents-controller-manager`), the Platform Agent gateway (`platform-agent-gateway`), and LiteLLM (`litellm`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When the Platform Agent gateway pod is `Running` and Google Chat is configured, DM your Chat app and it should reply.
 
+   Read the gateway's log in the first few minutes and it looks worse than it is. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are startup ordering: both relays dial the credential-proxy sidecar on loopback, and it is not listening yet. They retry, and on a fresh install these cleared themselves within about seven minutes. Treat them as a fault only if they are still arriving well after that — at which point the thing to inspect is the `envoy-credential-proxy` container, not the relay reporting the error.
+
 </Steps>
 
 ## What just happened
