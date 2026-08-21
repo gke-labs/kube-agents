@@ -14,24 +14,46 @@ Use [`terraform/examples/full-install`](../full-install/README.md) instead for a
 
 Each pool project gets its **own** private GitOps repository, and the minty rule the chart renders scopes tokens to exactly that one repository, keyed on that project's agent GSA. Two leases therefore cannot reach each other's repository, cannot share a ledger issue, and cannot race on a remediation branch. The resources are per-project (a KMS key ring is not shareable across projects), so the composition is applied once per project with its own state.
 
-The project-to-repository table lives in `gitops_repo_for_project()` in `hack/ci-deploy.sh`, and is documented in [CI pool project prerequisites](../../../docs/site/src/content/docs/deploy/ci-pool-projects.md).
-
-<!-- prettier-ignore -->
-| Project | GitOps repository |
-| --- | --- |
-| `kube-agents-evals` | `gke-agentic/kube-agents-evals-infra` |
-| `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
+The project-to-repository mapping has exactly one home: `gitops_repo_for_project()` in `hack/ci-deploy.sh`, documented in [CI pool project prerequisites](../../../docs/site/src/content/docs/deploy/ci-pool-projects.md). Read the `gitops_repo` for the project being onboarded out of there. Onboarding a project is one line in that function plus one row on that page, so a copy of the table here would go stale on the first onboarding.
 
 ## Usage
 
+**One state per project, chosen before the first apply.** This composition ships no backend block, so a bare `terraform apply` writes `terraform.tfstate` into this directory. Re-pointing `project_id` at a second pool project and re-applying against that same state does not add a second minter — `project_id` is force-new on the module's GSA, so the plan **destroys** the first project's `kubeagents-github-minter-gsa`, its `roles/iam.workloadIdentityUser` binding, and its `roles/cloudkms.signerVerifier` grant before creating the second project's. Re-applying does not undo that: by the KMS warning below, the first project's key ring and key then have to be `terraform import`ed back before its GSA can be recreated.
+
+Pick one of these once, per project:
+
 ```bash
 cd terraform/examples/ci-pool-minter
-cp terraform.tfvars.example terraform.tfvars   # edit for the project being onboarded
+
+# a) Workspaces — one local state file per project under terraform.tfstate.d/,
+#    no extra files to write. Fine when the checkout is long-lived.
 terraform init
-terraform plan
+terraform workspace new kube-agents-evals    # later runs: workspace select
+
+# b) Remote state, the same pattern terraform/examples/full-install uses: a
+#    gitignored backend_override.tf (*_override.tf is in .gitignore) with a
+#    per-project prefix. Prefer this if the state must outlive the checkout.
+cat > backend_override.tf <<'EOF'
+terraform {
+  backend "gcs" {
+    bucket = "<your-tfstate-bucket>"
+    prefix = "ci-pool-minter/kube-agents-evals"
+  }
+}
+EOF
+terraform init
+```
+
+Then, for that project:
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # set project_id and gitops_repo
+terraform plan                                 # must be create-only
 terraform apply
 terraform output manual_steps
 ```
+
+`terraform plan` before every apply is the check that matters. Onboarding a project that has not been onboarded yet is a create-only plan; **any `destroy` line means the wrong state is loaded** — stop and fix the workspace or the backend prefix rather than confirming.
 
 `location` and `namespace` default to the values `hack/ci-env.sh` uses (`us-central1`, `kubeagents-system`) and should only be overridden if that file changes: the chart derives the KMS key path from `platformAgent.harness.location`, which `hack/ci-deploy.sh` sets from `REGION`.
 

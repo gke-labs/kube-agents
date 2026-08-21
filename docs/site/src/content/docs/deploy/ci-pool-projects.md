@@ -140,10 +140,15 @@ Adding a project is one line in `gitops_repo_for_project()` and one row in the t
 
 ```bash
 cd terraform/examples/ci-pool-minter
+terraform init
+terraform workspace new "${PROJECT_ID}"        # or a per-project backend prefix
 cp terraform.tfvars.example terraform.tfvars   # set project_id and gitops_repo
-terraform init && terraform apply
+terraform plan                                 # must be create-only
+terraform apply
 terraform output manual_steps
 ```
+
+**Each project needs its own state.** `project_id` is force-new on the minter's GSA, so re-pointing this composition at a second pool project and applying over the first project's state destroys the first project's minter rather than adding a second — and the KMS key ring cannot simply be re-created afterwards. The workspace above (or a `backend_override.tf` prefix, as in `terraform/examples/full-install`) is what keeps them apart; the create-only plan is what catches it if they are not. The composition's README covers both and the recovery.
 
 That provisions the minter GSA, its Workload Identity binding to `kubeagents-system/kubeagents-github-minter`, and the import-only KMS signing key. The chart renders the Kubernetes half and derives both `githubMinter.gsaName` and `githubMinter.allowedServiceAccount` from `platformAgent.harness.projectId`, so the minty rule comes out scoped to this project's repository and keyed on this project's `kubeagents-platform-gsa` with no per-project values.
 
