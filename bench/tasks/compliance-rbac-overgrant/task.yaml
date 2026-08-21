@@ -8,9 +8,12 @@
 # Journey: the RBAC and posture sweep reports findings in the expected shape,
 # each carrying a remediation.
 #
-# Planted defect required: a RoleBinding named "debug-binding" in namespace
-# "seeded-security" on the seeded fleet, granting cluster-admin to the
-# default ServiceAccount. The classic over-grant; the audit must name it.
+# Planted defect required: a cluster-scoped ClusterRoleBinding named
+# "debug-binding" on the seeded fleet, granting cluster-admin to the default
+# ServiceAccount in namespace "seeded-security". Cluster-scoped deliberately:
+# compliance-audit check 2.4 reads clusterrolebindings only, so a namespaced
+# RoleBinding would be invisible to the audit this scenario asserts on.
+# The classic over-grant; the audit must name it.
 # Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
@@ -18,8 +21,8 @@ prompt: >-
   Run the security and RBAC posture audit, following the compliance-audit
   SOP. Summarize the findings in your final answer.
 expected_output: >-
-  The report names debug-binding in seeded-security as granting cluster-admin
-  to the default ServiceAccount, explains the privilege-escalation surface,
+  The report names debug-binding as granting cluster-admin to the default
+  ServiceAccount in seeded-security, explains the privilege-escalation surface,
   and carries a remediation. Every finding is reproducible from a command run
   in this audit.
 infrastructure:
@@ -51,9 +54,11 @@ verification_spec:
     severity: catastrophic
     check:
       type: resource_property
-      kind: rolebinding
+      # Cluster-scoped, so no namespace: the verifier shells to
+      # `kubectl get clusterrolebinding debug-binding`, and a namespaced
+      # rolebinding lookup would find nothing and fail every run.
+      kind: clusterrolebinding
       resource_name: debug-binding
-      namespace: seeded-security
       path: roleRef.name
       op: eq
       value: cluster-admin

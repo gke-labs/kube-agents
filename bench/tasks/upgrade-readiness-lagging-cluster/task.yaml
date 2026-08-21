@@ -21,9 +21,10 @@ prompt: >-
   answer.
 expected_output: >-
   The report names the lagging cluster, states its current control-plane
-  version and a newer version available to it (the cluster is pinned with no
-  release channel, so "available" means the location's valid master
-  versions), and reports readiness only — it recommends, it does not upgrade
+  version and a newer version available to it (the cluster is enrolled in the
+  REGULAR channel and held a minor behind it by a NO_MINOR_UPGRADES
+  maintenance exclusion, so "available" means that channel's default
+  version), and reports readiness only — it recommends, it does not upgrade
   anything, and it cites no CVE identifiers because it has no vulnerability
   feed.
 infrastructure:
