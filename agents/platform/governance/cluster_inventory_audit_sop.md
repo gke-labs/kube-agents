@@ -11,23 +11,26 @@ nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.m
 exists. Those steps belong to the Platform Agent, and running them here means several agents
 writing one path at once.
 
-**Do not block this card for a failure that only costs you data.** Denied permissions, an
-unreachable API server, a cluster in `ERROR`, credentials that will not mint, an MCP tool that
-errors — every one of them is a `gaps` entry and a completed card. An aggregation card is waiting
-on this card and every other cluster's, so blocking for one of those stops the whole fleet report
-rather than losing one cluster's row. Record what you did get, record what failed and why in
-`gaps`, and complete.
+**A failed `cluster_preflight.sh` blocks this card, exactly as `SOUL.md` §6 step 2 says** — call
+`kanban_block(kind="needs_input", ...)` with the script's own `reason` and `remediation`, and stop.
+One exception: its check 5, "Cannot reach the target cluster's API server", is a liveness failure —
+record it in `gaps` and complete. For this card that exception also overrides
+`agents/cluster/AGENTS.md` ("Fail loud, never silent") and `SOUL.md` §2.
 
-**One class of failure is different, and there you block exactly as `SOUL.md` §6 step 2 says.** If
-`cluster_preflight.sh` fails because it cannot establish _which cluster you are_ — no `USER.md`, a
-kubeconfig that selects a different cluster than `USER.md` declares, or a plain `kubectl` that
-resolves somewhere other than your pinned context — call `kanban_block(kind="needs_input", ...)`
-and stop. Those are the script's identity checks, and every one of their remediations begins "Do
-not proceed". A `gaps` entry does not cover them: you would go on to audit a reachable cluster that
-is not yours and file its namespaces, workloads and findings under the name `USER.md` gave you.
-Aggregation copies `metadata` verbatim and the Platform Agent is forbidden to re-audit, so nothing
-downstream can catch it — the fleet report simply carries confidently mislabelled rows. Losing the
-fleet report to a block is recoverable; publishing another cluster's posture as this one's is not.
+**Decide from the check that failed, not from its remediation text.** Everything except check 5 is
+checks 1–4, and the script stops at the first failure, so a failure there means you have not
+established which cluster you are — you have only failed to check. A missing `USER.md` and a
+missing kubeconfig both say "Re-scaffold the profile", and both leave you as unidentified as a
+context mismatch does. An unpinned `kubectl` resolves to the credential proxy's own context, the
+management cluster, so the alternative to blocking is filing another cluster's workloads under your
+name. Aggregation copies `metadata` verbatim and the Platform Agent is forbidden to re-audit, so
+nothing downstream catches it.
+
+**Preflight passed and something else failed? Do not block.** Denied permissions, a cluster in
+`ERROR`, credentials that will not mint, an MCP tool that errors — each is a `gaps` entry and a
+completed card. An aggregation card is waiting on this card and every other cluster's, so blocking
+there costs the whole fleet report to save one row. Record what you did get, record what failed and
+why in `gaps`, and complete.
 
 ---
 
@@ -42,13 +45,11 @@ are pinned to.
 yours. An agent that trusts them audits the wrong cluster and reports the result as if it were
 right.
 
-If `USER.md` is missing or does not parse, stop and complete the card with that as the finding.
-Guessing your own identity from a profile name or a cluster list is how a report ends up describing
-somebody else's cluster.
+If `USER.md` is missing, incomplete, or does not parse, block. Guessing your own identity from a
+profile name or a cluster list is how a report ends up describing somebody else's cluster.
 
 If the audit cannot be done at all for one of the data-cost reasons above, record what failed in
-`gaps`, leave the other fields empty, and complete. If it is your identity that will not resolve,
-block — see the rule above.
+`gaps`, leave the other fields empty, and complete.
 
 ---
 
