@@ -5,7 +5,10 @@ import re
 import urllib.request
 from urllib.parse import urlencode
 
-SESSION_KV_URL = "http://127.0.0.1:8699"
+# Env-overridable for the integration seam tests, which run the real KV server
+# on an ephemeral port; every pod deployment leaves it at the default. Read at
+# import, like the rest of this module's configuration.
+SESSION_KV_URL = os.environ.get("SESSION_KV_URL", "http://127.0.0.1:8699")
 
 logger = logging.getLogger(__name__)
 
