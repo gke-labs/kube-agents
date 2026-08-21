@@ -125,6 +125,11 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # reconciles lapse past the exclusion window, or the minor reaches EOL and
 # GKE auto-upgrades -- the lag is gone for good and the fix is replacing
 # the cluster (`tofu apply -replace=google_container_cluster.seeded_b`).
+# That replacement is not free: the drift SOP drops a cluster under 24h old
+# from every cohort, which takes the comparable cohort from three to two,
+# under its 3-cluster floor -- so the drift audit emits nothing for the
+# WHOLE fleet for a day and consistency-drift-outlier goes red everywhere.
+# Schedule it accordingly; the README's activation timeline has the detail.
 # The seeded_b comment and the README carry the full account.
 data "google_container_engine_versions" "fleet" {
   location = var.zone

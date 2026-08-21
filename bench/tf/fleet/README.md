@@ -66,24 +66,38 @@ going red is the detection. The pin cannot pull it back — the provider upgrade
 when the recorded master is below the configured value, and a control plane cannot be
 downgraded — so the recovery is the same in both cases: replace the cluster and let the
 derived pin re-lag it against the then-current default:
-`tofu apply -replace=google_container_cluster.seeded_b`. The other standing hazard is
+`tofu apply -replace=google_container_cluster.seeded_b`. That replacement costs the
+drift scenario a day — see the cluster-replacement note under Activation timeline
+below. The other standing hazard is
 a cleanup sweep — one `orphan-pd-` deletion breaks the cost scenario, and recreating a
 deleted fixture restarts its age gate (below).
 
 ## Activation timeline
 
-The cost SOP's collectors are age-gated, so the fleet is not fully assertable on the
-day it is applied. Recreating a fixture restarts its clock — `creationTimestamp` is
-server-set and immutable, so backdating is impossible; do not try.
+The cost SOP's collectors and the drift SOP's cohort rules are age-gated, so the fleet
+is not fully assertable on the day it is applied. Recreating a fixture restarts its
+clock — `creationTimestamp` is server-set and immutable, so backdating is impossible;
+do not try.
 
-| Day  | What becomes detectable                                                                                                |
-| ---- | ---------------------------------------------------------------------------------------------------------------------- |
-| D0   | Everything except the cost fixtures: RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag, drift outlier |
-| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                     |
-| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                            |
+| Day  | What becomes detectable                                                                                                                                                            |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag                                                                                                                 |
+| D+1  | The drift outlier. The drift SOP excludes a cluster whose `createTime` is under 24 hours old "from every cohort" (§1), so on apply day the `(standard, seeded)` cohort has zero members, and §2.4's floor ("a cohort of fewer than **3** clusters produces no findings, ever") would floor it out even if only one cluster were new |
+| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                 |
+| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                        |
 
-The `fleet-cost-idle-pool` scenario must stay dormant until D+30, when both of its
-fixtures are visible.
+So `consistency-drift-outlier` must stay dormant until D+1, and `fleet-cost-idle-pool`
+until D+30, when both of its fixtures are visible.
+
+**Those two drift gates also govern cluster replacement.** Replacing any one of the
+three — the documented recovery for `seeded-b`'s lag, and anything else that forces a
+cluster — makes it new for 24 hours, which takes the comparable cohort from three
+clusters to two and drops it under the §2.4 floor. The drift audit then emits nothing
+for the **whole** fleet, not just the replaced cluster, so `consistency-drift-outlier`
+goes red on every open pull request for a day. It is a clean, self-clearing outage
+rather than a wrong answer (each member records the floor in its `limitations`, and no
+finding is invented), but it is a day of red: schedule a replacement when the drift
+scenario can be quiet, or expect and announce the gap.
 
 ## The defects
 
