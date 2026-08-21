@@ -120,17 +120,17 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 | --- | --- |
 | `kube-agents-evals` | `gke-agentic/kube-agents-evals-infra` |
 | `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
-| `kube-agents-evals-3` | `gke-agentic/kube-agents-evals-3-infra` — **not created yet, see below** |
+| `kube-agents-evals-3` | `gke-agentic/kube-agents-evals-3-infra` — **not on the App yet, see below** |
 
 The repository is seeded from the layout in [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) and kept private: it is throwaway state a bot rewrites on every run.
 
 > **`kube-agents-evals-3` is mapped but not finished.** The project was added to the Boskos pool on 2026-08-21 with its GCP half provisioned — it is `ACTIVE` and its `platform-agent-host` cluster is `RUNNING` — but section 5 was skipped, so every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal. The mapping row above closes that, and closes nothing else. Still outstanding, and all human-only:
 >
-> 1. Create the private `gke-agentic/kube-agents-evals-3-infra` from `examples/gitops-repo`.
-> 2. Add it to App `4675512`'s installation.
-> 3. Apply `terraform/examples/ci-pool-minter` for the project **in its own workspace or backend prefix** (see the composition's README — re-using another project's state destroys that project's minter), then import the App PEM into its KMS key.
+> 1. ~~Create the private `gke-agentic/kube-agents-evals-3-infra`.~~ **Done 2026-08-21** — private, `main`, LICENSE and README, matching the other two. Deliberately minimal: audits work against an empty tree, and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
+> 2. **Add it to App `4675512`'s installation.** Org-admin on `gke-agentic` plus App-manager rights; `contents: write`, `pull_requests: write`, `issues: write`, on that repository only.
+> 3. **Apply `terraform/examples/ci-pool-minter` for the project in its own workspace or backend prefix** (see the composition's README — re-using another project's state destroys that project's minter), then import the App PEM into its KMS key with the Minty CLI.
 >
-> Until (1) and (2) are done, a run that leases `kube-agents-evals-3` deploys and then fails at `audit_report.py start` with a clone error, which is a worse failure than the one it replaced: it names no cause. If that is happening, the fix is to finish the list or to drop the project from the pool — not to revert the row, which only moves the failure back one step.
+> Until (2) is done, a run that leases `kube-agents-evals-3` deploys and then fails at `audit_report.py start`: the clone target now exists, but no token can be minted for it. That is a worse failure than the unmapped-project refusal it replaced, because it names no cause. If that is happening, the fix is to finish the list or to drop the project from the pool — not to revert the row, which only moves the failure back one step.
 
 ### 5.1 How CI resolves it
 
