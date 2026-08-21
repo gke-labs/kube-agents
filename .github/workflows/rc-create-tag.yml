@@ -1,6 +1,10 @@
 name: RC Step 1 - Create Candidate Tag
 
+permissions:
+  contents: read
+
 on:
+  #checkov:skip=CKV_GHA_7:Standalone launch requires target commit SHA and release candidate tag inputs
   workflow_dispatch:
     inputs:
       commit_sha:

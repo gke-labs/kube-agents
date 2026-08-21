@@ -1,15 +1,17 @@
 ---
 title: Cron jobs
-description: The two shipped cron rosters — the Chat Agent's plumbing and the Platform Agent's governance watchdogs.
+description: The two shipped cron rosters — the Planning Agent's plumbing and the Platform Agent's governance watchdogs.
 sidebar:
   order: 2
 ---
 
 Two files define the scheduled jobs, one per profile, and which one an entry belongs in follows from what runs it. For the story of what these jobs achieve together, see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/); for the mechanism, [What fires the schedule](/kube-agents/concepts/autonomous-watchdogs/#what-fires-the-schedule).
 
-`agents/chat/defaults/cron/jobs.json` is the Chat Agent's roster, and the only store the gateway's own ticker advances. Every entry on it is a `no_agent` **script** job — a plain subprocess, no model prompted — because that profile's toolsets are stripped to `mcp-router`, `kanban` and `memory` and it could not run an audit if asked. Four jobs ship: `profile-cron-tick`, the every-minute dispatcher that ticks every named profile with work due; the hourly `cluster-agent-reconcile` sweep that keeps [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles aligned with the live fleet; and the two [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) jobs, `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`.
+`agents/chat/defaults/cron/jobs.json` is the Planning Agent's roster, and the only store the gateway's own ticker advances — unless the experimental [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) flag has re-homed the gateway, which moves the ticked store to the Platform Agent's roster and stops this one. Every entry on it is a `no_agent` **script** job — a plain subprocess, no model prompted — because that profile's toolsets are stripped to `mcp-router`, `kanban` and `memory` and it could not run an audit if asked. Four jobs ship: `profile-cron-tick`, the every-minute dispatcher that ticks every named profile with work due; the hourly `cluster-agent-reconcile` sweep that keeps [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles aligned with the live fleet; and the two [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) jobs, `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`.
 
-`agents/platform/cron/jobs.json` is the Platform Agent's roster, and carries the eight governance watchdogs. `profile-cron-tick` is what makes it live: each is a real cron run in its own process, with that profile's persona, toolsets, `skills`, `model` and `max_turns`. No id may appear on both rosters — two rosters both carrying one is that audit running twice per schedule, concurrently with itself.
+`agents/platform/cron/jobs.json` is the Platform Agent's roster, and carries the seven governance watchdogs plus two `no_agent` entries that run no model: `github-repo-watcher` and the daily recap described below. `profile-cron-tick` is what makes it live: each watchdog is a real cron run in its own process, with that profile's persona, toolsets, `skills`, `model` and `max_turns`. No id may appear on both rosters — two rosters both carrying one is that audit running twice per schedule, concurrently with itself.
+
+`eod-event-watcher-daily-report` is the roster's second `no_agent` entry: a script that renders the k8s-event-watcher recap straight from the session ledger and delivers its stdout verbatim. It sits here despite needing none of the profile's toolsets because what it reads belongs to the Platform Agent: the session database. Scripts are shared rather than per-profile (the entrypoint links `profiles/platform/scripts` at the shared directory), so `script` resolves here exactly as it does on the Planning Agent's roster.
 
 ## The shipping jobs
 
@@ -21,10 +23,10 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 
 | ID | Profile | Schedule | Cadence | Enabled | Runs |
 | -- | ------- | -------- | ------- | :-----: | ---- |
-| `profile-cron-tick` | Chat Agent | `* * * * *` | — | yes | `profile_cron_tick.py` |
-| `cluster-agent-reconcile` | Chat Agent | `11 * * * *` | Hourly at :11 | yes | `cluster_agent_reconcile.py` |
-| `bootstrap-inventory-scan` | Chat Agent | `* * * * *` | — | yes | `bootstrap_scan_gate.py` |
-| `bootstrap-inventory-delivery` | Chat Agent | `* * * * *` | — | yes | `bootstrap_delivery.py` |
+| `profile-cron-tick` | Planning Agent | `* * * * *` | — | yes | `profile_cron_tick.py` |
+| `cluster-agent-reconcile` | Planning Agent | `11 * * * *` | Hourly at :11 | yes | `cluster_agent_reconcile.py` |
+| `bootstrap-inventory-scan` | Planning Agent | `* * * * *` | — | yes | `bootstrap_scan_gate.py` |
+| `bootstrap-inventory-delivery` | Planning Agent | `* * * * *` | — | yes | `bootstrap_delivery.py` |
 | `compliance-audit` | Platform Agent | `20 6 * * *` | Daily 06:20 | yes | Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' i... |
 | `obtainability-audit` | Platform Agent | `50 6 * * *` | Daily 06:50 | yes | Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your p... |
 | `security-patch-orchestrator` | Platform Agent | `20 7 * * 1` | Weekly, Monday 07:20 | yes | Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrat... |
@@ -32,7 +34,9 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `fleet-consistency-drift` | Platform Agent | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' i... |
 | `ai-security-audit` | Platform Agent | `50 8 * * *` | Daily 08:50 | yes | Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your pro... |
 | `stockout-prevention` | Platform Agent | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention... |
-| `github-issue-resolver` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on ou... |
+| `gcp-networking-fabric-audit` | Platform Agent | `0 8 * * *` | — | yes | Run the daily GCP networking fabric and VPC IPAM audit. Read the SOP at 'governance/gcp_networking_fabric_s... |
+| `github-repo-watcher` | Platform Agent | `*/10 * * * *` | Every 10 minutes | yes | `github_scan_gate.py` |
+| `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: cron-jobs -->
@@ -53,33 +57,32 @@ Both rosters use one schema. A governance watchdog:
   "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 406 lines of it, before you run anything. Its eleven checks are section 2, lines 102-314, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": ["fleet-audit"],
   "enabled": true,
-  "deliver": "all"
+  "deliver": "chat"
 }
 ```
 
-| Field              | Type            | Purpose                                                                                                                                                                                                                                                                                                     |
-| ------------------ | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`               | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.                                                                                                                                                          |
-| `name`             | string          | Human-readable name for logs. For the audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`.                                                                                                                                                                  |
-| `schedule.kind`    | string          | `"cron"` on every entry. `"interval"` is supported but unused: Hermes re-anchors an interval job to when the last run _finished_, and the gateway ticker sleeps a fixed 60 seconds after each tick returns, so a 1-minute interval fires every two.                                                         |
-| `schedule.expr`    | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                                                                                                                                                                 |
-| `schedule.display` | string          | Display form (usually equal to `expr`).                                                                                                                                                                                                                                                                     |
-| `prompt`           | string          | What the run is asked to do, copied verbatim into the turn. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`. It lives here and nowhere else.                                                                                                                        |
-| `skills`           | array of string | The skills the run needs. The scheduler force-loads each one's text ahead of the first turn, rather than leaving the load to the model's discretion. The seven audits use `fleet-audit`; `github-issue-resolver` uses its namesake skill. A `no_agent` job prompts no model, so the field is ignored there. |
-| `no_agent`         | bool            | Set on the Chat Agent's four plumbing jobs: the tick is a subprocess, not an LLM turn. The governance watchdogs omit it.                                                                                                                                                                                    |
-| `script`           | string          | For a `no_agent` job, the script to run, resolved in that profile's `scripts/`. The scheduler runs it with no arguments.                                                                                                                                                                                    |
-| `enabled`          | bool            | Set `false` to disable without deleting the entry. See [Disabling a watchdog](/kube-agents/concepts/autonomous-watchdogs/#disabling-a-watchdog) — a deleted entry is not removed from a cluster that already has it.                                                                                        |
-| `deliver`          | string          | Where the run's outcome goes. `"all"` sends it to the configured target; `"local"` resolves to no target at all and drops it. The eight watchdogs all use `"all"`, so a watchdog that has stopped working is visible rather than indistinguishable from a quiet fleet.                                      |
+| Field              | Type            | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------ | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`               | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.                                                                                                                                                                                                                                                                                |
+| `name`             | string          | Human-readable name for logs. For the audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`.                                                                                                                                                                                                                                                                                        |
+| `schedule.kind`    | string          | `"cron"` on every entry. `"interval"` is supported but unused: Hermes re-anchors an interval job to when the last run _finished_, and the gateway ticker sleeps a fixed 60 seconds after each tick returns, so a 1-minute interval fires every two.                                                                                                                                                                               |
+| `schedule.expr`    | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                                                                                                                                                                                                                                                                                       |
+| `schedule.display` | string          | Display form (usually equal to `expr`).                                                                                                                                                                                                                                                                                                                                                                                           |
+| `prompt`           | string          | What the run is asked to do, copied verbatim into the turn. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`. It lives here and nowhere else.                                                                                                                                                                                                                                              |
+| `skills`           | array of string | The skills the run needs. The scheduler force-loads each one's text ahead of the first turn, rather than leaving the load to the model's discretion. The seven audits use `fleet-audit`. A `no_agent` job prompts no model, so the field is ignored there.                                                                                                                                                                        |
+| `no_agent`         | bool            | Set on the Planning Agent's four plumbing jobs and on the Platform Agent's two non-watchdog entries, `github-repo-watcher` and `eod-event-watcher-daily-report`: the tick is a subprocess, not an LLM turn. The governance watchdogs omit it.                                                                                                                                                                                     |
+| `script`           | string          | For a `no_agent` job, the script to run, resolved in that profile's `scripts/`. The scheduler runs it with no arguments.                                                                                                                                                                                                                                                                                                          |
+| `enabled`          | bool            | Set `false` to disable without deleting the entry. See [Disabling a watchdog](/kube-agents/concepts/autonomous-watchdogs/#disabling-a-watchdog) — a deleted entry is not removed from a cluster that already has it.                                                                                                                                                                                                              |
+| `deliver`          | string          | Where the run's outcome goes. `"all"` sends it to the configured target; `"chat"` hands the report to the Planning Agent, who posts it and can answer a follow-up about it; `"local"` resolves to no target at all and drops it. Every enabled job on the Platform Agent's roster uses `"chat"` bar `gcp-networking-fabric-audit`, so a job that has stopped working is visible rather than indistinguishable from a quiet fleet. |
 
 ## Editing
 
 Adding or editing a job is a one-file change — see [Adding a watchdog](/kube-agents/concepts/autonomous-watchdogs/#adding-a-watchdog).
 
-Edit `jobs.json`, then redeploy the workspace:
+Edit `jobs.json`, then redeploy the agent image at the revision carrying the change:
 
 ```bash
-cd k8s-operator/scripts
-./provision_08_deploy_platform_agent.sh
+./upgrade.sh --upgrade-mode=harness --image-tag=<SEMVER_TAG_OR_FULL_COMMIT_SHA>
 ```
 
 Or during development:
@@ -93,7 +96,7 @@ The change is picked up on the next pod restart.
 
 ### How an edit reaches an existing pod
 
-This part is about the **Chat Agent's** file, [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — the one the start-up reconcile below acts on. The Platform Agent's roster, which the rest of this page documents, reaches its profile by a separate path: `profile_scaffold.py` scaffolds it, and `merge_cron_store` merges it under the same per-key rule.
+This part is about the **Planning Agent's** file, [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — the one the start-up reconcile below acts on. The Platform Agent's roster, which the rest of this page documents, reaches its profile by a separate path: `profile_scaffold.py` scaffolds it, and `merge_cron_store` merges it under the same per-key rule.
 
 `$HERMES_HOME/cron/jobs.json` lives on the agent's persistent volume, and the scheduler writes `last_run` back into it on every tick — so the volume's copy is always newer than the image's, and the entrypoint's update-only defaults copy never overwrites it. Simply overwriting the file is not an option either: it would reset every `last_run` (making all jobs look due at once), discard the chat binding [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) writes, and reinstate the two onboarding jobs that finishing onboarding deliberately removes.
 

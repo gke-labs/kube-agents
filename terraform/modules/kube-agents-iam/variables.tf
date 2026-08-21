@@ -35,10 +35,10 @@ variable "ksa_name" {
 variable "project_roles" {
   description = <<-EOT
     Project-level IAM roles granted to the agent's service account. The default
-    is the read-only permission set the provisioning scripts grant
-    (k8s-operator/scripts/provision_04_gcp_iam.sh, PLATFORM_AGENT_PERMISSION_SET
-    read-only, which is also that script's default); see the security-and-iam
-    reference for what each role is used for. Set to [] to grant nothing and
+    is the read-only permission set (the full-install composition's
+    permission_set = "read-only", which is also the installer's default); see
+    the security-and-iam reference for what each role is used for. Set to [] to
+    grant nothing and
     manage roles outside the module. Passing null selects this default
     (nullable = false), which lets root modules expose a passthrough variable.
   EOT

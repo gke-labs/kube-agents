@@ -9,13 +9,217 @@ PRs always live in that repo. Everything else — remote names, the base branch,
 location — is discovered at runtime, so this command works for any teammate in any clone regardless
 of what they called their remotes or where they cloned to.
 
-Spawn **one subagent per PR number**, all in a single message so they run concurrently. Each
-subagent owns exactly one PR end to end and reports back a short structured result. Do not review
-any PR yourself in the main loop — your job is to fan out, then relay.
+Run **Phase −1 in the main loop first**, for every PR number, and wait for my answer. Then spawn
+**one subagent per PR number that survives it**, all in a single message so they run concurrently.
+Each subagent owns exactly one PR end to end and reports back a short structured result. Do not
+review any PR yourself in the main loop — your job is to pre-flight, fan out, then relay.
 
-Give each subagent the instructions below verbatim, with `<N>` replaced by its PR number.
+Give each subagent everything under **[Subagent instructions (per PR)](#subagent-instructions-per-pr)**
+verbatim, with `<N>` replaced by its PR number, plus the PR's pre-flight verdict, the review mode I
+chose for it, and the SHA that mode starts from when it is a narrowed one. Phase −1 is yours and
+stops at that heading: it asks me a question, which a subagent cannot do, so handing it on would
+either hang the subagent or have it answer on my behalf.
 
 ---
+
+## Phase −1 — Pre-flight: is this review already covered? (main loop)
+
+Every PR here is read by `kube-agents-bot` on the way in, and the repo requires the author to have
+run `review-adversarial` over their own diff and written the disposition into the body before
+opening. When both of those happened and neither has gone stale, a third hostile read usually buys
+nothing — so find that out before spending it.
+
+This phase runs **in the main loop, before any subagent exists**, for two reasons. Its output is a
+question for me, and a subagent has no way to ask one. And it is pure GitHub API — no worktree, no
+fetch, no diff read — so it costs two calls per PR, plus one per merge sitting after the bot's
+review, which is nearly always none or one.
+
+### The two queries
+
+The repo is named literally in both: Phase −1 runs before Phase 0 defines `$REPO`.
+
+```bash
+# Signal 1, in one call: the head SHA, the bot's reviews with the commit each one
+# actually read, the commit graph, and the open threads. The filter reports the
+# commits *after* the review's commit, which is what the currency test needs.
+gh api graphql -f query='
+query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(number:$pr){
+  headRefOid isDraft state author{login}
+  reviews(last:20){nodes{author{login} state submittedAt body commit{oid}}}
+  commits(last:100){nodes{commit{oid messageHeadline parents(first:2){totalCount nodes{oid}}}}}
+  reviewThreads(first:100){nodes{isResolved path}}
+}}}' -F pr=<N> --jq '.data.repository.pullRequest as $p
+| ([$p.reviews.nodes[] | select(.author.login == "kube-agents-bot")] | last) as $r
+| ($p.commits.nodes | map(.commit)) as $cs
+| ($cs | map(.oid) | index($r.commit.oid // "")) as $i
+| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length)",
+  (if $r == null then "lastbot: NONE"
+   else "lastbot at=\($r.submittedAt) commit=\($r.commit.oid)",
+        ($r.body | split("\n") | [.[0], (.[] | select(startswith("### Findings outside") or startswith("#### ") or startswith("_This was a")))] | join("\n")),
+        (if $i == null then "since: review commit is not among those \($cs|length) commits"
+         elif $i == ($cs|length) - 1 then "since: nothing, the review is at the tip"
+         else "since:\n  " + ($cs[$i+1:] | map("\(.oid[0:7]) parents=\(.parents.totalCount)\(if .parents.totalCount > 1 then " p2=" + .parents.nodes[1].oid[0:7] else "" end) \(.messageHeadline)") | join("\n  "))
+         end)
+   end)'
+
+# Signal 2: the PR description. Read it yourself — see below.
+gh pr view <N> --repo gke-labs/kube-agents --json body -q .body
+```
+
+Use GraphQL for the reviews rather than `gh api repos/$REPO/pulls/<N>/reviews`: the REST endpoint
+has been observed returning an empty body against this repo while `/pulls/<N>/comments` worked.
+(REST does carry the review's `commit_id`, so that is not the reason — availability is.)
+
+Keep the filter's `.[0]` / `startswith` shape if you edit it. `gh --jq` is gojq, but the same
+program gets piped through real `jq` often enough that it has to run in both, and jq rejects a field
+access applied straight to a function call — `capture("…").s` compiles under gojq and is a syntax
+error under jq 1.6.
+
+All three page sizes are caps rather than promises:
+
+- `reviews(last: 20)` and `reviewThreads(first: 100)` — on a long-lived PR, say you looked at the
+  last twenty reviews rather than reporting it clear off a truncated list.
+- `commits(last: 100)` — a branch can outrun that, and a review older than the window is then
+  indistinguishable from one whose commit was force-pushed away. Both print the same
+  `since: … not among those N commits`. That lands on stale either way, which is the safe direction,
+  but when `commits=100` say "could not confirm currency" rather than "force-pushed".
+
+### Signal 1 — a current, clean bot review
+
+Three things must hold.
+
+**Clean.** The **last** bot review's body opens with either of the two clean verdicts. GraphQL
+reports the login as `kube-agents-bot`, without the `[bot]` suffix the REST API adds. Take the last
+one: after a `/review` the earlier review is still sitting there, and reading it back looks exactly
+like the new one.
+
+- `**No findings.**` — nothing raised anywhere.
+- `**No findings in the code.**` — the bot cleared the diff and raised something outside it, a note
+  on the description usually. It counts, but quote the note in the evidence rather than letting the
+  word "clean" swallow it.
+
+Where that note lives decides whether you have it. Sometimes it is in the first line, as on #684.
+Sometimes the body carries a whole `### Findings outside this diff` section — findings the bot could
+not anchor to a changed line — and on #709 that section ran to a 🔴 High and fifteen hundred words.
+The filter keeps the section heading and each finding's `####` title line, not the argument under
+them, which is enough to see that one exists and to quote it in a line. When the heading does
+appear, re-run the same query with `--jq '…| last | .body'` and read it before you put `covered` in
+front of me — one more call, on the rare PR that needs it. An unanchored High is a live finding on
+the pull request, and it must not vanish between the review and the evidence I am shown.
+
+Note the width too. The footer reads `_This was a strict pass: only what I am certain of…_` or
+`_This was a wider pass: as well as what I am certain of…_`. A strict-pass clean covers less ground
+than a wide-pass clean, and I may want the difference.
+
+**Current.** Either the review's commit is the head, or everything after it is a merge **from the
+base branch**. Merging the base branch in is not new work to review — this is the API-only twin of
+the `git log <sha>..HEAD --no-merges --not "$BASE_REF"` rule in Phase 2.
+
+`parents.totalCount > 1` is necessary and nowhere near sufficient. A sibling feature branch, or a
+colleague's fork branch, merges with two parents exactly like `main` does, and it brings an entire
+branch of code no review has read; `messageHeadline` is no backstop, since `Merge branch 'main'` is
+a string anyone can type. The git rule catches this and the parent count does not, which is why the
+filter prints the second parent as `p2=`. Confirm it is on the base branch before calling the review
+current:
+
+```bash
+# One call per merge in the tail. "identical" or "behind" means <p2> was already on
+# the base branch, so the merge brought in nothing unreviewed. "ahead" or "diverged"
+# means it brought in a branch of its own: the review is stale, not current.
+gh api repos/gke-labs/kube-agents/compare/<base-branch>...<p2> --jq .status
+```
+
+On #675 that is `behind` for `p2=5bc8165`, which is what makes its 8-commit tail a base merge. An
+octopus merge has parents past the second; check each of them the same way, or call the review stale
+and say why. Two ways this is still softer than the git rule, both worth saying out loud rather than
+papering over:
+
+- A conflicted merge carries hand-written resolution that no review has seen, and over the API it
+  looks exactly like a clean one — `compare` reports on the parent, not on what the author did with
+  it. When the tail is merges, call them presumed base merges and offer the delta pass; only a
+  worktree can tell the two apart, and Phase −1 has no worktree by design. Phase 3 does that check;
+  it does not use `git show --cc`, for a reason worth reading before you assume it would have.
+- A review commit missing from the list is stale, but see the `commits(last: 100)` caveat above for
+  which kind of stale.
+
+**Nothing left open.** No unresolved review thread. An open thread is outstanding work by the repo's
+own merge rules, however clean the latest review reads.
+
+### Signal 2 — the author reviewed and tested it themselves
+
+Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" requires before a
+pull request is opened at all:
+
+- **`## Self-Review`** — the disposition list from the author's own pre-PR passes, merged:
+  `review-adversarial` and `review-docs-drift`, both on every change. What they looked for, what
+  kind of context each pass ran in, what it found, and for each finding whether
+  they fixed it or decided not to and why. This is the signal that matters most here, because it is
+  the only one that says somebody already read this diff hostilely.
+- **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
+  exercised. `Not live-tested` with a stated reason is a filled section.
+
+Judge them by reading, not by measuring. A section holding only the template's HTML comment,
+whitespace, or a bare `-` is unfilled — but so is a paragraph that says "reviewed it, looks fine",
+because the bar AGENTS.md sets is that "no findings" counts **only alongside what was looked for**.
+Length settles neither question. Watch for the section heading appearing in prose elsewhere in the
+body, which is why this is a read rather than a regex: a PR that discusses the `## Self-Review`
+section is not a PR that filled one in.
+
+When the section is missing or unanswered, Signal 2 fails — say so plainly, since that is the first
+thing the review would report anyway.
+
+Do not reach for the author's inline comments as a substitute. Authors here do not leave top-level
+inline comments on their own diffs; what you see under an author's name are replies to bot threads,
+which is engagement with a review rather than one.
+
+### The verdicts
+
+| Verdict   | When                                                                    | What you do                                                                  |
+| --------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `skip`    | Draft, closed, or merged                                                | Report it and stop — no queries argued, no subagent                          |
+| `covered` | Signal 1 in full, plus Signal 2                                         | Report the evidence and **ask me** before reviewing                          |
+| `partial` | Clean bot review but stale, or Signal 2 missing, or a thread still open | Report it, name exactly what is missing, and offer a narrower or a full pass |
+| `review`  | No clean bot review — the bot found issues, or never ran                | Proceed to fan-out with no prompt                                            |
+
+`skip` is the same judgement Phase 2 makes and the same one it reports; making it here as well just
+saves spawning a subagent to reach it. A draft is the author saying they are not asking yet.
+
+### The ask
+
+If nothing is `covered` or `partial`, say so in one line and fan out. Otherwise, per such PR, put
+the evidence in front of me before you spend anything:
+
+- the bot review's first line, its width, and its date;
+- its commit versus the head, and what the commits in between are, if any;
+- what the Self-Review section says it looked for and found, in a line or two;
+- the Live-validation section in one line — what the author says they exercised;
+- for `partial`, the single thing that is missing.
+
+Then offer three choices: **skip it**, **review only what landed since `<sha>`** — the bot review's
+commit, the one the query prints as `lastbot … commit=` — or **a full pass anyway**. I decide —
+coverage is a suggestion, and "the bot found nothing" is not a review verdict of yours.
+
+Two of the filter's three `since:` outcomes take the narrowed option off the table, and for opposite
+reasons. Offer two choices, not three, when the line reads either of these:
+
+- **`since: nothing, the review is at the tip`** — there is nothing after the review to narrow to.
+- **`since: review commit is not among those N commits`** — there is no anchor at all. That commit
+  was force-pushed away, or the branch outran the `commits(last: 100)` window, and either way
+  "everything since `<sha>`" names a starting point that is not on the branch. Phase 1 fetches only
+  `refs/pull/<N>/head`, so the SHA would not even resolve in the worktree, and `git log
+"$SINCE_SHA"..pr<N>` fails with `fatal: bad revision` on empty stdout — indistinguishable, to a
+  subagent reading stdout, from a delta that is genuinely empty. This is the case a stale verdict
+  exists for: offer the full pass, and say the anchor is gone rather than that there is nothing to
+  see.
+
+Do **not** withhold it for the remaining case, a tail of presumed base merges. That is where the
+option earns its keep — a conflicted merge's hand-written resolution is precisely the code no review
+has read, and from up here it looks exactly like a clean one. It may still turn out to hold nothing,
+but that is a result Phase 3 reports after replaying the merge in a worktree, not a promise you can
+make before spending it.
+
+Fan out only for what I keep, and tell each subagent its verdict, its mode, and — for a narrowed
+pass — the SHA, which it has no way to recover from a decision I made in the main loop.
 
 ## Subagent instructions (per PR)
 
@@ -59,6 +263,13 @@ Set `BASE_REF` once to whichever applies and use `$BASE_REF` everywhere below.
 
 `$MAIN_ROOT` is the top of the primary checkout even when you are standing inside a worktree; it is
 where saved reviews live so that every run — and every teammate — sees the same history.
+
+Two more variables come from the main loop rather than from here, and carry the same way:
+`$REVIEW_MODE` is `full` or `since`, and in `since` mode `$SINCE_SHA` is the commit Phase −1 found
+already reviewed. Phase 3 picks what it reads off them and Phase 4 records them. **Spawned without
+a mode, you are `full`** — that is what the `review` verdict hands over, and it is the common case.
+Never infer a narrower one from the PR's history yourself: narrowing is mine to authorise, and a
+review that silently reads less than the whole diff still saves a file the next run trusts.
 
 ### Phase 1 — Worktree
 
@@ -150,9 +361,9 @@ matching this PR.
   saying they are not asking for review yet, and review comments on unfinished work are noise at
   best. Wait for ready-for-review;
 - a saved review already exists for this PR **and** `headRefOid` matches the head SHA it recorded —
-  nothing has changed since;
+  nothing has changed since (`full` mode only, see below);
 - a saved review exists and the author has landed no work of their own since — merging the base
-  branch in is not new work to review:
+  branch in is not new work to review (`full` mode only, see below):
 
   ```bash
   git log <recorded-sha>..HEAD --no-merges --not "$BASE_REF"     # empty → skip
@@ -164,7 +375,36 @@ matching this PR.
   skip. Phase 1b has already merged the base locally by this point, which makes the unfiltered range
   wrong even when the author pushed nothing at all.
 
+Both of those conditions read the saved review's **scope** as well as its SHA, and skip only on
+`scope: full`. A file recording `scope: since <sha>` covers the commits after that SHA and nothing
+before them, so a matching head SHA there says that nothing new has landed, not that the diff was
+ever read whole — skipping on it would let one narrowed pass suppress the full one permanently.
+Proceed instead, and say in your report that the prior review was a narrowed one and what it
+covered. A saved review with no scope field predates the narrowed mode and was a full pass.
+
+**Neither condition applies at all when `$REVIEW_MODE` is `since`.** They read a saved review of
+ours; Phase −1 read the bot's and mine; and because the two never consult each other, the second
+condition silently cancels precisely the pass Phase −1 got authorisation for. It is empty _by
+construction_ on a merge tail — `--no-merges` drops the merge and `--not "$BASE_REF"` drops
+everything it pulled in — which is the same fact that made Phase −1 call the bot review current and
+offer the narrowed pass in the first place. Skipping there means the merge's hand-written
+resolution is read by nobody, and that resolution is the whole reason I paid for the pass. So run
+it. If the delta turns out empty, Phase 3 says so and names what it ran, which is a report; `status: skipped` off a
+condition I was never asked about is not.
+
 A merge conflict is **not** a skip reason. Neither is an unmergeable `mergeStateStatus`.
+
+**Do not re-litigate coverage.** Phase −1 already weighed the bot's verdict and the author's
+evidence — either it found no coverage worth raising, or it raised it and was told to go ahead. You
+were spawned either way, so a clean bot review is not a skip reason at this point, and neither is a
+thorough Self-Review section. Review at the mode you were given.
+
+Both are still worth reading, for a different purpose. The Self-Review section is where AGENTS.md
+tells every reviewer to start — it says where the author's own pass stopped, so yours can start
+there — and the bot's review says what a second reader already cleared. Neither is a reason to drop
+a finding of your own; both are a reason to be able to say why they missed it. A finding on a line
+the bot passed, or one the author rejected with a reason, needs the skill's step 5 to answer them
+rather than talk past them.
 
 Otherwise proceed. If a prior review exists but new commits landed, review the current head in full
 and note in your report which findings from the prior review the new commits resolved. Read the
@@ -174,167 +414,128 @@ restating the claim).
 
 ### Phase 2b — Establish intent
 
-Read the PR description (`body`) and any issue it links (`gh issue view <M> --repo "$REPO"`), then
-write down, in one sentence, **what this PR claims to do**. Keep that sentence; it is the yardstick
-for Angle I and it is what tells you whether a given change belongs here at all.
+Read the PR description (`body`) and any issue it links (`gh issue view <M> --repo "$REPO"`), and
+carry both into step 3 of the skill below. On a pull request the description is also a thing that
+can be wrong: a body promising a behaviour the diff does not implement, or silent about one it
+does, is itself a finding.
 
-Two failure modes to avoid. Do not let the description talk you out of a defect — "known
-limitation, follow-up PR" in the body does not make a dropped guard correct, though it does change
-how you phrase the finding. And do not treat the description as a description of the diff: where
-the two disagree, the diff is what merges. A body that promises a behaviour the diff does not
-implement, or omits a behaviour the diff does, is itself a finding.
+### Phase 3 — Find the candidates and verify them
 
-### Phase 3 — Find candidates (ten angles)
+Run `$MAIN_ROOT/.agents/skills/review-adversarial/SKILL.md`. It is the repository's review method
+and the canonical home for the ten angles and the verification discipline; read it now and work it
+in order — intent, angles A–J, then the verification step, which is not optional.
 
-Work through all ten angles below yourself, in sequence, in this context. Do not skip an angle
-because an earlier one found nothing there, and do not let one angle's conclusion suppress
-another's — if two angles flag the same line for different reasons, record both.
+Its step 1 is already satisfied: you are a subagent that did not write this change, which is the
+separation it asks for. Do not spawn another one. Start at its step 2.
 
-Each angle surfaces up to six candidates, each with a `file`, a `line`, a one-line `summary`, and a
-concrete `failure_scenario`. Pass every candidate with a nameable failure scenario through to
-Phase 4 — finders that silently drop half-believed candidates are the dominant cause of misses.
-A candidate you cannot express as a failure scenario is not yet a candidate.
+`$MAIN_ROOT` is not decoration. You are standing in the worktree, which holds the pull request's
+own content: a bare path would load the review method **from the change under review**, so a fork
+branch could edit the angles that judge it, and a branch cut before the skill existed would find no
+file at all and silently review nothing. Read it from the primary checkout, the way Phase 2 and
+Phase 4 already read the saved-review directory.
 
-**Angle A — line-by-line diff scan.** Read every hunk, line by line. Then read the enclosing
-function for each hunk — bugs in unchanged lines of a touched function are in scope, since the PR
-re-exposes or fails to fix them. For every line ask: what input, state, timing, or platform makes
-this line wrong? Inverted or wrong conditions, off-by-one, nil/undefined deref, missing `await`,
-unchecked `err`, falsy-zero checks, wrong-variable copy-paste, an error swallowed in a catch,
-unescaped regex metacharacters.
+Two substitutions for this context:
 
-**Angle B — removed-behavior auditor.** For every line the diff deletes or replaces, name the
-invariant it enforced, then find where the new code re-establishes it. If you cannot find it,
-that's a candidate: a removed guard, a dropped error path, a narrowed validation, a deleted test
-that was covering a real case, a loosened RBAC or NetworkPolicy rule.
+- **The diff range follows `$REVIEW_MODE`.** In `full` mode it is the one Phase 1b settled on —
+  `$BASE_REF...HEAD` after a clean merge, or `$BASE_REF...pr<N>` when the merge conflicted and was
+  aborted. Never `main` on its own.
 
-**Angle C — cross-file tracer.** For each function, template, chart value, or CRD field the diff
-changes, grep for its consumers and check whether the change breaks any of them: a new
-precondition, a changed return shape, a renamed key a manifest still reads, a timing dependency.
-Trace runtime wiring through to the source — which container an env var lands in, which process
-reads a port, which service account a binding actually grants — rather than inferring it from names.
+  `since` mode has **no such range, and you must not invent one.** The obvious answer,
+  `git diff "$SINCE_SHA"..pr<N>`, is the wrong one: every base-branch commit an intervening merge
+  pulled in lands inside it — on #675 that is 250 files and 25,323 insertions of already-reviewed
+  work, more than the full pass I declined rather than less. The three-dot form is no escape, being
+  the identical diff whenever `$SINCE_SHA` is an ancestor of `pr<N>` — which is a precondition to
+  check, not a property to assume. Read the commits instead, and against `pr<N>` rather than `HEAD`,
+  since `HEAD` after a clean merge carries a merge commit Phase 1b created seconds ago that no
+  author wrote:
 
-**Angle D — operations and security.** This repo provisions clusters and holds credentials, so
-weigh blast radius: IAM and RBAC scope, credential handling and redaction, NetworkPolicy reach,
-what an agent is newly permitted to do, and whether a failure mode degrades or destroys. Check that
-third-party GitHub Actions are pinned to a full commit SHA with the version in a trailing comment.
+  ```bash
+  # Precondition. Phase 1 fetched only refs/pull/<N>/head, so a rebased-away anchor is
+  # not in this worktree at all: every command below would then exit 128 on empty stdout.
+  git merge-base --is-ancestor "$SINCE_SHA" pr<N> || exit 1
 
-**Angle E — reuse.** The angles above hunt for bugs; this one and the next two hunt for cleanup in
-the changed code. Flag new code that re-implements something the codebase already has — grep shared
-and adjacent modules, and name the existing helper to call instead.
+  git log "$SINCE_SHA"..pr<N> --no-merges --not "$BASE_REF" --format=%H   # the author's own commits
+  git show <sha>                                                          # one per commit above
+  git log "$SINCE_SHA"..pr<N> --merges --format=%H                        # every merge in between
 
-**Angle F — simplification and efficiency.** Flag unnecessary complexity the diff adds: redundant
-or derivable state, copy-paste with slight variation, deep nesting, dead code left behind. And
-wasted work: repeated I/O, independent operations run sequentially, blocking work added to startup
-or a hot path. Name the simpler or cheaper form that does the same job.
+  # Per merge: replay it, and diff the machine's result against the author's. What
+  # comes out is exactly what the human did that an automatic merge would not have.
+  AUTO=$(git merge-tree --write-tree <merge-sha>^1 <merge-sha>^2 | head -1)
+  git diff "$AUTO" <merge-sha>^{tree}
+  ```
 
-**Angle G — altitude.** Check that each change sits at the right depth rather than being a fragile
-bandaid. Special cases layered onto shared infrastructure are a sign the fix isn't deep enough —
-prefer generalizing the underlying mechanism.
+  **Stop if the precondition fails** and report `status: skipped`, reason `since-anchor <sha> is not
+an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in exactly that case,
+  so reaching here means either it did not, or the branch was force-pushed between its query and
+  your fetch. Do not fall back to a full pass I did not ask for, and above all do not read the empty
+  stdout as an empty delta: `fatal: bad revision` and "nothing landed since" are the same two blank
+  lines, and Phase 2's skip conditions — which would otherwise have caught a stale anchor — are
+  disabled for this mode.
 
-**Angle H — conventions and docs.** Read the `AGENTS.md` / `CLAUDE.md` files that govern the changed
-code: the repo root, plus any in a directory that is an ancestor of a changed file (a directory's
-file only applies at or below it). Flag a violation only when you can quote the exact rule and the
-exact line that breaks it — no style preferences, no "spirit of the doc" inferences. Name the file
-and quote the rule so the report can cite it. This is also where docs drift belongs: one canonical
-home per fact, generated `<!-- BEGIN GENERATED -->` regions regenerated rather than hand-edited,
-identifiers verified against source rather than against other docs.
+  `--not "$BASE_REF"` earns its place for the reason Phase 2 gives, and it is doing more work than
+  it looks: a sibling branch merged into the PR contributes its own non-merge commits to that first
+  list, because they are reachable from `pr<N>` and not from the base. That is the git-side check
+  Phase −1 can only approximate with `compare`.
 
-**Angle I — scope and test coverage.** Hold the diff against the intent sentence from Phase 2b.
-Flag changes that do not serve it: an unrelated refactor riding along, a dependency bump nobody
-asked for, a behaviour change buried in a PR described as a rename, reformatting that inflates the
-diff and hides the real hunks. Repo convention is scoped changes and no unrelated formatting, so
-cite the rule when it applies. Judge by whether a change serves the stated intent, not by how large
-it is — a big diff that does one thing is in scope, and a three-line change that does a second
-thing is not.
+  **Do not reach for `git show --cc` here**, however natural it looks. `--cc` prunes every hunk whose
+  merge result matches one of the parents, and taking one side wholesale — `git checkout --ours`,
+  `--theirs`, or picking a variant per hunk — is how most conflicts are actually resolved. A merge
+  that discarded the base branch's change to a file the PR also touched prints a bare 162-byte
+  header, byte-identical to a merge that had no conflict at all. Empty `--cc` means "nothing was
+  resolved into a form that differs from both parents", which is not the claim this mode needs.
 
-Then check that the intent is actually tested: for each behaviour the PR claims, name the test that
-would fail if that behaviour regressed. Where there is none, the candidate is the untested
-behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
-regression test, and new error paths nothing exercises, are the usual cases.
+  `git merge-tree --write-tree` (git ≥ 2.38) makes the claim it needs. It replays the merge with no
+  worktree and prints the tree an automatic merge would have produced — conflict markers and all,
+  exiting 1 when it hit one — so diffing that tree against the merge's own tree yields precisely the
+  author's contribution: the resolution they wrote, or nothing at all when the merge really was
+  clean. Empty there **is** the clean base merge Phase −1 could only presume it was, and non-empty is
+  the unreviewed code that justified the pass. Two edges: on a merge with more than two parents
+  `merge-tree` takes only two, and on git below 2.38 the flag does not exist. In either case fall
+  back to `git show --cc`, and say in the review that the merge was checked with the weaker test.
 
-**Angle J — sibling pull requests.** Every angle so far has looked only at this PR. Widen once:
+  The author's commits and whatever the replay turns up are together what the skill's step 2 means
+  by the range — its angles apply to them, read as always at their state in `pr<N>` rather than as
+  isolated hunks.
 
-```bash
-gh pr list --repo "$REPO" --author <login> --state open --json number,title,files
-```
+  **Both lists coming back empty is a real outcome once the precondition has passed**, and #675 is
+  one — no author commits, and a merge the replay reproduces exactly. Report the delta as empty and
+  say what you ran; do not go looking for something to say, and do not quietly widen to the full
+  diff I did not ask for. A defect you happen to notice outside the delta is still worth reporting,
+  but you have not read the rest of the diff, so do not imply you have — Phase 4 records the scope.
 
-Read the review comments on any sibling that touches adjacent paths. Three things come out of this
-that nothing else in the review can see. A finding already accepted on a sibling usually applies
-here unchanged — apply it rather than rediscovering it. A near-identical PR that has diverged is
-itself a finding: name which copy carries the fix and which does not, because merge order then
-decides whether the fix survives. And where one PR is a superset of others, say so — reviewing the
-subset in isolation spends effort on a diff that may never merge.
+- **Angle J already has an author to filter by**, which the skill cannot assume:
+  `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
+  review comments on any sibling touching adjacent paths.
 
-For cleanup, altitude, conventions, scope, and sibling candidates the `failure_scenario` states the concrete
-cost — what is duplicated, wasted, harder to maintain, out of scope, or which rule or untested
-behaviour is at risk — instead of a crash. Correctness bugs always outrank them when the output cap
-forces a cut.
+- **No green-suite bypass.** Do not skip hunting candidates because CI or unit tests are passing.
+  Work every angle explicitly against the diff as defined in `review-adversarial`.
 
-Prefer running things over reasoning about them: execute the test suites the PR touches and
-reproduce the failures you claim. Also check merge mechanics: `gh pr checks <N> --repo "$REPO"`. If
-`mergeStateStatus` is `BLOCKED` or `DIRTY`, determine _why_ — failing required checks, merely
-`REVIEW_REQUIRED`, missing labels, or the merge conflict you already found. The `tide` check usually
-states its reason outright. Report which it is; they mean very different things.
+One thing the skill has no way to know about:
 
-### Phase 4 — Verify every claim (this phase is not optional)
+- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"`. If
+  `mergeStateStatus` is `BLOCKED` or `DIRTY`, determine _why_ — failing required checks, merely
+  `REVIEW_REQUIRED`, missing labels, or the merge conflict you already found. The `tide` check
+  usually states its reason outright. Report which it is; they mean very different things.
 
-Dedup first: candidates pointing at the same line and the same mechanism collapse into the one with
-the most concrete failure scenario.
+The skill's step 6 does not apply: dispositions belong to the author, and you fix nothing here. Its
+"single confident first pass" constraint does, and it covers the saved file, the PR comment, and
+your report back — everywhere.
 
-Then take each surviving candidate and re-derive it from the source as if you were a hostile second
-reviewer trying to get it thrown out. Open the actual file and read the actual code path — do not
-re-read your own notes, and do not accept a claim because it sounded right when you wrote it.
-Confirm the mechanism, not just the conclusion: a real defect reached by an imaginary code path is
-still a wrong finding. Assign each one a verdict:
-
-- **CONFIRMED** — you can name the inputs or state that trigger it and the resulting wrong output,
-  crash, or misconfiguration. Quote the line.
-- **PLAUSIBLE** — the mechanism is real but the trigger is uncertain (timing, environment, cluster
-  state). State what would confirm it. Realistic-but-unproven is PLAUSIBLE, not REFUTED:
-  concurrency races, nil on a rare-but-reachable path (error handler, cold cache, absent optional
-  field), falsy-zero treated as missing, off-by-one on a boundary the code does not exclude, a
-  regex or allowlist that lost an anchor.
-- **REFUTED** — factually wrong (the code doesn't say that), provably impossible (show the type,
-  constant, or invariant), already handled in this diff (cite the guard), or pure style with no
-  observable effect. Quote the line that proves it.
-
-Keep CONFIRMED and PLAUSIBLE. Then rewrite the finding list so it reflects only what survived:
-
-- **Claim holds** → keep it as written.
-- **Claim holds but the mechanism, severity, line number, or blast radius is wrong** → rewrite the
-  finding to the corrected version. The finding now reads as though the corrected version is what
-  you found in the first place.
-- **REFUTED, or you cannot verify it** → delete it entirely. Do not demote it to a footnote, a
-  "worth checking" aside, or a parenthetical. If the underlying uncertainty is genuinely worth the
-  author's time, restate it as an open question in its own right, with the uncertainty stated
-  plainly in the finding body — never as a correction to something you previously asserted.
-
-Then clean up after the edit, because these are what give away a second pass:
-
-1. Re-sort findings by severity (`BLOCKER` / `HIGH` / `MEDIUM` / `LOW`) and **renumber from 1 with
-   no gaps**.
-2. Update every cross-reference between findings to the new numbers.
-3. Update any count in the prose ("three blockers") to match the surviving set.
-4. Re-read the whole document once for tense and voice consistency.
-
-**The finished review must read as a single confident first pass.** It must contain no
-"Correction", "Verification pass", "on second look", "an earlier draft said", "downgraded from",
-"initially I thought", no diff-of-claims, and no changelog of your own reasoning. The reader should
-have no way to tell that Phase 4 happened. This constraint applies to the saved file, the PR
-comment, and your report back — everywhere.
-
-### Phase 5 — Output
+### Phase 4 — Output
 
 Save the review to `$MAIN_ROOT/.claude/pr-reviews/pr-<N>-<short-slug>.md`, matching the structure of
 the files already in that directory:
 
-- header block: title, author, review date, **head SHA reviewed** (needed for the skip check on the
-  next run), base branch and base SHA, diff stat, worktree path;
+- header block: title, author, review date, **head SHA reviewed**, **scope** — `full`, or
+  `since <sha>` — base branch and base SHA, diff stat, worktree path. The next run's skip check
+  needs both of the bold ones: it trusts a matching SHA only where the scope says the whole diff was
+  read, so a narrowed pass that records only the SHA reads exactly like a full one and cancels it;
 - **Intent** — the one-sentence claim from Phase 2b, so the next reader knows what the findings were
   measured against;
 - **Verdict** — can this merge as is, yes or no, with the blocking items named, and what the
   `mergeStateStatus` actually reflects. When the PR conflicts with its base, say so here and state
-  that the review covers the PR as authored, not as merged;
+  that the review covers the PR as authored, not as merged. In `since` mode say that too: the
+  verdict speaks for the commits you read, not for the pull request;
 - **Checks run** — commands executed and what they showed;
 - **Findings** — severity-ordered, each with anchor, description, failure scenario, and verdict;
 - **Not findings, for the record** — things that look wrong but are fine, so the next reader does
@@ -350,6 +551,7 @@ Report back to the main agent, and nothing more than this:
 pr: <N>
 status: reviewed | skipped
 reason: <one line, only when skipped>
+scope: full | since <sha>
 mergeable: yes | no
 block_reason: ci | review-required | labels | conflicts | none
 conflicts: none | <comma-separated paths>
@@ -366,8 +568,9 @@ blockers: <one line each, file:line — claim>
 
 Print one compact table across all PRs — number, title, verdict, block reason, blocker count,
 review file path — then the blocker one-liners grouped by PR. Call out explicitly any PR that was
-skipped and why, and any that was reviewed against a conflicting base (those reviews cover the PR
-as authored, not as merged).
+skipped and why, any that was reviewed against a conflicting base (those reviews cover the PR as
+authored, not as merged), and any reviewed at a narrowed scope, naming the SHA it started from —
+those cover the commits since that SHA and say nothing about the rest of the diff.
 
 Do not post to GitHub unless I ask. When I do, post findings only — no verdict, no CI summary, no
 closing section — and tell me whether you posted it as an issue comment or a formal review.

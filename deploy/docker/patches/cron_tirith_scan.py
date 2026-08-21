@@ -37,7 +37,8 @@ the operator (``platformagent_manifests.go``), and it is the value operators
 hand-write into ``AgentPlugin`` config. Every governance watchdog on
 ``agents/platform/cron/jobs.json`` therefore ran unscanned.
 
-One of those seven jobs is ``github-issue-resolver``, firing every 30 minutes to
+The worked example is ``github-issue-resolver``, which until
+``github-repo-watcher`` replaced it was a prompt job firing every 30 minutes to
 "poll, triage, investigate, and resolve unaddressed open issues on our target
 repo". Its input is issue text written by anyone with a GitHub account, and its
 output is shell commands run with the platform agent's credentials. Tirith's
@@ -58,6 +59,27 @@ Do not over-read the coverage. A pure-ASCII lookalike TLD
 (``kubernetes.io.evil-cdn.co``) and terminal escape injection are caught by
 neither layer — ANSI is stripped before pattern matching, and real ESC payloads
 did not trip the scanner either.
+
+Nor should the example be read as saying that turn is still covered here. Issue
+triage is no longer a cron turn: ``github-repo-watcher`` is a ``no_agent``
+poller that files a kanban card, so the model reads the issue text inside a
+*worker* run, and a worker run is deliberately not a cron run
+(``tools/cron_run_scope.py``; ``kanban_worker_tools.py``). Read from the source
+quoted above and nothing else, the upstream arm looks like it falls straight
+through to ``return {"approved": True}`` for that worker, with no content scan
+and no pattern check. Measured in the pod, it does not: a worker is spawned as a
+``hermes -p <profile> chat -q`` subprocess, which enters ``cli.py``'s ``main()``
+and sets ``HERMES_INTERACTIVE=1`` unconditionally, so ``_is_interactive_cli()``
+is true and the same scan runs on the *interactive* arm instead. With no TTY the
+approval prompt that arm raises defaults to a refusal, which makes a worker
+stricter than the cron run that filed its card rather than looser.
+
+So the coverage this module restores to the cron arm is not lost when triage
+moves to a card; it is reached by the other arm. One state does reach the
+unscanned fall-through — no ``HERMES_INTERACTIVE``, no cron marker, no gateway
+platform — and no session type has been found that lands there. Covering it, if
+one ever is, means a ``pre_tool_call`` plugin hook above the approval layer
+rather than more anchored wiring here.
 
 What this patch does
 --------------------

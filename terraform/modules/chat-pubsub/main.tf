@@ -3,6 +3,7 @@ data "google_project" "this" {
 }
 
 resource "google_pubsub_topic" "chat_events" {
+  #checkov:skip=CKV_GCP_83:Chat event topic uses default Google-managed encryption keys
   project = var.project_id
   name    = var.topic_name
 }

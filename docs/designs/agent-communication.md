@@ -24,7 +24,10 @@ Two communication channels, with different shapes and different reliability requ
 
 **Guiding principles**
 
-1. **No agent-to-agent prompting.** Agents never call each other. They coordinate through shared state (files) and, when delegating, through the kanban board. This avoids the delegation/loop antipatterns.
+1. **No agent-to-agent prompting.** No agent blocks waiting on another. They coordinate through durable state (files) and, when delegating, through the kanban board. This avoids the delegation/loop antipatterns.
+
+   > **Known gap, recorded rather than claimed.** The kanban channel _does_ pass one agent's model output into another's context: a `kanban_create` body becomes the worker's pre-built context (§3.2), and a fan-in card's context carries every parent's structured `metadata`. That is precisely what the **non-authoritative** property in [02](../architecture/02-agent-personas.md) §2.3 exists to control, and nothing in §3 or §5 yet treats a card body as untrusted input to the worker. This channel has **not** been assessed against the four-property test. It should be, before anything else is built on it.
+
 2. **Constrain writes, free reads.** Writers use a schema-enforcing tool; readers use ordinary file tools. LLMs are reliable at reading files and less reliable at bespoke interfaces, so only the _write_ path is a tool.
 3. **Co-located now, migrateable later.** For the MVP all profiles share one pod and one PVC. The design keeps a single seam (the write helper) where a future cross-pod transport would slot in without changing the reader contract.
 
@@ -301,7 +304,7 @@ Delegated cards **do not imperatively mutate clusters**. They either (a) **valid
 Delegation is **transparent to the user**, not hidden plumbing:
 
 - On `kanban_create`, the originating chat session is **auto-subscribed** to the task.
-- The gateway's kanban notifier surfaces a card's **terminal** events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `status`, `archived`, `unblocked`, `block_loop_detected`) back into that chat, plus `heartbeat` for mid-run progress: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note posts into the thread as a `⏳` line, delivered straight from the board and deliberately not waking the subscribed agent, so progress costs no LLM turn. `claimed` is not among them, and `kanban_comment` posts nothing to chat at all — a comment reaches a human only by causing a worker to act.
+- The gateway's kanban notifier surfaces a card's **terminal** events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `status`, `archived`, `unblocked`, `block_loop_detected`) back into that chat, plus `heartbeat` for mid-run progress: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note joins a `⏳` line in the card's rolling progress message, delivered straight from the board and deliberately not waking the subscribed agent, so progress costs no LLM turn. Only the first note posts a message; the rest are edits to it, on any platform whose adapter supports editing, so a talkative card interrupts the space once. A terminal event settles that message (`✓` or `⏹`) and posts its own — the completion is the notification. `claimed` is not among them, and `kanban_comment` posts nothing to chat at all — a comment reaches a human only by causing a worker to act.
 - The orchestrator (platform) narrates its plan when it decides to delegate ("delegating readiness checks to 3 clusters…") and reports the synthesized result when the fan-in completes.
 
 Net effect: delegated cluster subagents **emit their thoughts and results to the chat**, so the platform admin can watch the orchestration unfold and intervene (e.g. answer a `needs_input` block) without digging into internal state.

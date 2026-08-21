@@ -37,6 +37,15 @@ type dedupEntry struct {
 	EventLastTS time.Time `json:"event_last_ts"`
 	// Count is the total occurrences observed within the current deduplication window.
 	Count int `json:"count"`
+	// PolicyFiltered records that the daemon accepted the event this entry was
+	// opened for and then dropped it on purpose, grading it Info. The entry is
+	// kept in that case — see injectStatusFiltered — so the flag marks a key
+	// that is held on behalf of an alert nobody received.
+	PolicyFiltered bool `json:"policy_filtered,omitempty"`
+	// Reopened records that ReopenIfPolicyFiltered has already fired for this
+	// window, and is deliberately not cleared when it does. It bounds the
+	// escape hatch at one extra session per window per key.
+	Reopened bool `json:"reopened,omitempty"`
 }
 
 // dedupResult dictates whether an event should trigger a new session or be suppressed.
@@ -44,6 +53,9 @@ type dedupResult struct {
 	Kind      dedupResultKind
 	SessionID string // only set when Kind==dedupDuplicate (referencing the existing active session)
 	Count     int    // window count (1 for new incident, N for duplicates)
+	// Replay marks a duplicate whose LastTimestamp had not advanced. Observe
+	// consumes that timestamp, so the caller cannot re-derive this afterwards.
+	Replay bool
 }
 
 type dedupResultKind int
@@ -149,7 +161,7 @@ func (c *dedupCache) Observe(key EventKey, message string, eventLastTS time.Time
 	if !eventLastTS.After(entry.EventLastTS) {
 		// Case 1: Replay of an event we already processed.
 		entry.Count++
-		return dedupResult{Kind: dedupDuplicate, SessionID: entry.SessionID, Count: entry.Count}
+		return dedupResult{Kind: dedupDuplicate, SessionID: entry.SessionID, Count: entry.Count, Replay: true}
 	}
 	if now.Sub(entry.LastSeen) > c.window {
 		// Case 2: Cooldown expired. Create a new session.
@@ -185,6 +197,95 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 	if entry, ok := c.entries[key]; ok {
 		entry.SessionID = sessionID
 	}
+}
+
+// MarkPolicyFiltered flags the entry for a key as being held on behalf
+// of an event the daemon graded Info and dropped. Called by the dispatch
+// path when an inject comes back injectStatusFiltered, which — unlike
+// every other undelivered outcome — keeps its entry rather than
+// forgetting it.
+//
+// Canonicalizes the reason exactly as Observe does. No-op if the entry
+// is already gone.
+//
+// An entry that has already been reopened is *deleted* rather than
+// flagged, because for that entry there is no state left worth holding.
+// ReopenIfPolicyFiltered needs PolicyFiltered set and Reopened clear, and
+// a reopened entry fails the second clause whatever this method writes —
+// so flagging it, or declining to, leaves the same dead key either way,
+// with Observe's Case 3 sliding LastSeen on every later sighting so it
+// never expires and all three Forget callers sitting behind an attempted
+// inject no sighting now reaches. Restarting does not help; restore
+// rehydrates the flags verbatim. Deleting gives the family its way back:
+// the next sighting opens a new incident, at the cost of one session per
+// sighting until the daemon stops filtering it — the same price the
+// "suppressed" path already pays, and cheap against permanent silence.
+//
+// It should not be reachable at all. reopenPolicyFiltered admits only
+// events daemonWouldAlert says the daemon posts, so the reopened entry's
+// own inject should never come back filtered. That mirror is a rule
+// written in another language on another image, which is exactly the kind
+// of agreement that decays without anything failing, so the recovery is
+// here rather than in a comment asserting it cannot happen.
+func (c *dedupCache) MarkPolicyFiltered(key EventKey, message string) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return
+	}
+	if entry.Reopened {
+		delete(c.entries, key)
+		return
+	}
+	entry.PolicyFiltered = true
+}
+
+// ReopenIfPolicyFiltered re-opens an incident whose entry is held by a
+// policy-filtered event, and reports whether it did. The caller should
+// then treat its own event as a new incident.
+//
+// The problem it solves is that the dedup key is (uid, *canonical*
+// reason), and canonicalizeReason deliberately folds a whole failure
+// family onto one key: kubelet's Normal-type `BackOff` ("Back-off
+// pulling image"), the `ErrImagePull` beside it and the Warning-type
+// `Failed` that follows are one incident, not three. That is right for
+// deduplication and wrong for a policy filter. The daemon grades the
+// Normal member Info and asks us to keep its entry, and the key is then
+// held on behalf of the one member of the family nobody needed to hear
+// about. Every Warning behind it takes Case 3, which slides LastSeen
+// forward, so an image pull that keeps failing keeps its own window
+// alive and the alert never comes — permanent silence on a real
+// failure, with only k8s_event_watcher_events_policy_filtered_total to
+// show for it.
+//
+// Bounded at one firing per entry by the sticky Reopened flag, so the
+// escape hatch cannot turn into a session per sighting — the churn
+// keeping the entry exists to avoid. Dispatch withholds replays, so only
+// a fresh sighting can spend that firing. reopenPolicyFiltered admits only
+// events daemonWouldAlert says the daemon posts, which rules out the
+// obvious way to spend the firing repeatedly; the flag is what holds if
+// that mirror is ever wrong. An emitter leaving Event.Type empty is not
+// an example of such a family: inject_message coerces an absent type to
+// Warning, so the daemon posts those rather than grading them Info.
+func (c *dedupCache) ReopenIfPolicyFiltered(key EventKey, message string, eventLastTS time.Time) bool {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || !entry.PolicyFiltered || entry.Reopened {
+		return false
+	}
+	c.entries[key] = &dedupEntry{
+		FirstSeen:   now,
+		LastSeen:    now,
+		EventLastTS: eventLastTS,
+		Count:       1,
+		Reopened:    true,
+	}
+	return true
 }
 
 // Forget drops the entry for a key, so the next sighting of the same

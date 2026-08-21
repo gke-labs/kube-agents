@@ -17,8 +17,31 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # openai_api_key    = "sk-..."
 
 # Image tag for the operator and platform agent. Defaults to "latest";
-# pin a vX.Y.Z release tag for production.
-# image_tag = "vX.Y.Z"
+# pin an X.Y.Z release tag for production.
+# image_tag = "1.2.0"
+
+# Pull every image from a mirror instead of the public registries. Copy them
+# there first with `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>`
+# from the repository root, using this same prefix and the same tag as
+# image_tag above — the mirror only holds the tag it was told to copy.
+# image_registry = "us-east4-docker.pkg.dev/my-project/kube-agents"
+# Only if the mirror keeps third-party images (LiteLLM, fluent-bit) elsewhere;
+# defaults to image_registry.
+# third_party_image_registry = "us-east4-docker.pkg.dev/my-project/mirror"
+# Only if that mirror needs authenticating to (Harbor, Artifactory rather than
+# an Artifact Registry the nodes can already read). Names Secrets you create
+# yourself, in the namespace above, before applying — see the README.
+# image_pull_secrets = ["regcred"]
+
+# Cluster topology. "autopilot" (default) or "standard" — standard builds an
+# e2-standard-4 node pool with Dataplane V2, and is the only mode
+# that can carry the gVisor node pool. Set create_cluster = false to install
+# onto an existing cluster (it must already have Workload Identity; CMEK on it
+# stays a gcloud step outside Terraform).
+# cluster_mode            = "standard"
+# create_cluster          = false
+# enable_gvisor_node_pool = true
+# gvisor_pool_name        = "gvisor-pool"
 
 # Cluster tuning
 # deletion_protection = true
@@ -26,6 +49,11 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # namespace           = "kubeagents-system"  # leave as-is: the agent's model
 #                                             # gateway endpoint is hard-wired
 #                                             # to kubeagents-system
+#
+# Publish the cluster's DNS-based control plane endpoint to traffic from
+# outside the VPC, for a cluster a Platform Agent running elsewhere has to
+# reach. Off by default; see the README before turning it on.
+# allow_external_dns_traffic = true
 
 # Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
 # the CR's googleChat integration is wired to the created topic/subscription
@@ -52,3 +80,48 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
 # Optional GitHub token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
+
+# Optional Slack integration. Needs no GCP resources: the tokens go into the
+# credentials Secret and the CR's slack section turns on. Creating the Slack
+# app (Socket Mode + bot scopes) stays manual — see the README.
+# enable_slack            = true
+# slack_bot_token         = "xoxb-..."
+# slack_app_token         = "xapp-..."
+# slack_allowed_users     = ["U01234567"]
+# slack_home_channel      = "C01234567"
+# slack_home_channel_name = "#kube-agents"
+
+# IAM. "read-only" (default) or "gke-admin" select the bundles
+# the composition grants; "custom" requires project_roles. An explicit
+# project_roles list overrides permission_set either way.
+# permission_set = "read-only"
+
+# Optional scheduled backups of the release namespace. Off by default in both
+# install paths: Backup for GKE bills per backed-up pod and per GB of snapshot
+# storage, and the snapshots contain the agent's credentials Secret.
+# enable_gke_backup_plan = true
+# backup_cron_schedule   = "0 2 * * *"
+# backup_retain_days     = 30
+# backup_encryption_key  = "projects/my-gcp-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key"
+
+# Admission webhooks for the PlatformAgent CR, and the cert-manager install
+# that issues their serving certificate. Both default to on.
+#
+# Set enable_cert_manager = false if the cluster ALREADY runs cert-manager —
+# this apply fails on the existing CRDs otherwise. The webhooks keep working
+# in that case; they just use the cert-manager that is already there.
+#
+# Destroying a release that installed cert-manager here removes its CRDs, and
+# with them every Certificate and Issuer in the cluster, not only these. On a
+# shared cluster, install cert-manager separately and set this to false.
+# enable_cert_manager  = true
+# enable_webhooks      = true
+# cert_manager_version = "v1.21.1"
+
+# Anything the variables above do not reach. Deep-merged over the values this
+# composition computes, so one leaf can be set without restating its block.
+# extra_helm_values = {
+#   litellm = { otel = true }
+#   telemetry = { otlpEndpoint = "http://opentelemetry-collector.observability.svc.cluster.local:4318" }
+#   platformAgent = { harness = { hermes = { dashboardEnabled = false } } }
+# }

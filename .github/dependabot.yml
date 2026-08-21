@@ -1,23 +1,139 @@
+# Each ecosystem below names its directories explicitly and batches everything
+# it finds into one grouped pull request. Both are deliberate.
+#
+# Globbed directories (`/**/*`) recreate #763: pip's parser follows the
+# `-r admin_console/requirements.txt` include at the root, so a root job and an
+# `/admin_console` job edit the same file and open two pull requests for one
+# change. Add a directory only after checking that no other entry already
+# reaches the manifest it holds.
+#
+# Without `groups`, five ecosystems at five pull requests each is a ceiling of
+# 25 open at once -- 20 of them arrived in three minutes the first time this
+# config ran. A catch-all group per ecosystem makes that one pull request per
+# ecosystem per week.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "github-actions"
     commit-message:
       prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
-  - package-ecosystem: "docker"
-    directory: "/agents/platform"
+  # k8s-operator holds the only go.mod in the tree.
+  - package-ecosystem: "gomod"
+    directory: "/k8s-operator"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "ci"
+    groups:
+      gomod:
+        patterns:
+          - "*"
+
+  # "/" covers requirements-test.txt and, through its `-r` include,
+  # admin_console/requirements.txt -- naming /admin_console as well is what
+  # opened #763 and #764 for the same httpx bump. /bench is left out on
+  # purpose: bench/pyproject.toml pins devops-bench to a git SHA that its own
+  # comment says to bump deliberately.
+  - package-ecosystem: "pip"
+    directories:
+      - "/"
+      - "/tests/e2e"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "ci"
+    # requirements-test.txt holds mcp below 2.0 to match the runtime image,
+    # which ships 1.28.1 from the digest-pinned Hermes base and cannot move:
+    # hermes-agent itself imports mcp.server.fastmcp, the module 2.x deletes.
+    # The full reasoning is on the pin in that file; the ceiling comes off when
+    # the base image ships 2.x (#800). #751 widened the constraint to <3 anyway
+    # and nothing caught it -- the tests fell back to a stub on the failing
+    # import -- so this rule stops Dependabot re-proposing it.
+    # `versions` and not `update-types`: a semver-major comparison needs a
+    # resolved current version, and `mcp<2` is a bare range rather than an `==`
+    # pin, so there is none. That is why #751 arrived titled "update mcp
+    # requirement from <2 to <3" instead of as a version bump.
+    ignore:
+      - dependency-name: "mcp"
+        versions:
+          - ">=2"
+    groups:
+      python:
+        patterns:
+          - "*"
+
+  # The docs site holds the only package.json with dependencies to update. The
+  # gke-app-onboarding scaffold's declares none, so the old glob covered it
+  # without ever having anything to propose.
+  - package-ecosystem: "npm"
+    directory: "/docs/site"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "ci"
+    groups:
+      npm:
+        patterns:
+          - "*"
+
+  # These two directories hold the only literal FROM pins in the tree, and
+  # images.json covers neither. The gke-app-onboarding one is `node:18-slim`,
+  # past end of life, and deploy/docker/Dockerfile copies
+  # agents/platform/skills/ wholesale into the published platform image, so it
+  # ships. The other is `alpine:3.19` in an e2e fixture.
+  #
+  # Every other Dockerfile is out of reach rather than excluded: the images
+  # this repository builds interpolate two ARGs each
+  # (`FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}`), which the Docker updater cannot
+  # resolve, and the agentplugins ones are `FROM scratch`. images.json and
+  # `make mirror-images` own the ARG-interpolated pins. Naming the two
+  # directories, rather than globbing, is what keeps this from recreating #763.
+  - package-ecosystem: "docker"
+    directories:
+      - "/agents/platform/skills/gke-app-onboarding/assets"
+      - "/tests/e2e/operator/templates/plugin_src"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "docker"
     commit-message:
       prefix: "ci"
+    groups:
+      docker:
+        patterns:
+          - "*"

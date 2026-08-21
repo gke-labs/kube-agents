@@ -17,13 +17,13 @@ A proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by 
 
 **Modes:** `off` (passthrough), `on` (cache hits, forward misses). Toggle via `ConfigMap` patch — see [Inference gateway → Inference replay](/kube-agents/concepts/inference-gateway/#inference-replay).
 
-**Deploy via provisioner:** `INFERENCE_REPLAY_ENABLED=true ./provision.sh`.
+**Deploy (development only):** `make -C k8s-operator deploy-inference-replay` — the replay proxy is a dev tool and is never part of the installer.
 
 ## `litellm-gemini`
 
 [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini)
 
-LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (`provision_09_deploy_litellm.sh`) deploys an equivalent LiteLLM + Gemini config from `k8s-operator/config/integrations/litellm/base` rather than this example directory.
+LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (the chart's `litellm.*` values) deploys an equivalent LiteLLM + Gemini config rather than this example directory; the dev copy lives at `k8s-operator/config/integrations/litellm/base`.
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 
@@ -39,7 +39,7 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 
 [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma)
 
-vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
+vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
 

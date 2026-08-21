@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"net"
@@ -30,11 +31,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -64,6 +64,7 @@ func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
+	var webhookPort int
 	var enableLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
@@ -80,9 +81,24 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&apiServerCIDR, "kubernetes-api-server-cidr", os.Getenv("KUBERNETES_API_SERVER_CIDR"),
 		"Comma-separated CIDRs or IPs for Kubernetes API server egress allowlisting in generated NetworkPolicies.")
+	var dnsClusterIP string
+	flag.StringVar(&dnsClusterIP, "kubernetes-dns-cluster-ip", os.Getenv("KUBERNETES_DNS_CLUSTER_IP"),
+		"Cluster DNS Service ClusterIP for NetworkPolicy DNS egress. Overrides kube-dns discovery.")
+	var metadataDaemonIP string
+	flag.StringVar(&metadataDaemonIP, "kubernetes-metadata-daemon-ip", os.Getenv("KUBERNETES_METADATA_DAEMON_IP"),
+		"Node-local Workload Identity metadata daemon IP for NetworkPolicy egress (rule 3).")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
 	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
 	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.IntVar(&webhookPort, "webhook-port", agentwebhook.DefaultPort,
+		"The port the webhook server binds to. Defaults to 10250 because GKE's automatic "+
+			"control-plane-to-node firewall rule only permits tcp:443 and tcp:10250; on a private "+
+			"cluster the API server cannot reach a webhook on any other port without a manual VPC "+
+			"firewall rule, and failurePolicy=Fail then blocks all PlatformAgent writes. The "+
+			"kubelet's 10250 is bound on the node IP in a different network namespace, so there is "+
+			"no conflict. Changing this alone is not enough: the manager containerPort and the "+
+			"webhook Service targetPort have to move with it, or the API server dials a port "+
+			"nothing is listening on.")
 	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
@@ -96,6 +112,17 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Reject an out-of-range --webhook-port rather than letting controller-runtime
+	// silently substitute its own default: webhook.Options.Port <= 0 falls back to 9443
+	// (pkg/webhook/server.go), the one port this operator sets DefaultPort to avoid. That
+	// spelling is easy to reach by analogy with --metrics-bind-address=0, which does mean
+	// "off", and the only symptom would be an info-level log line followed by fail-closed
+	// admission blocking every PlatformAgent write.
+	if webhookPort < 1 || webhookPort > 65535 {
+		setupLog.Error(nil, "invalid --webhook-port: must be between 1 and 65535", "port", webhookPort)
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -118,6 +145,7 @@ func main() {
 		webhookTLSOpts := tlsOpts
 		webhookServerOptions := webhook.Options{
 			TLSOpts: webhookTLSOpts,
+			Port:    webhookPort,
 		}
 
 		if len(webhookCertPath) > 0 {
@@ -174,27 +202,30 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
-		Cache: cache.Options{
-			ByObject: map[client.Object]cache.ByObject{
-				// The NetworkPolicy reconciler needs one field of a Node — its addresses
-				// — but caching Nodes whole keeps the list of every image on every node
-				// resident for the life of the process. On a large cluster that dwarfs
-				// everything else the operator holds.
-				&corev1.Node{}: {
-					Transform: func(obj any) (any, error) {
-						if node, ok := obj.(*corev1.Node); ok {
-							node.Status.Images = nil
-							node.ManagedFields = nil
-						}
-						return obj, nil
-					},
-				},
-			},
-		},
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
+	}
+
+	// Auto-discover the operator's container image from its own pod spec if not explicitly set
+	if os.Getenv("OPERATOR_IMAGE") == "" && os.Getenv("PLATFORM_AGENT_IMAGE") == "" {
+		podName := os.Getenv("HOSTNAME")
+		if nsBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil && podName != "" {
+			podNamespace := strings.TrimSpace(string(nsBytes))
+			var pod corev1.Pod
+			if err := mgr.GetAPIReader().Get(context.Background(), types.NamespacedName{Namespace: podNamespace, Name: podName}, &pod); err == nil {
+				for _, c := range pod.Spec.Containers {
+					if c.Name == "manager" || len(pod.Spec.Containers) == 1 {
+						if c.Image != "" {
+							setupLog.Info("Auto-discovered operator container image from pod spec", "image", c.Image)
+							_ = os.Setenv("OPERATOR_IMAGE", c.Image)
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 
 	apiHost := os.Getenv("KUBERNETES_SERVICE_HOST")
@@ -217,11 +248,13 @@ func main() {
 	}
 
 	if err := (&controller.PlatformAgentReconciler{
-		Client:                mgr.GetClient(),
-		APIReader:             mgr.GetAPIReader(),
-		Scheme:                mgr.GetScheme(),
-		APIServerIP:           apiHost,
-		APIServerCIDROverride: apiServerCIDR,
+		Client:                   mgr.GetClient(),
+		APIReader:                mgr.GetAPIReader(),
+		Scheme:                   mgr.GetScheme(),
+		APIServerIP:              apiHost,
+		APIServerCIDROverride:    apiServerCIDR,
+		DNSClusterIPOverride:     dnsClusterIP,
+		MetadataDaemonIPOverride: metadataDaemonIP,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
 		os.Exit(1)

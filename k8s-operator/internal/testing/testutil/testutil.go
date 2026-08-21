@@ -198,6 +198,7 @@ func RunGoldenTest(
 ) {
 	t.Run(filepath.Base(inputPath), func(t *testing.T) {
 		// Read input CRD
+		// #nosec G304 -- Test utility reading test fixture files
 		inputData, err := os.ReadFile(inputPath)
 		if err != nil {
 			t.Fatalf("failed to read input file: %v", err)
@@ -327,16 +328,17 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 func CompareGolden(t *testing.T, actual string, expectedPath string, update bool) {
 	if update {
 		expectedDir := filepath.Dir(expectedPath)
-		if err := os.MkdirAll(expectedDir, 0755); err != nil {
+		if err := os.MkdirAll(expectedDir, 0750); err != nil { // #nosec G301 -- Test utility directory creation
 			t.Fatalf("failed to create expected directory: %v", err)
 		}
-		if err := os.WriteFile(expectedPath, []byte(actual), 0644); err != nil {
+		if err := os.WriteFile(expectedPath, []byte(actual), 0600); err != nil { // #nosec G306 -- Test utility writing golden file
 			t.Fatalf("failed to write expected golden file: %v", err)
 		}
 		t.Logf("updated golden file: %s", expectedPath)
 		return
 	}
 
+	// #nosec G304 -- Test utility reading golden files
 	expectedData, err := os.ReadFile(expectedPath)
 	if err != nil {
 		if os.IsNotExist(err) {

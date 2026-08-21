@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Nine anchored
-string replacements across three files is past the point where an inline
-``python3 -c`` stays readable, so the edits live here — but the guarantee is
-the same as the other patches in the Dockerfile: every anchor must be found
-the exact number of times expected, every edited file must still parse, and
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. One AST locator
+and nine anchored string replacements across three files is past the point
+where an inline ``python3 -c`` stays readable, so the edits live here — but the
+guarantee is the same as the other patches in the Dockerfile: every anchor must
+be found the number of times expected, every edited file must still parse, and
 anything else fails the build loudly rather than shipping a half-patched image.
 
 Why each edit is needed is documented in the module docstring of
@@ -22,16 +22,27 @@ from pathlib import Path
 import patchlib
 
 # --- cron/scheduler.py: stop discarding the run's own report ----------------
+#
+# The out-param goes on the end of run_one_job's keyword-only parameters.
+# Located rather than spelled out: this used to be a literal anchor on the
+# whole one-line signature, and v2026.8.13 both wrapped that line onto three
+# and added an ``extra_prompt`` of its own, either of which broke the build for
+# a change the patch has no opinion about. What it does have an opinion about
+# is that this is still the shared execute→deliver→mark body the ticker and the
+# cronjob tool both call, which is what expect_keyword_only asserts.
 
-SCHEDULER_SIGNATURE = (
-    "def run_one_job(job: dict, *, adapters=None, loop=None, "
-    "verbose: bool = False) -> bool:"
-)
+SCHEDULER_OUTCOME_PARAM = ", outcome=None"
 
-SCHEDULER_SIGNATURE_PATCHED = (
-    "def run_one_job(job: dict, *, adapters=None, loop=None, "
-    "verbose: bool = False, outcome=None) -> bool:"
-)
+#: Parameters the run entry point must still take for it to be the one this
+#: patch means. Not the whole signature: upstream may add to it, and this patch
+#: does not care.
+SCHEDULER_EXPECTED_PARAMS = ("adapters", "loop", "verbose")
+
+#: Text only a successful run leaves behind. The out-param is inserted rather
+#: than substituted for an anchor, so the count check cannot tell a fresh file
+#: from one this has already run against, and a second pass would append a
+#: second ``outcome=None``.
+SCHEDULER_PATCHED_MARKER = 'outcome["response"] = final_response'
 
 SCHEDULER_SAVE_OUTPUT = '            output_file = save_job_output(job["id"], output)\n'
 
@@ -87,16 +98,40 @@ CRONJOB_IMPORT_PATCHED = (
     "\n" + CRONJOB_IMPORT_ANCHOR
 )
 
-# run_one_job runs inside a try/finally that stops the heartbeat thread
-# upstream added in v2026.8.3; the cron scope has to nest inside that try so
-# the heartbeat is still joined if the scope or the run raises.
+# The run_one_job call, and the return that reports on it, are two anchors
+# rather than one span. v2026.8.13 split this fire path in half — the claim
+# stays in _execute_job_now and the run moved to _run_claimed_job so a
+# background dispatch can take the claim synchronously — and pushed a
+# try/finally for the scheduler's in-flight registration in between them.
+# Anchored separately, that reshuffle costs nothing; anchored as one block, as
+# it was, it broke both edits at once.
+#
+# The cron scope nests inside the try that stops the heartbeat thread upstream
+# added in v2026.8.3, so the heartbeat is still joined if the scope or the run
+# raises.
 CRONJOB_EXECUTE = (
-    "        try:\n"
-    "            processed = run_one_job(job)\n"
-    "        finally:\n"
-    "            _heartbeat_stop.set()\n"
-    "            if _heartbeat_thread is not None:\n"
-    "                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)\n"
+    "            try:\n"
+    "                processed = run_one_job(\n"
+    "                    job, adapters=adapters, loop=gateway_loop,\n"
+    "                    extra_prompt=extra_prompt,\n"
+    "                )\n"
+)
+
+CRONJOB_EXECUTE_PATCHED = (
+    "            # kube-agents patch: mark the thread as a cron run so the\n"
+    "            # kanban tools can tell it apart from the worker whose env it\n"
+    "            # inherited, and collect the run's report instead of throwing\n"
+    "            # it away.\n"
+    "            outcome: Dict[str, Any] = {}\n"
+    "            try:\n"
+    "                with cron_run_scope(job_id):\n"
+    "                    processed = run_one_job(\n"
+    "                        job, adapters=adapters, loop=gateway_loop,\n"
+    "                        extra_prompt=extra_prompt, outcome=outcome,\n"
+    "                    )\n"
+)
+
+CRONJOB_RETURN = (
     "        refreshed = get_job(job_id) or {}\n"
     '        ok = refreshed.get("last_status") == "ok"\n'
     "        return {\n"
@@ -106,24 +141,14 @@ CRONJOB_EXECUTE = (
     "        }\n"
 )
 
-CRONJOB_EXECUTE_PATCHED = (
-    "        # kube-agents patch: mark the thread as a cron run so the kanban\n"
-    "        # tools can tell it apart from the worker whose env it inherited,\n"
-    "        # and collect the run's report instead of throwing it away.\n"
-    "        outcome: Dict[str, Any] = {}\n"
-    "        try:\n"
-    "            with cron_run_scope(job_id):\n"
-    "                processed = run_one_job(job, outcome=outcome)\n"
-    "        finally:\n"
-    "            _heartbeat_stop.set()\n"
-    "            if _heartbeat_thread is not None:\n"
-    "                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)\n"
+CRONJOB_RETURN_PATCHED = (
     "        refreshed = get_job(job_id) or {}\n"
     '        ok = refreshed.get("last_status") == "ok"\n'
     "        return {\n"
     '            "claimed": True,\n'
     '            "success": bool(processed and ok),\n'
     '            "error": refreshed.get("last_error"),\n'
+    "            # kube-agents patch: the run's own report, collected above.\n"
     '            "response": outcome.get("response"),\n'
     '            "output_file": outcome.get("output_file"),\n'
     '            "delivery_error": outcome.get("delivery_error"),\n'
@@ -165,40 +190,23 @@ KANBAN_IMPORT_PATCHED = (
     "from tools.cron_run_scope import (\n"
     "    cron_ownership_violation,\n"
     "    missing_task_id_error,\n"
-    "    resolve_default_task_id,\n"
     ")"
 )
 
-# v2026.8.3 added the _is_delegated_child_context() early return. Keep it:
-# resolve_default_task_id only knows about the cron rule, so replacing the
-# whole body — as this patch used to — would silently drop upstream's
-# delegate_task behaviour on every base-image bump.
-KANBAN_DEFAULT_TASK = (
-    "def _default_task_id(arg: Optional[str]) -> Optional[str]:\n"
-    '    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""\n'
-    "    if arg:\n"
-    "        return arg\n"
-    "    if _is_delegated_child_context():\n"
-    "        return None\n"
-    '    env_tid = os.environ.get("HERMES_KANBAN_TASK")\n'
-    "    return env_tid or None\n"
-)
-
-KANBAN_DEFAULT_TASK_PATCHED = (
-    "def _default_task_id(arg: Optional[str]) -> Optional[str]:\n"
-    '    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set.\n'
-    "\n"
-    "    kube-agents patch: inside a cron run there is no fallback — the ambient\n"
-    "    card belongs to whoever dispatched the job, not to the job. See\n"
-    "    tools/cron_run_scope.py.\n"
-    '    """\n'
-    "    if arg:\n"
-    "        return arg\n"
-    "    if _is_delegated_child_context():\n"
-    "        return None\n"
-    "    # arg is falsy here, so this is the cron check plus the env fallback.\n"
-    "    return resolve_default_task_id(arg)\n"
-)
+# There is no _default_task_id edit here any more, and its absence is the
+# patch, not an omission. v2026.8.13 absorbed that half: cron.scheduler.run_job
+# now enters agent.delegation_context.non_dispatcher_owned_context() around the
+# whole run, _default_task_id consults it through _is_dispatcher_owned_worker(),
+# and a dispatched job therefore inherits no ambient card upstream-side. Keeping
+# our own rewrite of that function would be a second implementation of a rule
+# upstream now owns, pinned to a literal anchor on a body upstream is actively
+# editing — every future bump would break the build to re-apply a no-op.
+#
+# What the scope is still needed for is everything below: upstream's marker
+# says "not the dispatcher's worker", not "cron job X", so the refusal messages
+# that name the job and the explicit-task_id guard both still come from here.
+# verify_cron_run_scope.py asserts upstream's mechanism still returns no
+# ambient card, because nothing else would now notice if it stopped.
 
 KANBAN_OWNERSHIP = (
     '    env_tid = os.environ.get("HERMES_KANBAN_TASK")\n'
@@ -220,43 +228,47 @@ KANBAN_OWNERSHIP_PATCHED = (
 KANBAN_MISSING_MSG = '"task_id is required (or set HERMES_KANBAN_TASK in the env)"'
 KANBAN_MISSING_MSG_PATCHED = "missing_task_id_error()"
 
-# (relative path, [(anchor, replacement, expected occurrences)])
-PATCHES = (
-    (
-        "cron/scheduler.py",
-        (
-            (SCHEDULER_SIGNATURE, SCHEDULER_SIGNATURE_PATCHED, 1),
-            (SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, 1),
-            (SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, 1),
-        ),
-    ),
-    (
-        "tools/cronjob_tools.py",
-        (
-            (CRONJOB_IMPORT_ANCHOR, CRONJOB_IMPORT_PATCHED, 1),
-            (CRONJOB_EXECUTE, CRONJOB_EXECUTE_PATCHED, 1),
-            (CRONJOB_RESULT, CRONJOB_RESULT_PATCHED, 1),
-        ),
-    ),
-    (
-        "tools/kanban_tools.py",
-        (
-            (KANBAN_IMPORT_ANCHOR, KANBAN_IMPORT_PATCHED, 1),
-            (KANBAN_DEFAULT_TASK, KANBAN_DEFAULT_TASK_PATCHED, 1),
-            (KANBAN_OWNERSHIP, KANBAN_OWNERSHIP_PATCHED, 1),
-            (KANBAN_MISSING_MSG, KANBAN_MISSING_MSG_PATCHED, 7),
-        ),
-    ),
-)
+PREFIX = "cron_run_scope"
 
 
 def apply(root: Path) -> None:
     """Apply every patch under ``root``, or raise SystemExit with the reason."""
-    for relative, edits in PATCHES:
-        patch = patchlib.Patch(root, relative, prefix="cron_run_scope")
-        for anchor, replacement, expected in edits:
-            patch.substitute(anchor, replacement, expected=expected)
-        patch.commit(f"{len(edits)} anchors")
+    scheduler = patchlib.Patch(root, "cron/scheduler.py", prefix=PREFIX)
+    scheduler.refuse_if_patched(SCHEDULER_PATCHED_MARKER)
+    run_one = scheduler.find_def("run_one_job", label="cron run entry point")
+    run_one.expect_keyword_only(*SCHEDULER_EXPECTED_PARAMS)
+    # First, and by offset: substitute() rewrites the whole string and would
+    # invalidate the locator's spans. The two anchors below sit inside this
+    # same def, so the order also has to be this way round.
+    scheduler.insert(run_one.keyword_only_end(), SCHEDULER_OUTCOME_PARAM)
+    scheduler.substitute(
+        SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
+    )
+    scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
+    scheduler.commit("1 locator, 2 anchors")
+
+    cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
+    cronjob.substitute(
+        CRONJOB_IMPORT_ANCHOR, CRONJOB_IMPORT_PATCHED, label="scope import"
+    )
+    cronjob.substitute(CRONJOB_EXECUTE, CRONJOB_EXECUTE_PATCHED, label="scoped run")
+    cronjob.substitute(CRONJOB_RETURN, CRONJOB_RETURN_PATCHED, label="run report")
+    cronjob.substitute(CRONJOB_RESULT, CRONJOB_RESULT_PATCHED, label="tool result")
+    cronjob.commit("4 anchors")
+
+    kanban = patchlib.Patch(root, "tools/kanban_tools.py", prefix=PREFIX)
+    kanban.substitute(
+        KANBAN_IMPORT_ANCHOR, KANBAN_IMPORT_PATCHED, label="helper import"
+    )
+    kanban.substitute(
+        KANBAN_OWNERSHIP, KANBAN_OWNERSHIP_PATCHED, label="ownership guard"
+    )
+    # One per lifecycle tool, and how many of those there are is upstream's
+    # business: v2026.8.13 shipped nine where v2026.8.3 had seven.
+    kanban.substitute_all(
+        KANBAN_MISSING_MSG, KANBAN_MISSING_MSG_PATCHED, label="missing task_id"
+    )
+    kanban.commit("3 anchors")
 
 
 if __name__ == "__main__":

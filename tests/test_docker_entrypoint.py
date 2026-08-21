@@ -26,14 +26,34 @@ re-checking this against a real container wants scripts/ or profiles/platform/pr
 instead, which only the gated steps below create.
 """
 
+import ast
 import os
 import pathlib
+import re
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 
-_ENTRYPOINT = (
-    pathlib.Path(__file__).resolve().parents[1] / "deploy" / "shared" / "docker-entrypoint.sh"
+import yaml
+
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+_ENTRYPOINT = _REPO / "deploy" / "shared" / "docker-entrypoint.sh"
+_CHAT_TEMPLATE = _REPO / "agents" / "chat" / "config.yaml"
+# The operator's rendered ConfigMap, as the manifests golden records it. It is the only
+# place in this repository where the entrypoint's expectation of the render can be
+# checked against the render itself — the two are written in different languages.
+_MANIFEST_GOLDEN = (
+    _REPO
+    / "k8s-operator"
+    / "internal"
+    / "testing"
+    / "testdata"
+    / "platform"
+    / "expected"
+    / "platformagent.yaml"
 )
 
 # The gate announces its decision on stderr in both directions. Asserting on that rather
@@ -55,7 +75,15 @@ class SharedStateGateTest(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             home = pathlib.Path(tmp) / "data"
-            full_env = {"PATH": "/usr/bin:/bin", "PLATFORM_AGENT_HOME": str(home)}
+            full_env = {
+                "PATH": "/usr/bin:/bin",
+                "PLATFORM_AGENT_HOME": str(home),
+                # These cases are about the GATE, and none of them seeds a config.yaml,
+                # so every non-owner would otherwise sit in the wait below the gate for
+                # its full default. Zero keeps them measuring what they are named for;
+                # ConfigWaitTest owns the wait itself.
+                "AGENT_SHARED_STATE_WAIT_SECS": "0",
+            }
             full_env.update(env or {})
             proc = subprocess.run(
                 ["sh", str(_ENTRYPOINT), *(["echo"] if echo else []), *argv],
@@ -222,6 +250,441 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run([], echo=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup)
+
+
+class ConfigWaitTest(unittest.TestCase):
+    """The non-owner's bounded wait for the config.yaml the owner seeds.
+
+    This replaced a subPath mount that shadowed the PVC copy on every volume, so the
+    dashboard read a different config from the gateway's. In the shipped image the wait
+    is belt and braces rather than the guarantee: upstream's stage2 hook seeds
+    config.yaml from cli-config.yaml.example before the entrypoint runs, so the loop
+    never iterates there. It is carried for an upstream that stops doing that, which is
+    exactly why it needs tests of its own — nothing in the running system would notice
+    if it broke. What they hold is that it waits, stops early, and never becomes a wedge.
+    """
+
+    def _run(self, *, seed_after=None, wait_secs=30, home_exists=True, timeout=None):
+        """Run the entrypoint as an explicit non-owner against a home with no config.
+
+        `seed_after`, in seconds, writes config.yaml from a timer thread — the owner
+        container arriving late, which is the whole case. Returns `(proc, elapsed)`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            if home_exists:
+                home.mkdir(parents=True)
+            config = home / "config.yaml"
+            timer = None
+            if seed_after is not None:
+                timer = threading.Timer(seed_after, lambda: config.write_text("model: {}\n"))
+                timer.start()
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(
+                    ["sh", str(_ENTRYPOINT), "echo", "hermes", "dashboard"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "PLATFORM_AGENT_HOME": str(home),
+                        "AGENT_SHARED_STATE_SETUP": "skip",
+                        "AGENT_SHARED_STATE_WAIT_SECS": str(wait_secs),
+                        # The wait is gated on this: it marks an operator-managed pod,
+                        # the only arrangement where a second container is coming to
+                        # seed the file. Without it here every test below would pass by
+                        # never reaching the code it names. The path is never read —
+                        # this branch execs long before the managed-scope assertion.
+                        "HERMES_MANAGED_DIR": "/etc/hermes",
+                    },
+                    timeout=timeout if timeout is not None else wait_secs + 60,
+                )
+            finally:
+                if timer is not None:
+                    timer.cancel()
+            return proc, time.monotonic() - started
+
+    def test_a_config_already_there_is_not_waited_for(self):
+        """The steady state — every restart on an existing volume — must not pause."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            home.mkdir(parents=True)
+            (home / "config.yaml").write_text("model: {}\n")
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "dashboard"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_SETUP": "skip",
+                    # Long enough that waiting at all would blow the timeout below.
+                    "AGENT_SHARED_STATE_WAIT_SECS": "600",
+                    # Set, so that what skips the wait here is the file being present
+                    # and not the operator gate — that gate has its own test.
+                    "HERMES_MANAGED_DIR": "/etc/hermes",
+                },
+                timeout=30,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_the_wait_ends_as_soon_as_the_config_appears(self):
+        """Not a fixed sleep. The owner's seed has to release it early."""
+        proc, elapsed = self._run(seed_after=2, wait_secs=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("waiting up to", proc.stderr)
+        self.assertIn("appeared after", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+        self.assertLess(
+            elapsed,
+            30,
+            "the wait polls for the file; taking the full budget with the file present "
+            f"means it is really a sleep. stderr was:\n{proc.stderr}",
+        )
+
+    def test_a_config_that_never_arrives_starts_the_process_anyway(self):
+        """Bounded, and it proceeds either way.
+
+        Exiting here would only buy a kubelet backoff loop — this container carries no
+        probes — and an owner that never runs is legitimate for a pre-populated volume.
+        """
+        proc, _ = self._run(wait_secs=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("still absent", proc.stderr)
+        self.assertIn(
+            "hermes dashboard",
+            proc.stdout,
+            "the timeout must hand over to the command regardless; a non-owner that never "
+            "starts is worse than one that starts early",
+        )
+
+    def test_a_non_numeric_budget_warns_and_falls_back(self):
+        """`set -e` is on, so an unguarded `-lt` on a typo would kill the container.
+
+        That is the exact outcome the branch exists to avoid, arriving through the knob
+        that configures avoiding it. Seeded from a timer so the 120s fallback the guard
+        installs is left early rather than waited out.
+        """
+        proc, _ = self._run(seed_after=1, wait_secs="two minutes", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("non-numeric", proc.stderr)
+        self.assertIn("waiting up to 120s", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_a_home_that_does_not_exist_yet_is_waited_through_not_crashed_on(self):
+        """The owner creates $TARGET_DIR itself, so on a fresh PVC it is absent, not empty.
+
+        `set -e` is on and the `cd` below this point is guarded for exactly this reason;
+        the wait must not become the thing that fails first.
+        """
+        proc, _ = self._run(wait_secs=2, home_exists=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_a_start_outside_the_operator_does_not_wait_at_all(self):
+        """No HERMES_MANAGED_DIR means no second container, so nobody is coming.
+
+        compose, a plain manifest, `docker run`, the kustomize bases, a test harness: a
+        missing config.yaml there is a fact, not a race, and pausing on it turns a fast
+        failure into a two-minute one for no possible gain. This is not hypothetical —
+        it is how the first cut of this wait hung deploy/docker's startup-contract tests,
+        which run the entrypoint as `sh -c pwd` against an empty temp home.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            home.mkdir(parents=True)
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "dashboard"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_SETUP": "skip",
+                    # Deliberately no HERMES_MANAGED_DIR. The budget is long enough that
+                    # waiting at all would blow the timeout below.
+                    "AGENT_SHARED_STATE_WAIT_SECS": "600",
+                },
+                timeout=30,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+
+def _extract_heredoc(marker):
+    """Return the body of the entrypoint's `<<'MARKER'` heredoc.
+
+    Step 2d's back-fill is a Python program embedded in the shell script, so the only
+    way to test the program that actually ships is to lift it back out. Copying it into
+    this file instead would be worse than no test: the copy would keep passing after the
+    original diverged from it.
+
+    Insists on exactly one opener. A second heredoc with the same marker would make this
+    silently test whichever came first.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    openers = [i for i, line in enumerate(lines) if f"<<'{marker}'" in line]
+    if len(openers) != 1:
+        raise AssertionError(f"expected one <<'{marker}' in {_ENTRYPOINT}, found {len(openers)}")
+    start = openers[0] + 1
+    for end in range(start, len(lines)):
+        if lines[end] == marker:
+            return "\n".join(lines[start:end]) + "\n"
+    raise AssertionError(f"<<'{marker}' is never closed in {_ENTRYPOINT}")
+
+
+def _extract_shell_function(name):
+    """Return the text of a `name() { ... }` function from the entrypoint.
+
+    Same bargain as `_extract_heredoc`: run the shipped definition, never a copy of it.
+    Relies on the script's own formatting — opener line, body, a `}` in column zero —
+    which `sh -n` and the repo's shell style already enforce.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    openers = [i for i, line in enumerate(lines) if line.startswith(f"{name}() {{")]
+    if len(openers) != 1:
+        raise AssertionError(f"expected one {name}() in {_ENTRYPOINT}, found {len(openers)}")
+    start = openers[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == "}":
+            return "\n".join(lines[start : end + 1]) + "\n"
+    raise AssertionError(f"{name}() is never closed in {_ENTRYPOINT}")
+
+
+class FreshVolumeDetectionTest(unittest.TestCase):
+    """A fresh volume is not an absent file, and getting that wrong cost a whole install.
+
+    Upstream's stage2 hook seeds $HERMES_HOME/config.yaml from cli-config.yaml.example
+    before this script runs, so `[ ! -f config.yaml ]` never fires and step 2d took the
+    FILL-ONLY path into upstream's example. Fill-only cannot overrule a key that is
+    present, so a new install kept upstream's terminal, browser, code_execution,
+    delegation and telemetry defaults permanently — 26 top-level keys of example where
+    the template asks for 9. Measured on a live cluster, not deduced.
+
+    So the trigger is the example itself, byte-for-byte. These tests pin both halves:
+    that a pristine example is recognised, and that anything the agent has touched is
+    not — the second being the one that would turn this into the config-destroying
+    force-copy the whole PR exists to avoid.
+    """
+
+    _FUNC = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._FUNC = _extract_shell_function("config_is_pristine_upstream_example")
+
+    def _is_pristine(self, live, example):
+        """Run the shipped function over two real files; True iff it exits 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            live_path = pathlib.Path(tmp) / "config.yaml"
+            example_path = pathlib.Path(tmp) / "cli-config.yaml.example"
+            if live is not None:
+                live_path.write_text(live, encoding="utf-8")
+            if example is not None:
+                example_path.write_text(example, encoding="utf-8")
+            proc = subprocess.run(
+                ["sh", "-c", self._FUNC + f'\nconfig_is_pristine_upstream_example "{live_path}" "{example_path}"'],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return proc.returncode == 0
+
+    def test_the_untouched_example_is_recognised(self):
+        """What stage2 leaves on a brand-new PVC: a verbatim copy."""
+        example = "model:\n  provider: anthropic\nterminal:\n  enabled: true\n"
+        self.assertTrue(self._is_pristine(example, example))
+
+    def test_a_config_the_agent_has_written_is_not(self):
+        """One `/sethome` is enough to end the equality, and must be."""
+        example = "model:\n  provider: anthropic\nterminal:\n  enabled: true\n"
+        live = "model: {}\nterminal:\n  enabled: true\nplatforms:\n  slack:\n    home_channel: C123\n"
+        self.assertFalse(self._is_pristine(live, example))
+
+    def test_a_one_byte_difference_is_enough(self):
+        """A byte compare, not a fuzzy one: near-miss must fall through to the back-fill."""
+        example = "model:\n  provider: anthropic\n"
+        self.assertFalse(self._is_pristine(example + "\n", example))
+
+    def test_a_missing_example_is_not_pristine(self):
+        """An image without the example must take the back-fill path, not overwrite.
+
+        This is the forward-compatibility case: if upstream moves or renames the file,
+        the answer has to be "leave the live config alone", never "replace it".
+        """
+        self.assertFalse(self._is_pristine("model: {}\n", None))
+
+    def test_a_missing_live_config_is_not_pristine(self):
+        """That case belongs to the seed branch above it, which needs no comparison."""
+        self.assertFalse(self._is_pristine(None, "model: {}\n"))
+
+
+class ConfigBackfillTest(unittest.TestCase):
+    """Step 2d fills keys the live config.yaml has lost, and must change nothing else.
+
+    Two things hollow the PVC file out, and both are ordinary: hermes' `save_config`
+    strips every leaf the managed scope holds before writing, so one `/sethome` leaves
+    `model: {}` on disk; and a release that stops pinning a leaf hands it back to a file
+    the previous release already emptied of it. The pod then runs on hermes' built-in
+    defaults with green health checks — the failure this step exists to prevent.
+
+    The back-fill is the only thing in the entrypoint that rewrites a file the running
+    agent owns, so both halves matter: what it restores, and what it refuses to touch.
+    Overruling one value the agent wrote for itself would make it the three-way merge
+    this PR deleted, whose rule kept a bad value alive across every restart (#658).
+    """
+
+    _PROGRAM = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._PROGRAM = _extract_heredoc("PYEOF")
+
+    def _fill(self, template, live):
+        """Run the real program over two files, returning `(proc, reloaded_live)`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            template_path = pathlib.Path(tmp) / "template.yaml"
+            live_path = pathlib.Path(tmp) / "live.yaml"
+            template_path.write_text(
+                template if isinstance(template, str) else yaml.safe_dump(template),
+                encoding="utf-8",
+            )
+            live_path.write_text(
+                live if isinstance(live, str) else yaml.safe_dump(live), encoding="utf-8"
+            )
+            before = live_path.read_bytes()
+            proc = subprocess.run(
+                [sys.executable, "-c", self._PROGRAM, str(template_path), str(live_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            after = live_path.read_bytes()
+            return proc, yaml.safe_load(after), before == after
+
+    def test_a_key_the_live_file_lost_is_restored(self):
+        """`model: {}` is what a save leaves behind; the template's block goes back in."""
+        proc, live, _ = self._fill(
+            {"model": {"base_url": "http://litellm/v1", "api_mode": "chat_completions"}},
+            {"model": {}},
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["model"]["base_url"], "http://litellm/v1")
+        self.assertEqual(live["model"]["api_mode"], "chat_completions")
+        self.assertIn("model.base_url", proc.stdout)
+
+    def test_a_value_the_agent_wrote_is_never_overruled(self):
+        """Including one deliberately set empty — absence is the only trigger."""
+        proc, live, _ = self._fill(
+            {"platforms": {"slack": {"home_channel": "C-TEMPLATE", "rich_blocks": True}}},
+            {"platforms": {"slack": {"home_channel": "", "rich_blocks": False}}},
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            live["platforms"]["slack"]["home_channel"],
+            "",
+            "an empty home channel is a value the agent set, not a missing key: "
+            "restoring the template's over it is the /sethome bug of #658",
+        )
+        self.assertIs(live["platforms"]["slack"]["rich_blocks"], False)
+
+    def test_a_live_scalar_is_not_descended_into(self):
+        """Where the live file holds a scalar and the template a mapping, the agent wins."""
+        proc, live, _ = self._fill({"memory": {"provider": "hindsight"}}, {"memory": "none"})
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["memory"], "none")
+
+    def test_nothing_missing_leaves_the_file_byte_identical(self):
+        """No rewrite when there is nothing to add — that is what keeps the comments."""
+        live = "# the agent's own file\nmodel:\n  base_url: http://litellm/v1\n"
+        proc, _, unchanged = self._fill({"model": {"base_url": "http://other/v1"}}, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged, f"the file was rewritten with nothing to add: {proc.stdout}")
+
+    def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
+        """A corrupt config must not take the container down; step 2d only reports."""
+        proc, live, unchanged = self._fill({"model": {"base_url": "http://litellm/v1"}}, "- a\n- b")
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertEqual(live, ["a", "b"])
+        self.assertIn("skipped", proc.stderr)
+
+    def test_the_shipped_template_repairs_a_hollowed_config(self):
+        """The real files, in the shape the cluster produced: `model: {}` plus /sethome."""
+        template = yaml.safe_load(_CHAT_TEMPLATE.read_text(encoding="utf-8"))
+        proc, live, _ = self._fill(
+            template,
+            {
+                "model": {},
+                "platforms": {"google_chat": {"home_channel": "spaces/AAQA"}},
+                "monitoring": {"install_id": "abc123"},
+            },
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["model"], template["model"])
+        self.assertEqual(
+            live["platforms"]["google_chat"]["home_channel"],
+            "spaces/AAQA",
+            "the back-fill overwrote the home channel /sethome set — the one thing #658 "
+            "is about keeping",
+        )
+        self.assertEqual(live["monitoring"]["install_id"], "abc123")
+        for key in ("toolsets", "platform_toolsets", "kanban", "agent"):
+            self.assertIn(key, live, f"{key} was lost to the managed strip and not restored")
+
+
+class ManagedScopeAssertionTest(unittest.TestCase):
+    """Step 2d's other half: the check that the operator's pins actually arrived.
+
+    Hermes' managed scope fails OPEN — an absent or unparseable file is ignored — which
+    for us means the model endpoint is silently writable on a pod whose health checks
+    stay green. The entrypoint names the leaves it expects rather than counting them,
+    and a typo in one of those names makes the check pass vacuously. Nothing else in
+    this repository compares that list to what the operator emits: one side is shell,
+    the other Go.
+    """
+
+    def test_the_expected_keys_are_keys_the_operator_actually_pins(self):
+        script = _ENTRYPOINT.read_text(encoding="utf-8")
+        match = re.search(r"for expected in \(([^)]*)\):", script)
+        self.assertIsNotNone(
+            match, "step 2d no longer names the leaves it expects; this test guards that list"
+        )
+        expected = ast.literal_eval(f"({match.group(1)})")
+        self.assertTrue(expected, "an empty expectation would make the check pass vacuously")
+
+        managed = None
+        for doc in yaml.safe_load_all(_MANIFEST_GOLDEN.read_text(encoding="utf-8")):
+            if doc and doc.get("kind") == "ConfigMap" and "managed-config.yaml" in (
+                doc.get("data") or {}
+            ):
+                managed = yaml.safe_load(doc["data"]["managed-config.yaml"])
+        self.assertIsNotNone(managed, f"no managed-config.yaml in {_MANIFEST_GOLDEN}")
+
+        for dotted in expected:
+            node = managed
+            for part in dotted.split("."):
+                self.assertIsInstance(
+                    node, dict, f"step 2d expects {dotted}, which the render does not nest that way"
+                )
+                self.assertIn(
+                    part,
+                    node,
+                    f"step 2d warns unless the managed scope pins {dotted}, but the operator "
+                    f"does not render it — every boot would log 'running UNPINNED'",
+                )
+                node = node[part]
 
 
 def _extract_shell_function(name):
@@ -636,6 +1099,253 @@ class SyncProfileSkillsTest(unittest.TestCase):
                 "a stale skills.new must be cleared, not moved into place or nested",
             )
             self.assertEqual(sorted(p.name for p in (tmp / "profile").iterdir()), ["skills"])
+
+
+class PlatformFrontDoorTest(unittest.TestCase):
+    """The startup decisions that turn on spec.harness.experimental.platformFrontDoor.
+
+    The operator renders that flag as HERMES_GATEWAY_PROFILE=platform on the gateway
+    container, and the gateway then runs as the platform profile instead of the default
+    one. That moves profiles/platform/config.yaml out of the image's ownership and into
+    the agent's: `/sethome` persists the home channel into it and the monitoring policy
+    mints monitoring.install_id there. Step 2.6 must therefore stop force-syncing it, and
+    step 2.6b must back-fill it instead — the same bargain step 2d strikes for the default
+    profile's own file.
+
+    Both ask the same predicate, so it is tested once and each caller is tested against
+    it — the failure worth catching is the two disagreeing, which is either a config.yaml
+    force-synced out from under the agent or one that never takes a key the image added.
+
+    Extracted rather than run through the whole script for the reason step 2.6a's tests
+    give: the surrounding steps are guarded on /opt/hermes and /opt/agent-config, which
+    exist only inside the image.
+    """
+
+    def _run(self, snippet, profile=None):
+        """Run `snippet` under `set -e` with the front-door helpers in scope."""
+        script = "set -e\n"
+        for name in ("platform_is_front_door", "platform_sync_items"):
+            script += _extract_shell_function(name) + "\n"
+        script += snippet
+        env = {"PATH": "/usr/bin:/bin"}
+        if profile is not None:
+            env["HERMES_GATEWAY_PROFILE"] = profile
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
+        )
+
+    def _predicate(self, snippet, profile=None):
+        proc = self._run(f'if {snippet}; then echo YES; else echo NO; fi\n', profile=profile)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip() == "YES"
+
+    def _items(self, profile=None):
+        proc = self._run("platform_sync_items\n", profile=profile)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split()
+
+    def test_the_front_door_is_off_unless_the_operator_names_this_profile(self):
+        """Only the exact value opts in; everything else is the behaviour every install has.
+
+        The empty string matters on its own: Kubernetes renders an absent value as one
+        rather than omitting the variable, so a half-wired manifest arrives here as `""`.
+        """
+        for profile in (None, "", "  ", "default", "cluster-prod", "Platform", "platform2"):
+            self.assertFalse(
+                self._predicate("platform_is_front_door", profile=profile),
+                f"HERMES_GATEWAY_PROFILE={profile!r} must not opt an install in",
+            )
+        self.assertTrue(self._predicate("platform_is_front_door", profile="platform"))
+
+    def test_the_front_door_drops_config_yaml_and_nothing_else(self):
+        """config.yaml is the only entry whose ownership the flag changes.
+
+        Asserted as a set difference rather than against a spelled-out list, because the
+        bug to catch is a persona or a directory quietly falling out of the sync on
+        front-door installs only — where it would present months later as an agent whose
+        skills never updated, on the one install nobody compares against the image.
+        """
+        default = self._items()
+        front_door = self._items(profile="platform")
+
+        self.assertIn("config.yaml", default)
+        self.assertEqual(
+            set(default) - set(front_door),
+            {"config.yaml"},
+            "the front door must drop config.yaml from the force-sync and keep the rest",
+        )
+        self.assertEqual(
+            set(front_door) - set(default), set(), "the front door must not add entries"
+        )
+
+    def test_step_2_6b_fills_the_platform_config_with_step_2ds_own_program(self):
+        """One program, two callers — asserted on the source, not on a copy of it.
+
+        The rule step 2.6b needs is exactly step 2d's: restore a key the image declares
+        and the live file has lost, never overrule one the agent wrote. Re-implementing
+        it here is the failure this catches, because the second copy would drift towards
+        the three-way merge that #658 removed — and the two files it governs are the two
+        an agent writes to, so a divergence surfaces as `/sethome` sticking on one
+        profile and not the other.
+        """
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        callers = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith("backfill_config_from_template")
+            and not line.strip().endswith("() {")
+        ]
+        self.assertEqual(
+            len(callers),
+            2,
+            f"expected step 2d and step 2.6b to be the only callers, found {callers}",
+        )
+        self.assertIn(
+            "$PLATFORM_TEMPLATE/config.yaml",
+            source,
+            "step 2.6b must fill from the platform profile's image template",
+        )
+
+    def test_step_2_6b_runs_only_at_the_front_door_and_only_on_the_primary(self):
+        """The guard, read off the source, because both halves are silent when wrong.
+
+        Without the predicate the fill runs on every install, on a file step 2.6 has
+        already force-synced — harmless the first time and wrong the moment the template
+        and the overlay disagree. Without the primary check a second container races the
+        first over one file on a shared PVC, which is what step 1.5 exists to stop.
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        call = next(
+            i
+            for i, line in enumerate(lines)
+            if line.strip().startswith("backfill_config_from_template")
+            and "PLATFORM_TEMPLATE" in "\n".join(lines[i : i + 3])
+        )
+        guard = next(lines[i] for i in range(call, -1, -1) if lines[i].startswith("if "))
+        self.assertIn("platform_is_front_door", guard)
+        self.assertIn("IS_BOOTSTRAP_PRIMARY", guard)
+
+    def test_step_2_6_asks_the_helper_rather_than_carrying_its_own_list(self):
+        """The call site, not just the helper — a literal here re-opens the whole bug.
+
+        Everything above tests platform_sync_items in isolation, which stays green if
+        step 2.6's `--items` is edited back to the spelled-out list it used to carry:
+        the helper would go on answering correctly and nothing would ask it. The result
+        is config.yaml force-synced over the front door's own file on every restart,
+        discarding `/sethome` and monitoring.install_id, silently.
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        # Two invocations name this profile — step 2.5 scaffolds it when absent, step 2.6
+        # force-syncs it on every boot — and only the second passes --items at all.
+        items = []
+        for i, line in enumerate(lines):
+            if line.strip() != "--name platform \\":
+                continue
+            items += [a.strip() for a in lines[i : i + 8] if a.strip().startswith("--items")]
+        self.assertEqual(
+            items,
+            ['--items "$(platform_sync_items)" \\'],
+            "step 2.6 must resolve its --items through platform_sync_items, not a literal",
+        )
+
+    def _run_step_2_6b(self, template, live):
+        """Run the shipped step 2.6b block over a real profile tree.
+
+        Lifted out by its guard rather than copied, for `_extract_heredoc`'s reason: a
+        copy would keep passing after the block it stands in for changed. Everything the
+        block reads is a variable, so a temp tree and an env is the whole fixture — the
+        one exception being `$INSTALL_DIR/.venv/bin/python3`, which the fill arm calls
+        and which is faked here with a symlink to the interpreter running the tests.
+
+        `template` and `live` are YAML text; `live=None` means the file is absent, which
+        is the branch under test. Returns (CompletedProcess, live text or None).
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        starts = [i for i, line in enumerate(lines) if line.startswith("if platform_is_front_door ")]
+        self.assertEqual(len(starts), 1, "expected exactly one step 2.6b block")
+        end = next(i for i in range(starts[0], len(lines)) if lines[i] == "fi")
+        block = "\n".join(lines[starts[0] : end + 1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "template").mkdir()
+            (root / "template" / "config.yaml").write_text(template, encoding="utf-8")
+            profile = root / "data" / "profiles" / "platform"
+            profile.mkdir(parents=True)
+            if live is not None:
+                (profile / "config.yaml").write_text(live, encoding="utf-8")
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            (venv / "python3").symlink_to(sys.executable)
+
+            script = "set -e\n" + _extract_shell_function("platform_is_front_door") + "\n"
+            script += _extract_shell_function("backfill_config_from_template") + "\n" + block
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HERMES_GATEWAY_PROFILE": "platform",
+                    "IS_BOOTSTRAP_PRIMARY": "1",
+                    "PLATFORM_TEMPLATE": str(root / "template"),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            written = (profile / "config.yaml").read_text(encoding="utf-8") if (profile / "config.yaml").exists() else None
+            return proc, written
+
+    def test_step_2_6b_seeds_the_config_when_the_profile_has_none(self):
+        """The absent-file arm, which is the only thing left that can recreate this file.
+
+        With config.yaml off the force-sync, the four steps that could write it are step
+        2.5 (gated on the profile being ABSENT, so not once profile.yaml exists), step
+        2.6 (no longer carries the name in --items), this block, and step 2.7 (skips a
+        profile whose config.yaml is missing). If this arm does not seed, a profile that
+        registered without a config — profile_scaffold writes profile.yaml before it
+        copies the template, and step 2.5's caller swallows a failure between the two
+        with a WARN — never gets one back for the life of the volume. It is also the
+        profile receiving chat, and an absent `platform_toolsets` does not fail closed:
+        `resolve_toolset` auto-generates the full core bundle plus every enabled MCP
+        server, with no `agent.disabled_toolsets` ceiling and no operator overlay.
+        """
+        template = "platform_toolsets:\n  google_chat: [kanban]\nmonitoring: {}\n"
+        proc, written = self._run_step_2_6b(template, live=None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(written, template, "an absent config must be seeded from the image template")
+
+    def test_step_2_6b_fills_an_existing_config_without_overruling_it(self):
+        """The other arm, on the same fixture: fill what is missing, keep what is there.
+
+        Pinned next to the seed so the two cannot be confused for each other. Seeding
+        over a live file would discard `/sethome` and monitoring.install_id on every
+        restart, which is the failure taking config.yaml off the force-sync exists to
+        prevent.
+        """
+        template = "platform_toolsets:\n  google_chat: [kanban]\nmonitoring: {}\n"
+        live = "platform_toolsets:\n  google_chat: [kanban, memory]\n"
+        proc, written = self._run_step_2_6b(template, live=live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        parsed = yaml.safe_load(written)
+        self.assertEqual(
+            parsed["platform_toolsets"]["google_chat"],
+            ["kanban", "memory"],
+            "the fill must not overrule a key the agent already wrote",
+        )
+        self.assertIn("monitoring", parsed, "the fill must add a key the template declares")
+
+    def test_the_predicate_survives_set_e_when_it_is_false(self):
+        """The off path is every existing install, so a false return must not end the boot.
+
+        `platform_is_front_door || _items=...` and `if platform_is_front_door` are both
+        exempt from `set -e`, but a future caller written as a bare command would not be,
+        and the symptom is a CrashLoopBackOff on the installs that did NOT opt in.
+        """
+        proc = self._run("platform_sync_items >/dev/null\necho SURVIVED\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SURVIVED", proc.stdout)
 
 
 if __name__ == "__main__":

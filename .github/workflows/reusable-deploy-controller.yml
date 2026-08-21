@@ -16,6 +16,9 @@ on:
         type: string
         description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -39,6 +42,10 @@ jobs:
   deploy:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     env:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -86,12 +93,23 @@ jobs:
 
       - name: Perform Controller Redeployment
         env:
-          PACKAGE_NAME: "k8s-operator"
-          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
-          REGION: ${{ env.GCP_REGION }}
-          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
-          IMG: "${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
-          echo "Redeploying controller via provision_03 with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
-          cd k8s-operator
-          make gcp-provision-03-operator ARGS="--no-confirm"
+          # Helm re-tags the operator image on the live release, keeping the
+          # release's own values while letting the checkout's chart defaults
+          # refresh (--reset-then-reuse-values; plain --reuse-values would
+          # snapshot old chart defaults into the release config, shadowing
+          # every later default bump). An environment without the
+          # release predates the Terraform + Helm engine and has to be
+          # re-installed from terraform/examples/full-install once — this
+          # fails loudly rather than half-adopting objects Helm does not own.
+          if ! helm status kube-agents -n kubeagents-system >/dev/null 2>&1; then
+            echo "::error::No Helm release 'kube-agents' in kubeagents-system — this environment predates the Terraform + Helm engine and must be re-installed from terraform/examples/full-install before redeploys can run."
+            exit 1
+          fi
+          echo "Redeploying controller via helm upgrade with tag: $IMAGE_TAG"
+          # CRD schema changes never ride a helm upgrade (Helm's documented
+          # behaviour for crds/), so apply them first.
+          kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
+            --reset-then-reuse-values --set "operator.image.tag=${IMAGE_TAG}" --wait --timeout 10m

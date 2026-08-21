@@ -1,3 +1,4 @@
+import os
 import unittest
 import sys
 from unittest.mock import MagicMock, patch
@@ -131,6 +132,77 @@ class TestLeaderElectLogic(unittest.TestCase):
         
         # Verify it started the process
         mock_popen.assert_called_once()
+
+
+class TestGatewayProfile(unittest.TestCase):
+    """The gateway argv this wrapper supervises, at spec.harness.experimental.platformFrontDoor.
+
+    At one replica the operator puts `hermes --profile platform gateway run` straight into
+    the container args and this file never runs. Above one it runs INSTEAD of those args, so
+    the profile has to arrive as an environment variable — and if it does not arrive at all,
+    an HA install silently keeps serving chat from the Chat Agent while the CR says otherwise.
+
+    `--profile` is a global flag that hermes_cli/main.py pre-parses out of argv before any
+    import, so its position ahead of `gateway` is part of the contract, not formatting.
+    HERMES_COMMAND is built at import time, hence the reload.
+    """
+
+    def _command(self, value):
+        import importlib
+        with patch.dict(os.environ, {} if value is None else {"HERMES_GATEWAY_PROFILE": value},
+                        clear=False):
+            if value is None:
+                os.environ.pop("HERMES_GATEWAY_PROFILE", None)
+            return importlib.reload(leader_elect).HERMES_COMMAND
+
+    def tearDown(self):
+        # Leave the module as the other tests in this file expect to find it.
+        self._command(None)
+
+    def test_no_profile_runs_the_default_gateway(self):
+        self.assertEqual(self._command(None), ["hermes", "gateway", "run"])
+
+    def test_an_empty_profile_is_not_a_profile(self):
+        """An unset variable and one set to "" must mean the same thing.
+
+        Kubernetes renders an absent value as the empty string rather than omitting the
+        variable, so `hermes --profile "" gateway run` is what a half-wired manifest would
+        produce — and Hermes reads that as a profile named "", homing the gateway at a
+        directory nothing scaffolded.
+        """
+        self.assertEqual(self._command(""), ["hermes", "gateway", "run"])
+        self.assertEqual(self._command("  "), ["hermes", "gateway", "run"])
+
+    def test_the_profile_precedes_the_subcommand(self):
+        self.assertEqual(
+            self._command("platform"),
+            ["hermes", "--profile", "platform", "gateway", "run"],
+            "`--profile` is global: after `gateway` it is not the same command",
+        )
+
+    @patch("leader_elect.time.sleep")
+    def test_the_supervised_process_gets_the_profile(self, mock_sleep):
+        """The argv is not merely built, it is what Popen is handed."""
+        import importlib
+        with patch.dict(os.environ, {"HERMES_GATEWAY_PROFILE": "platform"}):
+            module = importlib.reload(leader_elect)
+        module.lease_name, module.namespace, module.pod_name = "l", "ns", "pod-1"
+        module.process, module.is_shutting_down = None, False
+
+        mock_coordination = MagicMock()
+        mock_kubernetes.client.CoordinationV1Api.return_value = mock_coordination
+        mock_kubernetes.client.CoreV1Api.return_value = MagicMock()
+        lease = MagicMock()
+        lease.spec.holder_identity = "pod-1"
+        mock_coordination.read_namespaced_lease.return_value = lease
+
+        with patch.object(module.subprocess, "Popen") as popen:
+            mock_sleep.side_effect = Exception("StopLoop")
+            with self.assertRaises(Exception):
+                module.main()
+
+        popen.assert_called_once_with(["hermes", "--profile", "platform", "gateway", "run"])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -34,8 +34,12 @@ wrong even if it compiles and passes tests:
 2. **All mutation flows through GitOps** — agent proposes → human approves → the customer's CI/CD
    applies the change (KCC YAML or Terraform HCL). No direct `kubectl`/`gcloud` writes; no
    break-glass path in v1.
-3. **Agents never call each other directly.** They coordinate only through shared state — the GitOps
-   repo and the Operational Knowledge Framework (OKF).
+3. **Agents coordinate through durable, attributable state — never synchronous RPC.** The GitOps
+   repo and the Operational Knowledge Framework (OKF) are the substrates today. Any other substrate
+   must satisfy the four-property test in [02-agent-personas.md](02-agent-personas.md) §2.3, which
+   is **necessary, not sufficient** — the properties are enumerated there and nowhere else.
+   **No agent gains authority by being called:** a message may request work, never confer
+   permission to do it.
 4. **Each tier is scope-bounded** (project / cluster / namespace), enforced by a per-agent read-only
    identity, not by convention.
 5. **Every change is reviewed, attributable, and revertible.**

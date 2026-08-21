@@ -1223,17 +1223,17 @@ def _record_task_failure(conn, task_id, error, *, outcome, failure_limit=None,
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
+                # Timeout/crash path: source phase already restored with claim
+                # cleared; just flip to blocked + update
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
                     (failures, error[:500], task_id),
                 )
             payload = {
@@ -1245,12 +1245,13 @@ def _record_task_failure(conn, task_id, error, *, outcome, failure_limit=None,
         else:
             # Below threshold. These two must keep binding the raw count.
             if release_claim:
+                # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (retry_status, failures, error[:500], task_id),
                 )
             else:
                 conn.execute(
@@ -1363,7 +1364,7 @@ class ApplierTest(unittest.TestCase):
         out = self._applied()
         self.assertLess(
             out.index("_kanban_release_dead_foreign_claims"),
-            out.index('"SELECT id, worker_pid, claim_lock, started_at FROM tasks "'),
+            out.index('"SELECT id, worker_pid, claim_lock, started_at, assignee "'),
         )
 
     def test_the_charge_runs_after_the_sweeps_transaction_has_closed(self):
@@ -1387,8 +1388,14 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(
             patched.count("(persisted_failures, error[:500], task_id),"), 2
         )
-        # ...and the two below-threshold UPDATEs still bind the raw count.
-        self.assertEqual(patched.count("(failures, error[:500], task_id),"), 2)
+        # ...and the two below-threshold UPDATEs still bind the raw count. They
+        # differ in shape — v2026.8.13 gave the spawn path a ``retry_status``
+        # leading bind so it restores the phase it claimed from — so the raw
+        # count is counted once per shape rather than twice in one string.
+        self.assertEqual(patched.count("(failures, error[:500], task_id),"), 1)
+        self.assertEqual(
+            patched.count("(retry_status, failures, error[:500], task_id),"), 1
+        )
 
         # The gave_up payload keeps reporting the true attempt count, so the
         # audit trail does not silently change meaning.

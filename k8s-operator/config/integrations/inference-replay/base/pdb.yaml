@@ -1,0 +1,16 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: standalone-replay
+spec:
+  # One replica, backed by an RWO PVC of recorded responses. A minAvailable
+  # here would leave zero allowed disruptions and hang every node drain — the
+  # critical `blocking-pdb` finding in
+  # agents/platform/governance/obtainability_audit_sop.md §3.4. maxUnavailable: 1
+  # says what is true instead: this is an eval-time proxy and may be evicted.
+  maxUnavailable: 1
+  # Copied from the Deployment's own immutable spec.selector; §3.3 of that
+  # audit matches a PDB to its workload by selector, never by name.
+  selector:
+    matchLabels:
+      app: standalone-replay

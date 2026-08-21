@@ -11,7 +11,7 @@ Everything below runs from `k8s-operator/`.
 
 ## Prerequisites
 
-- Go 1.25+.
+- Go 1.26+.
 - `docker` (or `podman`) for image builds.
 - `kubectl` pointed at a target cluster for `make install` / `make deploy`.
 - `make` — the entire workflow is Makefile-driven.
@@ -59,13 +59,13 @@ make deploy        IMG=<your-registry>/kube-agents-operator:dev
 
 ## Fast agent iteration (dev only)
 
-For local Platform Agent development you don't want to run the full provisioner every time. `make dev-rebuild-agent` shells out to `k8s-operator/scripts/dev/dev_rebuild_agent.sh`:
+For local Platform Agent development you don't want to run the full installer every time. `make dev-rebuild-agent` shells out to `k8s-operator/scripts/dev/dev_rebuild_agent.sh`:
 
 ```bash
 make dev-rebuild-agent ARGS="platform"
 ```
 
-This builds the Platform Agent image, pushes to Artifact Registry, and restarts the Deployment. First run creates a dev Artifact Registry repo; clean it up later with `make gcp-teardown-dev-artifact-registry`.
+This builds the Platform Agent image, pushes to Artifact Registry, and restarts the Deployment. First run creates a dev Artifact Registry repo; clean it up later with `scripts/dev/teardown_dev_01_gcp_artifact_registry.sh`.
 
 ### Building on a private worker pool
 
@@ -75,7 +75,9 @@ Cloud Build runs on the project's default pool (2 vCPU) unless you point it else
 export CLOUD_BUILD_WORKER_POOL=projects/PROJECT/locations/REGION/workerPools/POOL
 ```
 
-`dev_rebuild_agent.sh` and `hack/ci-deploy.sh` both read this variable and pass `--worker-pool` (plus the pool's region, parsed from the name) to every `gcloud builds submit`. Leave it unset to keep the default pool. The pool must allow public egress, or builds fail pulling base images and packages.
+`dev_rebuild_agent.sh` and `hack/ci-deploy.sh` both read this variable and pass `--worker-pool` (along with the pool's region parsed from the name) to `gcloud builds submit`. Leave it unset to use the default pool. Note that the worker pool must allow public egress, or image builds will fail when pulling base images and downloading dependencies.
+
+The two scripts handle the unset case differently. `dev_rebuild_agent.sh` takes the default pool's default machine (2 vCPUs), while `hack/ci-deploy.sh` requests `e2-highcpu-8` because it compiles all three container images in a single Cloud Build submission ([`deploy/docker/cloudbuild-ci.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/cloudbuild-ci.yaml)) with the operator build running in parallel alongside the agent builds. Because private worker pools define their own fixed machine types and reject `--machine-type`, `hack/ci-deploy.sh` only passes `--machine-type` when `CLOUD_BUILD_WORKER_POOL` is unset.
 
 ## Integrations (Kustomize)
 
@@ -87,7 +89,7 @@ make deploy-inference-replay    # inference-replay proxy
 make deploy-github              # Minty (GitHub token minter)
 ```
 
-Each has a matching `undeploy-*` target. These are the same kustomize bases the provisioner uses.
+Each has a matching `undeploy-*` target. These are the development copies of the components the Helm chart renders in a stock install.
 
 ## RBAC Migration & Deprecation Guidelines
 

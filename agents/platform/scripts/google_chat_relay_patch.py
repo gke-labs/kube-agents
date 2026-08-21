@@ -167,8 +167,12 @@ def install() -> None:
     original_registry_create = PlatformRegistry.create_adapter
     if not getattr(PlatformRegistry, "_credential_proxy_relay_patched", False):
 
-        def create_adapter(self: Any, name: str, config: Any) -> Any:
-            adapter = original_registry_create(self, name, config)
+        # Forwarded blind past ``name``: this wrapper adds a side effect and
+        # delegates, so upstream owns the signature. Restating one is how the
+        # Slack relay's registry shim took every platform down when the base
+        # image grew a new keyword-only argument (see slack_relay_patch).
+        def create_adapter(self: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+            adapter = original_registry_create(self, name, *args, **kwargs)
             if name == "google_chat" and adapter is not None:
                 patch_adapter_class(type(adapter))
             return adapter

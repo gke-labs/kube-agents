@@ -25,6 +25,15 @@ and a second ledger issue opened and closed with eight-hour-stale data.
    dispatcher then got ``could not complete t_… (unknown id or already
    terminal)`` and its own summary was silently dropped on the floor.
 
+   Upstream fixed the no-``task_id`` half of this in v2026.8.13:
+   ``agent/delegation_context.py`` grew ``non_dispatcher_owned_context()``,
+   ``cron.scheduler.run_job`` enters it around the whole run, and
+   ``_default_task_id`` consults it. This module no longer patches that
+   function — see ``apply_cron_run_scope.py``. What upstream's marker records
+   is "not the dispatcher's own worker", which is enough to withhold the
+   fallback but not enough to say *which* job is running, so the two messages
+   below and the explicit-``task_id`` guard still come from here.
+
 Together they leave a dispatcher with a finished-but-invisible run and a dead
 card, which is what drove three of them to improvise: re-running the audit's
 publish step against shared scratch state, restoring a stale findings file from
@@ -140,24 +149,6 @@ def current_cron_job(environ: Optional[Mapping[str, str]] = None) -> str:
         return job_id
     env = os.environ if environ is None else environ
     return env.get(CRON_RUN_ENV) or ""
-
-
-def resolve_default_task_id(
-    arg: Optional[str], environ: Optional[Mapping[str, str]] = None
-) -> Optional[str]:
-    """Resolve a ``task_id`` argument, with the dispatcher's card as fallback.
-
-    An explicit argument always wins. Inside a cron run there is no fallback:
-    the ambient ``HERMES_KANBAN_TASK`` belongs to whoever dispatched the job,
-    not to the job, so silently defaulting to it is how a cron run came to
-    close its caller's card.
-    """
-    if arg:
-        return arg
-    if current_cron_job(environ):
-        return None
-    env = os.environ if environ is None else environ
-    return env.get(WORKER_TASK_ENV) or None
 
 
 def cron_ownership_violation(

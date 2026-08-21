@@ -131,9 +131,12 @@ agent:
 # and the saved output holds only the run's final response, so neither records
 # it unless the model says so).
 #
-# That matters most for github-issue-resolver, which fires every 30 minutes over
-# issue text written by anyone with a GitHub account. Two things the scan buys,
-# both measured against the shipped image on 2026-08-08:
+# The worked example is github-issue-resolver, which ran every 30 minutes over
+# issue text written by anyone with a GitHub account until github-repo-watcher
+# replaced it with a token-free poller — that triage turn is now a kanban worker
+# rather than a cron run, so read the scan's coverage from
+# deploy/docker/patches/cron_tirith_scan.py, not from this example. Two things
+# the scan buys, both measured against the shipped image on 2026-08-08:
 #
 #   * Homograph and confusable-Unicode content, which DANGEROUS_PATTERNS does
 #     not look for at all. A Cyrillic-e `kubernetеs.io` is refused by the scan

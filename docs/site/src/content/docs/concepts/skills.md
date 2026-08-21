@@ -46,15 +46,17 @@ Anything after the frontmatter is procedural instruction: workflows, SOPs, examp
 Two ways a skill enters the model's context:
 
 1. **On-demand.** The agent notices from the user's prompt (or a cron job's prompt) that a particular skill's `description` matches. It loads the skill body and follows the procedure.
-2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. The `github-issue-resolver` job, for example, always loads its namesake skill:
+2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. Each fleet audit, for example, always loads `fleet-audit`:
 
    ```json
    {
-     "id": "github-issue-resolver",
-     "prompt": "Run the github-issue-resolver skill to poll, triage, ...",
-     "skills": ["github-issue-resolver"]
+     "id": "compliance-audit",
+     "prompt": "Run the daily fleet security and RBAC posture audit. ...",
+     "skills": ["fleet-audit"]
    }
    ```
+
+   This route is only open to jobs that run a model. A `no_agent` job such as `github-repo-watcher` runs a script instead of a turn, so `skills` has nothing to load into; when its script files a kanban card, the card body names the skill and the worker loads it on demand.
 
 ## Skill structure conventions
 
@@ -73,7 +75,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.
-5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure. (The DM lands at the Chat Agent front door; the skill itself loads in the delegated Platform Agent worker.)
+5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure. (The DM lands at the Planning Agent front door; the skill itself loads in the delegated Platform Agent worker.)
 6. If the skill should also run on schedule, add an entry to `agents/platform/cron/jobs.json` — see [Adding a watchdog](/kube-agents/concepts/autonomous-watchdogs/#adding-a-watchdog).
 
 ## Importing external skills
@@ -81,7 +83,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 The agent discovers skills from **two** locations at startup:
 
 - **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing writes runtime state under them — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`, and a Cluster Agent's identity-stamped `config.yaml`) is untouched.
-- **The profile's runtime workspace** at `$HERMES_HOME/profiles/<profile>/skills` — `HERMES_HOME` defaults to `/opt/data`, so the Platform Agent's is `/opt/data/profiles/platform/skills`. This path is backed by the agent's persistent volume. Note it is _not_ `/opt/data/skills`: that is the `default` profile's home, which belongs to the Chat Agent, and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml) disables the `skills` toolset there — a skill dropped in that directory is loaded by nothing.
+- **The profile's runtime workspace** at `$HERMES_HOME/profiles/<profile>/skills` — `HERMES_HOME` defaults to `/opt/data`, so the Platform Agent's is `/opt/data/profiles/platform/skills`. This path is backed by the agent's persistent volume. Note it is _not_ `/opt/data/skills`: that is the `default` profile's home, which belongs to the Planning Agent, and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml) disables the `skills` toolset there — a skill dropped in that directory is loaded by nothing.
 
 That gives you two ways to bring in additional skills — for example from the upstream [`google/skills`](https://github.com/google/skills/tree/main/skills/cloud) catalog.
 

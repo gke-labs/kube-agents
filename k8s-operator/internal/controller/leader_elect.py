@@ -9,6 +9,23 @@ pod_name = os.environ.get("HOSTNAME")
 process = None
 is_shutting_down = False
 
+# The gateway command this wrapper supervises.
+#
+# At one replica the operator puts the whole command line in the container's args and
+# this file never runs; above one it runs instead of that command line, so anything the
+# args would have carried has to arrive as an environment variable. The operator always
+# sets HERMES_GATEWAY_PROFILE — empty unless spec.harness.experimental.platformFrontDoor
+# names a profile, so that an AgentPlugin's spec.env cannot become its only writer — and
+# empty means the default profile, which is the `hermes gateway run` this file has always
+# supervised.
+#
+# `--profile` is a GLOBAL flag and its position is load-bearing: hermes_cli/main.py
+# pre-parses it out of argv before any import and re-points HERMES_HOME at that profile's
+# home. `hermes gateway run --profile platform` is not the same command — the subcommand
+# has no such flag — so it must sit ahead of `gateway`.
+_gateway_profile = (os.environ.get("HERMES_GATEWAY_PROFILE") or "").strip()
+HERMES_COMMAND = ["hermes"] + (["--profile", _gateway_profile] if _gateway_profile else []) + ["gateway", "run"]
+
 # Tradeoff documented explicitly per review:
 # This active/passive failover blackholes traffic during leader transition.
 # The Service selector requires 'kubeagents.io/is-leader=true', which is only carried by the active leader.
@@ -58,7 +75,7 @@ def main():
     global process, is_shutting_down
     
     if not lease_name or not namespace:
-        os.execvp("hermes", ["hermes", "gateway", "run"])
+        os.execvp("hermes", HERMES_COMMAND)
         
     signal.signal(signal.SIGTERM, release_lease_and_exit)
     signal.signal(signal.SIGINT, release_lease_and_exit)
@@ -135,7 +152,7 @@ def main():
             if process is None:
                 print(f"[{pod_name}] Acquired leadership! Starting Hermes...", flush=True)
                 update_pod_label(v1, True)
-                process = subprocess.Popen(["hermes", "gateway", "run"])
+                process = subprocess.Popen(HERMES_COMMAND)
             elif process.poll() is not None:
                 print(f"[{pod_name}] Hermes process crashed with code {process.returncode}. Exiting to trigger pod restart...", flush=True)
                 sys.exit(process.returncode)

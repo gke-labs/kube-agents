@@ -122,7 +122,16 @@ class CreateProfileTest(unittest.TestCase):
         # `hermes profile create` — the real one registers the profile and makes its home.
         self._patch(cap, "ensure_profile", self._fake_ensure_profile)
         # `gcloud container clusters get-credentials`.
+        self.runs = []
         self._patch(subprocess, "run", self._fake_run)
+        # Whether that command needs --dns-endpoint. Patched explicitly rather
+        # than left to fall out of the fake above: gke_endpoint reads gcloud's
+        # help text to decide the flag exists at all, the fake answers every
+        # command with empty stdout, and the resulting "no flag" would be an
+        # accident of the mock rather than a decision the test made. The
+        # predicate itself is covered in test_gke_endpoint.py.
+        self.dns_args = []
+        self._patch(cap, "dns_endpoint_args", lambda *a, **k: self.dns_args)
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
@@ -136,7 +145,14 @@ class CreateProfileTest(unittest.TestCase):
         return home
 
     def _fake_run(self, cmd, **kwargs):
+        self.runs.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def get_credentials_argv(self):
+        for cmd in self.runs:
+            if cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                return cmd
+        raise AssertionError(f"no get-credentials call in {self.runs}")
 
     def mount(self, plugin):
         d = self.mounts / self.name / plugin
@@ -152,6 +168,27 @@ class CreateProfileTest(unittest.TestCase):
 
     def config(self):
         return yaml.safe_load((self.profile / "config.yaml").read_text()) or {}
+
+    def test_fetches_credentials_over_the_ip_endpoint_by_default(self):
+        self.create()
+        self.assertEqual(
+            self.get_credentials_argv(),
+            [
+                "gcloud", "container", "clusters", "get-credentials", self.CLUSTER,
+                f"--location={self.LOCATION}",
+                f"--project={self.PROJECT}",
+            ],
+        )
+
+    def test_fetches_credentials_over_the_dns_endpoint_when_detected(self):
+        # An onboarded cluster whose control plane is only reachable by DNS. The
+        # profile's pinned kubeconfig is what the Cluster Agent runs against for
+        # its whole life, so the flag has to be present when it is scaffolded.
+        self.dns_args = ["--dns-endpoint"]
+
+        self.create()
+
+        self.assertEqual(self.get_credentials_argv()[-1], "--dns-endpoint")
 
     def test_applies_the_cluster_class_overlay_at_scaffold_time(self):
         (self.overlay_dir / "profileclass-cluster.overlay.yaml").write_text(

@@ -61,6 +61,8 @@ It deliberately does **not** evaluate the model. Prompt-injection resistance, ja
 
 `inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.raw.md` once and then returns `[SILENT]` forever after. Its companion `inventory_prioritize_sop.md` runs as a separate card on the same one-shot path, ranking those findings into the short `/opt/data/INVENTORY.md` that reaches the user.
 
+`eod_event_watcher_daily_report_sop.md` is not a fleet audit either, and it is the one SOP here that no agent ever reads. It documents `eod_report_generator.py`, a `no_agent` script that renders the k8s-event-watcher recap deterministically from the session ledger; the file exists so the behaviour has an owner next to the SOPs it sits beside, not to instruct a model.
+
 ## How SOPs work
 
 Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The seven audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.
@@ -74,7 +76,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 
 The division of labour in the seven audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the seven ledgers uniform and their run-to-run deltas computable.
 
-The seven audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the eighth job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
+The seven audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 
 ## Where to go next
 

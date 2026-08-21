@@ -16,6 +16,7 @@ resources:
   - networkpolicy.yaml
   - api.yaml
   - podmonitoring.yaml
+  - pdb.yaml
 
 # See config/default/kustomization.yaml for why includeSelectors stays false.
 #

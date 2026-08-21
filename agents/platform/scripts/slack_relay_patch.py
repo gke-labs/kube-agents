@@ -691,8 +691,12 @@ def install() -> None:
     original_registry_create = PlatformRegistry.create_adapter
     if not getattr(PlatformRegistry, "_slack_credential_proxy_relay_patched", False):
 
-        def create_adapter(self: Any, name: str, config: Any) -> Any:
-            adapter = original_registry_create(self, name, config)
+        # ``*args``/``**kwargs`` rather than upstream's signature restated: this
+        # wrapper adds a side effect and delegates, so the signature is not its
+        # to own. Restating one is what took chat down when v2026.8.13 gave
+        # ``register`` a keyword-only ``scope`` -- see the note there.
+        def create_adapter(self: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+            adapter = original_registry_create(self, name, *args, **kwargs)
             if name == "slack" and adapter is not None:
                 patch_adapter_class(type(adapter))
             return adapter
@@ -709,7 +713,7 @@ def install() -> None:
         PlatformRegistry, "_slack_standalone_relay_patched", False
     ):
 
-        def register(self: Any, entry: Any) -> Any:
+        def register(self: Any, entry: Any, *args: Any, **kwargs: Any) -> Any:
             if getattr(entry, "name", None) == "slack":
                 try:
                     patch_slack_entry(entry)
@@ -719,7 +723,33 @@ def install() -> None:
                     # import into a debug line. Raising here would disable the
                     # relay for the life of the process, and say nothing.
                     LOGGER.warning("Slack relay entry patch failed", exc_info=True)
-            return original_registry_register(self, entry)
+            # Forward everything after ``entry`` blind rather than restating
+            # today's signature. This wrapper sits on the class, so every
+            # platform registers through it and one TypeError here takes Slack,
+            # Google Chat and A2A down together -- the gateway comes up with the
+            # built-in adapters missing and the pod answers no chat at all.
+            # v2026.8.13 added a keyword-only ``scope`` and did exactly that
+            # (#718 bumped the base image without touching this line); spelling
+            # the arguments out again would re-arm the same failure on the next
+            # bump.
+            #
+            # One residual difference from calling the original directly, and it
+            # predates this wrapper's argument handling: when ``scope`` is
+            # omitted the registry infers it from the caller's frame at a fixed
+            # depth (``_caller_plugin_scope`` reads ``sys._getframe(2)``), and
+            # this frame occupies the slot it reads. Three things keep that
+            # harmless. The inference is gated on ``entry.source == "plugin"``,
+            # so the built-in relay path never reaches it. ``register_platform``
+            # -- the path every bundled platform takes -- passes ``scope``
+            # explicitly. And where it does run, the shifted frame resolves to
+            # this module, which is not a plugin namespace, so upstream falls
+            # through to ``_plugin_scope_from_callable`` on the entry's own
+            # ``adapter_factory`` and then its ``check_fn``; both are
+            # frame-independent and recover the same scope
+            # (``platform_registry.py:515-520`` in v2026.8.13). Only an entry
+            # whose callables the tool registry cannot place lands in the global
+            # scope instead of a plugin one.
+            return original_registry_register(self, entry, *args, **kwargs)
 
         PlatformRegistry.register = register
         PlatformRegistry._slack_standalone_relay_patched = True
@@ -733,24 +763,53 @@ def install() -> None:
             registry_module = sys.modules.get("gateway.platform_registry")
             singleton = getattr(registry_module, "platform_registry", None)
             entries = getattr(singleton, "_entries", None)
-            if isinstance(entries, dict):
-                if "slack" in entries:
-                    patch_slack_entry(entries["slack"])
-            elif singleton is not None:
-                # The registry is up but its entries are not where this reads
-                # them. Normally that means nothing -- the register() wrapper
-                # above is the path that actually fires, and this fallback is
-                # for the ordering where the plugin got in first. But `_entries`
-                # is a private name: if upstream renames it, the two cases stop
-                # being distinguishable from here, and the one that matters
-                # fails by silently not relaying. Warn rather than debug, so a
-                # base-image bump that moves it leaves a trace.
+            # Both maps. Since v2026.8.13 a scoped registration lands in
+            # `_scoped_entries[scope]` rather than `_entries`, and
+            # `PluginContext.register_platform` always passes a scope (the
+            # profile's Hermes home), so the scoped map is where a plugin's
+            # Slack entry would be.
+            #
+            # Defensive, not a live fix: `sitecustomize`'s import hook calls
+            # install() the moment `gateway.platform_registry` finishes
+            # executing, so in the deployed process both maps are still empty
+            # here and the register() wrapper above is what does the work.
+            # Nothing else in the repo calls install(). This keeps the sweep
+            # honest for the ordering it claims to cover, so that it is not
+            # quietly wrong if install() ever acquires a second caller.
+            scoped = getattr(singleton, "_scoped_entries", None)
+            readable = [entries] if isinstance(entries, dict) else []
+            if isinstance(scoped, dict):
+                readable.extend(
+                    scope_entries
+                    for scope_entries in scoped.values()
+                    if isinstance(scope_entries, dict)
+                )
+            for scope_entries in readable:
+                slack_entry = scope_entries.get("slack")
+                if slack_entry is not None:
+                    # Idempotent, so an entry visible in both maps is safe.
+                    patch_slack_entry(slack_entry)
+            if singleton is not None and not (
+                isinstance(entries, dict) and isinstance(scoped, dict)
+            ):
+                # The registry is up but at least one of the two maps is not
+                # where this reads it. Both are private names, and a bump that
+                # renames either one leaves the sweep partially blind. Warn on
+                # *either* going missing rather than only on both: with
+                # `_scoped_entries` gone this still reads `_entries` and finds
+                # it empty, which is the quiet, wrong answer -- `_entries` is
+                # the map a scoped registration never lands in. Whatever is
+                # still readable is swept first, because half a sweep beats
+                # none. A base image that consolidates the two maps trips this
+                # too; that is the intended cost, since from here consolidation
+                # and a rename look the same and only one of them is safe.
                 LOGGER.warning(
                     "Slack relay: platform registry is loaded but its entries "
-                    "are not introspectable (_entries is %s); a Slack entry "
-                    "registered before this patch installed will not be "
-                    "patched",
+                    "are not introspectable (_entries is %s, _scoped_entries "
+                    "is %s); a Slack entry registered before this patch "
+                    "installed may not be patched",
                     type(entries).__name__,
+                    type(scoped).__name__,
                 )
         except Exception:
             LOGGER.debug("No pre-registered Slack entry to patch", exc_info=True)

@@ -18,7 +18,6 @@ from cron_run_scope import (
     cron_run_scope,
     current_cron_job,
     missing_task_id_error,
-    resolve_default_task_id,
 )
 
 # The card the kanban dispatcher scoped the worker to, and the job the worker
@@ -171,30 +170,6 @@ class CronRunScopeTest(unittest.TestCase):
         self.assertEqual(current_cron_job({}), "")
 
 
-class ResolveDefaultTaskIdTest(unittest.TestCase):
-    """The ambient card must not be inherited by a cron run."""
-
-    def test_an_explicit_argument_always_wins(self):
-        self.assertEqual(
-            resolve_default_task_id("t_other", DISPATCH_ENV), "t_other"
-        )
-        self.assertEqual(
-            resolve_default_task_id("t_other", WORKER_ENV), "t_other"
-        )
-
-    def test_a_worker_still_falls_back_to_its_own_card(self):
-        self.assertEqual(resolve_default_task_id(None, WORKER_ENV), CALLER_CARD)
-
-    def test_a_cron_run_gets_no_fallback(self):
-        # This is the defect: kanban_complete with no task_id resolved to the
-        # caller's card and closed it out from under a blocked dispatcher.
-        self.assertIsNone(resolve_default_task_id(None, DISPATCH_ENV))
-
-    def test_no_env_at_all_resolves_to_nothing(self):
-        self.assertIsNone(resolve_default_task_id(None, {}))
-        self.assertIsNone(resolve_default_task_id("", {}))
-
-
 class CronOwnershipViolationTest(unittest.TestCase):
     """A cron run naming its caller's card explicitly is rejected too."""
 
@@ -216,7 +191,7 @@ class CronOwnershipViolationTest(unittest.TestCase):
         )
 
     def test_a_missing_task_id_is_not_a_violation(self):
-        # resolve_default_task_id already returned None; the handler's own
+        # _default_task_id already returned None; the handler's own
         # "task_id is required" guard owns that path.
         self.assertIsNone(cron_ownership_violation(None, DISPATCH_ENV))
 

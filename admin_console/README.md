@@ -156,7 +156,7 @@ Selecting a row updates the URL-selected session and renders its transcript and
 composer below the table.
 
 Portal-owned sessions use the connected deployment's default Hermes profile,
-the same front-door Chat Agent used by Google Chat and Slack. The Chat page uses
+the same front-door Planning Agent used by Google Chat and Slack. The Chat page uses
 the versioned `/api/v1` contract for agent discovery, session reads, messages,
 linked tasks, new interactions, and approvals; it does not call the Hermes
 adapter directly. The selected session is stored in the URL and its transcript

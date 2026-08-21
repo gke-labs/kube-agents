@@ -247,8 +247,29 @@ check(
 # of truth to compare against.
 print("whitelist drift:")
 check(
-    "the notifier calls the helper with the adapter",
-    '_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)' in NOTIFIER_SOURCE,
+    "the notifier calls the helper with both no-send tests",
+    'd["events"], adapter=adapter, passive_delivered=send_passive' in NOTIFIER_SOURCE,
+    "adapter= alone is not enough: delivery_mode='wake' skips the text ping on "
+    "a push adapter, and narrowing the wake there drops the completion",
+)
+# Upstream's own gate, kept verbatim by the patch. It answers a different
+# question than the narrowing does — "did this subscriber ask to be woken at
+# all" versus "is this kind worth a model turn" — and losing it would wake
+# notify-only subscribers on every terminal event without changing anything the
+# check above can see.
+check(
+    "and upstream's per-subscription wake gate still wraps it",
+    "if wake_agent" in NOTIFIER_SOURCE,
+    "delivery_mode=notify subscribers would be woken anyway",
+)
+# `send_passive` is upstream's own name for "this mode gets a text ping". The
+# anchor above is worthless if the notifier stopped computing it, which is
+# exactly what a future upstream refactor of delivery_mode would do.
+check(
+    "and send_passive is still what upstream derives from delivery_mode",
+    'send_passive = mode != "wake"' in NOTIFIER_SOURCE,
+    "the anchor above would bind a name that no longer means "
+    "'a ping was sent'",
 )
 check(
     "upstream's hardcoded tuple is gone",
@@ -344,6 +365,34 @@ check(
     wake_kinds_for(completed, cfg({"wake_on_events": []}), adapter=APIServerAdapter)
     == {"completed"},
 )
+# The second no-send path, and the one that looks like the first case above
+# rather than the two before it: a push adapter, so `_adapter_can_push` is True
+# and the adapter carve-out does not fire. Only `passive_delivered` separates
+# "the ping already said it" from "the wake is all there is".
+check(
+    "a wake-only subscription still wakes on completion",
+    wake_kinds_for(
+        completed, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter, passive_delivered=False
+    )
+    == {"completed"},
+    "delivery_mode='wake' skips the text ping, so narrowing the wake away "
+    "delivers the card to nobody and then advances the cursor past it",
+)
+check(
+    "and an explicit empty list cannot silence that path either",
+    wake_kinds_for(
+        completed,
+        cfg({"wake_on_events": []}),
+        adapter=BasePlatformAdapter,
+        passive_delivered=False,
+    )
+    == {"completed"},
+)
+check(
+    "the default is the delivered case, so a caller that predates the mode "
+    "keeps narrowing",
+    wake_kinds_for(completed, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter) == set(),
+)
 
 # --- 8. Failure posture -------------------------------------------------------
 print("fail-soft posture:")
@@ -408,7 +457,9 @@ check(
     "the marker is called with everything it names the card by",
     'self, d["events"], _wake_kinds, task, sub, board_slug,' in NOTIFIER_SOURCE,
 )
-_wake_at = NOTIFIER_SOURCE.find('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)')
+_wake_at = NOTIFIER_SOURCE.find(
+    'd["events"], adapter=adapter, passive_delivered=send_passive'
+)
 _note_at = NOTIFIER_SOURCE.find("_kanban_note_suppressed(")
 # `if task_terminal:` guards this delivery's unsub. It is the tail of the same
 # block the marker sits in, and unlike `self._kanban_unsub` — which upstream

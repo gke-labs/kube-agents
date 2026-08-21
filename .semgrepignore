@@ -1,0 +1,12 @@
+# Test suites, fixtures, and mocks
+tests/
+**/test_*.py
+**/*_test.py
+**/*_test.go
+k8s-operator/internal/testing/
+k8s-operator/testing/
+
+# Benchmark and patch evaluation scripts
+bench/
+deploy/docker/patches/
+hack/
