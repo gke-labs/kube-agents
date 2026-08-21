@@ -11,7 +11,6 @@ from typing import Any, Iterable
 class AcceptanceStatus(str, Enum):
     PASSED = "passed"
     FAILED = "failed"
-    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)
@@ -40,7 +39,7 @@ class AcceptanceResult:
             "requirement": self.criterion.requirement,
             "expected": self.criterion.proof,
             "observed": self.observed,
-            "blockedBy": list(self.blocked_by),
+            "missingProof": list(self.blocked_by),
         }
 
 
@@ -70,10 +69,8 @@ class AcceptanceCriteria:
         except KeyError as exc:
             raise ValueError(f"unknown acceptance criterion {criterion_id}") from exc
         status = (
-            AcceptanceStatus.BLOCKED
-            if blocked_by
-            else AcceptanceStatus.PASSED
-            if met
+            AcceptanceStatus.PASSED
+            if met and not blocked_by
             else AcceptanceStatus.FAILED
         )
         self._results[criterion_id] = AcceptanceResult(
@@ -108,11 +105,7 @@ class AcceptanceCriteria:
     def report_lines(self) -> list[str]:
         lines: list[str] = []
         for result in self.results:
-            label = {
-                AcceptanceStatus.PASSED: "PASS ",
-                AcceptanceStatus.FAILED: "FAIL ",
-                AcceptanceStatus.BLOCKED: "BLOCK",
-            }[result.status]
+            label = "PASS " if result.passed else "FAIL "
             lines.extend(
                 [
                     f"{label}  {result.criterion.id} — {result.status.value.upper()}",
@@ -122,7 +115,7 @@ class AcceptanceCriteria:
                 ]
             )
             if result.blocked_by:
-                lines.append(f"      Blocked by: {', '.join(result.blocked_by)}")
+                lines.append(f"      Missing proof: {', '.join(result.blocked_by)}")
         return lines
 
     def failure_summary(self) -> str:
@@ -131,7 +124,7 @@ class AcceptanceCriteria:
             if item.passed:
                 continue
             reason = (
-                f"; blocked by {', '.join(item.blocked_by)}"
+                f"; missing proof: {', '.join(item.blocked_by)}"
                 if item.blocked_by
                 else ""
             )
