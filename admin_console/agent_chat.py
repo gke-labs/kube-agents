@@ -19,9 +19,14 @@ from admin_console.project_config import (
     is_valid_namespace,
     is_valid_project_id,
 )
+from admin_console.runtime_contract import (
+    CanonicalPlatformAgentMissing,
+    canonical_platform_agent_name,
+    gateway_endpoints,
+    select_canonical_platform_agent,
+)
 from admin_console.telemetry import redact_evidence
 
-_K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _RUN_ID = re.compile(r"^run_[a-f0-9]{32}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -261,9 +266,27 @@ class AgentChatProvider:
     def _base(self) -> list[str]:
         return ["--context", self.context, "-n", self.target.namespace]
 
-    def _gateway_pod(self, agent: str) -> str:
-        if not _K8S_NAME.fullmatch(agent):
-            raise ValueError("invalid PlatformAgent name")
+    def _gateway_endpoint(self, agent: str) -> tuple[str, str]:
+        expected = canonical_platform_agent_name()
+        if agent != expected:
+            raise ValueError(
+                f"agentId must be the canonical PlatformAgent "
+                f"{expected}"
+            )
+        resources = self.runner.run(
+            [*self._base(), "get", "platformagents", "-o", "json"],
+            input_text="",
+            timeout=20,
+        )
+        resource_payload = self._json(resources, "PlatformAgent discovery")
+        try:
+            select_canonical_platform_agent(resource_payload)
+        except CanonicalPlatformAgentMissing as exc:
+            raise AgentChatError(
+                str(exc),
+                f"Install the stock PlatformAgent/{expected} resource or select the "
+                "cluster containing it.",
+            ) from exc
         result = self.runner.run(
             [
                 *self._base(),
@@ -279,17 +302,14 @@ class AgentChatProvider:
             timeout=20,
         )
         payload = self._json(result, "Gateway discovery")
-        pods = sorted(
-            str((item.get("metadata") or {}).get("name") or "")
-            for item in payload.get("items", [])
-            if (item.get("metadata") or {}).get("name")
-        )
-        if not pods:
+        endpoints = gateway_endpoints(payload)
+        if not endpoints:
             raise AgentChatError(
-                "No running gateway pod was found.",
+                "No running gateway API container was found.",
                 f"Check PlatformAgent {agent} in namespace {self.target.namespace}.",
             )
-        return pods[0]
+        endpoint = endpoints[0]
+        return endpoint.pod, endpoint.container
 
     @staticmethod
     def _json(result: ChatCommandResult, component: str) -> dict:
@@ -332,7 +352,7 @@ class AgentChatProvider:
         timeout: int = 620,
         update_callback: Callable[[dict], None] | None = None,
     ) -> dict:
-        pod = self._gateway_pod(agent)
+        pod, container = self._gateway_endpoint(agent)
         parsed_lines: list[dict] = []
 
         def parse_line(line: str) -> None:
@@ -353,7 +373,7 @@ class AgentChatProvider:
                 "-i",
                 pod,
                 "-c",
-                "platform-agent",
+                container,
                 "--",
                 "/opt/hermes/.venv/bin/python3",
                 "-c",

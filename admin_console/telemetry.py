@@ -153,6 +153,30 @@ def redact_evidence(value: object) -> str:
     return rendered
 
 
+def redact_kubernetes_evidence(value: object) -> str:
+    """Redact Kubernetes EnvVar values whose names identify credentials."""
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return redact_evidence(value)
+    else:
+        parsed = value
+
+    def scrub(item: object) -> object:
+        if isinstance(item, dict):
+            cleaned = {str(key): scrub(child) for key, child in item.items()}
+            name = str(item.get("name") or "")
+            if "value" in cleaned and _SECRET_KEY.search(name):
+                cleaned["value"] = "[REDACTED]"
+            return cleaned
+        if isinstance(item, list):
+            return [scrub(child) for child in item]
+        return item
+
+    return redact_evidence(scrub(parsed))
+
+
 def _first(mapping: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = mapping.get(key)

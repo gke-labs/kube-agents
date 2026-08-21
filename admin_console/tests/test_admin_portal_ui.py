@@ -99,7 +99,10 @@ class FakeHistoryProvider:
         self.target = target
 
     def list_agents(self) -> tuple[str, ...]:
-        return ("test-agent-01",)
+        return ("platform-agent",)
+
+    def canonical_agent(self) -> str:
+        return "platform-agent"
 
     def list_conversations(self, agent: str, *, cutoff, limit: int = 200) -> HistoryResult:
         conversation = AgentConversation(
@@ -1329,13 +1332,10 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertEqual(
             [item.label for item in app.selectbox],
             [
-                "Agent",
                 "History",
                 "Source",
             ],
         )
-        agent_selector = next(item for item in app.selectbox if item.label == "Agent")
-        self.assertIn("PlatformAgent custom resource", agent_selector.help)
         self.assertEqual(len(app.dataframe), 1)
         self.assertEqual(
             list(app.dataframe[0].value.columns),
@@ -1352,7 +1352,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app.dataframe[0].value.iloc[0]["Session"],
             "Cluster investigation",
         )
-        self.assertEqual(app.query_params["chat_agent"], ["test-agent-01"])
+        self.assertNotIn("chat_agent", app.query_params)
         self.assertEqual(app.query_params["chat_window"], ["all"])
         self.assertEqual(app.query_params["chat_session"], ["default:session-1"])
         self.assertNotIn("user@example.com", str(app.query_params))
@@ -1486,7 +1486,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             if item.proto.label == "t_12345678"
         )
         self.assertEqual(task_link.proto.page, "kanban")
-        self.assertIn("kanban_agent=test-agent-01", task_link.proto.query_string)
+        self.assertNotIn("kanban_agent", task_link.proto.query_string)
         self.assertIn("kanban_task=t_12345678", task_link.proto.query_string)
 
     def test_chat_sends_a_real_run_and_renders_response(self):
@@ -1610,7 +1610,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.title[0].value, "Scheduled Cron")
-        self.assertEqual(app.query_params["cron_agent"], ["test-agent-01"])
+        self.assertNotIn("cron_agent", app.query_params)
         self.assertEqual(app.query_params["cron_window"], ["7d"])
         self.assertEqual(len(app.dataframe), 1)
         self.assertIn("Scheduler", app.dataframe[0].value.columns)
