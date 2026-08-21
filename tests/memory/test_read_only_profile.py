@@ -155,6 +155,20 @@ def test_the_prompt_says_read_only_and_says_not_to_cache():
     assert "memory_retain" not in block, block
 
 
+def test_the_prompt_names_the_nomination_channel():
+    """A read-only specialist is still the agent that discovers durable facts.
+    The prompt has to say where one goes, or "you cannot write" reads as "throw
+    it away" — and the corpus stays empty of anything a card ever learned."""
+    p, _ = provider(read_only=True)
+    block = p.system_prompt_block()
+    assert "memory_candidates" in block, block
+    # A nomination, not a write. The person on the other end of the card decides.
+    assert "does not record" in block, block
+    # The two exclusions travel with it, or the channel becomes a pipe for stale
+    # cluster state — see SHARED_SCOPE_TEST for the same pair.
+    assert "live state" in block, block
+
+
 def test_read_only_defaults_off_and_is_read_from_the_profile_config():
     """A profile that says nothing keeps its write tools; a broken config too."""
     read = kube_agents_memory.memory_is_read_only
