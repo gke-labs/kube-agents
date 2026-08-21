@@ -28,6 +28,26 @@ locals {
   fleet_labels = {
     "managed-by" = "kube-agents-seeded-fleet"
   }
+
+  # Cluster resource labels carry the cohort confinement on top: the drift
+  # SOP resolves a cluster's environment from `.resourceLabels.environment`
+  # FIRST, before any name-keyword inference, and cohorts are keyed on
+  # (mode, environment) with unknown-environment clusters kept in their own
+  # cohort, never merged. Labeling all three `environment = seeded` --
+  # a literal the SOP's synonym table passes through unchanged -- makes the
+  # drift cohort exactly {seeded-a, seeded-b, seeded-c} no matter what else
+  # exists in the project: platform-agent-host and the transient eval-pr*
+  # clusters carry no environment label, land in the unknown cohort, and
+  # never vote on this fleet's baseline. Without this, a 2/2 authorized-
+  # networks split against an unlabeled neighbour has no majority and the
+  # consistency scenario has no finding. Label-resolved also means no
+  # "inferred environment" severity step, which the r = 2/3 math cannot
+  # spare. The value "seeded" is reserved for this fleet: labeling any
+  # other cluster in the project with it would add a fourth voter and
+  # change the arithmetic.
+  cluster_labels = merge(local.fleet_labels, {
+    "environment" = "seeded"
+  })
 }
 
 provider "google" {
@@ -116,7 +136,7 @@ resource "google_container_cluster" "seeded_a" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  resource_labels          = local.fleet_labels
+  resource_labels          = local.cluster_labels
 
   # The fleet is standing, but deletion protection stays off: the scheduled
   # re-apply must be able to replace a cluster when a facet change requires
@@ -233,7 +253,7 @@ resource "google_container_cluster" "seeded_b" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  resource_labels          = local.fleet_labels
+  resource_labels          = local.cluster_labels
   deletion_protection      = false
 
   min_master_version = local.lagging_version
@@ -297,7 +317,7 @@ resource "google_container_cluster" "seeded_c" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  resource_labels          = local.fleet_labels
+  resource_labels          = local.cluster_labels
   deletion_protection      = false
 
   logging_config {
