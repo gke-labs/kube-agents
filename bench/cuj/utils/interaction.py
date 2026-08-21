@@ -6,7 +6,7 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Collection
+from typing import TYPE_CHECKING, Any
 
 from cuj.utils.evidence import EvidenceLog
 from cuj.utils.portal import Portal, PortalError
@@ -129,13 +129,11 @@ def tool_operations(
     ]
 
 
-def opaque_tool_calls(
-    interaction: dict[str, Any], opaque_tools: Collection[str]
-) -> list[str]:
-    normalized = {tool.casefold() for tool in opaque_tools}
+def unnormalized_tool_calls(interaction: dict[str, Any]) -> list[str]:
+    """Tool calls whose mutation impact cannot be judged from the projection."""
+
     return [
-        str(call.get("name") or "")
+        str(call.get("name") or "<unnamed>")
         for call in projected_tool_calls(interaction)
         if not str(call.get("operation") or "").strip()
-        and str(call.get("name") or "").casefold() in normalized
     ]

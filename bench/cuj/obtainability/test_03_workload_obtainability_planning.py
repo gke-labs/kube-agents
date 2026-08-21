@@ -8,10 +8,10 @@ from typing import Any
 
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
-    opaque_tool_calls,
     projected_records,
     projected_tasks,
     tool_operations,
+    unnormalized_tool_calls,
 )
 from cuj.utils.milestones import Milestone, MilestoneSuite
 from cuj.utils.scenario import Scenario
@@ -34,7 +34,6 @@ FORBIDDEN_OPERATIONS = {
     "submit_provisioning_request",
     "submit_suggestion",
 }
-OPAQUE_TOOLS = {"bash", "exec", "gcloud", "git", "kubectl", "python", "shell"}
 
 PROMPT = """Act as my batch scheduling partner. Plan a 64-node TPU v5e \
 training job that must run for 12 hours and finish within the next 48 hours. \
@@ -491,7 +490,7 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     worker_tools_available = bool(platform_tasks) and all(
         "toolCalls" in task for task in platform_tasks
     )
-    opaque = opaque_tool_calls(interaction, OPAQUE_TOOLS)
+    unnormalized_calls = unnormalized_tool_calls(interaction)
     routed = [
         task
         for task in platform_tasks
@@ -533,16 +532,22 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
         ),
         platform_tasks,
     )
+    mutations = sorted(FORBIDDEN_OPERATIONS.intersection(operations))
     suite.record(
         "m5-planning-remains-read-only",
         interaction.get("toolEvidenceComplete") is True
-        and not FORBIDDEN_OPERATIONS.intersection(operations),
+        and not mutations
+        and not unnormalized_calls,
         {
             "toolEvidenceComplete": interaction.get("toolEvidenceComplete"),
             "operations": operations,
-            "opaqueTools": opaque,
+            "mutations": mutations,
+            "unnormalizedTools": unnormalized_calls,
         },
-        blocked_by=tuple(
+        # An observed mutation outranks any missing-evidence reason.
+        blocked_by=()
+        if mutations
+        else tuple(
             reason
             for condition, reason in (
                 (
@@ -553,7 +558,10 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
                     not worker_tools_available,
                     "portal task projection omits worker toolCalls",
                 ),
-                (bool(opaque), "tool evidence omits normalized operations"),
+                (
+                    bool(unnormalized_calls),
+                    "tool evidence omits normalized operations",
+                ),
             )
             if condition
         ),
