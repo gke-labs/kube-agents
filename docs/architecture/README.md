@@ -71,7 +71,7 @@ below and nothing in it is built.
 | 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
 | 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
 |     | _Buildable (bridging) above · north star below_                |                                                                                                                                                                                                                                                  |
-| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why it needs no cryptographic key. **Not built** -- no such topology yet                        |
+| 09  | [The capability envelope](09-capability-envelope.md)           | How a request's authority travels between agents once they are separate workloads: the attenuating capability, what enforces it at each hop, and why it needs no cryptographic key. **Not built** — no such topology yet                         |
 
 Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section and a
 **Verification** section of concrete, mostly-runnable checks.

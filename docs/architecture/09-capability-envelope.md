@@ -1,6 +1,6 @@
-# 09 — The Capability Envelope
+# Design 09: The Capability Envelope
 
-**Status:** Design. Not built.
+**Status:** ✅ Agreed
 
 > **Specifies the end state, not current behaviour.** Nothing here is implemented. See
 > [README.md](README.md) for the delta against what ships today.
@@ -12,7 +12,7 @@
 > ruled this out; #727 restated it as the property it protects, and section 1 states where the
 > mechanism stands against the revised version.
 
-**Overview:** [README.md](README.md) · **Depends on:** [03](03-security-model.md),
+**Overview:** [README.md](README.md) · **Depends on:** [02](02-agent-personas.md), [03](03-security-model.md),
 [05](05-system-architecture.md), [08](08-agent-runtime-and-identity.md) · **Tier:** Foundational
 (north star)
 
@@ -45,7 +45,7 @@ trade; read them there.
 
 What changes here is the **mechanism**. 03 §4a sketches it as `SubjectAccessReview` for Kubernetes
 plus `testIamPermissions` / Policy Troubleshooter for GCP, with per-run downscoped tokens. The GCP
-half was measured on a live cluster on 12 August and does not work:
+half was measured on a live cluster on 12 August 2026 and does not work:
 
 - OAuth scopes do not constrain Kubernetes object operations -- a token minted `container.read-only`
   created a namespace.
@@ -95,15 +95,23 @@ four is necessary rather than sufficient. Against that:
 head-on rather than hoping nobody asks. What #3 forbids is agents coordinating by calling each
 other -- one agent blocking on another's model output, with the call as the only record. The
 verifier is neither an agent nor coordination. It is an authorization callout on the request path,
-the same shape as the NATS auth callout this design already accepts, and it produces a decision
-about an entry rather than work product from a peer. If that reading is wrong the design has a
-problem, so it is stated here to be argued with rather than left implicit.
+the same shape as the NATS auth callout 09 proposes alongside it, and it produces a decision about
+an entry rather than work product from a peer. If that reading is wrong the design has a problem,
+so it is stated here to be argued with rather than left implicit.
+
+**Three components here do not exist in the design set, and 09 introduces all three.** The bus, the
+per-agent broker in front of each agent, and the verification service are named throughout as
+though they were furniture, and they are not: [05](05-system-architecture.md)'s component inventory
+runs C1-C15 with no message bus and no verifier, and its "broker" (C6) is the GitHub token minter,
+which is a different thing wearing the same word. Read every "the broker" below as something this
+document proposes. Adding them to 05 with C-numbers, so 09 can cite them instead of describing
+them, is the first thing to do if this moves toward being built.
 
 **What is settled and what is not.** The mechanism is agreed as the design. The topology it
 presumes does not exist, so the open question is not whether to do this but when there is anything
 to do it to -- see the north-star note at the top.
 
-## The recommendation, first
+## 2. The recommendation, first
 
 **No token format. Nothing signed. No cryptographic key anywhere in the design.**
 
@@ -112,7 +120,7 @@ The capability lives in NATS KV. The message on the bus carries only a lookup id
 **"Key" below means a KV lookup key** -- a string like `cap.root.req-8f2a` -- and never a
 cryptographic key. There are none in this design.
 
-## How it works
+## 3. How it works
 
 **Gateway.** Mints the capability, writes it to KV under `cap.root.<request-id>`, and puts the id
 -- not the capability -- into the message. The entry names the one agent permitted to descend from
@@ -161,7 +169,7 @@ A hop delegating to several agents writes one child per recipient, each naming a
 A list would also work; one child per recipient keeps the audit trail exact about who was handed
 what.
 
-## Why this needs no crypto
+## 4. Why this needs no crypto
 
 NATS KV keys live on subjects, and subject write permissions are enforced **at connect**, before a
 message is parsed. So:
@@ -228,8 +236,8 @@ worry you.
 capability is per-request, and a check that compares it against a per-agent identity is comparing
 against the wrong thing. This is a requirement 09 places on the runtime rather than something the
 KV scheme can fix from inside: whatever issues the broker's credential must issue a distinct one
-per request, so that "the caller" and "the request" are the same subject. The scoped ServiceAccount
-pool in the F10 work is the obvious place for it to come from.
+per request, so that "the caller" and "the request" are the same subject. The per-request scoped
+ServiceAccount pool being built for the agent runtime is the obvious place for it to come from.
 
 **Until that exists the guarantee is weaker, and it is worth saying which weaker.** With a shared
 agent identity the bound is the widest capability concurrently delegated to that agent, not the
@@ -242,8 +250,8 @@ Moving the walk into one service removes the need to distribute read at all. It 
 remove discovery: every broker must be able to call the verifier, so without the caller check above
 an id is still resolvable by anyone who can name one, and discovery has moved from a KV read to an
 RPC rather than gone away. Withholding read and checking the caller are what close it between them.
-The verifier sits on the request path, which is the same shape -- and the same cost -- as the NATS auth callout this design
-already accepts.
+The verifier sits on the request path, which is the same shape -- and the same
+cost -- as the NATS auth callout 09 proposes alongside it.
 
 **Revocation is deleting an entry**, which is the other reason to prefer this. A signed token is
 valid until it expires no matter what you learn in the meantime.
@@ -251,7 +259,7 @@ valid until it expires no matter what you learn in the meantime.
 **The cost** is a lookup on the request path and a dependency on the bus. If the bus is down
 there are no messages to authorize, so that dependency is smaller than it first appears.
 
-## What this does not solve
+## 5. What this does not solve
 
 Three things, stated so nobody assumes otherwise.
 
@@ -293,7 +301,7 @@ in the same tier of scrutiny as the auth callout, with no model attached to it.
 
 ---
 
-## Background: this pattern has a name
+## 6. Background: this pattern has a name
 
 Everything above is an application of **macaroons**, and it is worth being able to say so.
 
@@ -323,7 +331,7 @@ verifiers verify and cannot mint. <https://www.biscuitsec.org/>
 The only scenario that would force this is a hop that must authorize without reaching the bus.
 Nothing in the current topology needs that.
 
-## The general rule this came from
+## 7. The general rule this came from
 
 The same reasoning decided three separate questions:
 
@@ -344,7 +352,7 @@ It is also why the RBAC-over-IAM measurement felt like a win rather than a setba
 looking for a way to _express_ per-cluster scope and found the scope was already structural one
 layer down.
 
-## Goals & non-goals
+## 8. Goals & non-goals
 
 ### Goals
 
@@ -369,7 +377,7 @@ layer down.
 - **Not per-user granularity.** Capabilities carry tiers, so this is as fine-grained as the tier map
   and no finer.
 
-## Verification
+## 9. Verification
 
 Every check below asserts a **denial**. A test that only confirms an authorised request succeeds
 cannot distinguish a working control from an absent one, and several of the failure modes here are
@@ -413,7 +421,7 @@ silent.
 - **The agent never sees the capability:** from inside an agent container, the capability id and the
   KV store are both unreachable -- no bus credential, no verifier route.
 
-## References
+## 10. References
 
 - Birgisson et al., _Macaroons_, NDSS 2014.
 - Biscuit: <https://www.biscuitsec.org/>

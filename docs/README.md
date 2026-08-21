@@ -53,7 +53,7 @@ kube-agents/
 │   ├── README.md                                  this map
 │   ├── family-roster.txt                          GENERATED snapshot of every
 │   │                                              collapsed family's members
-│   ├── architecture/                              END-STATE spec set 01–08 + README
+│   ├── architecture/                              END-STATE spec set 01–09 + README
 │   ├── designs/                                   per-feature design documents
 │   ├── contributing.md, security-requirements.md,
 │   │   credential-isolation-design.md             standalone docs
@@ -162,7 +162,7 @@ identifier appears, add its source here.
 Not every document describes the same thing. When checking a doc against the
 code, first check which era it belongs to:
 
-- **`docs/architecture/` (01–08 + README) describes the END-STATE target, not
+- **`docs/architecture/` (01–09 + README) describes the END-STATE target, not
   what ships.** Each file carries the banner "Specifies the end state, not
   current behaviour." Do not treat mismatches between these specs and the code
   as doc bugs — the delta is the roadmap (`07-implementation-roadmap.md`).

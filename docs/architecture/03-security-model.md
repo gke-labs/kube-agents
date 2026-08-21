@@ -246,7 +246,9 @@ the requester's own identity (`SubjectAccessReview` for K8s, `testIamPermissions
 Troubleshooter for GCP) and down-scope the agent's effective authority to **agent scope ∩ requester
 permissions** (closing the confused-deputy gap), enforced by an authorization gateway/broker **outside
 the LLM loop** with per-run downscoped tokens. Contract sketch: [06](06-api-and-data-contracts.md)
-§2a. **Not in v1.**
+§2a. **Not in v1.** The GCP half of that mechanism was later measured and does not work;
+[09](09-capability-envelope.md) §1 carries the replacement. This section stays canonical for the
+requirement.
 
 ---
 
