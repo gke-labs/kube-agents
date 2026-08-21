@@ -65,6 +65,14 @@ Before pushing, run the checks CI enforces:
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
 
+- **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
+
+  ```bash
+  make test-integration   # what the Run Integration Seam Tests CI job runs; the Go seam skips cleanly without a toolchain
+  ```
+
+  Real components wired together with the agent replaced by a fake — no cluster, no model. `tests/integration/README.md` states the tier's contract and why the directory is not yet in `PYTHON_TEST_DIRS`.
+
 - **Docs build** (if you touched `docs/site/`):
 
   ```bash

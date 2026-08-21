@@ -14,6 +14,7 @@ bottom pins.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -166,6 +167,50 @@ class AlertPathTest(unittest.TestCase):
         self.assertEqual(2, critical["limit"])
         self.assertEqual(2, critical["sent"])
         self.assertEqual(1, critical["suppressed"])
+
+    def test_a_hermes_already_on_the_runners_path_is_never_the_one_that_runs(self):
+        """The workstation case: `make test-integration` must not post to chat.
+
+        A Critical inject shells out to a bare `hermes send`, resolved through
+        the server's PATH, and a maintainer running the AGENTS.md live
+        validation has a configured `hermes` on theirs. This stands one in the
+        runner's own PATH — not via `path_prepend` — and asserts the guard
+        `KVServer` installs shadows it. A test that wants the call recorded
+        passes its fake through `path_prepend`, which is searched first; that
+        is what every other test in this file relies on.
+        """
+        guarded = self.tmp_path / "guarded"
+        guarded.mkdir()
+        workstation_bin = self.tmp_path / "workstation-bin"
+        posted = self.tmp_path / "posted-for-real.jsonl"
+        fake_executable(workstation_bin, "hermes", _record_and_reply(posted))
+
+        kv = KVServer(
+            guarded,
+            env={
+                "PLATFORM_API_URL": self.gateway.url,
+                "PATH": f"{os.environ.get('PATH', '')}{os.pathsep}{workstation_bin}",
+                # The other half of the hazard: with a token in the
+                # environment, `get_active_platform` returns "slack" and the
+                # send targets whatever the machine is really configured for.
+                "SLACK_BOT_TOKEN": "xoxb-the-runners-real-token",
+            },
+        )
+        self.addCleanup(kv.stop)
+        session_id = self._create_session(kv)
+        status, _ = self._inject(kv, session_id)
+        self.assertEqual(200, status)
+
+        # Wait for the pipeline to run all the way through, so "nothing was
+        # posted" is a finished pipeline rather than an unfinished one.
+        wait_until(
+            lambda: any("/chat" in p for p in self.gateway.paths("POST")),
+            message="the pipeline to run to completion",
+        )
+        self.assertFalse(
+            posted.exists(),
+            "the runner's own hermes was invoked -- a real chat post from a test run",
+        )
 
     @unittest.expectedFailure
     def test_a_failed_chat_post_leaves_a_visible_record_not_silence(self):

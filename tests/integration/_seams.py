@@ -83,17 +83,52 @@ class KVServer:
             {
                 "SESSION_KV_DB_PATH": self.db_path,
                 "SESSION_KV_API_KEY": API_KEY,
-                # A config path that does not exist: get_active_platform falls
-                # back to google_chat, deterministically.
                 "PLATFORM_AGENT_CONFIG_PATH": str(tmp_path / "absent-config.yaml"),
                 "PLATFORM_AGENT_DOTENV_PATH": str(tmp_path / "absent.env"),
                 "PYTHONPATH": str(SCRIPTS_DIR),
             }
         )
-        if path_prepend:
-            run_env["PATH"] = path_prepend + os.pathsep + run_env.get("PATH", "")
+        # An absent config file gets `get_active_platform` past the yaml branch
+        # but not to a fixed answer: it then reads SLACK_BOT_TOKEN from the
+        # environment and returns "slack" if it finds one
+        # (`session_kv_server.py:431`). Dropping the chat credentials is what
+        # makes the fallback deterministic, and it also means a server started
+        # here holds no token to post with.
+        for leaked in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "GOOGLE_CHAT_WEBHOOK"):
+            run_env.pop(leaked, None)
+        # And a `hermes` that cannot reach a workspace, shadowing any real one
+        # on the runner's PATH. `_post_initial_alert` shells out to a bare
+        # `hermes send --json --to <platform>` (`session_kv_server.py:439-445`)
+        # on every Critical inject, resolved through this env's PATH, so a
+        # maintainer running `make test-integration` on a configured
+        # workstation would otherwise post an actual alert into the real
+        # workspace. Every seam test that drives an inject gets this whether it
+        # asked for it or not; a test that wants to observe the call installs
+        # its own recording fake through `path_prepend`, which is searched
+        # first.
+        guard_dir = tmp_path / "_seam-path-guard"
+        fake_executable(
+            guard_dir,
+            "hermes",
+            """
+            import sys
+            sys.stderr.write(
+                "hermes: refusing to send from a seam test -- this process was "
+                "started by tests/integration/_seams.py:KVServer, which shadows "
+                "the real hermes. A test that needs the call recorded should "
+                "pass its own fake via path_prepend.\\n"
+            )
+            sys.exit(127)
+            """,
+        )
         if env:
             run_env.update(env)
+        # PATH is assembled last, after the caller's `env`, so that a test
+        # setting PATH explicitly still gets the guard in front of whatever it
+        # set. Nothing here should be able to opt back into the real hermes by
+        # accident.
+        prepends = [p for p in (path_prepend, str(guard_dir)) if p]
+        run_env["PATH"] = os.pathsep.join(prepends + [run_env.get("PATH", "")])
         self.log = open(tmp_path / "kv-server.log", "wb")
         self.process = subprocess.Popen(
             [

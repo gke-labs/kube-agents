@@ -51,12 +51,79 @@ class SpecToolRegistryTest(unittest.TestCase):
         "kanban_heartbeat",
     }
 
+    def _mcp_server_aliases(self):
+        """Alias → the local server script it launches, from every agent config.
+
+        The alias is the `mcp_servers` key, and it is what namespaces the tool
+        at call time. Servers whose argv is the remote proxy
+        (`/opt/mcp-remote/dist/proxy.js <url>`) are skipped: their tool list
+        lives behind that URL and nothing in this repository can enumerate it.
+        A spec naming one of those is rejected, and the fix is an allowlist
+        entry with evidence, the same bargain HERMES_BUILTIN_TOOLS makes.
+        """
+        yaml = _yaml()
+        aliases = {}
+        configs = list((REPO_ROOT / "agents").glob("*/config.yaml"))
+        configs.append(REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml")
+        for config_path in configs:
+            if not config_path.exists():
+                continue
+            document = yaml.safe_load(config_path.read_text()) or {}
+            for alias, spec in (document.get("mcp_servers") or {}).items():
+                for arg in (spec or {}).get("args") or []:
+                    if arg.endswith(".py"):
+                        aliases[alias] = Path(arg).name
+        return aliases
+
     def _registered_mcp_tools(self):
-        names = set()
+        """The tool names a trajectory can actually carry, not the bare ones.
+
+        `tool_called` matches a trajectory entry's `name` exactly, and for an
+        MCP tool that name is namespaced by the server alias — every fixture
+        in the harness carries `mcp_platform_control_list_clusters` or
+        `mcp__router__list_agents`, never the bare `list_clusters` the `def`
+        is written with. Registering bare names would accept precisely the
+        spellings that can never match and reject the ones that do, which is
+        the silent-green shape this module exists to prevent.
+
+        Both separator spellings are registered because both appear in the
+        harness's own fixtures (`bench/tests/test_harness.py`); which one a
+        run produces is the MCP client's business, not this repository's.
+        """
         decorated = re.compile(r"@mcp\.tool\(\)\s*\ndef\s+(\w+)\s*\(")
-        for path in SCRIPTS_DIR.glob("*.py"):
-            names.update(decorated.findall(path.read_text(errors="replace")))
+        by_script = {}
+        for path in (REPO_ROOT / "agents").glob("*/scripts/*.py"):
+            found = decorated.findall(path.read_text(errors="replace"))
+            if found:
+                by_script.setdefault(path.name, set()).update(found)
+
+        names = set()
+        for alias, script_name in self._mcp_server_aliases().items():
+            for tool in by_script.get(script_name, ()):
+                names.add(f"mcp_{alias}_{tool}")
+                names.add(f"mcp__{alias}__{tool}")
         return names
+
+    def test_the_alias_to_server_join_still_resolves(self):
+        """The join above is the whole check; an empty one passes everything.
+
+        A config refactor that moves `mcp_servers`, or a rename of the server
+        script, would leave `_registered_mcp_tools` returning an empty set —
+        and an empty registry rejects every spec name rather than accepting
+        them, so it fails loudly. What it would not catch is the join quietly
+        covering fewer servers than it used to, which is what this pins.
+        """
+        aliases = self._mcp_server_aliases()
+        self.assertIn("platform_control", aliases)
+        self.assertEqual("platform_mcp_server.py", aliases["platform_control"])
+        registered = self._registered_mcp_tools()
+        # Derived rather than written down: alias `platform_control` joined to
+        # a real `@mcp.tool()` def in the server it launches. The harness's own
+        # fixtures use `list_clusters`, which is not a tool this server
+        # defines — synthetic names in a fixture are fine, and a spec naming
+        # one is exactly what this lint is for.
+        self.assertIn("mcp_platform_control_verify_gke_cluster", registered)
+        self.assertNotIn("verify_gke_cluster", registered)
 
     def _spec_tool_names(self):
         yaml = _yaml()
