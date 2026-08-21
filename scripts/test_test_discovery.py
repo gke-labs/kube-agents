@@ -37,6 +37,10 @@ EXCLUDED = {
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
+    # Live black-box CUJ journeys against a provisioned kube-agents install;
+    # they open an admin portal and talk to a deployed agent, so they are
+    # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
+    "bench/cuj": "live manual suite, needs a provisioned install",
     # tests/e2e is deliberately NOT here: its file is gchat_agent_test.py,
     # which the test_*.py pattern never matches. If a test_*.py ever lands
     # there, the orphan check below fires and forces this list to say why the
