@@ -96,10 +96,14 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
   --permission-set="read-only"
 ```
 
-To run pre-flight checks and output configuration state (`vars.sh`, `terraform.tfvars`, and
-`/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
-validates the Terraform configuration, and previews the full resource plan when Application
-Default Credentials are available:
+### Multi-Project Fleet Monitoring
+
+`kube-agents` supports unified fleet governance, discovery, and read-only telemetry monitoring across multiple GCP projects. When `--monitored-projects` is configured:
+
+- Grants the Platform Agent Google Service Account cross-project read-only permissions on each secondary project; for the detailed IAM role footprint, see the [Security & IAM Reference](docs/site/src/content/docs/reference/security-and-iam.md).
+- To modify monitored fleet projects on Day-2, run `./install.sh --menu` and select **"🏗️ Manage Multi-Project Fleet Scope"**.
+
+To run pre-flight checks and output configuration state (`vars.sh`, `terraform.tfvars`, and `/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also validates the Terraform configuration, and previews the full resource plan when Application Default Credentials are available:
 
 ```bash
 ./install.sh --dry-run --non-interactive \

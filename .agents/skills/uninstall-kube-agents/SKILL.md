@@ -14,7 +14,8 @@ To run the project teardown non-interactively:
 ```bash
 curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- \
   --non-interactive \
-  --project-id="<PROJECT_ID>" \
+  --project-id="<HOST_PROJECT_ID>" \
+  --monitored-projects="<PROJECT_B>,<PROJECT_C>" \
   --cluster-name="<CLUSTER_NAME>" \
   --region="<REGION>"
 ```
@@ -34,5 +35,11 @@ revision that was installed; otherwise it is fetched from `main`.
 **Installs with no Terraform state** (in GCS or locally) were created by a pre-Terraform
 release. This uninstaller exits without touching them — re-run it with
 `--source-ref=<that release>` so that release's own teardown runs instead.
+
+Or via the uninstaller CLI across multiple fleet projects:
+
+```bash
+./uninstall.sh --non-interactive --project-id="<HOST_PROJECT_ID>" --monitored-projects="<PROJECT_B>,<PROJECT_C>"
+```
 
 Machine-readable JSON status reports are generated at `/tmp/kube-agents-uninstall-report.json`.

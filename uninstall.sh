@@ -42,6 +42,7 @@ trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 PARAM_NON_INTERACTIVE="false"
 PARAM_DRY_RUN="false"
 PARAM_PROJECT_ID=""
+PARAM_MONITORED_PROJECTS=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
 PARAM_SOURCE_REF=""
@@ -100,7 +101,8 @@ Usage: ./uninstall.sh [OPTIONS]
 Options:
   -y, --yes, --non-interactive  Automated execution mode (no interactive confirmation prompt)
   --dry-run                     Preview uninstall plan without deleting resources
-  --project-id ID               GCP Target Project ID
+  --project-id ID               GCP Host Project ID (where platform agent control plane ran)
+  --monitored-projects IDS      Comma-separated additional GCP Project IDs to purge fleet IAM from
   --cluster-name NAME           GKE Target Cluster Name (default: platform-agent-host)
   --region REGION               GKE GCP Region
   --source-ref REF              Tag or commit SHA of the release that made the install; that
@@ -111,8 +113,8 @@ Examples:
   # Interactively discover and remove kube-agents cluster & GCP resources
   ./uninstall.sh
 
-  # Automated teardown for a known project and cluster
-  ./uninstall.sh --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+  # Complete fleet-wide automated purge with cross-project IAM and storage cleanup
+  ./uninstall.sh --non-interactive --project-id="my-gcp-project" --monitored-projects="project-b,project-c"
 EOF
   exit 0
 }
@@ -125,6 +127,8 @@ parse_args() {
       --uninstall|--delete) shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
+      --monitored-projects=*|--additional-projects=*) PARAM_MONITORED_PROJECTS="${1#*=}"; shift ;;
+      --monitored-projects|--additional-projects) PARAM_MONITORED_PROJECTS="$2"; shift 2 ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
@@ -145,6 +149,8 @@ write_report() {
   "status": "$(json_escape "$status")",
   "dry_run": ${PARAM_DRY_RUN},
   "non_interactive": ${PARAM_NON_INTERACTIVE},
+  "project_id": "${target_project:-}",
+  "monitored_projects": "${monitored_projects:-}",
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")"
 }
 EOF
@@ -267,6 +273,7 @@ main() {
   fi
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
+  local monitored_projects="${PARAM_MONITORED_PROJECTS:-${MONITORED_PROJECT_IDS:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-platform-agent-host}}"
   local target_region="${PARAM_REGION:-${REGION:-us-central1}}"
 
@@ -279,10 +286,12 @@ main() {
   fi
 
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
+  print_info "Monitored Fleet Projects: ${C_BOLD}${monitored_projects:-None (Single Project)}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Uninstall Preview"
     echo -e "  • ${C_CYAN}Target Cluster:${C_RESET} ${target_cluster} in ${target_project} (${target_region})"
+    echo -e "  • ${C_CYAN}Monitored Fleet Projects:${C_RESET} ${monitored_projects:-None}"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
@@ -317,6 +326,9 @@ main() {
     fi
     if [ -n "$PARAM_REGION" ]; then
       persist_state_var "$state_file" REGION "$target_region"
+    fi
+    if [ -n "$monitored_projects" ]; then
+      persist_state_var "$state_file" MONITORED_PROJECT_IDS "$monitored_projects"
     fi
   fi
 

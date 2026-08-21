@@ -2366,7 +2366,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	return result
 }
 
-// safeSandboxEnvOverrides preserves non-secret telemetry customization without
+// safeSandboxEnvOverrides preserves non-secret telemetry and fleet monitoring customization without
 // copying arbitrary deployment environment variables into the agent sandbox.
 func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// An allowlist, not a denylist: this env reaches the agent sandbox, so a
@@ -2384,6 +2384,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
 		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
+		"MONITORED_PROJECT_IDS":       {},
 	}
 	var result []corev1.EnvVar
 	for _, env := range custom {

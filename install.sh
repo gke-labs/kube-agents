@@ -160,6 +160,7 @@ parse_args() {
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --monitored-projects=*|--additional-projects=*) PARAM_MONITORED_PROJECTS="${1#*=}"; shift ;;
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
@@ -795,6 +796,7 @@ write_json_report() {
   "non_interactive": ${PARAM_NON_INTERACTIVE},
   "project_id": "$(json_escape "${project_id:-}")",
   "project_number": "$(json_escape "${project_number:-}")",
+  "monitored_projects": "$(json_escape "${monitored_projects:-}")",
   "cluster_name": "$(json_escape "${cluster_name:-}")",
   "region": "$(json_escape "${region:-}")",
   "model_provider": "$(json_escape "${model_provider:-}")",
@@ -1097,6 +1099,7 @@ run_menu_system() {
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   local enable_gvisor="${ENABLE_GVISOR:-false}"
   local enable_webui="${HERMES_DASHBOARD_ENABLED:-false}"
+  local monitored_projects="${MONITORED_PROJECT_IDS:-}"
   local github_org="${GITHUB_ORG:-}"
   local github_repo="${GITHUB_REPO:-gke-fleet-iac}"
   local github_app_id="${GITHUB_APP_ID:-}"
@@ -1126,6 +1129,7 @@ run_menu_system() {
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
       "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
+      "🏗️ Manage Multi-Project Fleet Scope (Add/Remove GCP Projects)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (gke-fleet-iac)" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
       "🚪 Exit Control Panel" \
@@ -1215,10 +1219,19 @@ run_menu_system() {
         esac
         ;;
       5)
+        prompt_read "Comma-separated GCP Project IDs to monitor across fleet (e.g. project-a,project-b, or 'none' to clear)" monitored_projects "${monitored_projects:-}"
+        local monitored_lower
+        monitored_lower=$(echo "$monitored_projects" | tr '[:upper:]' '[:lower:]' | xargs)
+        if [ "$monitored_lower" = "none" ] || [ "$monitored_projects" = "-" ]; then
+          monitored_projects=""
+        fi
+        print_success "Updated Monitored Fleet Projects to: ${C_BOLD}${monitored_projects:-None}${C_RESET}"
+        ;;
+      6)
         prompt_read "GitHub Org / Username" github_org "$github_org"
         prompt_read "GitOps Repository Name" github_repo "$github_repo"
         ;;
-      6)
+      7)
         print_step "Saving & Re-applying Configuration State"
         if [ -z "$image_tag" ]; then
           prompt_read "Container image tag (validated release tag or full commit SHA)" \
@@ -1229,10 +1242,12 @@ run_menu_system() {
         export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
+        export MONITORED_PROJECT_IDS="$monitored_projects"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
 
         save_var PROJECT_ID "$project_id"
         save_var PROJECT_NUMBER "$project_number"
+        save_var MONITORED_PROJECT_IDS "$monitored_projects"
         save_var CLUSTER_NAME "$cluster_name"
         save_var REGION "$region"
         save_var KMS_LOCATION "$(derive_kms_location "$region")"
@@ -1258,6 +1273,7 @@ run_menu_system() {
         save_var GITHUB_REPO "$github_repo"
         save_var GITHUB_APP_ID "$github_app_id"
         save_var KMS_KEYRING "$kms_keyring"
+        save_var MONITORED_PROJECT_IDS "$monitored_projects"
         save_var KMS_KEY "$kms_key"
         save_var GITHUB_PEM_PATH "$github_pem_path"
         save_var NO_CONFIRM "1"
@@ -1274,7 +1290,7 @@ run_menu_system() {
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
         ;;
-      7)
+      8)
         print_info "Exiting Control Panel."
         break
         ;;
@@ -1405,6 +1421,25 @@ main() {
     exit 1
   fi
   print_success "Resolved Project Number: ${C_BOLD}${project_number}${C_RESET}"
+
+  # Multi-Project Fleet Monitoring Configuration
+  local monitored_projects="${PARAM_MONITORED_PROJECTS:-}"
+  if [ -z "$monitored_projects" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local fleet_mode_choice=""
+    prompt_menu "Multi-Project Fleet Monitoring Scope:" \
+      "Single Project (Monitor only host project: ${project_id})" \
+      "Multi-Project Fleet (Monitor additional GCP projects across your fleet)" \
+      fleet_mode_choice
+
+    if [ "$fleet_mode_choice" = "2" ]; then
+      prompt_read "Enter additional GCP Project IDs to monitor (comma-separated)" monitored_projects ""
+      if [ -n "$monitored_projects" ]; then
+        print_success "Monitored Fleet Projects: ${C_BOLD}${monitored_projects}${C_RESET}"
+      fi
+    fi
+  elif [ -n "$monitored_projects" ]; then
+    print_success "Monitored Fleet Projects: ${C_BOLD}${monitored_projects}${C_RESET}"
+  fi
 
   # Region Selection
   local active_region=""
@@ -1873,6 +1908,7 @@ main() {
   printf '%s\n' '# Auto-generated by kube-agents zero-friction installer' > "$vars_file"
   write_state_var "$vars_file" PROJECT_ID "$project_id"
   write_state_var "$vars_file" PROJECT_NUMBER "$project_number"
+  write_state_var "$vars_file" MONITORED_PROJECT_IDS "$monitored_projects"
   write_state_var "$vars_file" CLUSTER_NAME "$cluster_name"
   write_state_var "$vars_file" REGION "$region"
   write_state_var "$vars_file" KMS_LOCATION "$(derive_kms_location "$region")"
@@ -1956,6 +1992,7 @@ main() {
   draw_separator
   echo -e "${C_RESET}${C_BOLD}Please review your selections before provisioning begins:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Target Project:${C_RESET} ${C_BOLD}${project_id}${C_RESET} (Project Number: ${project_number:-unknown})"
+  echo -e "  • ${C_CYAN}Monitored Fleet Projects:${C_RESET} ${C_BOLD}${monitored_projects:-None (Single Project)}${C_RESET}"
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE Standard)"
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"

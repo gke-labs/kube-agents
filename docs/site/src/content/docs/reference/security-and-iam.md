@@ -81,6 +81,14 @@ The default **read-only** set swaps the admin roles for viewers:
 
 The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
 
+### Multi-project fleet IAM footprint
+
+When multi-project fleet monitoring is configured (`MONITORED_PROJECT_IDS`), `provision_04_gcp_iam.sh` grants the Platform Agent GSA read-only viewer roles across all designated secondary GCP projects:
+
+- `roles/container.viewer`, `roles/container.clusterViewer` — read-only cluster and workload state across secondary fleet projects.
+- `roles/logging.viewer`, `roles/monitoring.viewer` — read-only telemetry and log access across secondary fleet projects.
+- `roles/recommender.viewer` — read-only GKE cost and resource optimization recommendations across secondary fleet projects.
+
 ## Kubernetes RBAC
 
 Independently of the GCP permission set, the operator grants the agent KSA a **read-only** footprint on the Kubernetes API, plus one namespaced housekeeping Role. It creates three bindings (see [`platformagent_manifests.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/platformagent_manifests.go)):
