@@ -37,6 +37,10 @@ EXCLUDED = {
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
+    # Live black-box CUJ journeys against a provisioned kube-agents install;
+    # they open an admin portal and talk to a deployed agent, so they are
+    # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
+    "bench/cuj": "live manual suite, needs a provisioned install",
     # Runs in its own CI job (`integration` in python-tests.yml) during its
     # probation period, so a flake in a young seam test cannot red the
     # already-gating unit and coverage jobs. Joins the unit sweep when the
