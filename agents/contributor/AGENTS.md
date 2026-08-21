@@ -35,13 +35,13 @@ work, perform **one** action, then stop. Do not do two things per cycle.
 
 1. **Own open pull requests first.** For each of your open PRs
    (`gh pr list --author @me --state open`), check for new review events,
-   inline comments, and check status. Resolve **every** bot review comment -
-   fix and push, or reply in the thread - the merge gate requires all of them
-   resolved. After making changes, re-run the review: comment `/review` for a
-   narrow re-check of the diff, or `/review all` for a wider re-check when the
-   changes are substantial. If `lgtm` is present, you are done - the system
-   merges; you never do. If `do-not-merge/hold` is present, read the comment
-   explaining why and wait.
+   inline comments, and check status. Address every finding - fix and push, or
+   answer it in the thread. Resolve each thread only once it is genuinely
+   resolved - the bar is owned by the root `AGENTS.md`. After making changes,
+   re-run the review: comment `/review` for a narrow re-check of the diff, or
+   `/review all` for a wider re-check when the changes are substantial. If
+   `lgtm` is present, you are done - the system merges; you never do. If
+   `do-not-merge/hold` is present, read the comment explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
    in progress, continue it.
 3. **Claim one unassigned issue.** See [Claiming](#claiming). Fix it on a
@@ -62,10 +62,10 @@ claim channel. To claim:
 1. `gh issue edit <number> --add-assignee @me` (or the API equivalent).
 2. **Re-read the issue** and confirm you are the **sole** assignee.
 
-If another agent assigned itself in the same window, you collided. **Yield:**
-remove your own assignment and pick a different issue. Collisions are rare with
-independent pollers and resolve on the next cycle; do not try to break the tie
-by force.
+If another agent assigned itself in the same window, you collided. Tie-break
+deterministically, without coordinating: sort the assignees by GitHub username;
+if yours is first, keep the assignment, otherwise remove yourself and pick a
+different issue. Never try to break the tie by force.
 
 You work only issues assigned to you. Never reassign or close an issue you do
 not own.
@@ -93,8 +93,8 @@ silently stall:
 
 The label plus the mention **is** the escalation - there is no other channel.
 An issue carrying `needs-human` is not claimable: your claim filter must skip
-it. After applying `needs-human`, stop working the issue until a human
-responds.
+it. After applying `needs-human`, stop working the issue until a human removes
+the label - the label, not a comment, is the signal to resume.
 
 `needs-human` is for decisions and blockers, on an issue or a PR.
 
@@ -119,8 +119,9 @@ responds.
 
 Opening a PR starts `kube-agents-bot`. The path to merge:
 
-1. Resolve **every** review thread (the bot's and any human's) - `main`
-   requires all conversations resolved before it can merge.
+1. Resolve every review thread (the bot's and any human's) - `main` requires
+   all conversations resolved before it can merge. Resolve a thread only once
+   genuinely resolved, per the root `AGENTS.md`.
 2. Get a clean bot pass (`/review`, per [The loop](#the-loop)) - a human is
    assigned only after the bot's check goes green.
 3. The human approves; the system applies `lgtm` and merges.
