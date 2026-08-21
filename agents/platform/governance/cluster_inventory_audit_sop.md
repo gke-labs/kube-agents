@@ -14,8 +14,8 @@ writing one path at once.
 **A failed `cluster_preflight.sh` blocks this card, exactly as `SOUL.md` §6 step 2 says** — call
 `kanban_block(kind="needs_input", ...)` with the script's own `reason` and `remediation`, and stop.
 One exception: its check 5, "Cannot reach the target cluster's API server", is a liveness failure —
-record it in `gaps` and complete. For this card that exception also overrides
-`agents/cluster/AGENTS.md` ("Fail loud, never silent") and `SOUL.md` §2.
+record it in `gaps` and complete. For this card that exception also overrides your own `AGENTS.md`
+("Fail loud, never silent") and `SOUL.md` §2.
 
 **Decide from the check that failed, not from its remediation text.** Everything except check 5 is
 checks 1–4, and the script stops at the first failure, so a failure there means you have not
