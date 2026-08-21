@@ -108,7 +108,9 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
 )
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
 # a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
-RECONCILE_SCRIPT = "/opt/data/scripts/cluster_agent_reconcile.py"
+# Resolved under the data dir rather than hardcoded: `spec.harness.hermes.agentHome` moves
+# the whole tree, and a missing path here silently files the solo sweep.
+RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 
 # The reconcile that creates the Cluster Agents runs on its own cron at `11 * * * *`,
 # while this gate runs every minute. On a fresh install the gate therefore reaches the
@@ -126,6 +128,10 @@ MAX_RECONCILE_ATTEMPTS = 5
 
 def _data_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _reconcile_script(data_dir: Path) -> Path:
+    return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
 def _roster_command() -> str:
@@ -189,7 +195,8 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
     and the worker reported the roster as unavailable and audited the fleet alone.
     An exit code cannot be misread that way.
     """
-    if not Path(RECONCILE_SCRIPT).exists():
+    script = _reconcile_script(data_dir)
+    if not script.exists():
         return True  # deployment without Cluster Agents; the solo sweep is correct here
 
     attempts = _reconcile_attempts(data_dir)
@@ -218,7 +225,7 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
         _record_reconcile_attempt(data_dir, attempts + 1)
         try:
             proc = subprocess.run(
-                [sys.executable, RECONCILE_SCRIPT],
+                [sys.executable, str(script)],
                 capture_output=True,
                 text=True,
                 timeout=RECONCILE_TIMEOUT_SECONDS,
@@ -235,7 +242,8 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
             )
             return False
 
-    _record_reconcile_attempt(data_dir, 0)
+        _record_reconcile_attempt(data_dir, 0)
+
     sys.stderr.write("bootstrap_scan_gate: Cluster Agent roster reconciled\n")
     return True
 
@@ -285,19 +293,14 @@ def _task_body() -> str:
         "costs far more than the missing answer is worth, and it produces a report that looks "
         "complete while resting on invented data.\n\n"
         "**Step 1 — the Cluster Agent roster is already reconciled.** This card was filed only "
-        f"after `{RECONCILE_SCRIPT}` ran to completion and exited 0, so the roster you read in "
-        "Step 3 is current. Do not run it yourself. It may legitimately have created no agents; "
+        f"after `{RECONCILE_SCRIPT_NAME}` ran to completion and exited 0, so the roster you read in "
+        "Step 2 is current. Do not run it yourself. It may legitimately have created no agents; "
         "an empty roster is a supported state, not a failure to repair.\n\n"
-        "**Do not create, repair, or delete a profile yourself.** Profile "
-        "lifecycle belongs to that script alone. It holds the guard that keeps the management "
-        "cluster from getting its own agent, and calling `cluster_agent_profile.py` directly "
-        "goes around that guard: the profile you create is one the next reconcile run will "
-        "immediately prune, and you will loop. An empty roster is a supported state, not damage "
-        "to repair.\n\n"
-        "**Step 2 — scan the management cluster yourself.** No Cluster Agent covers it, so "
-        "its inventory is yours to produce. Skipping it would leave a hole exactly where the "
-        "harness runs.\n\n"
-        "**Step 3 — fan out.** Read the roster with exactly this command, exactly once:\n\n"
+        "**Do not create, repair, or delete a profile yourself.** Profile lifecycle belongs to "
+        "that script alone, which holds the `RECONCILE_EXCLUDE` opt-out and the create/prune "
+        "rules. A profile you create by calling `cluster_agent_profile.py` directly is one the "
+        "next reconcile run may immediately prune, and you will loop.\n\n"
+        "**Step 2 — fan out.** Read the roster with exactly this command, exactly once:\n\n"
         f"    {_roster_command()}\n\n"
         "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
         "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
@@ -305,9 +308,9 @@ def _task_body() -> str:
         "single-cluster install and it is not an error. Use the command as written — the "
         "absolute path and the `HERMES_HOME` are both required, and a bare `hermes profile "
         "list` will either fail or quietly return an incomplete roster.\n\n"
-        "For every OTHER cluster that has an agent, open one child card per cluster with "
+        "For every cluster that has an agent, open one child card per cluster with "
         "`kanban_create(assignee=<that agent>, "
-        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>', ...)`. The body must "
+        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>-<location>', ...)`. The body must "
         "send that agent to the single-cluster audit SOP, reading whichever of these exists:\n"
         f"{cluster_audit_list}\n\n"
         "and tell it to complete its card with the structured `metadata` that SOP specifies. "
@@ -332,7 +335,8 @@ def _task_body() -> str:
         "card re-attaches to the sweep already in flight instead of launching a second "
         "fleet-wide scan on top of it.\n\n"
         "**Step 4 — write the raw findings** (in the aggregation card, or directly here if "
-        "there were no Cluster Agents to fan out to). Combine your management-cluster findings "
+        "there were no Cluster Agents to fan out to). Audit any cluster the roster did not "
+        "cover yourself, and combine those findings "
         "with every child's metadata into a COMPLETE, verbose findings file at "
         f"`{RAW_INVENTORY_PATH}` — the full fleet and workload tables and the full set of SRE "
         "remediation suggestions. Do not summarize and do not trim for length: this file is the "

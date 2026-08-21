@@ -33,7 +33,8 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 ## Step 2: Fan the per-cluster audit out to the Cluster Agents
 
 The workload audit is single-cluster runtime work, so each cluster's own Cluster Agent runs it, not
-you (`SOUL.md` §6). Create one card per running cluster from Step 1, **all of them up front, in one
+you (`SOUL.md` §6). Create one card per cluster from Step 1 that has a Cluster Agent on the
+roster, **all of them up front, in one
 burst and with no `parents`**, so the dispatcher runs them concurrently:
 
 ```
@@ -60,9 +61,11 @@ back is a topology listing with no findings in it. That has been observed: four 
 under two minutes each, every one of them with no `metadata` at all, and the fleet report that
 followed named zero problems on a fleet that had them.
 
-If a cluster has no Cluster Agent yet, create one first (`manage-cluster` /
-`cluster-agent-lifecycle`) and then file its card. A cluster you cannot reach or cannot create an
-agent for is a row in the report saying so — not a cluster you audit inline instead.
+**Do not create, repair, or delete a Cluster Agent profile.** Profile lifecycle belongs to
+`cluster_agent_reconcile.py`, which holds the `RECONCILE_EXCLUDE` opt-out and the create/prune
+rules; a profile you create by hand is one the next reconcile run may immediately prune, and you
+will loop. A cluster the roster does not cover is yours to audit in Step 4 — or, if you cannot
+reach it, a row in the report saying so.
 
 ---
 
@@ -82,7 +85,7 @@ kanban_create(
 )
 ```
 
-Run `kanban_notify_propagate.py --to <card_id>` for the fan-in card so the user gets one closing
+Run `python3 /opt/data/scripts/kanban_notify_propagate.py --to <card_id>` for the fan-in card so the user gets one closing
 summary, then **complete this card**. Steps 4 to 6 run on the aggregation card, not this one.
 
 **Do not wait here.** Blocking this card on the per-cluster cards deadlocks the board (`SOUL.md`

@@ -1,4 +1,4 @@
-# Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<name>`)
+# Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<cluster-name>-<location>`)
 
 **Purpose:** The per-cluster half of first-time environment discovery, performed by a Cluster Agent
 on the one cluster it is pinned to. The Platform Agent fans this out during
@@ -11,7 +11,10 @@ nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.m
 exists. Those steps belong to the Platform Agent, and running them here means several agents
 writing one path at once.
 
-**Never block this card, at any step.** Denied permissions, an unreachable API server, a cluster in
+**Never block this card, at any step — this SOP overrides `SOUL.md` §6 step 2 here.** A failed
+preflight normally means `kanban_block`; on this card it means a `gaps` entry and a completed card,
+because a block stops the whole fleet report rather than losing one cluster's row. Denied
+permissions, an unreachable API server, a cluster in
 `ERROR`, credentials that will not mint, an MCP tool that errors — every one of them is a `gaps`
 entry and a completed card, not a block. An aggregation card is waiting on this card and every
 other cluster's, so blocking here stops the whole fleet report rather than losing one cluster's row.
@@ -34,11 +37,8 @@ If `USER.md` is missing or does not parse, stop and complete the card with that 
 Guessing your own identity from a profile name or a cluster list is how a report ends up describing
 somebody else's cluster.
 
-**Complete this card even when the audit cannot be done at all** — an unreachable API server, a
-cluster in `ERROR`, credentials that will not mint. Record what failed in `gaps`, leave the other
-fields empty, and complete. Do not block the card and do not ask for input: an aggregation card is
-waiting on this one and every other cluster's, so a card left open stops the whole fleet report
-rather than just this cluster's row.
+If the audit cannot be done at all, record what failed in `gaps`, leave the other fields empty, and
+complete — see the rule above.
 
 ---
 
@@ -80,7 +80,9 @@ Across all namespaces on this cluster:
      ranks them out of sight.
 3. **Core Infrastructure Addons:** Check for ingress controllers (GKE Gateway API, NGINX),
    cert-manager, OpenTelemetry collectors (`gke-managed-otel`), and identity integration endpoints
-   (`github-token-minter` / `minty`).
+   (`github-token-minter` / `minty`). Record which deployment toolchain manages the cluster —
+   Config Sync (`config-management-system`), Argo CD, Flux, plain Helm releases, or none observed:
+   the fleet report has a column for it and no other stage can see your cluster.
 
 **A pod list is not this audit.** `kubectl get pods` reports phase, and every gap above sits in a
 workload's spec rather than its phase — a Deployment with no probes, no resource requests, and no
@@ -133,7 +135,8 @@ report loses.
     ],
     "workload_identity": true,
     "dataplane_v2": true,
-    "observability": "gke-managed-otel | self-hosted | none"
+    "observability": "gke-managed-otel | self-hosted | none",
+    "deployment_toolchain": "<Config Sync, Argo CD, Flux, Helm releases, or none observed>"
   },
   "workloads": [
     {
@@ -144,6 +147,7 @@ report loses.
       "probes": { "liveness": false, "readiness": false, "startup": false },
       "resources": { "requests": false, "limits": false, "qos": "BestEffort" },
       "hpa": false,
+      "telemetry": "otlp | prometheus-scrape | none",
       "security_context": {
         "run_as_non_root": false,
         "read_only_root_fs": false,

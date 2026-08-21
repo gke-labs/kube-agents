@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import ensure_profile, overlay_template
+from profile_scaffold import HERMES_BIN, ensure_profile, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -38,12 +38,6 @@ OVERLAY_DIR = Path(os.environ.get("PROFILE_OVERLAY_DIR", "/opt/agent-config"))
 PLUGIN_MOUNT_ROOT = Path(os.environ.get("PLUGIN_MOUNT_ROOT", "/opt/agent-plugins"))
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
-
-# Absolute, because a kanban worker's terminal runs with a stripped environment in
-# which /opt/hermes/.venv/bin is not on PATH — a bare `hermes` raises ENOENT there
-# while working fine from an interactive shell. Same trap as `_roster_command` in
-# agents/chat/scripts/bootstrap_scan_gate.py.
-HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
