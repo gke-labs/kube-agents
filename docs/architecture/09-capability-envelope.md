@@ -26,9 +26,10 @@ widened.
 
 **No token format. Nothing signed. No cryptographic key anywhere in the design.** The capability
 lives in NATS KV and the message carries only a lookup id. Integrity comes from connection-time
-subject permissions, which NATS enforces before a message is parsed. Two rules make it hold: a
-parent **names the one agent permitted to descend from it**, and only a verification service may
-read the store. Revocation is deleting an entry.
+subject permissions, which NATS enforces before a message is parsed. Three rules make it hold: a
+parent **names the one agent permitted to descend from it**, the verifier resolves an entry **only
+for the agent it names**, and only that verifier may read the store. Revocation is deleting an
+entry.
 
 This is the **deferred hardening** already named in [03](03-security-model.md) §4a and
 [08](08-agent-runtime-and-identity.md) §5, with a different mechanism.
@@ -92,22 +93,28 @@ sees neither the capability nor the store.
 parent, and the next hop as its own delegate -- under its own namespace, and passes the new id
 downstream.
 
-**Verification.** Four checks, all required. Walk the chain to the root. Confirm the root sits
+**Verification.** Five checks, all required. Authenticate the caller and confirm the entry it is
+asking about names that caller as its delegate. Walk the chain to the root. Confirm the root sits
 under `cap.root.*`. Confirm each link is narrower than its parent. Confirm **each link was written
 by the agent its parent named as delegate**. Refuse otherwise.
+
+The first of those is about the caller and the other four are about the chain, which is why an
+earlier draft had only the four. See "The subject prefix does not prove entitlement" below.
 
 ```
    gateway   writes  cap.root.req-8f2a      = {tier: operator, scope: project-P,
                                                delegate: fleet-recon}
                      └─ message carries "req-8f2a"
 
-   hop A     verifier resolves it: fleet-recon is the named delegate, so it may descend
+   hop A     asks the verifier to resolve it, and is authenticated as fleet-recon --
+             the delegate the entry names, so it resolves and fleet-recon may descend
              writes  cap.hop.fleet-recon.1  = {..., scope: cluster-C,
                                                delegate: platform-a}
                                               parent: cap.root.req-8f2a
                      └─ message carries "cap.hop.fleet-recon.1"
 
-   hop B     verifier resolves that: chain narrows, and platform-a is the named delegate
+   hop B     resolves that as platform-a: chain narrows, and platform-a is the delegate
+             the entry names.  fleet-recon asking for the same id would be refused
              writes  cap.hop.platform-a.7   = {tier: reader, scope: cluster-C, ...}
                      └─ and so on
 ```
@@ -136,10 +143,10 @@ that writes something wider than it received is caught when the next hop resolve
 The integrity comes from connection-time permissions rather than from cryptography. Same
 guarantee, no key to custody, rotate, distribute or recover.
 
-### The subject prefix does not prove entitlement to the parent
+### The subject prefix does not prove entitlement
 
-Worth stating separately, because an earlier draft of this design got it wrong and the failure is
-not obvious.
+Worth stating separately, because two drafts of this design got it wrong in two different places
+and neither failure is obvious.
 
 Write permission proves who wrote a child. It proves nothing about whether that writer ever
 _received_ the parent the child names. Without a further rule, a compromised broker writes
@@ -148,18 +155,33 @@ more privileged human -- and every check passes. The root is under `cap.root.*`,
 and the prefix correctly proves who wrote the child. The hop has escalated by descending from
 someone else's origin. Request ids are not secrets, so naming one is no barrier.
 
-**Two rules close it, and both are needed.**
+**Three rules close it, and all three are needed.**
 
 **The parent names its delegate.** Every entry carries the single agent id permitted to write
 children of it, and verification refuses a child whose writer is not that agent. Authority to
 descend is granted by the parent's author and proved by the subject prefix, rather than inferred
 from the child.
 
+**The verifier authenticates its caller.** A resolution is refused unless the entry names the
+caller as its delegate. The rule above closes descending from a root you were never handed. On its
+own it does nothing about simply _presenting_ that root, which reaches the same authority with less
+work. A broker puts `cap.root.<somebody-else's-request>` on its outbound message and skips writing
+a child entirely. The four chain checks all pass, and vacuously: a single-entry chain widens
+nothing, and a root has no parent whose delegate could be violated. Same precondition as above --
+ids are not secrets -- and the same escalation, on the read path.
+
+One field does both jobs, one level apart. The writer of an entry must be the delegate its
+_parent_ names; the resolver of an entry must be the delegate _it_ names. Both are the agent that
+was handed the id, which is the point.
+
 **Only the verifier reads.** If every broker could walk the chain itself, every broker would need
 read across `cap.*`, which is what makes other agents' roots discoverable in the first place.
-Moving the walk into one service removes discovery and removes the need to distribute read at all.
-The verifier sits on the request path, which is the same shape -- and the same cost -- as the NATS
-auth callout this design already accepts.
+Moving the walk into one service removes the need to distribute read at all. It does not by itself
+remove discovery: every broker must be able to call the verifier, so without the caller check above
+an id is still resolvable by anyone who can name one, and discovery has moved from a KV read to an
+RPC rather than gone away. Withholding read and checking the caller are what close it between them.
+The verifier sits on the request path, which is the same shape -- and the same cost -- as the NATS auth callout this design
+already accepts.
 
 **Revocation is deleting an entry**, which is the other reason to prefer this. A signed token is
 valid until it expires no matter what you learn in the meantime.
@@ -181,9 +203,10 @@ chain terminates at a root the gateway minted from the requester's own authority
 > intended", never "escalated past the human who asked."
 
 That is the sentence to have ready when someone probes the design, and it is worth knowing exactly
-what carries it: the delegate rule above, and nothing else. Drop that rule and the claim is simply
-false. It holds under imperfect implementation, which is the only kind there is, but it does not
-hold under a missing rule.
+what carries it: the two delegate rules above, and nothing else. The write half stops a hop
+descending from an origin it was never handed. The read half stops it presenting that origin
+directly. Drop either and the claim is simply false. It holds under imperfect implementation,
+which is the only kind there is, but it does not hold under a missing rule.
 
 **Chain depth.** Resolution walks to the root, so a long chain is a lot of KV reads. Those are now
 the verifier's reads rather than every broker's, which makes them cacheable per id -- a chain is
@@ -280,8 +303,14 @@ cannot distinguish a working control from an absent one, and several of the fail
 silent.
 
 - **Descent without delegation is refused:** a broker writes a child naming a parent that names a
-  _different_ agent as delegate. Resolution fails. This is the check that carries the "cannot exceed
-  what it was delegated" claim; without it the design is broken, so it is the first test to write.
+  _different_ agent as delegate. Resolution fails. This is one of the two checks that carry the
+  "cannot exceed what it was delegated" claim; without it the design is broken, so it is the first
+  test to write.
+- **Resolving an id you were never handed is refused:** a broker asks the verifier to resolve an
+  entry naming a different agent as delegate, and is refused. The one to write second, and the
+  easier of the two to leave out: it needs no forged write, so a chain-only test suite passes with
+  the hole open. Assert it for a bare `cap.root.*` id in particular, where the other four checks
+  pass vacuously -- nothing widens in a one-entry chain, and a root has no parent to violate.
 - **Widening is refused:** a child granting a tier or scope its parent does not hold fails
   resolution, whether it widens by one field or replaces the payload wholesale.
 - **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
