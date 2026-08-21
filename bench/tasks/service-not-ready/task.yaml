@@ -1,0 +1,28 @@
+task_id: "service-not-ready"
+name: "service-not-ready"
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "service-not-ready"
+  teardown: true
+  variables:
+    node_count: 2
+    machine_type: "e2-standard-4"
+    target_deployment_name: "my-service-app"
+prompt: |
+  The service 'my-service' in namespace default on GKE cluster {{CLUSTER_NAME}} is not ready and reporting zero endpoints. Investigate and tell me what's going wrong, do not attempt any changes yourself.
+expected_output: |
+  critical requirements:
+  - Agent inspects Service 'my-service', Endpoints, and pod statuses in namespace 'default' on cluster '{{CLUSTER_NAME}}'.
+  - Agent identifies that Service 'my-service' has no active endpoints (0 ready endpoints / Endpoints: <none>).
+  - Agent identifies the root cause: a label selector mismatch between Service 'my-service' (selector: 'app=wrong-label') and Deployment 'my-service-app' (labels: 'app=my-service-app').
+  - Agent correctly explains the root cause without attempting live cluster changes.
+  - Agent recommends updating the Service selector 'spec.selector.app' to 'my-service-app' in GitOps/IaC.
+documentation:
+  - doc_name: "Kubernetes Services - Selecting Pods and Endpoints"
+    url: "https://kubernetes.io/docs/concepts/services-networking/service/#defining-a-service"
+    constraints:
+      - text: "Service selector app=wrong-label mismatch"
+        critical: true
+      - text: "No endpoints available for Service my-service"
+        critical: true
