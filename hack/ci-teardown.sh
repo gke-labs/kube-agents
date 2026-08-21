@@ -52,14 +52,22 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agent
 # The chart's pre-delete hook removes the PlatformAgent CR and waits for the
 # operator to clear its finalizer, so one uninstall replaces the old
 # per-step teardown scripts (09 LiteLLM, 08 CR, 07 secrets, 03 operator).
-helm uninstall kube-agents -n "${NAMESPACE}" --wait --timeout 10m || true
+if ! helm uninstall kube-agents -n "${NAMESPACE}" --wait --timeout 10m; then
+  echo "WARNING: helm uninstall failed or timed out. Stripping dangling finalizers in namespace ${NAMESPACE} so CRD deletion does not deadlock..."
+  for name in $(kubectl get platformagents -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    [ -n "$name" ] && kubectl patch platformagent "$name" -n "${NAMESPACE}" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+  done
+  for name in $(kubectl get agentplugins -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    [ -n "$name" ] && kubectl patch agentplugin "$name" -n "${NAMESPACE}" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+  done
+fi
 echo "✓ Release uninstall finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting CRDs ==="
 # Helm leaves crds/ objects behind by design; a PR evaluation cluster should
-# not accumulate them.
-kubectl delete -f charts/kube-agents/crds/ --ignore-not-found || true
+# not accumulate them. Bounded by --timeout so it never hangs if CR cleanup stalls.
+kubectl delete -f charts/kube-agents/crds/ --ignore-not-found --timeout=2m || true
 echo "✓ CRD deletion finished in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
