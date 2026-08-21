@@ -69,11 +69,21 @@ rules:
     patch_contains: ["^-.*\\bfunc Test", "^-.*\\bdef test_"]
     why: "a coverage regression is invisible in a green run"
 
+  - id: docs-site-build-inputs
+    tier: high
+    match:
+      - "docs/site/package.json"
+      - "docs/site/package-lock.json"
+      - "docs/site/astro.config.mjs"
+      - "docs/site/tsconfig.json"
+      - "docs/site/public/**"
+    why: "docs-deploy runs npm ci and the build on these and publishes the site users fetch install.sh from via curl|bash -- a dependency or config swap here is a supply-chain edit, the workflows-are-supply-chain reasoning one artifact downstream"
+
   - id: docs-site-only
     tier: low
     only_match:
-      - "docs/site/**"
+      - "docs/site/src/content/docs/**"
       - "docs/designs/**"
       - "docs/README.md"
       - "README.md"
-    why: "narrative documentation; no runtime or agent-behavior path. INSTALL.md and docs/architecture are deliberately absent: the install guide is agent-executable and the architecture docs gate design decisions"
+    why: "narrative documentation; no runtime or agent-behavior path. Deliberately narrow: INSTALL.md is agent-executable, docs/architecture gates design decisions, and the rest of docs/site (manifests, astro config, components) executes in the docs-deploy build, so only the content tree is prose"

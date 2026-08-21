@@ -218,6 +218,17 @@ class DeclaredTierTest(unittest.TestCase):
             classify_risk.declared_tier(self.BODY % "No risk to running systems."), "low"
         )
 
+    def test_determiner_no_near_risk_is_not_a_declaration(self):
+        # "no" declares only in the literal "no risk" collocation; as a
+        # determiner in the same clause as "risk" it says nothing about tier.
+        body = self.BODY % (
+            "Risk: this rewrites the IAM bundle; there is no automated rollback."
+        )
+        self.assertIsNone(classify_risk.declared_tier(body))
+        self.assertIsNone(
+            classify_risk.declared_tier(self.BODY % "The risk is contained; no migration needed.")
+        )
+
     def test_section_without_tier_word_is_none(self):
         body = self.BODY % "Reverting this commit removes the page."
         self.assertIsNone(classify_risk.declared_tier(body))
@@ -352,6 +363,19 @@ class RepositoryRulesTest(unittest.TestCase):
     def test_docs_site_only_is_low(self):
         result = self.classify([_file("docs/site/src/content/docs/concepts.md"), _file("README.md")])
         self.assertEqual(result["tier"], "low")
+
+    def test_docs_site_build_inputs_are_high(self):
+        # The docs-deploy build executes these and publishes the install.sh
+        # users pipe to bash; a dependency bump is a supply-chain edit.
+        result = self.classify([_file("docs/site/package-lock.json"), _file("docs/site/package.json")])
+        self.assertEqual(result["tier"], "high")
+        self.assertIn("docs-site-build-inputs", [entry["id"] for entry in result["rules"]])
+
+    def test_docs_site_outside_the_content_tree_is_not_low(self):
+        # Components and build config execute at build time; only the content
+        # tree is prose.
+        result = self.classify([_file("docs/site/src/components/Hero.astro")])
+        self.assertEqual(result["tier"], "medium")
 
     def test_skill_md_is_not_docs(self):
         result = self.classify(

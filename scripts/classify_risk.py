@@ -69,7 +69,7 @@ RISK_SECTION = re.compile(
 # it misreads errs toward suppressing the mismatch flag rather than accusing
 # an author of a declaration they did not make.
 DECLARED_WORDS = {
-    "low": "low|none|no|minimal|negligible",
+    "low": "low|none|minimal|negligible",
     "medium": "medium|moderate",
     "high": "high",
 }
@@ -78,7 +78,11 @@ DECLARED = {
         # "<word> risk" / "<word>-risk", or "risk ... <word>" in one clause,
         # or the section opening with the bare word ("Low." / "Moderate,").
         # The lookahead keeps "High-level overview" from declaring high.
-        rf"(?<!not )(?<!not a )\b(?:{words})[- ]risk\b"
+        # "no" declares low ONLY in the literal "no risk" collocation: as a
+        # bare word near "risk" it is almost always a determiner ("there is
+        # no automated rollback"), and reading that as a declaration would
+        # accuse the author of claiming the opposite of what they wrote.
+        rf"(?<!not )(?<!not a )\b(?:{words}{'|no' if tier == 'low' else ''})[- ]risk\b"
         rf"|\brisk\b[^.!?\n]{{0,40}}?(?<!not )\b(?:{words})\b"
         rf"|\A[\s>*_-]*(?:\*\*)?(?:{words})(?=[\s.,:;!)])",
         re.IGNORECASE,
