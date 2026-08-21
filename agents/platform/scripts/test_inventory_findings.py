@@ -133,6 +133,18 @@ class BuildPayloadsTests(unittest.TestCase):
         self.assertEqual({p["source"] for p in payloads}, {"inventory"})
         self.assertEqual(sorted(p["object"] for p in payloads), ["api", "web"])
 
+    def test_a_string_flag_in_the_scores_file_is_rejected(self):
+        """The SOP has the model author these freehand, once per run."""
+        for key, value in (("provider_managed", "false"), ("actionable", None)):
+            with self.subTest(key=key):
+                scores = {"f001": {**SCORE, key: value}, "f002": SCORE}
+                with self.assertRaises(inv.Failure) as caught:
+                    inv.build_payloads(self.items, scores)
+                self.assertEqual(caught.exception.code, inv.EXIT_INCOMPLETE)
+                self.assertIn(
+                    f"{key} must be true or false", " ".join(caught.exception.errors)
+                )
+
     def test_an_unscored_finding_blocks_the_whole_batch(self):
         with self.assertRaises(inv.Failure) as caught:
             inv.build_payloads(self.items, {"f001": SCORE})

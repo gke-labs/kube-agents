@@ -29,10 +29,9 @@ TIMEOUT_SECONDS = 30
 # way, so raising this widens the message rather than revealing anything new.
 TOP_N = 2
 
-# `deliver: "chat"` relays this through a Chat Agent turn that is asked to
-# reproduce the report verbatim. Without a heading the empty-queue message is
-# one greeting-shaped sentence, and the agent answers it as conversation
-# instead — the user gets "Understood, I'll keep an eye on the board".
+# `deliver: "chat"` relays this through a Chat Agent turn. Without a heading the
+# empty-queue message is one greeting-shaped sentence, which reads as
+# conversation rather than as a report to reproduce.
 HEADING = "Findings queue — morning nudge"
 
 
