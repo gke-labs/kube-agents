@@ -98,41 +98,41 @@ resource "null_resource" "write_synthetic_logs" {
       # would otherwise read as "not ingested yet" for the full 120s and
       # bury the real cause. Three consecutive command failures fail
       # fast with gcloud's own stderr; a timeout prints it too.
-      err_file="$${TMPDIR:-/tmp}/synthetic-log-poll-$$$$.err"
+      err_file="$(mktemp)"
       elapsed=0
       poll_errs=0
       while :; do
-        if found="$$(gcloud logging read "logName=\"projects/${var.project_id}/logs/container\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"${module.cluster.cluster_name}\" AND (jsonPayload.message:\"GCS FUSE buffer exhaustion\" OR jsonPayload.message:\"HPA max-replica saturation\")" --project=${var.project_id} --freshness=10m --limit=10 --format='value(jsonPayload.message)' 2>"$$err_file")"; then
+        if found="$(gcloud logging read "logName=\"projects/${var.project_id}/logs/container\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"${module.cluster.cluster_name}\" AND (jsonPayload.message:\"GCS FUSE buffer exhaustion\" OR jsonPayload.message:\"HPA max-replica saturation\")" --project=${var.project_id} --freshness=10m --limit=10 --format='value(jsonPayload.message)' 2>"$err_file")"; then
           poll_errs=0
         else
-          poll_errs=$$((poll_errs + 1))
+          poll_errs=$((poll_errs + 1))
           found=""
-          if [ "$$poll_errs" -ge 3 ]; then
-            echo "ERROR: the ingestion poll itself failed $$poll_errs times running -- this is not an ingestion delay. Check logging.logEntries.list on the calling service account. gcloud said:" >&2
-            cat "$$err_file" >&2
-            rm -f "$$err_file"
+          if [ "$poll_errs" -ge 3 ]; then
+            echo "ERROR: the ingestion poll itself failed $poll_errs times running -- this is not an ingestion delay. Check logging.logEntries.list on the calling service account. gcloud said:" >&2
+            cat "$err_file" >&2
+            rm -f "$err_file"
             exit 1
           fi
         fi
         ok=0
-        printf '%s' "$$found" | grep -q "GCS FUSE buffer exhaustion" && ok=$$((ok + 1))
-        printf '%s' "$$found" | grep -q "HPA max-replica saturation" && ok=$$((ok + 1))
-        if [ "$$ok" -eq 2 ]; then
+        printf '%s' "$found" | grep -q "GCS FUSE buffer exhaustion" && ok=$((ok + 1))
+        printf '%s' "$found" | grep -q "HPA max-replica saturation" && ok=$((ok + 1))
+        if [ "$ok" -eq 2 ]; then
           echo "Synthetic log entries queryable after $${elapsed}s."
-          rm -f "$$err_file"
+          rm -f "$err_file"
           break
         fi
-        if [ "$$elapsed" -ge 120 ]; then
-          echo "ERROR: synthetic log entries not queryable after $${elapsed}s (found $$ok of 2); the post-incident fixture does not exist and the evaluation must not start." >&2
-          if [ -s "$$err_file" ]; then
+        if [ "$elapsed" -ge 120 ]; then
+          echo "ERROR: synthetic log entries not queryable after $${elapsed}s (found $ok of 2); the post-incident fixture does not exist and the evaluation must not start." >&2
+          if [ -s "$err_file" ]; then
             echo "Last poll stderr:" >&2
-            cat "$$err_file" >&2
+            cat "$err_file" >&2
           fi
-          rm -f "$$err_file"
+          rm -f "$err_file"
           exit 1
         fi
         sleep 5
-        elapsed=$$((elapsed + 5))
+        elapsed=$((elapsed + 5))
       done
     EOT
   }

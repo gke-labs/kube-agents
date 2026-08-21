@@ -16,12 +16,13 @@ exemption yet: no nightly runner exists anywhere in the tree, and an
 exemption into a runner that does not exist is an exemption into nothing.
 It returns with the nightly tier (testing implementation plan, Phase 4).
 
-Pending is not covered: scripts/test_domain_coverage.py counts a domain
-covered only when its task's path is an ACTIVE, uncommented TASKS entry, so
-a scenario parked here as commented-out keeps its domain on that lint's
-allowlist until someone activates it. The two lints ratchet together --
-this one guarantees every task is at least registered, that one guarantees
-a registered-but-dormant task never counts as coverage.
+Today this lint and scripts/test_domain_coverage.py are independent: that
+one counts a domain covered when any task carries its slug and a non-empty
+verification_spec, without reading TASKS at all. The feat/domain-scenarios
+branch redefines covered to require an ACTIVE, uncommented TASKS entry;
+once that lands, the two lints ratchet together -- this one guarantees
+every task is at least registered, that one guarantees a
+registered-but-dormant task never counts as coverage.
 
 TASKS is read from the script's text rather than by executing it: the script
 provisions clusters and reads secrets, so running it to ask a question is not
