@@ -80,10 +80,13 @@ four is necessary rather than sufficient. Against that:
   -- immutable once written, and readable after the fact by anyone auditing.
 - **Attributable.** This is the property the document exists to carry. The root is minted from the
   requester's verified identity and every hop descends from it, so "which human" is a chain walk
-  rather than a correlation exercise across logs.
+  rather than a correlation exercise across logs. Conditional on a request-scoped caller identity,
+  below: where one identity serves several requests at once, a resolution can attach to the wrong
+  chain and the walk then names the wrong human confidently, which is worse than naming none.
 - **Non-escalating.** Also this document, and the stronger claim: a message confers no authority
   because authority does not travel in the message at all. It travels in an entry the receiver
-  cannot read, cannot widen, and cannot resolve unless it was named.
+  cannot read, cannot widen, and cannot resolve unless it was named. Same condition -- "named"
+  has to mean this request.
 - **Non-authoritative.** Untouched by this design and not weakened by it. A capability bounds what a
   peer message may _ask for_; it says nothing about trusting the message content, which stays
   untrusted input under [03](03-security-model.md).
@@ -123,9 +126,15 @@ parent, and the next hop as its own delegate -- under its own namespace, and pas
 downstream.
 
 **Verification.** Five checks, all required. Authenticate the caller and confirm the entry it is
-asking about names that caller as its delegate. Walk the chain to the root. Confirm the root sits
-under `cap.root.*`. Confirm each link is narrower than its parent. Confirm **each link was written
-by the agent its parent named as delegate**. Refuse otherwise.
+asking about names that caller as its delegate. Walk the chain to the root, refusing a chain that
+revisits an entry or exceeds a fixed depth bound. Confirm the root sits under `cap.root.*`. Confirm
+each link is narrower than its parent. Confirm **each link was written by the agent its parent
+named as delegate**. Refuse otherwise.
+
+The caller identity in the first check **must be request-scoped**. An identity shared across
+concurrent requests cannot separate them, and the guarantee this design exists to make is void
+without it. "The identity the verifier authenticates" below states what that requires of the
+runtime.
 
 The first of those is about the caller and the other four are about the chain, which is why an
 earlier draft had only the four. See "The subject prefix does not prove entitlement" below.
@@ -200,8 +209,32 @@ nothing, and a root has no parent whose delegate could be violated. Same precond
 ids are not secrets -- and the same escalation, on the read path.
 
 One field does both jobs, one level apart. The writer of an entry must be the delegate its
-_parent_ names; the resolver of an entry must be the delegate _it_ names. Both are the agent that
+_parent_ names; the resolver of an entry must be the delegate _it_ names. Both are the party that
 was handed the id, which is the point.
+
+### The identity the verifier authenticates
+
+Both delegate rules are only as sharp as the identity they compare against, and an agent id is not
+sharp enough. [02](02-agent-personas.md) fixes cardinality at one Cluster Admin Agent per cluster
+and one Developer Team Agent per namespace, so a single agent id is the named delegate of every
+request routed through it, for every human, at the same time. Check the rules against that and they
+stop separating anything. A broker serving a reader-tier request presents the id of a concurrent
+operator-tier one, is the named delegate of that entry too, and passes all five checks holding a
+capability minted for someone else. No forged write and no second compromise -- and a concurrency
+bug in an honest broker reaches the same place as a malicious one, which is the part that should
+worry you.
+
+**So the identity the verifier authenticates must be scoped to the request, not to the agent.** A
+capability is per-request, and a check that compares it against a per-agent identity is comparing
+against the wrong thing. This is a requirement 09 places on the runtime rather than something the
+KV scheme can fix from inside: whatever issues the broker's credential must issue a distinct one
+per request, so that "the caller" and "the request" are the same subject. The scoped ServiceAccount
+pool in the F10 work is the obvious place for it to come from.
+
+**Until that exists the guarantee is weaker, and it is worth saying which weaker.** With a shared
+agent identity the bound is the widest capability concurrently delegated to that agent, not the
+authority of the human whose request is being served. That is still a bound and it is still worth
+having. It is not the sentence below, and 09 should not be built as though it were.
 
 **Only the verifier reads.** If every broker could walk the chain itself, every broker would need
 read across `cap.*`, which is what makes other agents' roots discoverable in the first place.
@@ -228,19 +261,30 @@ KV scheme fixes that. Real tension with "structural, not behavioural."
 The bound that makes it survivable: a hop can only descend from a parent that named it, and every
 chain terminates at a root the gateway minted from the requester's own authority.
 
-> **A broken hop cannot exceed what it was delegated.** Worst case is "narrowed less than
-> intended", never "escalated past the human who asked."
+> **A broken hop cannot exceed what it was delegated for the request it is serving.** Worst case is
+> "narrowed less than intended", never "escalated past the human who asked."
 
 That is the sentence to have ready when someone probes the design, and it is worth knowing exactly
-what carries it: the two delegate rules above, and nothing else. The write half stops a hop
-descending from an origin it was never handed. The read half stops it presenting that origin
-directly. Drop either and the claim is simply false. It holds under imperfect implementation,
-which is the only kind there is, but it does not hold under a missing rule.
+what carries it: the two delegate rules above, a request-scoped caller identity, and nothing else.
+The write half stops a hop descending from an origin it was never handed. The read half stops it
+presenting that origin directly. The identity is what makes "it" mean this request rather than this
+agent -- drop that and the last five words of the claim go with it. It holds under imperfect
+implementation, which is the only kind there is, but it does not hold under a missing rule.
 
-**Chain depth.** Resolution walks to the root, so a long chain is a lot of KV reads. Those are now
-the verifier's reads rather than every broker's, which makes them cacheable per id -- a chain is
-immutable once written, so the only invalidation is revocation. Not a problem at three or four
-hops. Worth watching if chains get deeper.
+**Chain depth is a refusal, not just a cost.** Resolution walks to the root, so a long chain is a
+lot of KV reads. Those are now the verifier's reads rather than every broker's, which makes them
+cacheable per id -- a chain is immutable once written, so the only invalidation is revocation. Not
+a problem at three or four hops.
+
+The reason the walk is bounded is the other one. A broker holds publish across
+`cap.hop.<its-own-id>.*`, so it can write two entries in its own namespace naming each other as
+parent, each naming itself as delegate, with identical payloads. Every rule holds -- both writes
+are inside its permitted subject, each entry's parent names it as delegate, and `C_new ⊆ C_old` is
+satisfied by equality -- and the walk never reaches a terminal. One broker, using only the
+permissions this design grants it, hangs the verifier. Since the verifier is a single service on
+the request path and nothing authorizes while it is down, that is a fleet-wide outage from one
+compromised or simply buggy hop. Hence the depth bound and the visited set in the checks above,
+and the denial tests for both.
 
 **The verifier is trusted and on the request path.** It is the only component holding read across
 `cap.*`, so compromising it exposes every in-flight capability, and if it is down nothing
@@ -342,6 +386,19 @@ silent.
   pass vacuously -- nothing widens in a one-entry chain, and a root has no parent to violate.
 - **Widening is refused:** a child granting a tier or scope its parent does not hold fails
   resolution, whether it widens by one field or replaces the payload wholesale.
+- **A concurrent capability belonging to another request is refused:** one agent is handed two
+  capabilities at once, at different tiers, for two different humans. Resolving the wider one while
+  serving the narrower one's message fails. This is the test that decides whether the caller
+  identity is really request-scoped, and it passes vacuously against a shared agent identity -- so
+  assert the tiers actually differ and that the refusal is the identity check rather than a
+  coincidence of the chain.
+- **A cyclic chain is refused, and quickly:** two entries in one broker's own namespace naming each
+  other as parent, each naming that broker as delegate, with identical payloads. Resolution fails on
+  the visited set rather than running. Assert the refusal is bounded in time: the failure mode being
+  tested is a verifier that never returns, so a test that only checks the verdict would hang with
+  the bug present.
+- **An over-deep chain is refused:** a well-formed chain longer than the bound fails, terminal
+  `cap.root.*` and all.
 - **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
   including one that terminates at a well-formed `cap.hop.*` entry.
 - **Only the gateway mints roots:** any other connection publishing to `cap.root.*` is rejected by
