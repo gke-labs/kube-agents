@@ -411,7 +411,6 @@ class TestEODWatcherRecap(unittest.TestCase):
 
         self.assertEqual(summary["total_occurrences"], 1)
         self.assertEqual(summary["unique_incidents"], 1)
-        self.assertEqual(summary["forwarded"], 1)
 
     def test_ledger_workload_names_are_used_as_stored(self):
         """The server already stripped the replica hash; a second pass merges services.
@@ -986,7 +985,6 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
 
         self.assertEqual(summary["alerts_posted"], 1)
         self.assertEqual(summary["delivery_failed"], 0)
-        self.assertEqual(summary["delivery_failed_entries"], [])
         report = generate_markdown_report(summary, cluster_name="test-cluster")
         self.assertNotIn("Alerts That Never Reached Chat", report)
         self.assertIn("*Alerts Raised:* 1", report)
@@ -1101,16 +1099,14 @@ class TestTheHeaderGradesTheDayAndNotTheListing(unittest.TestCase):
 
 
 class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
-    """A group's `count` is a sum over every row under the key.
+    """The two alert tallies count rows, not the groups those rows landed in.
 
-    `cap_dropped` and `delivery_failed` are ORs over the same rows, so one
-    withheld alert in a group of ten delivered ones marks the whole group. The
-    recap does not render these, so the per-group subtotals are the only place
-    the distinction between "this group holds a withheld alert" and "how many"
-    survives.
+    Both are printed as a number of alerts and both veto the all-clear, so a
+    group total standing in for either would deny a day over events that
+    reached chat.
     """
 
-    def test_the_undelivered_subtotal_counts_only_the_undelivered_rows(self):
+    def test_the_undelivered_tally_counts_only_the_undelivered_rows(self):
         # One failed post among nine that arrived. Same workload, reason and
         # severity, so the ledger rows land in one group.
         events = [event(notified=True) for _ in range(9)]
@@ -1119,28 +1115,16 @@ class TestTheTalliesCountWhatTheyClaimToCount(unittest.TestCase):
         summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["delivery_failed"], 1)
-        self.assertEqual(len(summary["delivery_failed_entries"]), 1)
-        self.assertEqual(summary["delivery_failed_entries"][0]["delivery_failed_count"], 1)
-        self.assertEqual(summary["delivery_failed_entries"][0]["count"], 10)
 
-    def test_the_withheld_subtotal_counts_only_the_withheld_rows(self):
-        """Two mechanisms keep the nine out, and this asserts they agree.
-
-        `notified` is part of the group key, so the withheld row does not share
-        a group with the nine that alerted and `count` is 1, not 10. The
-        subtotal is asserted alongside it rather than replaced by it: it is
-        what the threshold reads, and a key change that merged these rows again
-        would surface here as the two numbers parting.
-        """
+    def test_the_withheld_tally_counts_only_the_withheld_rows(self):
+        """One withheld alert among nine that reached chat is one, not ten."""
         events = [event(notified=True) for _ in range(9)]
         events.append(event(notified=False))
 
         summary = filter_and_aggregate_events(events)
 
         self.assertEqual(summary["cap_dropped"], 1)
-        self.assertEqual(len(summary["cap_dropped_entries"]), 1)
-        self.assertEqual(summary["cap_dropped_entries"][0]["cap_dropped_count"], 1)
-        self.assertEqual(summary["cap_dropped_entries"][0]["count"], 1)
+        self.assertEqual(summary["alerts_posted"], 9)
 
 
 class TestTheListingIsFixedToInfo(unittest.TestCase):
@@ -1219,7 +1203,6 @@ class TestTheNamespaceFilterDoesNotReachTheAlertVeto(unittest.TestCase):
 
         self.assertEqual(summary["cap_dropped"], 0)
         self.assertEqual(summary["alerts_posted"], 0)
-        self.assertEqual(summary["cap_dropped_entries"], [])
         self.assertIn("Nothing was held back from chat in this window", report)
 
     def test_informational_churn_in_an_excluded_namespace_stays_excluded(self):

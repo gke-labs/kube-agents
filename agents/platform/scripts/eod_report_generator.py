@@ -333,7 +333,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     exclude_ns = excluded_namespaces()
 
     total_occurrences = 0
-    forwarded = 0
     excluded_occurrences = 0
     # Every cluster the window's rows came from, excluded namespaces included:
     # this is the scope the recap looked at, not the scope it found noise in.
@@ -366,7 +365,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             excluded_occurrences += count
         else:
             total_occurrences += count
-            forwarded += 1
 
         # `notified = 0` covers three unrelated outcomes and they must not be
         # reported as one: the severity gate held the event back as
@@ -398,7 +396,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # agree today; they are written apart so they keep agreeing if a
         # future writer batches sightings into one row.
         event_delivery_failed = bool(event.get("delivery_error"))
-        event_cap_dropped = False
         if event_delivery_failed:
             delivery_failed += 1
         elif event.get("notified"):
@@ -409,7 +406,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 suppressed_info += count
         else:
             cap_dropped += 1
-            event_cap_dropped = True
 
         # Used as stored. session_kv_server.clean_workload_name already stripped
         # the replica hash on the way in, and only for `kind == pod`. A
@@ -441,19 +437,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         if group_key in workload_map:
             group = workload_map[group_key]
             group["count"] += count
-            # `notified` is not merged: it is part of the key, so every row
-            # here already agrees on it.
-            group["cap_dropped"] = group["cap_dropped"] or event_cap_dropped
-            group["delivery_failed"] = group["delivery_failed"] or event_delivery_failed
-            # Counted alongside the flags, because the flags are ORs while
-            # `count` sums the whole group. Ten delivered rows and one that
-            # failed is `delivery_failed = True` with `count = 11`, and a
-            # listing that prints `count` claims eleven alerts never reached
-            # chat when one did not.
-            group["cap_dropped_count"] += count if event_cap_dropped else 0
-            group["delivery_failed_count"] += count if event_delivery_failed else 0
-            if event_delivery_failed and not group["delivery_error"]:
-                group["delivery_error"] = str(event.get("delivery_error", ""))
             if not group["message"]:
                 group["message"] = msg
         else:
@@ -469,12 +452,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 # `notified` is a key field in its own right.
                 "excluded": excluded,
                 "notified": bool(event.get("notified")),
-                "cap_dropped": event_cap_dropped,
-                "delivery_failed": event_delivery_failed,
-                "delivery_error": str(event.get("delivery_error", "")) if event_delivery_failed else "",
                 "count": count,
-                "cap_dropped_count": count if event_cap_dropped else 0,
-                "delivery_failed_count": count if event_delivery_failed else 0,
                 "message": msg,
             }
 
@@ -495,35 +473,9 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not e["excluded"] and e["severity"] in LISTED_SEVERITIES and not e["notified"]
     ]
 
-    # Aggregated; counted in the report, never itemised in it.
-    # `generate_markdown_report` lists informational events only, so neither list
-    # reaches the chat message — but the two counts beside them do, on their own
-    # ⚠️ lines above the body. The lists are part of the summary because callers
-    # other than the report read it, and because those two counts also veto the
-    # ✅ all-clear and the 🟢 header — a recap may
-    # decline to report a withheld alert, but it may not assert the day was clean
-    # over one. Kept as lists rather than bare counters so a consumer can say which
-    # workloads, and so restoring a listing is a rendering change and not a
-    # re-derivation.
-    #
-    # `EOD_EXCLUDE_NAMESPACES` deliberately does not apply to either: that filter drops
-    # routine churn from the breakdown, and an alert nobody received is not churn.
-    cap_dropped_entries = [e for e in workload_map.values() if e["cap_dropped"]]
-
-    # Letting the namespace filter reach this one would be worse still: a ceiling drop
-    # is counted by `k8s_event_watcher_events_quota_suppressed_total` and
-    # `GET /v1/alert-quota`, whereas nothing anywhere counts a failed delivery — the
-    # alert is not in chat and the metric recorded it as sent. The ledger's
-    # `delivery_error` column is the only trace, and this list is the only thing
-    # that reads it.
-    delivery_failed_entries = [e for e in workload_map.values() if e["delivery_failed"]]
-
+    # Descending, because the listing is cut at `_ENTRY_LIMIT` and the groups
+    # that survive the cut should be the noisiest ones.
     filtered_entries.sort(key=lambda x: x["count"], reverse=True)
-    # Sorted on the same number each section prints, so that the five that
-    # survive the `[:5]` cut are the five worst by that section's measure
-    # rather than the five noisiest workloads that happen to appear in it.
-    cap_dropped_entries.sort(key=lambda x: x["cap_dropped_count"], reverse=True)
-    delivery_failed_entries.sort(key=lambda x: x["delivery_failed_count"], reverse=True)
 
     # No dedup ratio here, deliberately: every ledger row is already one
     # deduplicated incident, so a derived "noise reduction" would measure key
@@ -531,7 +483,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # ratio is reported".
     return {
         "total_occurrences": total_occurrences,
-        "forwarded": forwarded,
         # Excluded namespaces are out of scope here, matching
         # `total_occurrences` above: the headline counts and the breakdown
         # under them describe one scope, not two.
@@ -548,8 +499,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cap_dropped": cap_dropped,
         "delivery_failed": delivery_failed,
         "entries": filtered_entries,
-        "cap_dropped_entries": cap_dropped_entries,
-        "delivery_failed_entries": delivery_failed_entries,
     }
 
 
@@ -702,15 +651,10 @@ def generate_markdown_report(
     # failed delivery is not counted anywhere at all — the recap is what reaches
     # the on-call without being asked.
     #
-    # Before this the two counts were computed, thresholded, sorted and then
-    # only ever read as veto terms on the ✅ and the 🟢. A day whose ceiling ate
-    # thirty Criticals rendered as an ordinary card whose one signal was the
-    # *absence* of the all-clear, under "Alerts Raised: 0" — which reads as good
-    # news. Nobody notices a line that is not there.
-    #
-    # Counts, not listings: `cap_dropped_entries` and `delivery_failed_entries`
-    # carry the workloads for a caller that wants them, and the point here is
-    # that the reader is told at all, in the two lines above the fold.
+    # Stated, not left to the absence of the all-clear: a day whose ceiling ate
+    # thirty Criticals otherwise renders as an ordinary card under "Alerts
+    # Raised: 0", and nobody notices a line that is not there. Counts rather
+    # than listings, because this recap never names a withheld alert.
     if not problems:
         if summary.get("cap_dropped"):
             lines.append(
