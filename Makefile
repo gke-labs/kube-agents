@@ -287,8 +287,14 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # of its tests and errors on both. So it runs under its own target, and
 # scripts/test_test_discovery.py keeps the exclusion explicit rather than an
 # accident of the globs above.
-test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
-	@python3 -m pip install -e bench/ pytest
+# pyyaml is a test-only dependency and is named here rather than in bench's
+# runtime `dependencies`: the harness never parses a task.yaml itself (devops-
+# bench does that before any of this package is imported). One test reads the
+# specs directly -- the roster-collision sweep in tests/test_verifiers.py,
+# which has to see every task's phrases at once -- so the parser belongs with
+# the test runner. Keep in step with bench/pyproject.toml's `dev` group.
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
+	@python3 -m pip install -e bench/ pytest pyyaml
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
