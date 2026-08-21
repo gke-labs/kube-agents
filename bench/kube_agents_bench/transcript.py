@@ -73,12 +73,23 @@ class TranscriptSnapshot:
             dates a snapshot unambiguously in a debug session.
         prompt_head: First 64 characters of the prompt that produced this
             transcript, for human correlation only — never matched against.
+        started_at: Wall-clock ``time.time()`` at which the harness began this
+            run, stamped by the caller. Unlike ``seq`` and ``prompt_head``
+            this one IS matched against: it is how ``ledger_issue_contains``
+            tells the GitHub artifact this run published from the one the
+            previous run left behind at the same issue number. Wall clock
+            rather than ``time.monotonic()`` deliberately — it is compared to
+            a timestamp another machine wrote into an issue body, which a
+            process-local monotonic clock cannot be. Left ``0.0`` when the
+            caller does not stamp it, and consumers that need it must treat
+            that as ``status="error"``, not as "epoch".
     """
 
     output: str
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     seq: int = 0
     prompt_head: str = ""
+    started_at: float = 0.0
     # What the user ultimately receives: the delegating turn's closing
     # message plus, when work was delegated, the delivered card results and
     # artifacts (composed by the harness's _append_final; poll-turn recitals
@@ -97,8 +108,14 @@ def set(  # noqa: A001 - deliberate, matches get/clear
     trajectory: list[dict[str, Any]],
     prompt: str = "",
     final_message: str = "",
+    started_at: float = 0.0,
 ) -> None:
-    """Stash the just-finished run's transcript for the verifiers."""
+    """Stash the just-finished run's transcript for the verifiers.
+
+    ``started_at`` is the wall-clock instant the run BEGAN, which the caller
+    has to have captured before invoking the agent; it cannot be taken here,
+    where the run is already over.
+    """
     global _current, _seq
     _seq += 1
     _current = TranscriptSnapshot(
@@ -107,6 +124,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
         seq=_seq,
         prompt_head=prompt[:64],
         final_message=final_message or output,
+        started_at=started_at,
     )
 
 

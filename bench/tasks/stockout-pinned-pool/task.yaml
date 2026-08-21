@@ -22,14 +22,19 @@
 # blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: stockout-pinned-pool
 name: Capacity audit names the pool that cannot scale
+# The prompt no longer asks for a summary in the final answer: the SOP's
+# closing rule is one line that restates nothing, so asking for a summary
+# asked the agent to break its own SOP in order to be graded. The findings go
+# where the SOP puts them, and the verification reads them there.
 prompt: >-
   Run the fleet stockout prevention and capacity audit, following the
-  stockout-prevention SOP. Summarize the findings in your final answer.
+  stockout-prevention SOP.
 expected_output: >-
-  The report names pinned-inference-pool as the pool at risk, states why
+  The ledger issue names pinned-inference-pool as the pool at risk, states why
   (single zone, node autoscaling capped, pending replicas the pool cannot
   place), and quantifies the shortfall in nodes or pods rather than issuing
-  a generic capacity warning.
+  a generic capacity warning. The closing response is the SOP's one line,
+  carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -37,29 +42,38 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: capacity
 
+# Graded against the LEDGER, not the chat reply: the stockout-prevention SOP
+# mandates a one-line closing response that deliberately restates nothing, so
+# a report_contains check would fail a conformant run.
 verification_spec:
-  - name: report-names-the-planted-pool
+  # scope: finding_ids -- the planted noun is an object name, so a filed
+  # finding carries it in its derived id
+  # ("<check>.<cluster>.<namespace>.<object>"). Against the body it would also
+  # pass on a pool inventory listing every pool and faulting none.
+  - name: a-finding-was-filed-against-the-planted-pool
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends -- polling would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # The planted pool name; nothing else in a capacity report plausibly
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding_ids
+      # The planted pool name; nothing else in a capacity finding id plausibly
       # contains it.
       required_phrases: ["pinned-inference-pool"]
-  - name: report-names-the-live-backlog
+  - name: ledger-names-the-live-backlog
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
+      type: ledger_issue_contains
+      audit: stockout-prevention
       # The planted backlog is live: the HPA's desired count exceeds what the
       # full pool can run, so Pending pods exist for the audit to see.
       #
       # Bare "Pending" is not usable here. The verifier lowercases both sides
-      # and does a plain substring test with no word boundaries, and "pending"
+      # and does a plain substring test with no word boundaries (the ledger
+      # check reuses report_contains' matching semantics verbatim), and "pending"
       # is a suffix of depending, impending, spending and suspending -- so
       # "depending on the workload profile" would satisfy an objective whose
       # only job is to prove the report saw the live backlog. Every phrase
