@@ -57,8 +57,10 @@ scheduler treats every run as silent. The report reaches the user through
 
 import json
 import os
+import fcntl
 import re
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -108,6 +110,20 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
 # a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
 RECONCILE_SCRIPT = "/opt/data/scripts/cluster_agent_reconcile.py"
 
+# The reconcile that creates the Cluster Agents runs on its own cron at `11 * * * *`,
+# while this gate runs every minute. On a fresh install the gate therefore reaches the
+# roster up to 59 minutes before anything has populated it, reads it as empty, and the
+# sweep degrades to the Platform Agent walking the whole fleet alone. So the gate runs
+# the reconcile itself and waits for it, rather than racing it.
+RECONCILE_LOCK = ".bootstrap_reconcile.lock"
+RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
+RECONCILE_TIMEOUT_SECONDS = 240
+# After this many failed reconciles the sweep proceeds anyway. A reconcile that cannot
+# succeed (no IAM to list clusters, a project with one cluster and nothing to create) must
+# not hold onboarding shut forever — a solo sweep is a worse report, no report is none.
+MAX_RECONCILE_ATTEMPTS = 5
+
+
 def _data_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
 
@@ -142,6 +158,86 @@ def _roster_command() -> str:
     has hit that twice before (see the notes in agents/platform/config.yaml).
     """
     return f"HERMES_HOME={_data_dir()} /opt/hermes/.venv/bin/hermes profile list"
+
+
+def _reconcile_attempts(data_dir: Path) -> int:
+    try:
+        return int((data_dir / RECONCILE_ATTEMPTS_MARKER).read_text(encoding="utf-8").strip())
+    except Exception:  # noqa: BLE001 - absent or unreadable counts as no attempts yet
+        return 0
+
+
+def _record_reconcile_attempt(data_dir: Path, attempts: int) -> None:
+    try:
+        (data_dir / RECONCILE_ATTEMPTS_MARKER).write_text(f"{attempts}\n", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 - never fail the cron run
+        sys.stderr.write(f"bootstrap_scan_gate: could not record reconcile attempt: {e}\n")
+
+
+def ensure_cluster_agents(data_dir: Path) -> bool:
+    """Create the Cluster Agents, blocking until that finishes.
+
+    Returns True when the sweep may be filed. False means "not yet, retry on the
+    next tick" — the caller must not file the card, because a sweep filed against
+    an empty roster is a sweep with no fan-out, and the marker it writes makes that
+    permanent.
+
+    Running the reconcile here rather than asking the sweep's worker to run it (as
+    Step 1 of the card body used to) is what makes the result checkable. The worker
+    read the script's stderr and interpreted it: on 2026-08-21 the reconcile
+    succeeded — ``created=0 pruned=1 kept=4`` — while printing two ENOENT warnings,
+    and the worker reported the roster as unavailable and audited the fleet alone.
+    An exit code cannot be misread that way.
+    """
+    if not Path(RECONCILE_SCRIPT).exists():
+        return True  # deployment without Cluster Agents; the solo sweep is correct here
+
+    attempts = _reconcile_attempts(data_dir)
+    if attempts >= MAX_RECONCILE_ATTEMPTS:
+        sys.stderr.write(
+            f"bootstrap_scan_gate: reconcile failed {attempts} times; "
+            "filing the sweep anyway against whatever roster exists\n"
+        )
+        return True
+
+    lock_path = data_dir / RECONCILE_LOCK
+    try:
+        lock = open(lock_path, "w")  # noqa: SIM115 - held for the duration of the run
+    except Exception as e:  # noqa: BLE001 - never fail the cron run
+        sys.stderr.write(f"bootstrap_scan_gate: could not open {lock_path}: {e}\n")
+        return False
+
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # A previous tick is still reconciling. The gate fires every minute and
+            # the reconcile takes tens of seconds, so overlap is expected, not an error.
+            return False
+
+        _record_reconcile_attempt(data_dir, attempts + 1)
+        try:
+            proc = subprocess.run(
+                [sys.executable, RECONCILE_SCRIPT],
+                capture_output=True,
+                text=True,
+                timeout=RECONCILE_TIMEOUT_SECONDS,
+                env={**os.environ, "HERMES_HOME": str(data_dir)},
+            )
+        except Exception as e:  # noqa: BLE001 - timeout or spawn failure; retry next tick
+            sys.stderr.write(f"bootstrap_scan_gate: reconcile did not complete: {e}\n")
+            return False
+
+        if proc.returncode != 0:
+            sys.stderr.write(
+                f"bootstrap_scan_gate: reconcile exited {proc.returncode}; "
+                f"retrying next tick. stderr: {proc.stderr.strip()[:500]}\n"
+            )
+            return False
+
+    _record_reconcile_attempt(data_dir, 0)
+    sys.stderr.write("bootstrap_scan_gate: Cluster Agent roster reconciled\n")
+    return True
 
 
 def should_skip(data_dir: Path) -> bool:
@@ -188,14 +284,11 @@ def _task_body() -> str:
         "answer another way. A step that cannot answer is a finding, not a puzzle. Guessing "
         "costs far more than the missing answer is worth, and it produces a report that looks "
         "complete while resting on invented data.\n\n"
-        "**Step 1 — reconcile the Cluster Agent roster.** If "
-        f"`{RECONCILE_SCRIPT}` exists, run it **exactly once**. It is best-effort: it may create "
-        "no agents at all, and `created=0 pruned=0 kept=0` is a normal, successful result. It "
-        "deliberately does NOT create an agent for the management cluster this pod runs on, and "
-        "it skips creating anything at all when it cannot list the project's clusters. Running "
-        "it again does not change that. If the script is absent, or the run fails, skip this "
-        "step.\n\n"
-        "**Whatever it reports, do not create, repair, or delete a profile yourself.** Profile "
+        "**Step 1 — the Cluster Agent roster is already reconciled.** This card was filed only "
+        f"after `{RECONCILE_SCRIPT}` ran to completion and exited 0, so the roster you read in "
+        "Step 3 is current. Do not run it yourself. It may legitimately have created no agents; "
+        "an empty roster is a supported state, not a failure to repair.\n\n"
+        "**Do not create, repair, or delete a profile yourself.** Profile "
         "lifecycle belongs to that script alone. It holds the guard that keeps the management "
         "cluster from getting its own agent, and calling `cluster_agent_profile.py` directly "
         "goes around that guard: the profile you create is one the next reconcile run will "
@@ -204,7 +297,7 @@ def _task_body() -> str:
         "**Step 2 — scan the management cluster yourself.** No Cluster Agent covers it, so "
         "its inventory is yours to produce. Skipping it would leave a hole exactly where the "
         "harness runs.\n\n"
-        "**Step 3 — fan out.** Read the roster with exactly this command, once:\n\n"
+        "**Step 3 — fan out.** Read the roster with exactly this command, exactly once:\n\n"
         f"    {_roster_command()}\n\n"
         "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
         "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
@@ -354,6 +447,8 @@ def main(data_dir: Path | None = None) -> int:
         data_dir = _data_dir()
     if should_skip(data_dir):
         return 0  # silent no-op: already filed, scanned, or delivered
+    if not ensure_cluster_agents(data_dir):
+        return 0  # roster not ready; the next tick retries, no marker written
     file_scan_task(data_dir)
     # Stdout stays empty on purpose — this job never speaks to the user.
     return 0

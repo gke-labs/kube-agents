@@ -18,6 +18,7 @@ again.
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -350,6 +351,46 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("do not improvise", body.lower())
         self.assertIn("exactly once", body)
 
+    def test_reconcile_runs_before_the_sweep_is_filed(self):
+        """A sweep filed against a not-yet-reconciled roster fans out to nobody.
+
+        `cluster-agent-reconcile` is on `11 * * * *` and this gate is on
+        `* * * * *`, so on a fresh install the gate reaches an empty roster up to
+        59 minutes before anything populates it — and the marker it writes makes
+        that solo sweep the only one that ever runs.
+        """
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(len(calls), 1)
+        self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT, calls[0])
+
+    def test_a_failed_reconcile_defers_the_sweep_without_marking_it(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_reconcile_stops_blocking_onboarding_after_repeated_failure(self):
+        """A reconcile that can never succeed must not hold onboarding shut.
+
+        No IAM to list clusters is a permanent condition on some installs. A
+        solo sweep is a worse report; no report at all is none.
+        """
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
+            str(bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS)
+        )
+        with mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
 
@@ -363,17 +404,18 @@ class ScanGateTest(unittest.TestCase):
         shell calls against arm 1a's 65.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn("do not create, repair, or delete a profile yourself", body)
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn("Do not create, repair, or delete a profile yourself", body)
         self.assertIn("An empty roster is a supported state", body)
-        self.assertIn("created=0 pruned=0 kept=0", body)
+        self.assertIn("Do not run it yourself", body)
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
-        # Cluster Agents ship now, but the script is still absent wherever an older
-        # image is running or no cluster has an agent yet. The same card must produce a
-        # report there rather than fanning out to an empty roster and writing nothing.
+        # A single-cluster install reconciles to an empty roster, and that is the
+        # supported answer. The same card must still produce a report there rather
+        # than fanning out to an empty roster and writing nothing.
         body = bootstrap_scan_gate._task_body()
-        self.assertIn("If the script is absent", body)
-        self.assertIn("no Cluster Agents", body)
+        self.assertIn("there are no Cluster Agents", body)
+        self.assertIn("do the whole sweep yourself", body)
 
     def test_body_propagates_idempotency_keys_to_the_fan_out(self):
         # The root card is guarded by a marker and a key; the cards it spawns
