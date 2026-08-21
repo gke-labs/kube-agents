@@ -34,14 +34,19 @@
 # it forbids is worse than none. Documented residual.
 id: obtainability-planted-pdb
 name: Reliability sweep finds the deployment a drain would kill
+# The prompt no longer asks for a summary in the final answer: the SOP's
+# closing rule is one line that restates nothing, so asking for a summary
+# asked the agent to break its own SOP in order to be graded. The findings go
+# where the SOP puts them, and the verification reads them there.
 prompt: >-
   Run the workload reliability audit against the fleet, following the
-  obtainability-audit SOP. Summarize the findings in your final answer.
+  obtainability-audit SOP.
 expected_output: >-
-  The report names the checkout-gateway deployment in seeded-reliability as
-  unprotected against drains and upgrades (two replicas, no PodDisruptionBudget) and
-  carries a concrete recommendation. Every conclusion cites live cluster
-  reads made during this run.
+  The ledger issue names the checkout-gateway deployment in seeded-reliability
+  as unprotected against drains and upgrades (two replicas, no
+  PodDisruptionBudget) and carries a concrete recommendation. Every conclusion
+  cites live cluster reads made during this run. The closing response is the
+  SOP's one line, carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -50,26 +55,59 @@ validated: false
 domain: reliability
 
 # Exact checks: we planted both nouns (the deployment name and the missing
-# object's kind), so requiring them is fair.
+# object's kind), so requiring them is fair. Graded against the LEDGER, not
+# the chat reply: the obtainability-audit SOP mandates a one-line closing
+# response that deliberately restates nothing, so a report_contains check
+# would fail a conformant run.
 verification_spec:
-  - name: report-names-the-planted-workload
+  # scope: finding_ids -- the planted noun is an OBJECT name, so it belongs in
+  # the id audit_report.py derives ("<check>.<cluster>.<namespace>.<object>").
+  # Against the id it says a finding was filed on checkout-gateway; against
+  # the body it would also pass on a passing mention in an inventory table.
+  - name: a-finding-was-filed-against-the-planted-workload
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends -- polling would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # The planted deployment name.
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: finding_ids
       required_phrases: ["checkout-gateway"]
-  - name: report-names-the-missing-budget
+  - name: a-pdb-check-finding-was-filed
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # Either the object kind or its universal abbreviation.
-      any_of_phrases: ["PodDisruptionBudget", "PDB"]
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      # scope: finding_ids, for the same reason as the check above, and the
+      # reason is NOT the one the previous body-scoped version gave. This was
+      # any_of_phrases: ["PodDisruptionBudget", "PDB"] against the body, on the
+      # theory that the explanation lives in prose. It does -- but so does
+      # `_render_check_evidence`, the per-cluster {check, command} table
+      # `render_issue_body` appends to every ledger. `checks_run` is required
+      # on every cluster, so a run that swept the fleet and filed NOTHING
+      # still publishes a row reading `| seeded-reliability | no-pdb | ... |`,
+      # and the verifier lowercases both sides and takes a bare substring:
+      # "pdb" is inside "no-pdb". The objective scored a clean sweep.
+      #
+      # The roster slug is the discriminator instead. `derive_finding_id`
+      # composes "<check>.<cluster>.<namespace>.<object>", so a slug reaches
+      # the delta block only if a finding was FILED under that check, and
+      # `_shorten_id` trims the longest segment and never the leading check
+      # slug -- the phrase cannot be truncated away. Both roster spellings are
+      # accepted: the planted defect is an absent budget (`no-pdb`), but an
+      # audit that reads it as present-and-ineffective files `blocking-pdb`,
+      # and that is the same problem correctly identified.
+      #
+      # Residual, stated rather than papered over: this scores a PDB finding
+      # anywhere in the fleet, and the sibling check above scores a finding
+      # anywhere on checkout-gateway. Nothing binds them into one finding.
+      # Binding them would mean asserting "no-pdb.<cluster>.<namespace>." as a
+      # prefix, and the namespace segment is fixture detail this spec does not
+      # own -- a wrong guess fails a correct run, which is the worse error.
+      scope: finding_ids
+      any_of_phrases: ["no-pdb", "blocking-pdb"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (the trajectory carries only the
   # delegating turn's calls), so read-only is asserted against the cluster

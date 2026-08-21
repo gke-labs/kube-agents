@@ -309,22 +309,76 @@ Every leaf takes an optional `name` (its own label in the report) and `kubeconfi
 specific cluster). Unknown keys are rejected rather than ignored, so a typo fails loudly instead of
 silently running the check with defaults.
 
-| `type`              | Fields                                                                                                                                                   | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pod_healthy`       | `selector` (required), `namespace`                                                                                                                       | Waits for matched pods to be Ready, falling back to a Running-phase check when the readiness condition never propagates.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `resource_property` | `kind` (required), `resource_name` _or_ `selector`, `namespace`, `path`, `op`, `value`, `across_matches`                                                 | Compares a JSONPath property of the matched objects. The general-purpose one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `scaling_complete`  | `deployment` (required), `min_replicas`, `max_replicas`, `namespace`                                                                                     | Polls `status.readyReplicas` into `[min, max]`. Leaving `max_replicas` unset checks scale-up only; setting it catches scale-down and cost targets too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `report_contains`   | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may), `scope` (`final` \| `full`, default `final`) | Case-insensitive substring checks against the agent's answer, not the cluster. `final` is what the user ultimately receives: the delegating turn's closing message plus, when work was delegated, the delivered card results and artifacts — poll-turn recitals excluded. `full` is the accumulated output (every settled closer on top of that), which passes a phrase merely quoted in progress chatter and false-fails a forbidden phrase in quoted material; use it only for genuinely whole-transcript checks. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point. |
-| `tool_called`       | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                                                                  | Counts the **delegating turn's** calls only — poll turns are excluded by design and a delegated worker's calls never reach the trajectory, so this asserts what the router did, never what a worker did on a cluster; use cluster-state checks (`resource_property`) for mutation safeguards. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in router-level safeguards, where an attempt should trip the check.                                                                                                                |
+| `type`                  | Fields                                                                                                                                                                                                        | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pod_healthy`           | `selector` (required), `namespace`                                                                                                                                                                            | Waits for matched pods to be Ready, falling back to a Running-phase check when the readiness condition never propagates.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `resource_property`     | `kind` (required), `resource_name` _or_ `selector`, `namespace`, `path`, `op`, `value`, `across_matches`                                                                                                      | Compares a JSONPath property of the matched objects. The general-purpose one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `scaling_complete`      | `deployment` (required), `min_replicas`, `max_replicas`, `namespace`                                                                                                                                          | Polls `status.readyReplicas` into `[min, max]`. Leaving `max_replicas` unset checks scale-up only; setting it catches scale-down and cost targets too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `report_contains`       | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may), `scope` (`final` \| `full`, default `final`)                                                      | Case-insensitive substring checks against the agent's answer, not the cluster. `final` is what the user ultimately receives: the delegating turn's closing message plus, when work was delegated, the delivered card results and artifacts — poll-turn recitals excluded. `full` is the accumulated output (every settled closer on top of that), which passes a phrase merely quoted in progress chatter and false-fails a forbidden phrase in quoted material; use it only for genuinely whole-transcript checks. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point. |
+| `tool_called`           | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false)                                                                                                                       | Counts the **delegating turn's** calls only — poll turns are excluded by design and a delegated worker's calls never reach the trajectory, so this asserts what the router did, never what a worker did on a cluster; use cluster-state checks (`resource_property`) for mutation safeguards. `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in router-level safeguards, where an attempt should trip the check.                                                                                                                |
+| `ledger_issue_contains` | `audit` (required, one of the eight fleet-audit stream ids), `required_phrases`, `any_of_phrases`, `forbidden_phrases`, `scope` (`body` \| `finding_ids`, default `body`), `max_clock_skew_sec` (default 120) | The same phrase semantics as `report_contains`, but against the **GitHub ledger issue this run published** rather than the chat reply — the surface a fleet audit actually writes its findings to. See [Grading a fleet audit](#grading-a-fleet-audit) below, which you must read before using it: it needs a credential, and its freshness binding is what stops it passing forever.                                                                                                                                                                                                                                             |
 
-The two transcript verifiers read the run's stashed output and trajectory
-(`kube_agents_bench/transcript.py`), so unlike the cluster verifiers they need no cluster and set
-`mode: assert` (the transcript is immutable; converging on it only waits out the budget). They fail
-closed: when no transcript was stashed — the harness never completed an execution — they return
-`status: "error"`, which surfaces as `VerificationCoverage < 1.0` rather than a pass or a fail. One
-interaction to know about: `BENCH_NO_INFRA=true` makes the eval harness skip **all** verification,
-transcript checks included, so a `deployer: noop` task that relies on these must run without it —
-the noop deployer alone already skips provisioning.
+The three transcript verifiers read the run's stash (`kube_agents_bench/transcript.py`), so unlike
+the cluster verifiers they need no cluster and set `mode: assert` (the transcript is immutable;
+converging on it only waits out the budget). They fail closed: when no transcript was stashed — the
+harness never completed an execution — they return `status: "error"`, which surfaces as
+`VerificationCoverage < 1.0` rather than a pass or a fail. One interaction to know about:
+`BENCH_NO_INFRA=true` makes the eval harness skip **all** verification, transcript checks included,
+so a `deployer: noop` task that relies on these must run without it — the noop deployer alone
+already skips provisioning.
+
+##### Grading a fleet audit
+
+Every fleet-audit SOP ends the run with **one line that deliberately restates nothing**; the
+findings go to a GitHub issue, one per audit stream, which `audit_report.py finish` rewrites in
+full on every run. So `report_contains` is the wrong surface for those six scenarios: it fails a
+_conformant_ run. Widening it to `scope: full` is worse — it would pass on a noun that appeared in
+tool output the agent never reported on. `ledger_issue_contains` grades the artifact instead.
+
+**Finding the issue.** From the run's own final message, because that is the only channel that
+exists: `start` prints `"issue": null` until a ledger exists, the audit's on-disk `.lease` marker
+records the repo and the stream but no issue number, and the audit runs in a delegated worker whose
+tool calls never reach the trajectory. What does cross back is `finish`'s `issue_url`, which the
+SOP requires every non-silent report to carry in full — and an on-demand run, which is what an eval
+task is, is never silent. The URL is a **pointer only**: every phrase assertion is made against
+what the GitHub API returns for it.
+
+**Freshness, which is the whole difficulty.** A stream owns one issue forever and rewrites it in
+place, so its number, title and labels are identical run over run. A check that merely found _an_
+issue containing the planted noun would pass for good after the first green run. Three bindings
+close that:
+
+1. the issue must carry the `audit:<audit>` label;
+2. its body must carry the footer `audit_report.py` renders —
+   "Generated by the Platform Agent `<audit>` watchdog at &lt;ISO-8601&gt;." — naming the same stream;
+3. that stamp must be no earlier than the moment the harness started _this_ run, less
+   `max_clock_skew_sec`. It is the only per-run identifier on the artifact, it is written by the
+   audit script rather than by the model, and it moves on every run even when the fleet is
+   unchanged. (Not GitHub's `updated_at`: an edit that changes nothing need not move it.)
+
+Exactly one of the URLs a report names may satisfy all three; two would mean the report claimed two
+ledgers for a stream that owns one, and that is a fail.
+
+**`scope: finding_ids`.** Reach for it whenever the phrase is a **cluster** name. The rendered
+body's Scope table enumerates every audited cluster on every run, so requiring `seeded-c` in the
+body would pass a run that swept the fleet and faulted nobody. The hidden
+`<!-- audit-findings: [...] -->` block carries the ids `audit_report.py` derived as
+`<check>.<cluster>.<namespace>.<object>`, so a name appears there only when a finding was actually
+filed against it. The same argument applies to any planted _object_ name that a clean inventory
+table would also mention.
+
+**Credential.** A GitHub token in the verifier process's environment: `BENCH_GITHUB_TOKEN`
+preferred, `GITHUB_TOKEN` as a fallback. It needs one permission, `issues: read`, on the eval
+GitOps repositories — private, ours, and throwaway, which is what makes reading them from CI
+acceptable. Deliberately **not** the agent's own credential: the in-cluster `github-token-minter`
+mints a write-scoped installation token held by the credential-proxy sidecar, and reaching into the
+pod under test to verify it with the very credential that produced the artifact couples the gate to
+the thing it grades. An absent token is `status: "error"`, never a pass.
+
+Everything this check needs and cannot get is an error rather than a fail: no transcript, no
+run-start clock, no token, an unreachable API, a `401`/`403`. Everything it can observe and finds
+wrong is a fail: no issue URL in the report, a `404`, an empty or footerless body, another stream's
+ledger, a previous run's stamp, a missing phrase.
 
 `resource_property` names its target with `resource_name`, not `name` — `name` is already the
 check's own label — and takes `resource_name` or `selector`, never both.

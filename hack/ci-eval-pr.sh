@@ -155,8 +155,16 @@ TASKS=(
   #       honoured, so the value alone only moves the failure to the clone.
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
   #       (2026-08-28 for the pool, 2026-09-20 for the disks).
-  #   A4  the six audit scenarios' objectives read the final message, which
-  #       the SOPs keep to one line -- they need an artifact verifier first.
+  #   A4  cleared in the code, open on one credential. The six audit
+  #       scenarios' objectives no longer read the final message (which the
+  #       SOPs keep to one line); they use ledger_issue_contains, which reads
+  #       the GitHub ledger issue the run published and proves it is THIS
+  #       run's by the generated-at stamp audit_report.py renders into it.
+  #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
+  #       issues:read on the eval GitOps repos, which this script does not
+  #       export and Prow does not supply -- provision it with A1's minter
+  #       work. Until then those checks return status=error, which drops
+  #       VerificationCoverage below the gate's 1.0 floor by design.
   #   A5  every resource_property safeguard in the corpus (six scenarios,
   #       cluster-agent-crashloop-debug included) reads the ambient
   #       kubeconfig, and the only get-credentials above is for

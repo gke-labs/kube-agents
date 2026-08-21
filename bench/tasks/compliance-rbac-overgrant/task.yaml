@@ -25,14 +25,18 @@
 # blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
+# The prompt no longer asks for a summary in the final answer: the SOP's
+# closing rule is one line that restates nothing, so asking for a summary
+# asked the agent to break its own SOP in order to be graded. The findings go
+# where the SOP puts them, and the verification reads them there.
 prompt: >-
-  Run the security and RBAC posture audit, following the compliance-audit
-  SOP. Summarize the findings in your final answer.
+  Run the security and RBAC posture audit, following the compliance-audit SOP.
 expected_output: >-
-  The report names debug-binding as granting cluster-admin to the default
+  The ledger issue names debug-binding as granting cluster-admin to the default
   ServiceAccount in seeded-security, explains the privilege-escalation surface,
   and carries a remediation. Every finding is reproducible from a command run
-  in this audit.
+  in this audit. The closing response is the SOP's one line, carrying the
+  ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -41,15 +45,65 @@ validated: false
 domain: security
 
 verification_spec:
-  - name: report-names-the-planted-binding
+  # Graded against the LEDGER, not the chat reply: the compliance-audit SOP
+  # mandates a one-line closing response that deliberately restates nothing,
+  # so a report_contains check here would fail a perfectly conformant run.
+  # The verifier reads the GitHub issue this run published and proves it is
+  # this run's by the generated-at stamp audit_report.py renders into it.
+  - name: ledger-names-the-planted-binding
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends -- polling would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # Both planted nouns: the binding name and the role it over-grants.
-      required_phrases: ["debug-binding", "cluster-admin"]
+      type: ledger_issue_contains
+      audit: compliance-audit
+      # The planted binding name, in the ledger's prose. "cluster-admin" used
+      # to sit alongside it here as the second "planted noun" and has moved to
+      # the ids check below, because on the body it could not fail:
+      # `render_issue_body` always appends `_render_check_evidence`, a
+      # {cluster, check, command} table over the required `checks_run`, and
+      # this stream's roster carries the slug `cluster-admin-binding`. Any run
+      # that declared the check -- including one that filed nothing -- put the
+      # substring in its own evidence table. The phrase was inert, so the
+      # objective was really only ever asserting "debug-binding".
+      #
+      # "debug-binding" itself is a planted object name, not a roster slug, so
+      # it survives the same scrutiny and stays. It is reachable from a
+      # `checks_run` command that named the object while finding nothing
+      # wrong, which is why the two ids checks below are what carry the
+      # weight; this one asserts the weaker, still-worth-having claim that the
+      # ledger a human reads names the object in prose.
+      required_phrases: ["debug-binding"]
+  # The binding name again, but against the finding ids rather than the body:
+  # this is what says a finding was FILED on the over-grant, not merely that
+  # the noun appears somewhere in the prose.
+  - name: a-finding-was-filed-against-the-binding
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: compliance-audit
+      scope: finding_ids
+      required_phrases: ["debug-binding"]
+  # The over-granted role, relocated from the body check above and expressed
+  # as what it actually is: a roster slug. `derive_finding_id` composes
+  # "<check>.<cluster>.<namespace>.<object>", so the slug reaches the delta
+  # block only if a finding was FILED under that check, and `_shorten_id`
+  # trims the longest segment and never the leading check slug. any_of rather
+  # than a single required phrase because the planted over-grant is legible
+  # under either of the stream's two RBAC checks: `cluster-admin-binding` is
+  # the exact reading, `wildcard-rbac` the one an audit reaches if it scores
+  # the verbs rather than the role name. Both are the problem, correctly
+  # identified.
+  - name: an-rbac-overgrant-finding-was-filed
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: compliance-audit
+      scope: finding_ids
+      any_of_phrases: ["cluster-admin-binding", "wildcard-rbac"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (the trajectory carries only the
   # delegating turn's calls), so read-only is asserted against the cluster
