@@ -8,10 +8,10 @@ from typing import Any
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
     completed_evidence,
-    opaque_tool_calls,
     projected_records,
     projected_tasks,
     tool_operations,
+    unnormalized_tool_calls,
 )
 from cuj.utils.milestones import Milestone, MilestoneSuite
 from cuj.utils.scenario import Scenario, required_env
@@ -37,7 +37,6 @@ FORBIDDEN_OPERATIONS = {
     "submit_suggestion",
     "open_pull_request",
 }
-OPAQUE_TOOLS = {"bash", "exec", "gcloud", "git", "kubectl", "python", "shell"}
 L4_ACCELERATORS = {"l4", "nvidia-l4"}
 T4_ACCELERATORS = {"t4", "nvidia-t4", "nvidia-tesla-t4"}
 CAPACITY_TERMS = {
@@ -322,6 +321,12 @@ def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
 
 def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     tasks = projected_tasks(interaction)
+    interaction_blocker = (
+        ()
+        if interaction.get("status") == "completed"
+        and interaction.get("terminal") is True
+        else ("interaction did not complete successfully",)
+    )
     evidence_projected = "evidence" in interaction or any(
         "evidence" in task for task in tasks
     )
@@ -330,11 +335,29 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     evidence = projected_records(interaction, "evidence")
     artifacts = projected_records(interaction, "artifacts")
-    evidence_blocker = (
-        () if evidence_projected else ("portal task projection omits evidence",)
+    evidence_blocker = tuple(
+        dict.fromkeys(
+            (
+                *interaction_blocker,
+                *(
+                    ()
+                    if evidence_projected
+                    else ("portal task projection omits evidence",)
+                ),
+            )
+        )
     )
-    artifact_blocker = (
-        () if artifacts_projected else ("portal task projection omits artifacts",)
+    artifact_blocker = tuple(
+        dict.fromkeys(
+            (
+                *interaction_blocker,
+                *(
+                    ()
+                    if artifacts_projected
+                    else ("portal task projection omits artifacts",)
+                ),
+            )
+        )
     )
     capacity = _completed_capacity_evidence(evidence)
     details = capacity.get("details", {}) if capacity else {}
@@ -509,7 +532,7 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     final_output_available = "output" in interaction
     result_text = str(interaction.get("output") or "")
     claims_met, claims_observed = capacity_claims(result_text)
-    opaque_calls = opaque_tool_calls(interaction, OPAQUE_TOOLS)
+    unnormalized_calls = unnormalized_tool_calls(interaction)
     suite = MilestoneSuite(MILESTONES)
     suite.record(
         "interaction-completed",
@@ -576,16 +599,22 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
         sorted(completed),
         blocked_by=evidence_blocker,
     )
+    mutations = sorted(FORBIDDEN_OPERATIONS.intersection(operations))
     suite.record(
         "m9-design-remains-read-only",
         interaction.get("toolEvidenceComplete") is True
-        and not FORBIDDEN_OPERATIONS.intersection(operations),
+        and not mutations
+        and not unnormalized_calls,
         {
             "toolEvidenceComplete": interaction.get("toolEvidenceComplete"),
             "operations": operations,
-            "opaqueTools": opaque_calls,
+            "mutations": mutations,
+            "unnormalizedTools": unnormalized_calls,
         },
-        blocked_by=tuple(
+        # An observed mutation outranks any missing-evidence reason.
+        blocked_by=()
+        if mutations
+        else tuple(
             reason
             for condition, reason in (
                 (
@@ -596,7 +625,10 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
                     not worker_tool_evidence_available,
                     "portal task projection omits worker toolCalls",
                 ),
-                (bool(opaque_calls), "tool evidence omits normalized operations"),
+                (
+                    bool(unnormalized_calls),
+                    "tool evidence omits normalized operations",
+                ),
             )
             if condition
         ),
