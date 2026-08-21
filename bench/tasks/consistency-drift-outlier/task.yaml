@@ -45,6 +45,13 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["seeded-c"]
+      # Binding: "seeded-c" is a substring of the seeded-capacity namespace,
+      # which the stockout fixture plants on this same fleet -- a report that
+      # wanders into capacity territory could satisfy the name check without
+      # naming the outlier. A drift report has no business mentioning the
+      # capacity namespace at all, so forbidding it structurally removes the
+      # collision (no proximity semantics exist in the verifier).
+      forbidden_phrases: ["seeded-capacity"]
   - name: report-names-the-drift-facet
     role: objective
     # assert, not the converge default: the transcript is immutable once the

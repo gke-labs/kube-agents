@@ -53,7 +53,11 @@ verification_spec:
     check:
       type: report_contains
       # Discriminates a lag finding from a mere mention of the cluster name.
-      any_of_phrases: ["behind", "outdated", "lag", "older"]
+      # No lag-rooted form is usable: "lag" sits inside "flag", "lags" inside
+      # "flags", "lagging" inside "flagging" -- a report saying "nothing was
+      # flagged" would pass. "older" sits inside "folder"/"holder", so it is
+      # bounded to the two-word form.
+      any_of_phrases: ["behind", "outdated", "older version"]
   - name: no-invented-cves
     role: objective
     # assert, not the converge default: the transcript is immutable once the
