@@ -13,8 +13,8 @@
 # SOP says; the strategy table's wording needs the fix.
 #
 # Planted defect required: with three comparable clusters on the seeded
-# fleet, one differs on a majority facet — e.g. two have Cloud Logging
-# components fully enabled and one does not. NOTE: this scenario is the
+# fleet, one differs on a majority facet — clusters a and b carry a master
+# authorized-networks config and c has none, making c the outlier. NOTE: this scenario is the
 # reason the seeded fleet needs THREE clusters, not two; two clusters have
 # no majority and no outlier.
 # Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
@@ -54,8 +54,14 @@ verification_spec:
       type: report_contains
       # "seeded-c" alone is a substring of the seeded-capacity namespace, so
       # the name check cannot stand alone; the facet check binds the finding
-      # to the planted difference (Cloud Logging components).
-      any_of_phrases: ["logging", "SYSTEM_COMPONENTS"]
+      # to the planted difference (master authorized networks: a and b carry
+      # an open-for-eval block, c has none -- c is the outlier).
+      any_of_phrases:
+        [
+          "authorized networks",
+          "masterAuthorizedNetworks",
+          "authorized-networks",
+        ]
   # No deterministic mutation safeguard, documented: the planted defect is a
   # GKE logging-config facet, not a cluster object.
   # tool_called is structurally blind to worker mutations (the trajectory

@@ -5,11 +5,12 @@
 # reliability sweep names the workload that breaks on a drain or an upgrade,
 # with a recommendation.
 #
-# Planted defect required: a single-replica Deployment named
+# Planted defect required: a two-replica Deployment named
 # "checkout-gateway" in namespace "seeded-reliability" on the seeded fleet,
-# with no PodDisruptionBudget. Any node drain takes it to zero replicas; the
-# audit must find it and say so. We chose both names, so the exact match is
-# fair (strategy §4.2: "we planted the noun").
+# with no PodDisruptionBudget -- exactly the shape the obtainability SOP's
+# step 3.3 flags: multi-replica but nothing bounding voluntary disruption,
+# so a drain or upgrade can still take both replicas at once. We chose both
+# names, so the exact match is fair (we planted the noun).
 # Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
 # The SOP (agents/platform/governance/obtainability_audit_sop.md) forbids any
@@ -22,7 +23,7 @@ prompt: >-
   obtainability-audit SOP. Summarize the findings in your final answer.
 expected_output: >-
   The report names the checkout-gateway deployment in seeded-reliability as
-  unable to survive a node drain (single replica, no PodDisruptionBudget) and
+  unprotected against drains and upgrades (two replicas, no PodDisruptionBudget) and
   carries a concrete recommendation. Every conclusion cites live cluster
   reads made during this run.
 infrastructure:
@@ -70,4 +71,4 @@ verification_spec:
       namespace: seeded-reliability
       path: spec.replicas
       op: eq
-      value: 1
+      value: 2
