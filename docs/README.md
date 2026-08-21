@@ -127,6 +127,7 @@ identifier appears, add its source here.
 | Identifier | Source of truth |
 | --- | --- |
 | Service-account names, namespace, permission-set defaults | `k8s-operator/scripts/common.sh` |
+| Installer flag defaults (`--gvisor`, `--permission-set`, `--region`) | `install.sh` |
 | Go toolchain version | `k8s-operator/go.mod` |
 | Minimum supported tool versions (`gcloud`) | `k8s-operator/scripts/min_versions.sh` |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |

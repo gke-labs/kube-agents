@@ -61,6 +61,13 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 `platformAgent.harness.{clusterName,location,projectId}` are required and have
 no defaults — rendering fails until they are set.
 
+These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
+chart enables by default. On a cluster that has no such RuntimeClass the
+operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
+add `--set platformAgent.deployment.availability.runtimeClassName=""` to run on
+the standard container runtime. See
+[Agent runtime knobs](#agent-runtime-knobs) for what the sandbox needs.
+
 ### Installing from a repository checkout
 
 The `appVersion` in a checkout's `Chart.yaml` is a placeholder that never
@@ -313,10 +320,19 @@ tag is the case that wants the override.
 
 Two knobs need context beyond the chart:
 
-- `deployment.availability.runtimeClassName: gvisor` needs a GKE Sandbox node
-  pool on a Standard cluster — the `gke-cluster` module's
-  `enable_gvisor_node_pool` creates one; Autopilot ships the RuntimeClass
-  natively.
+- `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
+  agent executes model-authored commands and an unsandboxed pod shares the node
+  kernel with everything else on the node. That needs a GKE Sandbox node pool on
+  a Standard cluster — the `gke-cluster` module's `enable_gvisor_node_pool`
+  creates one; Autopilot ships the RuntimeClass natively from GKE
+  `1.27.4-gke.800`. Where neither holds, the operator refuses to write the agent
+  Deployment and reports `RuntimeClassNotFound` on the PlatformAgent; set the
+  value to `""` to run on the standard container runtime instead. Installs
+  driven by the Terraform composition never see this default — it always renders
+  `runtimeClassName` explicitly, from its own `agent_runtime_class` variable,
+  which `install.sh` writes from `--gvisor`. That variable still defaults to
+  `""`, so a bare `terraform apply` against the composition leaves the agent
+  unsandboxed where a bare `helm install` sandboxes it.
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.

@@ -71,7 +71,7 @@ PARAM_GITOPS_ORG="${GITHUB_ORG:-}"
 PARAM_GITOPS_REPO="${GITHUB_REPO:-}"
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
-PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
+PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-true}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
 PARAM_MEMORY="${MEMORY:-file}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
@@ -114,7 +114,7 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | gke-admin | custom
                                 (default: read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
-  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
+  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: true)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
   --user-profile-enabled=BOOL   Enable user profile persona extensions (default: false)
   --memory=MODE                 Long-term agent memory: file | hindsight | off
@@ -1095,6 +1095,12 @@ run_menu_system() {
   local chat_sub_name="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+  # Not the fresh-install default. The control panel describes an install that
+  # already exists and its Save & Apply re-applies what it displays, so a
+  # vars.sh with no ENABLE_GVISOR has to read as the standard runtime — that is
+  # what such a cluster is actually running. Defaulting on here would show
+  # "gVisor Sandbox" for an unsandboxed install and then provision a node pool
+  # nobody asked for on the next apply.
   local enable_gvisor="${ENABLE_GVISOR:-false}"
   local enable_webui="${HERMES_DASHBOARD_ENABLED:-false}"
   local github_org="${GITHUB_ORG:-}"
@@ -1716,7 +1722,11 @@ main() {
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
   fi
-  local enable_gvisor="${PARAM_ENABLE_GVISOR:-false}"
+  # ${VAR-default}, not ${VAR:-default}: PARAM_ENABLE_GVISOR is always set (see
+  # its declaration), so the only way it arrives empty is `--gvisor=` with no
+  # value. Substituting on empty would silently read that as the default; this
+  # form lets it reach the validator below and be rejected.
+  local enable_gvisor="${PARAM_ENABLE_GVISOR-true}"
   if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
     print_error "--gvisor must be either true or false."
     exit 1
@@ -1768,14 +1778,26 @@ main() {
       fi
     done
 
+    # prompt_menu answers an empty line with option 1, so the current value has
+    # to be listed first — otherwise the "(Default)" label contradicts what a
+    # bare Enter actually produces. The value reaching here is the sandbox
+    # unless --gvisor=false said otherwise, so the usual order is Yes first;
+    # the else branch keeps an explicit --gvisor=false from being re-enabled by
+    # someone confirming the prompt. Option 2 is "the other one" either way.
     local gvisor_choice=""
-    prompt_menu "Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?" \
-      "No - Standard Container Runtime (Default)" \
-      "Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)" \
-      gvisor_choice
-
-    if [ "$gvisor_choice" = "2" ]; then
-      enable_gvisor="true"
+    local gvisor_yes="Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)"
+    local gvisor_no="No - Standard Container Runtime"
+    local gvisor_prompt="Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?"
+    if [ "$enable_gvisor" = "true" ]; then
+      prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)" "$gvisor_no" gvisor_choice
+      if [ "$gvisor_choice" = "2" ]; then
+        enable_gvisor="false"
+      fi
+    else
+      prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)" "$gvisor_yes" gvisor_choice
+      if [ "$gvisor_choice" = "2" ]; then
+        enable_gvisor="true"
+      fi
     fi
 
     local webui_choice=""

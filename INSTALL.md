@@ -71,7 +71,7 @@ into KMS (the PEM must not enter Terraform state). The installer sources
 registry prefix) and its accepted values live in exactly one place; see
 [Shared defaults live in `installer_common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-installer_commonsh).
 
-Two behaviours worth knowing before the first run:
+Three behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the checkout's `HEAD`** and must be a SemVer release tag or a
   full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so
@@ -81,6 +81,11 @@ Two behaviours worth knowing before the first run:
   controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
   pull-request path works in every set. See the site's
   [security and IAM reference](docs/site/src/content/docs/reference/security-and-iam.md).
+- **The agent runs sandboxed under gVisor**, because it executes model-authored commands and an
+  unsandboxed pod shares the node kernel with everything else on the node. On a Standard cluster
+  that provisions a `gvisor-pool` node pool (one `e2-standard-4` per zone); Autopilot ships the
+  RuntimeClass and needs no pool, from GKE `1.27.4-gke.800` on. Pass `--gvisor=false` to run on the
+  standard container runtime.
 
 ### Non-Interactive & AI Agent Execution Mode
 

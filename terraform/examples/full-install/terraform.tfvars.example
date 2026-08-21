@@ -43,6 +43,10 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_gvisor_node_pool = true
 # gvisor_pool_name        = "gvisor-pool"
 
+# Sandboxing on Autopilot, which has the gvisor RuntimeClass built in and no
+# node pool to provision. enable_gvisor_node_pool must stay false there.
+# agent_runtime_class = "gvisor"
+
 # Cluster tuning
 # deletion_protection = true
 # release_channel     = "REGULAR"

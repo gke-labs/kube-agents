@@ -93,6 +93,46 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("CHAT=true", proc.stdout)
 
+    def test_gvisor_defaults_to_on(self):
+        """The agent runs model-authored commands; the sandbox is the default."""
+        proc = self._run_install_func('echo "GVISOR=$PARAM_ENABLE_GVISOR"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("GVISOR=true", proc.stdout)
+
+    def test_parse_args_keeps_an_empty_gvisor_value_empty(self):
+        """`--gvisor=` must reach main's validator rather than read as a default.
+
+        main uses ${PARAM_ENABLE_GVISOR-true} for exactly this: parse_args
+        leaves the empty string in place, the `:-` form would silently
+        substitute it back to the default, and the validator rejects it.
+        """
+        cmd = 'parse_args --gvisor=; echo "GVISOR=[$PARAM_ENABLE_GVISOR]"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("GVISOR=[]", proc.stdout)
+
+    def test_prompt_menu_defaults_to_the_first_option(self):
+        """The premise the gVisor prompt's ordering rests on.
+
+        main lists the incoming value as option 1 and treats option 2 as "the
+        other one", so that answering the prompt with nothing confirms what
+        `--gvisor` asked for and the `(Default)` label matches what that
+        produces. It holds only while prompt_menu resolves an unanswered
+        prompt to option 1; if that moves, the prompt starts inverting the
+        caller's choice in silence.
+
+        With no controlling TTY this takes prompt_read's auto-select branch
+        rather than a literal empty line, but both resolve through the same
+        default_val="1" that prompt_menu passes.
+        """
+        cmd = (
+            'gvisor_choice=""; prompt_menu "Pick" "first" "second" gvisor_choice; '
+            'echo "CHOICE=$gvisor_choice"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("CHOICE=1", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

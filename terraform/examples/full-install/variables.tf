@@ -42,6 +42,12 @@ variable "gvisor_pool_name" {
   default     = "gvisor-pool"
 }
 
+variable "agent_runtime_class" {
+  description = "RuntimeClass for the agent pod, overriding what enable_gvisor_node_pool implies. Autopilot ships the gvisor RuntimeClass with no node pool to manage — and enable_gvisor_node_pool fails the plan there — so \"gvisor\" here is how an Autopilot install gets the sandbox. Empty derives the value from enable_gvisor_node_pool."
+  type        = string
+  default     = ""
+}
+
 variable "deletion_protection" {
   description = "Whether deletion protection is enabled on the cluster. Passed through to the gke-cluster module; must be false before `terraform destroy` can remove the cluster."
   type        = bool

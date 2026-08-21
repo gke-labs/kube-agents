@@ -84,7 +84,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 - **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
 - **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
-- **Kernel-level sandboxing** — agent workloads can run under a gVisor RuntimeClass (GKE Sandbox).
+- **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox) by default; `--gvisor=false` opts out.
 - **GitOps-only mutations** — infrastructure changes are proposed as pull requests for human review.
 
 Exactly what is _enforced_ on which plane — Kubernetes RBAC, GCP IAM, and the GitOps path each answer differently — is set out in [Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do). Read that before granting the agent access to a production project.
