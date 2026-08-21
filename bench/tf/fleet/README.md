@@ -103,21 +103,38 @@ what stops channel enrollment from healing the lag.
 
 ## Accepted background findings
 
-A compliance audit of this fleet returns the planted `debug-binding` finding **plus**
-the rows below. Everything else the baseline used to trip is closed in the stack
-itself (Workload Identity and `GKE_METADATA` everywhere, `automountServiceAccountToken:
-false` on all planted workloads, default-deny NetworkPolicies in the three workload
-namespaces), precisely so this table stays short: the fixture's premise is that a
+Each audit of this fleet returns its planted finding **plus** the rows below —
+nothing else. Everything else the baseline used to trip is closed in the stack
+itself (Workload Identity and `GKE_METADATA` everywhere, legacy metadata endpoints
+disabled, `automountServiceAccountToken: false` and non-root-with-seccomp on all
+planted workloads, default-deny NetworkPolicies in the three workload namespaces,
+REGULAR channel and a maintenance window on every cluster, a PDB and soft spread
+constraints where a non-fixture workload would otherwise trip the reliability
+checks), precisely so this table stays short: the fixture's premise is that a
 correct audit's findings are known in advance.
 
-| Check                                  | Where              | Why it stays open                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2.10 `public-control-plane` (critical) | all three clusters | `seeded-a`/`seeded-b` carry a literal `0.0.0.0/0` authorized-networks block and `seeded-c` none — and `seeded-c`'s missing block IS the drift outlier, so it can never close. Closing a/b needs a named CIDR that still admits every caller with dynamic egress: Prow runners, the platform-agent pods that run the audits, and owner laptops. Until those have stable egress (reserved Cloud NAT IPs per project, or private endpoints plus internal runners), a narrow list would brick the fleet's own auditability |
+| Audit       | Check                                  | Where                       | Why it stays open                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------- | -------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| compliance  | 2.10 `public-control-plane` (critical) | all three clusters          | `seeded-a`/`seeded-b` carry a literal `0.0.0.0/0` authorized-networks block and `seeded-c` none — and `seeded-c`'s missing block IS the drift outlier, so it can never close. Closing a/b needs a named CIDR that still admits every caller with dynamic egress: Prow runners, the platform-agent pods that run the audits, and owner laptops. Until those have stable egress (reserved Cloud NAT IPs per project, or private endpoints plus internal runners), a narrow list would brick the fleet's own auditability. The matching trivy IDs (GCP-0053, GCP-0061) are ignored path-scoped in `.trivyignore.yaml` for the same reason |
+| upgrades    | 3.10 `no-notifications` (minor)        | all three clusters          | Closing needs a Pub/Sub topic and notification config per project — real infrastructure for a minor visibility finding on a fleet whose upgrades are themselves fixtures                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| reliability | 3.10 `probes-liveness` (minor)         | the three planted workloads | `checkout-gateway` runs `pause`, which has no shell and listens on nothing, so no honest probe exists; the SOP itself calls a missing liveness probe "frequently the correct choice". Declared for all three rather than closed on two and left asymmetric                                                                                                                                                                                                                                                                                                                                                                             |
 
-Implication for the scenarios (`feat/domain-scenarios`): the compliance objective must
-assert the planted finding specifically — `debug-binding`, `cluster-admin` — never
-"the audit found something", and its judged prose should expect the declared 2.10
-findings to appear alongside it.
+The drift and cost audits are fully declared with no background rows: the drift
+cohort is confined to the three seeded clusters whose only surviving-severity
+divergence is the planted authorized-networks outlier (the other base-critical
+facets — private nodes, database encryption — are uniform, and everything
+lower-severity is dropped by the ladder at r = 2/3), and the cost audit's only
+findings are the two planted, age-gated fixtures (the right-sizing check's
+reclaimable-delta floor sits far above these tiny pods). The upgrade audit's
+remaining absolute checks are clean by construction: every cluster now has a
+channel and a window, the fleet's minor spread is one (below the two-minor
+threshold), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly
+does not flag, and pools run default auto-upgrade/auto-repair on COS_CONTAINERD.
+
+Implication for the scenarios (`feat/domain-scenarios`): each objective must
+assert the planted finding specifically — `debug-binding`, `cluster-admin` —
+never "the audit found something", and judged prose should expect the declared
+rows above to appear alongside the planted finding in their respective audits.
 
 The chat-routing and incident-triage scenarios need no planted defect; the
 silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design

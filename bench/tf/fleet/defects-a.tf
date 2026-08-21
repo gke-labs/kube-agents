@@ -78,10 +78,31 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
         labels = { app = "checkout-gateway" }
       }
       spec {
+        # Reliability SOP 3.8: a multi-replica workload with no spreading
+        # mechanism is a finding. Soft on purpose -- ScheduleAnyway cannot
+        # ever block scheduling on this small fleet.
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "checkout-gateway" }
+          }
+        }
         # Compliance SOP 2.7: a workload on the default SA with the token
         # automounted is a finding. None of the planted workloads uses the
         # API, so the token is refused rather than declared.
         automount_service_account_token = false
+        # Compliance SOP 2.11: run as non-root with a seccomp filter. UID
+        # 65534 (nobody) suits every planted command -- pause pauses, tail
+        # eats memory, the spin loop spins -- none needs a capability.
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
         container {
           name  = "gateway"
           image = "registry.k8s.io/pause:3.9"
@@ -142,6 +163,14 @@ resource "kubernetes_deployment_v1" "payments_api" {
       spec {
         # SOP 2.7, as on checkout-gateway.
         automount_service_account_token = false
+        # SOP 2.11, as on checkout-gateway.
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
         container {
           name    = "api"
           image   = "busybox:1.36"
@@ -190,6 +219,23 @@ resource "kubernetes_deployment_v1" "inference_server" {
       spec {
         # SOP 2.7, as on checkout-gateway.
         automount_service_account_token = false
+        # SOP 2.11, as on checkout-gateway.
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        # SOP 3.8, as on checkout-gateway.
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "inference-server" }
+          }
+        }
         node_selector = {
           "seeded-role" = "pinned-inference"
         }
@@ -272,5 +318,24 @@ resource "kubernetes_network_policy_v1" "default_deny" {
   spec {
     pod_selector {}
     policy_types = ["Ingress", "Egress"]
+  }
+}
+
+# Reliability SOP 3.3 background closure: inference-server runs at two or
+# more replicas (the HPA settles at three) with no PodDisruptionBudget,
+# which is exactly the planted checkout-gateway defect -- but only
+# checkout-gateway is the fixture. maxUnavailable: 1 is the SOP's own
+# structurally-safe shape; a PDB governs evictions only, so the stockout
+# fixture (a scheduling gap) is untouched.
+resource "kubernetes_pod_disruption_budget_v1" "inference_server" {
+  metadata {
+    name      = "inference-server"
+    namespace = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+  }
+  spec {
+    max_unavailable = "1"
+    selector {
+      match_labels = { app = "inference-server" }
+    }
   }
 }

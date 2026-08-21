@@ -160,6 +160,20 @@ resource "google_container_cluster" "seeded_a" {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
 
+  # Upgrade-SOP background closure (3.4 no-channel, 3.7 no-window): a and c
+  # enroll in REGULAR and take a maintenance window. Unlike seeded-b there
+  # is no version fixture here, so auto-upgrade is welcome; enrollment also
+  # keeps the drift release-channel facet uniform across the cohort.
+  release_channel {
+    channel = "REGULAR"
+  }
+
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "03:00"
+    }
+  }
+
   # Half of the consistency defect: A and B run with master authorized
   # networks ON; C does not (see seeded_c). The drift SOP's severity ladder
   # walks every finding down two steps on a three-cluster cohort (r = 2/3 is
@@ -202,6 +216,16 @@ resource "google_container_node_pool" "seeded_a_default" {
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
+
+    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
+    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
+    # field is immutable on a live pool, so adding it REPLACES all five
+    # pools -- accepted on D0, when the idle pool's 7-day age gate has
+    # nothing to lose; the same change a week from now would cost the cost
+    # scenario its activation clock.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
   }
 }
 
@@ -231,6 +255,16 @@ resource "google_container_node_pool" "idle_batch_pool" {
 
     workload_metadata_config {
       mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
+    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
+    # field is immutable on a live pool, so adding it REPLACES all five
+    # pools -- accepted on D0, when the idle pool's 7-day age gate has
+    # nothing to lose; the same change a week from now would cost the cost
+    # scenario its activation clock.
+    metadata = {
+      disable-legacy-endpoints = "true"
     }
 
     taint {
@@ -268,6 +302,16 @@ resource "google_container_node_pool" "pinned_inference_pool" {
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
+
+    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
+    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
+    # field is immutable on a live pool, so adding it REPLACES all five
+    # pools -- accepted on D0, when the idle pool's 7-day age gate has
+    # nothing to lose; the same change a week from now would cost the cost
+    # scenario its activation clock.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
     labels = {
       "seeded-role" = "pinned-inference"
     }
@@ -293,7 +337,7 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 #
 # What holds the lag under a channel: the maintenance exclusion below, at
 # scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now
-# (var.exclusion_window_hours, default 150 days) -- timestamp() makes this
+# (var.exclusion_window_hours, default 90 days) -- timestamp() makes this
 # a perpetual in-place diff, ACCEPTED LOUDLY: the scheduled reconcile is
 # what rolls the window forward, so the always-present one-line plan change
 # is the mechanism working, not drift. Two ways the window ends:
@@ -403,6 +447,16 @@ resource "google_container_node_pool" "seeded_b_default" {
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
+
+    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
+    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
+    # field is immutable on a live pool, so adding it REPLACES all five
+    # pools -- accepted on D0, when the idle pool's 7-day age gate has
+    # nothing to lose; the same change a week from now would cost the cost
+    # scenario its activation clock.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
   }
 }
 
@@ -425,6 +479,18 @@ resource "google_container_cluster" "seeded_c" {
 
   logging_config {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
+
+  # Upgrade-SOP background closure, as on seeded-a: REGULAR channel and a
+  # window. The consistency defect above is authorized networks alone.
+  release_channel {
+    channel = "REGULAR"
+  }
+
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "03:00"
+    }
   }
 
   # Workload Identity on, and GKE_METADATA on every pool below (compliance
@@ -452,6 +518,16 @@ resource "google_container_node_pool" "seeded_c_default" {
 
     workload_metadata_config {
       mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
+    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
+    # field is immutable on a live pool, so adding it REPLACES all five
+    # pools -- accepted on D0, when the idle pool's 7-day age gate has
+    # nothing to lose; the same change a week from now would cost the cost
+    # scenario its activation clock.
+    metadata = {
+      disable-legacy-endpoints = "true"
     }
   }
 }
