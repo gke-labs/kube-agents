@@ -56,14 +56,15 @@ class ReportContainsVerifier(BaseVerifier):
     is fair, and case is the one variation a correct report may legitimately
     introduce. Anything fuzzier belongs to the judge, not to a blocking check.
 
-    ``scope`` picks the text under test. The default, ``final``, is the last
-    settled turn's closing message — the sentence that IS the answer. ``full``
-    is the accumulated output: every settled closer, delegated card text, and
-    up to 20KB of worker artifacts. ``full`` therefore passes a required
-    phrase the agent merely QUOTED (a planted log line pasted into evidence
-    reads as "named the defect") and false-fails a forbidden phrase that only
-    appears in quoted material — reach for it only when the check genuinely
-    concerns the whole transcript.
+    ``scope`` picks the text under test. The default, ``final``, is what the
+    user ultimately receives: the delegating turn's own closing message plus,
+    when work was delegated, the delivered card results and artifacts — the
+    worker's actual answer, with the router's intermediate poll recitals
+    excluded. ``full`` is the accumulated output: every settled closer on top
+    of all of that. ``full`` therefore passes a required phrase the agent
+    merely QUOTED in progress chatter and false-fails a forbidden phrase that
+    only appears in quoted material — reach for it only when the check
+    genuinely concerns the whole transcript.
     """
 
     type: Literal["report_contains"]

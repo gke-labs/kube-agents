@@ -79,10 +79,12 @@ class TranscriptSnapshot:
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     seq: int = 0
     prompt_head: str = ""
-    # The last settled turn's closing message -- the sentence that IS the
-    # answer. ``output`` accumulates every settled closer plus delegated card
-    # text and worker artifacts (up to 20KB), so a phrase check against it
-    # passes on a quotation; checks default to this field instead.
+    # What the user ultimately receives: the delegating turn's closing
+    # message plus, when work was delegated, the delivered card results and
+    # artifacts (composed by the harness's _append_final; poll-turn recitals
+    # excluded). ``output`` additionally accumulates every settled closer, so
+    # a phrase check against it passes on progress chatter; checks default to
+    # this field instead.
     final_message: str = ""
 
 

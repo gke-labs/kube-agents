@@ -403,6 +403,24 @@ _MAX_SILENT_TURNS = 3
 _MAX_TRANSPORT_FAILURES = 3
 
 
+def _append_final(result: AgentResult, sections: list[str]) -> None:
+    """Fold delegated deliverables into the run-level final message.
+
+    ``metadata["final_message"]`` is what the user ultimately receives: the
+    delegating turn's own closing message plus, when work was delegated, the
+    delivered card results and artifacts. Poll-turn recitals stay out (see
+    ``_fold_status_turn``). The transcript verifiers' default scope reads
+    this, so a worker's actual RCA satisfies a phrase check while a router's
+    progress paraphrase cannot.
+    """
+    if not sections:
+        return
+    current = str(result.metadata.get("final_message") or "")
+    add = [s for s in sections if s.split("\n", 1)[-1].strip() not in current]
+    if add:
+        result.metadata["final_message"] = "\n\n".join(filter(None, [current, *add]))
+
+
 def _append_delivered(
     result: AgentResult, observed: list[dict[str, Any]], task_ids: list[str]
 ) -> None:
@@ -414,13 +432,14 @@ def _append_delivered(
     rather than ``result.trajectory``, so the polls inform the answer without
     being graded as the agent's tool use.
     """
-    sections = [
+    all_sections = [
         f"Result of delegated task {tid}:\n{text}"
         for tid, text in delivered_results(observed, task_ids).items()
-        if text.strip() not in result.output
     ]
+    sections = [s for s in all_sections if s.split("\n", 1)[1].strip() not in result.output]
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
+    _append_final(result, all_sections)
 
 
 def _shell_quote(value: str) -> str:
@@ -470,6 +489,7 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
             sections.append(f"Artifact {name} produced by delegated task {tid}:\n{text.rstrip()}")
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
+    _append_final(result, sections)
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
@@ -538,15 +558,16 @@ def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) ->
     session row supersedes the sum when it is reachable.
     """
     answer = str(turn.metadata.get("final_message") or turn.output)
-    if settled and answer.strip():
-        if answer.strip() not in base.output:
-            base.output = "\n\n".join(filter(None, [base.output, answer]))
-        # Run-level final_message tracks the LAST settled turn's closer: on a
-        # delegated investigation that is where the actual answer lives, and
-        # the transcript verifiers' default scope reads it (a check against
-        # the delegating turn's "created, working on it" would grade the
-        # wrong sentence).
-        base.metadata["final_message"] = answer
+    if settled and answer.strip() and answer.strip() not in base.output:
+        base.output = "\n\n".join(filter(None, [base.output, answer]))
+        # Deliberately NOT folded into metadata["final_message"]: a poll
+        # turn's closer is the router reciting progress, not the answer the
+        # user receives. Run-level final_message is composed of the
+        # delegating turn's own closer plus the delivered card results and
+        # artifacts (_append_final via _settle) -- letting a later recital
+        # overwrite it would replace "created, the id is 7" with "the card
+        # settled", which is exactly the sentence the exact checks must not
+        # grade.
     _sum_tokens(base.tokens, turn.tokens)
     for key in ("response_id", "response_status"):
         if turn.metadata.get(key) is not None:

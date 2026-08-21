@@ -157,29 +157,34 @@ for TASK in "${TASKS[@]}"; do
   [ -n "${NEW_RUN_DIR}" ] && LATEST_RESULT="${NEW_RUN_DIR}/results.json"
 
   # Classify the run. Three outcomes, because they route differently:
-  #   INFRA  -- no results.json at all: devops-bench died before producing a
-  #             record, which in this pipeline means OpenTofu / resource
-  #             preparation. Non-blocking for the PR, loud for the infra owner.
-  #   BROKEN -- results.json exists but carries no scores: the run completed
-  #             far enough to write a record and the scoring pass crashed or
-  #             emitted nothing. That is a harness defect, not weather, and it
-  #             BLOCKS -- treating it as infra would let a scoring crash turn
-  #             the whole gate green.
+  #   INFRA  -- devops-bench died before evaluating anything, on a task that
+  #             HAS infrastructure to die on: no results.json, or the
+  #             documented empty-list record. Non-blocking for the PR, loud
+  #             for the infra owner. A noop-deployer task prepares nothing,
+  #             so its pre-record death is never weather -- it is a harness
+  #             or agent crash and classifies BROKEN instead.
+  #   BROKEN -- the run died somewhere no infrastructure excuse exists: a
+  #             record with no scores (the scoring pass crashed), or any
+  #             pre-record death on a noop task. BLOCKS -- treating these as
+  #             infra would let a crash turn the whole gate green.
   #   OK     -- a record with scores; the gate below decides.
   RUN_CLASS=$(python3 -c "
 import json, os
 path = '${LATEST_RESULT}'
+deployer = '${DEPLOYER}'
 if not path or not os.path.exists(path):
-    print('INFRA')
+    print('BROKEN' if deployer == 'noop' else 'INFRA')
 else:
     try:
         data = json.load(open(path))
         # An empty list is the documented resource-preparation signature:
         # devops-bench wrote a record file but evaluated zero tasks. Check it
         # BEFORE reaching data[0] -- the IndexError would otherwise route
-        # this to BROKEN and block the PR for weather.
+        # this to BROKEN and block the PR for weather. Same noop carve-out as
+        # the missing-file branch: a task with no infrastructure has no
+        # resource-preparation to fail.
         if isinstance(data, list) and not data:
-            print('INFRA')
+            print('BROKEN' if deployer == 'noop' else 'INFRA')
         else:
             rec = data[0] if isinstance(data, list) else data
             print('OK' if rec and isinstance(rec, dict) and rec.get('scores') else 'BROKEN')
@@ -193,8 +198,12 @@ else:
     ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
     mkdir -p "${ARTIFACT_DIR}"
     cp "${EVAL_LOG}" "${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log" 2>/dev/null || true
-    echo "Task ${TASK_NAME} Result: [FAILED] results.json exists but carries no scores -- the scoring pass crashed or emitted nothing; see ${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log (Duration: ${TASK_DURATION}s)"
-    FAILED_TASKS+=("${TASK_NAME} (scoring produced no record)")
+    if [ -n "${LATEST_RESULT}" ] && [ -f "${LATEST_RESULT}" ]; then
+      echo "Task ${TASK_NAME} Result: [FAILED] results.json carries no scored record -- the run or its scoring pass crashed; see ${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log (Duration: ${TASK_DURATION}s)"
+    else
+      echo "Task ${TASK_NAME} Result: [FAILED] no results.json from a noop-deployer task -- nothing was provisioned, so this is a harness or agent crash, not infrastructure; see ${ARTIFACT_DIR}/scoring_failure_${TASK_NAME}.log (Duration: ${TASK_DURATION}s)"
+    fi
+    FAILED_TASKS+=("${TASK_NAME} (run produced no scored record)")
   elif [ "${RUN_CLASS}" = "INFRA" ]; then
     echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation or teardown failed! (The evaluation is skipped)"
     ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
