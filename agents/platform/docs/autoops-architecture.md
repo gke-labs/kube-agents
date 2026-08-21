@@ -57,6 +57,21 @@ flowchart TB
 
     FIX -.->|PR link| CHAT
 
+    subgraph DURABLE["📒 Durable artifacts + verdict-time delivery · designed, not shipped — #613"]
+        direction LR
+        VERD["⚖️<br/><b>Verdict gate</b><br/>transient → nothing<br/>stalled → watchdog"]
+        ILED["📒<br/><b>Incident ledger issue</b><br/>one per signature, updated in place"]
+        RPR["🔧<br/><b>Remediation PR</b><br/>manifest fixes only, capped"]
+        DIG["📰<br/><b>Daily digest</b><br/>ledgers · stalls · silences"]
+        VERD -.->|real + actionable| ILED
+        ILED -.->|fix is a diff| RPR
+        ILED -.->|below the interrupt line| DIG
+    end
+
+    DIAG -.->|structured verdict| VERD
+    VERD -.->|report card · above the floor| CHAT
+    ILED -.->|issue + PR links| CHAT
+
     classDef live fill:#475569,stroke:#334155,color:#fff;
     classDef newdom fill:#14B8A6,stroke:#0F766E,stroke-width:3px,color:#fff,stroke-dasharray:6 4;
     classDef ingest fill:#8B5CF6,stroke:#6D28D9,color:#fff;
@@ -78,13 +93,18 @@ flowchart TB
     class CHAT chat;
     class HUMAN human;
     class FIX fix;
+    classDef designed fill:#64748B,stroke:#334155,stroke-width:2px,color:#fff,stroke-dasharray:4 4;
+    class VERD,ILED,RPR,DIG designed;
 
     style SOURCES fill:#F8FAFC,stroke:#CBD5E1,color:#334155
     style INGEST fill:#F8FAFC,stroke:#CBD5E1,color:#334155
     style SPINE fill:#F1F5F9,stroke:#94A3B8,color:#334155
+    style DURABLE fill:#F8FAFC,stroke:#94A3B8,stroke-dasharray:4 4,color:#334155
 ```
 
-> **Legend:** solid = live today · dashed teal = what a new domain supplies (its source and its adapter).
+> **Legend:** solid = live today · dashed teal = what a new domain supplies (its source and its adapter)
+> · dashed slate = designed, not shipped — the [incident ledger](#the-incident-ledger-designed-not-shipped)
+> of [#613](https://github.com/gke-labs/kube-agents/issues/613).
 > Everything inside the shaded band already ships. Judgment sits inside the band but is _parameterized_
 > per domain — see [Contract 3](#contract-3--judgment).
 >
@@ -188,6 +208,8 @@ in one place:
 
 - **A postmortem draft**, written from the triage and the approved fix, not from memory a week later.
 - **Recurrence matching** — match a new incident against past ones and surface the fix that actually worked.
+  The deterministic incident signature of [#613](https://github.com/gke-labs/kube-agents/issues/613) is the
+  first concrete key for this — see [the incident ledger](#the-incident-ledger-designed-not-shipped).
 - **Fleet failure patterns** — what breaks, where, and how often. A reliability review built from real incidents.
 - **An eval set** — past reports plus what humans approved is a labelled set for scoring the agent.
 
@@ -280,6 +302,11 @@ written to the live cluster directly.
   precisely enough to act on from the report alone. This is the safety property of the whole
   architecture, and it is stated in the prompt.
 
+[#613](https://github.com/gke-labs/kube-agents/issues/613) adds a fifth pin, not yet in the prompt:
+the RCA must end in a **structured verdict** — `no-action-required`, `transient`, or real-and-actionable —
+because the verdict gates writes to GitHub, and a gate keyed on prose is not a gate. See
+[the incident ledger](#the-incident-ledger-designed-not-shipped).
+
 A domain also registers a **skill** in the catalog (`agents/platform/skills/`), which supplies the
 diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status → namespace events →
 container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
@@ -355,6 +382,100 @@ The GKE-events path is live end to end:
 - **Human-in-the-loop** — an engineer approves in-thread; nothing reaches production without it.
 - **Remediation** — the approved fix ships as a GitOps PR.
 
+## The incident ledger (designed, not shipped)
+
+Today the reactive path is chat-terminal: the RCA is delivered into the alert's thread and
+that is where it ends — the `incidents` row it should also leave is itself missing (issue
+#802) — so a real, recurring, fixable problem found at 03:00 leaves no tracked artifact and
+cannot be told apart from the same problem recurring next Tuesday. The proactive fleet audits
+already solved this shape — one ledger issue per stream, narrow remediation PRs, every body
+rendered deterministically by `audit_report.py`
+([`fleet-audit-issue-ledger.md`](../../../docs/designs/fleet-audit-issue-ledger.md)) — and
+[#613](https://github.com/gke-labs/kube-agents/issues/613) extends that harness to incidents
+rather than writing a second one. That issue and its CUJ catalog are canonical for the design
+while it is in discussion; this section is the architecture-level summary, and the detail
+moves to a `docs/designs/` document when implementation starts.
+
+Three additions to the spine, in order:
+
+1. **A structured verdict gates every write.** The RCA ends in a verdict field, not prose.
+   `no-action-required` and `transient` are terminal — nothing reaches GitHub. Only a real,
+   actionable problem proceeds, so a kubelet warm-up race that self-resolved in two minutes
+   produces no issue and no PR ([#612](https://github.com/gke-labs/kube-agents/issues/612)'s
+   grace period filters most of those upstream).
+2. **Tier 1 — a ledger issue keyed by a deterministic signature.**
+   `<reason>.<cluster>.<namespace>.<object>`, built from the watcher's structured event fields
+   and never model-written. The id admits no timestamp, which is exactly what makes a
+   recurrence update the existing issue in place instead of opening a second one. Labelled
+   `agent:incident`, and added to `github-issue-resolver`'s exclusion list before the writer
+   ships — otherwise the resolver picks up a fresh ledger on its next 10-minute poll and
+   re-investigates it.
+3. **Tier 2 — a remediation PR, only when the fix is a diff.** A `manifest` fix opens one
+   narrow PR on the audit branch scheme, linked to the issue; `gcloud` and `manual` fixes
+   render as instructions in the issue and cut no branch. Auto-opened PRs share the audit's
+   per-run cap, because a control-plane failure fires many signatures at once — during the
+   exact window an operator can least afford a hundred fresh issues.
+
+Contract 3's approval interaction comes back unchanged once #802 restores it — "apply Option
+B" in the thread authorizes, as the withheld template bullet promises — and the ledger helps
+there: the issue is a second durable home for the report and its options, keyed by a signature
+rather than by a row a TTL sweep can expire. The thread gains the issue and PR URLs, so the
+"real problem found" branch of an alert's follow-up points at a durable object instead of a
+prose summary re-derived on every recurrence. Two audit properties carry over untouched: every body passes `redact_secrets`
+before publication — incident evidence (pod logs, `describe` output, env dumps) is more likely
+to carry credentials than audit evidence — and the ledger closes on non-recurrence decay
+rather than on merge of its PR, because "fix merged, problem persists" must stay expressible.
+
+What does change is when chat speaks at all.
+
+### Delivery moves to verdict time
+
+Today every warning event announces itself in chat before the RCA has concluded — "digging
+down to the root cause…" — so the channel fills with investigations, many of which end in "no
+action required". Customer feedback on that is unambiguous: the event message is noise. So
+delivery moves from event time to verdict time. Nothing posts when an event arrives; the first
+and usually only message is the finished report card, and only when the verdict earns it.
+
+The policy: event → silence · verdict `transient` → silence · real below the severity floor →
+ledger issue + daily digest · real above it → one report card · stalled RCA → watchdog line in
+the digest.
+
+Two consequences are structural, not cosmetic:
+
+- **The thread anchor moves.** The Chat API message ID captured as the session's persistent
+  thread key ([`session_management.md`](session_management.md)) comes from the first message
+  posted, which is now the report card the completing kanban card delivers — so for the
+  minutes the RCA runs, a session has no thread, and the delivery path must tolerate that
+  window.
+- **Silence needs a warrant.** With no event-time message, a crashed RCA is a silently
+  swallowed incident. Every injected event must reach a terminal verdict within a timeout, and
+  one that does not is reported — a stalled-investigation line in the digest, an ops ping when
+  a critical is in flight. That invariant is what makes a quiet channel a claim rather than a
+  hope. The same discipline covers the platform's own plumbing: pollers and cron jobs are
+  silent when routine (the audit's `silent_ok` rule), and their operational warnings go to an
+  ops channel, never the incident channel.
+
+### Silencing through the ledger
+
+A recurring problem someone has decided to live with for a sprint should page nobody — and the
+deterministic signature gives a silence a key to hang on for the first time.
+`/silence <duration> reason: …`, commented on the ledger issue and parsed with the
+`/remediate` command machinery (write-access gate, line-anchored parsing, answer-once
+markers), applies `incident:silenced` and stops chat delivery for that signature. Recurrences
+still append occurrence rows — deterministically, from event fields, with no RCA re-run and no
+tokens spent re-diagnosing a diagnosed problem.
+
+Three rules keep a mute from eating a regression: recurrence at a higher severity breaks
+through; expiry while still firing posts one roll-up — "fired 37× during the silence, still
+occurring" — instead of 37 pings; and permanence costs more than a fortnight's quiet — closing
+the issue with `incident:wontfix` is the only "never again", and a human close is final. The
+runtime check sits beside the alert ceiling in the session store and, like the ceiling, fails
+open: annoying beats swallowed.
+
+The full set of SRE journeys this produces — golden path, issue-only tier, storm, the silence
+lifecycle, digest, postmortem-from-the-ledger — is catalogued as CUJs on
+[#613](https://github.com/gke-labs/kube-agents/issues/613#issuecomment-5359726450).
+
 ## Plugging in a new domain
 
 Each new domain adds a source, an adapter, a skill, and a judgment prompt. In order:
@@ -414,6 +535,12 @@ Rows grounded in events, logs, RBAC, and networking config are within reach toda
 `gcloud`. The scale-up and capacity rows depend on the metrics and quota gaps in
 [Contract 4](#contract-4--context-reach).
 
+These are the judgment journeys — where cross-domain reach earns its keep. The lifecycle
+journeys — how an incident is tracked, silenced, recurs, and closes, and what the channel
+carries while that happens — belong to
+[the incident ledger](#the-incident-ledger-designed-not-shipped), which links the full CUJ
+catalog.
+
 ## What this architecture enables
 
 > **The differentiator:** turn a _Workload_ symptom into a _Networking_ or _RBAC_ root cause **without a
@@ -432,16 +559,22 @@ Stated plainly, because they scope the next milestone:
 
 - **The inject envelope is k8s-shaped**, and so is `_build_agent_query()`. The second domain generalizes both.
 - **No incident corpus yet** — the `incidents` table has the data but not the keys, outcomes, or retention.
+  [#613](https://github.com/gke-labs/kube-agents/issues/613)'s signature id is the missing resource key.
 - **Event triage stops at the report** (issue #802). Turn ② needs the `incidents` row, and the only
   writer is `send_notification` — the egress call the kanban card delivery replaced. So a reply of _"apply"_
   reaches an agent that cannot see the report, and the template withholds the invitation rather than
   making a promise nothing keeps. The fix is to store the completed report on the delivery path, where the
   subscription row already holds the chat id, thread id and result together.
 - **No metric or quota tooling** — two of the five cross-domain CUJ rows are blocked on it.
+- **Every event announces itself in chat** — the per-event "digging down…" message ships today;
+  [verdict-time delivery](#delivery-moves-to-verdict-time) replaces it, and the stalled-RCA
+  watchdog is what makes removing it safe.
 - **Judgment has no regression harness** — judgment is the differentiator, so it needs an eval suite.
 - **Outbound is chat-only** — the only paths out are the chat thread and the PR link posted into it.
-  Nothing acks or resolves the originating signal (a PagerDuty incident, a monitoring alert). A PRD on
-  outbound paths is in flight; the shape is a status adapter mirroring the ingestion adapters.
+  [The incident ledger](#the-incident-ledger-designed-not-shipped) closes the durable-artifact half of
+  this, but nothing yet acks or resolves the originating signal (a PagerDuty incident, a monitoring
+  alert). A PRD on outbound paths is in flight; the shape is a status adapter mirroring the ingestion
+  adapters.
 
 ## Related
 
