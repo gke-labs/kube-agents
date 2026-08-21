@@ -56,15 +56,20 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
   depends_on = [google_container_node_pool.pinned_inference_pool]
 }
 
-# Defect (reliability): single replica, no PodDisruptionBudget. A node drain
-# takes it to zero. Asserted by obtainability-planted-pdb.
+# Defect (reliability): two replicas, no PodDisruptionBudget. Two, not one,
+# deliberately: the reliability SOP's no-pdb check (3.3) flags only
+# `spec.replicas >= 2` with no matching PDB and explicitly does NOT flag
+# single-replica workloads -- at replicas = 1 the audit produces no finding
+# and the scenario could never pass. Nothing constrains the eviction API,
+# so one drain can still take both replicas at once; that is the finding.
+# Asserted by obtainability-planted-pdb.
 resource "kubernetes_deployment_v1" "checkout_gateway" {
   metadata {
     name      = "checkout-gateway"
     namespace = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
   }
   spec {
-    replicas = 1
+    replicas = 2
     selector {
       match_labels = { app = "checkout-gateway" }
     }
@@ -86,15 +91,18 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
   }
 }
 
-# Defect (security): the classic over-grant -- cluster-admin bound to the
+# Defect (security): the classic over-grant -- cluster-admin bound to a
 # namespace's default ServiceAccount. Asserted by compliance-rbac-overgrant.
-# A RoleBinding to a ClusterRole grants the role's permissions within this
-# namespace only, but binding cluster-admin to default is exactly the shape
-# the audit exists to flag.
-resource "kubernetes_role_binding_v1" "debug_binding" {
+# A ClusterRoleBinding, not a RoleBinding, deliberately: the compliance
+# SOP's check 2.4 reads `kubectl get clusterrolebindings` only, so a
+# namespaced binding would never appear in the audit and the scenario could
+# never pass. The blast radius is real -- any pod running as this SA holds
+# unrestricted read/write on all of seeded-a, Secrets included. That is
+# acceptable on an isolated defect fleet with nothing worth stealing, and
+# it is precisely the compromise shape check 2.4 exists to flag.
+resource "kubernetes_cluster_role_binding_v1" "debug_binding" {
   metadata {
-    name      = "debug-binding"
-    namespace = kubernetes_namespace_v1.seeded_security.metadata[0].name
+    name = "debug-binding"
   }
   role_ref {
     api_group = "rbac.authorization.k8s.io"
@@ -148,13 +156,17 @@ resource "kubernetes_deployment_v1" "payments_api" {
 }
 
 # Defect (capacity): the workload half of pinned-inference-pool, and the
-# live signal the audit reads. The container burns a full core against a
-# 400m request (capped at 500m), so CPU utilization sits at ~125% of request
-# against the HPA's 60% target and the HPA pins at max_replicas wanting
-# pods the pool can never place: an e2-small allocates ~940m CPU, system
-# daemonsets take ~250m, so one 400m replica fits and the second does not --
-# with the autoscaler pinned at one node, replicas 2..10 sit Pending. That
-# standing Pending backlog is the shortfall the audit must quantify.
+# live signal the audit reads. The container burns its 500m limit against a
+# 400m request, so the one Ready pod sits at ~125% CPU of request against
+# the HPA's 60% target. autoscaling/v2 averages over Ready pods only, so
+# the controller settles at desired = ceil(1 x 125/60) = 3, not at the max
+# of 10: one replica Ready, two Pending forever, because an e2-small
+# allocates ~940m CPU, system daemonsets take ~250m, and a second 400m
+# replica does not fit a pool whose autoscaler is pinned at one node. That
+# standing Pending pair -- an HPA that wants more than the pool can ever
+# place -- is the live shortfall the audit must quantify. max_replicas
+# stays 10 because the capacity gap it declares (and the scenario's HPA
+# safeguard) is part of the fixture.
 resource "kubernetes_deployment_v1" "inference_server" {
   metadata {
     name      = "inference-server"
@@ -192,10 +204,11 @@ resource "kubernetes_deployment_v1" "inference_server" {
     }
   }
 
-  # The HPA owns replicas from the moment it syncs, and most of what it asks
-  # for can never become Ready -- both halves are the defect. Ignoring the
-  # drift keeps the reconcile from resetting the HPA's count, and skipping
-  # the rollout wait keeps an apply from blocking on Pending pods forever.
+  # The HPA owns replicas from the moment it syncs, and part of what it
+  # asks for can never become Ready -- both halves are the defect. Ignoring
+  # the drift keeps the reconcile from resetting the HPA's count, and
+  # skipping the rollout wait keeps an apply from blocking on Pending pods
+  # forever.
   wait_for_rollout = false
   lifecycle {
     ignore_changes = [spec[0].replicas]

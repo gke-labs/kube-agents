@@ -123,9 +123,25 @@ resource "google_container_cluster" "seeded_a" {
   # it, and the label plus README are the guard against accidental sweeps.
   deletion_protection = false
 
-  # A and B log workloads; C deliberately does not (see seeded_c).
   logging_config {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
+
+  # Half of the consistency defect: A and B run with master authorized
+  # networks ON; C does not (see seeded_c). The drift SOP's severity ladder
+  # walks every finding down two steps on a three-cluster cohort (r = 2/3 is
+  # below both the 0.90 and 0.80 rungs), so only a base-critical facet
+  # survives to a finding -- authorized-networks is one (SOP 4.5), and the
+  # logging components facet this stack first used is base-minor and would
+  # have been dropped before anyone saw it. The 0.0.0.0/0 block is what
+  # keeps the defect access-safe: the facet reads ON from `enabled` plus a
+  # non-empty cidrBlocks, the SOP explicitly never compares the blocks'
+  # contents, and an allow-everything list restricts no eval agent.
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "open-for-eval"
+    }
   }
 }
 
@@ -229,6 +245,16 @@ resource "google_container_cluster" "seeded_b" {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
 
+  # The other peer of the consistency majority: B matches A (authorized
+  # networks ON, open block -- see seeded_a for why this is safe), so C is
+  # the single outlier on a single facet.
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "open-for-eval"
+    }
+  }
+
   lifecycle {
     precondition {
       condition     = length(local.lagging_versions) > 0
@@ -257,10 +283,14 @@ resource "google_container_node_pool" "seeded_b_default" {
   }
 }
 
-# Defect (consistency): the outlier. A and B enable workload logging; C
-# enables system logging only. Two agree, one differs -- the drift audit's
-# baseline is the fleet majority, which is the reason this fleet is three
-# clusters and not two.
+# Defect (consistency): the outlier. A and B run master authorized networks
+# ON; C carries no authorized-networks config at all, which the drift SOP
+# normalizes to OFF -- absence on one cluster against an ON majority is the
+# finding (SOP 4.5, base critical, the severity that survives a
+# three-cluster cohort's two ladder steps). Two agree, one differs: the
+# reason this fleet is three clusters and not two. Everything else on C
+# deliberately matches its peers, so C is an outlier on exactly one facet
+# and the split-cluster guard never mistakes it for an uncohorted cluster.
 resource "google_container_cluster" "seeded_c" {
   name     = "${var.cluster_prefix}-c"
   location = var.zone
@@ -271,7 +301,7 @@ resource "google_container_cluster" "seeded_c" {
   deletion_protection      = false
 
   logging_config {
-    enable_components = ["SYSTEM_COMPONENTS"]
+    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
 }
 

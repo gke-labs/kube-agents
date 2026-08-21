@@ -38,16 +38,16 @@ the fix is replacing the cluster:
 The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 (`feat/domain-scenarios`); the names here are the source of truth its specs assert on.
 
-| Defect                                                                                   | Where                                | Asserting scenario                                   |
-| ---------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------- |
-| `checkout-gateway`, single replica, no PDB                                               | `seeded-a` / ns `seeded-reliability` | `obtainability-planted-pdb`                          |
-| `debug-binding`, cluster-admin to default SA                                             | `seeded-a` / ns `seeded-security`    | `compliance-rbac-overgrant`                          |
-| `payments-api`, deterministic OOM crashloop                                              | `seeded-a` / ns `seeded-debug`       | `cluster-agent-crashloop-debug`, remediation fixture |
-| `pinned-inference-pool`: one zone, autoscaler at max, HPA pinned at 10 with Pending pods | `seeded-a` / ns `seeded-capacity`    | `stockout-pinned-pool`                               |
-| `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                   | `seeded-a`                           | `fleet-cost-idle-pool`                               |
-| `orphan-pd-1`, `orphan-pd-2`, unattached disks                                           | project, `var.zone`                  | `fleet-cost-idle-pool`                               |
-| Control plane one minor behind REGULAR default                                           | `seeded-b`                           | `upgrade-readiness-lagging-cluster`                  |
-| Workload logging off (peers have it on)                                                  | `seeded-c`                           | `consistency-drift-outlier`                          |
+| Defect                                                                                                                                                        | Where                                | Asserting scenario                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------- |
+| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                    | `seeded-a` / ns `seeded-reliability` | `obtainability-planted-pdb`                          |
+| `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only) | `seeded-a`                           | `compliance-rbac-overgrant`                          |
+| `payments-api`, deterministic OOM crashloop                                                                                                                   | `seeded-a` / ns `seeded-debug`       | `cluster-agent-crashloop-debug`, remediation fixture |
+| `pinned-inference-pool`: one zone, autoscaler at max, HPA settles at 3 with a standing Pending backlog                                                        | `seeded-a` / ns `seeded-capacity`    | `stockout-pinned-pool`                               |
+| `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                        | `seeded-a`                           | `fleet-cost-idle-pool`                               |
+| `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                | project, `var.zone`                  | `fleet-cost-idle-pool`                               |
+| Control plane one minor behind REGULAR default                                                                                                                | `seeded-b`                           | `upgrade-readiness-lagging-cluster`                  |
+| Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares)                        | `seeded-c`                           | `consistency-drift-outlier`                          |
 
 `seeded-b`'s lag is derived at apply time (REGULAR channel default minus one minor,
 freshest patch of that minor), so the pin re-computes each reconcile instead of
