@@ -331,6 +331,17 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "snapshots", "list"),
         ("compute", "target-pools", "list"),
         ("container", "ai", "profiles", "list"),
+        # A `create` verb on the read list, so it needs its argument. It
+        # renders Kubernetes YAML and mutates nothing in the cloud -- gcloud's
+        # own help calls it "generate ready-to-deploy Kubernetes manifests" --
+        # and it is the documented next step after `profiles list` in four
+        # shipped skills (gke-inference, gke-manifest-generation,
+        # gke-cluster-creation, gke-basics' cli-reference), with no MCP
+        # equivalent to fall back to. Refusing it let a skill discover a
+        # profile and then not generate the manifest it exists to produce.
+        # What is NOT granted is its file write: --output-path is refused
+        # below, so the manifest comes back on stdout.
+        ("container", "ai", "profiles", "manifests", "create"),
         ("container", "ai", "profiles", "models", "list"),
         ("container", "clusters", "describe"),
         ("container", "clusters", "list"),
@@ -350,6 +361,11 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("version",),
     }
 )
+
+# Derived, not hand-written: a new entry longer than every current one must
+# extend the prefix scan in _gcloud_is_read_only, and a constant maintained by
+# hand would silently make that entry unreachable.
+_LONGEST_GCLOUD_COMMAND = max(len(command) for command in GCLOUD_READ_COMMANDS)
 
 # gcloud flags that consume the following argument. Without these,
 # `gcloud --project my-proj container clusters list` reads `my-proj` as the
@@ -378,8 +394,25 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--instance-selection-machine-types", "--size", "--types", "--zones",
         # `billing budgets list` requires it.
         "--billing-account",
+        # `container ai profiles manifests create` selectors, from its gcloud
+        # synopsis. --output-path is deliberately absent from this set and
+        # refused outright below; the rest only shape the rendered YAML.
+        "--model-server", "--model-server-version", "--model-bucket-uri",
+        "--accelerator-type", "--serving-stack", "--serving-stack-version",
+        "--target-itl-milliseconds", "--target-ntpot-milliseconds",
+        "--target-ttft-milliseconds", "--use-case", "--namespace", "--output",
     }
 )
+
+# gcloud flags that write a file wherever the caller points them. The command
+# runs in the sidecar, so the file lands in the container holding the
+# credentials rather than in the agent's workspace, and an agent that can
+# choose the path can overwrite gcloud's own configuration -- the identity
+# material --account and --configuration are refused for naming. The shared
+# workspace is already writable by the agent directly, so refusing this costs
+# a caller nothing it cannot get by redirecting stdout in its own shell. This
+# is the gcloud half of the rule _KUBECTL_FILE_WRITE_FLAGS states for kubectl.
+_GCLOUD_FILE_WRITE_FLAGS = frozenset({"--output-path", "--log-http-log-file"})
 
 # gcloud boolean global flags that do not consume the following argument.
 # These are enumerated from gcloud help and are boolean **at the global parser
@@ -400,6 +433,10 @@ _GCLOUD_BOOLEAN_FLAGS = frozenset(
         # control plane without a public IP, which is exactly the cluster
         # where there is no fallback spelling.
         "--dns-endpoint", "--internal-ip",
+        # The one spelling gke-app-onboarding ships for `artifacts docker
+        # images describe`; without it the entry granting that read was
+        # unreachable.
+        "--show-package-vulnerability",
     }
 )
 
@@ -431,6 +468,21 @@ def _gcloud_has_flags_file(argv: list[str]) -> str | None:
         name, _, _ = token.partition("=")
         if name == "--flags-file":
             return "--flags-file"
+    return None
+
+
+def _gcloud_writes_a_file(argv: list[str]) -> str | None:
+    """Return the file-writing flag found in ``argv``, or None.
+
+    Checked before the command path is read, like the --flags-file and identity
+    rules above it: the flag is refused wherever it appears and whatever the
+    command turns out to be, so a new allowlist entry cannot quietly bring a
+    file write along with it.
+    """
+    for token in argv[1:]:
+        name, _, _ = token.partition("=")
+        if name in _GCLOUD_FILE_WRITE_FLAGS:
+            return name
     return None
 
 
@@ -482,8 +534,19 @@ def _gcloud_is_read_only(words: list[str]) -> bool:
     # A prefix of the words must exactly match a listed command. This allows
     # positional arguments after the command: get-credentials my-cluster matches
     # (container, clusters, get-credentials).
+    #
+    # The scan stops at the longest listed command rather than at len(words).
+    # Every longer prefix is a tuple no entry can equal, and building and
+    # hashing it made a refusal cost O(n^2) in the number of argv words. Nothing
+    # upstream bounds that count -- credential_proxy caps the request body, not
+    # the list length, and a 1 MiB body holds ~260k words -- so a single
+    # unmatched command could hold the sidecar's CPU for minutes. The proxy
+    # process also carries the Chat relay and the Slack socket client, and
+    # policy evaluation has no timeout around it (timeout_seconds bounds the
+    # subprocess, which a refusal never reaches).
+    longest = min(len(words), _LONGEST_GCLOUD_COMMAND)
     return any(tuple(words[:length]) in GCLOUD_READ_COMMANDS
-               for length in range(1, len(words) + 1))
+               for length in range(1, longest + 1))
 
 
 def _kubectl_verb_and_flag(argv: list[str]) -> tuple[tuple[str, ...] | None, str | None]:
@@ -834,6 +897,19 @@ def evaluate(argv: list[str]) -> Decision:
                     "--configuration, and --account to use the default identity."
                 ),
                 offending_flag=identity_flag,
+            )
+
+        write_flag = _gcloud_writes_a_file(argv)
+        if write_flag:
+            return Decision(
+                allowed=False,
+                rule_id="gcp.file-write-forbidden",
+                message=(
+                    "This flag writes a file inside the credential proxy's own "
+                    "container, not the agent workspace. Drop it and redirect "
+                    "the command's stdout instead."
+                ),
+                offending_flag=write_flag,
             )
 
         words, unknown_flag = _gcloud_words_and_flag(argv)

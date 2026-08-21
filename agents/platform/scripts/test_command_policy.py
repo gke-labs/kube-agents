@@ -1,6 +1,6 @@
 import unittest
 
-from command_policy import evaluate, _gcloud_words_and_flag
+from command_policy import evaluate, GCLOUD_READ_COMMANDS, _gcloud_words_and_flag
 
 
 def _gcloud_words(argv):
@@ -857,6 +857,37 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 self.assertEqual(expected_rule_id, decision.rule_id)
 
 
+class RefusalCostIsBounded(unittest.TestCase):
+    """A refusal must not become a way to spend the sidecar's CPU.
+
+    The proxy caps the request body, not the number of argv words, and a 1 MiB
+    body holds hundreds of thousands of them. Policy evaluation has no timeout
+    around it -- timeout_seconds bounds the subprocess, which a refusal never
+    reaches -- and the same process carries the Chat relay and the Slack socket
+    client, so a wedged evaluation is an outage rather than a slow command.
+    """
+
+    def test_a_huge_argv_is_refused_without_a_quadratic_scan(self):
+        import time
+
+        argv = ["gcloud"] + ["a"] * 200_000
+        started = time.perf_counter()
+        decision = evaluate(argv)
+        elapsed = time.perf_counter() - started
+
+        self.assertFalse(decision.allowed)
+        # Two orders of magnitude of headroom over the bounded implementation
+        # and far under the minutes the unbounded prefix scan took, so this
+        # fails on a regression rather than on a slow machine.
+        self.assertLess(elapsed, 2.0, f"refusal took {elapsed:.2f}s")
+
+    def test_the_scan_bound_covers_the_longest_listed_command(self):
+        # The bound is derived from GCLOUD_READ_COMMANDS rather than written
+        # down, so this pins the reason: a longer entry must stay reachable.
+        longest = max(GCLOUD_READ_COMMANDS, key=len)
+        self.assertTrue(evaluate(["gcloud", *longest]).allowed, longest)
+
+
 class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
     """Refusals that are outages rather than controls.
 
@@ -969,6 +1000,52 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
+
+    def test_the_inference_skills_can_generate_a_manifest(self):
+        # `manifests create` renders YAML and mutates nothing in the cloud, and
+        # four skills document it as the step after `profiles list` with no MCP
+        # equivalent. Both its allowlist entry and its flags' arity are needed:
+        # either one missing refuses the command. Spellings are the skills' own
+        # (gke-inference:53, gke-basics cli-reference:241).
+        for argv, desc in (
+            (["gcloud", "container", "ai", "profiles", "manifests", "create",
+              "--model=meta-llama/Llama-3", "--model-server=vllm",
+              "--accelerator-type=nvidia-h100-80gb"], "gke-inference"),
+            (["gcloud", "container", "ai", "profiles", "manifests", "create",
+              "--model=m", "--model-server=vllm", "--accelerator-type=a",
+              "--target-ntpot-milliseconds=200"], "with a latency target"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_the_manifest_generator_may_not_write_a_file_in_the_sidecar(self):
+        # The command runs in the credential proxy's container, so --output-path
+        # writes next to the credentials rather than in the agent's workspace.
+        # Granting the command must not grant the write: the caller redirects
+        # stdout in its own shell instead.
+        for argv, desc in (
+            (["gcloud", "container", "ai", "profiles", "manifests", "create",
+              "--model=m", "--model-server=vllm", "--accelerator-type=a",
+              "--output-path=/opt/inference.yaml"], "attached"),
+            (["gcloud", "container", "ai", "profiles", "manifests", "create",
+              "--model=m", "--output-path", "/etc/passwd"], "detached"),
+            (["gcloud", "container", "clusters", "list",
+              "--log-http-log-file=/tmp/x"], "on an ordinary read too"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, desc)
+                self.assertEqual("gcp.file-write-forbidden", decision.rule_id)
+
+    def test_the_vulnerability_scan_read_is_reachable_as_shipped(self):
+        # gke-app-onboarding SKILL.md:88 is the only invocation of this entry in
+        # the tree, and it passes --show-package-vulnerability. Without arity
+        # for that flag the entry granted the skill nothing.
+        self.assertTrue(evaluate([
+            "gcloud", "artifacts", "docker", "images", "describe",
+            "us-east4-docker.pkg.dev/p/r/i:t", "--show-package-vulnerability",
+            "--quiet",
+        ]).allowed)
 
     def test_logging_read_works_as_the_shipped_scripts_spell_it(self):
         # `logging read` was allowlisted while every flag the repo passes to it
