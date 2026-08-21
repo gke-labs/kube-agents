@@ -151,6 +151,12 @@ class BuildPayloadsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, inv.EXIT_INCOMPLETE)
         self.assertIn("unscored: f002", " ".join(caught.exception.errors))
 
+    def test_a_null_score_counts_as_unscored_rather_than_dropping_the_finding(self):
+        with self.assertRaises(inv.Failure) as caught:
+            inv.build_payloads(self.items, {"f001": SCORE, "f002": None})
+        self.assertEqual(caught.exception.code, inv.EXIT_INCOMPLETE)
+        self.assertIn("unscored: f002", " ".join(caught.exception.errors))
+
     def test_a_score_for_an_unknown_id_is_an_error(self):
         with self.assertRaises(inv.Failure) as caught:
             inv.build_payloads(self.items, {"f001": SCORE, "f002": SCORE, "f009": SCORE})

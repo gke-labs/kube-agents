@@ -209,7 +209,9 @@ def build_payloads(items: list[dict], scores: dict) -> list[dict]:
 
     for unknown in sorted(set(scores) - set(by_id)):
         errors.append(f"{unknown}: scored but not an extracted id")
-    missing = [fid for fid in by_id if fid not in scores]
+    # `is None` rather than key membership: the payload loop below skips a null
+    # score, so keying on presence alone would drop the finding with no error.
+    missing = [fid for fid in by_id if scores.get(fid) is None]
     if missing:
         errors.append(
             f"unscored: {', '.join(missing)} -- every extracted finding needs a score, "

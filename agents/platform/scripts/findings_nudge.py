@@ -3,19 +3,22 @@
 
 Backs the ``findings-morning-nudge`` cron job, which runs with ``no_agent:
 true`` and ``deliver: "chat"``. Its stdout is delivered verbatim, so everything
-this prints is what the user reads.
+this prints is what the user reads, and printing nothing relays nothing.
 
 No model turn, because there is no judgement to make: the ordering is the
 queue's (`GET /v1/findings/ranked`), the severity is computed by the rubric at
 registration, and the recommendation was written by whoever found the thing.
 What is left is counting and formatting.
 
-This is §7.2 of `docs/designs/inventory-findings-queue.md` minus its third
-line. The design's nudge links to a backlog document holding the whole queue;
-that publisher (§7.1) is not built, so the message says how many findings it did
-not name rather than pointing at a list of them.
+This is §7.2 of `docs/designs/inventory-findings-queue.md` minus two things.
+The design's nudge links to a backlog document holding the whole queue; that
+publisher (§7.1) is not built, so the message says how many findings it did not
+name rather than pointing at a list of them. And the design's change gate comes
+with a weekly message that posts regardless, so a silent week cannot be confused
+with a broken job; there is no such floor here.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -35,14 +38,14 @@ TOP_N = 2
 HEADING = "Findings queue — morning nudge"
 
 
-def _request(endpoint: str, path: str, body: dict | None = None) -> dict:
+def _request(endpoint: str, path: str, body: dict | None = None, method: str = "") -> dict:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
     token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
-        f"{endpoint}{path}", data=data, headers=headers, method="POST" if data else "GET"
+        f"{endpoint}{path}", data=data, headers=headers, method=method or ("POST" if data else "GET")
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -99,6 +102,18 @@ def _body(findings: list[dict]) -> str:
     return "\n".join(lines)
 
 
+PUBLISHER = "nudge"
+
+
+def _last_posted_hash(endpoint: str) -> str | None:
+    try:
+        return (_request(endpoint, f"/v1/findings/publication/{PUBLISHER}") or {}).get("content_hash")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     endpoint = (os.environ.get("SESSION_KV_ENDPOINT") or DEFAULT_ENDPOINT).rstrip("/")
 
@@ -112,8 +127,29 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"findings_nudge: could not read the queue at {endpoint}: {detail}\n")
         return 1
 
-    sys.stdout.write(compose(findings) + "\n")
+    message = compose(findings)
+    # The message itself is what "the list changed" is about, so hash that
+    # rather than the findings it was built from.
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    try:
+        if _last_posted_hash(endpoint) == digest:
+            return 0
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        # Post anyway: a repeated message is a smaller failure than a lost one.
+        sys.stderr.write(f"findings_nudge: could not read the last posted hash: {exc}\n")
+
+    sys.stdout.write(message + "\n")
     sys.stdout.flush()
+
+    try:
+        _request(
+            endpoint,
+            f"/v1/findings/publication/{PUBLISHER}",
+            {"target_kind": "chat", "content_hash": digest},
+            method="PUT",
+        )
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        sys.stderr.write(f"findings_nudge: could not record the posted hash: {exc}\n")
 
     # After the message, and best-effort: `surface_count` and `surfaced_at` are
     # how a finding stuck at the top of the list becomes visible as its own
