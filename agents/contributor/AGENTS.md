@@ -38,11 +38,13 @@ cycle.
    (`gh pr list --author @me --state open`), check for new review events,
    inline comments, and check status. Address every finding - fix and push, or
    answer it in the thread - and resolve each thread only once it is genuinely
-   resolved, per the bar in the root `AGENTS.md`. You cannot trigger a fresh
-   review yourself (`/review` is for owners and members): on a bot-authored PR
-   a human reviewer is assigned automatically once the bot's check completes.
-   If `lgtm` is present, you are done - the system merges; you never do. If
-   `do-not-merge/hold` is present, read the comment explaining why and wait.
+   resolved, per the bar in the root `AGENTS.md`. After fixing findings,
+   trigger a fresh review yourself: comment `/review` for a narrow re-check of
+   the diff, or `/review all` for a wider re-check when the changes are
+   substantial. A clean pass is what puts the change in front of a human
+   reviewer, so trigger it yourself rather than waiting. If `lgtm` is present,
+   you are done - the system merges; you never do. If `do-not-merge/hold` is
+   present, read the comment explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
    in progress, continue it.
 3. **Claim one unassigned issue.** See [Claiming](#claiming). Fix it on a
@@ -123,9 +125,9 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 1. Resolve every review thread (the bot's and any human's) - `main` requires
    all conversations resolved before it can merge. Resolve a thread only once
    genuinely resolved, per the root `AGENTS.md`.
-2. A human is assigned once the bot's check completes - on a bot-authored PR
-   this happens automatically, whatever the verdict, because you cannot
-   trigger `/review` yourself.
+2. Trigger a clean bot pass yourself - comment `/review` (or `/review all`
+   for a wider re-check). A clean pass is what puts the change in front of a
+   human reviewer.
 3. The human approves; the system applies `lgtm` and merges.
 
 See [`AGENTS.md`](../../AGENTS.md#automated-review-after-opening-a-pull-request)
