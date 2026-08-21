@@ -65,13 +65,14 @@ export SLACK_ENABLED="false"
 # docs/site/src/content/docs/deploy/ci-pool-projects.md.
 #
 # One GitOps repo per leasable project, so two concurrent leases can never
-# share a ledger issue or race on a remediation branch. Onboarding a third
+# share a ledger issue or race on a remediation branch. Onboarding a new
 # project (issue #637, Boskos leasing) is one line here plus its row in that
 # same doc — no other edit in this file.
 gitops_repo_for_project() {
   case "$1" in
     kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
     kube-agents-evals-2) echo "gke-agentic/kube-agents-evals-2-infra" ;;
+    kube-agents-evals-3) echo "gke-agentic/kube-agents-evals-3-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -151,7 +152,7 @@ fi
 # deploy failing loudly is the right outcome.
 #
 # The pool's App is kube-agents-evals-token-minter, id 4675512, installed on
-# the two *-infra repos above and nothing else. One App for the whole pool, so
+# the three *-infra repos above and nothing else. One App for the whole pool, so
 # the value is the same in every project's job environment; what is per-project
 # is the KMS key its PEM was imported into. That installation list -- not this
 # script, and not the minty rule the chart renders -- is what bounds where a
