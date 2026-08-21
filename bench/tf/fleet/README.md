@@ -36,19 +36,36 @@ apply needs nothing Cloud Build has that Actions lacks. The workflow does not ex
 yet; creating it is the fleet owner's call. Until it does, a manual `tofu apply` after
 any suspected drift is the reconcile.
 
-The reconcile is load-bearing for `seeded-b` in particular: its version lag is held by
-a `NO_MINOR_UPGRADES` maintenance exclusion whose window (90 days by default,
+The reconcile is load-bearing for `seeded-b` in particular, and it does two distinct
+things there. First, it **carries the control plane forward**: `min_master_version` is
+not a creation-time floor — the field is neither `ForceNew` nor ignored, and the
+provider answers a raised value with an operator-initiated `clusters.update` carrying
+`desiredMasterVersion` (it upgrades only when the recorded master is lower, never
+down). That is what keeps the pin from rotting: a new patch inside the held minor moves
+the master onto it, and the day the REGULAR default rolls a minor, the derived pin
+recomputes and the next apply walks the master to the new default-minus-one, so the lag
+stays exactly one minor without anyone touching the file. `seeded-b`'s node pool is
+driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
+moves with the master; freezing it would leave the pool a minor (or, between minor
+rolls, a patch) behind the control plane, which is upgrade SOP 3.2 `pool-skew` and a
+finding this fleet never declared.
+
+Second, it rolls the exclusion. The lag is held between reconciles by a
+`NO_MINOR_UPGRADES` maintenance exclusion whose window (90 days by default,
 `var.exclusion_window_hours`) is re-stamped from now on every apply — the plan always
 shows that one in-place update, by design; it is the window rolling forward, not
-drift. The window has a hard ceiling the API enforces: an exclusion cannot outlive the
-held minor's end of life (observed live: 1.34 capped at 2027-01-25), so as EOL
+drift. The exclusion gates GKE's _automatic_ upgrades only; manually initiated upgrades
+(including the provider's) begin immediately and ignore maintenance policy, which is
+why the two mechanisms do not fight. The window has a hard ceiling the API enforces: an
+exclusion cannot outlive the held minor's end of life (observed live: 1.34 capped at 2027-01-25), so as EOL
 approaches, applies start failing with exactly that 400 — the built-in warning to
 shorten the window variable or plan the re-lag. The exclusion therefore dies in one of
 two ways — reconciles lapse for longer than the window, or the minor reaches EOL — and
 either way GKE upgrades the master, the defect self-heals, and the upgrade scenario
-going red is the detection. A control plane cannot be downgraded, so
-the recovery is the same in both cases: replace the cluster and let the derived pin
-re-lag it against the then-current default:
+going red is the detection. The pin cannot pull it back — the provider upgrades only
+when the recorded master is below the configured value, and a control plane cannot be
+downgraded — so the recovery is the same in both cases: replace the cluster and let the
+derived pin re-lag it against the then-current default:
 `tofu apply -replace=google_container_cluster.seeded_b`. The other standing hazard is
 a cleanup sweep — one `orphan-pd-` deletion breaks the cost scenario, and recreating a
 deleted fixture restarts its age gate (below).
@@ -137,7 +154,12 @@ findings are the two planted, age-gated fixtures (the right-sizing check's
 reclaimable-delta floor sits far above these tiny pods). The upgrade audit's
 remaining absolute checks are clean by construction: every cluster now has a
 channel and a window, the fleet's minor spread is one (below the two-minor
-threshold), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly
+threshold — which is also why `seeded-b`'s master is re-pinned forward rather
+than frozen: a frozen master would fall two minors behind at the next REGULAR
+roll and trip 3.3 `fleet-spread`), 3.2 `pool-skew` is clean because
+`seeded-b`'s pool is driven from the same derived pin as its control plane
+(any skew between them is the transient mid-reconcile lag 3.2 explicitly does
+not flag), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly
 does not flag, and pools run default auto-upgrade/auto-repair on COS_CONTAINERD.
 
 Implication for the scenarios (`feat/domain-scenarios`): each objective must

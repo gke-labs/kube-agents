@@ -101,14 +101,31 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # is ENROLLED in REGULAR -- required, because the upgrade SOP's
 # master-behind check compares a master's minor against its own channel's
 # default, so a channel-less cluster falls out of the comparison and the
-# lag is invisible. What stops enrollment from healing the lag is the
-# rolling NO_MINOR_UPGRADES maintenance exclusion on the seeded_b resource
-# below, re-stamped each apply and capped by the API at the held minor's
-# end of life. A control plane cannot be downgraded and min_master_version
-# is only a creation-time floor, so if the master ever moves past the pin
-# (a lapse in reconciles, or the minor reaching EOL), the fix is replacing
-# the cluster (`tofu apply -replace=google_container_cluster.seeded_b`) --
-# the seeded_b comment and the README carry the full account.
+# lag is invisible. What stops enrollment from healing the lag between
+# reconciles is the rolling NO_MINOR_UPGRADES maintenance exclusion on the
+# seeded_b resource below, re-stamped each apply and capped by the API at
+# the held minor's end of life.
+#
+# min_master_version is NOT a creation-time floor, and the pin depends on
+# that: the field is not ForceNew and not ignored, and the provider's
+# update path answers a raised value with an operator-initiated
+# clusters.update carrying desiredMasterVersion -- "Only upgrade the master
+# if the current version is lower than the desired version"
+# (resource_container_cluster.go, the min_master_version branch). So the
+# reconcile CARRIES THE MASTER FORWARD, which is exactly what keeps the pin
+# from rotting: a new patch inside the held minor moves the master to it,
+# and the day REGULAR's default rolls a minor, local.lagging_version
+# recomputes and the next apply walks the master to the new
+# default-minus-one. Both are manual upgrades in GKE's sense, and
+# "manually-initiated upgrades begin immediately and ignore any maintenance
+# windows" -- the exclusion never had to gate them, and does not.
+#
+# The provider only ever upgrades (cur < des) and a control plane cannot be
+# downgraded, so the pin is one-way: if the master ever gets AHEAD of it --
+# reconciles lapse past the exclusion window, or the minor reaches EOL and
+# GKE auto-upgrades -- the lag is gone for good and the fix is replacing
+# the cluster (`tofu apply -replace=google_container_cluster.seeded_b`).
+# The seeded_b comment and the README carry the full account.
 data "google_container_engine_versions" "fleet" {
   location = var.zone
   project  = var.project_id
@@ -425,16 +442,28 @@ resource "google_container_node_pool" "seeded_b_default" {
   node_count = 1
   version    = local.lagging_version
 
+  # The pool takes the SAME derived pin as the master, and is deliberately
+  # not ignore_changes'd: min_master_version carries the control plane
+  # forward on every reconcile (see the block above), so a frozen pool
+  # would skew against it. Freezing it costs a finding in both directions:
+  # at the next REGULAR minor roll the master moves and the pool does not,
+  # which is upgrade SOP 3.2 `pool-skew` -- exactly one minor behind with
+  # autoUpgrade true, severity minor -- and even without a minor roll the
+  # same asymmetry leaks at patch level, because GKE auto-upgrades the pool
+  # to the channel's default patch while the pin pushes the master to the
+  # freshest patch of the minor, which 3.2 flags as patch-only drift.
+  # Either would be an undeclared finding on a fleet whose whole premise is
+  # that a correct audit's findings are known in advance. Driving both from
+  # local.lagging_version keeps them equal at steady state; the pool
+  # depends on the cluster, so terraform updates the master first and the
+  # pool follows, which is the only ordering GKE accepts.
+  #
   # Channel enrollment requires node auto-upgrade on -- the API rejects
-  # false. The NO_MINOR_UPGRADES exclusion on the cluster is what actually
-  # holds the minor; patch upgrades within it may roll, so the version is
-  # ignored after creation rather than fought back down every reconcile.
+  # false. Between reconciles that auto-upgrade may roll patches within the
+  # held minor, and the NO_MINOR_UPGRADES exclusion is what keeps it from
+  # crossing into the next one.
   management {
     auto_upgrade = true
-  }
-
-  lifecycle {
-    ignore_changes = [version]
   }
 
   node_config {
