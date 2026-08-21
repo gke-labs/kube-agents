@@ -150,6 +150,14 @@ fi
 # says "the manual half is done for this project" — and if it is not, the
 # deploy failing loudly is the right outcome.
 #
+# The pool's App is kube-agents-evals-token-minter, id 4675512, installed on
+# the two *-infra repos above and nothing else. One App for the whole pool, so
+# the value is the same in every project's job environment; what is per-project
+# is the KMS key its PEM was imported into. That installation list -- not this
+# script, and not the minty rule the chart renders -- is what bounds where a
+# run can write, because a presubmit deploys the pull request's own chart and
+# could otherwise rewrite either of them.
+#
 # githubMinter.allowedServiceAccount is left at its default, which derives
 # kubeagents-platform-gsa@<harness.projectId> — exactly the GSA_NAME/PROJECT_ID
 # pair this deploy annotates the agent KSA with, so the rule is keyed on this

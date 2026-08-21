@@ -149,10 +149,20 @@ That provisions the minter GSA, its Workload Identity binding to `kubeagents-sys
 
 Two steps have no Terraform equivalent and must be done by a human with the corresponding rights:
 
-1. **Install the GitHub App on the repository** (org-admin on `gke-agentic`, plus App-manager rights). Grant `contents: write`, `pull_requests: write`, and `issues: write`, on that one repository.
-2. **Import the App's private key** into the project's KMS signing key with the Minty CLI. The PEM must never enter Terraform state, so the key is created import-only and empty; the command is in the [composition's README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/ci-pool-minter). Confirm version 1 reaches `ENABLED`.
+1. **Install the GitHub App on the repository** (org-admin on `gke-agentic`, plus App-manager rights). Grant `contents: write`, `pull_requests: write`, and `issues: write`, on that one repository. **Done for both current pool projects** — see the App below; a third project means adding its repository to the same installation.
+2. **Import the App's private key** into the project's KMS signing key with the Minty CLI. The PEM must never enter Terraform state, so the key is created import-only and empty; the command is in the [composition's README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/ci-pool-minter). Confirm version 1 reaches `ENABLED`. This one is per project — the same PEM, imported into each project's own key.
 
-Only then set `EVAL_GITHUB_APP_ID` to the App's numeric ID in the Prow job environment. `hack/ci-deploy.sh` keeps `githubMinter.enabled=false` until it is set, because the minter Deployment is part of the release `helm --wait` gates on: enabling it before the key import fails every presubmit instead of degrading quietly.
+The pool is served by a single App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on exactly `gke-agentic/kube-agents-evals-infra` and `gke-agentic/kube-agents-evals-2-infra`:
+
+```bash
+gh api /orgs/gke-agentic/installations \
+  --jq '.installations[] | select(.app_id==4675512) |
+        {app_slug, repository_selection, permissions}'
+```
+
+It is a dedicated App rather than the organisation's existing all-repositories minter, and that is a deliberate cost. Reusing the staging App would have copied its signing key into every pool project's KMS, added unreviewed presubmit code to the callers of an identity that otherwise only serves merged code, and coupled rotation — an eval incident forcing a key rotation would have taken staging and autopush with it.
+
+Only then set `EVAL_GITHUB_APP_ID=4675512` in the Prow job environment. The value is the same for every pool project. `hack/ci-deploy.sh` keeps `githubMinter.enabled=false` until it is set, because the minter Deployment is part of the release `helm --wait` gates on: enabling it before the key import fails every presubmit instead of degrading quietly.
 
 ### 5.3 What actually bounds where a run can write
 

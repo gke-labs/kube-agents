@@ -43,7 +43,19 @@ Two steps are human-only, and the minter does not work until both are done. `ter
 
 **1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on `gke-agentic`. Grant `contents: write`, `pull_requests: write` and `issues: write` on that repository only.
 
-This installation — not the minty rule, and not `hack/ci-deploy.sh` — is what actually bounds where an eval run can write. A presubmit builds and deploys the pull request's own chart, operator, and agent, so a pull request can in principle rewrite the rule ConfigMap or the resolution table; it cannot make the App mint a token for a repository the App is not installed on. Keep the installation list to the pool's GitOps repositories.
+**This is already done for both current pool projects.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on exactly `gke-agentic/kube-agents-evals-infra` and `gke-agentic/kube-agents-evals-2-infra`. Verify before an apply:
+
+```bash
+gh api /orgs/gke-agentic/installations \
+  --jq '.installations[] | select(.app_id==4675512) |
+        {app_slug, repository_selection, permissions}'
+```
+
+`repository_selection` must read `selected`. If it ever reads `all`, a presubmit can mint for every repository in the organisation and the boundary below is gone.
+
+This installation — not the minty rule, and not `hack/ci-deploy.sh` — is what actually bounds where an eval run can write. A presubmit builds and deploys the pull request's own chart, operator, and agent, so a pull request can in principle rewrite the rule ConfigMap or the resolution table; it cannot make the App mint a token for a repository the App is not installed on. Keep the installation list to the pool's GitOps repositories, and treat adding a repository to it as the security review.
+
+A dedicated App rather than an existing one, deliberately. `gke-agentic` already hosts an all-repositories minter App used by the staging deployment, and pointing the pool at it would have meant three things: the staging App's signing key copied into every pool project's KMS, unreviewed presubmit code joining merged code as a caller of the same identity, and any rotation forced by an eval incident taking staging and autopush down with it. The pool's own App costs one creation and removes all three.
 
 **2. Import the App's private key into the signing key.** The PEM must never enter Terraform state, so the key is created import-only and empty. The Minty CLI does the cryptographic wrapping:
 
@@ -66,6 +78,6 @@ gcloud kms keys versions list --key=github-token-minter-key \
 
 ## Turning the minter on in CI
 
-`hack/ci-deploy.sh` renders `githubMinter.enabled=false` until `EVAL_GITHUB_APP_ID` is set in the job environment, and that variable is the switch meaning "the two manual steps above are done for this project". The minter Deployment is part of the release `helm --wait` gates on, so enabling it before the key import fails every presubmit rather than degrading quietly.
+`hack/ci-deploy.sh` renders `githubMinter.enabled=false` until `EVAL_GITHUB_APP_ID` is set in the job environment, and that variable is the switch meaning "the two manual steps above are done for this project". Its value is **`4675512`** and is the same for every pool project — one App serves the pool. What differs per project is the KMS key its PEM was imported into. The minter Deployment is part of the release `helm --wait` gates on, so enabling it before the key import fails every presubmit rather than degrading quietly.
 
 The chart needs nothing else per project. `githubMinter.gsaName` and `githubMinter.allowedServiceAccount` both derive from `platformAgent.harness.projectId`, which `hack/ci-deploy.sh` sets to the leased project, so the rule comes out keyed on that project's `kubeagents-platform-gsa` automatically.
