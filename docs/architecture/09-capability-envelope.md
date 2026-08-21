@@ -26,8 +26,8 @@ capability**: minted at ingress from the human's verified identity, narrowed at 
 widened.
 
 **No token format. Nothing signed. No cryptographic key anywhere in the design.** The capability
-lives in NATS KV and the message carries only a lookup id. Integrity comes from connection-time
-subject permissions, which NATS enforces before a message is parsed. Three rules make it hold: a
+lives in NATS KV and the message carries only a lookup id. Integrity comes from subject
+permissions the server evaluates on every operation, fixed when the connection authenticates. Three rules make it hold: a
 parent **names the one agent permitted to descend from it**, the verifier resolves an entry **only
 for the agent it names**, and only that verifier may read the store. Revocation is deleting an
 entry.
@@ -76,8 +76,10 @@ invariant actually asks.
 substrate must be durable, attributable, non-escalating and non-authoritative, and that meeting all
 four is necessary rather than sufficient. Against that:
 
-- **Durable.** The bus is durable with replay, and the capability chain is a second durable record
-  -- immutable once written, and readable after the fact by anyone auditing.
+- **Durable.** The bus is durable with replay, and the capability chain is a second durable record,
+  readable after the fact by anyone auditing. Append-only is a requirement on the store rather than
+  something it gives us -- see "entries are written once" below -- and the audit value depends on
+  that being enforced.
 - **Attributable.** This is the property the document exists to carry. The root is minted from the
   requester's verified identity and every hop descends from it, so "which human" is a chain walk
   rather than a correlation exercise across logs. Conditional on a request-scoped caller identity,
@@ -133,19 +135,19 @@ sees neither the capability nor the store.
 parent, and the next hop as its own delegate -- under its own namespace, and passes the new id
 downstream.
 
-**Verification.** Five checks, all required. Authenticate the caller and confirm the entry it is
+**Verification.** Six checks, all required. Authenticate the caller and confirm the entry it is
 asking about names that caller as its delegate. Walk the chain to the root, refusing a chain that
 revisits an entry or exceeds a fixed depth bound. Confirm the root sits under `cap.root.*`. Confirm
 each link is narrower than its parent. Confirm **each link was written by the agent its parent
-named as delegate**. Refuse otherwise.
+named as delegate**. Confirm no link has been rewritten since it was written. Refuse otherwise.
 
 The caller identity in the first check **must be request-scoped**. An identity shared across
 concurrent requests cannot separate them, and the guarantee this design exists to make is void
 without it. "The identity the verifier authenticates" below states what that requires of the
 runtime.
 
-The first of those is about the caller and the other four are about the chain, which is why an
-earlier draft had only the four. See "The subject prefix does not prove entitlement" below.
+The first is about the caller and the rest are about the chain, which is why an earlier draft had
+only the chain ones. See "The subject prefix does not prove entitlement" below.
 
 ```
    gateway   writes  cap.root.req-8f2a      = {tier: operator, scope: project-P,
@@ -171,8 +173,8 @@ what.
 
 ## 4. Why this needs no crypto
 
-NATS KV keys live on subjects, and subject write permissions are enforced **at connect**, before a
-message is parsed. So, writing a bucket named `cap`:
+NATS KV keys live on subjects, and a client's subject permissions are **fixed when it
+authenticates and evaluated by the server on every operation**. So, writing a bucket named `cap`:
 
 - Only the gateway may publish under `$KV.cap.root.*`
 - Each broker may publish only under `$KV.cap.hop.<its-own-agent-id>.*`
@@ -191,13 +193,30 @@ warning about.
 That buys the two properties a signature would have bought:
 
 **Who wrote this link.** The subject prefix proves it. Forging a root capability means
-publishing on a subject NATS refuses you at connection time.
+publishing on a subject the server refuses you, with the permissions
+it attached when you authenticated and cannot be talked out of afterwards.
 
 **Did each link narrow.** The verifier reads parent and child and compares. A compromised broker
 that writes something wider than it received is caught when the next hop resolves the chain.
 
-The integrity comes from connection-time permissions rather than from cryptography. Same
+The integrity comes from server-enforced permissions rather than from cryptography. Same
 guarantee, no key to custody, rotate, distribute or recover.
+
+**Entries are written once.** A KV put on an existing key is an update, not an error, and the same
+permission that lets a broker create a link lets it rewrite that link after the link has been
+resolved and acted on. So the audit record would be rewritable by the party it exists to attest.
+Two things close it and both are cheap: write entries with the store's create-only operation, which
+fails if the key exists, and have the verifier refuse an entry whose revision is not its first,
+which catches an overwrite that got in anyway. The second is the one that matters, because a
+subject permission cannot express "create but do not update" and so cannot be relied on here.
+
+**Say "the server refuses it", not "the connection is refused".** The two are different observables
+and only one of them happens. A client with no publish right on `$KV.cap.root.*` connects fine and
+authenticates fine; it gets `-ERR 'Permissions Violation for Publish to ...'` when it publishes, and
+the connection stays open. The property §4 needs is intact -- the refusal comes from the server and
+not from application code we have to write -- but a denial test worded as "the connect is rejected"
+fails against a correctly configured server, and the natural repair is to weaken it to "the connect
+succeeds", which asserts nothing at all.
 
 ### The subject prefix does not prove entitlement
 
@@ -222,7 +241,7 @@ from the child.
 caller as its delegate. The rule above closes descending from a root you were never handed. On its
 own it does nothing about simply _presenting_ that root, which reaches the same authority with less
 work. A broker puts `cap.root.<somebody-else's-request>` on its outbound message and skips writing
-a child entirely. The four chain checks all pass, and vacuously: a single-entry chain widens
+a child entirely. Every chain check passes, and vacuously: a single-entry chain widens
 nothing, and a root has no parent whose delegate could be violated. Same precondition as above --
 ids are not secrets -- and the same escalation, on the read path.
 
@@ -237,7 +256,7 @@ sharp enough. [02](02-agent-personas.md) fixes cardinality at one Cluster Admin 
 and one Developer Team Agent per namespace, so a single agent id is the named delegate of every
 request routed through it, for every human, at the same time. Check the rules against that and they
 stop separating anything. A broker serving a reader-tier request presents the id of a concurrent
-operator-tier one, is the named delegate of that entry too, and passes all five checks holding a
+operator-tier one, is the named delegate of that entry too, and passes every check holding a
 capability minted for someone else. No forged write and no second compromise -- and a concurrency
 bug in an honest broker reaches the same place as a malicious one, which is the part that should
 worry you.
@@ -305,9 +324,13 @@ downscoping design discussion together with the three below, since all four turn
 request it is serving" means to a mechanism that cannot observe a request.
 
 **Chain depth is a refusal, not just a cost.** Resolution walks to the root, so a long chain is a
-lot of KV reads. Those are now the verifier's reads rather than every broker's, which makes them
-cacheable per id -- a chain is immutable once written, so the only invalidation is revocation. Not
-a problem at three or four hops.
+lot of KV reads. Those are now the verifier's reads rather than every broker's, so caching them is
+tempting. Be careful with it: a per-id cache invalidated only by revoking that id serves a stale
+answer after an _ancestor_ is deleted, which is exactly the case §9's revocation test exercises, so
+an implementation doing the obvious thing fails that test. A cache has to be invalidated by any
+delete or overwrite anywhere in the chain, which means watching the bucket rather than reasoning
+about the id in hand. Not a problem at three or four hops, so the honest advice is to leave it
+uncached until it measures.
 
 The reason the walk is bounded is the other one. A broker holds publish across
 `cap.hop.<its-own-id>.*`, so it can write two entries in its own namespace naming each other as
@@ -382,7 +405,7 @@ The same reasoning decided three separate questions:
 | Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                 |
 | :------------------------------------------------------- | :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **We hold no signing key.** |
-| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. Enforced at connect.                                                                                                         |
+| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                              |
 | What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                   |
 
 > **Prefer a boundary that already exists and is enforced by someone else over a check we have to
@@ -451,14 +474,18 @@ silent.
   the bug present.
 - **An over-deep chain is refused:** a well-formed chain longer than the bound fails, terminal
   `cap.root.*` and all.
+- **A rewritten entry is refused:** write a link, resolve it once, overwrite it in place, resolve it
+  again. The second resolution fails. Without this the store's own semantics let a hop revise
+  history after the fact, and the audit record 09 offers to 02 §2.3 is not one.
 - **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
   including one that terminates at a well-formed `cap.hop.*` entry.
-- **Only the gateway mints roots:** any other connection publishing to `$KV.cap.root.*` is rejected
-  by NATS **at connect**, not by application code.
+- **Only the gateway mints roots:** any other connection publishing to `$KV.cap.root.*` gets a
+  permissions violation **from the server**, not a rejection from application code. The connection
+  is expected to succeed and stay open; the publish is what fails.
 - **No broker writes in another broker's namespace:** broker A publishing to `$KV.cap.hop.<B>.*` is
-  rejected at connect.
-- **No broker reads the store:** a broker connection attempting any read of the bucket is rejected
-  at connect -- both a direct get on `$KV.cap.>` and the JetStream API path to the same stream,
+  refused the same way.
+- **No broker reads the store:** a broker attempting any read of the bucket is refused -- both a
+  direct get on `$KV.cap.>` and the JetStream API path to the same stream,
   since denying only the first leaves the second open. Assert this for a broker that legitimately
   participates in a chain, since the whole point is that participation does not imply read.
 - **The permissions are actually configured:** a connection with no capability permissions at all is
