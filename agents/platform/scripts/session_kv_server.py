@@ -328,6 +328,7 @@ def init_db() -> None:
                     cluster     TEXT NOT NULL DEFAULT '',
                     namespace   TEXT NOT NULL DEFAULT '',
                     workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
                     object_kind TEXT NOT NULL DEFAULT '',
                     reason      TEXT NOT NULL DEFAULT '',
                     message     TEXT NOT NULL DEFAULT '',
@@ -426,6 +427,7 @@ def record_intercepted_event(
     cluster: str,
     namespace: str,
     workload: str,
+    object_uid: str,
     object_kind: str,
     reason: str,
     message: str,
@@ -452,6 +454,14 @@ def record_intercepted_event(
     lost entirely if the process died mid-flight. `mark_delivery_failed` is what
     turns that intent back into an observation.
 
+    `object_uid` is the involved object's UID, stored because `workload` cannot
+    substitute for it: `clean_workload_name` strips the replica suffix, so every
+    pod of one Deployment shares a `workload`. The recap counts alerts the daily
+    ceiling withheld, and a ceiling refusal makes the watcher forget its dedup
+    entry — so the same incident writes a row per sighting while N replicas write
+    rows that look alike. Only the UID separates those two cases, and it is the
+    watcher's own dedup key.
+
     `message` is truncated to `LEDGER_MESSAGE_MAX_CHARS` on the way in rather
     than on the way out. The reader's 120-character cut is a display choice and
     leaves the row itself unbounded, and the row is what the shared session PVC
@@ -462,12 +472,13 @@ def record_intercepted_event(
             with conn:
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
-                    "(cluster, namespace, workload, object_kind, reason, message, severity, occurrences, notified) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
                         workload,
+                        object_uid,
                         object_kind,
                         reason,
                         message[:LEDGER_MESSAGE_MAX_CHARS],
@@ -1494,6 +1505,7 @@ def inject_message(
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
     object_name = payload.get("name") or ""
+    object_uid = payload.get("uid") or ""
     message = payload.get("message") or ""
     count = payload.get("count") if payload.get("count") is not None else 1
     event_type = payload.get("type") or "Warning"
@@ -1554,6 +1566,7 @@ def inject_message(
         cluster=event_cluster,
         namespace=namespace,
         workload=clean_name,
+        object_uid=object_uid,
         object_kind=object_kind,
         reason=event_reason,
         message=clean_msg,

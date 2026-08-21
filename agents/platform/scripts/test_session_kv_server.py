@@ -362,6 +362,49 @@ class TestInterceptedEventLedger(unittest.TestCase):
         self.assertEqual(rows, [("cluster-b",)])
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_the_ledger_records_the_pod_the_event_was_about(self, mock_trigger):
+        """`workload` cannot stand in for the pod, by construction.
+
+        `clean_workload_name` strips the replica suffix on the way in, so two
+        pods of one Deployment write rows identical in every column the recap
+        groups on. The daily recap counts alerts the ceiling withheld, and
+        without the UID a rollout that OOMKills forty replicas reports as one.
+        """
+        for pod in ("payment-api-64d8988cb7-aaaaa", "payment-api-64d8988cb7-bbbbb"):
+            self.assertEqual(
+                self._inject("sess-uid", name=pod, uid=f"uid-of-{pod[-5:]}").status_code, 200
+            )
+
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            rows = conn.execute(
+                "SELECT workload, object_uid FROM intercepted_events "
+                "WHERE workload = 'payment-api' ORDER BY object_uid",
+                (),
+            ).fetchall()
+        self.assertEqual(
+            rows, [("payment-api", "uid-of-aaaaa"), ("payment-api", "uid-of-bbbbb")]
+        )
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_payload_without_a_uid_records_an_empty_one(self, mock_trigger):
+        """A watcher older than the field writes '' rather than failing the row.
+
+        Unlike `cluster` there is no useful fallback — this pod cannot guess
+        another pod's UID — so the recap under-counts that skewed watcher's
+        withheld alerts exactly as it did before the column existed. Losing the
+        row instead would lose the informational listing too.
+        """
+        self.assertEqual(self._inject("sess-no-uid", name="uidless-api-64d8988cb7-r76jr").status_code, 200)
+
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            rows = conn.execute(
+                "SELECT object_uid FROM intercepted_events WHERE workload = 'uidless-api'"
+            ).fetchall()
+        self.assertEqual(rows, [("",)])
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_a_payload_without_a_cluster_falls_back_to_this_pods_own(self, mock_trigger):
         """A watcher older than the field must not file its events under ''.
 
@@ -682,6 +725,7 @@ class TestInterceptedEventLedger(unittest.TestCase):
             cluster="c",
             namespace="prod",
             workload="verbose-api",
+            object_uid="pod-uid-1",
             object_kind="Pod",
             reason="FailedScheduling",
             message="0/900 nodes are available: " + "insufficient cpu, " * 400,
@@ -727,7 +771,8 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
 
     def _record(self):
         return session_kv_server.record_intercepted_event(
-            cluster="c", namespace="prod", workload="api", object_kind="Pod",
+            cluster="c", namespace="prod", workload="api", object_uid="pod-uid-1",
+            object_kind="Pod",
             reason="OOMKilled", message="m", severity="Critical",
             occurrences=1, notified=True,
         )

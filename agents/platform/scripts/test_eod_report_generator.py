@@ -116,6 +116,10 @@ def event(**overrides):
         "namespace": "prod-api",
         "workload": "payment-api",
         "object_kind": "Pod",
+        # One pod per workload unless a test overrides it. The recap counts
+        # withheld alerts per UID, so N rows of one workload is one pod
+        # re-offering, and a test that means N replicas has to say so.
+        "object_uid": None,
         "reason": "OOMKilled",
         "message": "Memory cgroup out of memory",
         "severity": "Critical",
@@ -124,6 +128,8 @@ def event(**overrides):
         "created_at": "2026-08-10 12:00:00",
     }
     row.update(overrides)
+    if row.get("object_uid") is None:
+        row["object_uid"] = f"uid-{row['workload']}"
     return row
 
 
@@ -320,6 +326,43 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertIn("*2 alerts withheld by the daily ceiling and never reached chat.*", report)
         self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("CrashLoopBackOff", report)
+
+    def test_the_withheld_line_counts_replicas_separately(self):
+        """The other half of the same number, and it fails the opposite way.
+
+        `clean_workload_name` strips the replica suffix before the row is
+        written, so forty pods of one Deployment share a `workload`, a
+        `namespace`, a `reason`, a `severity` and `notified = 0`. Counting on
+        those alone reports a rollout that OOMKilled the whole Deployment as
+        one withheld alert, which is the reading that makes an on-call skip it.
+        The watcher held forty dedup keys and forty alerts is what chat lost.
+        """
+        events = [
+            event(workload="payment-api", object_uid=f"pod-{i}", notified=False)
+            for i in range(30)
+        ]
+        summary = filter_and_aggregate_events(events)
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertEqual(summary["cap_dropped_alerts"], 30)
+        self.assertIn("*30 alerts withheld by the daily ceiling and never reached chat.*", report)
+
+    def test_a_replica_re_offering_is_still_one_withheld_alert(self):
+        """The control for the two tests above: both effects at once.
+
+        Three pods of one Deployment, each re-offered ten times after the
+        ceiling refused it. Neither counting rows nor counting cleaned
+        workloads gets this right.
+        """
+        events = [
+            event(workload="payment-api", object_uid=f"pod-{i}", notified=False)
+            for i in range(3)
+            for _ in range(10)
+        ]
+        summary = filter_and_aggregate_events(events)
+
+        self.assertEqual(summary["cap_dropped"], 30)
+        self.assertEqual(summary["cap_dropped_alerts"], 3)
 
     def test_a_clean_day_is_not_told_about_alerts_it_did_not_lose(self):
         """The control. Without it the assertion above passes on a fixed string."""
@@ -544,7 +587,7 @@ class TestReportWindow(unittest.TestCase):
                 conn.execute(
                     "CREATE TABLE intercepted_events ("
                     " id INTEGER PRIMARY KEY AUTOINCREMENT, cluster TEXT DEFAULT '',"
-                    " namespace TEXT, workload TEXT,"
+                    " namespace TEXT, workload TEXT, object_uid TEXT DEFAULT '',"
                     " object_kind TEXT, reason TEXT, message TEXT, severity TEXT,"
                     " occurrences INTEGER, notified INTEGER, created_at TIMESTAMP)"
                 )
@@ -576,6 +619,7 @@ class TestLedgerLoading(unittest.TestCase):
                     cluster     TEXT NOT NULL DEFAULT '',
                     namespace   TEXT NOT NULL DEFAULT '',
                     workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
                     object_kind TEXT NOT NULL DEFAULT '',
                     reason      TEXT NOT NULL DEFAULT '',
                     message     TEXT NOT NULL DEFAULT '',
@@ -589,11 +633,11 @@ class TestLedgerLoading(unittest.TestCase):
             for ns, workload, reason, notified, age_hours in rows:
                 conn.execute(
                     "INSERT INTO intercepted_events "
-                    "(namespace, workload, object_kind, reason, message, severity, "
-                    " occurrences, notified, created_at) "
-                    "VALUES (?, ?, 'Pod', ?, 'msg', 'Warning', 2, ?, "
+                    "(namespace, workload, object_uid, object_kind, reason, message, "
+                    " severity, occurrences, notified, created_at) "
+                    "VALUES (?, ?, ?, 'Pod', ?, 'msg', 'Warning', 2, ?, "
                     "        datetime('now', ?))",
-                    (ns, workload, reason, notified, f"-{age_hours} hours"),
+                    (ns, workload, f"uid-{workload}", reason, notified, f"-{age_hours} hours"),
                 )
         conn.close()
         return path
@@ -625,6 +669,7 @@ class TestLedgerLoading(unittest.TestCase):
                 cluster     TEXT NOT NULL DEFAULT 'cluster-b',
                 namespace   TEXT NOT NULL DEFAULT '',
                 workload    TEXT NOT NULL DEFAULT '',
+                object_uid  TEXT NOT NULL DEFAULT '',
                 object_kind TEXT NOT NULL DEFAULT '',
                 reason      TEXT NOT NULL DEFAULT '',
                 message     TEXT NOT NULL DEFAULT '',
@@ -657,6 +702,7 @@ class TestLedgerLoading(unittest.TestCase):
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 namespace   TEXT NOT NULL DEFAULT '',
                 workload    TEXT NOT NULL DEFAULT '',
+                object_uid  TEXT NOT NULL DEFAULT '',
                 object_kind TEXT NOT NULL DEFAULT '',
                 reason      TEXT NOT NULL DEFAULT '',
                 message     TEXT NOT NULL DEFAULT '',
@@ -685,6 +731,45 @@ class TestLedgerLoading(unittest.TestCase):
         )
         self.assertTrue(report.startswith("🔴"), report.splitlines()[0])
         self.assertNotIn("Nothing was held back from chat in this window", report)
+
+    def test_a_table_without_the_uid_column_is_a_read_failure_too(self):
+        """`object_uid` is in the INSERT, so it fails the same way `cluster` does.
+
+        A pre-release database carrying every other column still records
+        nothing, and the empty table it leaves behind reads as a quiet fleet.
+        The distinction worth keeping is against `delivery_error`, which the
+        INSERT does not name and which is therefore tolerated as ''.
+        """
+        err = io.StringIO()
+        # Seeded with no rows, because that is the production shape: the writer
+        # names `object_uid`, so on this table every write raises and is
+        # swallowed, and the recap meets an empty ledger.
+        path = self._db(
+            [],
+            table_sql="""
+            CREATE TABLE intercepted_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster     TEXT NOT NULL DEFAULT '',
+                namespace   TEXT NOT NULL DEFAULT '',
+                workload    TEXT NOT NULL DEFAULT '',
+                object_kind TEXT NOT NULL DEFAULT '',
+                reason      TEXT NOT NULL DEFAULT '',
+                message     TEXT NOT NULL DEFAULT '',
+                severity    TEXT NOT NULL DEFAULT '',
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                notified    INTEGER NOT NULL DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+        problems = []
+        with mock.patch.object(eod_report_generator.sys, "stderr", err):
+            rows = load_intercepted_events(path, window_hours=24, problems=problems)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("object_uid", problems[0])
+        self.assertIn("drop the table", problems[0])
 
     def test_missing_table_reports_rather_than_crashing(self):
         """A volume that predates the ledger has the DB but not the table."""
@@ -736,7 +821,8 @@ class TestTheRecapReadsOneDatabaseAndOnlyATrustedOne(unittest.TestCase):
         with conn:
             conn.execute(
                 "CREATE TABLE intercepted_events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " cluster TEXT DEFAULT '', namespace TEXT, workload TEXT, object_kind TEXT,"
+                " cluster TEXT DEFAULT '', namespace TEXT, workload TEXT,"
+                " object_uid TEXT DEFAULT '', object_kind TEXT,"
                 " reason TEXT, message TEXT, severity TEXT, occurrences INTEGER,"
                 " notified INTEGER, created_at TIMESTAMP, delivery_error TEXT DEFAULT '')"
             )
@@ -853,7 +939,7 @@ class TestAnUnreadableLedgerIsNotAQuietDay(unittest.TestCase):
             conn.execute(
                 "CREATE TABLE intercepted_events ("
                 " id INTEGER PRIMARY KEY AUTOINCREMENT, cluster TEXT DEFAULT '',"
-                " namespace TEXT, workload TEXT,"
+                " namespace TEXT, workload TEXT, object_uid TEXT DEFAULT '',"
                 " object_kind TEXT, reason TEXT, message TEXT, severity TEXT,"
                 " occurrences INTEGER, notified INTEGER, created_at TIMESTAMP)"
             )
@@ -1031,6 +1117,7 @@ class TestAnUndeliveredAlertIsNotADeliveredOne(unittest.TestCase):
                     cluster     TEXT NOT NULL DEFAULT '',
                     namespace   TEXT NOT NULL DEFAULT '',
                     workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
                     object_kind TEXT NOT NULL DEFAULT '',
                     reason      TEXT NOT NULL DEFAULT '',
                     message     TEXT NOT NULL DEFAULT '',

@@ -191,12 +191,12 @@ def load_intercepted_events(
             try:
                 cursor = conn.cursor()
                 columns = {row[1] for row in cursor.execute("PRAGMA table_info(intercepted_events)")}
-                # A table without `cluster` is not an older shape to read
-                # around, it is a ledger nothing can write to.
-                # `session_kv_server.record_intercepted_event` names the column
+                # A table without `cluster` or `object_uid` is not an older
+                # shape to read around, it is a ledger nothing can write to.
+                # `session_kv_server.record_intercepted_event` names both
                 # unconditionally in its INSERT and wraps the whole write in a
                 # blanket `except`, so on this shape every event raises
-                # `no such column: cluster`, is logged, and is dropped. The
+                # `no such column`, is logged, and is dropped. The
                 # table stays empty. Substituting '' would read that empty
                 # table cleanly and print a 🟢 all-clear every weekday over a
                 # recording path that has never worked — the precise failure
@@ -207,9 +207,10 @@ def load_intercepted_events(
                 # Guarded on `columns` being non-empty because PRAGMA returns
                 # no rows for a table that does not exist, and that fault has
                 # its own message: the SELECT below raises `no such table`.
-                if columns and "cluster" not in columns:
+                missing = [c for c in ("cluster", "object_uid") if c not in columns]
+                if columns and missing:
                     raise sqlite3.OperationalError(
-                        "`intercepted_events` has no `cluster` column, so "
+                        f"`intercepted_events` is missing {', '.join(missing)}, so "
                         "session_kv_server.py cannot write to it and the table "
                         "will stay empty — drop the table and let the server "
                         "recreate it"
@@ -224,7 +225,7 @@ def load_intercepted_events(
                 # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
                 cursor.execute(
-                    "SELECT cluster, namespace, workload, object_kind, reason, message, "
+                    "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
                     f"severity, occurrences, notified, created_at, {delivery_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
@@ -253,14 +254,15 @@ def load_intercepted_events(
                 "cluster": r[0] or "",
                 "namespace": r[1] or "",
                 "workload": r[2] or "",
-                "object_kind": r[3] or "",
-                "reason": r[4] or "Unknown",
-                "message": r[5] or "",
-                "severity": r[6] or "",
-                "occurrences": int(r[7] or 1),
-                "notified": bool(r[8]),
-                "created_at": r[9],
-                "delivery_error": r[10] or "",
+                "object_uid": r[3] or "",
+                "object_kind": r[4] or "",
+                "reason": r[5] or "Unknown",
+                "message": r[6] or "",
+                "severity": r[7] or "",
+                "occurrences": int(r[8] or 1),
+                "notified": bool(r[9]),
+                "created_at": r[10],
+                "delivery_error": r[11] or "",
             }
             for r in rows
         ]
@@ -343,12 +345,17 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     alerts_posted = 0
     suppressed_info = 0
     cap_dropped = 0
-    # Rows and alerts diverge only here. On a quota refusal the watcher forgets
-    # the dedup entry, so every later sighting of the same failure re-offers and
-    # writes another row; chat would have received one alert and deduplicated
-    # the rest. `cap_dropped` rows veto the all-clear, and the printed ⚠️ line
-    # sizes the loss from the groups.
-    cap_dropped_groups: set = set()
+    # Keyed on the UID rather than on `group_key`, and the two answer different
+    # questions. On a quota refusal the watcher forgets the dedup entry, so one
+    # failure re-offers on every sighting and writes a row each time — chat
+    # would have received one alert. But `group_key` carries `workload`, which
+    # `clean_workload_name` has already stripped the replica suffix from, so a
+    # rollout that OOMKills forty pods of one Deployment collapses to a single
+    # key: forty incidents reported as one. `(cluster, uid, reason)` is the
+    # watcher's own dedup key and is the only thing in the row that separates
+    # those two cases. `cap_dropped` rows still veto the all-clear, where any
+    # row at all is the whole question.
+    cap_dropped_incidents: set = set()
     delivery_failed = 0
     workload_map: Dict[str, Dict[str, Any]] = {}
 
@@ -441,7 +448,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # events or as none, while the 📉 total counts one.
         group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(bool(event.get('notified')))}"
         if cap_row:
-            cap_dropped_groups.add(group_key)
+            cap_dropped_incidents.add((cluster, event.get("object_uid", ""), reason))
         msg = sanitize_chat_message(event.get("message", ""))
 
         if group_key in workload_map:
@@ -507,7 +514,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "alerts_posted": alerts_posted,
         "suppressed_info": suppressed_info,
         "cap_dropped": cap_dropped,
-        "cap_dropped_alerts": len(cap_dropped_groups),
+        "cap_dropped_alerts": len(cap_dropped_incidents),
         "delivery_failed": delivery_failed,
         "entries": filtered_entries,
     }

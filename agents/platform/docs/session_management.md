@@ -226,7 +226,16 @@ two clusters apart, and it is what lets the recap's header say which clusters a 
 postdates the other columns, and unlike `delivery_error` the reader gets no tolerance for its
 absence: `record_intercepted_event` names it in every INSERT, so a table without it records nothing
 at all, and the recap reports that as an unreadable ledger rather than a quiet day — see
-"A pre-release table, and no migration" below. Rows expire on the same 14-day TTL as the rest of the
+"A pre-release table, and no migration" below.
+
+`object_uid` is recorded, and named in the same INSERT under the same terms, because `workload`
+cannot substitute for it: `clean_workload_name` strips the replica suffix before the row is written,
+so every pod of one Deployment shares a `workload`, a `namespace` and a `reason`. The recap counts
+the alerts the daily ceiling withheld, and those two cases are indistinguishable without it — one
+pod re-offered all afternoon writes many rows for one lost alert, while forty replicas failing at
+once write rows that look the same and are forty. It is the watcher's own dedup key
+(`involvedObject.uid`), which the payload has always carried; the daemon simply did not store it.
+A payload without one records `''`, since this pod cannot guess another pod's UID. Rows expire on the same 14-day TTL as the rest of the
 database, and on a row cap besides — see "Two bounds, not one":
 
 ```sql
@@ -235,6 +244,7 @@ CREATE TABLE intercepted_events(
   cluster     TEXT NOT NULL DEFAULT '',
   namespace   TEXT NOT NULL DEFAULT '',
   workload    TEXT NOT NULL DEFAULT '',
+  object_uid  TEXT NOT NULL DEFAULT '',  -- the involved object's UID; `workload` has its replica suffix stripped
   object_kind TEXT NOT NULL DEFAULT '',
   reason      TEXT NOT NULL DEFAULT '',
   message     TEXT NOT NULL DEFAULT '',
@@ -265,7 +275,7 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### A pre-release table, and no migration
 
 `init_db` runs `CREATE TABLE IF NOT EXISTS` and nothing else: there is no `ALTER TABLE` for
-`cluster` or `delivery_error` anywhere in the tree. The table has never been in a release, so the
+`cluster`, `object_uid` or `delivery_error` anywhere in the tree. The table has never been in a release, so the
 only databases carrying an earlier shape are dev installs that ran an intermediate commit of the
 change that introduced it, and a migration maintained for a shape no user has is machinery that
 outlives its reason.
@@ -278,6 +288,8 @@ which column is missing:
   column in its INSERT, so every write raises `no such column: cluster` into the blanket
   `except Exception` around it, is logged once per event, and is dropped. The table stays empty for
   as long as the shape lasts.
+- **No `object_uid`** — the same, and for the same reason: it is in the INSERT, so nothing is
+  recorded.
 - **No `delivery_error`** — events are still recorded correctly and only the correction fails.
   `mark_delivery_failed` raises `no such column: delivery_error`, the same blanket `except`
   swallows it, and the row keeps `notified = 1`, so the recap counts an alert nobody received as
@@ -294,7 +306,8 @@ lose, because none was ever written.
 The reader treats the two shapes the way the writer does. A ledger with no `delivery_error` reads
 normally, with the column substituted as empty: that keeps a recap running against a ledger written
 by an older _session server_ in the same pod during a rollout, which is a skew a drop cannot fix. A
-ledger with no `cluster` is a **read failure** — the recap prints the 🔴 card naming the path
+ledger with no `cluster` or no `object_uid` is a **read failure** — the recap prints the 🔴 card
+naming the path
 instead of a green all-clear over a table nothing can write to. That card is the only warning this
 condition produces; the per-event log lines go to the session server's own stderr, which nobody
 reads on a day the recap said everything was fine.
