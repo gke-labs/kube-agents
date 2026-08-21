@@ -11,7 +11,6 @@ from typing import Any, Iterable
 class MilestoneStatus(str, Enum):
     PASSED = "passed"
     FAILED = "failed"
-    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)
@@ -41,7 +40,7 @@ class MilestoneResult:
             "requirement": self.milestone.requirement,
             "expected": self.milestone.proof,
             "observed": self.observed,
-            "blockedBy": list(self.blocked_by),
+            "missingProof": list(self.blocked_by),
         }
 
 
@@ -86,10 +85,8 @@ class MilestoneSuite:
         )
         blockers = tuple(dict.fromkeys((*dependency_blockers, *blocked_by)))
         status = (
-            MilestoneStatus.BLOCKED
-            if blockers
-            else MilestoneStatus.PASSED
-            if met
+            MilestoneStatus.PASSED
+            if met and not blockers
             else MilestoneStatus.FAILED
         )
         self._results[milestone_id] = MilestoneResult(
@@ -124,11 +121,7 @@ class MilestoneSuite:
     def report_lines(self) -> list[str]:
         lines: list[str] = []
         for result in self.results:
-            label = {
-                MilestoneStatus.PASSED: "PASS ",
-                MilestoneStatus.FAILED: "FAIL ",
-                MilestoneStatus.BLOCKED: "BLOCK",
-            }[result.status]
+            label = "PASS " if result.passed else "FAIL "
             lines.extend(
                 [
                     f"{label}  {result.milestone.id} — {result.status.value.upper()}",
@@ -138,7 +131,7 @@ class MilestoneSuite:
                 ]
             )
             if result.blocked_by:
-                lines.append(f"      Blocked by: {', '.join(result.blocked_by)}")
+                lines.append(f"      Missing proof: {', '.join(result.blocked_by)}")
         return lines
 
     def failure_summary(self) -> str:
