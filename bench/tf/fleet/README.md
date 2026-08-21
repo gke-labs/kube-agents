@@ -57,9 +57,9 @@ shows that one in-place update, by design; it is the window rolling forward, not
 drift. The exclusion gates GKE's _automatic_ upgrades only; manually initiated upgrades
 (including the provider's) begin immediately and ignore maintenance policy, which is
 why the two mechanisms do not fight. The window has a hard ceiling the API enforces: an
-exclusion cannot outlive the held minor's end of life (observed live: 1.34 capped at 2027-01-25), so as EOL
-approaches, applies start failing with exactly that 400 — the built-in warning to
-shorten the window variable or plan the re-lag. The exclusion therefore dies in one of
+exclusion cannot outlive the held minor's end of life (observed live: 1.34 capped at
+2027-01-25), so as EOL approaches, applies start failing with exactly that 400 — the
+built-in warning to shorten the window variable or plan the re-lag. The exclusion therefore dies in one of
 two ways — reconciles lapse for longer than the window, or the minor reaches EOL — and
 either way GKE upgrades the master, the defect self-heals, and the upgrade scenario
 going red is the detection. The pin cannot pull it back — the provider upgrades only
@@ -67,10 +67,9 @@ when the recorded master is below the configured value, and a control plane cann
 downgraded — so the recovery is the same in both cases: replace the cluster and let the
 derived pin re-lag it against the then-current default:
 `tofu apply -replace=google_container_cluster.seeded_b`. That replacement costs the
-drift scenario a day — see the cluster-replacement note under Activation timeline
-below. The other standing hazard is
-a cleanup sweep — one `orphan-pd-` deletion breaks the cost scenario, and recreating a
-deleted fixture restarts its age gate (below).
+drift scenario a day — see the cluster-replacement note under Activation timeline below.
+The other standing hazard is a cleanup sweep — one `orphan-pd-` deletion breaks the cost
+scenario, and recreating a deleted fixture restarts its age gate (below).
 
 ## Activation timeline
 
@@ -79,12 +78,12 @@ is not fully assertable on the day it is applied. Recreating a fixture restarts 
 clock — `creationTimestamp` is server-set and immutable, so backdating is impossible;
 do not try.
 
-| Day  | What becomes detectable                                                                                                                                                            |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag                                                                                                                 |
+| Day  | What becomes detectable                                                                                                                                                                                                                                                                                                             |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag                                                                                                                                                                                                                                                                  |
 | D+1  | The drift outlier. The drift SOP excludes a cluster whose `createTime` is under 24 hours old "from every cohort" (§1), so on apply day the `(standard, seeded)` cohort has zero members, and §2.4's floor ("a cohort of fewer than **3** clusters produces no findings, ever") would floor it out even if only one cluster were new |
-| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                 |
-| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                        |
+| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                                                                                                                                                                  |
+| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                                                                                                                                                                         |
 
 So `consistency-drift-outlier` must stay dormant until D+1, and `fleet-cost-idle-pool`
 until D+30, when both of its fixtures are visible.
