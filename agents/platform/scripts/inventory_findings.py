@@ -233,7 +233,17 @@ def build_payloads(items: list[dict], scores: dict) -> list[dict]:
         absent = [key for key in SCORE_REQUIRED if score.get(key) is None]
         if absent:
             errors.append(f"{fid}: missing {', '.join(absent)}")
-        if unknown or absent:
+        # The queue coerces these with `bool()`, where the string "false" is
+        # True and an explicit null is False. Both are silent: a wrongly
+        # provider-managed row drops out of the report and can never carry a
+        # pull request, and an unactionable one sorts behind everything.
+        bad_flags = [
+            key for key in ("actionable", "provider_managed")
+            if key in score and not isinstance(score[key], bool)
+        ]
+        for key in bad_flags:
+            errors.append(f"{fid}: {key} must be true or false, not a string")
+        if unknown or absent or bad_flags:
             continue
 
         payload = {
