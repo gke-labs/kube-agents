@@ -1,6 +1,7 @@
 # The seeded dirty fleet
 
-Three small standing GKE clusters in `kube-agents-evals` whose defects are planted on
+Three small standing GKE clusters, one trio per eval project (`kube-agents-evals` and
+`kube-agents-evals-2` — see State below), whose defects are planted on
 purpose: they are the fixtures the Phase 2 presubmit scenarios assert on. The fleet is
 read-only for evaluations — every open pull request shares it, and no scenario may
 mutate it. Because we planted each defect and chose its name, the scenarios' assertions
@@ -104,7 +105,15 @@ what stops channel enrollment from healing the lag.
 ## Accepted background findings
 
 Each audit of this fleet returns its planted finding **plus** the rows below —
-nothing else. Everything else the baseline used to trip is closed in the stack
+nothing else, once the fleet is at steady state. Two conditions qualify that:
+enrolling `seeded-a`/`seeded-c` in REGULAR can surface a transient upgrade 3.1
+`master-behind` on them until GKE auto-upgrades their masters in the 03:00
+window, and upgrade 3.3 `fleet-spread` is computed over **every** cluster the
+audit reads in the project, not just the seeded trio — a `platform-agent-host`
+or transient `eval-pr*` cluster running a minor ahead of the channel default
+pushes project-wide spread to two and attaches an undeclared `minor` to
+`seeded-b`. Neither breaks any scenario (the objectives are `report_contains`,
+not exclusivity checks), but both make this table temporarily incomplete. Everything else the baseline used to trip is closed in the stack
 itself (Workload Identity and `GKE_METADATA` everywhere, legacy metadata endpoints
 disabled, `automountServiceAccountToken: false` and non-root-with-seccomp on all
 planted workloads, default-deny NetworkPolicies in the three workload namespaces,

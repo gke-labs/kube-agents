@@ -218,11 +218,17 @@ resource "google_container_node_pool" "seeded_a_default" {
     }
 
     # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
-    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
-    # field is immutable on a live pool, so adding it REPLACES all five
-    # pools -- accepted on D0, when the idle pool's 7-day age gate has
-    # nothing to lose; the same change a week from now would cost the cost
-    # scenario its activation clock.
+    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens.
+    #
+    # Declaring this key costs nothing live. GKE has set it by default since
+    # 1.12 and the provider marks node_config.metadata Optional+Computed, so
+    # the value written here is the value both projects' state already holds:
+    # zero plan diff, verified (4 add / 11 change / 0 destroy, no pool is
+    # replaced). The hazard is the other direction -- metadata is ForceNew on
+    # any *diff*, so adding a second key to this map, or changing this value,
+    # on a live pool REPLACES the pool. That would restart idle-batch-pool's
+    # 7-day age gate and cost the cost scenario its activation clock. Edit
+    # this map only on a fleet you are willing to rebuild.
     metadata = {
       disable-legacy-endpoints = "true"
     }
@@ -257,12 +263,9 @@ resource "google_container_node_pool" "idle_batch_pool" {
       mode = "GKE_METADATA"
     }
 
-    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
-    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
-    # field is immutable on a live pool, so adding it REPLACES all five
-    # pools -- accepted on D0, when the idle pool's 7-day age gate has
-    # nothing to lose; the same change a week from now would cost the cost
-    # scenario its activation clock.
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
     metadata = {
       disable-legacy-endpoints = "true"
     }
@@ -303,12 +306,9 @@ resource "google_container_node_pool" "pinned_inference_pool" {
       mode = "GKE_METADATA"
     }
 
-    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
-    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
-    # field is immutable on a live pool, so adding it REPLACES all five
-    # pools -- accepted on D0, when the idle pool's 7-day age gate has
-    # nothing to lose; the same change a week from now would cost the cost
-    # scenario its activation clock.
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
     metadata = {
       disable-legacy-endpoints = "true"
     }
@@ -448,12 +448,9 @@ resource "google_container_node_pool" "seeded_b_default" {
       mode = "GKE_METADATA"
     }
 
-    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
-    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
-    # field is immutable on a live pool, so adding it REPLACES all five
-    # pools -- accepted on D0, when the idle pool's 7-day age gate has
-    # nothing to lose; the same change a week from now would cost the cost
-    # scenario its activation clock.
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
     metadata = {
       disable-legacy-endpoints = "true"
     }
@@ -520,12 +517,9 @@ resource "google_container_node_pool" "seeded_c_default" {
       mode = "GKE_METADATA"
     }
 
-    # trivy GCP-0048, and defence-in-depth beside GKE_METADATA above: the
-    # v0.1/v1beta1 metadata endpoints serve unfiltered tokens. NOTE: this
-    # field is immutable on a live pool, so adding it REPLACES all five
-    # pools -- accepted on D0, when the idle pool's 7-day age gate has
-    # nothing to lose; the same change a week from now would cost the cost
-    # scenario its activation clock.
+    # trivy GCP-0048. See seeded_a_default above for why this is a zero-diff
+    # write and why a second key in this map must never be added to a live
+    # pool.
     metadata = {
       disable-legacy-endpoints = "true"
     }

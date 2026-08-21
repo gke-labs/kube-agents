@@ -326,7 +326,11 @@ resource "kubernetes_network_policy_v1" "default_deny" {
 # which is exactly the planted checkout-gateway defect -- but only
 # checkout-gateway is the fixture. maxUnavailable: 1 is the SOP's own
 # structurally-safe shape; a PDB governs evictions only, so the stockout
-# fixture (a scheduling gap) is untouched.
+# fixture (a scheduling gap) is untouched. Side effect of that same fixture:
+# with one replica Ready out of three desired, disruptionsAllowed sits at 0
+# permanently, so draining pinned-inference-pool's node waits out GKE's
+# ~1h PDB force-drain timeout. No audit finding results (3.4 decides on the
+# spec), and nothing in the eval path drains that node.
 resource "kubernetes_pod_disruption_budget_v1" "inference_server" {
   metadata {
     name      = "inference-server"
