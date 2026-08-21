@@ -165,6 +165,7 @@ class LlmGatewayService:
         timeout: int = 20,
         input_text: str | None = None,
     ) -> RawEvidence:
+        arguments = ["--context", self.kube.context, *arguments]
         result = self.kube.run(arguments, timeout=timeout, input_text=input_text)
         return RawEvidence.from_result(source, "kubectl " + " ".join(arguments), result)
 
@@ -378,6 +379,8 @@ except urllib.error.HTTPError as error:
 
     def _deployment(self, *, optional: bool = False) -> dict[str, Any] | None:
         arguments = [
+            "--context",
+            self.kube.context,
             "get",
             "deployment",
             str(self.catalog.gateway["deployment"]),

@@ -68,6 +68,9 @@ class FakeKube:
     def __init__(self, results: list[KubeCommandResult]) -> None:
         self.results = list(results)
         self.calls: list[tuple[list[str], str | None]] = []
+        self.context = (
+            f"gke_{TARGET.project_id}_{TARGET.location}_{TARGET.cluster_name}"
+        )
 
     def run(self, arguments, *, input_text=None, timeout=20, line_callback=None):
         self.calls.append((list(arguments), input_text))
@@ -229,11 +232,33 @@ class LlmGatewayServiceTest(unittest.TestCase):
             result = service.configure("chatgpt", "gpt-5.4")
 
         commands = [call[0] for call in kube.calls]
-        self.assertFalse(any(command[:2] == ["rollout", "status"] for command in commands))
-        self.assertFalse(any(command[:2] == ["patch", "deployment"] for command in commands))
-        self.assertEqual(commands[-1][0], "logs")
+        self.assertFalse(any(command[2:4] == ["rollout", "status"] for command in commands))
+        self.assertFalse(any(command[2:4] == ["patch", "deployment"] for command in commands))
+        self.assertEqual(commands[-1][2], "logs")
         self.assertIn("--pod-running-timeout=45s", commands[-1])
         self.assertIn("ABCD-EFGH", result["evidence"][-1]["stdout"])
+
+    def test_every_kubectl_command_pins_the_connected_context(self):
+        live_deployment = deployment()
+        kube = FakeKube(
+            [
+                KubeCommandResult(0, json.dumps(live_deployment)),
+                KubeCommandResult(0, "secret patched"),
+                KubeCommandResult(0, "resources applied"),
+                KubeCommandResult(0, json.dumps(live_deployment)),
+                KubeCommandResult(0, "deployment patched"),
+                KubeCommandResult(0, "rollout complete"),
+            ]
+        )
+        service = LlmGatewayService(TARGET, kube=kube)
+
+        with patch.object(service, "_render", return_value="rendered manifest"):
+            service.configure(
+                "gemini", "gemini-3.5-flash", credential="super-secret"
+            )
+
+        for arguments, _ in kube.calls:
+            self.assertEqual(arguments[:2], ["--context", kube.context])
 
 
 class FakeGateway:
