@@ -136,16 +136,30 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # The ten domain scenarios, registered here but commented out: every one
-  # reads the standing seeded fleet under bench/tf/fleet, which is not applied
-  # yet -- activating them now would red every pull request on missing
-  # infrastructure. Uncomment as the fleet lands and each scenario's planted
-  # defect is verified present (bench/tasks/DRAFTS.md tracks which). The
+  # The ten domain scenarios, registered here but commented out. Uncommenting
+  # is the LAST step of activation, not the only one: bench/tasks/DRAFTS.md
+  # carries an activation-blockers section and a per-scenario status column,
+  # and every entry below is blocked on at least one of them today. The
   # task-registration lint counts a commented entry as registered.
-  # EXCEPTION: autoops-warning-event-triage is not activatable by
-  # uncommenting -- its prompt is a meta-note and nothing applies its
-  # incident workload yet; it needs a scenario driver, which arrives with
-  # the AutoOps seam work.
+  #
+  # Summarised, so a reader here does not have to guess:
+  #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
+  #       every fleet-audit stream mints a GitHub token and writes a ledger
+  #       issue. They need the eval GitOps repos pinned and the agent deployed
+  #       with a scoped minter before they may run in presubmit.
+  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
+  #       (2026-08-28 for the pool, 2026-09-20 for the disks).
+  #   A4  the six audit scenarios' objectives read the final message, which
+  #       the SOPs keep to one line -- they need an artifact verifier first.
+  #
+  # Two entries are not activatable by uncommenting at all:
+  #   autoops-warning-event-triage -- its prompt is a meta-note and nothing
+  #     applies its incident workload; it needs a scenario driver, which
+  #     arrives with the AutoOps seam work.
+  #   chat-routing-fleet-question (A2) -- AGENT_SERVICE_NAME above is a single
+  #     global target, so every task here reaches the platform agent. This one
+  #     needs the chat front door, and would fail its delegation objective on
+  #     a correct system until the harness can target an agent per task.
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/obtainability-planted-pdb/task.yaml"
   # "./tasks/stockout-pinned-pool/task.yaml"

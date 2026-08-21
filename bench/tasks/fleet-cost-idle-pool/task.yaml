@@ -14,7 +14,29 @@
 # Planted defect required: a node pool named "idle-batch-pool" on the seeded
 # fleet running zero non-system pods, plus two orphaned unattached
 # PersistentDisks with the prefix "orphan-pd-". We chose the names.
-# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+#
+# ACTIVATION IS DATE-GATED, by the SOP's own do-not-flag rules rather than by
+# anything in this spec. Check 3.5 lists disks with the literal filter
+# `creationTimestamp<-P30D` and flags only at AGE >= 30d; check 3.7 will not
+# flag "pools created < 7 days ago". The fleet in both eval projects was
+# created 2026-08-21, so the idle-pool half of this scenario cannot pass
+# before 2026-08-28 and the orphan-disk half not before 2026-09-20. Turning
+# it on earlier produces a red presubmit that is the SOP behaving correctly.
+# Any replant of the fixtures restarts both clocks. One unsettled detail: the
+# 3.7 command (`gcloud container node-pools list`) returns no creation field,
+# so pool age is whatever the agent infers -- if it reads node age, the
+# rolling node recreation from a GKE_METADATA or machine-type change resets
+# the 7-day gate even though the pool object is untouched. See DRAFTS.md,
+# activation blocker A3.
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: fleet-cost-idle-pool
 name: Waste audit names the idle pool and the orphaned disks
 prompt: >-

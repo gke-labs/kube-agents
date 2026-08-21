@@ -11,10 +11,25 @@
 # Planted defect required: the payments-api OOMKilled crashloop in
 # seeded-debug on seeded cluster A (shared with cluster-agent-crashloop-debug;
 # one planted defect serves two domains). The PR lands on the evaluation
-# GitOps repository submit-suggestion is configured for; each run leaves a PR
-# behind, which the eval repo's cleanup owns (close-unmerged on a schedule).
-# Isolation class: read-only on the cluster; write path is the GitOps repo
-# only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+# GitOps repository submit-suggestion is configured for: per eval project,
+# gke-agentic/kube-agents-evals-infra and -evals-2-infra, throwaway repos that
+# exist for this and for the audit ledgers (DRAFTS.md, activation blocker A1).
+#
+# Every run leaves a pull request behind, permanently. An earlier version of
+# this comment claimed a scheduled close-unmerged job cleans them up; no such
+# job exists, and submit-suggestion's own SKILL.md is explicit that a PR opened
+# through this skill gets no dedupe and nothing ever closes it -- that is the
+# difference between it and fleet-audit's `remediate`, which keys the branch on
+# the touched files and closes the PR when the finding stops reproducing. So
+# the accumulation is real and unbounded: N presubmit runs leave N open PRs on
+# the eval infra repo. That is survivable only because the repo is a fixture
+# nobody reads; it is not a property to rely on, and it is why this scenario
+# asserts on the PR URL its own run produced rather than on repo state.
+#
+# Isolation class: read-only on the cluster; unbounded write to the eval
+# GitOps repo. Presubmit-eligible on the same terms as the audit scenarios
+# (throwaway repo, token scoped to it), with the accumulation above accepted
+# rather than mitigated. Eligible tier: presubmit, once A1 is in place.
 id: rca-remediation-pr
 name: RCA lands its fix as a pull request, never on the cluster
 prompt: >-

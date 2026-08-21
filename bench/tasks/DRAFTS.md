@@ -1,23 +1,44 @@
 # Phase 2 scenario drafts
 
-Spec-ready `task.yaml` files for the ten domains in `docs/designs/domains.yaml`. Every one carries a live `verification_spec` (the Phase 1 verifiers exist) and is registered, commented out, in `hack/ci-eval-pr.sh`'s `TASKS` array. None runs yet: all ten read the standing seeded fleet (`bench/tf/fleet/`), and activation means applying the fleet, verifying each planted defect, and uncommenting the task's line. One exception: `autoops-warning-event-triage` is not activatable by uncommenting — its prompt is a meta-note and nothing applies its incident workload yet; it needs a scenario driver, which arrives with the AutoOps seam work.
+Spec-ready `task.yaml` files for the ten domains in `docs/designs/domains.yaml`. Every one carries a live `verification_spec` (the Phase 1 verifiers exist) and is registered, commented out, in `hack/ci-eval-pr.sh`'s `TASKS` array. None runs yet: all ten read the standing seeded fleet (`bench/tf/fleet/`), and activation means applying the fleet, verifying each planted defect, clearing the blockers below, and uncommenting the task's line.
 
-Every draft carries in its header comment: the planted defect it needs, its isolation class (read-only or namespace-scoped is presubmit-eligible), and the tier that class makes it eligible for.
+Every draft carries in its header comment: the planted defect it needs, its isolation class, the tier that class makes it eligible for, and any blocker standing between it and a green run.
+
+## Activation blockers
+
+Uncommenting a line in `TASKS` is the last step, not the only one. Four blockers are open, each affecting several scenarios. They are recorded here rather than discovered as red presubmits.
+
+**A1 — the audit SOPs write to GitHub, so the target repo must be a throwaway one.** The six audit scenarios (security, upgrades, reliability, capacity, cost, consistency) and `rca-remediation-pr` are not read-only, and the specs said they were until this was caught in review. Step 0 of every fleet-audit stream, `audit_report.py start`, mints a repo-scoped GitHub token and clones the GitOps workspace named by the `Git Repo:` line of `/opt/data/SETTINGS.md`; `finish` rewrites the ledger issue, opens remediation pull requests, and closes findings that stopped reproducing. Pointed at the real fleet-audit ledger, a presubmit run mutates production records.
+
+The mitigation is the pattern the autopush environment already uses. Autopush points `spec.integration.github.gitRepo` at `gke-agentic/kube-agents-autopush-infra` — a private repo in a different org that exists only to be written to — and `github-token-minter` scopes the minted token to that one repository, keyed on the environment's platform service account, so a wrong `SETTINGS.md` cannot produce a token that reaches anything else. Mirrored per eval project:
+
+| Eval project          | GitOps repo                             |
+| --------------------- | --------------------------------------- |
+| `kube-agents-evals`   | `gke-agentic/kube-agents-evals-infra`   |
+| `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
+
+Both repos exist. What remains is the deploy side: no platform agent is installed in either eval project yet (`kubeagents-system` on each `platform-agent-host` is empty), so installing it with `github_repo` set to that project's repo and `enable_github_minter = true`, minter rule keyed on that project's platform GSA, is the work A1 names.
+
+**A2 — `chat-routing-fleet-question` cannot be reached by the harness.** `hack/ci-eval-pr.sh` exports one `AGENT_SERVICE_NAME` (`platform-agent`) and the runner port-forwards that single service, so every entry in `TASKS` talks to the platform agent. The routing scenario needs the chat front door. Until the harness can target an agent per task, this draft is not activatable by uncommenting — the same category as `autoops-warning-event-triage`, which needs a scenario driver to apply its incident workload and gets one with the AutoOps seam work.
+
+**A3 — the cost scenario is date-gated by the SOP's own do-not-flag rules.** Check 3.5 lists disks with the literal filter `creationTimestamp<-P30D`; check 3.7 will not flag pools created less than 7 days ago. Both eval fleets were created 2026-08-21, so the idle-pool half cannot pass before 2026-08-28 and the orphan-disk half not before 2026-09-20, and any replant restarts both clocks. Unsettled: 3.7's command returns no pool creation field, so pool age is whatever the agent infers — if it reads node age, a rolling node recreation resets the gate while the pool object is untouched.
+
+**A4 — six objectives read a message the SOPs keep deliberately empty.** The audit scenarios assert planted nouns with `report_contains` against the agent's final message, but every audit SOP mandates a one-line closing response that explicitly does not restate findings; the findings live in the ledger issue. A SOP-conformant run fails these objectives. The agreed direction is to verify the artifact the audit actually writes — the ledger issue the run created, whose number `start` prints and whose URL `finish` returns — rather than the chat message, which A1's throwaway repos make straightforward since we own and can read them. That needs a verifier that does not exist yet, so the objectives below are left as-is and known-wrong rather than quietly widened to `scope: output`, which would pass on a noun appearing anywhere in the transcript.
 
 ## The ten domains
 
-| Domain            | Draft                                | Planted defect required                                                                                                                            | Isolation                            | Eligible tier                                          | Status     |
-| ----------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------ | ---------- |
-| Chat and routing  | `chat-routing-fleet-question/`       | none (deployed agents + seeded fleet)                                                                                                              | read-only                            | presubmit                                              | spec-ready |
-| Reliability       | `obtainability-planted-pdb/`         | two-replica `checkout-gateway` in `seeded-reliability`, no PDB (the SOP-3.3 shape: nothing bounds voluntary disruption)                            | read-only                            | presubmit                                              | spec-ready |
-| Capacity          | `stockout-pinned-pool/`              | `pinned-inference-pool`: one zone, node autoscaling capped; `inference-server`'s HPA settles desired above pool capacity, leaving Pending replicas | read-only                            | presubmit                                              | spec-ready |
-| Cost              | `fleet-cost-idle-pool/`              | `idle-batch-pool` with zero non-system pods; unattached `orphan-pd-*` disks                                                                        | read-only                            | presubmit                                              | spec-ready |
-| Security          | `compliance-rbac-overgrant/`         | `debug-binding` in `seeded-security`: cluster-admin to default SA                                                                                  | read-only                            | presubmit                                              | spec-ready |
-| Upgrades          | `upgrade-readiness-lagging-cluster/` | cluster B held one minor version behind its channel (reconcile must pin it)                                                                        | read-only                            | presubmit                                              | spec-ready |
-| Consistency       | `consistency-drift-outlier/`         | cluster C is the outlier on master authorized networks (a and b carry an open-for-eval block, c has none)                                          | read-only                            | presubmit                                              | spec-ready |
-| Remediation       | `rca-remediation-pr/`                | `payments-api` crashloop in `seeded-debug` (shared with cluster debugging); PR lands on the submit-suggestion GitOps repo                          | read-only cluster, GitOps-repo write | presubmit                                              | spec-ready |
-| Cluster debugging | `cluster-agent-crashloop-debug/`     | `payments-api` in `seeded-debug`: OOMKilled crashloop (shared with remediation)                                                                    | read-only                            | presubmit                                              | spec-ready |
-| Incident triage   | `autoops-warning-event-triage/`      | none standing — creates `eval-unschedulable` in a fresh namespace                                                                                  | **namespace-scoped**                 | presubmit, after the eval-infra concurrency fix (#835) | spec-ready |
+| Domain            | Draft                                | Planted defect required                                                                                                                            | Isolation                                      | Eligible tier                                          | Status              |
+| ----------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------ | ------------------- |
+| Chat and routing  | `chat-routing-fleet-question/`       | none (deployed agents + seeded fleet)                                                                                                              | read-only                                      | presubmit                                              | blocked: A2         |
+| Reliability       | `obtainability-planted-pdb/`         | two-replica `checkout-gateway` in `seeded-reliability`, no PDB (the SOP-3.3 shape: nothing bounds voluntary disruption)                            | read-only cluster, GitOps-repo write           | presubmit                                              | blocked: A1, A4     |
+| Capacity          | `stockout-pinned-pool/`              | `pinned-inference-pool`: one zone, node autoscaling capped; `inference-server`'s HPA settles desired above pool capacity, leaving Pending replicas | read-only cluster, GitOps-repo write           | presubmit                                              | blocked: A1, A4     |
+| Cost              | `fleet-cost-idle-pool/`              | `idle-batch-pool` with zero non-system pods; unattached `orphan-pd-*` disks                                                                        | read-only cluster, GitOps-repo write           | presubmit                                              | blocked: A1, A3, A4 |
+| Security          | `compliance-rbac-overgrant/`         | `debug-binding` in `seeded-security`: cluster-admin to default SA                                                                                  | read-only cluster, GitOps-repo write           | presubmit                                              | blocked: A1, A4     |
+| Upgrades          | `upgrade-readiness-lagging-cluster/` | cluster B held one minor version behind its channel (reconcile must pin it)                                                                        | read-only cluster, GitOps-repo write           | presubmit                                              | blocked: A1, A4     |
+| Consistency       | `consistency-drift-outlier/`         | cluster C is the outlier on master authorized networks (a and b carry an open-for-eval block, c has none)                                          | read-only cluster, GitOps-repo write           | presubmit                                              | blocked: A1, A4     |
+| Remediation       | `rca-remediation-pr/`                | `payments-api` crashloop in `seeded-debug` (shared with cluster debugging); PR lands on the submit-suggestion GitOps repo                          | read-only cluster, unbounded GitOps-repo write | presubmit                                              | blocked: A1         |
+| Cluster debugging | `cluster-agent-crashloop-debug/`     | `payments-api` in `seeded-debug`: OOMKilled crashloop (shared with remediation)                                                                    | read-only                                      | presubmit                                              | spec-ready          |
+| Incident triage   | `autoops-warning-event-triage/`      | none standing — creates `eval-unschedulable` in a fresh namespace                                                                                  | **namespace-scoped**                           | presubmit, after the eval-infra concurrency fix (#835) | blocked: driver     |
 
 ## The two cross-cutting failure cases
 
@@ -39,7 +60,11 @@ Three clusters, not two — the consistency scenario has no majority and no outl
 ## Verification-spec semantics the specs rely on
 
 - `report_contains` checks the agent's final message; phrases are nouns the
-  fleet plants, chosen defensively against substring collisions.
+  fleet plants, chosen defensively against substring collisions. For the six
+  audit scenarios this is the wrong surface and blocker A4 owns the fix: the
+  SOPs put findings in the ledger issue and keep the final message to one
+  line. Widening the scope to the whole transcript is not the fix — it would
+  accept a noun that appeared in tool output the agent never reported on.
 - `tool_called` sees only the delegating turn's calls — worker mutations are
   structurally invisible to it. Mutation safeguards are therefore
   cluster-state checks (`resource_property`: the planted defect object

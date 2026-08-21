@@ -11,7 +11,15 @@
 # desired count above what the full pool can run -- one replica Ready, the
 # rest Pending. The backlog is live, the pool cannot absorb it, and the
 # audit must name the pool and quantify the gap.
-# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: stockout-pinned-pool
 name: Capacity audit names the pool that cannot scale
 prompt: >-

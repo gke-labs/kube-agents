@@ -11,7 +11,15 @@
 # step 3.3 flags: multi-replica but nothing bounding voluntary disruption,
 # so a drain or upgrade can still take both replicas at once. We chose both
 # names, so the exact match is fair (we planted the noun).
-# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
 #
 # The SOP (agents/platform/governance/obtainability_audit_sop.md) forbids any
 # write path outside the audit helper: the agent never runs git/gh itself and

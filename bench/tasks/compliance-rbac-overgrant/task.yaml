@@ -14,7 +14,15 @@
 # compliance-audit check 2.4 reads clusterrolebindings only, so a namespaced
 # RoleBinding would be invisible to the audit this scenario asserts on.
 # The classic over-grant; the audit must name it.
-# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 prompt: >-

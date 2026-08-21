@@ -9,7 +9,15 @@
 # reconcile must pin this, or GKE auto-upgrade quietly heals the defect and
 # the scenario stops proving anything — the exact drift risk strategy §6
 # open question 2 names).
-# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
 #
 # The SOP has no vulnerability feed and forbids naming CVEs; a CVE id in the
 # report is an invention. That rule becomes an exact forbidden-phrase check.
