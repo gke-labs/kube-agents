@@ -35,6 +35,14 @@ if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
 
+try:
+    from . import conftest  # noqa: F401
+except Exception:
+    try:
+        import conftest  # noqa: F401
+    except Exception:
+        pass
+
 from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
 
 PLUGIN_DIR = os.path.join(

@@ -112,7 +112,10 @@ fi
 # Paths are relative to BENCH_DIR, which is where devops-bench runs. Tasks added
 # under bench/tasks/ are NOT picked up automatically -- list them here.
 BENCH_DIR="${SCRIPT_DIR}/../bench"
-TASKS=("./tasks/gpu-stress-test-diagnosis/task.yaml")
+TASKS=(
+  "./tasks/agent-kanban-smoke/task.yaml"
+  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+)
 
 # Reads infrastructure.deployer out of a task file. Matching on the task *path*
 # instead -- the previous approach -- silently sends every task whose directory

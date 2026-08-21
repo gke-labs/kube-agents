@@ -37,11 +37,9 @@ EXCLUDED = {
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
-    # tests/e2e is deliberately NOT here: its file is gchat_agent_test.py,
-    # which the test_*.py pattern never matches. If a test_*.py ever lands
-    # there, the orphan check below fires and forces this list to say why the
-    # live-cluster suite must not join PYTHON_TEST_DIRS. That is the point.
-    #
+    # Live GKE cluster E2E test suite; pytest-native, requires live cluster, Workload Identity,
+    # and KMS. Runs under `make test-e2e` in e2e-nightly-matrix.yml and e2e-manual-runner.yml.
+    "tests/e2e": "live cluster E2E suite, runs under make test-e2e",
     # Imports kube_agents_memory, which imports hermes-agent's `agent` module
     # at module scope -- a dependency requirements-test.txt deliberately does
     # not install ("far too heavy to install for a unit-test run"). Whether to
@@ -55,7 +53,7 @@ EXCLUDED = {
 # provider and module downloads (an initialized module can carry its own
 # upstream test files), so a worktree where tofu init ever ran would
 # otherwise red this guard on vendored tests.
-IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform"}
+IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform", ".claude"}
 
 
 def discovered_dirs():

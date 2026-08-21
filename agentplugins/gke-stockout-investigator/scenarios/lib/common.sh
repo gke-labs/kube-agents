@@ -39,6 +39,9 @@
 
 set -euo pipefail
 
+# Enforce system python for gcloud to prevent google-auth AttributeError crashes in CI
+export CLOUDSDK_PYTHON="${CLOUDSDK_PYTHON:-/usr/bin/python3}"
+
 # --------------------------------------------------------------------- settings
 #
 # Every one of these is overridable from the environment. The defaults describe the
@@ -418,13 +421,18 @@ publish_alert() {
 # in its allowed list, and that list lags creation by a few seconds.
 _manifest_part() {
     scenario_manifest | python3 -c '
-import sys, yaml
+import re, sys
 want = sys.argv[1]
-INFRA = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-sel = [d for d in docs if (d.get("kind") in INFRA) == (want == "infra")]
+INFRA_PATTERN = re.compile(r"^kind:\s*(ComputeClass|StorageClass|PriorityClass|ResourceQuota)\b", re.MULTILINE)
+raw = sys.stdin.read()
+docs = [d.strip() for d in re.split(r"^---\s*$", raw, flags=re.MULTILINE) if d.strip()]
+sel = []
+for doc in docs:
+    is_infra = bool(INFRA_PATTERN.search(doc))
+    if is_infra == (want == "infra"):
+        sel.append(doc)
 if sel:
-    print(yaml.safe_dump_all(sel, sort_keys=False), end="")
+    print("\n---\n".join(sel))
 ' "$1"
 }
 
@@ -449,11 +457,17 @@ emit_manifest() {
         [ -n "$work" ] && {
             printf -- '---\n'
             printf '%s\n' "$work" | python3 -c '
-import sys, yaml
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-for d in docs:
-    d.setdefault("metadata", {})["namespace"] = sys.argv[1]
-print(yaml.safe_dump_all(docs, sort_keys=False), end="")
+import re, sys
+ns = sys.argv[1]
+raw = sys.stdin.read()
+docs = [d.strip() for d in re.split(r"^---\s*$", raw, flags=re.MULTILINE) if d.strip()]
+out = []
+for doc in docs:
+    if "metadata:" in doc:
+        doc = re.sub(r"(metadata:\s*\n)", r"\1  namespace: " + ns + "\n", doc, count=1)
+    out.append(doc)
+if out:
+    print("\n---\n".join(out))
 ' "$WORKLOAD_NAMESPACE"
         }
     } > >(if [ "$out" = "-" ]; then cat; else cat > "$out"; fi)

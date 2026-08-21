@@ -273,7 +273,9 @@ ensure_git_tag() {
   fi
 
   local push_err
-  if push_err=$(git push "https://github.com/${target_repo}.git" "${rc_tag}" 2>&1); then
+  if push_err=$(git push origin "${rc_tag}" 2>&1); then
+    echo "✅ Git tag '${rc_tag}' successfully pushed to remote repository (${target_repo})!"
+  elif push_err=$(git push "https://github.com/${target_repo}.git" "${rc_tag}" 2>&1); then
     echo "✅ Git tag '${rc_tag}' successfully pushed to remote repository (${target_repo})!"
   else
     echo "❌ ERROR: Could not push git tag '${rc_tag}' to remote repository (${target_repo}): ${push_err}" >&2

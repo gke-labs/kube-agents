@@ -34,6 +34,14 @@ sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "scripts"))
 
 import memory_file_import as mfi  # noqa: E402
+try:
+    from . import conftest  # noqa: F401
+except Exception:
+    try:
+        import conftest  # noqa: F401
+    except Exception:
+        pass
+
 from kube_agents_memory import (  # noqa: E402
     NO_IDENTITY_NOTICE,
     USER_TAG_PREFIX,

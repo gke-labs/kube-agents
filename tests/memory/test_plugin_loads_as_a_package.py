@@ -36,6 +36,14 @@ _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
 if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
 
+try:
+    from . import conftest  # noqa: F401
+except Exception:
+    try:
+        import conftest  # noqa: F401
+    except Exception:
+        pass
+
 PLUGIN_DIR = _REPO / "agents" / "chat" / "plugins" / "memory" / "kube_agents_memory"
 SUBMODULES = sorted(f.stem for f in PLUGIN_DIR.glob("*.py") if f.name != "__init__.py")
 
