@@ -456,8 +456,13 @@ platformAgent:
     data: {}
   integration:
     github:
-      # Target GitOps repository for the GitHub integration (owner/repo or
-      # URL). Empty leaves the GitHub integration unconfigured.
+      # Target GitHub Organization where the GitHub App is installed (optional).
+      # If omitted and gitRepo is specified, the organization is inferred from the repository owner.
+      # If both are empty, GitHub integration remains unconfigured.
+      org: ""
+      # Primary GitOps repository URL or owner/repo shorthand (optional).
+      # If omitted or empty, the agent starts with no registered repos, and
+      # repositories can be registered dynamically via the register-github-repo skill.
       gitRepo: ""
     googleChat:
       # Requires the Chat Pub/Sub backend (terraform/modules/chat-pubsub).

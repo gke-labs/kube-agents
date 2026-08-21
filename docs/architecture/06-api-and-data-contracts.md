@@ -242,8 +242,8 @@ default) — a closed allowlist must be set explicitly.
 
 ## 3. GitOps repository layout & propose/apply contract
 
-Single source of truth (`05` C13) — the **customer's own GitOps repository** (configured via the agent's
-`integration.github.gitRepo`, checked out into the agent workspace), **separate from the kube-agents
+Single source of truth (`05` C13) — the **customer's own GitOps repository** (scoped to the agent's
+GitHub organization/context, checked out dynamically into the agent workspace), **separate from the kube-agents
 source tree**; `submit-suggestion` pushes a branch here and opens the PR. This layout is scaffolded in
 Phase 0 ([07](07-implementation-roadmap.md)); it does not exist in the source repo today. Recommended
 layout:

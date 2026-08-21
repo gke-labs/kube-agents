@@ -277,8 +277,11 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
   tokens are read from the credentials Secret's `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).
-- **GitHub** — `platformAgent.integration.github.gitRepo` sets the agent's
-  GitOps target repository.
+- **GitHub** — `platformAgent.integration.github.org` sets the GitHub
+  Organization where the GitHub App is installed, and optional
+  `platformAgent.integration.github.gitRepo` sets the initial GitOps repository.
+  GitOps repositories can also be dynamically managed by the agent at runtime via
+  the `register-github-repo` skill.
 
 Chat and Slack each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at

@@ -105,42 +105,15 @@ LEASE_FILENAME = ".lease"
 # somehow straddles the TTL loses its untracked manifests and re-clones, which
 # is the same outcome a crashed run already had.
 DEFAULT_LEASE_TTL_HOURS = 24.0
-
-def default_settings_path() -> str:
-    """`<agent home>/SETTINGS.md`.
-
-    Written by the operator at provisioning time, so it is present from the
-    first second of the pod's life — unlike a clone, which is what makes it the
-    only usable repository source before anything has been cloned. Derived from
-    `agent_home` for the same reason `default_root` is: on a deployment that
-    moved its home, a hardcoded path is simply a file that is not there, and
-    `resolve_repo` then falls through to a git remote that does not exist yet.
-    """
-    return str(Path(agent_home()) / "SETTINGS.md")
-
-
 # The branch a pull request targets when nothing better can be determined —
 # which is only when there is no clone to ask yet. See `resolve_base_branch`.
 DEFAULT_BASE_BRANCH = "main"
 
-# Tolerates the operator's Markdown bullet and bold markers, and the literal
-# `None` when the CR leaves it unset.
-SETTINGS_REPO_RE = re.compile(r"^\s*[-*]?\s*\**Git Repo:\**\s*(\S+)\s*$", re.M)
-
 _LEASE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_LEASE_CHARS = 64
+BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 Runner = Callable[..., object]
-
-
-def settings_path() -> str:
-    return (
-        os.environ.get("GITOPS_SETTINGS")
-        or os.environ.get("FLEET_AUDIT_SETTINGS")
-        or default_settings_path()
-    )
-
-
 # One `git symbolic-ref` per clone per process, keyed by workspace path. The
 # answer cannot change while a process runs, and the call is not free: `git`
 # here is a shim that POSTs to the sidecar, so every repeat is an HTTP round
@@ -161,8 +134,8 @@ def resolve_base_branch(
 ) -> str:
     """The branch a pull request should target, for *this* repository.
 
-    Hardcoding `main` was wrong in a quiet way. This harness clones whatever
-    repository `SETTINGS.md` names, and a fleet whose GitOps repo still calls
+    Hardcoding `main` was wrong in a quiet way. This harness clones the target
+    GitOps repository, and a fleet whose GitOps repo still calls
     its trunk `master` got `origin/main` — a ref that does not resolve. Every
     remediation branch then failed at checkout, and the audit reported the fix
     it could not push as a fix the model never wrote.
@@ -604,54 +577,114 @@ def configure_identity(
     runner(["git", "config", "user.email", email], cwd=str(target))
 
 
-def repo_from_settings(path: str | None = None) -> str | None:
-    """The target repository as `owner/name`, from SETTINGS.md, or None.
-
-    This is the only repo source that works before the clone exists, which is
-    why it is tried first. `github-issue-resolver/scripts/resolver.py` reads the
-    same line; the skills agree by construction rather than by coincidence.
-    """
+def get_managed_repos() -> list[str]:
+    """Extracts managed repositories from the state ConfigMap."""
+    cfg_name = os.environ.get("GITHUB_STATE_CONFIGMAP", "platform-agent-github-state")
+    ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
     try:
-        text = Path(path or settings_path()).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = SETTINGS_REPO_RE.search(text)
-    if not match:
-        return None
-    url = match.group(1).strip().strip("/")
-    if url.lower() in {"none", "null", ""}:
-        return None
-    url = re.sub(r"^https?://(www\.)?github\.com/", "", url)
-    url = re.sub(r"^git@github\.com:", "", url)
-    url = re.sub(r"\.git$", "", url)
-    parts = [p for p in url.split("/") if p]
-    if len(parts) < 2:
-        return None
-    return f"{parts[-2]}/{parts[-1]}"
+        cm_res = subprocess.run(
+            ["kubectl", "get", "configmap", cfg_name, "-n", ns, "-o", "json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("kubectl binary not found in PATH") from e
+    except subprocess.CalledProcessError as e:
+        err_msg = (e.stderr or e.stdout or "").strip()
+        raise RuntimeError(
+            f"Failed to read ConfigMap {cfg_name} in namespace {ns}: {err_msg} (exit code {e.returncode})"
+        ) from e
+
+    try:
+        cm = json.loads(cm_res.stdout)
+        if not isinstance(cm, dict):
+            raise RuntimeError(f"ConfigMap JSON is not an object: {cm}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Failed to parse ConfigMap {cfg_name} JSON output: {e}"
+        ) from e
+
+    repos_str = (cm.get("data") or {}).get("managed_repos", "")
+    if not repos_str:
+        return []
+    repos_str = repos_str.strip()
+    raw_list: list[str] = []
+    if repos_str.startswith("["):
+        try:
+            parsed = json.loads(repos_str)
+            if isinstance(parsed, list):
+                raw_list = [str(r).strip() for r in parsed if str(r).strip()]
+        except json.JSONDecodeError:
+            pass
+    if not raw_list:
+        raw_list = [r.strip() for r in repos_str.split(",") if r.strip()]
+    return [r for r in raw_list if BARE_REPO_RE.match(r)]
 
 
-def resolve_repo(settings: str | None = None) -> str:
-    """Resolve the GitOps repository as `owner/name`, without needing a clone.
+def resolve_repo(workspace: str | Path | None = None) -> str:
+    """Resolve the GitOps repository as `owner/name`.
 
-    Order matters. The git remote used to be the only source, and it cannot
-    work on this path: the audit crons start in the agent's profile directory,
-    which is not a working tree, so `git config --get remote.origin.url`
-    returned nothing and the run died before it could clone anything. SETTINGS.md
-    is written by the operator at provisioning time and is present from the
-    first second of the pod's life.
+    Order:
+    1. Workspace path clone decoding (if a leased workspace directory is provided).
+    2. Workspace lease record (fallback if workspace is the lease holder directory).
+    3. Git remote origin of workspace (if workspace is provided).
+    4. ConfigMap state ($GITHUB_STATE_CONFIGMAP).
+    5. Local git remote origin fallback (for local development/inside clone).
     """
-    settings = settings or settings_path()
-    repo = repo_from_settings(settings)
-    if repo:
-        return repo
+    if workspace is not None:
+        try:
+            workspace_p = Path(workspace).resolve()
+            holder = lease_holder(workspace_p)
+            if holder is not None:
+                try:
+                    rel = workspace_p.relative_to(holder.resolve())
+                    if rel.parts:
+                        clone_segment = rel.parts[0]
+                        if "__" in clone_segment:
+                            owner, sep, name = clone_segment.partition("__")
+                            if owner and name:
+                                return f"{owner}/{name}"
+                except ValueError:
+                    pass
+                record = read_lease(holder)
+                if record and record.get("repo"):
+                    return record["repo"]
+        except Exception:
+            pass
+
+        try:
+            from github_token_refresh import get_current_git_repo
+
+            repo = get_current_git_repo(cwd=str(workspace))
+            if repo and "/" in repo:
+                return repo
+        except Exception:
+            pass
+
+    try:
+        managed = get_managed_repos()
+        if len(managed) == 1:
+            return managed[0]
+        elif len(managed) > 1:
+            raise RuntimeError(
+                f"Multiple repositories configured in ConfigMap ({', '.join(managed)}): "
+                "please specify the target repository explicitly (e.g. via --repo <owner/repo>)."
+            )
+    except RuntimeError as e:
+        if "Multiple repositories configured" in str(e):
+            raise
+    except Exception:
+        pass
 
     from github_token_refresh import get_current_git_repo
 
     repo = get_current_git_repo()
     if not repo or "/" not in repo:
         raise RuntimeError(
-            f"Could not resolve the target repository as owner/name: no usable "
-            f"'Git Repo:' line in {settings} and no origin remote in {Path.cwd()}"
+            f"Could not resolve the target repository as owner/name: "
+            f"no repos in ConfigMap ($GITHUB_STATE_CONFIGMAP), "
+            f"and no origin remote in {Path.cwd()}"
         )
     return repo
 

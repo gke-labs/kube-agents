@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"slices"
@@ -244,6 +245,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile Github State ConfigMap (create-only to avoid overwriting agent updates)
+	if err := r.reconcileGithubStateConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 9. Reconcile Credential Proxy Policy ConfigMap
 	proxyPolicyHash, err := r.reconcileCredentialProxyPolicyConfigMap(ctx, instance)
 	if err != nil {
@@ -335,6 +341,20 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		configmapEditorRBACName := fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name)
+
+		// Delete Configmap Editor RoleBinding
+		rbConfigmapEditor := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: configmapEditorRBACName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbConfigmapEditor)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Delete Configmap Editor Role
+		rConfigmapEditor := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: configmapEditorRBACName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rConfigmapEditor)); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -464,6 +484,169 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 		return "", err
 	}
 	return hash, nil
+}
+
+func parseManagedRepos(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "[") {
+		var list []string
+		if err := json.Unmarshal([]byte(raw), &list); err == nil {
+			var res []string
+			for _, r := range list {
+				trimmed := strings.TrimSpace(r)
+				if trimmed != "" {
+					res = append(res, trimmed)
+				}
+			}
+			return res
+		}
+	}
+	parts := strings.Split(raw, ",")
+	var res []string
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			res = append(res, trimmed)
+		}
+	}
+	return res
+}
+
+// reconcileGithubStateConfigMap ensures the <agent-name>-github-state ConfigMap exists to track
+// managed repositories. If spec.integration.github.gitRepo is defined on the CR, it is seeded
+// into managed_repos and kept present on subsequent reconciles without removing any dynamically
+// registered repositories added by the register-github-repo skill.
+//
+// Repository lifecycle and removal:
+// The operator treats spec.integration.github.gitRepo as declared desired state. If that repo
+// is absent from managed_repos in the existing ConfigMap, the reconciler re-appends it.
+// Therefore:
+//   - Dynamically registered repositories (added at runtime via register-github-repo) can be
+//     unregistered by removing them from the ConfigMap's managed_repos string.
+//   - CR-declared repositories must be removed or changed in the PlatformAgent CR itself
+//     (spec.integration.github.gitRepo); removing a CR-declared repo from the ConfigMap alone
+//     will cause the reconciler to re-add it on the next pass.
+func (r *PlatformAgentReconciler) reconcileGithubStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildGithubStateConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+
+	found := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			withCommonLabels(cm, agent)
+			if err := r.Create(ctx, cm); err != nil {
+				return err
+			}
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data["managed_repos"])
+		}
+		return err
+	}
+
+	// If the CR spec provides a repository and the existing ConfigMap does not include it,
+	// ensure the repository is recorded without overwriting other dynamically added repositories.
+	if cmRepo, ok := cm.Data["managed_repos"]; ok && cmRepo != "" {
+		if found.Data == nil {
+			found.Data = map[string]string{}
+		}
+		existing := strings.TrimSpace(found.Data["managed_repos"])
+		if existing == "" {
+			found.Data["managed_repos"] = cmRepo
+			if err := r.Update(ctx, found); err != nil {
+				return err
+			}
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo)
+		}
+		repos := parseManagedRepos(existing)
+		present := false
+		for _, r := range repos {
+			if r == cmRepo {
+				present = true
+				break
+			}
+		}
+		if !present {
+			repos = append(repos, cmRepo)
+			found.Data["managed_repos"] = strings.Join(repos, ", ")
+			if err := r.Update(ctx, found); err != nil {
+				return err
+			}
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+		}
+	}
+
+	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+}
+
+// syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos,
+// a corresponding <repo>.yaml entry exists in github-token-minter-config ConfigMap,
+// and removes any <repo>.yaml entry for repositories that are no longer managed.
+func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
+	minterCM := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: agent.Namespace}, minterCM)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if minterCM.Data == nil {
+		return nil
+	}
+
+	baseTemplate, ok := minterCM.Data["default.yaml"]
+	if !ok || strings.TrimSpace(baseTemplate) == "" {
+		return nil
+	}
+
+	repos := parseManagedRepos(managedReposStr)
+	activeKeys := make(map[string]struct{}, len(repos))
+	for _, fullRepo := range repos {
+		bareRepo := fullRepo
+		if idx := strings.LastIndex(fullRepo, "/"); idx != -1 {
+			bareRepo = fullRepo[idx+1:]
+		}
+		bareRepo = strings.TrimSpace(bareRepo)
+		if bareRepo == "" {
+			continue
+		}
+		activeKeys[bareRepo+".yaml"] = struct{}{}
+	}
+
+	updated := false
+
+	// Ensure all active managed repositories have policy entries
+	for key := range activeKeys {
+		if _, exists := minterCM.Data[key]; !exists {
+			minterCM.Data[key] = baseTemplate
+			updated = true
+		}
+	}
+
+	// Prune policy entries for repositories that were removed / unmanaged (preserving default.yaml)
+	for key := range minterCM.Data {
+		if key == "default.yaml" {
+			continue
+		}
+		if !strings.HasSuffix(key, ".yaml") {
+			continue
+		}
+		if _, active := activeKeys[key]; !active {
+			delete(minterCM.Data, key)
+			updated = true
+		}
+	}
+
+	if updated {
+		return r.Update(ctx, minterCM)
+	}
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
@@ -734,7 +917,7 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 
 // cleanupAgentRBAC dynamically purges un-wanted or all RBAC resources for a PlatformAgent.
 // When deleteAll is true (called during finalization), all RBAC resources are deleted.
-// When deleteAll is false (called during reconcile), active canonical bindings (minimal, local, leader) are preserved.
+// When deleteAll is false (called during reconcile), active canonical bindings (minimal, local, leader, configmap-editor) are preserved.
 func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent, deleteAll bool) error {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
@@ -743,6 +926,7 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
 	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
 	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+	configmapEditorBindingName := fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name)
 
 	// 1. Fast, dynamic cleanup of ClusterRoleBindings using targeted label selectors (current and legacy instance labels)
 	var labeledClusterRoleBindings rbacv1.ClusterRoleBindingList
@@ -811,7 +995,8 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range existingRoleBindings.Items {
 		rb := &existingRoleBindings.Items[i]
-		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
+		// Preserve configmapEditorBindingName during reconciliation alongside local and leader bindings
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName || rb.Name == configmapEditorBindingName) {
 			continue
 		}
 		isTargetSA := false
@@ -830,7 +1015,7 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 		}
 	}
 
-	// 5. Clean up local and leader Role/RoleBindings if deleteAll is requested
+	// 5. Clean up local, leader, and configmap-editor Role/RoleBindings if deleteAll is requested
 	if deleteAll {
 		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderBindingName, Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
@@ -850,6 +1035,16 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 		rbLocal := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: localBindingName, Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, rbLocal)); err != nil {
 			return fmt.Errorf("failed to delete local RoleBinding %s: %w", localBindingName, err)
+		}
+
+		rConfigmapEditor := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: configmapEditorBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rConfigmapEditor)); err != nil {
+			return fmt.Errorf("failed to delete configmap-editor Role %s: %w", configmapEditorBindingName, err)
+		}
+
+		rbConfigmapEditor := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: configmapEditorBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbConfigmapEditor)); err != nil {
+			return fmt.Errorf("failed to delete configmap-editor RoleBinding %s: %w", configmapEditorBindingName, err)
 		}
 	}
 
@@ -906,6 +1101,22 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 		return fmt.Errorf("failed to reconcile leader RoleBinding: %w", err)
 	}
 
+	configmapEditorRole := buildPlatformConfigMapEditorRole(agent)
+	if err := ctrl.SetControllerReference(agent, configmapEditorRole, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on configmap-editor Role: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, configmapEditorRole); err != nil {
+		return fmt.Errorf("failed to reconcile configmap-editor Role: %w", err)
+	}
+
+	configmapEditorRBACName := fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name)
+	rbConfigmapEditor := buildPlatformConfigMapEditorRoleBinding(agent, configmapEditorRBACName, configmapEditorRole.Name)
+	if err := ctrl.SetControllerReference(agent, rbConfigmapEditor, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on configmap-editor RoleBinding: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, rbConfigmapEditor); err != nil {
+		return fmt.Errorf("failed to reconcile configmap-editor RoleBinding: %w", err)
+	}
 	// Clean up legacy or un-canonical RBAC definitions after new roles are applied (Zero-Downtime Upgrade)
 	if err := r.cleanupAgentRBAC(ctx, agent, false); err != nil {
 		return err
@@ -989,7 +1200,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	gitRepoErr := error(nil)
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepoErr = agentv1alpha1.ValidateGitRepoURL(agent.Spec.Integration.GitHub.GitRepo)
+		if err := agentv1alpha1.ValidateGitHubOrg(agent.Spec.Integration.GitHub.Org); err != nil {
+			gitRepoErr = err
+		} else if err := agentv1alpha1.ValidateGitRepoURLWithOrg(agent.Spec.Integration.GitHub.GitRepo, agent.Spec.Integration.GitHub.Org); err != nil {
+			gitRepoErr = err
+		}
 	}
 
 	degradedStatus := metav1.ConditionFalse
@@ -997,7 +1212,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
 		condReason = "InvalidGitRepoURL"
-		condMsg = fmt.Sprintf("Invalid gitRepo URL (%s); GitOps disabled in SETTINGS.md", gitRepoErr.Error())
+		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config", gitRepoErr.Error())
 		degradedStatus = metav1.ConditionTrue
 	}
 

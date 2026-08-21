@@ -246,14 +246,25 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		}
 	}
 
-	// 4. Validate GitHub Repository URL
+	// 4. Validate GitHub Integration (both Org and GitRepo are optional)
 	if platformAgent.Spec.Integration != nil && platformAgent.Spec.Integration.GitHub != nil {
-		if err := agentv1alpha1.ValidateGitRepoURL(platformAgent.Spec.Integration.GitHub.GitRepo); err != nil {
-			allErrs = append(allErrs, field.Invalid(
-				field.NewPath("spec", "integration", "github", "gitRepo"),
-				platformAgent.Spec.Integration.GitHub.GitRepo,
-				err.Error(),
-			))
+		if platformAgent.Spec.Integration.GitHub.Org != "" {
+			if err := agentv1alpha1.ValidateGitHubOrg(platformAgent.Spec.Integration.GitHub.Org); err != nil {
+				allErrs = append(allErrs, field.Invalid(
+					field.NewPath("spec", "integration", "github", "org"),
+					platformAgent.Spec.Integration.GitHub.Org,
+					err.Error(),
+				))
+			}
+		}
+		if platformAgent.Spec.Integration.GitHub.GitRepo != "" {
+			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(platformAgent.Spec.Integration.GitHub.GitRepo, platformAgent.Spec.Integration.GitHub.Org); err != nil {
+				allErrs = append(allErrs, field.Invalid(
+					field.NewPath("spec", "integration", "github", "gitRepo"),
+					platformAgent.Spec.Integration.GitHub.GitRepo,
+					err.Error(),
+				))
+			}
 		}
 	}
 

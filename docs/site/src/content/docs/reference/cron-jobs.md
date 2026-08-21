@@ -54,7 +54,7 @@ Both rosters use one schema. A governance watchdog:
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
-  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 406 lines of it, before you run anything. Its eleven checks are section 2, lines 102-314, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 413 lines of it, before you run anything. Its eleven checks are section 2, lines 107-320, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": ["fleet-audit"],
   "enabled": true,
   "deliver": "chat"

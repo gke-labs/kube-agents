@@ -13,31 +13,34 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
+
+# Add scripts directory so gitops_workspace is importable
+sys.path.append("/opt/defaults/scripts")
+sys.path.append("/opt/data/scripts")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token")
 
 def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
 
-def get_current_git_repo() -> str:
+
+def get_current_git_repo(cwd: str | None = None) -> str | None:
     """Extract repository name (owner/repo) from local git config."""
     try:
         res = subprocess.run(
             ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(cwd) if cwd else None,
             capture_output=True, text=True, check=True
         )
         url = res.stdout.strip().strip("/")
-        # Parse owner/repo from URL (supports HTTPS and SSH formats)
-        # e.g., git@github.com:owner/repo.git or https://github.com/owner/repo.git
         if url.endswith(".git"):
             url = url[:-4]
-        # Remove protocol prefix if present (e.g. https://)
         if "://" in url:
             url = url.split("://", 1)[1]
-        # If SSH format, split by ':' (e.g. git@github.com:owner/repo)
         if "@" in url and ":" in url:
             url = url.split(":", 1)[1]
-        
         parts = url.split("/")
         if len(parts) >= 2:
             return f"{parts[-2]}/{parts[-1]}"
@@ -45,11 +48,18 @@ def get_current_git_repo() -> str:
         log(f"WARNING: Could not parse repository from git config: {e}")
     return None
 
+
 def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
-    repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
-    if not repository or "/" not in repository:
-        raise RuntimeError("Could not identify target repository as owner/name")
+    if target_repo:
+        repository = target_repo.strip().strip("/")
+        if repository.count("/") != 1:
+            raise RuntimeError(f"Invalid repository format: '{target_repo}'. Expected 'owner/repo'.")
+    else:
+        repository = get_current_git_repo()
+
+    if not repository or repository.count("/") != 1:
+        raise RuntimeError("Could not identify target repository (must be formatted as owner/repo) to determine GitHub organization")
 
     proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
     if proxy_url:
@@ -90,8 +100,21 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     if not oidc_token:
         raise RuntimeError("Retrieved Google OIDC token via gcloud is empty")
 
-    # 2. Dynamically identify target repository from workspace git remote or parameter
     org_name, repo_name = repository.split("/", 1)
+
+    # In a multi-repo deployment, scope the installation token to all managed
+    # repositories within this organization to avoid pod-wide token slot churn.
+    repositories_to_scope = [repo_name]
+    try:
+        from gitops_workspace import get_managed_repos
+
+        for m in get_managed_repos():
+            if "/" in m:
+                m_org, m_repo = m.split("/", 1)
+                if m_org.lower() == org_name.lower() and m_repo not in repositories_to_scope:
+                    repositories_to_scope.append(m_repo)
+    except Exception:
+        pass
 
     headers = {
         "Content-Type": "application/json",
@@ -99,12 +122,12 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     }
     body = {
         "org_name": org_name,
-        "repositories": [repo_name],
+        "repositories": repositories_to_scope,
         "scope": "platform-agent-scope"
     }
     req_data = json.dumps(body).encode("utf-8")
 
-    log(f"Requesting scoped installation token from Minty for repository: {org_name}/{repo_name}...")
+    log(f"Requesting scoped installation token from Minty for organization {org_name} (repositories: {repositories_to_scope})...")
     
     try:
         req = urllib.request.Request(

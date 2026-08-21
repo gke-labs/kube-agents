@@ -341,19 +341,7 @@ func allowAllUsers(users []string) bool {
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
-	gitRepo := ""
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo = strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-	}
-
-	if err := agentv1alpha1.ValidateGitRepoURL(gitRepo); err != nil {
-		manifestsLog.Info("Invalid gitRepo URL in PlatformAgent spec, defaulting SETTINGS.md to None", "err", err, "gitRepo", gitRepo)
-		gitRepo = "None"
-	} else if gitRepo == "" {
-		gitRepo = "None"
-	}
-
-	settingsContent := fmt.Sprintf("# GKE Scope Configuration\n- **Git Repo:** %s\n", gitRepo)
+	settingsContent := "# GKE Scope Configuration\n"
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -1079,6 +1067,38 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// buildGithubStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
+func buildGithubStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	data := map[string]string{}
+
+	// Extract primary repository from CR Spec if provided
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
+		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
+		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
+		if gitRepo != "" && gitRepo != "None" {
+			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
+				if cleaned, err := agentv1alpha1.CleanRepoSlugWithOrg(gitRepo, org); err == nil {
+					data["managed_repos"] = cleaned
+				}
+			} else {
+				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+			}
+		}
+	}
+
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-github-state",
+			Namespace: agent.Namespace,
+		},
+		Data: data,
+	}
+}
+
 // renderConfigYAML builds the MANAGED config the pod runs under.
 //
 // Unlike every other profile rendering, this one is not an overlay merged into the PVC.
@@ -1628,6 +1648,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
 		},
+		{
+			Name:  "GITHUB_STATE_CONFIGMAP",
+			Value: agent.Name + "-github-state",
+		},
 	}
 
 	// The two exceptions to "no credentials in the sandbox", both of them
@@ -1766,6 +1790,23 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "SLACK_HOME_CHANNEL_NAME",
 					Value: slack.HomeChannelName,
+				})
+			}
+		}
+		if github := integration.GitHub; github != nil {
+			org := strings.TrimSpace(github.Org)
+			if org == "" && github.GitRepo != "" {
+				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
+					parts := strings.SplitN(cleaned, "/", 2)
+					if len(parts) == 2 {
+						org = parts[0]
+					}
+				}
+			}
+			if org != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "GITHUB_ORG",
+					Value: org,
 				})
 			}
 		}
@@ -3925,6 +3966,72 @@ func toSlice(v any) ([]any, bool) {
 		return res, true
 	}
 	return nil, false
+}
+
+// appendWorkloadIdentityUser conditionally appends the Workload Identity GSA as a User if specified
+func appendWorkloadIdentityUser(agent *agentv1alpha1.PlatformAgent, subjects []rbacv1.Subject) []rbacv1.Subject {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountAnnotations != nil {
+		if gsaEmail, ok := agent.Spec.Security.ServiceAccountAnnotations["iam.gke.io/gcp-service-account"]; ok {
+			subjects = append(subjects, rbacv1.Subject{
+				Kind: "User",
+				Name: gsaEmail,
+			})
+		}
+	}
+	return subjects
+}
+
+// buildPlatformConfigMapEditorRole generates the Role manifest for editing the global agent configmap
+func buildPlatformConfigMapEditorRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"configmaps"},
+				ResourceNames: []string{agent.Name + "-github-state"},
+				Verbs:         []string{"get", "update", "patch"},
+			},
+		},
+	}
+}
+
+// buildPlatformConfigMapEditorRoleBinding generates the RoleBinding manifest for editing the global agent configmap
+func buildPlatformConfigMapEditorRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
+
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "RoleBinding",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      bindingName,
+			Namespace: agent.Namespace,
+		},
+		Subjects: appendWorkloadIdentityUser(agent, []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: agent.Namespace,
+			},
+		}),
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     roleName,
+		},
+	}
 }
 
 //go:embed leader_elect.py

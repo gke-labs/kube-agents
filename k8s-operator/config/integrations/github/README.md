@@ -46,8 +46,7 @@ The App may be owned by the organization or by a personal account, but an App cr
 To deploy the agent with GitHub integration, `install.sh` collects the details of your GitHub App into `vars.sh` (and the chart's `githubMinter.*` values through the generated `terraform.tfvars`).
 
 - `GITHUB_APP_ID`: The unique numeric ID of the GitHub App (found in the App's General Settings).
-- `GITHUB_ORG`: The name of the GitHub organization hosting the repository. This must be an organization, not a user account — see [The Target Repository Must Be Organization-Owned](#the-target-repository-must-be-organization-owned).
-- `GITHUB_REPO`: The name of the target repository the agent will manage.
+- `GITHUB_ORG`: The name of the GitHub organization or user account where the repository is hosted.
 - `GITHUB_PEM_PATH`: The absolute local file path to the downloaded `.pem` private key file. If provided, the provisioning script will automatically use the Minty CLI to import it into Google Cloud KMS. If omitted, the deployment will proceed but Minty will fail readiness probes until a key is manually imported.
 
 ## Minty Limitations & GSA Tokens
@@ -137,9 +136,9 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
   -H "X-OIDC-Token: $OIDC_TOKEN" \
   -d '{
     "org_name": "YOUR_GITHUB_ORG",
-    "repositories": ["YOUR_GITHUB_REPO"],
+    "repositories": ["YOUR_REPO"],
     "scope": "platform-agent-scope"
   }'
 ```
 
-If successful, Minty will return a JSON payload containing the short-lived GitHub access token.
+If successful, Minty will return a JSON payload containing the short-lived, repository-scoped GitHub access token.

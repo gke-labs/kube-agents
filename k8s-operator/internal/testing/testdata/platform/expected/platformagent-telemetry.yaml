@@ -230,6 +230,61 @@ subjects:
     name: kubeagents-platform-agent
     namespace: kubeagents-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:configmap-editor:kubeagents-system:platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resourceNames:
+      - platformagent-github-state
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:configmap-editor:kubeagents-system:platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents:configmap-editor:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -387,7 +442,6 @@ apiVersion: v1
 data:
   SETTINGS.md: |
     # GKE Scope Configuration
-    - **Git Repo:** None
 kind: ConfigMap
 metadata:
   labels:
@@ -396,6 +450,24 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: kube-agents
   name: platformagent-settings
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-github-state
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -498,6 +570,8 @@ spec:
               value: cluster-internal-trusted
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: GITHUB_STATE_CONFIGMAP
+              value: platformagent-github-state
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:

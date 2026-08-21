@@ -90,6 +90,7 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/kube-agents-observability/SKILL.md
   agents/platform/skills/manage-cluster/SKILL.md
   agents/platform/skills/pr-conversation/SKILL.md
+  agents/platform/skills/register-github-repo/SKILL.md
   agents/platform/skills/submit-suggestion/SKILL.md
   agents/platform/skills/workload-rebalancing/SKILL.md
 
