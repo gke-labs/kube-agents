@@ -151,6 +151,15 @@ resource "google_container_cluster" "seeded_a" {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
 
+  # Workload Identity on, and GKE_METADATA on every pool below (compliance
+  # SOP 2.8/2.9): without them any pod could read the metadata server and
+  # mint the seeded-fleet-nodes token -- the exact escalation the dedicated
+  # minimal SA exists to close. Not a fixture; closed because it costs the
+  # fixtures nothing.
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
   # Half of the consistency defect: A and B run with master authorized
   # networks ON; C does not (see seeded_c). The drift SOP's severity ladder
   # walks every finding down two steps on a three-cluster cohort (r = 2/3 is
@@ -159,8 +168,13 @@ resource "google_container_cluster" "seeded_a" {
   # logging components facet this stack first used is base-minor and would
   # have been dropped before anyone saw it. The 0.0.0.0/0 block is what
   # keeps the defect access-safe: the facet reads ON from `enabled` plus a
-  # non-empty cidrBlocks, the SOP explicitly never compares the blocks'
-  # contents, and an allow-everything list restricts no eval agent.
+  # non-empty cidrBlocks, the drift SOP explicitly never compares the
+  # blocks' contents, and an allow-everything list restricts no eval agent.
+  # The compliance audit is a different reader: its 2.10 flags a literal
+  # 0.0.0.0/0 here and on seeded-b, and seeded-c's absent block, all at
+  # critical. That is a DECLARED background finding, not an oversight --
+  # the README's accepted-background table says why it stays open and what
+  # closing it would take.
   master_authorized_networks_config {
     cidr_blocks {
       cidr_block   = "0.0.0.0/0"
@@ -184,6 +198,10 @@ resource "google_container_node_pool" "seeded_a_default" {
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
   }
 }
 
@@ -210,6 +228,10 @@ resource "google_container_node_pool" "idle_batch_pool" {
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
 
     taint {
       key    = "seeded-role"
@@ -242,6 +264,10 @@ resource "google_container_node_pool" "pinned_inference_pool" {
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
     labels = {
       "seeded-role" = "pinned-inference"
     }
@@ -321,6 +347,15 @@ resource "google_container_cluster" "seeded_b" {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
 
+  # Workload Identity on, and GKE_METADATA on every pool below (compliance
+  # SOP 2.8/2.9): without them any pod could read the metadata server and
+  # mint the seeded-fleet-nodes token -- the exact escalation the dedicated
+  # minimal SA exists to close. Not a fixture; closed because it costs the
+  # fixtures nothing.
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
   # The other peer of the consistency majority: B matches A (authorized
   # networks ON, open block -- see seeded_a for why this is safe), so C is
   # the single outlier on a single facet.
@@ -364,6 +399,10 @@ resource "google_container_node_pool" "seeded_b_default" {
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
   }
 }
 
@@ -387,6 +426,15 @@ resource "google_container_cluster" "seeded_c" {
   logging_config {
     enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
+
+  # Workload Identity on, and GKE_METADATA on every pool below (compliance
+  # SOP 2.8/2.9): without them any pod could read the metadata server and
+  # mint the seeded-fleet-nodes token -- the exact escalation the dedicated
+  # minimal SA exists to close. Not a fixture; closed because it costs the
+  # fixtures nothing.
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
 }
 
 resource "google_container_node_pool" "seeded_c_default" {
@@ -401,6 +449,10 @@ resource "google_container_node_pool" "seeded_c_default" {
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
   }
 }
 

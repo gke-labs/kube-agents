@@ -78,6 +78,10 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
         labels = { app = "checkout-gateway" }
       }
       spec {
+        # Compliance SOP 2.7: a workload on the default SA with the token
+        # automounted is a finding. None of the planted workloads uses the
+        # API, so the token is refused rather than declared.
+        automount_service_account_token = false
         container {
           name  = "gateway"
           image = "registry.k8s.io/pause:3.9"
@@ -136,6 +140,8 @@ resource "kubernetes_deployment_v1" "payments_api" {
         labels = { app = "payments-api" }
       }
       spec {
+        # SOP 2.7, as on checkout-gateway.
+        automount_service_account_token = false
         container {
           name    = "api"
           image   = "busybox:1.36"
@@ -182,6 +188,8 @@ resource "kubernetes_deployment_v1" "inference_server" {
         labels = { app = "inference-server" }
       }
       spec {
+        # SOP 2.7, as on checkout-gateway.
+        automount_service_account_token = false
         node_selector = {
           "seeded-role" = "pinned-inference"
         }
@@ -238,5 +246,31 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
         }
       }
     }
+  }
+}
+
+# Compliance SOP 2.6 flags any non-system namespace that has workloads and
+# zero NetworkPolicies. The planted workloads use no network at all (a pause
+# container, a memory bomb, a CPU burn), so a default-deny policy closes the
+# finding at zero fixture risk: empty podSelector, both policy types, no
+# rules -- which is deny-all, not the allow-all shape (an empty ingress RULE)
+# the SOP also flags. seeded-security gets none on purpose: the SOP's
+# zero-workload suppression already exempts it, and an object it does not
+# need would only blur what the fixture asserts.
+resource "kubernetes_network_policy_v1" "default_deny" {
+  for_each = {
+    reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
+    debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
+    capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+  }
+
+  metadata {
+    name      = "default-deny"
+    namespace = each.value
+  }
+
+  spec {
+    pod_selector {}
+    policy_types = ["Ingress", "Egress"]
   }
 }

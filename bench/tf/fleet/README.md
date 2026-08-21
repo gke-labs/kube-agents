@@ -101,9 +101,28 @@ default, so a channel-less cluster falls out of that comparison entirely and the
 would be invisible to the audit it was planted for. The maintenance exclusion above is
 what stops channel enrollment from healing the lag.
 
+## Accepted background findings
+
+A compliance audit of this fleet returns the planted `debug-binding` finding **plus**
+the rows below. Everything else the baseline used to trip is closed in the stack
+itself (Workload Identity and `GKE_METADATA` everywhere, `automountServiceAccountToken:
+false` on all planted workloads, default-deny NetworkPolicies in the three workload
+namespaces), precisely so this table stays short: the fixture's premise is that a
+correct audit's findings are known in advance.
+
+| Check                                  | Where              | Why it stays open                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2.10 `public-control-plane` (critical) | all three clusters | `seeded-a`/`seeded-b` carry a literal `0.0.0.0/0` authorized-networks block and `seeded-c` none — and `seeded-c`'s missing block IS the drift outlier, so it can never close. Closing a/b needs a named CIDR that still admits every caller with dynamic egress: Prow runners, the platform-agent pods that run the audits, and owner laptops. Until those have stable egress (reserved Cloud NAT IPs per project, or private endpoints plus internal runners), a narrow list would brick the fleet's own auditability |
+
+Implication for the scenarios (`feat/domain-scenarios`): the compliance objective must
+assert the planted finding specifically — `debug-binding`, `cluster-admin` — never
+"the audit found something", and its judged prose should expect the declared 2.10
+findings to appear alongside it.
+
 The chat-routing and incident-triage scenarios need no planted defect; the
 silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
-decision recorded with the scenario drafts.
+decision recorded with the scenario drafts. The silence case in particular must
+tolerate the declared background rows above.
 
 Rough standing cost: about $260 per month — the GKE management fee (three zonal
 clusters) is most of it, the five small nodes (20 GB disks) and two 10 GB orphan disks
