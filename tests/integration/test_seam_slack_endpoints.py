@@ -59,12 +59,23 @@ class FakeSlackRelay:
         return {"ok": True, "ts": "123.456", "method": method, "team": team_id}
 
 
-class _ChatStatusError(Exception):
-    """Shaped like the googleapiclient/slack errors _chat_error_fields reads."""
+class _SlackApiErrorLike(Exception):
+    """Shaped like `slack_sdk.errors.SlackApiError`, which is what the relay raises.
 
-    def __init__(self, message, status):
+    `_slack_error_fields` reads `exc.response.data`; an earlier revision of
+    this fixture carried only a `status_code`, so the extractor found no
+    payload, returned None, and the endpoint emitted the generic body with no
+    `slack` key at all -- leaving the assertion below unable to fail.
+    """
+
+    def __init__(self, message, data):
         super().__init__(message)
-        self.status_code = status
+        self.response = _SlackResponseLike(data)
+
+
+class _SlackResponseLike:
+    def __init__(self, data):
+        self.data = data
 
 
 class SlackEndpointsSeamTest(unittest.TestCase):
@@ -126,7 +137,20 @@ class SlackEndpointsSeamTest(unittest.TestCase):
         self.assertFalse(body["settled"])
 
     def test_an_api_failure_becomes_the_502_slack_envelope(self):
-        self.relay.api_error = _ChatStatusError("channel_not_found", 404)
+        self.relay.api_error = _SlackApiErrorLike(
+            "channel_not_found",
+            {
+                "ok": False,
+                "error": "channel_not_found",
+                "needed": "channels:read",
+                "provided": "chat:write",
+                # Outside SLACK_ERROR_DIAGNOSTIC_FIELDS, and deliberately
+                # secret-shaped: this payload answered a call made with the
+                # relay's own credential, and the envelope below is both
+                # logged and handed to the agent.
+                "response_metadata": {"token": "xoxb-not-for-the-agent"},
+            },
+        )
         status, body = self._call(
             "/v1/chat/slack/api",
             payload={"teamId": "T1", "method": "chat.postMessage", "arguments": {}},
@@ -134,7 +158,19 @@ class SlackEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(502, status)
         # The patch rebuilds SlackApiError from this envelope; without the
         # fields a transport fault and a Slack rejection are indistinguishable.
-        self.assertIn("error", body)
+        # Asserted whole, not by membership: `error` alone is in every 4xx and
+        # 5xx this handler emits, so deleting the `slack` key would not have
+        # shown up here.
+        self.assertEqual(
+            {
+                "ok": False,
+                "error": "channel_not_found",
+                "needed": "channels:read",
+                "provided": "chat:write",
+            },
+            body["slack"],
+        )
+        self.assertNotIn("xoxb-not-for-the-agent", json.dumps(body))
 
     def test_a_successful_api_call_round_trips_method_and_team(self):
         status, body = self._call(

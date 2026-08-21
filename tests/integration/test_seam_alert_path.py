@@ -157,14 +157,15 @@ class AlertPathTest(unittest.TestCase):
         # dedup entry rather than counting this against its inject-error metric.
         status, quota = http_json(f"{kv.url}/v1/alert-quota")
         self.assertEqual(200, status)
-        rows = {row["severity"]: row for row in quota["quota"]} if "quota" in quota else {}
-        if rows:
-            self.assertEqual(2, rows["Critical"]["sent"])
-            self.assertEqual(1, rows["Critical"]["suppressed"])
-        else:
-            # Endpoint shape without a list wrapper: assert on the raw body.
-            self.assertIn("2", json.dumps(quota))
-            self.assertIn("suppressed", json.dumps(quota))
+        # The endpoint's shape is a contract in this repo, not something to
+        # probe for: get_alert_quota returns {"day", "severities"} keyed by
+        # severity. An earlier revision guarded on a "quota" key the endpoint
+        # never emits, so the real assertions below sat in an unreachable
+        # branch and the accounting would have stayed green recording nothing.
+        critical = quota["severities"]["Critical"]
+        self.assertEqual(2, critical["limit"])
+        self.assertEqual(2, critical["sent"])
+        self.assertEqual(1, critical["suppressed"])
 
     @unittest.expectedFailure
     def test_a_failed_chat_post_leaves_a_visible_record_not_silence(self):
