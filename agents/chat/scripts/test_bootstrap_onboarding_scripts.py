@@ -259,6 +259,17 @@ class ScanGateTest(unittest.TestCase):
             self.assertIn(path, body)
         self.assertIn("Do not rank the findings yourself", body)
 
+    def test_child_cards_are_pointed_at_the_per_cluster_audit_sop(self):
+        """Without the SOP path the child body is written freehand.
+
+        Observed: four per-cluster cards completed in under two minutes each,
+        every one with no `metadata` at all, and the fleet report that followed
+        named zero problems on a fleet that had them.
+        """
+        body = bootstrap_scan_gate._task_body()
+        for path in bootstrap_scan_gate.CLUSTER_AUDIT_INSTRUCTIONS_PATHS:
+            self.assertIn(path, body)
+
     def test_raw_and_delivered_paths_are_distinct(self):
         # Same file for both would make the delivery job fire on the unranked
         # sweep output — the pre-prioritization behaviour, silently restored.

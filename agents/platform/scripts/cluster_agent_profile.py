@@ -39,6 +39,12 @@ PLUGIN_MOUNT_ROOT = Path(os.environ.get("PLUGIN_MOUNT_ROOT", "/opt/agent-plugins
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
 
+# Absolute, because a kanban worker's terminal runs with a stripped environment in
+# which /opt/hermes/.venv/bin is not on PATH — a bare `hermes` raises ENOENT there
+# while working fine from an interactive shell. Same trap as `_roster_command` in
+# agents/chat/scripts/bootstrap_scan_gate.py.
+HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
+
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
@@ -299,7 +305,7 @@ def delete_profile(name: str) -> None:
     home = profile_home(name)
     try:
         subprocess.run(
-            ["hermes", "profile", "delete", name, "-y"],
+            [HERMES_BIN, "profile", "delete", name, "-y"],
             check=True, capture_output=True, text=True, timeout=30, env=_run_env(),
         )
     except Exception as e:  # noqa: BLE001 - tolerate an already-absent profile

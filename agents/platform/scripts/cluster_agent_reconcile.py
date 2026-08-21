@@ -42,6 +42,7 @@ import sys
 import urllib.request
 
 from cluster_agent_profile import (
+    HERMES_BIN,
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
@@ -262,7 +263,7 @@ def _notify(message: str) -> None:
     """Post a summary to the user's Google Chat home channel (best-effort)."""
     try:
         subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
+            [HERMES_BIN, "send", "--to", "google_chat", message],
             capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
         )
     except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run

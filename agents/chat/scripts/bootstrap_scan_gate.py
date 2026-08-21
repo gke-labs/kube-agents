@@ -100,6 +100,10 @@ PRIORITIZE_INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory_prioritize_sop.md",
     "/opt/platform-template/governance/inventory_prioritize_sop.md",
 )
+CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
+    "/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md",
+    "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
+)
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
 # a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
 RECONCILE_SCRIPT = "/opt/data/scripts/cluster_agent_reconcile.py"
@@ -168,6 +172,7 @@ def should_skip(data_dir: Path) -> bool:
 def _task_body() -> str:
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
+    cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -209,9 +214,14 @@ def _task_body() -> str:
         "list` will either fail or quietly return an incomplete roster.\n\n"
         "For every OTHER cluster that has an agent, open one child card per cluster with "
         "`kanban_create(assignee=<that agent>, "
-        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>', ...)` asking it to "
-        "report its own cluster's inventory, and to return the findings as structured "
-        "`metadata` on completion. Each Cluster Agent is read-only and pinned to its own "
+        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>', ...)`. The body must "
+        "send that agent to the single-cluster audit SOP, reading whichever of these exists:\n"
+        f"{cluster_audit_list}\n\n"
+        "and tell it to complete its card with the structured `metadata` that SOP specifies. "
+        "**Point at the SOP; do not describe the checks in the card body.** Both the checks and "
+        "the `metadata` shape the aggregation stage reads are specific, and a body written "
+        "freehand loses them: what comes back is a topology listing with no findings in it. "
+        "Each Cluster Agent is read-only and pinned to its own "
         "cluster, so these run in parallel and none can touch another's. Then create ONE "
         "aggregation card assigned to `platform` with `parents=[<all child card ids>]` and "
         f"`idempotency_key='{AGGREGATE_IDEMPOTENCY_KEY}'` — a fan-in child receives every "
