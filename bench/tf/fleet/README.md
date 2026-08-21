@@ -14,11 +14,18 @@ deletes bench-labeled clusters by age, and the standing fleet must never match i
 
 State is remote (`backend "gcs"`, partial config), because the operating model is
 re-apply from any checkout — against local state a fresh checkout would plan full
-creates and 409 against the live fleet. The fleet owner creates the bucket once and
-every apply names it:
+creates and 409 against the live fleet. The stack applies **once per eval project**,
+and each project keeps its own state: bucket `<project>-tf-state`, prefix
+`seeded-fleet`, always. Both eval projects are live today —
+`gs://kube-agents-evals-tf-state` and `gs://kube-agents-evals-2-tf-state` — and
+project N+1 follows the same convention. The fleet owner creates the bucket once per
+project; switching projects means re-initializing against that project's bucket and
+naming the project on the apply:
 
-    tofu init -backend-config="bucket=kube-agents-evals-tf-state" \
+    tofu init -reconfigure \
+              -backend-config="bucket=<project>-tf-state" \
               -backend-config="prefix=seeded-fleet"
+    tofu apply -var="project_id=<project>"
 
 Local validation without credentials: `tofu init -backend=false && tofu validate`.
 

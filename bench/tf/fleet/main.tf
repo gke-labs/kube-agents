@@ -97,14 +97,18 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 
 # seeded-b is held one minor version behind whatever the REGULAR channel
 # currently defaults to, derived live rather than hardcoded so the pin does
-# not rot: each apply re-computes "current default minus one". The lag is
-# HELD, not healed: the UNSPECIFIED channel and auto_upgrade = false are
-# what stop GKE from moving the cluster, because a control plane cannot be
-# downgraded and min_master_version is only a creation-time floor. If the
-# master ever does move past the pin (a forced upgrade at end of support),
-# the reconcile cannot walk it back -- the fix is replacing the cluster
-# (`tofu apply -replace=google_container_cluster.seeded_b`), and the README
-# says so.
+# not rot: each apply re-computes "current default minus one". The cluster
+# is ENROLLED in REGULAR -- required, because the upgrade SOP's
+# master-behind check compares a master's minor against its own channel's
+# default, so a channel-less cluster falls out of the comparison and the
+# lag is invisible. What stops enrollment from healing the lag is the
+# rolling NO_MINOR_UPGRADES maintenance exclusion on the seeded_b resource
+# below, re-stamped each apply and capped by the API at the held minor's
+# end of life. A control plane cannot be downgraded and min_master_version
+# is only a creation-time floor, so if the master ever moves past the pin
+# (a lapse in reconciles, or the minor reaching EOL), the fix is replacing
+# the cluster (`tofu apply -replace=google_container_cluster.seeded_b`) --
+# the seeded_b comment and the README carry the full account.
 data "google_container_engine_versions" "fleet" {
   location = var.zone
   project  = var.project_id
