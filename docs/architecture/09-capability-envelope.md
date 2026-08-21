@@ -5,11 +5,12 @@
 > **Specifies the end state, not current behaviour.** Nothing here is implemented. See
 > [README.md](README.md) for the delta against what ships today.
 
-> **Depends on a pending revision to core invariant #3.** [README.md](README.md) states that agents
-> never call each other directly. The mechanism below is a per-hop path between agents, so it does
-> not hold under that invariant as written. It is filed here so the mechanism can be reviewed on its
-> merits; **it is not agreed and must not be built until the invariant question is settled.** §1
-> states the case.
+> **Proposed. Not agreed, and not built.** The invariant that blocked it no longer does: core
+> invariant #3 used to ban agent-to-agent calls outright, and #727 restated it as the property it
+> protects -- coordination through durable, attributable state, with no authority conferred by
+> being called. That clears the way but agrees nothing. The mechanism below still needs review on
+> its merits before anyone builds it. Section 1 states where it stands against the revised
+> invariant.
 
 **Overview:** [README.md](README.md) · **Depends on:** [03](03-security-model.md),
 [05](05-system-architecture.md), [08](08-agent-runtime-and-identity.md) · **Tier:** Foundational
@@ -64,12 +65,39 @@ broker -- cluster-scoped by construction, because the issuer is the cluster. Whe
 disagree on mechanism, this is the later measurement. Where they disagree on requirement, 03 §4a
 wins.
 
-**On invariant #3.** The invariant bans a transport; what it protects is a property -- that agents
-do not form an unaudited call graph, and that being called grants no authority. A durable bus with
-replay is shared state by any reasonable reading, and this document is a stronger answer to the
-authority half than anything currently specified. The proposal is therefore to restate #3 as the
-property rather than delete it. That is a decision for the README's invariant list, with its
-rationale, and it is not made here.
+**On invariant #3.** An earlier draft of this document argued that the invariant banned a transport
+where what it protected was a property, and proposed restating it. That has happened -- #727
+rewrote #3 as "agents coordinate through durable, attributable state -- never synchronous RPC",
+with "no agent gains authority by being called" attached to it. So the argument this section used
+to make is settled and does not need making again. What replaces it is the question the revised
+invariant actually asks.
+
+**The four-property test.** [02](02-agent-personas.md) section 2.3 says a new coordination
+substrate must be durable, attributable, non-escalating and non-authoritative, and that meeting all
+four is necessary rather than sufficient. Against that:
+
+- **Durable.** The bus is durable with replay, and the capability chain is a second durable record
+  -- immutable once written, and readable after the fact by anyone auditing.
+- **Attributable.** This is the property the document exists to carry. The root is minted from the
+  requester's verified identity and every hop descends from it, so "which human" is a chain walk
+  rather than a correlation exercise across logs.
+- **Non-escalating.** Also this document, and the stronger claim: a message confers no authority
+  because authority does not travel in the message at all. It travels in an entry the receiver
+  cannot read, cannot widen, and cannot resolve unless it was named.
+- **Non-authoritative.** Untouched by this design and not weakened by it. A capability bounds what a
+  peer message may _ask for_; it says nothing about trusting the message content, which stays
+  untrusted input under [03](03-security-model.md).
+
+**The verifier is a synchronous call, and the invariant says never synchronous RPC.** Worth meeting
+head-on rather than hoping nobody asks. What #3 forbids is agents coordinating by calling each
+other -- one agent blocking on another's model output, with the call as the only record. The
+verifier is neither an agent nor coordination. It is an authorization callout on the request path,
+the same shape as the NATS auth callout this design already accepts, and it produces a decision
+about an entry rather than work product from a peer. If that reading is wrong the design has a
+problem, so it is stated here to be argued with rather than left implicit.
+
+**Still not agreed.** Clearing the invariant is not agreement on the mechanism, and nothing here
+should be built on the strength of #727 alone.
 
 ## The recommendation, first
 
