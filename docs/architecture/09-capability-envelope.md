@@ -224,6 +224,15 @@ the underlying stream's sequence and is bucket-wide, not per key, so an entry's 
 whatever number the bucket had reached and there is nothing for a verifier holding one entry to
 compare against.
 
+One consequence for anyone reading the store afterwards. A pin protects the _verifier_, which asks
+for a specific revision and gets what the referrer intended or nothing. It does not protect a reader
+who asks for a key and takes the latest value, and that is how an audit tool would naturally be
+written. At the bucket's default of one revision per key the two agree, because an overwrite
+discards what it replaced and the pin then dangles. Raise history above one and they diverge: the
+pin still resolves to the intended content while the latest value at that key is whatever was
+written last. **So audit reads follow the pins, by revision, rather than reading keys** -- which is
+also the only reading that reconstructs the chain as it was resolved.
+
 The cost is that a broker can still break its own descendants by deleting a link it wrote. That is
 denial of service against a chain it is already inside, not a way to widen anything, and it is the
 same delete authority §5 flags as unresolved for revocation.
