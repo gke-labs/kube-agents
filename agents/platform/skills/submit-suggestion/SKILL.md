@@ -130,6 +130,19 @@ that tree is still yours and refuses outright if it belongs to another agent:
 Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!"
 ```
 
+#### Optional Telemetry & SLA Flags
+
+When exact runtime metrics are provided by the harness or session environment variables (`HERMES_SESSION_TOKENS`, `HERMES_SESSION_ELAPSED`, `HERMES_MODEL`, `OTEL_TRACE_ID`), `submit_suggestion.py` automatically injects telemetry summaries into the PR. You may also pass explicit flags if exact numbers are known:
+
+```bash
+  --tokens "14820" \
+  --elapsed "49s" \
+  --model "gemini-3.5-flash" \
+  --trace-id "<otel_trace_id>"
+```
+
+**CRITICAL ACCURACY RULE:** Never guess, estimate, or fabricate token counts or SLA durations. Note that `HERMES_SESSION_TOKENS` and related telemetry environment variables are reserved for future harness exporter integration and are currently unpopulated by default. If exact metrics are unmeasured or unknown, omit these flags—`submit_suggestion.py` gracefully omits the telemetry section when data is absent.
+
 `--lease` is not optional bookkeeping. `prepare` and `submit` are separate
 processes, and outside a kanban card there is no session identity for `submit`
 to re-derive the lease from — so without it the script stops and tells you to
