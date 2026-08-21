@@ -91,7 +91,9 @@ permission/config change, anything only a maintainer can resolve - do **not**
 silently stall:
 
 1. Apply the `needs-human` label.
-2. Comment, `@mention`ing the relevant maintainer (see `OWNERS`), stating: what
+2. Comment, `@mention`ing the relevant maintainer: read `OWNERS` for the
+   approver, and expand a group alias (e.g. `waw-leads`) through
+   `OWNERS_ALIASES` to the accounts a mention actually reaches. State what
    blocks you, what would unblock you, and who can unblock it.
 
 The label plus the mention **is** the escalation - there is no other channel.
@@ -127,7 +129,8 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
    genuinely resolved, per the root `AGENTS.md`.
 2. Trigger a clean bot pass yourself - comment `/review` (or `/review all`
    for a wider re-check). A clean pass is what puts the change in front of a
-   human reviewer.
+   human reviewer; `/request-review` assigns one immediately when a review
+   never arrives or you have answered a finding you disagree with.
 3. The human approves; the system applies `lgtm` and merges.
 
 See [`AGENTS.md`](../../AGENTS.md#automated-review-after-opening-a-pull-request)
