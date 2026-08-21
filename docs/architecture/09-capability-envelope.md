@@ -77,9 +77,9 @@ substrate must be durable, attributable, non-escalating and non-authoritative, a
 four is necessary rather than sufficient. Against that:
 
 - **Durable.** The bus is durable with replay, and the capability chain is a second durable record,
-  readable after the fact by anyone auditing. Append-only is a requirement on the store rather than
-  something it gives us -- see "entries are written once" below -- and the audit value depends on
-  that being enforced.
+  readable after the fact by anyone auditing. The store does not give append-only on its own -- see
+  "every reference pins a revision" below -- so the audit value rests on that pinning, not on the
+  bucket.
 - **Attributable.** This is the property the document exists to carry. The root is minted from the
   requester's verified identity and every hop descends from it, so "which human" is a chain walk
   rather than a correlation exercise across logs. Conditional on a request-scoped caller identity,
@@ -125,21 +125,22 @@ cryptographic key. There are none in this design.
 ## 3. How it works
 
 **Gateway.** Mints the capability, writes it to KV under `cap.root.<request-id>`, and puts the id
--- not the capability -- into the message. The entry names the one agent permitted to descend from
-it.
+and the revision the write returned -- not the capability -- into the message. The entry names the
+one agent permitted to descend from it.
 
 **Broker.** Reads the id off the message and asks the verifier to resolve it. The agent behind it
 sees neither the capability nor the store.
 
 **Attenuation.** A hop that narrows writes a _new_ entry -- narrower capability, a pointer to its
-parent, and the next hop as its own delegate -- under its own namespace, and passes the new id
-downstream.
+parent pinned at the revision it resolved, and the next hop as its own delegate -- under its own
+namespace, and passes the new id and revision downstream.
 
 **Verification.** Six checks, all required. Authenticate the caller and confirm the entry it is
 asking about names that caller as its delegate. Walk the chain to the root, refusing a chain that
 revisits an entry or exceeds a fixed depth bound. Confirm the root sits under `cap.root.*`. Confirm
 each link is narrower than its parent. Confirm **each link was written by the agent its parent
-named as delegate**. Confirm no link has been rewritten since it was written. Refuse otherwise.
+named as delegate**. Fetch every link **at the revision its referrer pinned**, and refuse if that
+revision is no longer the one the store holds. Refuse otherwise.
 
 The caller identity in the first check **must be request-scoped**. An identity shared across
 concurrent requests cannot separate them, and the guarantee this design exists to make is void
@@ -152,14 +153,15 @@ only the chain ones. See "The subject prefix does not prove entitlement" below.
 ```
    gateway   writes  cap.root.req-8f2a      = {tier: operator, scope: project-P,
                                                delegate: fleet-recon}
-                     └─ message carries "req-8f2a"
+                     └─ the write returns revision 412
+                     └─ message carries "req-8f2a @412"
 
    hop A     asks the verifier to resolve it, and is authenticated as fleet-recon --
              the delegate the entry names, so it resolves and fleet-recon may descend
              writes  cap.hop.fleet-recon.1  = {..., scope: cluster-C,
                                                delegate: platform-a}
-                                              parent: cap.root.req-8f2a
-                     └─ message carries "cap.hop.fleet-recon.1"
+                                              parent: cap.root.req-8f2a @412
+                     └─ message carries "cap.hop.fleet-recon.1 @418"
 
    hop B     resolves that as platform-a: chain narrows, and platform-a is the delegate
              the entry names.  fleet-recon asking for the same id would be refused
@@ -202,13 +204,29 @@ that writes something wider than it received is caught when the next hop resolve
 The integrity comes from server-enforced permissions rather than from cryptography. Same
 guarantee, no key to custody, rotate, distribute or recover.
 
-**Entries are written once.** A KV put on an existing key is an update, not an error, and the same
-permission that lets a broker create a link lets it rewrite that link after the link has been
-resolved and acted on. So the audit record would be rewritable by the party it exists to attest.
-Two things close it and both are cheap: write entries with the store's create-only operation, which
-fails if the key exists, and have the verifier refuse an entry whose revision is not its first,
-which catches an overwrite that got in anyway. The second is the one that matters, because a
-subject permission cannot express "create but do not update" and so cannot be relied on here.
+**Every reference pins a revision.** A KV put on an existing key is an update rather than an error,
+and a KV delete is itself a publish to the key's own subject -- so the one permission that lets a
+broker create a link also lets it overwrite that link, or delete it and create it again, after the
+link has been resolved and acted on. Either way the audit record is rewritable by the party it
+exists to attest, and a subject permission cannot express "create but do not update", so the
+permission model cannot close this on its own.
+
+What closes it is that nothing refers to an entry by key alone. A write returns the revision it
+landed at; whoever refers to that entry afterwards carries the revision with the key, and the
+verifier fetches at that revision rather than fetching the latest. The message carries `id @rev`,
+and a child's parent pointer carries its parent's `@rev`, so the chain is pinned end to end.
+
+Both rewrite paths then fail the same way rather than needing separate detection. An overwrite moves
+the entry to a new revision and the pinned one no longer resolves. A delete-and-recreate is worse
+for the attacker, not better: the recreated entry lands at a fresh sequence, so every pin to the old
+one dangles. This is deliberately not "check the entry is at its first revision" -- a revision is
+the underlying stream's sequence and is bucket-wide, not per key, so an entry's first write carries
+whatever number the bucket had reached and there is nothing for a verifier holding one entry to
+compare against.
+
+The cost is that a broker can still break its own descendants by deleting a link it wrote. That is
+denial of service against a chain it is already inside, not a way to widen anything, and it is the
+same delete authority §5 flags as unresolved for revocation.
 
 **Say "the server refuses it", not "the connection is refused".** The two are different observables
 and only one of them happens. A client with no publish right on `$KV.cap.root.*` connects fine and
@@ -474,9 +492,11 @@ silent.
   the bug present.
 - **An over-deep chain is refused:** a well-formed chain longer than the bound fails, terminal
   `cap.root.*` and all.
-- **A rewritten entry is refused:** write a link, resolve it once, overwrite it in place, resolve it
-  again. The second resolution fails. Without this the store's own semantics let a hop revise
-  history after the fact, and the audit record 09 offers to 02 §2.3 is not one.
+- **A rewritten entry is refused, by either route:** write a link, resolve it once, then (a)
+  overwrite it in place and (b) in a second run delete it and create the same key again with
+  different content. Both resolutions fail on the pinned revision. Test both: create-only writes
+  stop (a) and do nothing about (b), since the create succeeds once the key is gone, so a suite that
+  only exercises the overwrite passes with the delete path open.
 - **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
   including one that terminates at a well-formed `cap.hop.*` entry.
 - **Only the gateway mints roots:** any other connection publishing to `$KV.cap.root.*` gets a
