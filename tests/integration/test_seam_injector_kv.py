@@ -27,10 +27,10 @@ def _go_binary():
     found = shutil.which("go")
     if found:
         return found
-    for candidate in ("/tmp/goroot/bin/go", "/usr/local/go/bin/go"):
-        if Path(candidate).exists():
-            return candidate
-    return None
+    # PATH plus the one conventional system location. Never a /tmp path: a
+    # world-writable directory is an execution hazard on shared hosts.
+    candidate = "/usr/local/go/bin/go"
+    return candidate if Path(candidate).exists() else None
 
 
 GO = _go_binary()
@@ -151,21 +151,16 @@ class InjectorKVSeamTest(unittest.TestCase):
         self.addCleanup(stub.server_close)
         self.addCleanup(stub.shutdown)
 
-        class _StubKV:
-            url = f"http://127.0.0.1:{stub.server_port}"
-
-        # Empty status string == delivered; the Go test asserts injected only
-        # for the real daemon, so reuse the create-and-inject path and expect
-        # it to fail ONLY on the status assertion... instead, assert directly:
-        # an empty body must not error. TestLiveKVCreateAndInject requires
-        # status "injected", so drive the plain path with go run semantics is
-        # overkill — the empty-body contract is asserted by the Go unit tests
-        # in injector_test.go already; here we only prove the real wire
-        # accepts it end-to-end by checking the Go client does not error.
+        # An empty 2xx body is a tolerated answer, not a failure: the Go test
+        # run against this stub must get past session-create and the inject
+        # transport, and fail only on its status expectation (the stub answers
+        # "" where the real daemon answers "injected"). What must NOT appear
+        # is a transport or decode error — that would mean the client stopped
+        # tolerating the documented legacy-daemon shape.
         env = dict(os.environ)
         env.update(
             {
-                "SESSION_KV_INTEGRATION_URL": _StubKV.url,
+                "SESSION_KV_INTEGRATION_URL": f"http://127.0.0.1:{stub.server_port}",
                 "SESSION_KV_INTEGRATION_TOKEN": API_KEY,
                 "GOCACHE": str(self.tmp_path / "gocache"),
             }
@@ -178,12 +173,15 @@ class InjectorKVSeamTest(unittest.TestCase):
             text=True,
             timeout=300,
         )
-        # The session create succeeds and the inject returns status "" — the
-        # Go test then reports the mismatch against "injected". What must NOT
-        # appear is a transport or decode error: empty-body is a tolerated
-        # answer, not a failure.
-        self.assertNotIn("Inject:", completed.stdout + completed.stderr)
-        self.assertIn('expected status injected, got ""', completed.stdout)
+        combined = completed.stdout + completed.stderr
+        # No transport/decode error from the client (its error strings all
+        # carry the "injector:" prefix)...
+        self.assertNotIn("injector: POST inject", combined)
+        self.assertNotIn("injector: decode", combined)
+        # ...and the run failed only on the Go test's own status expectation,
+        # which proves the empty body was read as a status, not an error.
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("expected status injected", completed.stdout)
 
 
 if __name__ == "__main__":

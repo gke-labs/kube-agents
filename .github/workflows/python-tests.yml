@@ -198,9 +198,12 @@ jobs:
 
   # The integration tier (testing strategy 4.1b): real components wired
   # together with the agent replaced by a fake — deterministic, no model
-  # calls, minutes not hours. Intended to become a required check once it has
-  # a green track record; nothing statistical stands between a failure here
-  # and a defect.
+  # calls, minutes not hours. This job is the tier's ONLY runner during its
+  # probation period (tests/integration is deliberately excluded from
+  # PYTHON_TEST_DIRS, so the unit and coverage jobs never execute it); it is
+  # intended to become a required check once it has a green track record, and
+  # the directory joins the unit sweep at the same moment. Nothing statistical
+  # stands between a failure here and a defect.
   integration:
     name: Run Integration Seam Tests
     runs-on: ubuntu-latest

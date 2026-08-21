@@ -244,9 +244,11 @@ class ChatIngressSeamTest(unittest.TestCase):
             "receipt": "r-poison",
         }
         self._run_adapter([poison], until=lambda: self.relay.settled, run_for=4.0)
-        self.assertEqual(
-            [("r-poison", False)],
-            self.relay.settled,
+        # The contract is "every pulled event settles" — a nack is the obvious
+        # implementation, but an ack after dead-lettering satisfies it too, so
+        # the assertion is on the receipt being settled at all.
+        self.assertTrue(
+            any(receipt == "r-poison" for receipt, _ in self.relay.settled),
             "a malformed event must be settled, never silently redelivered",
         )
 

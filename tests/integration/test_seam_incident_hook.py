@@ -43,14 +43,25 @@ class _Event:
         self.raw_message = raw_message
 
 
-def _load_hook(kv_url):
-    """Import the plugin against a specific KV URL, fresh each time."""
-    os.environ["SESSION_KV_URL"] = kv_url
-    os.environ["SESSION_KV_API_KEY"] = API_KEY
+def _load_hook(case, kv_url):
+    """Import the plugin against a specific KV URL, fresh each time.
+
+    Environment edits are registered on the test case for cleanup: this file
+    runs inside a discovery sweep, and a leaked SESSION_KV_URL would point
+    every later module's clients at a dead port.
+    """
+    for name, value in (("SESSION_KV_URL", kv_url), ("SESSION_KV_API_KEY", API_KEY)):
+        previous = os.environ.get(name)
+        os.environ[name] = value
+        if previous is None:
+            case.addCleanup(os.environ.pop, name, None)
+        else:
+            case.addCleanup(os.environ.__setitem__, name, previous)
     plugin_dir = REPO_ROOT / "agents" / "platform" / "plugins"
     if str(plugin_dir) not in sys.path:
         sys.path.insert(0, str(plugin_dir))
     sys.modules.pop("incident_context", None)
+    case.addCleanup(sys.modules.pop, "incident_context", None)
     return importlib.import_module("incident_context")
 
 
@@ -66,7 +77,7 @@ class IncidentHookSeamTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
-        self.hook = _load_hook(self.kv.url)
+        self.hook = _load_hook(self, self.kv.url)
 
     def test_a_threaded_reply_gets_the_stored_report_prepended(self):
         status, _ = http_json(
@@ -102,7 +113,7 @@ class IncidentHookSeamTest(unittest.TestCase):
         threading.Thread(target=stub.serve_forever, daemon=True).start()
         self.addCleanup(stub.server_close)
         self.addCleanup(stub.shutdown)
-        hook = _load_hook(f"http://127.0.0.1:{stub.server_port}")
+        hook = _load_hook(self, f"http://127.0.0.1:{stub.server_port}")
         self.assertIsNone(hook.on_inbound(event=_Event("/hermes sethome")))
         self.assertIsNone(hook.on_inbound(event=_Event("<@U123ABC> /hermes status")))
         self.assertEqual([], hits)
@@ -122,7 +133,7 @@ class IncidentHookSeamTest(unittest.TestCase):
         threading.Thread(target=stub.serve_forever, daemon=True).start()
         self.addCleanup(stub.server_close)
         self.addCleanup(stub.shutdown)
-        hook = _load_hook(f"http://127.0.0.1:{stub.server_port}")
+        hook = _load_hook(self, f"http://127.0.0.1:{stub.server_port}")
         started = time.monotonic()
         self.assertIsNone(hook.on_inbound(event=_Event("is this thing on?")))
         self.assertLess(time.monotonic() - started, 6.0)

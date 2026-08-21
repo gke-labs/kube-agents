@@ -147,12 +147,14 @@ class McpStdioSeamTest(unittest.TestCase):
         self.assertEqual(["send", "--to", "google_chat:spaces/HOME"], argvs[0][:3])
 
     def test_every_stdout_line_the_server_emits_is_protocol_json(self):
-        """Raw stream purity — the actual pin for the bare-print bug.
+        """Every line of the stdio conversation held to the protocol contract.
 
-        The MCP client in requirements-test tolerates a stray prose line on
-        stdout (it logs and skips unparseable lines), so a client-level test
-        passes even with the bug present; whether the DEPLOYED client build
-        is as forgiving is not this repository's call to make. The protocol
+        Not the pin for the bare-print bug: the client at requirements-test's
+        pin tolerates stray prose lines, and the buffered print flushes late
+        enough that this sweep passes even with the bug present — reproduced
+        during review. The deterministic pin for the print's destination is
+        test_the_kv_failure_log_line_never_touches_stdout; this test's job is
+        the broader contract, held through EOF. The protocol
         contract is stricter than the lenient client: stdout carries JSON-RPC
         and nothing else. This test speaks the handshake over raw pipes and
         asserts every stdout line parses as JSON. The KV-failure print does
@@ -262,8 +264,14 @@ class McpStdioSeamTest(unittest.TestCase):
 
         module = importlib.import_module("platform_mcp_server")
         stdout, stderr = io.StringIO(), io.StringIO()
+        # Both outward calls are pinned shut: the KV lookup raises (the path
+        # under test), and subprocess.run raises too — on a workstation with
+        # a real hermes on PATH, an unpatched broadcast would post an actual
+        # chat message from a unit-test run.
         with mock.patch.object(
             module.urllib.request, "urlopen", side_effect=OSError("kv down")
+        ), mock.patch.object(
+            module.subprocess, "run", side_effect=FileNotFoundError("hermes")
         ):
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 result = module.send_notification(
@@ -271,7 +279,7 @@ class McpStdioSeamTest(unittest.TestCase):
                 )
         self.assertEqual("", stdout.getvalue(), "log lines must never reach the JSON-RPC stream")
         self.assertIn("Failed to resolve session metadata", stderr.getvalue())
-        self.assertIn("ERROR", result)  # hermes not faked in-process; broadcast fails loudly
+        self.assertIn("ERROR", result)  # the pinned-shut broadcast fails loudly
 
 
 if __name__ == "__main__":

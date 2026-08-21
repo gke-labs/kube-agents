@@ -127,8 +127,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
-	$(wildcard tests/test_*.py) \
-	$(wildcard tests/integration/test_*.py)))
+	$(wildcard tests/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
@@ -296,9 +295,10 @@ test-bench: ## Run the bench harness tests under pytest.
 
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
-# The tests also run under `make test-python` through the PYTHON_TEST_DIRS
-# glob; this target exists so the tier can be run (and its CI job named)
-# on its own.
+# Deliberately NOT in PYTHON_TEST_DIRS while the tier is on probation: its own
+# CI job is the single runner, so a flake in a young seam test cannot red the
+# already-gating unit job. It joins the unit sweep when the job becomes a
+# required check; the discovery guard's exclusion entry tells the same story.
 test-integration: ## Run the in-process integration seam tests.
 	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 

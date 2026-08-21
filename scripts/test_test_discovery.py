@@ -37,6 +37,11 @@ EXCLUDED = {
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
+    # Runs in its own CI job (`integration` in python-tests.yml) during its
+    # probation period, so a flake in a young seam test cannot red the
+    # already-gating unit and coverage jobs. Joins the unit sweep when the
+    # job becomes a required check.
+    "tests/integration": "own CI job during probation, make test-integration",
     # tests/e2e is deliberately NOT here: its file is gchat_agent_test.py,
     # which the test_*.py pattern never matches. If a test_*.py ever lands
     # there, the orphan check below fires and forces this list to say why the
