@@ -582,6 +582,74 @@ print(f"managed scope: {len(keys)} pinned config keys from {managed_scope.get_ma
     echo "WARN: $MANAGED_DIR/config.yaml did not load as a managed scope (unparseable, or missing the model keys) — hermes fails open, so the agent is running UNPINNED" >&2
 fi
 
+# The same assertion for the ONE key in the managed .env that is not about chat, and the
+# only one whose absence takes the whole API surface down rather than degrading a feature.
+#
+# What it is guarding against, and why it needs guarding at all (issue #786). Hermes'
+# Docker stage2 hook — step 1 above, upstream's, in every container — generates a strong
+# random API_SERVER_KEY into $TARGET_DIR/.env whenever that file does not already carry
+# one, and load_hermes_dotenv applies that file with override=True. Before the operator
+# pinned this key, the gateway therefore authenticated against a value invented at boot
+# inside the pod that nothing else knew: `os.environ["API_SERVER_KEY"]`, the Secret, the
+# credential proxy's AGENT_API_UPSTREAM_KEY and the container's own startup probe all
+# presented the sentinel and all got 401. The managed .env is applied last of everything,
+# so pinning API_SERVER_KEY there is what makes the whole pod agree — but managed scope
+# fails open, so an absent or unmounted pin restores the broken state silently.
+#
+# It is checked HERE, before `exec`, rather than left to the container's startup probe.
+# The probe (agentAPIProbe in platformagent_manifests.go) does catch the failure — it
+# curls an authenticated route with $API_SERVER_KEY and the pod never goes Ready — but a
+# probe reports THAT something is wrong, not WHICH of the several things it could be. One
+# line naming the missing pin turns a CrashLoopBackOff into a diagnosis.
+#
+# Reads the file with grep rather than asking Hermes: this is the operator's rendered
+# text, and the point is to check what was MOUNTED, not what some library would resolve.
+# Comparing values, not just presence, because the two renders sit in different files in
+# different languages and agreeing is the entire property.
+#
+# Report, never exit, for the reason the block above gives.
+#
+# A function taking its inputs as arguments, so the tests can run the shipped definition
+# rather than a copy of it (tests/test_docker_entrypoint.py).
+warn_unless_api_key_is_pinned() {
+    _wuakip_managed_env="$1"
+    _wuakip_key="$2"
+
+    if [ ! -f "$_wuakip_managed_env" ]; then
+        echo "WARN: no managed $_wuakip_managed_env — API_SERVER_KEY is NOT pinned, so Hermes' stage2 hook may have generated a different key into $TARGET_DIR/.env and every authenticated call to this agent's API will 401 (issue #786)" >&2
+        return 0
+    fi
+    # -x and -F together: a line that merely CONTAINS the value is a different pin, and a
+    # key whose value happens to look like a pattern is still just a string.
+    if grep -qxF "API_SERVER_KEY=$_wuakip_key" "$_wuakip_managed_env"; then
+        return 0
+    fi
+    # The two remaining shapes are both broken, but they are NOT broken the same way, and
+    # the difference is which file an operator should go and read. Say which one wins.
+    if grep -q '^API_SERVER_KEY=' "$_wuakip_managed_env"; then
+        # The managed scope is applied last with override=True, so a file that pins some
+        # OTHER value is the value the gateway will accept — and it will then 401 this
+        # container's env, which is what the sidecar, the startup probe and every in-pod
+        # caller present.
+        echo "WARN: $_wuakip_managed_env pins API_SERVER_KEY to a different value than this container's env — the managed file is applied last, so the gateway will accept ITS key and 401 the credential proxy, the startup probe and every in-pod caller (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit the same value as the container env." >&2
+    else
+        # No pin for this key at all: the managed file overrides nothing, so the winner is
+        # $TARGET_DIR/.env — where Hermes' stage2 hook generates a random key that nothing
+        # outside the gateway process knows. This is the pre-fix shape exactly, and it is
+        # what a stale (chat-only) ConfigMap still renders.
+        echo "WARN: $_wuakip_managed_env does not pin API_SERVER_KEY — with no managed pin the PVC's $TARGET_DIR/.env wins, and Hermes' stage2 hook generates a random key there that the credential proxy, the startup probe and every in-pod caller will 401 against (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit API_SERVER_KEY." >&2
+    fi
+    return 0
+}
+
+# Gated on the key being SET as well as on the managed dir, and not only because there is
+# nothing to compare otherwise: an unset API_SERVER_KEY is Hermes' own supported shape —
+# stage2 generates one and the pod is internally consistent — so it is the operator's
+# arrangement, half-applied, that this is looking for.
+if [ -n "$MANAGED_DIR" ] && [ -n "${API_SERVER_KEY:-}" ]; then
+    warn_unless_api_key_is_pinned "$MANAGED_DIR/.env" "$API_SERVER_KEY"
+fi
+
 # The image's own copy of the scaffolder, never the volume's. Step 2 seeds
 # $TARGET_DIR/scripts with `cp -u`, which SKIPS any file the PVC holds a newer
 # mtime for — the same trap step 2a exists to work around for config.yaml. This
