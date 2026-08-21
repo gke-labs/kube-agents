@@ -66,17 +66,37 @@ def compose(findings: list[dict]) -> str:
     return f"{HEADING}\n\n{_body(findings)}"
 
 
+def _managed_line(findings: list[dict]) -> str:
+    managed = [f for f in findings if f.get("provider_managed")]
+    if not managed:
+        return ""
+    return (
+        f"\n\n{len(managed)} provider-managed "
+        f"{'item is' if len(managed) == 1 else 'items are'} also on the list. "
+        "The operator does not own those manifests, so they are observations rather "
+        "than work."
+    )
+
+
 def _body(findings: list[dict]) -> str:
     if not findings:
         return "Good morning. The findings queue is empty."
 
-    criticals = [f for f in findings if f.get("severity") == "critical"]
+    # §4.4: a provider-managed row is scored and stays on the list, but naming it
+    # here would be asking the operator to change a manifest they do not own.
+    nameable = [f for f in findings if not f.get("provider_managed")]
+    criticals = [f for f in nameable if f.get("severity") == "critical"]
     if not criticals:
-        top = findings[0]
+        if not nameable:
+            return (
+                f"Good morning. Nothing on the queue is yours to act on: all "
+                f"{len(findings)} open items are provider-managed."
+            )
+        top = nameable[0]
         return (
             f"Good morning. No critical findings are open, and {len(findings)} "
             f"in the queue. The highest is {top.get('severity')}: {top.get('title')} "
-            f"({_where(top)})."
+            f"({_where(top)})." + _managed_line(findings)
         )
 
     lines = [
@@ -99,7 +119,7 @@ def _body(findings: list[dict]) -> str:
             f"{'finding' if remaining == 1 else 'findings'} not named here. "
             "Ask for the full list."
         )
-    return "\n".join(lines)
+    return "\n".join(lines) + _managed_line(findings)
 
 
 PUBLISHER = "nudge"
@@ -155,7 +175,10 @@ def main(argv: list[str] | None = None) -> int:
     # how a finding stuck at the top of the list becomes visible as its own
     # problem, and leaving them at zero would make that undetectable. A failure
     # here costs that bookkeeping, not the message, which is already out.
-    for finding in [f for f in findings if f.get("severity") == "critical"][:TOP_N]:
+    named = [
+        f for f in findings if f.get("severity") == "critical" and not f.get("provider_managed")
+    ][:TOP_N]
+    for finding in named:
         try:
             _request(endpoint, f"/v1/findings/{finding['id']}/surfaced", {})
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:

@@ -86,6 +86,36 @@ class ComposeTests(unittest.TestCase):
         self.assertFalse(message.endswith("\n   "))
 
 
+class ProviderManagedTests(unittest.TestCase):
+    """§4.4: scored and on the list, but never named in a nudge."""
+
+    def test_a_provider_managed_critical_is_not_named(self):
+        message = nudge.compose(
+            [
+                finding(id="a", title="kube-system has no limits", provider_managed=True),
+                finding(id="b", title="payments api has no probe"),
+            ]
+        )
+        self.assertNotIn("kube-system has no limits", message)
+        self.assertIn("payments api has no probe", message)
+        self.assertIn("1 critical finding is open, 2 in the queue", message)
+        self.assertIn("1 provider-managed item is also on the list", message)
+
+    def test_a_provider_managed_row_is_not_the_highest_when_nothing_is_critical(self):
+        message = nudge.compose(
+            [
+                finding(id="a", severity="major", title="gke-managed thing", provider_managed=True),
+                finding(id="b", severity="minor", title="yours"),
+            ]
+        )
+        self.assertIn("The highest is minor: yours", message)
+        self.assertNotIn("gke-managed thing", message)
+
+    def test_a_queue_of_nothing_but_provider_managed_rows_says_so(self):
+        message = nudge.compose([finding(id="a", provider_managed=True)])
+        self.assertIn("Nothing on the queue is yours to act on", message)
+
+
 class NudgeHarness(unittest.TestCase):
     def setUp(self):
         self.out = io.StringIO()
@@ -145,6 +175,13 @@ class MainTests(NudgeHarness):
                 "/v1/findings/b/surfaced",
             ],
         )
+
+    def test_a_provider_managed_critical_is_not_marked_surfaced(self):
+        _, calls = self.run_with(
+            [finding(id="managed", provider_managed=True), finding(id="mine")]
+        )
+        self.assertIn("/v1/findings/mine/surfaced", calls)
+        self.assertNotIn("/v1/findings/managed/surfaced", calls)
 
     def test_a_failed_surfaced_call_costs_the_bookkeeping_not_the_message(self):
         code, _ = self.run_with([finding(id="a")], surfaced_error=urllib.error.URLError("refused"))

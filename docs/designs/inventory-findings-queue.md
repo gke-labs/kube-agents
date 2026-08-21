@@ -4,12 +4,13 @@
 > `agents/platform/scripts/findings_queue.py`, `inventory_findings.py` and the Session KV server:
 > the two tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
 > rules (§5.2), the seven endpoints and MCP tools (§6.1), and the inventory sweep's registration
-> path (§5). Item 7 ships in part: `agents/platform/scripts/findings_nudge.py` and the
-> `findings-morning-nudge` cron job post §7.2's message behind its change gate, so an unchanged
-> queue — including an empty one — says nothing. §7.2's weekly message regardless is deferred, as is
-> §7.1's backlog document the nudge is meant to link to. §7.5's SOP-driven job is not how it runs; it
-> is a `no_agent` script. Items 8–13 do not ship, so no finding reaches a pull request and
-> §8 and §9 remain design. The pipeline
+> path (§5). Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Items 8 and
+> 10 ship in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
+> entry in `jobs.json` post §7.2's message behind item 10's `content_hash` change gate, so an
+> unchanged queue — including an empty one — says nothing. Item 10's weekly floor and its alarm are
+> deferred, and item 8's `findings_publish_sop.md` is not written: the nudge runs as a `no_agent`
+> script rather than as §7.5's SOP-driven job. Items 9 and 11–13 do not ship, so nothing publishes
+> the backlog and no finding reaches a pull request — §7.1, §7.4 and §9 remain design. The pipeline
 > this design extends does ship: the sweep in
 > [`inventory.md`](../../agents/platform/governance/inventory.md), the ranking in
 > [`inventory_prioritize_sop.md`](../../agents/platform/governance/inventory_prioritize_sop.md), and
