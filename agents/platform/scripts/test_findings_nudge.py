@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import sys
@@ -85,7 +86,7 @@ class ComposeTests(unittest.TestCase):
         self.assertFalse(message.endswith("\n   "))
 
 
-class MainTests(unittest.TestCase):
+class NudgeHarness(unittest.TestCase):
     def setUp(self):
         self.out = io.StringIO()
         self.err = io.StringIO()
@@ -96,14 +97,24 @@ class MainTests(unittest.TestCase):
         self.addCleanup(patch_out.stop)
         self.addCleanup(patch_err.stop)
 
-    def run_with(self, ranked, surfaced_error=None):
+    def run_with(self, ranked, surfaced_error=None, last_hash=None, publication_error=None):
         """Drive `main` against a stubbed queue, recording every request made."""
         calls = []
+        self.published = []
 
-        def fake_request(endpoint, path, body=None):
+        def fake_request(endpoint, path, body=None, method=""):
             calls.append(path)
             if path == "/v1/findings/ranked":
                 return {"findings": ranked}
+            if path == f"/v1/findings/publication/{nudge.PUBLISHER}":
+                if publication_error:
+                    raise publication_error
+                if method == "PUT":
+                    self.published.append(body)
+                    return body
+                if last_hash is None:
+                    raise urllib.error.HTTPError(path, 404, "not found", None, None)
+                return {"content_hash": last_hash}
             if surfaced_error:
                 raise surfaced_error
             return {}
@@ -112,6 +123,8 @@ class MainTests(unittest.TestCase):
             code = nudge.main([])
         return code, calls
 
+
+class MainTests(NudgeHarness):
     def test_only_the_criticals_the_message_named_are_marked_surfaced(self):
         code, calls = self.run_with(
             [
@@ -124,7 +137,13 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             calls,
-            ["/v1/findings/ranked", "/v1/findings/a/surfaced", "/v1/findings/b/surfaced"],
+            [
+                "/v1/findings/ranked",
+                f"/v1/findings/publication/{nudge.PUBLISHER}",
+                f"/v1/findings/publication/{nudge.PUBLISHER}",
+                "/v1/findings/a/surfaced",
+                "/v1/findings/b/surfaced",
+            ],
         )
 
     def test_a_failed_surfaced_call_costs_the_bookkeeping_not_the_message(self):
@@ -139,6 +158,63 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.out.getvalue(), "")
         self.assertIn("could not read the queue", self.err.getvalue())
+
+
+class ChangeGateTests(NudgeHarness):
+    """§7.2: post only when the message changed, so an empty queue is not a daily greeting."""
+
+    def _digest(self, ranked):
+        return hashlib.sha256(nudge.compose(ranked).encode("utf-8")).hexdigest()
+
+    def test_an_unchanged_empty_queue_says_nothing_at_all(self):
+        code, calls = self.run_with([], last_hash=self._digest([]))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.out.getvalue(), "")
+        self.assertNotIn(f"/v1/findings/publication/{nudge.PUBLISHER}", calls[2:])
+
+    def test_an_unchanged_queue_of_findings_says_nothing_either(self):
+        ranked = [finding(id="a")]
+        code, _ = self.run_with(ranked, last_hash=self._digest(ranked))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.out.getvalue(), "")
+
+    def test_a_first_run_has_no_recorded_hash_and_posts(self):
+        code, _ = self.run_with([])
+        self.assertEqual(code, 0)
+        self.assertIn("The findings queue is empty", self.out.getvalue())
+
+    def test_a_changed_queue_posts_and_records_the_new_hash(self):
+        ranked = [finding(id="a")]
+        code, _ = self.run_with(ranked, last_hash=self._digest([]))
+        self.assertEqual(code, 0)
+        self.assertIn("no readinessProbe on api", self.out.getvalue())
+        self.assertEqual(
+            self.published,
+            [{"target_kind": "chat", "content_hash": self._digest(ranked)}],
+        )
+
+    def test_a_queue_that_cannot_be_read_for_its_hash_posts_anyway(self):
+        code, _ = self.run_with([], publication_error=urllib.error.URLError("refused"))
+        self.assertEqual(code, 0)
+        self.assertIn("The findings queue is empty", self.out.getvalue())
+        self.assertIn("could not read the last posted hash", self.err.getvalue())
+
+    def test_a_hash_that_cannot_be_recorded_costs_the_gate_not_the_message(self):
+        recorded = []
+
+        def fake_request(endpoint, path, body=None, method=""):
+            if path == "/v1/findings/ranked":
+                return {"findings": []}
+            if method == "PUT":
+                raise urllib.error.URLError("refused")
+            recorded.append(path)
+            raise urllib.error.HTTPError(path, 404, "not found", None, None)
+
+        with unittest.mock.patch.object(nudge, "_request", side_effect=fake_request):
+            code = nudge.main([])
+        self.assertEqual(code, 0)
+        self.assertIn("The findings queue is empty", self.out.getvalue())
+        self.assertIn("could not record the posted hash", self.err.getvalue())
 
 
 class RosterTests(unittest.TestCase):
