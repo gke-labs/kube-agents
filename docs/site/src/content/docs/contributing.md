@@ -73,6 +73,16 @@ Before pushing, run the checks CI enforces:
   npm run build
   ```
 
+- **Docs checks** (if you touched any Markdown — the `Docs Check` CI job runs these on every PR, and a green docs build does not imply they pass):
+
+  ```bash
+  # from the repo root; runs the four checks the Docs Check job runs as separate steps:
+  # generated regions are up to date, cross-references resolve, terminology is consistent, and the docs map matches
+  make docs-check
+  ```
+
+  If the generated-regions step fails, `make docs-generate` rewrites them from their sources.
+
 ## Live validation
 
 The checks above tell you the code compiles, the docs resolve, and the unit tests agree with themselves. None of them tell you whether the operator reconciled your change or the agent pod picked it up — this project's failure mode is a green build that configures nothing. So every pull request fills in the template's **Testing → Live validation** section with how the change was exercised against a real, running kube-agents installation. If you don't have one, [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md) stands one up.
