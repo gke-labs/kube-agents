@@ -1344,14 +1344,31 @@ def read_only_enforced() -> bool:
 
     This switch is deliberately not documented in the customer-facing reference.
     It is global, unscoped and has no expiry: setting it disables the read-only
-    posture for every command, every agent and every cluster in the Pod, for as
-    long as the ConfigMap says so, and today there is no impersonation layer
-    underneath to catch what gets through (see command_policy's module
-    docstring). It exists so an operator can recover from a bad allowlist
-    without waiting on an image build, and it should be reverted in the same
-    change that adds the missing verb to command_policy.KUBECTL_READ_VERBS or
-    GCLOUD_READ_COMMANDS. Adding the verb is the fix; this is the outage
-    stopgap.
+    posture for every command, every agent and every cluster in the Pod, and
+    today there is no impersonation layer underneath to catch what gets through
+    (see command_policy's module docstring).
+
+    **On an operator-managed install there is no supported way to set it, by
+    design.** The operator reserves the name: a `spec.deployment.env` entry is
+    rejected by the validating webhook and dropped by mergeCredentialProxyEnv,
+    no ConfigMap carries it, and a hand edit to the generated Deployment is
+    reverted on the next reconcile. Whoever can edit the PlatformAgent is
+    frequently who the policy is meant to constrain, so the switch is not
+    theirs. An earlier version of this docstring offered it as the way to
+    "recover from a bad allowlist without waiting on an image build"; that
+    route did not exist -- the ConfigMap it named has only ever carried
+    policy.json -- and following it during an outage costs an operator a CR
+    patch that changes nothing and explains nothing.
+
+    The remedy for a command the allowlist should have permitted is to add it
+    to command_policy.KUBECTL_READ_VERBS or GCLOUD_READ_COMMANDS and ship the
+    image, which is what the customer-facing reference already tells the
+    reader to do (docs/site/.../reference/credential-isolation.md).
+
+    What remains is the process environment, which is how the tests arm and
+    disarm the gate and how the proxy behaves when run outside the operator --
+    a standalone or local invocation, where the person setting it is the
+    person running the process.
     """
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
 
