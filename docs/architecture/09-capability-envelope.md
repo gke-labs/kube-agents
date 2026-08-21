@@ -279,6 +279,16 @@ presenting that origin directly. The identity is what makes "it" mean this reque
 agent -- drop that and the last five words of the claim go with it. It holds under imperfect
 implementation, which is the only kind there is, but it does not hold under a missing rule.
 
+**One of the three is not carried yet, and the claim is ahead of the mechanism until it is.** The
+read side can be request-scoped because the verifier authenticates a live caller. The write side is
+proved by the subject prefix, which is per agent, so an agent that is concurrently the delegate of
+two roots can still write a child descending from the wider one while serving the narrower one's
+request. Closing that needs a per-request identity on the bus itself, not only at the verifier,
+which is a change to the mechanism rather than to this paragraph.
+`docs/designs/capability-envelope-write-path.md` states the problem, why the obvious fix does not
+drop in, and the options. Treat the sentence above as the target until
+that is settled.
+
 **Chain depth is a refusal, not just a cost.** Resolution walks to the root, so a long chain is a
 lot of KV reads. Those are now the verifier's reads rather than every broker's, which makes them
 cacheable per id -- a chain is immutable once written, so the only invalidation is revocation. Not
