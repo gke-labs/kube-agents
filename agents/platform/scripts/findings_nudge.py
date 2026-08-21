@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""The morning nudge: a short chat message naming the top critical findings.
+
+Backs the ``findings-morning-nudge`` cron job, which runs with ``no_agent:
+true`` and ``deliver: "chat"``. Its stdout is delivered verbatim, so everything
+this prints is what the user reads.
+
+No model turn, because there is no judgement to make: the ordering is the
+queue's (`GET /v1/findings/ranked`), the severity is computed by the rubric at
+registration, and the recommendation was written by whoever found the thing.
+What is left is counting and formatting.
+
+This is §7.2 of `docs/designs/inventory-findings-queue.md` minus its third
+line. The design's nudge links to a backlog document holding the whole queue;
+that publisher (§7.1) is not built, so the message says how many findings it did
+not name rather than pointing at a list of them.
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
+TIMEOUT_SECONDS = 30
+
+# The user asked for the top two. The count of what is left is printed either
+# way, so raising this widens the message rather than revealing anything new.
+TOP_N = 2
+
+
+def _request(endpoint: str, path: str, body: dict | None = None) -> dict:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(
+        f"{endpoint}{path}", data=data, headers=headers, method="POST" if data else "GET"
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _where(finding: dict) -> str:
+    cluster = finding.get("cluster") or ""
+    # A cluster-scoped finding names the cluster as its object, and reading
+    # `prod/prod` back is a puzzle rather than a location.
+    parts = [cluster, finding.get("namespace") or "", finding.get("object") or ""]
+    if parts[2] == cluster:
+        parts = parts[:2]
+    return "/".join(part for part in parts if part)
+
+
+def compose(findings: list[dict]) -> str:
+    """The message, from the ranked list. Pure, so the wording earns a test."""
+    if not findings:
+        return "Good morning. The findings queue is empty."
+
+    criticals = [f for f in findings if f.get("severity") == "critical"]
+    if not criticals:
+        top = findings[0]
+        return (
+            f"Good morning. No critical findings are open, and {len(findings)} "
+            f"in the queue. The highest is {top.get('severity')}: {top.get('title')} "
+            f"({_where(top)})."
+        )
+
+    lines = [
+        f"Good morning. {len(criticals)} critical "
+        f"{'finding is' if len(criticals) == 1 else 'findings are'} open, "
+        f"{len(findings)} in the queue."
+    ]
+    for position, finding in enumerate(criticals[:TOP_N], start=1):
+        action = (finding.get("recommendation") or {}).get("action") or ""
+        lines.append(
+            f"\n{position}. [{finding.get('rank_score')}] {finding.get('title')}"
+            f"\n   {_where(finding)}"
+            + (f"\n   {action}" if action else "")
+        )
+
+    remaining = len(criticals) - min(TOP_N, len(criticals))
+    if remaining:
+        lines.append(
+            f"\n{remaining} more critical "
+            f"{'finding' if remaining == 1 else 'findings'} not named here. "
+            "Ask for the full list."
+        )
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    endpoint = (os.environ.get("SESSION_KV_ENDPOINT") or DEFAULT_ENDPOINT).rstrip("/")
+
+    try:
+        findings = _request(endpoint, "/v1/findings/ranked").get("findings") or []
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        detail = exc.read().decode("utf-8", "replace") if isinstance(exc, urllib.error.HTTPError) else str(exc)
+        # Loudly, and with nothing on stdout: the scheduler turns a non-zero
+        # exit into a delivered failure summary, and a run that could not read
+        # the queue must not read as a quiet morning.
+        sys.stderr.write(f"findings_nudge: could not read the queue at {endpoint}: {detail}\n")
+        return 1
+
+    sys.stdout.write(compose(findings) + "\n")
+    sys.stdout.flush()
+
+    # After the message, and best-effort: `surface_count` and `surfaced_at` are
+    # how a finding stuck at the top of the list becomes visible as its own
+    # problem, and leaving them at zero would make that undetectable. A failure
+    # here costs that bookkeeping, not the message, which is already out.
+    for finding in [f for f in findings if f.get("severity") == "critical"][:TOP_N]:
+        try:
+            _request(endpoint, f"/v1/findings/{finding['id']}/surfaced", {})
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            sys.stderr.write(f"findings_nudge: could not mark {finding.get('id')} surfaced: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1703,7 +1703,11 @@ class TestAuditCatalogue(unittest.TestCase):
             "set; a stream switched off here simply stops running",
         )
         self.assertEqual(
-            {"github-repo-watcher", "eod-event-watcher-daily-report"},
+            {
+                "github-repo-watcher",
+                "eod-event-watcher-daily-report",
+                "findings-morning-nudge",
+            },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
             "pair; a subprocess job added here fires on every tick without "
