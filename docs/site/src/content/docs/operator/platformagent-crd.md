@@ -58,6 +58,16 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
 | `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                             |
 
+`dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
+dashboard` binds `127.0.0.1`, so a request arriving over the pod network gets connection refused.
+Reaching it means getting inside the pod's network namespace — `kubectl port-forward svc/<agent>
+9119:9119` on an ordinary node pool, and
+[`scripts/hermes-dashboard-tunnel.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/hermes-dashboard-tunnel.py)
+on a GKE Sandbox (gVisor) one, where port-forward is set up in the host-side netns and cannot see
+the sandbox's listener. That script is canonical on both the access path and why the loopback bind
+is deliberate. The container's readiness probe runs `curl` against loopback for the same reason a
+`tcpSocket` probe cannot work here: kubelet dials the pod IP, and nothing is listening on it.
+
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
 milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
 authenticates to that same server, treats an empty `SESSION_KV_API_KEY` as fatal, and exits on every

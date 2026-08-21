@@ -12,7 +12,7 @@ its own applier anchored into the same function, each its own way for a
 base-image bump to break the build for a reason that has nothing to do with the
 other two. They are merged here: two anchors, one applier, one verifier.
 
-The three concerns, in the order the notifier reaches them:
+The concerns, in the order the notifier reaches them:
 
 1. **Clip** the status line. ``clip_handoff`` is re-exported from
    ``gateway/kanban_handoff_clip.py``, which stays a module of its own because
@@ -30,6 +30,9 @@ The three concerns, in the order the notifier reaches them:
    :func:`note_suppressed_completion` writes a one-shot marker into the
    creator's session state so the *next* turn knows the card finished, without
    spending a turn to find out.
+5. **Store** the report the user just read: :func:`store_incident_report` puts
+   it in the ``incidents`` table, keyed on the thread it was posted in, so a
+   reply of ``apply Option A`` reaches an agent that can see what Option A was.
 
 Step 3 is only defensible because steps 1 and 2 happened, which is the clearest
 argument for keeping them together: ``kanban.wake_on_events`` may drop
@@ -37,13 +40,19 @@ argument for keeping them together: ``kanban.wake_on_events`` may drop
 this module that put it there. Step 4 is the other half of that bargain — the
 answer being in the thread is a fact about the *user's* screen, not about the
 agent's transcript, and step 3 is only safe once something has told the agent.
+Step 5 is the third: the answer being on the user's screen is what makes them
+reply to it, and until the row is written that reply arrives stripped of
+everything it refers to.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import time
+import urllib.request
 from typing import Callable, Iterable, List, Optional, Tuple
 
 try:  # in-image: both modules live in the gateway package
@@ -75,6 +84,10 @@ __all__ = [
     "creator_session_key",
     "stage_note",
     "note_suppressed_completion",
+    "SESSION_KV_URL",
+    "INCIDENT_TIMEOUT_SECONDS",
+    "actionable_report",
+    "store_incident_report",
 ]
 
 
@@ -1004,6 +1017,281 @@ def note_suppressed_completion(
             "%s on the creator's session; the report was still delivered, but "
             "the creator's next turn will not know the card finished",
             task_id or "(unknown card)",
+            exc_info=True,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 5. Storing the delivered report so a reply to it can be acted on
+# ---------------------------------------------------------------------------
+#
+# An event-triage report ends in two or three labelled remediation options. The
+# reader's next move is to pick one — ``apply Option A`` — and that reply is
+# ordinary chat ingress on the front door, a profile with no cluster access, no
+# memory of the card, and no idea what Option A was.
+#
+# The mechanism that closes the gap already exists and works.
+# ``agents/platform/plugins/incident_context/`` is a ``pre_gateway_dispatch``
+# hook: when a message arrives in a thread it recognises, it prepends the stored
+# report to the user's words before the agent sees them. It finds the thread
+# with ``GET /v1/incidents/by-thread`` against the ``incidents`` table.
+#
+# Nothing wrote that table on this path. The rows a triage reply needs came from
+# ``platform_mcp_server.send_notification`` — the egress call the card delivery
+# in section 2 replaced (#738) — so ``_lookup`` returned ``None``, the reply was
+# passed through unrewritten, and the front door received the bare word
+# ``apply``. Nothing unsafe followed, because the front door holds no GitOps
+# write path and simply cannot act; the report template stopped inviting the
+# reply instead, and this section is what lets it be invited again (#802).
+#
+# Why here
+# --------
+# This is where the three values the row needs sit together in one place. The
+# subscription carries the destination — ``sub["chat_id"]`` and
+# ``sub["thread_id"]``, already substituted from the alert's real chat route by
+# ``tools/kanban_event_routing.py`` — and ``task.result`` is the text that was
+# just posted to it. Anywhere earlier, the address is still the undeliverable
+# ``api_server`` one; anywhere later, the subscription row has been deleted.
+#
+# After the send, which is also where ``relay_cron_report`` puts its own store
+# (#731) and for the same reason: "the routing registration and the incident
+# store happen after the send because both need the thread the send resolves".
+# The notifier's thread is resolved a step earlier — it is the substituted
+# ``sub`` address rather than a value the send returns — but the other half of
+# that ordering holds identically here. A row written before the post claims a
+# reader has a report that has not been sent yet, and on a delivery that then
+# fails to send, claims it forever: ``INSERT OR IGNORE`` will not let the next
+# report replace it.
+#
+# Over loopback HTTP rather than SQLite, unlike
+# ``session_kv_server._store_incident_report``. That function writes the table
+# directly and its docstring says why: it *is* the server that owns the
+# database. The notifier runs in the same container — ``docker-entrypoint.sh``
+# starts the server in the background and then execs the gateway — but it is a
+# different process, so it goes through the same authenticated
+# ``POST /v1/incidents`` that ``send_notification`` used.
+#
+# What goes in the row is the specialist's report, ``task.result``, and not a
+# summary of it. The reply this exists to resolve names a letter — ``Option
+# B`` — so the stored text has to be the one the reader was looking at when they
+# picked it. That is a third answer to a question the table's writers already
+# answer two ways: the relay stores the Chat Agent's composed message rather
+# than the specialist's finding, and ``send_notification`` stores the
+# notification body. Nothing reads a row expecting a particular one of the
+# three, and both readers are written for the union — ``incident_context``
+# fences whatever it gets as untrusted, and ``list_recent_reports`` returns no
+# preview text at all.
+#
+# Which cards get a row
+# ---------------------
+# Only the ones carrying something to act on: a ``What to do`` section and at
+# least one lettered ``Option``. That is not a proxy for "was this event
+# triage" — it is the question itself. The row exists so ``apply Option A`` can
+# be resolved, and a card whose result is a one-line status has no Option A.
+#
+# Card metadata cannot answer it. By the time the notifier sees the
+# subscription, ``kanban_event_routing`` has rewritten the row to look exactly
+# like an ordinary chat card's, and the assignee and title are model-written.
+# The artifact is the only reliable evidence, and it is the right evidence.
+#
+# Getting this wrong is sticky in one direction. ``POST /v1/incidents`` is
+# ``INSERT OR IGNORE`` and deliberately keeps the FIRST report per thread — the
+# one carrying the options — so a one-line status card stored in a thread that
+# later receives a real report would shadow it for the table's whole retention
+# window. Storing too little costs one reply; storing too much poisons the
+# thread. The gate is set accordingly.
+#
+# Failing
+# -------
+# Never fatally: a report delivered and unstored is the behaviour this replaces,
+# while an exception raised on the delivery path rewinds the notifier cursor and
+# re-posts the report. But never silently either. A silent miss here is the
+# same shape as the bug ``kanban_event_routing`` was written for — a board that
+# reads healthy while the user gets a blank stare — and that patch settled it by
+# logging a warning naming the session on every fall-through. This follows it:
+# a report that had options and did not get stored says so, with the card and
+# the thread named.
+
+#: The Session KV server's loopback address, spelled as
+#: ``platform_mcp_server.py`` and the ``incident_context`` plugin spell it. The
+#: server binds 127.0.0.1 only, so this is reachable from the notifier's process
+#: and from nowhere off the pod.
+SESSION_KV_URL = "http://127.0.0.1:8699"
+
+#: Matches the two other callers of this server. The notifier polls every five
+#: seconds and this call happens after the report has already been sent, so a
+#: slow server must cost the tick a moment, not the next delivery.
+INCIDENT_TIMEOUT_SECONDS = 2.0
+
+#: The report's ``What to do`` section, which is where the options live. Written
+#: to tolerate the heading depth drifting (``##`` in the template, but §7 only
+#: pins the words) while still requiring a heading rather than the phrase in
+#: prose.
+_WHAT_TO_DO_RE = re.compile(r"^ {0,3}#{1,6} +what to do\b", re.IGNORECASE | re.MULTILINE)
+
+#: A lettered option — the thing ``apply Option A`` names. Case-sensitive on the
+#: letter because the template says "Label them 'Option A', 'Option B', ... in
+#: order", and a lowercase "option a" in prose is a sentence, not a label.
+_OPTION_RE = re.compile(r"\bOption [A-Z]\b")
+
+
+def actionable_report(result: object) -> bool:
+    """Whether ``result`` is a report a reply could ask to act on.
+
+    True only when both halves of the triage template's ``What to do`` section
+    are present: the heading, and at least one lettered option under it. Either
+    alone is not enough — a heading with no options offers nothing to apply, and
+    the word "Option" in a paragraph is not a label.
+
+    "Under it" is literal: the option search starts at the end of the heading
+    match, not at the top of the report. A ``What to do`` section holding only
+    unlettered bullets, in a report whose ``Why`` quotes "Option A" from an
+    earlier one, offers nothing to apply — and a row stored for it would hold
+    the thread's one ``INSERT OR IGNORE`` slot against the report that does.
+    """
+    if result is None:
+        return False
+    body = str(result).strip()
+    if not body:
+        return False
+    heading = _WHAT_TO_DO_RE.search(body)
+    if not heading:
+        return False
+    return bool(_OPTION_RE.search(body, heading.end()))
+
+
+def _incident_address(sub: object) -> Tuple[str, str]:
+    """The ``(chat_id, thread_id)`` the report was delivered to, or ``("", "")``.
+
+    Both are required. ``chat_id`` alone keys nothing the by-thread lookup can
+    find, and an unthreaded delivery is a message in the channel body that no
+    reply will be attached to.
+    """
+    if not isinstance(sub, dict):
+        return "", ""
+    chat_id = str(sub.get("chat_id") or "").strip()
+    thread_id = str(sub.get("thread_id") or "").strip()
+    return chat_id, thread_id
+
+
+def _post_incident(chat_id: str, thread_id: str, report: str) -> None:
+    """POST one row to the Session KV server. Raises on any failure."""
+    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"{SESSION_KV_URL}/v1/incidents",
+        data=json.dumps(
+            {"chat_id": chat_id, "thread_id": thread_id, "report": report}
+        ).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=INCIDENT_TIMEOUT_SECONDS):
+        pass
+
+
+def store_incident_report(
+    event: object, task: object, sub: object, posted: bool = True
+) -> bool:
+    """Key the delivered report to its chat thread. True when a row was posted.
+
+    Called from ``gateway/kanban_watchers.py`` on the same path as
+    :func:`note_suppressed_completion`, where every text ping for this delivery
+    has already been sent — so the report this stores is one the reader has, and
+    a reply to it is a reply to something.
+
+    Takes the loop's *current* event, not the delivery's whole event list, which
+    is where it parts company with :func:`note_suppressed_completion` at the
+    same call site. That function is asking what the delivery as a whole
+    suppressed, so it wants every kind; this one is asking whether *this* send
+    was the report, and the call site runs once per event. Reading the list here
+    would fire on a delivery's ``commented`` event too — writing the row before
+    the ``completed`` iteration has sent the report it claims the reader has,
+    and again on the iteration that did.
+
+    ``posted`` is ``send_passive`` at the call site, and False means this
+    subscription's ``delivery_mode`` is ``wake``: the agent is woken and the
+    thread gets no message. There is nothing for the reader to reply to, so
+    keying a report to that thread would prepend a report they never saw to
+    their next message — and ``INSERT OR IGNORE`` would keep it there for the
+    table's retention window.
+
+    Returns whether the POST was made, which the notifier ignores; it exists so
+    the behaviour is testable and so a silent no-op cannot pass for a write.
+
+    Never raises. The delivery is the outcome that matters and this is a second
+    write layered on top of it: an exception here would escape into the tick,
+    rewind the cursor, and re-post the report the user has already read.
+    """
+    card = ""
+    chat_id = thread_id = ""
+    try:
+        card = _task_id(task, sub) or "(unknown card)"
+        if getattr(event, "kind", None) != "completed":
+            # gave_up, crashed, timed_out: whatever is in `result` is not a
+            # report with options in it, and the reader has nothing to apply.
+            # commented, and every other mid-flight kind: the report has not
+            # been sent yet, and the completed event later in this same
+            # delivery is the iteration that stores it.
+            return False
+        if not posted:
+            logger.debug(
+                "kanban notifier: card %s completed on a wake-only "
+                "subscription; nothing was posted in the thread, so there is "
+                "no delivered report to store",
+                card,
+            )
+            return False
+        result = getattr(task, "result", None)
+        if not actionable_report(result):
+            # The common case — every status line, every "no drift found". Not
+            # a warning: this is what most cards look like.
+            logger.debug(
+                "kanban notifier: card %s completed with no options to act on; "
+                "no incident row stored",
+                card,
+            )
+            return False
+        chat_id, thread_id = _incident_address(sub)
+        if not (chat_id and thread_id):
+            logger.warning(
+                "kanban notifier: card %s delivered a report with remediation "
+                "options to chat %s thread %s, which is not a thread — a reply "
+                "naming an option will reach an agent that cannot see the report",
+                card,
+                chat_id or "<no chat>",
+                thread_id or "<no thread>",
+            )
+            return False
+        # Clipped to what was delivered. `result_block` bounds the chat message
+        # at the same limit, and storing more than the reader was shown would
+        # let the agent answer about options that never reached them.
+        _post_incident(chat_id, thread_id, clip_handoff(str(result).strip(), RESULT_LIMIT))
+        # chat and thread are logged as separate fields rather than joined with
+        # a slash. A Google Chat thread_id is already the fully qualified
+        # `spaces/<space>/threads/<thread>`, so `%s/%s` printed the space twice
+        # ("spaces/0sm.../spaces/0sm.../threads/IKT...") and read like a
+        # malformed identifier the store had written. Slack's is a bare ts, and
+        # would have read fine either way.
+        logger.info(
+            "kanban notifier: stored card %s's report against chat %s thread %s "
+            "so a reply to it carries the options back",
+            card,
+            chat_id,
+            thread_id,
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "kanban notifier: could not store card %s's report against chat %s "
+            "thread %s; the report was delivered, but a reply naming an option "
+            "will reach an agent that cannot see it",
+            card or "(unknown card)",
+            chat_id or "<no chat>",
+            thread_id or "<no thread>",
             exc_info=True,
         )
         return False

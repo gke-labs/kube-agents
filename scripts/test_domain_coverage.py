@@ -11,11 +11,20 @@ This test is what makes the rule a build failure:
 * a task claiming an unknown domain is a typo that would otherwise count as
   coverage of nothing.
 
-Delete allowlist entries as Phase 2 lands scenarios. The shrinking allowlist
-is the tier-2 progress metric of the testing implementation plan.
+Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
+allowlist is the tier-2 progress metric of the testing implementation plan.
+
+Covered means running: a task counts toward its domain only when its spec is
+non-empty AND its path is an active (uncommented) entry in ci-eval-pr.sh's
+TASKS array. A spec-ready task registered commented-out -- the Phase 2
+scenarios awaiting the seeded fleet -- is progress, but it blocks nothing,
+and a domain whose only scenario is dormant is still uncovered. Without this
+distinction the allowlist would have emptied the day the specs were written,
+ten scenarios before any of them ran.
 """
 
 import pathlib
+import re
 import unittest
 
 import yaml
@@ -23,6 +32,7 @@ import yaml
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 TASKS_GLOB = "bench/tasks/*/task.yaml"
+EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 
 def load_domains():
@@ -30,16 +40,32 @@ def load_domains():
     return data["domains"], set(data.get("allowlist") or [])
 
 
+def active_task_paths():
+    """Task paths the eval script actually runs: uncommented TASKS entries."""
+    text = EVAL_SCRIPT.read_text()
+    m = re.search(r"^TASKS=\(\n(.*?)^\)$", text, re.M | re.S)
+    if not m:
+        raise AssertionError("TASKS=( ... ) array not found in hack/ci-eval-pr.sh")
+    active = set()
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if line.startswith('"') and line.endswith('"'):
+            # "./tasks/<name>/task.yaml" relative to bench/
+            active.add("bench/" + line.strip('"').lstrip("./"))
+    return active
+
+
 def covered_domains():
-    """Domain slugs claimed by a task that carries a non-empty verification_spec."""
+    """Domain slugs claimed by an ACTIVE task carrying a non-empty spec."""
+    active = active_task_paths()
     claimed = {}
     for task_file in sorted(REPO_ROOT.glob(TASKS_GLOB)):
         task = yaml.safe_load(task_file.read_text()) or {}
         domain = task.get("domain")
         if domain:
-            claimed.setdefault(domain, []).append(
-                (task_file.relative_to(REPO_ROOT).as_posix(), bool(task.get("verification_spec")))
-            )
+            rel = task_file.relative_to(REPO_ROOT).as_posix()
+            counts = bool(task.get("verification_spec")) and rel in active
+            claimed.setdefault(domain, []).append((rel, counts))
     return claimed
 
 

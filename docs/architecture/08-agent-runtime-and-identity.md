@@ -103,7 +103,7 @@ user-permission awareness).
    enforces the target agent's `AllowedUsers` before dispatch. Per-request user-scoped authorization
    (the SAR/IAM check + down-scoping) is deferred (§5).
 10. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
-    co-located multiplexer and no direct agent-to-agent messaging.
+    co-located multiplexer and no synchronous agent-to-agent messaging.
 
 ## 3. Deliberately out of scope (this is where the simplicity comes from)
 

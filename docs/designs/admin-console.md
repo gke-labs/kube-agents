@@ -8,11 +8,12 @@ Kube Agents Console is a first-party web interface for chatting with the
 kube-agents front door and explaining human-initiated and autonomous activity
 using normalized telemetry and explicit causality.
 
-The console is implemented in `admin_console/`. Setup's Connection page
-owns Google Cloud project selection, connection, disconnect, and the diagnostic
-checklist. The Observability pages read bounded live Cloud Logging and Cloud
-Trace data. Remote authentication and operator-managed deployment remain
-follow-up work.
+The console is implemented in `admin_console/`. Setup's Connection page owns
+Google Cloud project selection, connection, disconnect, and the diagnostic
+checklist. Setup's LLM Gateway page reads and updates the inference provider,
+then tests the same in-cluster path the agents use. The Observability pages read
+bounded live Cloud Logging and Cloud Trace data. Remote authentication and
+operator-managed deployment remain follow-up work.
 
 ## Product questions
 
@@ -43,14 +44,19 @@ Browser
             -> kanban read model
        -> Task Kanban inspector
             -> board, task, run, event, and delivery projections
+       -> LLM gateway service
+            -> Kubernetes Deployment, Service, ConfigMap, and Secret writes
+            -> production-path model request from a Platform Agent pod
 ```
 
 The production console should run in a separate Deployment with a dedicated
-read-only telemetry identity and a narrow, authenticated chat proxy. It must not
+read-only telemetry identity, a narrow authenticated chat proxy, and a distinct
+setup capability limited to the LiteLLM resources it manages. It must not
 receive the Platform Agent API key, operational credentials, or unrestricted
-access to the credential proxy. The current local prototype invokes a fixed
-client in the selected agent pod and uses only the operator-managed non-secret
-loopback trust sentinel.
+access to the credential proxy. The current loopback-only prototype uses the
+launcher-verified gcloud identity for its explicit setup mutations. Model API
+keys are write-only inputs patched into the Secret referenced by the live
+LiteLLM Deployment; they are never read back or retained in portal state.
 
 ## Portal API and shared chat abstraction
 
@@ -215,11 +221,46 @@ on commands and tolerated on reads to allow additive server evolution.
 GET  /healthz
 GET  /readyz
 GET  /api/v1/agents
-GET  /api/v1/agents/{agentId}
 ```
 
 Readiness checks the store and the configured upstream agent boundary without
 running a model turn. It never creates, repairs, or grants anything.
+
+The stock console has one installation identity: the Helm
+`platformAgent.name` default. `GET /api/v1/agents` discovers `PlatformAgent`
+resources from the connected target and returns only that canonical resource.
+If it is absent, discovery fails and lists the names it did find; it never uses
+the cluster, Deployment, Service, gateway container, or Hermes profile as an
+agent ID. The gateway container is separately discovered from the live pod
+spec as the container that owns the named `api` port.
+
+The public interaction and session resources retain `agentId` for stable stored
+records and URLs. Portal clients populate it from discovery rather than asking
+the user to enter or select it. Hermes routing is an independent `profile`
+field: portal chat defaults to `default`, while a direct Platform specialist
+request explicitly selects `platform`.
+
+#### LLM gateway setup
+
+```text
+GET  /api/v1/llm-gateway
+GET  /api/v1/llm-gateway/device-status
+POST /api/v1/llm-gateway/configuration
+```
+
+The status read returns live resource evidence, the provider catalog, and a
+bounded model request from a running Platform Agent
+through the in-cluster LiteLLM Service, so API-server Service proxy behavior
+cannot contradict the path agents actually use. Configuration accepts one
+catalog provider and model plus write-only credentials or provider settings.
+For repository-managed installs it applies the repository-owned Kustomize
+overlay and ensures one rollout. A Helm-owned deployment is status-only: the
+portal disables mutation and directs the operator back to Terraform or Helm.
+Vertex changes first verify the catalog-defined Google API and IAM contract.
+The API never serializes a submitted credential into command arguments,
+responses, validation errors, or portal state. Device OAuth returns the
+authorization log without waiting for readiness; a bounded status poll waits
+for the new rollout before verification.
 
 #### Start and observe an interaction
 
@@ -234,7 +275,6 @@ POST /api/v1/interactions/{interactionId}/cancel
 
 ```json
 {
-  "agentId": "platform-agent",
   "profile": "default",
   "sessionId": "portal_9c7c...",
   "input": { "text": "Design a stockout-resilient GKE cluster." },
@@ -242,9 +282,11 @@ POST /api/v1/interactions/{interactionId}/cancel
 }
 ```
 
-The caller may omit `sessionId` to create a session. The authenticated principal,
-not the body, determines user identity. The API rejects an idempotency key that
-is reused with a different body.
+The caller may omit `agentId` and `sessionId`; the service derives the canonical
+resource and creates a session. An explicitly supplied `agentId` must match the
+canonical resource. The authenticated principal, not the body, determines user
+identity. The API rejects an idempotency key that is reused with a different
+body.
 
 The response contains stable links rather than leaking the Hermes base URL:
 
@@ -419,7 +461,8 @@ and may consume the portal API only for observation and diagnostics.
 
 FastAPI owns authentication for both the UI and API:
 
-- local UI access continues to use the launcher-verified gcloud identity;
+- local UI access uses the launcher-verified gcloud identity and a random
+  launch-scoped bearer capability between the Streamlit server and FastAPI;
 - in-cluster human access uses the configured application or IAP identity;
 - automated evaluation uses a dedicated workload identity or short-lived OIDC
   token, never a shared browser cookie;
@@ -624,6 +667,13 @@ override identity or correlation fields.
   The same page shows checklist results for CLI authentication, ADC, APIs, GKE,
   agent runtime state, Logging, structured audit events, and Trace.
 - **Agentic:** Chat is the interactive surface for working with the agent.
+- **LLM Gateway:** a Setup page showing one result for the complete Platform
+  Agent → LiteLLM → provider path, the live provider and model, a catalog-driven
+  configuration form, device authorization, and default-collapsed raw command
+  evidence. Opening the page performs one bounded connection request. Refresh
+  rereads the evidence and repeats the same request as one action. After a
+  configuration change, the page waits for or monitors the rollout and replaces
+  the status with the updated connection result.
 - **Observability:** an always-visible navigation group containing Overview,
   Activity Explorer, Task Kanban, and Scheduled Cron. A shared connection gate
   replaces provider-backed content with concise connection guidance until the
@@ -685,6 +735,7 @@ remain labeled as missing instead of being filled with demo data.
 | --------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------ | ------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------- |
 | Signed-in identity                      | Active gcloud account passed by the local launcher                                                       | No     | Yes                 | Yes                      | Keep launcher verification for local use; use application-level authentication for remote deployment    |
 | Connection diagnostics                  | Bounded live checks for project, APIs, GKE, logs, audit, and Trace                                       | No     | Yes                 | Yes                      | Reuse the proven source adapters in the production telemetry provider                                   |
+| LLM gateway setup and verification      | Catalog-driven provider changes plus a bounded request through the live agent-to-gateway path            | No     | Yes                 | Yes                      | Split the production setup capability from the read-only telemetry identity                             |
 | Overview metrics                        | Aggregated from the selected live Logging and Trace snapshot                                             | No     | Yes                 | Yes                      | Add server-side aggregation for windows larger than the bounded snapshot                                |
 | Activity pulse                          | Live evidence records grouped into 15-minute buckets                                                     | No     | Yes                 | Yes                      | Add paginated historical aggregation                                                                    |
 | Human versus autonomous classification  | Trusted session and cron evidence; unsupported records remain unknown                                    | No     | Partial             | Yes                      | Create a trusted interaction and trigger record at chat, cron, event, retry, and follow-up ingress      |
@@ -774,6 +825,13 @@ present time-adjacent records as proven causality.
   does not create time-adjacent causal joins.
 - The Connection page performs bounded, read-only gcloud and Cloud Trace
   requests. It does not change APIs, IAM, or Kubernetes resources.
+- The LLM Gateway page is the explicit exception to the console's read-only
+  operational views. It may apply only repository-managed LiteLLM manifests,
+  patch the catalog or live Deployment's credential Secret, and restart that
+  Deployment. Helm ownership is a hard stop. Submitted keys travel in request
+  bodies and `kubectl` standard input, are cleared from the widget, and are not
+  persisted, echoed in validation errors, or returned. Each automatic
+  connection test may incur one provider request capped at eight output tokens.
 - The local persisted connection is not an authentication token. It contains
   account and deployment coordinates plus verification time, but no Google
   credential, chat content, or telemetry. Google Cloud CLI remains the

@@ -30,9 +30,24 @@ import (
 
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
 // overridden by user Deployment specs or injected into the credential proxy.
+//
+// Membership does two things, and both are needed: the validating webhook
+// rejects a spec.deployment.env entry with one of these names, and
+// mergeCredentialProxyEnv drops it. The webhook alone is not enough because
+// the chart's default failurePolicy is Ignore, so an unreachable webhook
+// admits the object with validation skipped; the drop is what actually holds,
+// and the rejection is what tells the operator why.
 var SensitiveEnvVars = map[string]struct{}{
 	"API_SERVER_KEY": {},
-	"HERMES_HOME":    {},
+	// Not a secret, unlike its neighbours: this is the read-only gate, and
+	// setting it to "false" disables every refusal the credential proxy makes
+	// for every command, agent and cluster in the Pod. It was already dropped
+	// silently on the way to the sidecar, which left an operator patching the
+	// CR, seeing it accepted, and getting no behaviour change and no
+	// explanation. Naming it here turns that into a field.Forbidden on
+	// spec.deployment.env[i].name.
+	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
+	"HERMES_HOME":                        {},
 }
 
 type HermesSpec struct {

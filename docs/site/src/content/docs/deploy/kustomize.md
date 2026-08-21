@@ -132,7 +132,7 @@ The `app.kubernetes.io/*` labels follow the project-wide contract that makes the
 The exposed ports:
 
 - `8642` — Hermes API server. Chat integrations and the operator health probes hit this.
-- `9119` — Hermes dashboard. Behind `harness.hermes.dashboardEnabled` in the CR.
+- `9119` — Hermes dashboard. Behind `harness.hermes.dashboardEnabled` in the CR. Nothing answers on the pod network; the listener is loopback-only — see [`PlatformAgent` CRD](/kube-agents/operator/platformagent-crd/#specharness) for how to reach it.
 
 ## Kustomize for operator integrations
 

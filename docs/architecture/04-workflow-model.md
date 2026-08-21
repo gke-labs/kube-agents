@@ -71,16 +71,16 @@ control, not just an operational convenience.
 The loop is mechanism-agnostic. kube-agents provides the intelligence and the reviewed declarative
 artifact; **it integrates with the customer's existing CI/CD and IaC rather than mandating a stack**:
 
-| Concern                        | Mechanism                                                                                      | Notes                                                                                                                                      |
-| ------------------------------ | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Shared source of truth         | **GitOps repository**                                                                          | agents propose PRs here                                                                                                                    |
-| Provisioning artifact          | **KCC YAML or Terraform HCL** (per customer requirements)                                      | the agent generates whichever format the customer standardizes on                                                                          |
-| Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …)                    | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine                           |
-| Agent lifecycle                | **kube-agents controller** (`k8s-operator/`, extended)                                         | reconciles each `Agent` CR (Hermes harness) into an isolated pod; sets per-pod SA / namespace / runtimeClass on **Scion**'s verified model |
-| Curated shared knowledge       | **OKF** (markdown+frontmatter in git)                                                          | ad-hoc wikis / tribal knowledge                                                                                                            |
-| Semantic recall                | **mem0** (Qdrant) — _deferred post-v1_                                                         | —                                                                                                                                          |
-| Session / runtime state        | **`session_db.sqlite` + `kube_agents_memory`**                                                 | —                                                                                                                                          |
-| Cross-agent coordination       | **shared state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No direct agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3)                                     |
+| Concern                        | Mechanism                                                                                       | Notes                                                                                                                                      |
+| ------------------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Shared source of truth         | **GitOps repository**                                                                           | agents propose PRs here                                                                                                                    |
+| Provisioning artifact          | **KCC YAML or Terraform HCL** (per customer requirements)                                       | the agent generates whichever format the customer standardizes on                                                                          |
+| Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …)                     | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine                           |
+| Agent lifecycle                | **kube-agents controller** (`k8s-operator/`, extended)                                          | reconciles each `Agent` CR (Hermes harness) into an isolated pod; sets per-pod SA / namespace / runtimeClass on **Scion**'s verified model |
+| Curated shared knowledge       | **OKF** (markdown+frontmatter in git)                                                           | ad-hoc wikis / tribal knowledge                                                                                                            |
+| Semantic recall                | **mem0** (Qdrant) — _deferred post-v1_                                                          | —                                                                                                                                          |
+| Session / runtime state        | **`session_db.sqlite` + `kube_agents_memory`**                                                  | —                                                                                                                                          |
+| Cross-agent coordination       | **durable state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No synchronous agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3)                                |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
 **actuation pipeline** (plus the **kube-agents controller**, whose write is limited to reconciling agent
@@ -303,7 +303,7 @@ agent is an independent, controller-reconciled pod with its own identity. Theref
 | The **Platform Agent** is down           | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope | The controller relaunches the pod                                                                  |
 | The **controller** (a cluster's) is down | No new agent reconciles in that cluster; running agent pods + workloads continue                                    | Controller restart (standard controller recovery)                                                  |
 
-**Design intent:** no cascading failure. Because tiers don't call each other at runtime for their
+**Design intent:** no cascading failure. Because no tier blocks on another at runtime for its
 core function — they're independent controller-reconciled pods bound by reviewed, merged manifests — an
 outage at one layer degrades that layer's _new_ work, not the running state of the others.
 
@@ -351,7 +351,7 @@ Every step is declarative, reviewed, attributable, and revertible.
 - Proactive, **push-driven** stewardship at every layer (event triggers first, cron for scheduled work,
   heartbeat poll only as backstop), all changes via the loop.
 - Bounded autonomous recovery; failure isolation without cascade — agents stay **decoupled**,
-  coordinating only through shared state, never via direct agent-to-agent calls
+  coordinating only through durable state, never via synchronous agent-to-agent calls
   ([02](02-agent-personas.md) §2.3).
 
 ### Non-goals

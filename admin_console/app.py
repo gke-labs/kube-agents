@@ -47,6 +47,11 @@ pages = {
             icon=":material/cable:",
             default=True,
         ),
+        st.Page(
+            APP_DIRECTORY / "pages" / "llm_gateway.py",
+            title="LLM Gateway",
+            icon=":material/model_training:",
+        ),
     ],
     "Agentic": [
         st.Page(

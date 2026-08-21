@@ -1293,10 +1293,11 @@ mkdir -p "$TARGET_DIR/logs"
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     echo "Starting Session KV server on port 8699..."
     # Bound to loopback, not 0.0.0.0. Every caller — this container's MCP
-    # server and incident_context plugin, and the event watcher in the
-    # credential-proxy container — reaches it over the shared pod network
-    # namespace, so nothing needs it published on the pod IP. It carries chat
-    # identifiers, so the narrower bind is the correct default.
+    # server, incident_context plugin, and kanban notifier (the gateway this
+    # script execs below), and the event watcher in the credential-proxy
+    # container — reaches it over the shared pod network namespace, so nothing
+    # needs it published on the pod IP. It carries chat identifiers, so the
+    # narrower bind is the correct default.
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 127.0.0.1 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 

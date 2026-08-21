@@ -58,9 +58,22 @@ type metrics struct {
 	// ceiling. Without its own counter such an event increments nothing —
 	// neither injected nor an error — and the drop is invisible.
 	eventsQuotaSuppress *prometheus.CounterVec
-	injectErrors        *prometheus.CounterVec
-	sessionCreates      *prometheus.CounterVec
-	activeIncidents     *prometheus.GaugeVec
+	// eventsPolicyFiltered is the third way an accepted event reaches nobody,
+	// and the only one of the three that is not a problem: the daemon graded
+	// it Info and recorded it for the daily recap. Separate from
+	// eventsQuotaSuppress because the dedup entry survives this one — a rate
+	// on this counter is the watcher's routine-churn volume, while any rate at
+	// all on the quota counter means alerts are being lost.
+	eventsPolicyFiltered *prometheus.CounterVec
+	// eventsPolicyReopened counts the escape hatch out of the above: a
+	// higher-severity member of the same canonical family arriving behind a
+	// policy-filtered event and re-opening the incident it was holding. A rate
+	// here is healthy — these are alerts that would otherwise have been
+	// swallowed by the family's Info member. See ReopenIfPolicyFiltered.
+	eventsPolicyReopened *prometheus.CounterVec
+	injectErrors         *prometheus.CounterVec
+	sessionCreates       *prometheus.CounterVec
+	activeIncidents      *prometheus.GaugeVec
 	// clusterDiscoveryErrors and clusterUp are the two halves of "is this
 	// cluster actually being watched". Discovery skips profiles it cannot load
 	// and counts them here; everything after discovery — the dedup cache, the
@@ -112,6 +125,14 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_events_quota_suppressed_total",
 			Help: "Total events the daemon accepted and then dropped against its per-severity daily alert ceiling. These reached nobody; the watcher rolls back the dedup entry so the next sighting is re-offered.",
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
+		eventsPolicyFiltered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_events_policy_filtered_total",
+			Help: "Total events the daemon accepted and then held back from chat as informational. These reached nobody either, but by design: they are counted in the daily recap and the dedup entry is kept, so the workload is not re-offered.",
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
+		eventsPolicyReopened: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_events_policy_reopened_total",
+			Help: "Total events that escaped deduplication because the entry holding their key was left behind by a policy-filtered event of the same canonical family. Each one is an alert that would otherwise have been silenced by an informational sibling.",
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
 			Help: "Total inject (or session-create) attempts that returned a non-2xx response or transport error.",
@@ -152,6 +173,8 @@ func newMetrics() *metrics {
 		m.eventsInjected,
 		m.eventsDedupSuppress,
 		m.eventsQuotaSuppress,
+		m.eventsPolicyFiltered,
+		m.eventsPolicyReopened,
 		m.injectErrors,
 		m.sessionCreates,
 		m.activeIncidents,

@@ -25,6 +25,15 @@ dependencies = [
 [project.entry-points."devops_bench.agents"]
 kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 
+# Same mechanism, the verifier registry: devops-bench scans this group on the
+# first unresolved verifier lookup, so a task.yaml can name these check types
+# without devops-bench ever importing this package by hand. These two read the
+# per-run transcript stash (kube_agents_bench/transcript.py), which is what
+# makes report-text and tool-trace checks possible without an upstream change.
+[project.entry-points."devops_bench.verifiers"]
+report_contains = "kube_agents_bench.verifiers:ReportContainsVerifier"
+tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
+
 # Required for the git-URL dependency pin above.
 [tool.hatch.metadata]
 allow-direct-references = true

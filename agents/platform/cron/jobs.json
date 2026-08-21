@@ -118,6 +118,21 @@
       "script": "github_scan_gate.py",
       "enabled": true,
       "deliver": "chat"
+    },
+    {
+      "id": "eod-event-watcher-daily-report",
+      "name": "Event Watcher Daily Activity Recap",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 21 * * 1-5",
+        "display": "0 21 * * 1-5"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "eod_report_generator.py",
+      "enabled": true,
+      "deliver": "chat"
     }
   ]
 }

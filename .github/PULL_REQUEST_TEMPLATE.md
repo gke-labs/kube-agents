@@ -51,6 +51,9 @@ cleaned up.
 If the change cannot reach a running installation — docs-only, a CI workflow, a path
 that needs infrastructure you do not have — write "Not live-tested" and say why.
 
+If the install is shared with other agents, take the lease first: see
+docs/designs/live-test-lease.md.
+
 Re-testing after new commits folds into this section rather than stacking a round
 beneath it: keep what still holds, and re-run or flag what the new commits invalidated.
 

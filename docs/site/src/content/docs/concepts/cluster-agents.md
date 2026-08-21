@@ -40,6 +40,8 @@ A Kubernetes event alert arrives as a card like any other. The [event watcher](h
 
 The Cluster Agent finishes it with `kanban_complete` and nothing else, passing the whole report as `result`. Every card carries a subscription to the session it was filed from, and the notifier posts a subscribed card's `result` to chat when the card turns terminal — so completing the card is the delivery, threaded under the alert it answers. What made that fail before was the address rather than the mechanism: an event session's ambient platform is `api_server`, which no chat adapter can deliver to, so the subscription was written well-formed and undeliverable and every report was produced and dropped.
 
+The report ends by inviting a reply — `To authorize: reply 'apply'`, or `apply Option B` to name one of the remediation options directly. That reply is ordinary chat ingress and lands on the Planning Agent, which did not do the investigation and cannot see the card. What makes it resolve is a row the notifier writes in the same step that posts the report, keyed to the thread it posted into: a `pre_gateway_dispatch` hook finds it and prepends the report to the user's words, so `apply Option B` reaches an agent that knows what Option B was. Acting on it is still the Platform Agent's job through `submit-suggestion` — the fix ships as a Pull Request, and nothing is written to the live cluster.
+
 ## Security posture
 
 A Cluster Agent shares the pod's identity — the same KSA and GSA, so the same enforced IAM and RBAC ceilings apply ([Security &amp; IAM](/kube-agents/reference/security-and-iam/)). The profile split is a scoping-down inside those ceilings: fewer MCP servers, no write skills, one pinned cluster context.

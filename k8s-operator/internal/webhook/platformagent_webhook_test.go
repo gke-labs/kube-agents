@@ -224,6 +224,43 @@ func TestPlatformAgentValidation(t *testing.T) {
 		assertFieldError(t, err, "spec.deployment.env[0].name")
 	})
 
+	// The read-only gate is reserved by mergeCredentialProxyEnv, which drops it
+	// silently -- an accepted CR, a reconciled Deployment, and no behaviour
+	// change. Rejecting it here is what tells the operator why, so the drop and
+	// this refusal are one control with two halves; see SensitiveEnvVars.
+	t.Run("fails if the credential proxy read-only gate is overridden", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		for _, value := range []string{"false", "true"} {
+			t.Run(value, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-agent",
+						Namespace: "default",
+					},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{
+							Deployment: &agentv1alpha1.DeploymentSpec{
+								Env: []corev1.EnvVar{
+									{Name: "CREDENTIAL_PROXY_ENFORCE_READ_ONLY", Value: value},
+								},
+							},
+						},
+					},
+				}
+
+				// Rejected whatever the value: an operator-set "true" is
+				// indistinguishable from the reservation having failed, and
+				// accepting it would teach the habit that the name is settable.
+				_, err := val.ValidateCreate(ctx, agent)
+				assertFieldError(t, err, "spec.deployment.env[0].name")
+
+				_, err = val.ValidateUpdate(ctx, agent, agent)
+				assertFieldError(t, err, "spec.deployment.env[0].name")
+			})
+		}
+	})
+
 	t.Run("fails if HERMES_HOME environment variable is overridden", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 

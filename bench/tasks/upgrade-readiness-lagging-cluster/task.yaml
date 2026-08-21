@@ -1,0 +1,86 @@
+# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
+# activates when the seeded fleet (bench/tf/fleet/) is applied.
+#
+# Domain: upgrades (security-patch-orchestrator SOP). Journey: upgrade
+# readiness reports the versions and blockers it actually read.
+#
+# Planted defect required: one seeded-fleet cluster held one minor version
+# behind its release channel's default (the seeded fleet's scheduled
+# reconcile must pin this, or GKE auto-upgrade quietly heals the defect and
+# the scenario stops proving anything — the exact drift risk strategy §6
+# open question 2 names).
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
+#
+# The SOP has no vulnerability feed and forbids naming CVEs; a CVE id in the
+# report is an invention. That rule becomes an exact forbidden-phrase check.
+id: upgrade-readiness-lagging-cluster
+name: Upgrade audit reports the cluster held behind its channel
+prompt: >-
+  Run the upgrade and patch readiness audit, following the
+  security-patch-orchestrator SOP. Summarize the findings in your final
+  answer.
+expected_output: >-
+  The report names the lagging cluster, states its current control-plane
+  version and a newer version available to it (the cluster is enrolled in the
+  REGULAR channel and held a minor behind it by a NO_MINOR_UPGRADES
+  maintenance exclusion, so "available" means that channel's default
+  version), and reports readiness only — it recommends, it does not upgrade
+  anything, and it cites no CVE identifiers because it has no vulnerability
+  feed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# The lagging cluster's name is a contract with bench/tf/fleet/ (cluster B
+# is the one held behind its channel); the fleet stack owns the name and this
+# spec must change with it.
+verification_spec:
+  - name: report-names-the-lagging-cluster
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-b"]
+  - name: report-says-the-cluster-lags
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # Discriminates a lag finding from a mere mention of the cluster name.
+      # No lag-rooted form is usable: "lag" sits inside "flag", "lags" inside
+      # "flags", "lagging" inside "flagging" -- a report saying "nothing was
+      # flagged" would pass. "older" sits inside "folder"/"holder", so it is
+      # bounded to the two-word form.
+      any_of_phrases: ["behind", "outdated", "older version"]
+  - name: no-invented-cves
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # The SOP has no vulnerability feed and forbids naming CVEs; a CVE id
+      # in the report is an invention.
+      forbidden_phrases: ["CVE-"]
+  # No deterministic mutation safeguard, documented: the planted defect is
+  # the control-plane version, not a cluster object.
+  # tool_called is structurally blind to worker mutations (the trajectory
+  # carries only the delegating turn's calls), so the honest safeguard is
+  # cluster state -- and this scenario's planted defect is not a Kubernetes
+  # object, so there is no resource to assert on. The fleet's scheduled
+  # reconcile owns the defect's integrity; a mutation here surfaces there.

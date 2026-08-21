@@ -10,6 +10,7 @@
     "name": "Platform administrator",
     "userRole": "Platform Administrator",
     "description": "Designs and operates GKE infrastructure.",
+    "credentialEnv": "KUBE_AGENTS_PORTAL_API_TOKEN",
     "approvalPolicy": "deny"
   },
   "scenario": {

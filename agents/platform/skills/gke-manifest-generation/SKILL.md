@@ -203,8 +203,13 @@ hallucinations and optimize configurations:
           --model-server={server_name} \
           --accelerator-type={accelerator_type} \
           --output=manifest \
-          --output-path={output_file_path}
+          > {output_file_path}
         ```
+
+        Redirect stdout rather than passing `--output-path`: `gcloud` runs in
+        the credential proxy's container, so that flag writes the manifest
+        next to the credentials instead of in your workspace, and the proxy
+        refuses it.
 
     -   *Constraint*: You must include all resources returned by this command
         (Deployments, Services, PodMonitoring, etc.) without filtering.

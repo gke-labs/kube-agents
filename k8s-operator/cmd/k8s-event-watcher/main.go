@@ -562,6 +562,77 @@ func dedupPersistPath(base, cluster string) string {
 	return strings.TrimSuffix(base, ext) + "-" + cluster + ext
 }
 
+const eventTypeWarning = "Warning"
+
+// daemonWouldAlert reports whether session_kv_server would grade an event of
+// this Event.Type above Info — that is, post it to chat rather than record it
+// for the daily recap.
+//
+// Two lines decide that, and reading only the second gets it wrong.
+// inject_message coerces the type before grading it:
+//
+//	event_type = payload.get("type") or "Warning"
+//	... event_lower == "warning" ? Warning/Critical : Info
+//
+// So an absent or empty type is graded *Warning*, not Info. `InjectPayload.Type`
+// carries no omitempty, so an empty Go string reaches the daemon as `"type": ""`,
+// which is falsy in Python and takes that coercion. get_severity_details read on
+// its own says the opposite, and a guard written against it alone withholds the
+// reopen from an event the daemon goes on to alert on — the silence this whole
+// path exists to prevent.
+//
+// EqualFold because the daemon lowercases before comparing. One function so the
+// rule has one home: the fake daemon in dispatcher_test.go is written against
+// these same two lines, and a fixture that mirrors the wrong one turns a
+// regression into a passing test.
+func daemonWouldAlert(eventType string) bool {
+	return eventType == "" || strings.EqualFold(eventType, eventTypeWarning)
+}
+
+// reopenPolicyFiltered reports whether a deduplicated event should escape
+// suppression because the entry holding its key was left behind by an event the
+// daemon policy-filtered. Only an event the daemon would alert on gets that
+// chance.
+//
+// Admitting anything wider spends a budget that does not come back. The reopen
+// is bounded at one firing per window by the sticky Reopened flag, so an event
+// this guard admits and the daemon then grades Info takes the family's only
+// reopen and returns an entry that no later Warning can reopen, while Observe's
+// Case 3 slides LastSeen on every sighting so it never expires either. Barring
+// only a literal "Normal" admitted exactly those events: an empty or lowercase
+// Type passed and came back Info. Hence daemonWouldAlert rather than a test
+// against one string.
+//
+// The mirror is not load-bearing on its own. Grading lives in another language
+// on another image and can drift, so MarkPolicyFiltered drops a reopened entry
+// whose own inject comes back filtered rather than leaving it held — the next
+// sighting then opens a fresh incident instead of the family going quiet.
+//
+// The dedupResult it returns is the one the caller must go on to inject with,
+// and it counts from 1 like any other new incident. The result Observe handed
+// back describes the entry that has just been replaced: its Count is every
+// sighting in the canonical family, almost all of which reached nobody. Putting
+// that number on the wire would write it to `occurrences` in the ledger, and
+// the recap sums that column to report how many events were forwarded.
+func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupResult, bool) {
+	// An informer rotation re-delivers events whose LastTimestamp has not
+	// moved. Alerting on one costs a stale page and the family's one firing;
+	// an ongoing failure reopens on its next real sighting instead.
+	if replay {
+		return dedupResult{}, false
+	}
+	if !daemonWouldAlert(ev.Type) {
+		return dedupResult{}, false
+	}
+	if !d.dedup.ReopenIfPolicyFiltered(ev.Key, ev.Message, ev.LastSeen) {
+		return dedupResult{}, false
+	}
+	d.metrics.eventsPolicyReopened.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+	log.Printf("reopening %s pod=%s/%s — type=%q outranks the policy-filtered event holding its dedup key",
+		ev.Key.Reason, ev.Namespace, ev.Name, ev.Type)
+	return dedupResult{Kind: dedupNewIncident, Count: 1}, true
+}
+
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
@@ -587,10 +658,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
 	d.metrics.activeIncidents.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
-		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
-		log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
-			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
-		return
+		reopened, ok := d.reopenPolicyFiltered(ev, result.Replay)
+		if !ok {
+			d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+			log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
+				ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
+			return
+		}
+		// Overwritten, not merged: the entry this event now owns was created
+		// by the reopen and counts from 1, and everything downstream of the
+		// payload treats Count as the number of sightings this row stands for.
+		result = reopened
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
 	sid := d.targetSid
@@ -651,6 +729,24 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.dedup.Forget(ev.Key, ev.Message)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
+		return
+	}
+	if status == injectStatusFiltered {
+		// 2xx, and nobody was told — but by policy rather than by
+		// exhaustion, so the dedup entry stays. The daemon graded the
+		// event Info and will report it as a count in the daily recap.
+		// Nothing about the next sighting would grade differently, so
+		// rolling back here would re-offer the same routine churn every
+		// time the workload re-emits, each round trip costing a session
+		// row and a ledger row for an alert nobody was ever going to get.
+		//
+		// Flagged rather than merely kept, because the key it holds belongs
+		// to a whole canonical family and the rest of that family may well
+		// grade Warning. See dedupCache.ReopenIfPolicyFiltered.
+		d.dedup.MarkPolicyFiltered(ev.Key, ev.Message)
+		d.metrics.eventsPolicyFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("policy-filtered %s pod=%s/%s (sid=%s) — daemon graded it Info; counted in the daily recap",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
 	if status == injectStatusSuppressed {
