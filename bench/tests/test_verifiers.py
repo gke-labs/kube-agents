@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
@@ -887,3 +888,72 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
     assert ids == set(verifiers.LEDGER_AUDIT_IDS)
     literal = LedgerIssueContainsVerifier.model_fields["audit"].annotation
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
+
+
+def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
+    """A positive body-scoped phrase must not be a substring of any check slug.
+
+    `render_issue_body` always appends `_render_check_evidence`, a
+    {cluster, check, command} table built from `scope.clusters[].checks_run` --
+    a field validation *requires* on every cluster. So every roster slug the
+    run declared is in the ledger body whether or not the run filed a single
+    finding, and `ledger_issue_contains` lowercases both sides and takes a bare
+    substring. A phrase that is a substring of a slug therefore scores a run
+    that swept the fleet and found nothing: partial credit for a clean sweep.
+
+    This is not hypothetical and it is not a rule the task specs can be trusted
+    to keep by eye. Four objectives shipped with it -- "pdb" inside `no-pdb`,
+    "behind" inside `master-behind`, "cluster-admin" inside
+    `cluster-admin-binding`, and "authorized-networks" which is a drift slug
+    verbatim. Three of the four had a comment reasoning carefully about English
+    substring collisions ("lag" inside "flag"), because they were written for
+    the old `report_contains` surface, where the chat reply carried no table.
+    The move to the ledger body invalidated the reasoning, not the phrases.
+
+    The fix in each case was `scope: finding_ids`: ids come from
+    `derive_finding_id` as "<check>.<cluster>.<namespace>.<object>", so a slug
+    appears only if a finding was FILED under that check, and `_shorten_id`
+    trims the longest segment and never the leading check slug. Hence the
+    exemption below -- under that scope the collision is the intended semantic.
+    """
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    slugs = set(
+        re.findall(r'^\s+"([a-z0-9]+(?:-[a-z0-9]+)+)",\s*$', script.read_text(), re.M)
+    )
+    assert len(slugs) > 50, len(slugs)  # the parse must not silently find nothing
+
+    tasks = sorted((Path(__file__).resolve().parents[1] / "tasks").glob("*/task.yaml"))
+    assert tasks, "no task specs found"
+
+    graded = 0
+    offenders = []
+    for path in tasks:
+        spec = yaml.safe_load(path.read_text())
+        for entry in spec.get("verification_spec") or []:
+            check = entry.get("check") or {}
+            if check.get("type") != "ledger_issue_contains":
+                continue
+            # finding_ids is the fix, not the bug: there a slug means a filed
+            # finding. forbidden_phrases invert the direction -- a slug
+            # collision there fails a good run, which is a different defect
+            # and is not what this test is about.
+            if check.get("scope", "body") == "finding_ids":
+                continue
+            graded += 1
+            phrases = (check.get("required_phrases") or []) + (
+                check.get("any_of_phrases") or []
+            )
+            for phrase in phrases:
+                hits = sorted(s for s in slugs if phrase.lower() in s)
+                if hits:
+                    offenders.append(
+                        f"{path.parent.name}/{entry.get('name')}: {phrase!r} is a "
+                        f"substring of roster slug(s) {hits}, so the check-evidence "
+                        f"table satisfies it on a run that filed nothing. Use "
+                        f"scope: finding_ids, or pick a phrase no slug contains."
+                    )
+    assert graded, "no body-scoped ledger checks parsed -- the sweep found nothing"
+    assert not offenders, "\n".join(offenders)

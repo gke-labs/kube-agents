@@ -74,15 +74,40 @@ verification_spec:
       audit: obtainability-audit
       scope: finding_ids
       required_phrases: ["checkout-gateway"]
-  - name: ledger-names-the-missing-budget
+  - name: a-pdb-check-finding-was-filed
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: obtainability-audit
-      # Either the object kind or its universal abbreviation. Body scope: this
-      # is the explanation, which lives in the prose and not in an id.
-      any_of_phrases: ["PodDisruptionBudget", "PDB"]
+      # scope: finding_ids, for the same reason as the check above, and the
+      # reason is NOT the one the previous body-scoped version gave. This was
+      # any_of_phrases: ["PodDisruptionBudget", "PDB"] against the body, on the
+      # theory that the explanation lives in prose. It does -- but so does
+      # `_render_check_evidence`, the per-cluster {check, command} table
+      # `render_issue_body` appends to every ledger. `checks_run` is required
+      # on every cluster, so a run that swept the fleet and filed NOTHING
+      # still publishes a row reading `| seeded-reliability | no-pdb | ... |`,
+      # and the verifier lowercases both sides and takes a bare substring:
+      # "pdb" is inside "no-pdb". The objective scored a clean sweep.
+      #
+      # The roster slug is the discriminator instead. `derive_finding_id`
+      # composes "<check>.<cluster>.<namespace>.<object>", so a slug reaches
+      # the delta block only if a finding was FILED under that check, and
+      # `_shorten_id` trims the longest segment and never the leading check
+      # slug -- the phrase cannot be truncated away. Both roster spellings are
+      # accepted: the planted defect is an absent budget (`no-pdb`), but an
+      # audit that reads it as present-and-ineffective files `blocking-pdb`,
+      # and that is the same problem correctly identified.
+      #
+      # Residual, stated rather than papered over: this scores a PDB finding
+      # anywhere in the fleet, and the sibling check above scores a finding
+      # anywhere on checkout-gateway. Nothing binds them into one finding.
+      # Binding them would mean asserting "no-pdb.<cluster>.<namespace>." as a
+      # prefix, and the namespace segment is fixture detail this spec does not
+      # own -- a wrong guess fails a correct run, which is the worse error.
+      scope: finding_ids
+      any_of_phrases: ["no-pdb", "blocking-pdb"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (the trajectory carries only the
   # delegating turn's calls), so read-only is asserted against the cluster

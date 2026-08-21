@@ -70,18 +70,39 @@ verification_spec:
       audit: security-patch-orchestrator
       scope: finding_ids
       required_phrases: ["seeded-b"]
-  - name: ledger-says-the-cluster-lags
+  - name: a-master-behind-finding-was-filed
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: security-patch-orchestrator
-      # Discriminates a lag finding from a mere mention of the cluster name.
-      # No lag-rooted form is usable: "lag" sits inside "flag", "lags" inside
-      # "flags", "lagging" inside "flagging" -- a report saying "nothing was
-      # flagged" would pass. "older" sits inside "folder"/"holder", so it is
-      # bounded to the two-word form.
-      any_of_phrases: ["behind", "outdated", "older version"]
+      # scope: finding_ids, and the substring reasoning the body-scoped
+      # version carried was answering the wrong question. It was
+      # any_of_phrases: ["behind", "outdated", "older version"], with a comment
+      # ruling out every lag-rooted form because "lag" sits inside "flag" and
+      # "older" inside "folder". Sound as far as it goes -- but it reasons
+      # about the agent's prose, and the ledger body is not only the agent's
+      # prose. `render_issue_body` always appends `_render_check_evidence`, a
+      # {cluster, check, command} table over the required `checks_run`, and
+      # this stream's roster opens with `master-behind`. So "behind" is on
+      # every published ledger in this stream, including one from a run that
+      # read the fleet's versions and faulted nobody. The collision the
+      # comment was hunting was real; it was just not the one that fires.
+      #
+      # The roster slug is the discriminator instead. `derive_finding_id`
+      # composes "<check>.<cluster>.<namespace>.<object>", so `master-behind`
+      # reaches the delta block only if a finding was FILED under that check,
+      # and `_shorten_id` trims the longest segment and never the leading
+      # check slug -- the phrase cannot be truncated away.
+      #
+      # Residual, stated rather than papered over: this scores a master-behind
+      # finding against any cluster, and the sibling check above scores a
+      # finding of any check against seeded-b. Nothing binds them into one
+      # finding. "master-behind.seeded-b" would bind them, but the cluster
+      # segment is exactly what `_shorten_id` is free to trim, so a long
+      # fixture name would fail a correct run.
+      scope: finding_ids
+      required_phrases: ["master-behind"]
   - name: no-invented-cves
     role: objective
     mode: assert

@@ -80,7 +80,7 @@ verification_spec:
       # for the wrong reason. Forbidding it removes the collision structurally
       # (the verifier has no proximity semantics).
       forbidden_phrases: ["seeded-capacity"]
-  - name: ledger-names-the-drift-facet
+  - name: an-authorized-networks-finding-was-filed
     role: objective
     mode: assert
     check:
@@ -89,13 +89,29 @@ verification_spec:
       # Binds the finding to the planted difference (master authorized
       # networks: a and b carry an open-for-eval block, c has none -- c is
       # the outlier), so naming the right cluster for the wrong reason does
-      # not score.
-      any_of_phrases:
-        [
-          "authorized networks",
-          "masterAuthorizedNetworks",
-          "authorized-networks",
-        ]
+      # not score. That was the intent of the body-scoped version too, and on
+      # the body it bound to nothing. `render_issue_body` always appends
+      # `_render_check_evidence`, a {cluster, check, command} table over the
+      # required `checks_run`, and "authorized-networks" is not merely a
+      # substring of this stream's roster -- it IS a roster slug, verbatim.
+      # A run that swept the fleet and filed nothing published the phrase in
+      # its own evidence table and scored the objective. This was the worst of
+      # the three body-scoped collisions: no near-miss, an exact match.
+      #
+      # scope: finding_ids fixes it the same way the check above is fixed.
+      # `derive_finding_id` composes "<check>.<cluster>.<namespace>.<object>",
+      # so the slug reaches the delta block only if a finding was FILED under
+      # that check, and `_shorten_id` trims the longest segment and never the
+      # leading check slug -- the phrase cannot be truncated away.
+      #
+      # The two prose spellings are dropped rather than kept as alternatives.
+      # Ids are squeezed to [a-z0-9-] by `_id_segment`, so neither "authorized
+      # networks" nor "masterAuthorizedNetworks" can ever appear in one; as
+      # any_of alternatives under this scope they would be dead branches
+      # implying a prose fallback that does not exist. The slug is the only
+      # spelling this scope can see, and it is the reliable one.
+      scope: finding_ids
+      required_phrases: ["authorized-networks"]
   # No deterministic mutation safeguard, documented: the planted defect is a
   # GKE master authorized-networks facet, not a cluster object.
   # tool_called is structurally blind to worker mutations (the trajectory
