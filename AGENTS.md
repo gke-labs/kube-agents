@@ -174,6 +174,13 @@ resolve, identifiers match their source, every Markdown document has an entry in
 map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context budget
 (`scripts/check_context_budget.py`) — the same five checks CI runs.
 
+## Contributing as an agent
+
+If you are an agent collaborating on issues and pushing PRs, also read
+[`agents/contributor/AGENTS.md`](agents/contributor/AGENTS.md). It defines the
+agent-to-agent loop (claiming, escalating, and the review you'll receive) on
+top of the PR hygiene and `kube-agents-bot` contract in this file.
+
 ## Pull Request Hygiene
 
 - Keep changes scoped to the request.
