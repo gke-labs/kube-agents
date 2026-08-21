@@ -129,9 +129,11 @@ def _reply_text(report, user_text):
     which is what lets this hop be blunter than the relay turn, where the same
     text is composed into a message the user reads.
 
-    Deliberately not "k8s incident report". The `incidents` table has two writers
-    -- the event watcher, which does store incidents, and the cron report relay,
-    which stores a scheduled report from a job where nothing broke. Naming the
+    Deliberately not "k8s incident report". The `incidents` table has three
+    writers -- the kanban notifier, which stores the event-triage report it just
+    delivered into a thread; `send_notification`, when a Platform Agent posts
+    into one; and the cron report relay, which stores a scheduled report from a
+    job where nothing broke. Two of the three are not incidents. Naming the
     wrong one costs a real answer: told a smoke-test report was an incident, the
     agent opened its reply by correcting the framing ("It's not an incident report
     - nothing broke") before answering what was asked. The table name is history;
@@ -236,10 +238,25 @@ def _index_text(reports, text):
     for CLEANUP_TTL_DAYS, and because this block is unfenced -- there is no
     `<untrusted_report>` wrapper here to close, only the user's own words to be
     mistaken for.
+
+    Neither the fallback label nor the preamble says "scheduled" any more. Only
+    one of the table's three writers is the cron relay, and it is the only one
+    that supplies a label at all -- so every row that reaches the fallback is by
+    definition not a scheduled report. That was already true of
+    `send_notification`'s rows and rare; the kanban notifier's event-triage rows
+    make it the common case. The cost of the wrong word is on record: told a
+    smoke-test report was an incident, the agent spent its opening line
+    correcting the framing (see `_reply_text`). Told an incident is a scheduled
+    report, it has the same reason to argue instead of answering.
+
+    Labelling those rows properly is a different change. `job_id`, `title` and
+    `profile` are cron's shape and come from `session_metadata`, which the
+    notifier does not write -- so naming a triage row means giving the index a
+    second vocabulary rather than editing a sentence.
     """
     lines = []
     for report in reports:
-        label = _neutralize(report.get("job_id") or "") or "scheduled report"
+        label = _neutralize(report.get("job_id") or "") or "report"
         title = _neutralize(report.get("title") or "")
         if title and title != label:
             label = f'{label} "{title}"'
@@ -253,7 +270,7 @@ def _index_text(reports, text):
             label = f"{label} - {when} UTC"
         lines.append(f"- {label}")
     return (
-        "[No report is attached to this message. Scheduled reports posted in this "
+        "[No report is attached to this message. Reports posted in this "
         "space recently, most recent first. You do NOT have their contents. If the "
         "user is asking about one of these, ask which one they mean - do not answer "
         "from memory, and do not guess.]\n"

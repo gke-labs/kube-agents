@@ -11,7 +11,10 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 
 import ast
 import contextlib
+import json
 import logging
+import os
+import re
 import sys
 import tempfile
 import types
@@ -21,11 +24,13 @@ from unittest import mock
 
 from apply_kanban_notifier import (
     HANDOFF_ANCHOR,
+    INCIDENT_CALL,
     MARKER_CALL,
     RELATIVE,
     WAKE_ANCHOR,
     apply,
 )
+from apply_kanban_progress_lines import SEND_ANCHOR, SEND_PATCHED
 from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
     DEFAULT_WAKE_KINDS,
@@ -35,16 +40,22 @@ from kanban_notifier import (
     SEPARATOR,
     UNSTRUCTURED_MIN_CHARS,
     _warned_config,
+    actionable_report,
     completion_note,
     creator_session_key,
     handoff_with_result,
     note_suppressed_completion,
     resolve_wake_kinds,
     result_block,
+    store_incident_report,
     suppressed_kinds,
     unstructured_result,
     wake_kinds_for,
 )
+
+#: Read as text rather than imported: ``verify_kanban_notifier.py`` runs at the
+#: top level against a patched ``/opt/hermes`` and cannot be imported here.
+VERIFIER_SOURCE = (Path(__file__).parent / "verify_kanban_notifier.py").read_text()
 
 # The status line the incident actually delivered, and the catalogue it should
 # have carried with it.
@@ -1079,6 +1090,267 @@ class CreatorSessionKeyTest(unittest.TestCase):
 
 
 # =============================================================================
+# Storing the report for the reply
+# =============================================================================
+
+#: What a Cluster Agent completes an event-triage card with — the shape
+#: `session_kv_server._triage_task_body` asks for, abridged.
+TRIAGE_REPORT = """\
+## What's wrong
+
+The `checkout` deployment cannot schedule: every replica is Pending.
+
+## Why
+
+- The pod requests 8Gi and every node in `default-pool` has 4Gi allocatable
+  (`kubectl describe node` → `Allocatable: memory: 3910Mi`).
+
+## What to do
+
+- **Option A (Right-size the request):** drop `resources.requests.memory` to 2Gi.
+- **Option B (Add a larger node pool):** create an `e2-standard-8` pool.
+- ✅ **Recommended: Option A** — no new capacity to pay for or drain later.
+"""
+
+#: The other common completion: a card that did its job and has nothing to
+#: apply. Storing this would shadow a real report in the same thread for the
+#: whole of CLEANUP_TTL_DAYS, because POST /v1/incidents keeps the first row.
+STATUS_ONLY_RESULT = "Checked all 14 clusters. No configuration drift found."
+
+
+def sub_with_thread(chat_id="D0BKGRBM6RH", thread_id="1786216044.637229"):
+    """A subscription row after kanban_event_routing substituted a chat route."""
+    return {"task_id": "t_a8f58a2a", "chat_id": chat_id, "thread_id": thread_id}
+
+
+@contextlib.contextmanager
+def captured_post(fail=None):
+    """Intercept the loopback POST and collect the urllib Requests it made."""
+    posted = []
+
+    def _urlopen(request, timeout=None):
+        posted.append(request)
+        if fail is not None:
+            raise fail
+        return contextlib.nullcontext()
+
+    with mock.patch("kanban_notifier.urllib.request.urlopen", _urlopen):
+        yield posted
+
+
+def posted_body(request):
+    return json.loads(request.data.decode())
+
+
+class ActionableReportTest(unittest.TestCase):
+    """The gate on which completions get an `incidents` row."""
+
+    def test_a_triage_report_is_actionable(self):
+        self.assertTrue(actionable_report(TRIAGE_REPORT))
+
+    def test_a_status_line_is_not(self):
+        # The failure this gate exists for. INSERT OR IGNORE keeps the first
+        # report per thread, so a status line stored here is not a wasted row —
+        # it is the row a later real report cannot replace.
+        self.assertFalse(actionable_report(STATUS_ONLY_RESULT))
+
+    def test_a_single_option_report_is_actionable(self):
+        # The template drops the Recommended line when there is only one sound
+        # fix. "apply Option A" still means something, so the row is still owed.
+        self.assertTrue(
+            actionable_report(
+                "## What to do\n\n- **Option A (Bump the limit):** raise it to 2Gi.\n"
+            )
+        )
+
+    def test_the_heading_alone_is_not_enough(self):
+        self.assertFalse(actionable_report("## What to do\n\n- Restart the pod.\n"))
+
+    def test_an_option_named_above_the_heading_does_not_count(self):
+        # A report whose "What to do" holds only unlettered bullets, but which
+        # quotes an earlier report's Option A further up. Searching the whole
+        # body would take the thread's one INSERT OR IGNORE slot on a report
+        # with nothing to apply, and hold it against the one that has.
+        self.assertFalse(
+            actionable_report(
+                "## Why\n\nThe fix applied as Option A last week has regressed.\n\n"
+                "## What to do\n\n- Escalate to the service owner.\n"
+            )
+        )
+
+    def test_the_word_option_in_prose_is_not_a_label(self):
+        # Lowercase, and no heading: an ordinary sentence, not a labelled bullet.
+        self.assertFalse(
+            actionable_report("There is no good option here; escalate to the owner.")
+        )
+
+    def test_an_empty_or_missing_result_is_not_actionable(self):
+        for result in (None, "", "   ", 0):
+            self.assertFalse(actionable_report(result), result)
+
+
+class StoreIncidentReportTest(unittest.TestCase):
+    def test_a_completed_triage_report_is_stored_against_its_thread(self):
+        with captured_post() as posted:
+            self.assertTrue(
+                store_incident_report(
+                    Event("completed"),_Task(TRIAGE_REPORT), sub_with_thread()
+                )
+            )
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0].full_url, "http://127.0.0.1:8699/v1/incidents")
+        self.assertEqual(posted[0].get_method(), "POST")
+        body = posted_body(posted[0])
+        self.assertEqual(body["chat_id"], "D0BKGRBM6RH")
+        self.assertEqual(body["thread_id"], "1786216044.637229")
+        # The whole report, not the status line: "apply Option B" has to resolve
+        # to the option, and the option is three quarters of the way down.
+        self.assertIn("Option B (Add a larger node pool)", body["report"])
+
+    def test_the_api_key_is_sent(self):
+        # Every /v1/incidents route is authenticated. Without the header the
+        # POST is a 401 that this function would swallow as a warning, and the
+        # row would never exist — the exact failure being fixed, one layer over.
+        with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": "s3cret"}):
+            with captured_post() as posted:
+                store_incident_report(
+                    Event("completed"),_Task(TRIAGE_REPORT), sub_with_thread()
+                )
+        self.assertEqual(posted[0].get_header("Authorization"), "Bearer s3cret")
+
+    def test_a_status_only_card_stores_nothing(self):
+        with captured_post() as posted:
+            self.assertFalse(
+                store_incident_report(
+                    Event("completed"),_Task(STATUS_ONLY_RESULT), sub_with_thread()
+                )
+            )
+        self.assertEqual(posted, [])
+
+    def test_a_status_only_card_does_not_warn(self):
+        # Most cards look like this. A warning here would put a line in the log
+        # for every ordinary completion on every board.
+        with captured_post():
+            with self.assertLogs("gateway.run", level=logging.DEBUG) as captured:
+                store_incident_report(
+                    Event("completed"),_Task(STATUS_ONLY_RESULT), sub_with_thread()
+                )
+        self.assertEqual([r.levelno for r in captured.records], [logging.DEBUG])
+
+    def test_a_non_terminal_or_failed_card_stores_nothing(self):
+        for kind in ("commented", "crashed", "gave_up", "timed_out", "blocked"):
+            with captured_post() as posted:
+                self.assertFalse(
+                    store_incident_report(
+                        Event(kind), _Task(TRIAGE_REPORT), sub_with_thread()
+                    ),
+                    kind,
+                )
+            self.assertEqual(posted, [], kind)
+
+    def test_the_commented_event_of_a_completed_delivery_stores_nothing(self):
+        # The call site runs once per event, inside `for ev in d["events"]:`.
+        # A delivery bundling [commented, completed] reaches this function
+        # twice; only the second one has sent the report. Deciding from the
+        # delivery's whole kind set would store the row on the first pass,
+        # before the report the row claims the reader has was posted.
+        with captured_post() as posted:
+            self.assertFalse(
+                store_incident_report(
+                    Event("commented"), _Task(TRIAGE_REPORT), sub_with_thread()
+                )
+            )
+        self.assertEqual(posted, [])
+
+    def test_a_wake_only_subscription_stores_nothing(self):
+        # delivery_mode="wake" wakes the agent and posts nothing in the thread.
+        # There is no delivered report to reply to, and a row written anyway
+        # would prepend a report the user never saw to their next message for
+        # the whole of the table's retention window.
+        with captured_post() as posted:
+            with self.assertLogs("gateway.run", level=logging.DEBUG) as captured:
+                self.assertFalse(
+                    store_incident_report(
+                        Event("completed"),
+                        _Task(TRIAGE_REPORT),
+                        sub_with_thread(),
+                        posted=False,
+                    )
+                )
+        self.assertEqual(posted, [])
+        self.assertEqual([r.levelno for r in captured.records], [logging.DEBUG])
+
+    def test_an_unthreaded_delivery_warns(self):
+        # The by-thread lookup is keyed on both halves, so a report delivered to
+        # the channel body can never be found again. Failing open is right;
+        # failing open silently is the bug this whole change is about.
+        with captured_post() as posted:
+            with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+                self.assertFalse(
+                    store_incident_report(
+                        Event("completed"),
+                        _Task(TRIAGE_REPORT),
+                        sub_with_thread(thread_id=""),
+                    )
+                )
+        self.assertEqual(posted, [])
+        self.assertIn("t_a8f58a2a", captured.output[0])
+
+    def test_a_failed_post_warns_and_does_not_raise(self):
+        # An exception escaping here reaches the notifier tick, which rewinds
+        # the cursor and re-posts a report the user has already read.
+        with captured_post(fail=OSError("connection refused")) as posted:
+            with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+                self.assertFalse(
+                    store_incident_report(
+                        Event("completed"),_Task(TRIAGE_REPORT), sub_with_thread()
+                    )
+                )
+        self.assertEqual(len(posted), 1)
+        self.assertIn("t_a8f58a2a", captured.output[0])
+        self.assertIn("1786216044.637229", captured.output[0])
+
+    def test_a_hostile_task_object_does_not_raise(self):
+        class Exploding:
+            @property
+            def result(self):
+                raise RuntimeError("no result for you")
+
+        with captured_post() as posted:
+            with self.assertLogs("gateway.run", level=logging.WARNING):
+                self.assertFalse(
+                    store_incident_report(
+                        Event("completed"),Exploding(), sub_with_thread()
+                    )
+                )
+        self.assertEqual(posted, [])
+
+    def test_a_missing_task_or_subscription_does_not_raise(self):
+        with captured_post() as posted:
+            self.assertFalse(store_incident_report(Event("completed"), None, None))
+        self.assertEqual(posted, [])
+
+    def test_an_oversized_report_is_stored_at_the_delivered_length(self):
+        # Storing more than the reader was shown would let the agent answer
+        # about options that never reached the thread.
+        body = TRIAGE_REPORT + "\n" + ("filler line\n" * 5000)
+        self.assertGreater(len(body), RESULT_LIMIT)
+        with captured_post() as posted:
+            store_incident_report(Event("completed"), _Task(body), sub_with_thread())
+        self.assertLessEqual(len(posted_body(posted[0])["report"]), RESULT_LIMIT)
+
+    def test_a_stored_report_says_so_at_info(self):
+        # The only positive evidence in the log that turn ② is reachable.
+        with captured_post():
+            with self.assertLogs("gateway.run", level=logging.INFO) as captured:
+                store_incident_report(
+                    Event("completed"),_Task(TRIAGE_REPORT), sub_with_thread()
+                )
+        self.assertEqual([r.levelno for r in captured.records], [logging.INFO])
+        self.assertIn("t_a8f58a2a", captured.output[0])
+
+
+# =============================================================================
 # The applier
 # =============================================================================
 
@@ -1192,12 +1464,14 @@ class ApplyTest(unittest.TestCase):
         patched = patch_tree(UPSTREAM_WATCHERS)
         self.assertNotIn("handoff +=", patched)
 
-    def test_one_import_trailer_carries_all_three_names(self):
+    def test_one_import_trailer_carries_every_name(self):
         patched = patch_tree(UPSTREAM_WATCHERS)
         self.assertIn("from gateway.kanban_notifier import", patched)
         for name in (
             "clip_handoff as _clip_handoff",
             "handoff_with_result as _kanban_handoff_with_result",
+            "note_suppressed_completion as _kanban_note_suppressed",
+            "store_incident_report as _kanban_store_incident",
             "wake_kinds_for as _wake_kinds_for",
         ):
             self.assertIn(name, patched)
@@ -1320,29 +1594,30 @@ WAKE_CALL_MERGED = (
 WAKE_CALL_LEGACY = '                            _wake_kinds_for(d["events"], adapter=adapter)\n'
 
 
-def strip_patch_furniture(text, drop_marker_call=True, normalise_wake_call=True):
+def strip_patch_furniture(text, drop_added_calls=True, normalise_wake_call=True):
     """Reduce patched source to the part the legacy pipeline can be compared to.
 
-    Four things are dropped or rewritten, and only four:
+    Five things are dropped or rewritten, and only five:
 
     * the import trailer — three trailers became one;
     * the ``see <module>`` comments — they now name one module;
-    * the marker call, when ``drop_marker_call`` is set. This is one of the two
-      pieces of emitted code with no legacy counterpart, because it is one of
-      the two new behaviours (section 4 of ``kanban_notifier.py``);
+    * the marker call and the incident-store call, when ``drop_added_calls`` is
+      set. These are the pieces of emitted code with no legacy counterpart,
+      because they are new behaviours (sections 4 and 5 of
+      ``kanban_notifier.py``);
     * the wake call's ``passive_delivered=`` argument, when
-      ``normalise_wake_call`` is set — the other new behaviour, and the reason
+      ``normalise_wake_call`` is set — the third new behaviour, and the reason
       the merged call wraps where the legacy one did not.
 
-    Subtracting those two is what lets :class:`LegacyEquivalenceTest` keep
-    making its original claim about everything else; that the subtractions are
-    the *whole* difference is asserted separately for each, so nothing can hide
-    behind either.
+    Subtracting those is what lets :class:`LegacyEquivalenceTest` keep making
+    its original claim about everything else; that the subtractions are the
+    *whole* difference is asserted separately for each, so nothing can hide
+    behind any of them.
     """
     marker = "\n\n# kube-agents patch: see gateway/"
     body = text[: text.index(marker)] if marker in text else text
-    if drop_marker_call:
-        body = body.replace(MARKER_CALL, "")
+    if drop_added_calls:
+        body = body.replace(INCIDENT_CALL, "").replace(MARKER_CALL, "")
     if normalise_wake_call:
         body = body.replace(WAKE_CALL_MERGED, WAKE_CALL_LEGACY)
     return "\n".join(
@@ -1361,12 +1636,14 @@ class LegacyEquivalenceTest(unittest.TestCase):
     shipped once is exactly the kind of thing that hides in "while I was in
     there".
 
-    Two later additions are deliberate exceptions, and they are the only ones:
-    the completion marker, and the wake call's ``passive_delivered=`` argument.
-    Each is normalised away before the comparison and pinned by its own test —
-    :meth:`test_the_marker_call_is_the_only_departure_from_legacy` and
+    Three later additions are deliberate exceptions, and they are the only
+    ones: the completion marker, the incident-store call, and the wake call's
+    ``passive_delivered=`` argument. Each is normalised away before the
+    comparison and pinned by its own test —
+    :meth:`test_the_added_calls_are_the_only_departure_from_legacy`,
+    :meth:`test_the_incident_call_is_emitted_exactly_once` and
     :meth:`test_the_wake_call_carries_the_delivery_mode_argument` — so the
-    equivalence claim narrowed by exactly two reviewable blocks rather than
+    equivalence claim narrowed by exactly three reviewable blocks rather than
     quietly weakening.
     """
 
@@ -1376,16 +1653,16 @@ class LegacyEquivalenceTest(unittest.TestCase):
             strip_patch_furniture(patch_tree(UPSTREAM_WATCHERS)),
         )
 
-    def test_the_marker_call_is_the_only_departure_from_legacy(self):
+    def test_the_added_calls_are_the_only_departure_from_legacy(self):
         # Without this, strip_patch_furniture's replace() would be a hole any
         # future edit could be slipped through. Compare the two outputs with
-        # nothing subtracted and require every added line to belong to the
-        # marker call.
+        # nothing subtracted and require every added line to belong to one of
+        # the two added calls.
         legacy = strip_patch_furniture(
-            legacy_pipeline(UPSTREAM_WATCHERS), drop_marker_call=False
+            legacy_pipeline(UPSTREAM_WATCHERS), drop_added_calls=False
         ).splitlines()
         merged = strip_patch_furniture(
-            patch_tree(UPSTREAM_WATCHERS), drop_marker_call=False
+            patch_tree(UPSTREAM_WATCHERS), drop_added_calls=False
         ).splitlines()
         added = [line for line in merged if line not in legacy]
         # The marker call's closing `)` is not among them: since v2026.8.13 the
@@ -1393,9 +1670,12 @@ class LegacyEquivalenceTest(unittest.TestCase):
         # conditional, so a bare `)` at that indent already appears in both.
         # Membership, not identity, is what this comparison can see.
         self.assertEqual(added, [
-            line for line in MARKER_CALL.splitlines() if line not in legacy
+            line
+            for line in (INCIDENT_CALL + MARKER_CALL).splitlines()
+            if line not in legacy
         ])
         self.assertIn("wake_configured=wake_agent,", "\n".join(added))
+        self.assertIn(INCIDENT_CALL.strip(), "\n".join(added))
         # ...and nothing was removed, either.
         self.assertEqual([line for line in legacy if line not in merged], [])
 
@@ -1407,6 +1687,45 @@ class LegacyEquivalenceTest(unittest.TestCase):
         self.assertEqual(patched.count("_kanban_note_suppressed("), 1)
         self.assertEqual(patched.count("as _kanban_note_suppressed,"), 1)
         self.assertIn(MARKER_CALL, patched)
+
+    def test_the_incident_call_is_emitted_exactly_once(self):
+        # A second copy would POST the same row twice per delivery. Harmless
+        # against INSERT OR IGNORE, but it would double the loopback traffic on
+        # the notifier's poll loop and mask a duplicated build step.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertEqual(patched.count("_kanban_store_incident("), 1)
+        self.assertEqual(patched.count("as _kanban_store_incident,"), 1)
+        self.assertIn(INCIDENT_CALL, patched)
+
+    def test_the_incident_call_is_passed_this_event_and_not_the_delivery(self):
+        # The anchor is 24 spaces in, which is inside `for ev in d["events"]:`
+        # as well as `for d in deliveries:` — so this call runs once per event.
+        # Handed `d["events"]` it would fire on a delivery's `commented` event
+        # too, writing the row before the `completed` iteration sends the
+        # report the row claims the reader has. `posted=send_passive` is the
+        # other half: with delivery_mode="wake" nothing is posted at all.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertIn("_kanban_store_incident(ev, task, sub", patched)
+        self.assertNotIn('_kanban_store_incident(d["events"]', patched)
+        self.assertIn("posted=send_passive", INCIDENT_CALL)
+
+    def test_the_incident_call_runs_after_the_report_was_sent(self):
+        # The row asserts that the reader HAS this report, so it must not be
+        # written on a path that has not sent it. Upstream's `adapter.send` is
+        # the last thing before this anchor.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        send = patched.index("await adapter.send(")
+        store = patched.index(INCIDENT_CALL.strip())
+        self.assertLess(send, store)
+
+    def test_the_incident_call_comes_before_the_marker_call(self):
+        # Ordering is not load-bearing — neither can raise — but it is asserted
+        # so a reordering is a deliberate edit rather than a rebase artifact.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertLess(
+            patched.index(INCIDENT_CALL.strip()),
+            patched.index("_kanban_note_suppressed(\n"),
+        )
 
     def test_the_marker_call_reads_the_wake_set_it_is_reporting_on(self):
         # It subtracts the wake set from what upstream would have woken for, so
@@ -1438,6 +1757,46 @@ class LegacyEquivalenceTest(unittest.TestCase):
         patched = patch_tree(UPSTREAM_WATCHERS)
         self.assertIn("lines = payload_summary.strip().splitlines()", patched)
         self.assertIn("lines = task.result.strip().splitlines()", patched)
+
+
+class VerifierSendAnchorTest(unittest.TestCase):
+    """The one literal in ``verify_kanban_notifier.py`` another patch owns.
+
+    The verifier asserts the incident row is written after the report was sent
+    by comparing source offsets, and the send it measures against is not
+    upstream's ``await adapter.send(`` — ``apply_kanban_progress_lines.py``
+    rewrites that line earlier in the same build. Nothing else couples the two
+    files, and a mismatch is silent in the worst way: ``str.find`` returns -1,
+    the offset comparison fails, and the build reports "the row is written
+    before the report was sent" about code whose ordering is fine. That is the
+    build this test was written after.
+    """
+
+    ANCHOR_PATTERN = r'_send_at = NOTIFIER_SOURCE\.find\("([^"]+)"\)'
+
+    def _anchor(self):
+        match = re.search(self.ANCHOR_PATTERN, VERIFIER_SOURCE)
+        self.assertIsNotNone(
+            match, "verify_kanban_notifier.py no longer derives _send_at this way"
+        )
+        return match.group(1)
+
+    def test_the_anchor_is_text_the_progress_lines_patch_emits(self):
+        self.assertIn(self._anchor(), SEND_PATCHED)
+
+    def test_the_anchor_is_not_the_text_that_patch_replaced(self):
+        # Guards the specific regression rather than its shape: reverting to
+        # upstream's spelling passes every other test in this file, because no
+        # other test in this file reads the progress-lines patch at all.
+        self.assertNotIn(self._anchor(), SEND_ANCHOR)
+
+    def test_the_verifier_fails_loudly_when_the_anchor_moves(self):
+        self.assertIn(
+            "the send this ordering is measured against is still there",
+            VERIFIER_SOURCE,
+            "without a presence check, a moved anchor is reported as a "
+            "wrong-order bug that does not exist",
+        )
 
 
 if __name__ == "__main__":

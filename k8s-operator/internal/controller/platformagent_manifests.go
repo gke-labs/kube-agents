@@ -1630,7 +1630,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	//
 	//   SESSION_KV_API_KEY  authenticates callers of the Session KV server on
 	//                       127.0.0.1:8699. This container both serves it and
-	//                       calls it (platform_mcp_server, incident_context).
+	//                       calls it (platform_mcp_server, incident_context,
+	//                       and the gateway's kanban notifier).
 	//   SESSION_KV_SALT     the HMAC salt for pseudonymising chat identities.
 	//                       It has to be here because the hashing happens here,
 	//                       at the point the identity is first seen.

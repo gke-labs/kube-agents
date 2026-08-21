@@ -613,20 +613,26 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     the delegation to that persona is what makes the citation unresolvable for
     the agent being asked to obey it.
 
-    The report used to end by inviting the reader to reply ``apply``, and that
-    invitation is withheld here until something honours it. The agent that acts
-    on such a reply reads the report back from the ``incidents`` table through
-    the ``incident_context`` plugin, and the only writer of that table is
-    ``platform_mcp_server.send_notification`` — the egress call this delivery
-    path replaced. So the row is never written, ``_lookup`` returns ``None``,
-    and the front door receives the bare word ``apply`` with no report, no
-    options and no cluster. Nothing unsafe happens; the front door holds no
-    write path and simply cannot act. It is a promise the system cannot keep,
-    and on ``main`` it was never tested because no report reached a human to
-    reply to. Storing the report on the delivery path is issue #802; the
-    bullet comes back with it. §7 rule 3 — "no offer to help further" — is on the
-    side of the removal, which is why the docstring here used to have to argue
-    the call-to-action past it.
+    The report ends by inviting the reader to reply ``apply``, and something
+    honours it. The agent that acts on such a reply reads the report back from
+    the ``incidents`` table through the ``incident_context`` plugin, and the row
+    that lookup needs is written by the same delivery that posted the report:
+    ``kanban_notifier.store_incident_report`` keys it to the chat thread once
+    the notifier has sent it. That was not true between #738 — which replaced
+    the egress call in ``platform_mcp_server.send_notification``, the table's
+    only writer, with ``kanban_complete`` — and #802, which restored the write
+    on the new path. In that window the invitation was withheld here, because a
+    reply to it reached the front door as the bare word ``apply`` with no
+    report, no options and no cluster. So the bullet is load-bearing on that
+    write: if the row stops being written, take the bullet out again rather
+    than leaving a promise the system cannot keep.
+
+    §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
+    is about closing chatter, the "let me know if you need anything else" that
+    ends a message with nothing in it; rule 1 requires the report to say what
+    the agent wants done. The report asks the reader for exactly one decision,
+    and the ``To authorize:`` bullet is how that decision is expressed. It is
+    the ask, not an offer alongside it.
 
     The report template below is STANDARD markdown, and must stay that way.
     Every chat platform's adapter translates the agent's markdown on the way
@@ -662,13 +668,15 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
-        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
-        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line.\n\n"
+        f"Label them 'Option A', 'Option B', ... in order, and name those same letters in the call-to-action. "
+        f"When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
+        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and end the "
+        f"'To authorize:' bullet after **'apply'**, dropping the \"or name one directly with ...\" clause, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
-        f"**Do not end the report by inviting a reply.** No 'To authorize:', no 'reply apply', no offer to open the Pull Request "
-        f"if the reader asks — a reply to this thread reaches an agent that cannot see your report, so the offer would not be honoured. "
-        f"The Recommended line is the last bullet you write.\n\n"
+        f"The last bullet of the 'What to do' section is the call to action, not another option: keep its 'To authorize:' label, "
+        f"never give it an Option letter, and never count it when you number the options. "
+        f"A reply in this thread reaches an agent that can see your report, so the offer is honoured.\n\n"
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
@@ -678,7 +686,8 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
         f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n"
-        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n\n"
+        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
         f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
         f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
         f"---"
@@ -1422,16 +1431,18 @@ def list_recent_reports(chat_id: str, hours: int = 0, limit: int = 0) -> Dict[st
     in the channel above, unreachable. Naming them is enough for the agent to
     ask which one instead of answering about the wrong one.
 
-    It returns no report text, deliberately. `_store_incident_report` persists
-    the relay's composed output rather than the specialist's finding, so a
-    preview line would carry model-written text into every ordinary message in
+    It returns no report text, deliberately. No writer of this table stores
+    something safe to preview: the relay persists its own composed output, the
+    notifier persists a specialist's report quoting cluster objects, and either
+    would carry model-written or third-party text into every ordinary message in
     the space. `job_id`, `title` and `profile` are fields this server wrote
     itself.
 
     `incidents` is the source of truth for "a report was posted here";
     `session_metadata` only supplies the label. A row written by the
-    `send_notification` path has no relay session and so no job to name, and
-    still belongs in the index.
+    `send_notification` path or by the kanban notifier's triage delivery has no
+    relay session and so no job to name -- `incident_context._index_text`
+    renders it unlabelled -- and still belongs in the index.
     """
     hours = hours or RECENT_REPORTS_WINDOW_HOURS
     limit = limit or RECENT_REPORTS_LIMIT
