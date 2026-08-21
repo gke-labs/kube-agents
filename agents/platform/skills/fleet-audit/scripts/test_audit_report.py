@@ -1709,12 +1709,23 @@ class TestAuditCatalogue(unittest.TestCase):
             "pair; a subprocess job added here fires on every tick without "
             "any of the review a governance stream gets",
         )
+        # Resolved to a file, not merely non-empty. Nothing else in the tree
+        # checks a cron `script` against the scripts directory, so a typo in
+        # the name is silent until 21:00, when the tick runs nothing and the
+        # roster looks healthy.
+        scripts_dir = Path(__file__).resolve().parents[4] / "platform" / "scripts"
         for job_id in sorted(set(live) - prompted):
             with self.subTest(job=job_id):
+                script = live[job_id].get("script")
                 self.assertTrue(
-                    live[job_id].get("script"),
+                    script,
                     f"platform roster[{job_id}] is `no_agent` but names no "
                     f"script, so a tick would run nothing at all",
+                )
+                self.assertTrue(
+                    (scripts_dir / script).is_file(),
+                    f"platform roster[{job_id}] names {script!r}, which is not "
+                    f"in {scripts_dir}",
                 )
 
         chat_roster = (

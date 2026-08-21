@@ -17,7 +17,8 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, with the rest of the roster. That routes the report through the
+The entry ships `deliver: "chat"`, as every enabled entry on the roster does bar
+`gcp-networking-fabric-audit`. That routes the report through the
 Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
 [relay design](../../../docs/designs/cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
@@ -135,7 +136,7 @@ unreachable. The scope caveat rides the qualifier line under the counts instead.
 [What this recap does not report](#what-this-recap-does-not-report).
 
 The ✅ all-clear claims nothing was held back from chat. It does **not** claim the watcher is alive:
-this script never contacts it, and both tables it reads are written by the daemon's own `/inject`
+this script never contacts it, and the one table it reads is written by the daemon's own `/inject`
 path, so zero rows means no event arrived — which a dead, crash-looping, RBAC-denied or deliberately
 stopped watcher produces just as readily as a quiet fleet. `EVENT_WATCHER_ENABLED=false` is a
 documented emergency stop for an event storm, and an all-clear asserting "daemon active and
