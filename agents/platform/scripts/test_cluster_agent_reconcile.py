@@ -33,9 +33,9 @@ class ReconcileTest(unittest.TestCase):
         Returns (report, list_of_deleted_names).
         """
         deleted: list[str] = []
-        # _self_cluster() -> None disables the CREATE direction, isolating the prune behavior
+        # _project() -> None disables the CREATE direction, isolating the prune behavior
         # under test (and avoiding any real metadata/gcloud calls).
-        with mock.patch.object(rec, "_self_cluster", return_value=None), \
+        with mock.patch.object(rec, "_project", return_value=None), \
              mock.patch.object(rec, "list_profiles", return_value=profiles), \
              mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
              mock.patch.object(rec, "read_cluster_identity", side_effect=lambda home: identities[home.name]), \
@@ -89,14 +89,16 @@ def _name_for(identity_kwargs, identities):
 
 
 class CreateDirectionTest(unittest.TestCase):
-    def test_creates_missing_excludes_management_and_existing(self):
+    def test_creates_missing_including_the_management_cluster(self):
+        # "mgmt" is the cluster this pod runs on. It used to be excluded by name via the
+        # metadata server; it is now managed like any other, because the triage session for
+        # an event on it is created on its own profile and there would otherwise be none.
         created: list = []
-        with mock.patch.object(rec, "_self_cluster", return_value=("mgmt", "us-central1")), \
-             mock.patch.object(rec, "_project", return_value="p"), \
+        with mock.patch.object(rec, "_project", return_value="p"), \
              mock.patch.object(rec, "_all_clusters", return_value=[
                  ("p", "alpha", "us-central1"),   # no profile -> CREATE
                  ("p", "beta", "us-central1"),    # already has a profile -> skip
-                 ("p", "mgmt", "us-central1"),    # management/self -> excluded
+                 ("p", "mgmt", "us-central1"),    # the management cluster -> CREATE too
              ]), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
              mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
@@ -107,14 +109,31 @@ class CreateDirectionTest(unittest.TestCase):
              mock.patch.object(rec, "create_profile",
                                side_effect=lambda pr, c, l: created.append((pr, c, l)) or f"cluster-{c}"):
             report = rec.reconcile(dry_run=False)
-        self.assertEqual(created, [("p", "alpha", "us-central1")])
-        self.assertEqual(report["created"], ["cluster-alpha"])
+        self.assertEqual(created, [("p", "alpha", "us-central1"), ("p", "mgmt", "us-central1")])
+        self.assertEqual(report["created"], ["cluster-alpha", "cluster-mgmt"])
         self.assertEqual(report["kept"], ["cluster-beta"])
+
+    def test_an_excluded_cluster_loses_the_profile_it_already_has(self):
+        # RECONCILE_EXCLUDE is now the only opt-out, so it has to prune as well as skip:
+        # adding a name after the fact must remove the profile, not leave it orphaned.
+        deleted: list[str] = []
+        with mock.patch.object(rec, "_project", return_value="p"), \
+             mock.patch.object(rec, "EXTRA_EXCLUDE", {"skipme"}), \
+             mock.patch.object(rec, "_all_clusters", return_value=[("p", "skipme", "us-central1")]), \
+             mock.patch.object(rec, "list_profiles", return_value=["cluster-skipme"]), \
+             mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
+             mock.patch.object(rec, "read_cluster_identity",
+                               side_effect=lambda home: {"project": "p", "cluster": "skipme", "location": "us-central1"}), \
+             mock.patch.object(rec, "_cluster_exists", return_value=True), \
+             mock.patch.object(rec, "create_profile", side_effect=AssertionError("must not create an excluded cluster")), \
+             mock.patch.object(rec, "delete_profile", side_effect=deleted.append):
+            report = rec.reconcile(dry_run=False)
+        self.assertEqual(deleted, ["cluster-skipme"])
+        self.assertEqual(report["pruned"], ["cluster-skipme"])
 
     def test_extra_exclude_names_skipped(self):
         created: list = []
-        with mock.patch.object(rec, "_self_cluster", return_value=("mgmt", "us-central1")), \
-             mock.patch.object(rec, "_project", return_value="p"), \
+        with mock.patch.object(rec, "_project", return_value="p"), \
              mock.patch.object(rec, "EXTRA_EXCLUDE", {"skipme"}), \
              mock.patch.object(rec, "_all_clusters", return_value=[
                  ("p", "keep", "us-central1"), ("p", "skipme", "us-central1")]), \

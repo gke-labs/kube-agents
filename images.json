@@ -77,7 +77,7 @@
       "repository": "ghcr.io/vectorize-io/hindsight-api",
       "tag": "0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab",
       "override": "HINDSIGHT_API_IMAGE",
-      "pulledBy": "Provisioning step 13, when the memory provider uses Hindsight.",
+      "pulledBy": "The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path).",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
     },
     {
@@ -86,7 +86,7 @@
       "repository": "docker.io/ankane/pgvector",
       "tag": "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8",
       "override": "HINDSIGHT_POSTGRES_IMAGE",
-      "pulledBy": "Provisioning step 13, alongside the Hindsight API.",
+      "pulledBy": "The chart, alongside the Hindsight API.",
       "description": "Postgres with the pgvector extension, the store behind the Hindsight API. Upstream publishes only a floating 'latest', so the digest is the real pin."
     },
     {
@@ -94,7 +94,7 @@
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-controller",
       "tag": "v1.21.1",
-      "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
+      "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "Issues the webhook serving certificates the operator's webhooks need."
     },
     {
@@ -102,7 +102,7 @@
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-cainjector",
       "tag": "v1.21.1",
-      "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
+      "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "Injects CA bundles into webhook configurations."
     },
     {
@@ -110,7 +110,7 @@
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-webhook",
       "tag": "v1.21.1",
-      "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
+      "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "cert-manager's own admission webhook."
     },
     {
@@ -118,8 +118,16 @@
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-acmesolver",
       "tag": "v1.21.1",
-      "pulledBy": "cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist.",
+      "pulledBy": "cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself; the copy exists so a mirrored cert-manager install can point the flag at it.",
       "description": "Solver pod cert-manager runs for ACME HTTP-01 challenges."
+    },
+    {
+      "name": "cert-manager-startupapicheck",
+      "origin": "third-party",
+      "repository": "quay.io/jetstack/cert-manager-startupapicheck",
+      "tag": "v1.21.1",
+      "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false. Runs once per install as a post-install hook Job.",
+      "description": "One-shot check that the cert-manager API is actually serving before the install is declared done."
     },
     {
       "name": "hermes-agent",

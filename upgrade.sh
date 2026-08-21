@@ -159,9 +159,12 @@ random_hex_32() {
 
 # Add the pod-scoped Session KV keys to an existing Secret that predates them.
 #
-# provision_07_gcp_k8s_secrets.sh generates these, and the upgrade path does not
-# run it: every mode runs provision_03 and provision_08, and neither touches
-# platform-agent-secrets. The operator marks both Secret references optional, so
+# A fresh install generates these (the composition's random_password
+# resources), and the harness/operator fast paths never touch
+# platform-agent-secrets — `helm upgrade
+# --reuse-values` re-tags images and nothing else, so a Secret from an old
+# enough install keeps missing the keys until something adds them. The
+# operator marks both Secret references optional, so
 # a Secret without the keys yields containers without the variables rather than
 # a failed mount — and the k8s-event-watcher treats an empty --token-env
 # variable as fatal, so it exits on every start and NO cluster events are
@@ -298,16 +301,16 @@ main() {
 
   local script_dir repo_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "${script_dir}/k8s-operator/scripts/provision_03_gcp_gke_operator.sh" ]; then
+  if [ -f "${script_dir}/k8s-operator/scripts/installer_common.sh" ]; then
     repo_dir="$script_dir"
     verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
-  elif [ -f "$(pwd)/k8s-operator/scripts/provision_03_gcp_gke_operator.sh" ]; then
+  elif [ -f "$(pwd)/k8s-operator/scripts/installer_common.sh" ]; then
     repo_dir="$(pwd)"
     verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
   else
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
-    print_info "Fetching provisioning scripts for '${PARAM_IMAGE_TAG}'..."
+    print_info "Fetching the upgrade engine for '${PARAM_IMAGE_TAG}'..."
     git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
     git -C "$repo_dir" fetch --depth=1 origin "$PARAM_IMAGE_TAG"
     git -C "$repo_dir" checkout --detach FETCH_HEAD
@@ -317,6 +320,18 @@ main() {
   print_step "1. Validating Upgrade Target & Environment"
   print_info "Upgrade Mode: ${C_BOLD}${PARAM_UPGRADE_MODE}${C_RESET}"
   print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
+
+  local required_tools=(gcloud kubectl helm)
+  if [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    required_tools+=(terraform)
+  fi
+  local tool
+  for tool in "${required_tools[@]}"; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      print_error "Required CLI tool '$tool' is not installed."
+      exit 1
+    fi
+  done
 
   local state_file="${repo_dir}/k8s-operator/scripts/vars.sh"
   local state_loaded="false"
@@ -407,29 +422,92 @@ main() {
   print_step "3. Reconciling Pod-Scoped Session Keys"
   backfill_session_kv_keys "$target_namespace"
 
+  # Shared defaults and the terraform.tfvars generator. Print helpers are
+  # already defined above, as the file expects.
+  # shellcheck disable=SC1091
+  source "${repo_dir}/k8s-operator/scripts/installer_common.sh"
+
+  # Helm never touches the crds/ directory on upgrade — that is Helm's own
+  # documented behaviour, and the Terraform helm provider inherits it — so CRD
+  # schema changes are applied here first, for every mode that rolls the
+  # operator. Server-side apply, because these objects are large and have had
+  # several owners.
+  apply_crd_upgrades() {
+    print_info "Applying CRD updates from charts/kube-agents/crds..."
+    kubectl apply --server-side --force-conflicts -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
+  }
+
+  # The chart-only fast path: a mode that moves no GCP resource re-tags one
+  # image on the live release and leaves the rest of the values as they are.
+  # The regenerated tfvars carry the same new tag, so the next full
+  # `terraform apply` agrees with the release instead of reverting it.
+  helm_retag() {
+    local set_key="$1"
+    helm upgrade kube-agents "${repo_dir}/charts/kube-agents" \
+      --namespace "$target_namespace" --reuse-values \
+      --set "${set_key}=${PARAM_IMAGE_TAG}" --wait --timeout 10m
+  }
+
+  # The release guard runs before the tfvars generation on purpose: a
+  # pre-Terraform install deserves this message, not whatever the generator
+  # trips over first (its vars.sh may lack the credentials the generator
+  # recovers from the live Secret).
+  if ! helm status kube-agents -n "$target_namespace" >/dev/null 2>&1; then
+    print_error "No Helm release 'kube-agents' in namespace '$target_namespace'."
+    print_info "This install predates the Terraform + Helm engine. Upgrade it with the release that installed it (curl the matching versioned upgrade.sh), or re-install with install.sh to adopt the new engine."
+    exit 1
+  fi
+
+  # NAMESPACE steers the generator's Secret-recovery reads (vars.sh omits
+  # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
+  NAMESPACE="$target_namespace" \
+    write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
+
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
-      cd "${repo_dir}/k8s-operator"
-      IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_03_gcp_gke_operator.sh
-      cd "$repo_dir"
+      apply_crd_upgrades
+      helm_retag "operator.image.tag"
       print_success "Kubernetes Operator upgraded successfully!"
       ;;
 
     harness)
       print_step "4. Upgrading Platform Agent Deployment & Identity"
-      cd "${repo_dir}/k8s-operator"
-      IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_08_deploy_platform_agent.sh
-      cd "$repo_dir"
+      helm_retag "platformAgent.deployment.image.tag"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 
     full)
-      print_step "4. Executing Full Atomic Upgrade (Operator, Harness & Skills)"
-      cd "${repo_dir}/k8s-operator"
-      IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_03_gcp_gke_operator.sh
-      IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_08_deploy_platform_agent.sh
-      cd "$repo_dir"
+      print_step "4. Executing Full Atomic Upgrade (Terraform + Helm)"
+      apply_crd_upgrades
+      # install.sh's post-generation minter guard, without its import step:
+      # an upgrade never imports the App key, so a vars.sh that enables the
+      # minter against a key with no ENABLED version would wedge the apply on
+      # the minter's readiness until the helm timeout fails the upgrade.
+      # Refuse up front instead and name the two ways out.
+      if grep -q '^enable_github_minter = true$' \
+        "${repo_dir}/terraform/examples/full-install/terraform.tfvars" 2>/dev/null; then
+        minter_enabled_version="$({ gcloud kms keys versions list \
+          --key "${KMS_KEY:-github-token-minter-key}" \
+          --keyring "${KMS_KEYRING:-github-token-minter-keyring}" \
+          --location "$(derive_kms_location "${REGION}")" --project "${PROJECT_ID}" \
+          --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true; } | head -1)"
+        if [ -z "$minter_enabled_version" ]; then
+          print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key has no ENABLED version — the apply would wait on a minter that can never become ready."
+          print_info "Import the App key with install.sh (which runs the import before its apply), or unset GITHUB_APP_ID in vars.sh to upgrade without the minter."
+          exit 1
+        fi
+      fi
+      # A full terraform apply against the regenerated tfvars: both image tags
+      # move, and every setting saved in vars.sh is re-rendered — the successor
+      # of the old path's re-render of the CR from saved state.
+      (
+        cd "${repo_dir}/terraform/examples/full-install"
+        export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
+        export KUBE_AGENTS_STATE_PREFIX
+        KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+        ./lifecycle.sh apply -auto-approve -input=false
+      )
       print_success "Full atomic upgrade completed successfully!"
       ;;
   esac
@@ -452,7 +530,9 @@ main() {
   print_step "5. Post-Upgrade Health Verification"
   kubectl get ns kubeagents-system >/dev/null
   if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
-    kubectl rollout status deployment/kubeagents-controller-manager -n kubeagents-system --timeout=120s
+    # kube-agents-controller-manager, not kubeagents-: the chart prefixes the
+    # operator Deployment with the release name.
+    kubectl rollout status deployment/kube-agents-controller-manager -n kubeagents-system --timeout=120s
   fi
   if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
     kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=120s

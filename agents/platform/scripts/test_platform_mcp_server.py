@@ -12,10 +12,22 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+# Stub the hermes runtime deps only when mcp is not installed at all, so this
+# module still imports in a bare checkout. ABSENT is not BROKEN, and only the
+# first earns a stub -- see test_mcp_package_contract.py.
 try:
     import mcp.server.fastmcp
 except Exception:
     import importlib
+    import importlib.metadata
+
+    # importlib.metadata, not find_spec -- see test_mcp_package_contract.py.
+    try:
+        importlib.metadata.distribution("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        pass  # absent: a bare checkout, which is what the stubs are for
+    else:
+        raise  # installed and incompatible: the ImportError is the finding
 
     def _stub_if_missing(name, module):
         # Stub only a module that really cannot be imported. These entries

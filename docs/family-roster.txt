@@ -41,6 +41,7 @@ agents/platform/governance/*.md
   agents/platform/governance/compliance_audit_sop.md
   agents/platform/governance/fleet_consistency_drift_sop.md
   agents/platform/governance/fleet_wide_cost_analysis_sop.md
+  agents/platform/governance/gcp_networking_fabric_sop.md
   agents/platform/governance/global_capacity_orchestrator_sop.md
   agents/platform/governance/inventory.md
   agents/platform/governance/inventory_prioritize_sop.md
@@ -54,6 +55,7 @@ agents/platform/governance/*.md
 agents/platform/skills/*/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
+  agents/platform/skills/gcp-networking-fabric-audit/SKILL.md
   agents/platform/skills/github-issue-resolver/SKILL.md
   agents/platform/skills/gke-ai-troubleshooting-handle-disruption-gpu-tpu/SKILL.md
   agents/platform/skills/gke-ai-troubleshooting-jobset-interruption/SKILL.md

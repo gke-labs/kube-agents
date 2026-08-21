@@ -13,7 +13,7 @@
 {{- /*
   Mirrors k8s-operator/config/webhook and config/certmanager, which the
   kustomize install path composes in k8s-operator/config/default. The kustomize
-  copy is the source of truth; scripts/check_iac_parity.py compares the two.
+  copy is the source of truth; keep this template in step with it.
 */}}
 apiVersion: v1
 kind: Service

@@ -4,13 +4,42 @@ variable "project_id" {
 }
 
 variable "cluster_name" {
-  description = "Name of the GKE Autopilot cluster to create"
+  description = "Name of the GKE cluster to create (or, with create_cluster = false, the existing cluster to install onto)"
   type        = string
 }
 
-variable "location" {
-  description = "GCP region for the cluster (and the KMS key ring when the GitHub minter is enabled). Autopilot clusters are regional, so a zone is rejected by the gke-cluster module."
+variable "cluster_mode" {
+  description = "Cluster shape: \"autopilot\" (default) or \"standard\". Standard builds an e2-standard-4 default pool with Dataplane V2, FQDN NetworkPolicy, and the Filestore CSI and BackupRestore addons, and is the only mode that can carry a gVisor node pool."
   type        = string
+  default     = "autopilot"
+
+  validation {
+    condition     = contains(["autopilot", "standard"], var.cluster_mode)
+    error_message = "cluster_mode must be \"autopilot\" or \"standard\"."
+  }
+}
+
+variable "create_cluster" {
+  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled."
+  type        = bool
+  default     = true
+}
+
+variable "location" {
+  description = "GCP location for the cluster (and the KMS key ring when the GitHub minter is enabled): a region, or a zone for a zonal Standard or pre-existing cluster. Autopilot clusters are regional, so a zone is rejected by the gke-cluster module in autopilot mode."
+  type        = string
+}
+
+variable "enable_gvisor_node_pool" {
+  description = "Whether to add the dedicated GKE Sandbox (gVisor) node pool. Standard mode only; fails the plan on Autopilot, which provides the gvisor RuntimeClass natively."
+  type        = bool
+  default     = false
+}
+
+variable "gvisor_pool_name" {
+  description = "Name of the gVisor node pool."
+  type        = string
+  default     = "gvisor-pool"
 }
 
 variable "deletion_protection" {
@@ -56,13 +85,13 @@ variable "namespace" {
 }
 
 variable "permission_set" {
-  description = "Which of provision_04_gcp_iam.sh's role bundles the agent's service account gets: read-only, gke-admin, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
+  description = "Which GCP IAM role bundle the agent's service account gets: read-only, gke-admin, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
   type        = string
   default     = "read-only"
 
   validation {
     condition     = contains(["read-only", "gke-admin", "custom"], var.permission_set)
-    error_message = "permission_set must be one of read-only, gke-admin, or custom (the same values the provisioning scripts accept)."
+    error_message = "permission_set must be one of read-only, gke-admin, or custom."
   }
 }
 
@@ -79,9 +108,26 @@ variable "image_tag" {
 }
 
 variable "image_registry" {
-  description = "Registry prefix for the images built from this project (operator, agent, credential proxy). Empty pulls the public ghcr.io images. Set this for a cluster that may only pull from an approved registry, after copying the images there with `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from the repository root — the prefix here must be the same one, and that IMAGE_TAG must be the image_tag set below, since the mirror only holds the tag it was told to copy. Registry authentication is out of scope: the mirror has to be readable with the nodes' own credentials, e.g. an Artifact Registry in this project."
+  description = "Registry prefix for the images built from this project (operator, agent, credential proxy). Empty pulls the public ghcr.io images. Set this for a cluster that may only pull from an approved registry, after copying the images there with `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from the repository root — the prefix here must be the same one, and that IMAGE_TAG must be the image_tag set below, since the mirror only holds the tag it was told to copy. A mirror the nodes' own credentials cannot read (an Artifact Registry in this project can be) also needs image_pull_secrets."
   type        = string
   default     = ""
+}
+
+variable "image_pull_secrets" {
+  description = "Names of docker-registry Secrets in the kube-agents namespace holding credentials for image_registry, for a mirror the nodes cannot read on their own (Harbor, Artifactory). They are referenced, never created: this composition would otherwise hold registry credentials in Terraform state. Create them before `terraform apply` — and create the namespace first, since Helm has not made it yet: `kubectl create namespace <namespace>` then `kubectl create secret docker-registry <name> -n <namespace> --docker-server=... --docker-username=... --docker-password=...`, both idempotent against what Helm then finds. Does not reach helm_release.cert_manager, on the same terms as image_registry: a cluster whose registry needs authenticating to wants enable_cert_manager = false and cert-manager installed by hand."
+  type        = list(string)
+  default     = []
+
+  # A blank entry renders `- name: ""` into four pod specs. The API server
+  # accepts it — core PodSpec validation only rejects a name that differs from
+  # its own trimmed form — and the kubelet then looks for a Secret named "",
+  # fails, and pulls anonymously. That surfaces as ImagePullBackOff, several
+  # layers from the tfvars typo. The operator's webhook rejects the same thing
+  # on a hand-written PlatformAgent.
+  validation {
+    condition     = alltrue([for s in var.image_pull_secrets : trimspace(s) != ""])
+    error_message = "Every image_pull_secrets entry must name a Secret."
+  }
 }
 
 variable "third_party_image_registry" {
@@ -91,7 +137,7 @@ variable "third_party_image_registry" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai — chatgpt needs the kustomize overlay and is rejected by the chart). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
   type        = string
   default     = "gemini"
 
@@ -202,6 +248,20 @@ variable "slack_app_token" {
   default     = ""
 }
 
+variable "session_kv_api_key" {
+  description = "Existing SESSION_KV_API_KEY to keep, for adopting a cluster whose Secret already holds one. Empty generates a fresh value (the right choice for a new install)."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "session_kv_salt" {
+  description = "Existing SESSION_KV_SALT to keep, for adopting a cluster whose Secret already holds one. Rotating the salt re-anonymises every chat user, so an adoption must pass the live value; empty generates a fresh one."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "slack_allowed_users" {
   description = "Slack users allowed to talk to the agent (empty list = all users allowed). Only used when enable_slack is true."
   type        = list(string)
@@ -220,6 +280,42 @@ variable "slack_home_channel_name" {
   default     = ""
 }
 
+variable "chat_topic_name" {
+  description = "Pub/Sub topic for Google Chat events. The default matches the chat-pubsub module and the chart."
+  type        = string
+  default     = "platform-agent-chat-events"
+}
+
+variable "chat_subscription_name" {
+  description = "Pub/Sub subscription for Google Chat events."
+  type        = string
+  default     = "platform-agent-chat-events-sub"
+}
+
+variable "hermes_dashboard_enabled" {
+  description = "Whether the Hermes Web UI dashboard is enabled on the agent. null leaves the field out of the CR so the CRD default (true) applies."
+  type        = bool
+  default     = null
+}
+
+variable "memory_enabled" {
+  description = "Whether agent memory persistence is enabled. null defers to the CRD default (false)."
+  type        = bool
+  default     = null
+}
+
+variable "memory_provider" {
+  description = "Agent memory provider (multiuser_memory, kube_agents_memory, hindsight, none, ...). Empty defers to the CRD default. Selecting a hindsight-backed provider makes the chart render the Hindsight store automatically."
+  type        = string
+  default     = ""
+}
+
+variable "user_profile_enabled" {
+  description = "Whether per-user profiles are enabled in agent memory. null defers to the CRD default (false)."
+  type        = bool
+  default     = null
+}
+
 variable "github_repo" {
   description = "Target GitOps repository for the agent's GitHub integration (owner/repo or URL). Empty leaves the GitHub integration unconfigured. Independent of enable_github_minter, which only provisions the minter's GCP identity."
   type        = string
@@ -227,19 +323,37 @@ variable "github_repo" {
 }
 
 variable "enable_github_minter" {
-  description = "Provision the GitHub token minter's GCP resources (service account, KMS key ring and signing key)"
+  description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready."
   type        = bool
   default     = false
 }
 
+variable "github_minter_kms_keyring" {
+  description = "Cloud KMS key ring holding the GitHub minter's signing key."
+  type        = string
+  default     = "github-token-minter-keyring"
+}
+
+variable "github_minter_kms_key" {
+  description = "Cloud KMS asymmetric signing key the minter signs GitHub App JWTs with. The App private key is imported into it outside Terraform."
+  type        = string
+  default     = "github-token-minter-key"
+}
+
+variable "github_app_id" {
+  description = "GitHub App ID the minter signs as. Set, the chart creates the github-app-credentials Secret; empty, that Secret must already exist in the release namespace before the minter pod can start."
+  type        = string
+  default     = ""
+}
+
 variable "enable_backup_agent" {
-  description = "Enable the Backup for GKE agent on the cluster (the BackupRestore addon). True matches the cluster provision_01_gcp_cluster.sh creates; it costs nothing until a BackupPlan targets the cluster, but it must be on before enable_gke_backup_plan can work."
+  description = "Enable the Backup for GKE agent on the cluster (the BackupRestore addon). It costs nothing until a BackupPlan targets the cluster, but it must be on before enable_gke_backup_plan can work."
   type        = bool
   default     = true
 }
 
 variable "enable_gke_backup_plan" {
-  description = "Create a scheduled BackupPlan for the release namespace (mirrors provision_12_gke_backup_plan.sh, which is likewise opt-in). Backups include Secrets and volume data and are billed per backed-up pod and per GB of snapshot storage."
+  description = "Create a scheduled BackupPlan for the release namespace (opt-in). Backups include Secrets and volume data and are billed per backed-up pod and per GB of snapshot storage."
   type        = bool
   default     = false
 }
@@ -263,13 +377,13 @@ variable "backup_encryption_key" {
 }
 
 variable "enable_cert_manager" {
-  description = "Install cert-manager, which issues the serving certificate for the operator's admission webhooks (mirrors provision_03_gcp_gke_operator.sh). Set to false when the target cluster already runs cert-manager: unlike the script, Terraform does not detect an existing install and the apply fails on the existing CRDs. Turning this off with enable_webhooks left on leaves the webhooks without a certificate."
+  description = "Install cert-manager, which issues the serving certificate for the operator's admission webhooks. Set to false when the target cluster already runs cert-manager: Terraform does not detect an existing install and the apply fails on the existing CRDs (install.sh probes for one on the existing-cluster path and sets this for you). Turning this off with enable_webhooks left on leaves the webhooks without a certificate."
   type        = bool
   default     = true
 }
 
 variable "cert_manager_version" {
-  description = "cert-manager chart version, pinned to the release provision_03_gcp_gke_operator.sh installs. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
+  description = "cert-manager chart version. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
   type        = string
   default     = "v1.21.1"
 }

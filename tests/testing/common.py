@@ -1,5 +1,11 @@
 """Common test constants and fixtures shared across test suites."""
 
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+
 MOCK_DEFAULT_RELEASE_REPO = "gke-labs/kube-agents"
 MOCK_DEFAULT_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 MOCK_CUSTOM_ORG = "custom-org"
@@ -95,19 +101,67 @@ INSTALLER_HELP_BANNER = "kube-agents Zero-Friction Installer"
 UPGRADER_HELP_BANNER = "Lifecycle Upgrade Engine"
 
 
-
-
 def get_isolated_test_env(overrides=None, bin_dir=None):
     """Returns a sanitized environment for hermetic script execution, free of CI runner pollution."""
-    import os
-
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("GITHUB_", "RUNNER_")) and k not in ("CI", "CONTINUOUS_INTEGRATION")
+        if not k.startswith(("GITHUB_", "RUNNER_")) and k not in ("CI", "CONTINUOUS_INTEGRATION", "GH_TOKEN")
     }
     if bin_dir:
         env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if overrides:
         env.update(overrides)
     return env
+
+
+def create_minimal_tools_bin(temp_dir_path, exclude=()):
+    """Creates a minimal bin directory with symlinks to essential shell utilities, excluding specified tools."""
+    bin_dir = pathlib.Path(temp_dir_path) / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    essential_tools = [
+        "bash", "sh", "git", "tr", "cut", "sed", "awk", "grep",
+        "cat", "dirname", "basename", "echo", "mkdir", "rm",
+        "mktemp", "touch", "ls", "head", "tail"
+    ]
+    for tool in essential_tools:
+        if tool in exclude:
+            continue
+        tool_path = shutil.which(tool)
+        if tool_path:
+            symlink = bin_dir / tool
+            if not symlink.exists():
+                symlink.symlink_to(tool_path)
+    return bin_dir
+
+
+def create_mock_git_repo(temp_dir=None):
+    """Initializes an isolated mock Git repository for testing."""
+    if temp_dir is None:
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+    base_path = pathlib.Path(temp_dir.name if hasattr(temp_dir, "name") else temp_dir)
+    repo_dir = base_path / "repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+
+    def git_cmd(*args, cwd=repo_dir):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    git_cmd("init", "-b", "main")
+    git_cmd("config", "user.name", "Test User")
+    git_cmd("config", "user.email", "test@example.com")
+    git_cmd("config", "commit.gpgsign", "false")
+
+    init_file = repo_dir / "init.txt"
+    init_file.write_text("initial commit\n")
+    git_cmd("add", "init.txt")
+    git_cmd("commit", "-m", "chore: initial commit")
+
+    return temp_dir, str(repo_dir), git_cmd

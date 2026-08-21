@@ -18,10 +18,10 @@ k8s-operator/
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler + admission webhook logic
 ├── examples/               # sample PlatformAgent CR
-├── scripts/                # provision + teardown scripts
+├── scripts/                # shared installer helpers (vars.sh state, tfvars generator)
 ├── testing/staging_workloads/  # multi-cluster staging PoC
 ├── Dockerfile              # controller manager image
-└── Makefile                # generate, build, test, deploy, gcp-provision
+└── Makefile                # generate, build, test, deploy
 ```
 
 ## What the operator manages
@@ -168,4 +168,4 @@ That leaves the cluster with the same validation coverage a chart install has. R
 - [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
 - [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
 - [Development](/kube-agents/operator/development/) — build, test, and run the operator locally.
-- [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — the `provision_*.sh` sub-scripts.
+- [`k8s-operator/scripts/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/README.md) — the installer helper scripts that live beside the operator.

@@ -11,9 +11,9 @@ sidebar:
 
 1. **RC Testing**: Pre-release builds are validated by the automated RC pipeline —
    [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release) is the canonical reference for how `rc_YYMMDDHHMM_<short_sha>` builds are created, tested end-to-end, and tagged `*_validated` on success.
-2. **SemVer Publication**: Tagging a validated commit with `X.Y.Z` triggers GitHub Actions to publish immutable artifacts (example for `1.2.0`):
-   - **GHCR Images**: `ghcr.io/gke-labs/kube-agents/platform-agent:1.2.0`
-   - **OCI Helm Charts**: `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:1.2.0`
+2. **SemVer Publication**: Running the release workflow (`release-publish.yml`) for a validated commit or tag promotes and publishes immutable artifacts (example for `1.2.0`):
+   - **GHCR Images**: Clean promotion retags verified commit images to `ghcr.io/gke-labs/kube-agents/platform-agent:1.2.0` (and all required images) without rebuilding.
+   - **OCI Helm Charts**: `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:1.2.0` (packaged and signed by digest via `release-publish.yml`).
    - **Terraform Modules**: Sourced via Git tag reference `?ref=1.2.0`
 
 ## Helm Chart Versioning

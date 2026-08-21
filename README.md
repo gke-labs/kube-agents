@@ -52,14 +52,15 @@ Or delegate setup directly to your AI coding agent:
 "Using kube-agents/INSTALL.md provision k8s agentic harness and create platform agent"
 ```
 
-Prefer the scripted path? From an authenticated `gcloud`:
+Prefer to drive the engine by hand? From an authenticated `gcloud`, run a repository checkout's installer — or the Terraform composition it wraps:
 
 ```bash
-cd k8s-operator
-make gcp-provision
+./install.sh                                              # the interview, then one terraform apply
+# or, with your own terraform.tfvars:
+cd terraform/examples/full-install && ./lifecycle.sh apply
 ```
 
-This runs the staged, idempotent provisioning scripts end to end — from GKE cluster creation through IAM and chat integration to the optional inference stack. `make gcp-teardown` reverses it. See the [quick start](https://gke-labs.github.io/kube-agents/install/quickstart-gke/) for the walkthrough, or [INSTALL.md](INSTALL.md) for manual and local-development paths.
+Both paths run the same engine: `terraform/examples/full-install` provisions every GCP resource and installs the Helm chart that owns every Kubernetes one, end to end and idempotently. `./uninstall.sh` (or `lifecycle.sh destroy`) reverses it. See the [quick start](https://gke-labs.github.io/kube-agents/install/quickstart-gke/) for the walkthrough, or [INSTALL.md](INSTALL.md) for manual and local-development paths.
 
 ---
 

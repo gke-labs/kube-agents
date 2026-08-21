@@ -17,15 +17,25 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 # session_kv_server imports agent_common_server, which imports mcp.server.fastmcp.
-# That symbol is absent from some installed versions of the mcp package, and when
-# it is, this whole module fails to import -- so every test in it silently does
-# not run. That is how three denial tests for the /inject authentication came to
-# be passing-by-not-existing. Stub only when the real import fails, so a working
-# environment still exercises the real path.
+# When that import fails this whole module fails to import -- so every test in it
+# silently does not run. That is how three denial tests for the /inject
+# authentication came to be passing-by-not-existing.
+#
+# ABSENT is not BROKEN: stub only when no mcp distribution is installed -- see
+# test_mcp_package_contract.py.
 try:  # pragma: no cover - depends on the installed mcp version
     import mcp.server.fastmcp  # noqa: F401
 except Exception:  # pragma: no cover
+    import importlib.metadata
     import types
+
+    # importlib.metadata, not find_spec -- see test_mcp_package_contract.py.
+    try:
+        importlib.metadata.distribution("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        pass  # absent: a bare checkout, which is what the stub is for
+    else:
+        raise  # installed and incompatible: the ImportError is the finding
 
     _stub = types.ModuleType("mcp.server.fastmcp")
 
@@ -389,6 +399,65 @@ class TestPlaintextIdentityPurge(unittest.TestCase):
         self.assertEqual(self._read("modern-1")["user_email_hash"], "deadbeef")
 
 
+class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
+    """The row has to say which platform its thread lives on.
+
+    It is the address deploy/docker/patches/kanban_event_routing.py substitutes
+    into the event-triage card's subscription, and a thread belongs to exactly
+    one platform: a report addressed to the other is not degraded but refused
+    -- `slack:spaces/…:spaces/…/threads/…` resolves nothing. Before this field
+    was written the row carried `k8s-watcher` from POST /sessions, which the
+    patch treats as non-chat and declines to substitute.
+    """
+
+    def setUp(self):
+        import sqlite3
+
+        self._saved = {k: os.environ.get(k) for k in ("SLACK_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL")}
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                ("k8s-evt-abc123", json.dumps({"origin": "k8s-watcher"})),
+            )
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def _read(self):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-abc123",)
+            ).fetchone()
+        return json.loads(row[0])
+
+    def test_a_google_chat_thread_is_recorded_as_google_chat(self):
+        session_kv_server._register_session_routing(
+            "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
+        row = self._read()
+        self.assertEqual(row["platform"], "google_chat")
+        self.assertEqual(row["thread_id"], "spaces/AAQA123/threads/xYz")
+        # The space is the thread's own prefix, not the home channel.
+        self.assertEqual(row["chat_id"], "spaces/AAQA123")
+
+    def test_a_slack_thread_is_recorded_as_slack(self):
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        session_kv_server._register_session_routing(
+            "k8s-evt-abc123", "slack", "1712345678.000100")
+        row = self._read()
+        self.assertEqual(row["platform"], "slack")
+        self.assertEqual(row["chat_id"], "C0123456789")
+
+    def test_the_rest_of_the_row_is_preserved(self):
+        session_kv_server._register_session_routing(
+            "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
+        self.assertEqual(self._read()["origin"], "k8s-watcher")
+
+
 class TestAlertDailyQuota(unittest.TestCase):
     """The per-severity daily ceiling enforced in /sessions/{id}/inject."""
 
@@ -599,7 +668,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         self.assertIn("project=test-project-id", query)
         self.assertNotIn("jayantid-gkedemos", query)
 
@@ -613,7 +682,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         with patch.dict(os.environ, {"GCP_PROJECT_ID": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
+            query = session_kv_server._build_agent_query(payload)
             self.assertIn("project=test-project-legacy", query)
 
     def test_build_agent_query_no_project(self):
@@ -625,7 +694,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
+            query = session_kv_server._build_agent_query(payload)
             # With no project configured the console links carry no project
             # qualifier at all — `?project=` / `;project=` are omitted rather
             # than emitted empty, which would send the reader to a dead link.
@@ -643,7 +712,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message",
             "cluster": "prod-us-central1"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         self.assertIn("prod-us-central1", query)
         self.assertNotIn("platform-agent-host", query)
 
@@ -658,20 +727,19 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         self.assertIn("platform-agent-host", query)
 
-    def test_call_to_action_names_options_instead_of_a_placeholder(self):
-        # The call-to-action is copied verbatim into the chat message, so a
-        # `<letter>` there reaches the responder as an unfilled placeholder
-        # rather than a choice they can act on. `<letter>` is still correct in
-        # the instruction prose above the template, which the agent reads but
-        # never echoes -- so pin the template line, not the whole query.
-        #
-        # Locate it structurally, by its position and label, rather than by the
-        # text under test: selecting the line that contains `apply Option A`
-        # would make the assertions below tautological, and the instruction
-        # prose above the template legitimately says `apply Option <letter>`.
+    def test_the_template_does_not_invite_a_reply_it_cannot_honour(self):
+        # The report used to end with "To authorize: reply 'apply'". The agent
+        # that acts on such a reply reads the report back from the `incidents`
+        # table via the incident_context plugin, and the only writer of that
+        # table is platform_mcp_server.send_notification -- the egress call this
+        # delivery path replaced. So the row is never written, the lookup
+        # returns None, and the front door gets the bare word `apply` with no
+        # report, no options and no cluster. Nothing unsafe happens; it just
+        # cannot work. The invitation is withheld until #802 stores the
+        # report on the delivery path.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -679,21 +747,19 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         what_to_do = query.split("## What to do", 1)[1]
-        cta = next(
-            line for line in what_to_do.splitlines()
-            if line.startswith("- **To authorize:**")
-        )
-        self.assertNotIn("<letter>", cta)
-        self.assertIn("apply Option A", cta)
-        self.assertIn("apply Option B", cta)
+        for promise in ("To authorize:", "reply **'apply'**", "apply Option A"):
+            self.assertNotIn(promise, what_to_do)
 
     def test_template_uses_only_the_three_permitted_sections(self):
         # The template says "formatted exactly like this", so it outranks the
-        # persona for this path. SOUL.md section 7 permits exactly three `##`
-        # sections; a fourth labelled block here would override that policy
-        # silently rather than extend it, and the two briefs would contradict.
+        # persona for this path. The Platform Agent's SOUL.md section 7 permits
+        # exactly three `##` sections; a fourth labelled block here would
+        # override that policy silently rather than extend it, and the two
+        # briefs would contradict. The Cluster Agent this is usually routed to
+        # has no such section, so the template is the only statement of the
+        # shape it ever sees — one more reason it must not drift.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -701,17 +767,18 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
+        query = session_kv_server._build_agent_query(payload)
         headings = [line.strip() for line in query.splitlines() if line.startswith("## ")]
         self.assertEqual(headings, ["## What's wrong", "## Why", "## What to do"])
         # The old shape's labelled blocks are gone, not merely relocated.
         for stale in ("📋 **Incident Triage**", "🛠️ **Proposed Fixes (GitOps):**", "- **Issue:**"):
             self.assertNotIn(stale, query)
 
-    def test_approval_line_survives_inside_what_to_do(self):
-        # The authorization words are the one thing the reader cannot recover
-        # if the shape change drops them: without them they have a recommended
-        # GitOps fix and no stated way to authorize it.
+    def test_the_agent_is_told_not_to_write_its_own_call_to_action(self):
+        # Removing the bullet from the template is not enough on its own. The
+        # options end in a recommendation, which reads like it wants a decision,
+        # and an agent completing that shape will supply the missing line
+        # itself. So the instruction prose says outright not to.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -719,18 +786,160 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
-        body = query.split("## What to do", 1)[1].split("**GitOps PR Instructions", 1)[0]
-        self.assertIn("apply Option A", body)
-        self.assertIn("Recommended: Option", body)
-        # It shares a bullet list with the Options now that the separate `👉`
-        # block is gone, so it has to be labelled as the authorization step or
-        # it reads as one more thing to choose between.
-        authorize = next(
-            line for line in body.splitlines()
-            if line.startswith("- **To authorize:**")
-        )
-        self.assertNotRegex(authorize, r"\*\*Option [A-Z]")
+        query = session_kv_server._build_agent_query(payload)
+        instructions = query.split("## What to do", 1)[0]
+        self.assertIn("Do not end the report by inviting a reply", instructions)
+        self.assertIn("cannot see your report", instructions)
+
+    def test_the_options_and_the_recommendation_are_still_there(self):
+        # The report is now read rather than replied to, so the options carry
+        # the whole of its value. Dropping the call-to-action must not take the
+        # thing the call-to-action pointed at.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query(payload)
+        what_to_do = query.split("## What to do", 1)[1]
+        self.assertIn("**Option A (<Action Title>):**", what_to_do)
+        self.assertIn("Recommended: Option", what_to_do)
+        # And the report still has to be actionable by whoever opens the PR,
+        # since nothing can ask its author a follow-up question.
+        self.assertIn("open the Pull Request from your report alone", query)
+
+
+class TestTriageDeliveryInstruction(unittest.TestCase):
+    """What the card body has to say now that the card itself is the channel.
+
+    Delivery is the subscription the card carries, resolved to the alert's chat
+    thread by deploy/docker/patches/kanban_event_routing.py. The body's job is
+    no longer to ask for a second tool call; it is to make sure the thing the
+    notifier posts -- `kanban_complete`'s `result` -- is the whole report, and
+    that it is this card's result rather than some child card's.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+
+    def body(self):
+        return session_kv_server._triage_task_body(self.PAYLOAD)
+
+    def test_completion_is_demanded_not_offered(self):
+        # The old wording put MUST on an argument -- "when calling your
+        # send_notification tool ... you MUST pass this exact session ID" --
+        # which read as a condition on making the call at all. The agent
+        # summarised it back as "pass session_id if notification tools are
+        # used", called nothing, and the RCA was lost. Whatever the mechanism,
+        # the terminal call may not sound conditional.
+        body = self.body()
+        self.assertIn("**Finish by calling `kanban_complete(", body)
+        for hedge in ("if you have", "if notification", "if available", "If you have access"):
+            self.assertNotIn(hedge, body)
+
+    def test_the_whole_report_goes_in_result(self):
+        # `result` is verbatim what the notifier posts, so a card completed with
+        # a one-line result delivers one line. This is the failure the old
+        # send_notification path could not have: the report was a separate
+        # argument to a separate call.
+        body = self.body()
+        self.assertIn("Pass the entire report as `result`, not a summary of it", body)
+        self.assertIn("`result` is what gets posted there", body)
+
+    def test_it_says_where_the_result_goes(self):
+        # An agent whose persona says "the card is the channel" needs to know
+        # this card's completion is read by a human, or it writes `result` for
+        # the board.
+        self.assertIn("subscribed to the chat thread where the alert was raised", self.body())
+
+    def test_the_report_may_not_be_delegated(self):
+        # Delegation is the specific failure mode, and it is fatal under this
+        # design for a sharper reason than before: only *this* card carries the
+        # subscription, so a child card's result is delivered nowhere.
+        body = self.body()
+        self.assertIn("Do not delegate the diagnosis to another agent", body)
+        self.assertIn("do not open child cards", body)
+        self.assertIn("this card's own result", body)
+
+    def test_no_second_egress_call_is_asked_for(self):
+        # The Cluster Agent has no send_notification tool. Naming one is how the
+        # instruction became unfollowable.
+        self.assertNotIn("send_notification", self.body())
+
+
+class TestFrontDoorDelegation(unittest.TestCase):
+    """The turn itself, which is always read by the `default` profile.
+
+    `_create_gateway_session` cannot pick a profile -- Hermes selects one by URL
+    prefix under `gateway.multiplex_profiles`, not by a body key -- so this text
+    is addressed to a router with no cluster access and one delegation tool.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+
+    def query(self):
+        return session_kv_server._build_agent_query(self.PAYLOAD)
+
+    def test_it_asks_for_one_card_on_the_failing_cluster_s_agent(self):
+        query = self.query()
+        self.assertIn("kanban_create", query)
+        self.assertIn("`cluster-*` agent scoped to **prod-us-central1**", query)
+
+    def test_it_forbids_the_improvisations_that_lost_the_report(self):
+        # Observed live on 2026-08-17: the front door summarised the brief into
+        # the cluster card, then filed a second card asking the Platform Agent
+        # to post the report, then leaked a "test notification" probe into the
+        # user's incident thread from a third.
+        query = self.query()
+        self.assertIn("copied verbatim", query)
+        self.assertIn("do not file a second card", query)
+
+    def test_the_card_body_is_carried_whole_and_marked_off(self):
+        # The brief is a payload for another agent, not instructions for this
+        # one. Markers are what let the router copy it without reading it as
+        # its own task.
+        query = self.query()
+        body = session_kv_server._triage_task_body(self.PAYLOAD)
+        between = query.split("--- BEGIN TASK BODY (copy verbatim) ---\n", 1)[1]
+        between = between.split("\n--- END TASK BODY ---", 1)[0]
+        self.assertEqual(between, body)
+
+    def test_the_turn_does_not_ask_the_front_door_to_diagnose(self):
+        # It holds no cluster tools at all, so an instruction it cannot follow
+        # is an invitation to invent an answer.
+        self.assertIn("Do not diagnose the event", self.query())
+
+
+class TestGatewaySessionBody(unittest.TestCase):
+
+    def test_no_profile_key_is_sent(self):
+        # The gateway takes the profile from a `/p/<profile>/` URL prefix, and
+        # only when `gateway.multiplex_profiles` is on. A `profile` key in this
+        # body is accepted with a 201 and dropped -- which read as success for
+        # a whole release while every triage ran on the default profile.
+        with patch("session_kv_server.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = MagicMock(status=200)
+            ok = session_kv_server._create_gateway_session(
+                "http://127.0.0.1:8642", "k8s-evt-abc123", {"Content-Type": "application/json"}
+            )
+        self.assertTrue(ok)
+        body = json.loads(urlopen.call_args[0][0].data.decode("utf-8"))
+        self.assertEqual(set(body), {"session_id", "title"})
 
 
 class TestGatewayApiToken(unittest.TestCase):

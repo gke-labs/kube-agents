@@ -5,16 +5,16 @@ description: Bootstrap a GKE cluster, the kube-agents operator, and the Platform
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-The `./provision.sh` script bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter.
+The `./install.sh` installer bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter. It is a front door, not a second provisioner — the engine underneath is the Terraform composition [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which owns every GCP resource and installs the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents), which owns every Kubernetes resource.
 
-Prefer declarative IaC over the interactive pipeline? A single `terraform apply` can provision the same stack — see [Helm and Kind](/kube-agents/install/helm-and-kind/) for the Terraform + Helm path. Pick one path per project; both create equivalent GCP resources (the Terraform path provisions an Autopilot cluster where the scripts provision Standard).
+Prefer declarative IaC over the interview? Apply the same composition by hand with your own `terraform.tfvars` — see [the composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) for the hand-driven path. Both paths run the same Terraform, so they create the same resources.
 
 <Aside type="note">
   Prerequisites: a GCP project with billing enabled and `gcloud` authenticated.
-  If you're starting from a fresh project, the provisioner creates the GKE
-  cluster for you. You do **not** need to pre-install
+  If you're starting from a fresh project, the installer creates the GKE cluster
+  for you. You do **not** need to pre-install
   [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster)
-  — the operator step installs it automatically if it isn't already present.
+  — the composition installs it automatically if it isn't already present.
 </Aside>
 
 ## Run the Zero-Friction One-Liner Installer
@@ -30,7 +30,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 
 The installer asks for an immutable image/source revision. Enter a SemVer release tag or the full
 40-character commit SHA behind a validated RC tag; mutable refs such as `latest` and `main` are
-rejected so the provisioning scripts and container images stay on the same revision.
+rejected so the Terraform configuration and container images stay on the same revision.
 
 For non-interactive AI Agent or CI/CD automated deployments:
 
@@ -44,7 +44,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
   --permission-set="read-only"
 ```
 
-## Manual / Interactive Provisioner Workflow
+## Interactive installer workflow
 
 <Steps>
 
@@ -55,23 +55,15 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
    cd kube-agents
    ```
 
-2. **Run the provisioner.** The `gcp-provision` target lives in the operator's Makefile:
+2. **Run the installer.**
 
    ```bash
-   cd k8s-operator
-   make gcp-provision
+   ./install.sh
    ```
 
-   Or run the master script directly:
+   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, image tag, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). Answers are saved to `k8s-operator/scripts/vars.sh` (git-ignored, `chmod 600`), the install's machine-readable record; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two cannot disagree. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
 
-   ```bash
-   cd k8s-operator/scripts
-   ./provision.sh
-   ```
-
-   The first run is interactive: it prompts for the values it needs (project ID, region, cluster name, base image tag, container registry prefix, model provider and API key, agent permission set, and opt-in integrations such as Google Chat, Slack, and GitHub). Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored) so re-runs are non-interactive — except the base image tag, which is asked once per run because it usually changes between deploys. Every sub-step is idempotent, so you can safely Ctrl-C and re-run.
-
-3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the topic created in step 5 (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The provisioner prints the exact topic name and step-by-step instructions when it finishes.
+3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the created topic (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The installer prints the exact topic name and step-by-step instructions when it finishes.
 
 4. **Verify.**
 
@@ -86,38 +78,24 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
 
 ## What just happened
 
-`./provision.sh` runs a sequence of modular sub-scripts. Each is idempotent, so re-running the master script skips work already done.
+`./install.sh` collected your answers, wrote `vars.sh` and `terraform.tfvars`, and ran one `terraform apply` through the composition's [`lifecycle.sh`](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/lifecycle.sh) — GCP APIs, the GKE cluster (CMEK, Workload Identity, the host-discovery label), IAM and Workload Identity bindings, cert-manager, and the Helm chart carrying the operator, the `PlatformAgent` CR, the credentials Secret, and the LiteLLM gateway. Terraform state lives in a versioned GCS bucket (`<project>-kube-agents-tfstate`, prefix `kube-agents/<cluster>`), so `uninstall.sh` and `upgrade.sh` can find the install from a fresh clone.
 
-```mermaid
-flowchart TB
-    A[provision.sh] --> B["01: GKE cluster<br/>Workload Identity"]
-    A --> C["02: gVisor node pool (opt-in)"]
-    A --> D["03: Operator CRDs + manager<br/>(+ cert-manager)"]
-    A --> E["04: IAM + Workload Identity bindings"]
-    A --> F["05: Google Chat Pub/Sub (opt-in)"]
-    A --> G["06: Slack (opt-in)"]
-    A --> H["07: LLM API key Secret"]
-    A --> I["08: PlatformAgent CR<br/>host-discovery label"]
-    A --> J["09: LiteLLM Deployment"]
-    A --> K["10: GitHub token minter + Cloud KMS (opt-in)"]
-    A --> L["11: inference-replay (opt-in)"]
-```
+Two steps stay `gcloud` calls because Terraform cannot express them: the managed OpenTelemetry collection scope, and CMEK on a cluster that already existed before the install. The one-shot GitHub App key import into KMS also runs outside Terraform, so the PEM never enters state.
 
-See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the per-script breakdown.
+Changing your mind later is the same engine: `./install.sh --menu` opens a Day-2 control panel whose **Save & Apply** regenerates `terraform.tfvars` and re-applies.
 
 ## Common flags and toggles
 
-- `--dry-run` — prints what would be done without applying anything.
-- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 2.
-- `GOOGLE_CHAT_ENABLED=true` — configures the Google Chat Pub/Sub integration in step 5 (otherwise step 5 no-ops).
-- `SLACK_ENABLED=true` — configures Slack tokens in step 6 (otherwise step 6 no-ops).
-- `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 11.
+- `--dry-run` — always runs `terraform validate`, and adds a full `terraform plan` preview when Application Default Credentials exist; nothing is created, and state stays local. It still overwrites `vars.sh`.
+- `--gvisor=true` — provisions the gVisor sandbox node pool (the `gke-cluster` module's `enable_gvisor_node_pool`).
+- `--enable-google-chat` — provisions the Google Chat Pub/Sub backend and enables the CR's `googleChat` integration.
+- `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 
-Set these as environment variables before running, or accept the interactive defaults.
+Run `./install.sh --help` for the full list.
 
 ## Uninstall
 
-Run `make gcp-teardown` from `k8s-operator` (or `./teardown.sh` directly from `k8s-operator/scripts`) to run the sub-scripts in reverse order. See [Uninstall](/kube-agents/install/uninstall/) for the full procedure.
+Run `./uninstall.sh` — it drives the same composition's `lifecycle.sh destroy` against the state in GCS. See [Uninstall](/kube-agents/install/uninstall/) for the full procedure and the asymmetries it handles.
 
 ## Next steps
 

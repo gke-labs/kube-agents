@@ -135,16 +135,16 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 # empty string rather than failing, which renders `image:` — a null the API
 # server rejects with a message that says nothing about the missing variable.
 # Check first, and name where the value comes from.
-# $(3) says where the script gets the value, because the three integrations do
-# not agree: the two third-party images are resolved from images.json, while
-# the replay proxy is built here and follows REGISTRY_PREFIX.
-require-var = @test -n "$${$(1)}" || { echo "$(1) is not set. Export it, or run $(2), which resolves it from $(3)." >&2; exit 1; }
+# $(2) says where the value lives, because the integrations do not agree: the
+# third-party pins are in images.json, while the replay proxy is built here
+# and follows REGISTRY_PREFIX.
+require-var = @test -n "$${$(1)}" || { echo "$(1) is not set. Export it; the reference lives in $(2)." >&2; exit 1; }
 
 # The third-party images default to their upstream pin straight from the
 # inventory, so the documented manual sequences (INSTALL.md Step 5, README
 # below) keep working without exporting anything. `?=` means an export still
-# wins, and the provisioning scripts — which are the mirrored path, and know
-# about THIRD_PARTY_REGISTRY_PREFIX — always export. Resolving here rather than
+# wins for a mirrored deploy that sets its own references. Resolving here
+# rather than
 # hardcoding keeps images.json the only place any of these pins is written; if
 # jq is missing or the entry is gone the variable stays empty and require-var
 # reports it by name.
@@ -169,10 +169,8 @@ HINDSIGHT_VARS = $$HINDSIGHT_API_IMAGE $$HINDSIGHT_POSTGRES_IMAGE
 
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
-	$(call require-var,LITELLM_IMAGE,scripts/provision_09_deploy_litellm.sh,images.json)
-	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
-	elif [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
+	$(call require-var,LITELLM_IMAGE,images.json)
+	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
@@ -180,9 +178,7 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
-	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
-	elif [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
+	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
@@ -190,8 +186,8 @@ undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 
 .PHONY: deploy-hindsight
 deploy-hindsight: kustomize ## Deploy the Hindsight memory store.
-	$(call require-var,HINDSIGHT_API_IMAGE,scripts/provision_13_deploy_hindsight.sh,images.json)
-	$(call require-var,HINDSIGHT_POSTGRES_IMAGE,scripts/provision_13_deploy_hindsight.sh,images.json)
+	$(call require-var,HINDSIGHT_API_IMAGE,images.json)
+	$(call require-var,HINDSIGHT_POSTGRES_IMAGE,images.json)
 	$(KUSTOMIZE) build config/integrations/hindsight | envsubst '$(HINDSIGHT_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-hindsight
@@ -200,7 +196,7 @@ undeploy-hindsight: kustomize ## Undeploy the Hindsight memory store (keeps its 
 
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
-	$(call require-var,REPLAY_IMAGE,scripts/provision_11_deploy_inference_replay.sh,REGISTRY_PREFIX)
+	$(call require-var,REPLAY_IMAGE,REGISTRY_PREFIX)
 	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-inference-replay
@@ -209,7 +205,7 @@ undeploy-inference-replay: kustomize ## Undeploy Inference Replay proxy integrat
 
 .PHONY: deploy-github
 deploy-github: kustomize ## Deploy GitHub integration.
-	$(call require-var,GITHUB_MINTER_IMAGE,scripts/provision_10_deploy_github_minter.sh,images.json)
+	$(call require-var,GITHUB_MINTER_IMAGE,images.json)
 	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$KMS_LOCATION $$GITHUB_ORG $$GITHUB_REPO $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME $$GITHUB_MINTER_IMAGE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-github
@@ -279,160 +275,10 @@ endef
 
 ##@ Setup & Cleanup
 
-.PHONY: provision gcp-provision
-provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy PlatformAgent.
-	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
-	@./scripts/provision.sh $(ARGS)
-
-.PHONY: teardown gcp-teardown
-teardown gcp-teardown: ## Clean up and delete all provisioned GCP and GKE resources.
-	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
-	@./scripts/teardown.sh
-
-.PHONY: gcp-provision-01-cluster
-gcp-provision-01-cluster: ## Step 1: Provision GKE cluster and initial GCP environment.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_01_gcp_cluster.sh $(ARGS)
-
-.PHONY: gcp-provision-02-gvisor
-gcp-provision-02-gvisor: ## Step 2: Provision gVisor node pool for GKE Sandbox.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_02_gvisor_nodepool.sh $(ARGS)
-
-.PHONY: gcp-provision-03-operator
-gcp-provision-03-operator: ## Step 3: Install operator CRDs and deploy controller manager.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_03_gcp_gke_operator.sh $(ARGS)
-
-.PHONY: gcp-provision-04-iam
-gcp-provision-04-iam: ## Step 4: Configure IAM service accounts and Workload Identity.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_04_gcp_iam.sh $(ARGS)
-
-.PHONY: gcp-provision-05-gchat
-gcp-provision-05-gchat: ## Step 5: Setup Google Chat Pub/Sub topic and subscription.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_05_gcp_gchat.sh $(ARGS)
-
-.PHONY: gcp-provision-06-slack
-gcp-provision-06-slack: ## Step 6: Setup Slack integration configuration.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_06_slack.sh $(ARGS)
-
-.PHONY: gcp-provision-07-secrets
-gcp-provision-07-secrets: ## Step 7: Configure secrets directly in GKE.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_07_gcp_k8s_secrets.sh $(ARGS)
-
-.PHONY: gcp-provision-08-deploy
-gcp-provision-08-deploy: ## Step 8: Deploy the PlatformAgent Custom Resource.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_08_deploy_platform_agent.sh $(ARGS)
-
-.PHONY: gcp-provision-09-litellm
-gcp-provision-09-litellm: ## Step 9: Deploy LiteLLM Gateway.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_09_deploy_litellm.sh $(ARGS)
-
-.PHONY: gcp-provision-10-github
-gcp-provision-10-github: ## Step 10: Deploy GitHub Token Minter.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_10_deploy_github_minter.sh $(ARGS)
-
-.PHONY: gcp-provision-11-inference-replay
-gcp-provision-11-inference-replay: ## Step 11: Deploy Inference Replay proxy.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_11_deploy_inference_replay.sh $(ARGS)
-
-.PHONY: gcp-provision-12-gke-backup-plan
-gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disaster recovery.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
-
-.PHONY: gcp-provision-13-hindsight
-gcp-provision-13-hindsight: ## Step 13: Deploy Hindsight memory store.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_13_deploy_hindsight.sh $(ARGS)
-
-.PHONY: gcp-provision-14-verify-rollout
-gcp-provision-14-verify-rollout: ## Step 14: Verify the PlatformAgent Deployment rollout.
-	@chmod +x scripts/*.sh
-	@./scripts/provision_14_verify_agent_rollout.sh $(ARGS)
-
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
-
-.PHONY: gcp-teardown-13-hindsight
-gcp-teardown-13-hindsight: ## Teardown Step 13: Undeploy Hindsight memory store.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_13_deploy_hindsight.sh $(ARGS)
-
-.PHONY: gcp-teardown-12-gke-backup-plan
-gcp-teardown-12-gke-backup-plan: ## Teardown Step 12: Delete GKE Backup Plan and snapshots.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_12_gke_backup_plan.sh $(ARGS)
-
-.PHONY: gcp-teardown-11-inference-replay
-gcp-teardown-11-inference-replay: ## Teardown Step 11: Undeploy Inference Replay proxy.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_11_deploy_inference_replay.sh $(ARGS)
-
-.PHONY: gcp-teardown-10-github
-gcp-teardown-10-github: ## Teardown Step 10: Delete GitHub Token Minter resources.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_10_deploy_github_minter.sh $(ARGS)
-
-.PHONY: gcp-teardown-09-litellm
-gcp-teardown-09-litellm: ## Teardown Step 9: Undeploy LiteLLM Gateway.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_09_deploy_litellm.sh $(ARGS)
-
-.PHONY: gcp-teardown-08-deploy
-gcp-teardown-08-deploy: ## Teardown Step 8: Delete the PlatformAgent Custom Resource.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_08_deploy_platform_agent.sh $(ARGS)
-
-.PHONY: gcp-teardown-07-secrets
-gcp-teardown-07-secrets: ## Teardown Step 7: Clean up Kubernetes secrets.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_07_gcp_k8s_secrets.sh $(ARGS)
-
-.PHONY: gcp-teardown-06-slack
-gcp-teardown-06-slack: ## Teardown Step 6: Reset Slack integration settings.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_06_slack.sh $(ARGS)
-
-.PHONY: gcp-teardown-05-gchat
-gcp-teardown-05-gchat: ## Teardown Step 5: Delete Google Chat Pub/Sub resources.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_05_gcp_gchat.sh $(ARGS)
-
-.PHONY: gcp-teardown-04-iam
-gcp-teardown-04-iam: ## Teardown Step 4: Remove IAM service accounts and policies.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_04_gcp_iam.sh $(ARGS)
-
-.PHONY: gcp-teardown-03-operator
-gcp-teardown-03-operator: ## Teardown Step 3: Undeploy the operator and CRDs.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_03_gcp_gke_operator.sh $(ARGS)
-
-.PHONY: gcp-teardown-02-gvisor
-gcp-teardown-02-gvisor: ## Teardown Step 2: Delete gVisor node pool without destroying cluster.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_02_gvisor_nodepool.sh $(ARGS)
-
-.PHONY: gcp-teardown-dev-artifact-registry
-gcp-teardown-dev-artifact-registry: ## Teardown Dev Step: Delete the Artifact Registry repository created during local rebuilds.
-	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
-	@./scripts/dev/teardown_dev_01_gcp_artifact_registry.sh $(ARGS)
-
-.PHONY: gcp-teardown-01-cluster
-gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local configuration state.
-	@chmod +x scripts/*.sh
-	@./scripts/teardown_01_gcp_cluster.sh $(ARGS)
 
 ##@ Formatting
 

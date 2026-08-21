@@ -4727,3 +4727,84 @@ func TestFrontDoorToolsetsMatchPlatformConfig(t *testing.T) {
 			path, got, want)
 	}
 }
+
+// TestImagePullSecretsReachThePodSpec is the end-to-end check for #499: an
+// authenticated private registry is only usable if the pull identity lands on
+// the pod, and the pod is where it has to land — Kubernetes has no
+// per-container pull identity, so one field covers the agent, both
+// operator-injected sidecars, and anything the CR adds beside them.
+func TestImagePullSecretsReachThePodSpec(t *testing.T) {
+	agent := func(secrets ...string) *agentv1alpha1.PlatformAgent {
+		var refs []corev1.LocalObjectReference
+		for _, s := range secrets {
+			refs = append(refs, corev1.LocalObjectReference{Name: s})
+		}
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{ImagePullSecrets: refs},
+				},
+			},
+		}
+	}
+	names := func(refs []corev1.LocalObjectReference) []string {
+		var out []string
+		for _, r := range refs {
+			out = append(out, r.Name)
+		}
+		return out
+	}
+
+	t.Run("from the CR", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		dep := buildDeployment(agent("harbor-pull", "extra-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull", "extra-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("from the operator-wide default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildDeployment(agent(), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"fleet-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v — IMAGE_PULL_SECRETS must reach a CR that names none", got, want)
+		}
+	})
+
+	t.Run("the CR wins over the default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildDeployment(agent("harbor-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+
+	// The default install must render exactly as it did before this field
+	// existed; an empty slice instead of nil would show up as `imagePullSecrets:
+	// []` on every agent Deployment in the fleet.
+	t.Run("absent when nothing is configured", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		bare := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"}}
+		dep := buildDeployment(bare, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got := dep.Spec.Template.Spec.ImagePullSecrets; got != nil {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want nil", got)
+		}
+	})
+
+	// buildStatefulSet shares buildPodTemplateSpec with buildDeployment, and the
+	// RWO storage path is the only way to reach it — an agent with custom RWO
+	// storage must not be the one install that cannot pull from its mirror.
+	t.Run("on the StatefulSet path too", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		sts := buildStatefulSet(agent("harbor-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(sts.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("StatefulSet pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+}

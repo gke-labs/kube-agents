@@ -20,6 +20,9 @@ spec:
         kubectl.kubernetes.io/default-container: manager
     spec:
       serviceAccountName: {{ .Release.Name }}-operator-sa
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       terminationGracePeriodSeconds: 10
       securityContext:
         runAsNonRoot: true
@@ -56,6 +59,15 @@ spec:
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
             - name: FLUENT_BIT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
+            {{- /* The pull identity for those same pods. Redundant for the CR
+                   this release renders, which carries the secrets itself, and
+                   load-bearing for any OTHER PlatformAgent written against this
+                   install: without it that agent reaches an authenticated
+                   mirror with no credentials at all. */}}
+            {{- with (include "kube-agents.imagePullSecretNames" .) }}
+            - name: IMAGE_PULL_SECRETS
+              value: {{ . | quote }}
+            {{- end }}
             {{- /* Last occurrence of a name wins in a container's env, so an
                    operator.extraEnv entry still overrides anything above. */}}
             {{- with .Values.operator.extraEnv }}

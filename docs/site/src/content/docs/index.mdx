@@ -37,10 +37,10 @@ It ships as a small set of components:
 - An **inference gateway** — [LiteLLM](https://litellm.ai) for hosted models (Gemini, Anthropic, OpenAI) or [vLLM](https://vllm.ai) for local models on GPU nodes.
 
 <Aside type="note">
-  Today's shipping skills, provisioning scripts, and MCP integrations target
-  GKE. The Platform Agent architecture — the agent Deployment, operator,
-  inference gateway, ChatOps ingress — is not GKE-specific and can extend to
-  other Kubernetes distributions as skills and toolsets are added.
+  Today's shipping skills, install path, and MCP integrations target GKE. The
+  Platform Agent architecture — the agent Deployment, operator, inference
+  gateway, ChatOps ingress — is not GKE-specific and can extend to other
+  Kubernetes distributions as skills and toolsets are added.
 </Aside>
 
 ## Two ways to think about it
@@ -122,15 +122,15 @@ Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page
 
 ## Install
 
-The working install path is GKE via the provisioning script.
+The working install path is GKE via the installer.
 
 ```bash
 git clone https://github.com/gke-labs/kube-agents.git
-cd kube-agents/k8s-operator/scripts
-./provision.sh
+cd kube-agents
+./install.sh
 ```
 
-The script bootstraps a GKE Standard cluster, the operator CRDs, IAM bindings, Google Chat Pub/Sub, Kubernetes secrets, and the Platform Agent itself. See the [Quick start](/kube-agents/install/quickstart-gke/) for a step-by-step breakdown.
+The installer bootstraps a GKE cluster, the operator CRDs, IAM bindings, Google Chat Pub/Sub, Kubernetes secrets, and the Platform Agent itself — one `terraform apply` through `terraform/examples/full-install`. See the [Quick start](/kube-agents/install/quickstart-gke/) for a step-by-step breakdown.
 
 ## Disclaimer
 

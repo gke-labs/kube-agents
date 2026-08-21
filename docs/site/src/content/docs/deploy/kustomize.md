@@ -61,7 +61,7 @@ The base [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kub
 > [!IMPORTANT]
 > **Workload Identity metadata egress**: On GKE Dataplane V1 (iptables), the node rewrites `169.254.169.254:80` to the node-local metadata daemon at `169.254.169.252:988` in `nat PREROUTING` before `NetworkPolicy` is evaluated. Dataplane V2 (eBPF) evaluates policy pre-NAT at the socket layer, where the `169.254.169.254/32` rule on ports `80`/`8080` satisfies it directly.
 >
-> - **Operator Deployments**: The operator generates both rules (`169.254.169.254/32` on ports `80`/`8080` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. Nothing to configure.
+> - **Operator Deployments**: The operator generates both rules (`169.254.169.254/32` on ports `80`/`8080` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. Cluster DNS and metadata daemon endpoints are discovered automatically, with escape hatch overrides available via `kubeagents.x-k8s.io/dns-cluster-ip` / `kubeagents.x-k8s.io/metadata-daemon-ip` annotations or `KUBERNETES_DNS_CLUSTER_IP` / `KUBERNETES_METADATA_DAEMON_IP` operator environment variables.
 > - **Static Kustomize Deployments**: [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) ships both rules directly, covering both Dataplane V1 and Dataplane V2 out of the box.
 
 Do **not** edit base manifests directly. If your cluster uses a different service CIDR, is a GKE Dataplane V2 cluster, is managing private-endpoint fleet clusters, or is a GKE Private Cluster with a specific Control Plane VIP range (e.g., `172.16.0.0/28`), override the CIDR cleanly in your deployment overlay using a Kustomize patch in your `kustomization.yaml`:
@@ -143,7 +143,7 @@ The exposed ports:
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
 - `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.
 - `config/integrations/github/` — Minty deployment and its `PodDisruptionBudget`.
-- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `PodDisruptionBudget`, `NetworkPolicy`, `PodMonitoring`, and `chatgpt` and `vertex_ai` overlays).
+- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `PodDisruptionBudget`, `NetworkPolicy`, `PodMonitoring`, and a `vertex_ai` overlay).
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, PVC, and `PodDisruptionBudget`.
 - `config/integrations/hindsight/` — the Planning Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `PodDisruptionBudget`s, `NetworkPolicy`, and `PodMonitoring`.
 
@@ -152,7 +152,12 @@ Each is built and applied on its own; there is no aggregate kustomization over
 output before it can be applied — each carries its image as a `${…}` variable so
 a mirrored install can redirect it, and most need other substitutions besides.
 
-Deploy these via `make deploy-*` from `k8s-operator/`:
+These copies are the **development path**: a stock install gets the same
+components rendered by the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents)
+(via the Terraform engine `./install.sh` drives), while `k8s-operator/config/`
+remains the source of truth for the CRDs and operator RBAC the chart copies
+(`make chart-check` enforces that). Deploy the dev copies via `make deploy-*`
+from `k8s-operator/`:
 
 ```bash
 make deploy                     # operator

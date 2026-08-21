@@ -28,6 +28,20 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Only if the mirror keeps third-party images (LiteLLM, fluent-bit) elsewhere;
 # defaults to image_registry.
 # third_party_image_registry = "us-east4-docker.pkg.dev/my-project/mirror"
+# Only if that mirror needs authenticating to (Harbor, Artifactory rather than
+# an Artifact Registry the nodes can already read). Names Secrets you create
+# yourself, in the namespace above, before applying — see the README.
+# image_pull_secrets = ["regcred"]
+
+# Cluster topology. "autopilot" (default) or "standard" — standard builds an
+# e2-standard-4 node pool with Dataplane V2, and is the only mode
+# that can carry the gVisor node pool. Set create_cluster = false to install
+# onto an existing cluster (it must already have Workload Identity; CMEK on it
+# stays a gcloud step outside Terraform).
+# cluster_mode            = "standard"
+# create_cluster          = false
+# enable_gvisor_node_pool = true
+# gvisor_pool_name        = "gvisor-pool"
 
 # Cluster tuning
 # deletion_protection = true
@@ -78,7 +92,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # slack_home_channel_name = "#kube-agents"
 
 # IAM. "read-only" (default) or "gke-admin" select the bundles
-# provision_04_gcp_iam.sh grants; "custom" requires project_roles. An explicit
+# the composition grants; "custom" requires project_roles. An explicit
 # project_roles list overrides permission_set either way.
 # permission_set = "read-only"
 
@@ -91,13 +105,11 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # backup_encryption_key  = "projects/my-gcp-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key"
 
 # Admission webhooks for the PlatformAgent CR, and the cert-manager install
-# that issues their serving certificate. Both default to on, matching
-# provision_03_gcp_gke_operator.sh.
+# that issues their serving certificate. Both default to on.
 #
 # Set enable_cert_manager = false if the cluster ALREADY runs cert-manager —
-# the script skips an existing install, this apply fails on the existing CRDs.
-# The webhooks keep working in that case; they just use the cert-manager that
-# is already there.
+# this apply fails on the existing CRDs otherwise. The webhooks keep working
+# in that case; they just use the cert-manager that is already there.
 #
 # Destroying a release that installed cert-manager here removes its CRDs, and
 # with them every Certificate and Issuer in the cluster, not only these. On a

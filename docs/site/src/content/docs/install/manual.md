@@ -3,7 +3,7 @@ title: Manual install
 description: Install the Platform Agent workspace into an existing Hermes-compatible harness by hand.
 ---
 
-If you're not using GKE or the shipping `./provision.sh` flow, you can install the Platform Agent workspace into an existing Hermes-compatible harness by hand. This page covers the harness-side setup only; you still need to arrange cluster access, chat ingress, an inference gateway, and (for GitOps flows) a token minter separately.
+If you're not using GKE or the shipping `./install.sh` flow, you can install the Platform Agent workspace into an existing Hermes-compatible harness by hand. This page covers the harness-side setup only; you still need to arrange cluster access, chat ingress, an inference gateway, and (for GitOps flows) a token minter separately.
 
 ## Prerequisites
 
@@ -58,7 +58,7 @@ See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Ref
 
 ## Step 4: Wire the surrounding infrastructure
 
-The manual install covers only the agent workspace. To reach parity with a `./provision.sh` install, you still need:
+The manual install covers only the agent workspace. To reach parity with a `./install.sh` install, you still need:
 
 - **Cluster access**: a Kubernetes context the agent can call. The shipping config expects the [GKE MCP server](https://container.googleapis.com/mcp) proxied via `mcp-remote`; for other clusters, substitute your own Kubernetes MCP server or add `kubectl` to the toolset.
 - **Chat ingress**: Google Chat Pub/Sub or Slack Socket Mode. See [ChatOps](/kube-agents/concepts/chatops/).

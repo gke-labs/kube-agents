@@ -31,6 +31,7 @@ module "gke" {
   enable_iap_ssh           = var.enable_iap_ssh
   gpu_type                 = var.gpu_type
   gpu_count                = var.gpu_count
+  orphan_max_age_hours     = var.orphan_max_age_hours
 }
 
 # Only the gke sub-module is vendored: it carries kube-agents changes (resource

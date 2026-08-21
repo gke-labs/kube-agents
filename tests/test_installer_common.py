@@ -1,0 +1,311 @@
+"""Unit tests for k8s-operator/scripts/installer_common.sh helpers.
+
+Covers the Terraform-state cluster probe (a managed-mode cluster entry reads
+as "ours", a data-mode entry from an existing-cluster install does not, and
+unparseable or unreadable state fails safe), the comma-or-space splitting
+behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
+"""
+
+import json
+import pathlib
+import stat
+import subprocess
+import tempfile
+import unittest
+
+from tests.testing.common import get_isolated_test_env
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_INSTALLER_COMMON = _REPO_ROOT / "k8s-operator" / "scripts" / "installer_common.sh"
+
+# installer_common.sh's contract: the caller defines the print helpers.
+_PRINT_STUBS = """
+print_info() { :; }
+print_success() { :; }
+print_warning() { :; }
+print_error() { echo "ERROR: $*" >&2; }
+"""
+
+
+def _state_doc(resources):
+    return json.dumps({"version": 4, "resources": resources})
+
+
+MANAGED_CLUSTER_STATE = _state_doc(
+    [{"mode": "managed", "type": "google_container_cluster", "name": "standard"}]
+)
+DATA_MODE_STATE = _state_doc(
+    [{"mode": "data", "type": "google_container_cluster", "name": "existing"}]
+)
+
+
+class InstallerCommonTest(unittest.TestCase):
+    def _run(
+        self,
+        script,
+        gcloud_stdout=None,
+        gcloud_exit=0,
+        env=None,
+        kubectl_script=None,
+        describe_stub='echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND" >&2; exit 1',
+        kms_versions="",
+    ):
+        """Source installer_common.sh with print stubs and run `script`.
+
+        A stub `gcloud` on PATH prints `gcloud_stdout` (when given) and exits
+        `gcloud_exit` for `storage cat` calls on the state object;
+        `clusters describe` runs `describe_stub` (default: exit 1, meaning
+        the cluster does not exist).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            state_file = pathlib.Path(tmp) / "default.tfstate"
+            if gcloud_stdout is not None:
+                state_file.write_text(gcloud_stdout)
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *\"clusters describe\"*) {describe_stub} ;;\n"
+                f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
+                "esac\n"
+                f"[ -f '{state_file}' ] && cat '{state_file}'\n"
+                f"exit {gcloud_exit}\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            # Hermetic kubectl: the generator recovers credentials from the
+            # live Secret when it can, and a developer's real kube context
+            # must never answer a unit test.
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(kubectl_script or "#!/usr/bin/env bash\nexit 1\n")
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            full_env = get_isolated_test_env(
+                overrides={
+                    "PROJECT_ID": "test-project",
+                    "CLUSTER_NAME": "test-cluster",
+                    "REGION": "us-central1",
+                    **(env or {}),
+                },
+                bin_dir=str(bin_dir),
+            )
+            body = f'set -u\n{_PRINT_STUBS}\nsource "{_INSTALLER_COMMON}"\n{script}'
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=full_env,
+                cwd=str(_REPO_ROOT),
+            )
+
+    # ── tf_state_has_cluster: the create_cluster re-run probe ────────────────
+
+    def test_managed_cluster_entry_reads_as_ours(self):
+        proc = self._run(
+            'tf_state_has_cluster; echo "rc=$?"',
+            gcloud_stdout=MANAGED_CLUSTER_STATE,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_data_mode_entry_is_not_ours(self):
+        # An existing-cluster install records a data-mode entry in the same
+        # state; reading it as "ours" would flip create_cluster back to true
+        # on re-run and plan a second cluster over the real one.
+        proc = self._run(
+            'tf_state_has_cluster; echo "rc=$?"',
+            gcloud_stdout=DATA_MODE_STATE,
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
+    def test_unparseable_state_fails_safe(self):
+        proc = self._run(
+            'tf_state_has_cluster; echo "rc=$?"',
+            gcloud_stdout="this is not JSON {",
+        )
+        self.assertNotIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_unreadable_state_fails_safe(self):
+        proc = self._run(
+            'tf_state_has_cluster; echo "rc=$?"',
+            gcloud_stdout=None,
+            gcloud_exit=1,
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
+    # ── hcl_csv_list: --custom-roles documents "space- or comma-separated" ──
+
+    def test_csv_list_splits_on_commas(self):
+        proc = self._run('hcl_csv_list "roles/viewer,roles/monitoring.viewer"')
+        self.assertEqual(
+            proc.stdout, '["roles/viewer", "roles/monitoring.viewer"]', proc.stderr
+        )
+
+    def test_csv_list_splits_on_spaces(self):
+        proc = self._run('hcl_csv_list "roles/viewer roles/monitoring.viewer"')
+        self.assertEqual(
+            proc.stdout, '["roles/viewer", "roles/monitoring.viewer"]', proc.stderr
+        )
+
+    def test_csv_list_splits_mixed_and_trims(self):
+        proc = self._run('hcl_csv_list " roles/a , roles/b  roles/c "')
+        self.assertEqual(proc.stdout, '["roles/a", "roles/b", "roles/c"]', proc.stderr)
+
+    def test_csv_list_empty_input_is_empty_list(self):
+        proc = self._run('hcl_csv_list ""')
+        self.assertEqual(proc.stdout, "[]", proc.stderr)
+
+    # ── write_tfvars_from_state: the API_SERVER_KEY guard ────────────────────
+
+    def test_tfvars_generation_without_api_server_key_fails_with_guidance(self):
+        # vars.sh omits API_SERVER_KEY when PERSIST_SECRETS_ON_DISK=false
+        # stripped it; under the front doors' `set -u` an unguarded read would
+        # abort on an opaque unbound-variable error mid-run.
+        proc = self._run(
+            "set -Eeo pipefail\n"
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"'
+        )
+        self.assertNotIn("rc=0", proc.stdout)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertNotIn("unbound variable", proc.stderr)
+        self.assertIn("API_SERVER_KEY", proc.stderr)
+
+    # ── cluster_mode follows the live cluster ────────────────────────────────
+
+    def test_tfvars_autopilot_cluster_keeps_autopilot_mode(self):
+        # Hardcoding "standard" against a live Autopilot install planned the
+        # cluster's destruction on the next uninstall/upgrade regeneration.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf 'True\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('cluster_mode               = "autopilot"', content)
+            # Exists but not in state (the stub serves no state object).
+            self.assertIn("create_cluster             = false", content)
+
+    def test_tfvars_standard_cluster_and_fresh_create_stay_standard(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            # An existing Standard cluster: describe succeeds, empty output.
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('cluster_mode               = "standard"', dest.read_text())
+            # No cluster at all: the script-parity create.
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('cluster_mode               = "standard"', content)
+            self.assertIn("create_cluster             = true", content)
+
+    def test_tfvars_refuses_to_guess_on_a_transient_describe_failure(self):
+        # Anything other than NOT_FOUND must abort: reading an auth expiry or
+        # network blip as "cluster absent" regenerates standard/create=true
+        # against a live Autopilot install and plans its replacement.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub='echo "ERROR: (gcloud) PERMISSION_DENIED: token expired" >&2; exit 1',
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not probe cluster", proc.stderr)
+
+    def test_tfvars_generation_recovers_credentials_from_live_secret(self):
+        # PERSIST_SECRETS_ON_DISK=false leaves vars.sh without the keys; the
+        # live Secret is their home, so the generator reads them back from it.
+        recovered_b64 = "cmVjb3ZlcmVkLWtleQ=="  # base64("recovered-key")
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            # Recovery is gated on the current context being this install's
+            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name.
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*) printf "%s" "{recovered_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                kubectl_script=kubectl_stub,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('api_server_key    = "recovered-key"', content)
+            # SESSION_KV_* recover too: an adoption re-install must keep the
+            # live salt or every chat identity re-pseudonymises.
+            self.assertIn('session_kv_salt    = "recovered-key"', content)
+
+    def test_tfvars_omits_credentials_when_persist_secrets_off(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_api_server_key"',
+                env={
+                    "PERSIST_SECRETS_ON_DISK": "false",
+                    "API_SERVER_KEY": "k1",
+                    "GEMINI_API_KEY": "g1",
+                    "SLACK_ENABLED": "true",
+                    "SLACK_BOT_TOKEN": "xoxb-1",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            for leaked in ("k1", "g1", "xoxb-1", "api_server_key", "slack_bot_token"):
+                self.assertNotIn(leaked, content)
+            self.assertIn("Credentials omitted", content)
+            # The TF_VAR_* channel carries them instead.
+            self.assertIn("tfvar=k1", proc.stdout)
+
+    def test_minter_deferred_without_an_enabled_key_version(self):
+        # A minter whose KMS key holds no ENABLED version never passes
+        # readiness, and the apply waits on it — the generator defers.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITHUB_ORG": "org",
+                "GITHUB_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(f'write_tfvars_from_state "{dest}"', env=env, kms_versions="")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            proc = self._run(f'write_tfvars_from_state "{dest}"', env=env, kms_versions="1")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = true", dest.read_text())
+
+    def test_tfvars_recovery_refuses_a_foreign_kube_context(self):
+        # A stale context pointing at some other install must not donate that
+        # environment's credentials: recovery skips, and the generator fails
+        # on the missing key instead.
+        recovered_b64 = "cmVjb3ZlcmVkLWtleQ=="
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_other-project_us-east1_other-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*) printf "%s" "{recovered_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            kubectl_script=kubectl_stub,
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("API_SERVER_KEY", proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

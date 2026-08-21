@@ -407,3 +407,237 @@ func TestVersionedDefaultImage(t *testing.T) {
 		t.Errorf("resolveCredentialProxyImage(nil) = %q, want %q", got, wantSidecar)
 	}
 }
+
+// TestDefaultImagePullSecrets covers the parsing of IMAGE_PULL_SECRETS. The
+// value is hand-written into a Deployment or joined by a Helm template, so the
+// malformed cases here are the realistic ones rather than pathological — and
+// each has a consequence a layer away from the typo: an empty name makes the
+// kubelet pull anonymously, and a repeat fails every apply of the Deployment,
+// PodSpec.imagePullSecrets being a server-side-apply list-map keyed on name.
+func TestDefaultImagePullSecrets(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want []corev1.LocalObjectReference
+	}{
+		{name: "unset", env: "", want: nil},
+		{name: "single", env: "regcred", want: []corev1.LocalObjectReference{{Name: "regcred"}}},
+		{
+			name: "several with padding",
+			env:  " regcred , harbor-pull ",
+			want: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "harbor-pull"}},
+		},
+		{
+			name: "duplicates collapse",
+			env:  "regcred,regcred,harbor-pull",
+			want: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "harbor-pull"}},
+		},
+		{
+			name: "empty entries dropped",
+			env:  "regcred,,harbor-pull,",
+			want: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "harbor-pull"}},
+		},
+		{name: "nothing but separators", env: ", ,", want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(imagePullSecretsEnvVar, tt.env)
+			if got := defaultImagePullSecrets(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("defaultImagePullSecrets() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveImagePullSecrets pins the precedence: a CR that names its own pull
+// identity REPLACES the operator-wide default rather than merging with it, the
+// same way spec.deployment.image beats PLATFORM_AGENT_IMAGE. Merging would hand
+// the kubelet credentials the CR never asked for.
+func TestResolveImagePullSecrets(t *testing.T) {
+	t.Run("falls back to the operator default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		want := []corev1.LocalObjectReference{{Name: "fleet-pull"}}
+		for _, dep := range []*agentv1alpha1.DeploymentSpec{nil, {}, {ImagePullSecrets: nil}} {
+			if got := resolveImagePullSecrets(dep); !reflect.DeepEqual(got, want) {
+				t.Errorf("resolveImagePullSecrets(%v) = %v, want %v", dep, got, want)
+			}
+		}
+	})
+
+	t.Run("the CR replaces the default outright", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := &agentv1alpha1.DeploymentSpec{
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "team-pull"}},
+		}
+		want := []corev1.LocalObjectReference{{Name: "team-pull"}}
+		if got := resolveImagePullSecrets(dep); !reflect.DeepEqual(got, want) {
+			t.Errorf("resolveImagePullSecrets() = %v, want %v — the fleet default must not be merged in", got, want)
+		}
+	})
+
+	t.Run("nil when neither is set", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		if got := resolveImagePullSecrets(&agentv1alpha1.DeploymentSpec{}); got != nil {
+			t.Errorf("resolveImagePullSecrets() = %v, want nil — a default install must render no imagePullSecrets at all", got)
+		}
+	})
+
+	// The CR path gets the same normalization as the env var, because the
+	// webhook that would have rejected these is off by default in the chart.
+	// A repeat is the one that matters: PodSpec.imagePullSecrets is an SSA
+	// list-map keyed on name, so a duplicate passed through here fails every
+	// apply of the Deployment with "duplicate entries for key".
+	t.Run("the CR list is normalized", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		dep := &agentv1alpha1.DeploymentSpec{
+			ImagePullSecrets: []corev1.LocalObjectReference{
+				{Name: " regcred "},
+				{Name: "regcred"},
+				{Name: ""},
+				{Name: "harbor-pull"},
+			},
+		}
+		want := []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "harbor-pull"}}
+		if got := resolveImagePullSecrets(dep); !reflect.DeepEqual(got, want) {
+			t.Errorf("resolveImagePullSecrets() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a CR list that normalizes away counts as unset", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := &agentv1alpha1.DeploymentSpec{
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: ""}, {Name: "  "}},
+		}
+		want := []corev1.LocalObjectReference{{Name: "fleet-pull"}}
+		if got := resolveImagePullSecrets(dep); !reflect.DeepEqual(got, want) {
+			t.Errorf("resolveImagePullSecrets() = %v, want %v — an all-blank list is a typo, not a pull identity", got, want)
+		}
+	})
+}
+
+func TestDeriveAgentImageFromOperator(t *testing.T) {
+	tests := []struct {
+		name          string
+		operatorImage string
+		expected      string
+	}{
+		{
+			name:          "standard ghcr SemVer release",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "standard ghcr RC release candidate tag",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a",
+		},
+		{
+			name:          "standard ghcr full commit SHA",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba",
+		},
+		{
+			name:          "standard ghcr short commit SHA",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:1c06e1a",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:1c06e1a",
+		},
+		{
+			name:          "custom mirror registry with pure SemVer",
+			operatorImage: "mirror.corp.internal/kube-agents/k8s-operator:0.2.0",
+			expected:      "mirror.corp.internal/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "digest pinned image falls back to latest",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "tag and digest pinned image preserves tag",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "latest tag",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:latest",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "registry host with port and SemVer tag",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator:0.2.0",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "localhost with port and latest tag",
+			operatorImage: "localhost:5000/k8s-operator:latest",
+			expected:      "localhost:5000/platform-agent:latest",
+		},
+		{
+			name:          "registry host with port and digest falls back to latest",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "registry host with port, tag and digest preserves tag",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator:0.2.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "registry host with port and no tag",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "unqualified image with tag",
+			operatorImage: "k8s-operator:0.2.0",
+			expected:      "platform-agent:0.2.0",
+		},
+		{
+			name:          "unqualified image without tag",
+			operatorImage: "k8s-operator",
+			expected:      "platform-agent:latest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveAgentImageFromOperator(tt.operatorImage)
+			if got != tt.expected {
+				t.Errorf("deriveAgentImageFromOperator(%q) = %q, want %q", tt.operatorImage, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDefaultPlatformAgentImagePrecedence(t *testing.T) {
+	t.Run("explicit PLATFORM_AGENT_IMAGE overrides OPERATOR_IMAGE and fallback", func(t *testing.T) {
+		t.Setenv(platformAgentImageEnvVar, "custom-registry/agent:explicit")
+		t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0")
+
+		want := "custom-registry/agent:explicit"
+		if got := defaultPlatformAgentImage(); got != want {
+			t.Errorf("defaultPlatformAgentImage() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("OPERATOR_IMAGE derives platform-agent and credential-proxy when PLATFORM_AGENT_IMAGE unset", func(t *testing.T) {
+		t.Setenv(platformAgentImageEnvVar, "")
+		t.Setenv(credentialProxyImageEnvVar, "")
+		t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0")
+
+		wantAgent := "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
+		if got := defaultPlatformAgentImage(); got != wantAgent {
+			t.Errorf("defaultPlatformAgentImage() = %q, want %q", got, wantAgent)
+		}
+
+		wantSidecar := "ghcr.io/gke-labs/kube-agents/credential-proxy:0.2.0"
+		if got := resolveCredentialProxyImage(nil); got != wantSidecar {
+			t.Errorf("resolveCredentialProxyImage(nil) = %q, want %q", got, wantSidecar)
+		}
+	})
+}

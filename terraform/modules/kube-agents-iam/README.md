@@ -2,19 +2,19 @@
 
 Reusable Terraform module for provisioning the Platform Agent's Google Service Account (GSA), its Workload Identity binding, and its project-level IAM roles.
 
-## Relationship to the provisioning scripts
+## Relationship to the install
 
-This module and `k8s-operator/scripts/provision_04_gcp_iam.sh` create the **same** GSA and
-Workload Identity binding — use one or the other for a given project, never both. The
-canonical identifiers (GSA `kubeagents-platform-gsa`, KSA `kubeagents-platform-agent`,
-namespace `kubeagents-system`) live in `k8s-operator/scripts/common.sh`, and the module's
-defaults mirror them.
+This is the module the full-install composition (and therefore `install.sh`) uses for the
+agent's identity. The canonical identifiers (GSA `kubeagents-platform-gsa`, KSA
+`kubeagents-platform-agent`, namespace `kubeagents-system`) also appear in
+`k8s-operator/scripts/common.sh` for the dev tooling, and the module's defaults mirror
+them.
 
-By default the module grants the same read-only role set the script grants (its
-`read-only` permission set, also the script's default). Pass `project_roles = []` to grant
+By default the module grants the read-only role set (the composition's
+`permission_set = "read-only"`, also the installer's default). Pass `project_roles = []` to grant
 nothing and manage roles yourself — but note the agent fails every GCP call until an
-equivalent role set exists. The script's `gke-admin` set can be reproduced by passing those
-roles explicitly.
+equivalent role set exists. The `gke-admin` set can be reproduced by passing those
+roles explicitly (see `local.gke_admin_roles` in the full-install composition).
 
 ## Usage
 

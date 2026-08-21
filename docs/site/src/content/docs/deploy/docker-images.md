@@ -9,7 +9,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 ## Image inventory
 
-[`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the provisioning scripts resolve their third-party defaults from, and what the table below is generated from — so there is one pin per image, not one per install path.
+[`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
 That cuts both ways: **a version bump edits `images.json` and nothing else.** The manifest,
 Dockerfile, or chart value that used to carry a pin now names a variable, so editing the old
@@ -44,12 +44,13 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.0` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `k8s` | `docker.io/alpine/k8s` | `1.34.9` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
-| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab` | `HINDSIGHT_API_IMAGE` | Provisioning step 13, when the memory provider uses Hindsight. |
-| `hindsight-postgresql` | `docker.io/ankane/pgvector` | `latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8` | `HINDSIGHT_POSTGRES_IMAGE` | Provisioning step 13, alongside the Hindsight API. |
-| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.1` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
-| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.1` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
-| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.1` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
-| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.21.1` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist. |
+| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
+| `hindsight-postgresql` | `docker.io/ankane/pgvector` | `latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
+| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
+| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
+| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
+| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.21.1` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself; the copy exists so a mirrored cert-manager install can point the flag at it. |
+| `cert-manager-startupapicheck` | `quay.io/jetstack/cert-manager-startupapicheck` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. Runs once per install as a post-install hook Job. |
 
 ### Base images
 
@@ -68,7 +69,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Published via GitHub Actions workflows on push to `main` (tagged `:latest`) and on SemVer git tag pushes (`*.*.*`, tagged `X.Y.Z`); every publish also adds a commit-SHA tag.
+Built and published via GitHub Actions workflows on push to `main` (tagged with commit SHA and `:latest`). Production SemVer release tags (`X.Y.Z`) are promoted from validated commit images by the release publishing workflow without rebuilding.
 
 ### `platform-agent`
 
@@ -90,7 +91,9 @@ A late build step precompiles the Python tree — `/opt/hermes`, its venv, and t
 
 ### `credential-proxy`
 
-The Platform Agent image plus the Envoy-based credential proxy sidecar runtime. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) (it extends the `platform` target with the `envoy` binary and credential-proxy scripts).
+The Envoy-based credential proxy sidecar runtime. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile), on the shared `agent-base` stage rather than on `platform`: it adds the real `gcloud`, `kubectl`, `gh` and `git` that the sandbox image deliberately lacks, the `envoy` binary and its config, and `/opt/defaults/scripts`, which is where `start-services.sh` finds `credential_proxy.py`. It carries none of what the `platform` stage adds on top — no kube-agents personas, skills, cron entries or profile templates — because nothing in the sidecar reads them.
+
+Building it from `agent-base` is also what keeps a one-file agent change cheap. While it was `FROM platform`, editing anything under `agents/*/scripts/` invalidated the `platform` layer that copies them and every layer after it in both images, so the sidecar paid for a full rebuild of a chain whose output it did not use.
 
 - **Published by**: [`docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml) and [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
 
@@ -109,7 +112,7 @@ The Kubebuilder-generated operator manager image.
 
 ## Container entrypoint
 
-`platform-agent` — and `credential-proxy`, which extends it — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Before it `exec`s whatever command it was handed, the entrypoint seeds `$HERMES_HOME` from `/opt/defaults`, scaffolds the `platform` profile, links profile-targeted plugin volumes, merges the operator-rendered config overlays, and starts the Session KV server.
+`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. The sidecar never reaches it in a `PlatformAgent` Pod: the operator sets the container's `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright. Before it `exec`s whatever command it was handed, the entrypoint seeds `$HERMES_HOME` from `/opt/defaults`, scaffolds the `platform` profile, links profile-targeted plugin volumes, merges the operator-rendered config overlays, and starts the Session KV server.
 
 Every one of those writes to the data volume, and a Pod runs this image in more than one container against a single copy of it. Exactly one container may do the setup. A second pass from a container that lacks the plugin volumes and the overlay ConfigMap does not merely duplicate the work — it reads the first container's fresh plugin links as dangling and unlinks them, and reverts the overlay whose source it cannot see. `AGENT_SHARED_STATE_SETUP` decides which container that is:
 
@@ -188,58 +191,40 @@ one for the images it does not.
 
 | Install path                      | First-party            | Third party                      | If the second is unset              | Reaches cert-manager |
 | --------------------------------- | ---------------------- | -------------------------------- | ----------------------------------- | -------------------- |
-| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | those images stay upstream          | yes                  |
-| Provisioning scripts              | `REGISTRY_PREFIX`      | `THIRD_PARTY_REGISTRY_PREFIX`    | those images stay upstream          | yes                  |
+| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | falls back to the first-party value | **yes**              |
 | Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | falls back to the first-party value | n/a                  |
-| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value | **no**               |
+| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value | **yes**              |
 
-What "third party" covers differs by row, because the paths install different things. Every row
-covers LiteLLM and fluent-bit; the scripts additionally cover the GitHub token minter, Hindsight,
-and cert-manager. The chart never renders cert-manager at all — it expects one to be present
-already — so there is nothing for its prefixes to reach. Terraform is the row to read twice: it
-does install cert-manager, as a separate `helm_release` of the upstream chart, and that release
-is not passed either prefix. On an approved-registry cluster set `enable_cert_manager = false`
-and install cert-manager yourself from the mirror; `images.json` carries all four of its images,
-so `make mirror-images` has already copied them. The composition's
+The rows are one path in three coats: `install.sh` generates the Terraform composition's
+`terraform.tfvars` from its flags, and the composition passes both values to the chart's
+`global.*` keys, so "third party" covers the same set everywhere — LiteLLM, fluent-bit, the
+GitHub token minter, and Hindsight. cert-manager is the chart row's exception: the chart never
+renders it — it expects one to be present already. The composition installs it as a separate
+`helm_release` of the upstream chart and passes the third-party prefix to that release's image
+repositories, so a mirrored install pulls every image — cert-manager's five included — from the
+mirror. On a cluster whose cert-manager comes from somewhere else, set
+`enable_cert_manager = false` and install it yourself; `images.json` carries all five of its
+images, so `make mirror-images` has already copied them.
+The composition's
 [README](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/README.md)
 has the detail.
 
-The "if the second is unset" column is the one asymmetry in this page, and it is deliberate. `REGISTRY_PREFIX`
-shipped long before this inventory and has always meant "the registry holding the images this
-project builds" — a mirror populated against it holds those and nothing else, so inheriting it
-would send an existing install after cert-manager images its registry was never given, and
-provisioning would fail on ImagePullBackOff with the cluster already created. The chart and
-Terraform values are new in comparison and carry no such promise, so they take the safer default
-of covering everything. To mirror everything from the scripts, set both prefixes — usually to the
-same value. The scripts print a warning if `REGISTRY_PREFIX` is customised while the third-party
-one is not, because that is also what a half-mirrored install looks like.
+`REGISTRY_PREFIX` and `THIRD_PARTY_REGISTRY_PREFIX` are persisted to the installer's state file
+(`vars.sh`) like every other knob, so re-runs reuse them; `terraform.tfvars` is regenerated from
+that state on every run. Changing the registry _after_ a first run means re-running `install.sh`
+with the new flag (or editing the saved values in `vars.sh` — saved state wins over a new
+export).
 
-`REGISTRY_PREFIX` is persisted to the scripts' state file (`vars.sh`) like every other knob, so
-re-runs reuse it; the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, `REPLAY_IMAGE`,
-`LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE` variables still override it. Changing the registry
-_after_ a first run means editing the saved values in `vars.sh` — saved state wins over a new
-export — and the scripts warn when a saved image no longer matches the effective prefix.
-
-`IMAGE_TAG` is per-run and is deliberately not saved to `vars.sh`, so those `*_IMAGE` variables
-normally hold a bare repository path. The step that consumes one attaches the current
-`IMAGE_TAG` to it when it names neither a tag nor a digest — `provision_03` for the operator,
-agent, and credential-proxy references, `provision_11` for the replay proxy. The third-party
-images are excluded, because their tags come from `images.json` and have nothing to do with
-`IMAGE_TAG`. Set a value explicitly
-(`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:1.4.0`) to pin a reference
-independently of `IMAGE_TAG`.
-
-cert-manager is the one install step that applies a manifest it does not own. `provision_03`
-rewrites `quay.io/jetstack/` to the third-party prefix before applying it. Two escape hatches
-sit alongside: `CERT_MANAGER_MANIFEST` points the step at a local or mirrored manifest instead of
-the upstream URL, and `SKIP_CERT_MANAGER=1` skips it entirely where the platform team installs
-cert-manager themselves (the operator's admission webhooks still need it to be present).
+`IMAGE_TAG` is per-run and is deliberately not saved to `vars.sh`: the installer passes it into
+`terraform.tfvars` as `image_tag`, which overrides both first-party image tags in the chart. The
+third-party images are excluded, because their tags come from `images.json` and have nothing to
+do with `IMAGE_TAG`.
 
 ### What the prefix does not cover
 
 Two images are resolved by the operator at reconcile time rather than rendered by any install
-manifest, so they need the operator's own environment set — which the chart and `provision_03`
-now both do automatically when a prefix is in effect:
+manifest, so they need the operator's own environment set — which the chart does automatically
+when a prefix is in effect:
 
 - `PLATFORM_AGENT_IMAGE` — the agent image for a `PlatformAgent` that omits
   `spec.deployment.image`.
@@ -275,9 +260,46 @@ Hermes pin is by digest, and a `docker pull`/`push` round trip changes it.
 
 ### Registry authentication
 
-Out of scope: no install path renders `imagePullSecrets`. The mirror has to be readable with the
-nodes' own credentials — an Artifact Registry in the same project is the simple case — or
-reached through a pull-through cache.
+A mirror the nodes can already read — an Artifact Registry in the same project, or a pull-through
+cache — needs nothing here. One that has to be authenticated to, Harbor or Artifactory with token
+auth, needs `imagePullSecrets`, set in whichever of these matches how the install was made:
+
+- `global.imagePullSecrets` in the Helm chart, a list of Secret names — or of `{name: <secret>}`
+  maps, the shape a `PodSpec` takes; any other shape fails the render. It reaches every pod the
+  chart renders — the operator, the LiteLLM gateway, the `pre-delete` cleanup Job — and, through
+  `IMAGE_PULL_SECRETS` on the controller manager and `spec.deployment.imagePullSecrets` on the
+  `PlatformAgent` it creates, the agent pods the operator renders as well.
+- `image_pull_secrets` in `terraform/examples/full-install`, which passes the same list to the
+  chart.
+- `spec.deployment.imagePullSecrets` on a `PlatformAgent` written by hand, or
+  `IMAGE_PULL_SECRETS` (comma-separated Secret names) on the controller manager as the fleet-wide
+  default for agents that do not set it. The CR **replaces** that default rather than adding to
+  it, on the same terms as `spec.deployment.image` against `PLATFORM_AGENT_IMAGE`.
+
+The list is pod-scoped, so it covers every image in an agent pod: the agent, the credential-proxy
+and fluent-bit sidecars, anything in `initContainers`/`sidecars`, and the OCI image volumes
+`AgentPlugin`s mount. Kubernetes has no per-container split.
+
+The Secrets are referenced, never created. Registry credentials would otherwise live in Helm
+release data and Terraform state, so each Secret has to exist in the agent's namespace before the
+pod is scheduled:
+
+```bash
+kubectl create namespace kubeagents-system
+kubectl create secret docker-registry regcred \
+  --namespace kubeagents-system \
+  --docker-server=harbor.example.com \
+  --docker-username=robot\$kube-agents \
+  --docker-password="$TOKEN"
+```
+
+Two things this does not cover. The provisioning scripts have no flag for it, so `install.sh`
+sets no pull identity for the operator, LiteLLM, and token-minter pods it applies — those need a
+mirror the nodes can read, or a hand-patched Deployment. Agent pods are reachable on that path:
+set `IMAGE_PULL_SECRETS` on the controller manager yourself, the same way `INSTALL.md` documents
+setting `PLATFORM_AGENT_IMAGE`. And cert-manager is a separate Helm release of an upstream chart,
+unaffected by any of the above — on a cluster whose registry needs authenticating to, install it
+yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
@@ -285,4 +307,4 @@ For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is th
 
 ## CI
 
-Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` and on numeric SemVer `*.*.*` tag pushes (the `k8s-operator` workflow can also be dispatched manually; a non-main dispatch publishes only a commit-SHA tag).
+Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` (tagged with commit SHA and `:latest`). Production SemVer tags (`X.Y.Z`) are promoted from validated commit images via the release publishing workflow ([`.github/workflows/release-publish.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/release-publish.yml)) without rebuilding.

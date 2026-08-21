@@ -21,6 +21,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 
+# Coverage measurement (`make coverage`)
+.coverage-data/
+coverage.xml
+coverage-go.xml
+
 # Terraform working directories. Lock files are ignored because this repo
 # ships modules and a copy-paste example, not a deployed root configuration —
 # consumers should commit their own multi-platform lock in their own repo.

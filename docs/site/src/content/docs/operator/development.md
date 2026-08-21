@@ -59,13 +59,13 @@ make deploy        IMG=<your-registry>/kube-agents-operator:dev
 
 ## Fast agent iteration (dev only)
 
-For local Platform Agent development you don't want to run the full provisioner every time. `make dev-rebuild-agent` shells out to `k8s-operator/scripts/dev/dev_rebuild_agent.sh`:
+For local Platform Agent development you don't want to run the full installer every time. `make dev-rebuild-agent` shells out to `k8s-operator/scripts/dev/dev_rebuild_agent.sh`:
 
 ```bash
 make dev-rebuild-agent ARGS="platform"
 ```
 
-This builds the Platform Agent image, pushes to Artifact Registry, and restarts the Deployment. First run creates a dev Artifact Registry repo; clean it up later with `make gcp-teardown-dev-artifact-registry`.
+This builds the Platform Agent image, pushes to Artifact Registry, and restarts the Deployment. First run creates a dev Artifact Registry repo; clean it up later with `scripts/dev/teardown_dev_01_gcp_artifact_registry.sh`.
 
 ### Building on a private worker pool
 
@@ -89,7 +89,7 @@ make deploy-inference-replay    # inference-replay proxy
 make deploy-github              # Minty (GitHub token minter)
 ```
 
-Each has a matching `undeploy-*` target. These are the same kustomize bases the provisioner uses.
+Each has a matching `undeploy-*` target. These are the development copies of the components the Helm chart renders in a stock install.
 
 ## RBAC Migration & Deprecation Guidelines
 

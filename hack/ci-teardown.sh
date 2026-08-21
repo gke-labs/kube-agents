@@ -5,10 +5,9 @@
 # Cleans up PR-scoped Kubernetes resources from target GKE cluster.
 # Preserves static cluster & GCP IAM setup for fast re-use across PR runs.
 #
-#  - Step 9 (teardown_09): LiteLLM Gateway Teardown
-#  - Step 8 (teardown_08): PlatformAgent CR Teardown
-#  - Step 7 (teardown_07): Secrets Teardown
-#  - Step 3 (teardown_03): Operator & CRD Teardown
+# One `helm uninstall` (the release owns every Kubernetes object ci-deploy.sh
+# created) plus an explicit CRD delete, since the chart leaves CRDs behind by
+# Helm's own design.
 # ==============================================================================
 
 set -uo pipefail
@@ -19,6 +18,7 @@ cd "${REPO_ROOT}"
 # 1. Target Cluster Context
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
+ensure_helm
 
 echo "=== Target Cluster Context ==="
 echo "Project:   $PROJECT_ID"
@@ -36,10 +36,11 @@ gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --p
   exit 1
 }
 
-# Safety check: Verify active kubectl context matches target cluster before running teardown steps
+# Safety check: Verify active kubectl context matches target cluster and project before running teardown steps
 CURRENT_CTX="$(kubectl config current-context 2>/dev/null || echo "")"
-if [[ "$CURRENT_CTX" != *"${CLUSTER_NAME}"* && "$CURRENT_CTX" != *"${PROJECT_ID}"* ]]; then
-  echo "ERROR: Active kubectl context ('${CURRENT_CTX}') does not match target cluster '${CLUSTER_NAME}'! Aborting teardown for safety."
+EXPECTED_CTX="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
+if [[ "$CURRENT_CTX" != "$EXPECTED_CTX" ]]; then
+  echo "ERROR: Active kubectl context ('${CURRENT_CTX}') does not match expected context ('${EXPECTED_CTX}')! Aborting teardown for safety."
   exit 1
 fi
 
@@ -47,24 +48,19 @@ START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleaning Up GKE Resources ==="
 
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Undeploying LiteLLM Gateway ==="
-./k8s-operator/scripts/teardown_09_deploy_litellm.sh --no-confirm || true
-echo "✓ LiteLLM Gateway teardown finished in $((SECONDS - STEP_START))s"
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agents release ==="
+# The chart's pre-delete hook removes the PlatformAgent CR and waits for the
+# operator to clear its finalizer, so one uninstall replaces the old
+# per-step teardown scripts (09 LiteLLM, 08 CR, 07 secrets, 03 operator).
+helm uninstall kube-agents -n "${NAMESPACE}" --wait --timeout 10m || true
+echo "✓ Release uninstall finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting PlatformAgent Custom Resource ==="
-./k8s-operator/scripts/teardown_08_deploy_platform_agent.sh --no-confirm || true
-echo "✓ PlatformAgent CR teardown finished in $((SECONDS - STEP_START))s"
-
-STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Deleting Secrets ==="
-./k8s-operator/scripts/teardown_07_gcp_k8s_secrets.sh --no-confirm || true
-echo "✓ Secrets deletion finished in $((SECONDS - STEP_START))s"
-
-STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Undeploying Operator Controller Manager & CRDs ==="
-./k8s-operator/scripts/teardown_03_gcp_gke_operator.sh --no-confirm || true
-echo "✓ Operator & CRD teardown finished in $((SECONDS - STEP_START))s"
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting CRDs ==="
+# Helm leaves crds/ objects behind by design; a PR evaluation cluster should
+# not accumulate them.
+kubectl delete -f charts/kube-agents/crds/ --ignore-not-found || true
+echo "✓ CRD deletion finished in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="

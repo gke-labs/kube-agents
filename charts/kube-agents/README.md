@@ -33,8 +33,8 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   `create=true` the chart generates them on install and carries the existing
   values forward on upgrade — rotating the salt would re-anonymise every user,
   severing their past sessions from their future ones. With `create=false`,
-  whatever created the Secret supplies them; `provision_07_gcp_k8s_secrets.sh`
-  and the Terraform example both do.
+  whatever created the Secret supplies them; the Terraform full-install
+  composition does.
 
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
   authenticates with `SESSION_KV_API_KEY`, treats an empty value as fatal, and
@@ -128,9 +128,39 @@ either way.
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
 
-Registry authentication is out of scope — the mirror must be readable with the
-nodes' own credentials (an in-project Artifact Registry, or a pull-through
-cache). The chart renders no `imagePullSecrets`.
+`global.imagePullSecrets` is the pull identity for a mirror the nodes' own
+credentials cannot read — Harbor or Artifactory with token auth, rather than an
+in-project Artifact Registry. An entry is either a bare Secret **name**, so a
+single one is reachable with `--set global.imagePullSecrets[0]=regcred`, or the
+`{name: <secret>}` map a `PodSpec` takes; any other shape fails the render. It
+reaches the same two populations `global.imageRegistry` does: every pod the chart renders
+(operator, LiteLLM, the pre-delete cleanup Job) and the agent pods the operator
+renders, via `IMAGE_PULL_SECRETS` on the manager and `spec.deployment.imagePullSecrets`
+on the `PlatformAgent`. A hand-written `PlatformAgent` that sets that field
+replaces the operator's default rather than adding to it.
+
+The Secrets are referenced, never created: keeping registry credentials out of
+Helm release data is the point, and the chart has no way to write one that would
+not end up there. Create them yourself before installing, which for the usual
+case means creating the namespace first, since Helm has not made it yet:
+
+```bash
+kubectl create namespace kubeagents-system
+kubectl create secret docker-registry regcred \
+  --namespace kubeagents-system \
+  --docker-server=harbor.example.com \
+  --docker-username=robot\$kube-agents \
+  --docker-password="$TOKEN"
+```
+
+Both commands are idempotent against what Helm then finds. The cleanup Job is
+the one to get right: it is a `pre-delete` hook, so a pull it cannot
+authenticate fails `helm uninstall` at the one moment the operator is still
+running to clear the CR's finalizer.
+
+It does not reach cert-manager, which this chart never renders and which
+`operator.webhooks.enabled` requires you to have installed already. Pull that
+one from the mirror through its own chart's values.
 
 ### LiteLLM gateway
 
@@ -141,12 +171,35 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
 uses Workload Identity (below); `litellm.modelDefaultName`
-overrides the per-provider default model. `chatgpt` mode is rejected (it needs
-the OAuth-token PVC from the kustomize overlay). Set `litellm.enabled=false`
+overrides the per-provider default model. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
+
+### Hindsight memory store
+
+`hindsight.*` renders the agents' long-term memory store — the Hindsight API
+Deployment, the Postgres/pgvector StatefulSet behind it, an ingress-only
+NetworkPolicy standing in for the database's deliberate lack of a password,
+and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
+follows `platformAgent.harness.memory.provider`, so selecting a
+Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
+with it and everything else renders nothing; `true`/`false` override. The
+image pins mirror `images.json`; `hindsight.postgresql.storage` sizes the
+volumeClaimTemplate (immutable once the StatefulSet exists), and the PVC —
+which **is** the memory — survives uninstall.
+
+### GitHub token minter
+
+`githubMinter.*` renders the minty Deployment, Service, NetworkPolicy,
+Workload Identity KSA, and rule ConfigMap, plus the `github-app-credentials`
+Secret when `githubMinter.appId` is set (leave it empty to manage that Secret
+yourself). `org` and `repo` are required when enabled. This is the Kubernetes
+half only: the minter GSA, its Workload Identity binding, and the import-only
+KMS signing key come from `terraform/modules/github-minter`, and the App
+private key must be imported into that key (see the module README) before the
+Deployment passes its readiness probe.
 
 ### Telemetry
 
@@ -166,7 +219,7 @@ fails the render, so set `telemetry.collectorNamespace` (or
 `gke-managed-otel`, since nothing exports through it. Full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
-#### Vertex AI (`litellm.modelProvider=vertex`)
+#### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
 Vertex AI has no API key. The gateway calls
 `projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
@@ -187,10 +240,9 @@ resolves to that GSA:
 ```
 
 `terraform/examples/full-install` wires all of this up when
-`model_provider = "vertex_ai"`. The provisioning-script path does the same via
-`make gcp-provision-04-iam` (identity and roles) plus
-`make gcp-provision-09-litellm` (the annotated KSA), both run from
-`k8s-operator/`.
+`model_provider = "vertex_ai"` — the second `kube-agents-iam` module
+instantiation creates the identity and roles, and the chart values above carry
+the annotated KSA.
 
 ### Turning telemetry off
 
@@ -217,9 +269,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 ### Integrations
 
 - **Google Chat** — `platformAgent.integration.googleChat.enabled=true` plus the
-  topic/subscription names (defaults match the provisioning scripts and the
-  `chat-pubsub` Terraform module). Requires the Chat Pub/Sub backend to exist
-  (`provision_05_gcp_gchat.sh` or `terraform/modules/chat-pubsub`); `projectId`
+  topic/subscription names (defaults match the `chat-pubsub` Terraform
+  module). Requires the Chat Pub/Sub backend to exist
+  (`terraform/modules/chat-pubsub`); `projectId`
   is taken from `platformAgent.harness.projectId`. Restrict access via
   `allowedUsers` (empty = everyone).
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
@@ -231,22 +283,21 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 Chat and Slack each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
 the Pub/Sub topic; Socket Mode + bot scopes in the Slack app console) —
-[INSTALL.md § Enable Google Chat & Slack Integrations](../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps)
+[INSTALL.md § Enable Google Chat & Slack Integrations](../../INSTALL.md#step-4-enable-google-chat--slack-integrations-manual-required-steps)
 is the canonical walkthrough, including the pairing-code approval.
 
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`, and
-`platformAgent.deployment.availability` expose the remaining fields the
-provisioning scripts substitute into
-[`platform-agent.yaml.template`](../../k8s-operator/scripts/platform-agent.yaml.template),
-so a chart install can reach the same CR as a script install. Each one defaults
+`platformAgent.deployment.availability` expose the remaining PlatformAgent CR
+fields, so a chart install can reach every field of the CR without editing it
+by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
 
-`platformAgent.deployment.image.pullPolicy` defaults to `Always`, matching the
-same template. Under `IfNotPresent` a node that has already cached the tag never
+`platformAgent.deployment.image.pullPolicy` defaults to `Always`. Under
+`IfNotPresent` a node that has already cached the tag never
 picks up a rebuild, which is the normal case for the Terraform composition's
 default `image_tag = "latest"`.
 
@@ -256,18 +307,19 @@ immutable tag, where `Always` buys nothing and costs a registry round-trip on
 every pod start. It also removes a fallback: if the agent pod is rescheduled
 while ghcr.io is unreachable or rate-limiting, `Always` fails the pull and the
 pod sits in `ImagePullBackOff` where `IfNotPresent` would have started from the
-node's cache. The two install surfaces agree on `Always` for the mutable-tag
-case they were both written for, and `make iac-parity-check` holds them there;
-an install at a pinned release tag is the case that wants the override.
+node's cache. The chart and the Terraform composition agree on `Always` for the
+mutable-tag case they were both written for; an install at a pinned release
+tag is the case that wants the override.
 
-Two knobs have no Terraform or chart-side infrastructure behind them:
+Two knobs need context beyond the chart:
 
-- `deployment.availability.runtimeClassName: gvisor` needs the GKE Sandbox node
-  pool that [`provision_02_gvisor_nodepool.sh`](../../k8s-operator/scripts/provision_02_gvisor_nodepool.sh)
-  creates; the Autopilot `gke-cluster` module has no equivalent.
-- `harness.hermes.dashboardEnabled` is the one field where the two install paths
-  disagree by default: the CRD defaults it to `true`, the script path to
-  `false`. Set it explicitly when the two installs must match.
+- `deployment.availability.runtimeClassName: gvisor` needs a GKE Sandbox node
+  pool on a Standard cluster — the `gke-cluster` module's
+  `enable_gvisor_node_pool` creates one; Autopilot ships the RuntimeClass
+  natively.
+- `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
+  out of the CR so the CRD default (`true`) applies. Set it explicitly when an
+  install must pin the dashboard on or off rather than float with the CRD.
 
 ### ServiceAccount ownership
 

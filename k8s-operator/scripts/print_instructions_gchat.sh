@@ -25,7 +25,7 @@ if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
   echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
   echo -e "       - After saving, refresh the page and verify a ${C_BOLD}Service account email${C_RESET} appears under Connection settings"
   echo -e "         ${C_CYAN}(this field only exists when \"Build this Chat app as a Workspace add-on\" is checked — the default, locked-on state for new apps).${C_RESET}"
-  echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run provision_05_gcp_gchat.sh and re-save this config.${C_RESET}"
+  echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
   echo -e ""
   if [ -n "${PROJECT_NUMBER:-}" ]; then
     echo -e "[ ] 2. Direct DM Link to Bot on Google Chat:"

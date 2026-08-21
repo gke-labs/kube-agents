@@ -11,14 +11,17 @@ resource "google_service_account_iam_member" "workload_identity" {
 }
 
 resource "google_kms_key_ring" "minter" {
-  project  = var.project_id
-  name     = var.kms_keyring_name
-  location = var.location
+  project = var.project_id
+  name    = var.kms_keyring_name
+  # Cloud KMS has no zonal locations; a zonal cluster location maps to its
+  # region, matching the chart's KMS_KEY_NAME derivation and the installer's
+  # derive_kms_location.
+  location = replace(var.location, "/-[a-z]$/", "")
 }
 
 # The key is created import-only and without an initial version: the GitHub
-# App private key PEM is imported into it afterwards (a manual step, or
-# k8s-operator/scripts/provision_10_deploy_github_minter.sh via the Minty CLI).
+# App private key PEM is imported into it afterwards (install.sh does it via
+# the Minty CLI; the README carries the manual command).
 resource "google_kms_crypto_key" "minter" {
   #checkov:skip=CKV_GCP_82:Import-only asymmetric signing key lifecycle is managed via Minty/KMS
   name     = var.kms_key_name

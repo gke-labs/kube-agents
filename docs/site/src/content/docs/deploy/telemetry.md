@@ -91,7 +91,7 @@ The namespace is read off the endpoint host when it names an in-cluster Service 
 
 ### Kustomize and examples
 
-The kustomize LiteLLM base stays on the managed collector; `k8s-operator/config/integrations/litellm/overlays/custom-otel/` is a copy-and-edit overlay that moves the exporter env and the egress `namespaceSelector` together. The vLLM manifests under `examples/` still carry the managed endpoint literally — edit `--otlp-traces-endpoint` there if you redirect the rest.
+The kustomize LiteLLM base stays on the managed collector; to point it elsewhere, install through the chart and set `telemetry.otlpEndpoint`, which moves the exporter env and the egress `namespaceSelector` together. The vLLM manifests under `examples/` still carry the managed endpoint literally — edit `--otlp-traces-endpoint` there if you redirect the rest.
 
 ## Cloud Logging
 

@@ -1,0 +1,274 @@
+{{- /*
+The GitHub token minter (minty), mirroring k8s-operator/config/integrations/github
+(the kustomize dev path): the Deployment and Service the
+credential proxy calls for short-lived GitHub App tokens, the minty v2 rule
+ConfigMap, the Workload Identity KSA, and the NetworkPolicy. The GCP half —
+the minter GSA, its Workload Identity binding, and the import-only KMS signing
+key — is terraform/modules/github-minter; the GitHub App private key is
+imported into that key outside the chart (install.sh runs the import, or see
+the module README for the manual command).
+*/}}
+{{- if .Values.githubMinter.enabled }}
+{{- $m := .Values.githubMinter }}
+{{- $org := required "githubMinter.org is required when githubMinter.enabled" $m.org }}
+{{- $repo := required "githubMinter.repo is required when githubMinter.enabled" $m.repo }}
+{{- $projectId := required "platformAgent.harness.projectId is required when githubMinter.enabled" .Values.platformAgent.harness.projectId }}
+{{- $location := required "platformAgent.harness.location is required when githubMinter.enabled" .Values.platformAgent.harness.location }}
+{{- $clusterName := required "platformAgent.harness.clusterName is required when githubMinter.enabled" .Values.platformAgent.harness.clusterName }}
+{{- /* KMS rings are regional; a zonal cluster location maps to its region —
+       the same derivation as derive_kms_location in
+       k8s-operator/scripts/installer_common.sh, so chart and installer name
+       the same ring. */}}
+{{- $kmsLocation := $m.kms.location | default (regexReplaceAll "-[a-z]$" $location "") }}
+{{- $allowedSa := $m.allowedServiceAccount | default (printf "kubeagents-platform-gsa@%s.iam.gserviceaccount.com" $projectId) }}
+{{- if $m.appId }}
+---
+# The App identity the minter signs as. Rendered only when appId is set, so
+# an operator who manages this Secret elsewhere can leave appId empty — the
+# chart then renders no Secret, and one must exist in the release namespace
+# before the pod is Ready.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-app-credentials
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  app-id: {{ $m.appId | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $m.ksaName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ $m.gsaName }}@{{ $projectId }}.iam.gserviceaccount.com
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: github-token-minter-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+data:
+  {{ $org }}-{{ $repo }}.yaml: |
+    version: 'minty.abcxyz.dev/v2'
+    rule:
+      if: "assertion.iss == 'https://accounts.google.com'"
+    scope:
+      platform-agent-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'write'
+          pull_requests: 'write'
+          issues: 'write'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-token-minter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: github-token-minter
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $m.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: github-token-minter
+  template:
+    metadata:
+      labels:
+        app: github-token-minter
+        {{- include "kube-agents.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $m.ksaName }}
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: token-minter
+          image: {{ include "kube-agents.thirdPartyImage" (dict "repository" $m.image.repository "tag" $m.image.tag "root" .) }}
+          imagePullPolicy: {{ $m.image.pullPolicy }}
+          command: ["/minty"]
+          args: ["server", "run"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+            - name: CONFIGS_DIR
+              value: "/etc/minty"
+            - name: ISSUER_ALLOWLIST
+              value: "https://container.googleapis.com/v1/projects/{{ $projectId }}/locations/{{ $location }}/clusters/{{ $clusterName }},https://accounts.google.com"
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-app-credentials
+                  key: app-id
+            # The key version must be ENABLED, which means imported: the
+            # deployment fails its readiness probe until the App private key
+            # has been imported into the KMS key (see the github-minter
+            # module README).
+            - name: KMS_KEY_NAME
+              value: "projects/{{ $projectId }}/locations/{{ $kmsLocation }}/keyRings/{{ $m.kms.keyring }}/cryptoKeys/{{ $m.kms.key }}/cryptoKeyVersions/{{ $m.kms.keyVersion }}"
+            - name: SOURCE_SYSTEM_AUTH
+              value: "gha://$(GITHUB_APP_ID)?kms_id=$(KMS_KEY_NAME)"
+          livenessProbe:
+            httpGet:
+              path: /version
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /version
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml $m.resources | nindent 12 }}
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/minty/{{ $org }}/{{ $repo }}.yaml
+              subPath: {{ $org }}-{{ $repo }}.yaml
+      volumes:
+        - name: config-volume
+          configMap:
+            name: github-token-minter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-token-minter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: github-token-minter
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+{{- if $m.networkPolicy }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-token-minter-policy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: github-token-minter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              kubeagents.x-k8s.io/has-credential-proxy: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The two peers
+        # below cover both shapes: the literal handles the classic service
+        # range, and the excepted block handles any VIP outside private space
+        # (34.118.224.0/20 today, whatever GKE allocates next).
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow GCP Workload Identity / Metadata Server.
+    # The minter dials 169.254.169.254:80, but the node DNATs that to the metadata
+    # daemon on port 988 before NetworkPolicy is evaluated: 169.254.169.252 on the
+    # iptables datapath, the hosting node's internal IP on Dataplane V2. Permitting
+    # only the link-local address drops every token fetch. On Dataplane V2, add one
+    # /32 per node to the port-988 rule.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 988
+    # Allow HTTPS outbound connection to GitHub and KMS APIs
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+{{- end }}

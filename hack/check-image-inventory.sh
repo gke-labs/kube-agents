@@ -161,9 +161,15 @@ chart_images() {
 
 # Split a reference into repository and tag. The digest, if any, goes first;
 # the tag is then the part after a colon in the final path segment, so a
-# registry port (host:5000/name) is not mistaken for one.
+# registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
+# digest (tag@sha256:...), because that is the form images.json pins
+# digest-only upstreams with (hindsight-postgresql) and what the chart's
+# default render must match byte for byte.
 split_ref() {
-  local ref=${1%%@*}
+  local ref=${1%%@*} digest=""
+  case "$1" in
+  *@*) digest="${1#*@}" ;;
+  esac
   case "${ref##*/}" in
   *:*)
     ref_repo="${ref%:*}"
@@ -174,6 +180,7 @@ split_ref() {
     ref_tag=""
     ;;
   esac
+  ref_pin="$ref_tag${digest:+@$digest}"
 }
 
 default_images="$(chart_images)" || exit 1
@@ -198,8 +205,8 @@ while read -r image; do
     continue
   }
   want_tag="$(pin_of_repo "$ref_repo")"
-  [ -z "$want_tag" ] || [ "$ref_tag" = "$want_tag" ] ||
-    fail "the chart renders '$image', but $INVENTORY pins '$ref_repo' at '$want_tag' — 'make mirror-images' would copy '$want_tag' and the install would ask for '$ref_tag'."
+  [ -z "$want_tag" ] || [ "$ref_pin" = "$want_tag" ] ||
+    fail "the chart renders '$image', but $INVENTORY pins '$ref_repo' at '$want_tag' — 'make mirror-images' would copy '$want_tag' and the install would ask for '$ref_pin'."
 done <<<"$default_images"
 
 # 3b. Mirrored install: nothing may be left on a public registry. This is the
@@ -216,28 +223,27 @@ done <<<"$mirrored_images"
 # 3c. Mirrored install, continued: the reference has to be in the mirror, not
 #     merely under its prefix. scripts/mirror_images.sh names each destination
 #     after the inventory entry's `.name`, but the chart cannot read
-#     images.json at render time, so kube-agents.imageRepository reproduces
-#     that by taking the repository's trailing path segment. The two agree only
-#     while `.name` equals that segment for every image the chart renders.
-#
-#     Two entries already break the convention — hindsight-postgresql
-#     (docker.io/ankane/pgvector) and distroless-static (gcr.io/distroless/
-#     static) — and neither is rendered by the chart, which is the only reason
-#     this has never bitten. Add a third that is, and 3b still passes: the
-#     reference sits under the mirror prefix, just under a name nothing ever
-#     pushed there, and the install fails at pull time on the one path this
+#     images.json at render time — kube-agents.imageRepository reproduces the
+#     rule by taking the repository's trailing path segment, and
+#     kube-agents.thirdPartyImage takes the real name explicitly for the
+#     entries where the two differ (hindsight-postgresql is
+#     docker.io/ankane/pgvector). So the check reads the mirrored render
+#     directly: every image under the mirror prefix must sit at a name the
+#     inventory carries, or it points at a path 'make mirror-images' never
+#     pushed to and the install fails at pull time on the one path this
 #     feature exists for.
+inventory_names="$(jq -r '.images[].name' "$INVENTORY" | sort -u)"
 while read -r image; do
   [ -n "$image" ] || continue
+  case "$image" in
+  "$MIRROR"/*) ;;
+  *) continue ;; # not under the prefix is check 3b's finding, not this one
+  esac
   split_ref "$image"
   segment="${ref_repo##*/}"
-  entry_names="$(names_of_repo "$ref_repo")"
-  # No entry at all is check 3a's finding, not this one; reporting it twice
-  # would say "add an entry" and "rename the entry you do not have".
-  [ -n "$entry_names" ] || continue
-  grep -qxF "$segment" <<<"$entry_names" ||
-    fail "the chart renders '$ref_repo', which $INVENTORY names '$(paste -sd/ - <<<"$entry_names")' — 'make mirror-images' pushes it to <prefix>/$(head -n1 <<<"$entry_names") while the chart asks for <prefix>/${segment}. Either rename the entry to '${segment}' or teach kube-agents.imageRepository the real name."
-done <<<"$default_images"
+  grep -qxF "$segment" <<<"$inventory_names" ||
+    fail "with global.imageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
+done <<<"$mirrored_images"
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by

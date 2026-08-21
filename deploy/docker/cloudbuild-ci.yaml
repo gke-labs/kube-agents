@@ -7,20 +7,20 @@
 # all three at once, so the multi-image shape lives here and the single-target
 # contract those two depend on stays untouched.
 #
-# What this buys, and why one build instead of three submits: credential-proxy
-# is `FROM platform AS credential-proxy` and adds an envoy binary, two configs
-# and one apt/gh-CLI layer. As its own submit it lands on a fresh worker with a
-# cold daemon, so it rebuilds the whole agent-base/platform chain before it can
-# run any of those five instructions. Built on the same worker right after
-# platform, they are already in the daemon's cache and only the delta runs
+# What this buys, and why one build instead of three submits: the two agent
+# images share the whole `agent-base` chain, which is nearly all of either
+# build. As its own submit, credential-proxy lands on a fresh worker with a cold
+# daemon and rebuilds that chain from scratch before it can run any of its own
+# instructions. Built on the same worker right after platform, agent-base is
+# already in the daemon's cache and only the delta runs
 # (gke-labs/kube-agents#635).
 steps:
   # Only platform's cache is seeded from the canonical postsubmit image
   # maintained by .github/workflows/docker-publish-gcp.yml in kube-agents-prow.
-  # credential-proxy's own cache is not pulled: the step below builds directly
-  # on top of the platform image this build just produced, so its five
-  # remaining instructions are cheap, and pulling the whole image to save them
-  # would cost far more than it saves.
+  # credential-proxy's own cache is not pulled: the step below inherits
+  # agent-base from the platform build on this worker, and pulling a second
+  # whole image to save the handful of instructions above that would cost far
+  # more than it saves.
   - id: warm-cache
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
@@ -81,7 +81,10 @@ steps:
           .
 
   # No --cache-from and no waitFor: this runs straight after platform on the
-  # same worker, which is the entire point of collapsing the submits.
+  # same worker, which is the entire point of collapsing the submits. What it
+  # inherits is agent-base, the ancestor the two images share -- it does not
+  # build on the platform image itself, and has not since the proxy-tools stage
+  # landed.
   - id: credential-proxy
     name: "gcr.io/cloud-builders/docker"
     env:

@@ -21,7 +21,7 @@ A managed cluster and its Cluster Agent profile are created together and deleted
 
 1. **Onboarding.** When the Platform Agent provisions a cluster (`gke-cluster-creation`) or first brings one under management, the `cluster-agent-lifecycle` skill creates the profile.
 2. **On request.** "Manage my cluster `X` in `Y`" invokes the `manage-cluster` skill, which verifies the cluster exists and creates its profile (idempotent).
-3. **Reconciliation.** The hourly `cluster-agent-reconcile` job (a `no_agent` script job on the Planning Agent profile's [cron file](/kube-agents/reference/cron-jobs/)) sweeps the project: it creates a profile for every cluster that lacks one — excluding the management cluster kube-agents itself runs on, which it identifies via the GKE metadata server — and prunes a profile only when its cluster is _definitively_ gone (a NotFound from `gcloud container clusters describe`). Ambiguous errors (auth, network, quota) never trigger deletion.
+3. **Reconciliation.** The hourly `cluster-agent-reconcile` job (a `no_agent` script job on the Planning Agent profile's [cron file](/kube-agents/reference/cron-jobs/)) sweeps the project: it creates a profile for every cluster that lacks one — including the management cluster kube-agents itself runs on, whose own workloads fail like any other cluster's — and prunes a profile only when its cluster is _definitively_ gone (a NotFound from `gcloud container clusters describe`). Ambiguous errors (auth, network, quota) never trigger deletion.
 
 ## How delegation works
 
@@ -33,6 +33,12 @@ Delegation runs on the shared kanban board — agents never pass context to each
 4. The Platform Agent reads the result and decides whether to submit the fix through the [declarative workflow](/kube-agents/concepts/declarative-workflow/) (`submit-suggestion`). The write path never moves to the cluster side.
 
 For multi-cluster work the Platform Agent fans out one card per cluster plus a fan-in card assigned to itself, synthesizing every parent's `metadata` once all complete — see the `workload-rebalancing` skill for the pattern.
+
+## Event triage
+
+A Kubernetes event alert arrives as a card like any other. The [event watcher](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/cmd/k8s-event-watcher/README.md) posts the event to the Session KV server, which records the chat thread it alerted in and then opens a session named `k8s-evt-…` on the gateway's default profile — the Planning Agent — whose whole instruction is to file **one** card, to the agent scoped to the cluster that raised the event, carrying the diagnostic brief verbatim.
+
+The Cluster Agent finishes it with `kanban_complete` and nothing else, passing the whole report as `result`. Every card carries a subscription to the session it was filed from, and the notifier posts a subscribed card's `result` to chat when the card turns terminal — so completing the card is the delivery, threaded under the alert it answers. What made that fail before was the address rather than the mechanism: an event session's ambient platform is `api_server`, which no chat adapter can deliver to, so the subscription was written well-formed and undeliverable and every report was produced and dropped.
 
 ## Security posture
 
