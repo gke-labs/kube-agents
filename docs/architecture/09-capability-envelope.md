@@ -5,12 +5,12 @@
 > **Specifies the end state, not current behaviour.** Nothing here is implemented. See
 > [README.md](README.md) for the delta against what ships today.
 
-> **Proposed. Not agreed, and not built.** The invariant that blocked it no longer does: core
-> invariant #3 used to ban agent-to-agent calls outright, and #727 restated it as the property it
-> protects -- coordination through durable, attributable state, with no authority conferred by
-> being called. That clears the way but agrees nothing. The mechanism below still needs review on
-> its merits before anyone builds it. Section 1 states where it stands against the revised
-> invariant.
+> **North star, not a build item.** This presumes agents are separate workloads, which is not the
+> current topology, so there is nothing here to build yet and no phase in
+> [07](07-implementation-roadmap.md) that builds it. The Verification suite below joins the phase
+> loop when one does. Core invariant #3 used to ban agent-to-agent calls outright and would have
+> ruled this out; #727 restated it as the property it protects, and section 1 states where the
+> mechanism stands against the revised version.
 
 **Overview:** [README.md](README.md) · **Depends on:** [03](03-security-model.md),
 [05](05-system-architecture.md), [08](08-agent-runtime-and-identity.md) · **Tier:** Foundational
@@ -96,8 +96,9 @@ the same shape as the NATS auth callout this design already accepts, and it prod
 about an entry rather than work product from a peer. If that reading is wrong the design has a
 problem, so it is stated here to be argued with rather than left implicit.
 
-**Still not agreed.** Clearing the invariant is not agreement on the mechanism, and nothing here
-should be built on the strength of #727 alone.
+**What is settled and what is not.** The mechanism is agreed as the design. The topology it
+presumes does not exist, so the open question is not whether to do this but when there is anything
+to do it to -- see the north-star note at the top.
 
 ## The recommendation, first
 
