@@ -15,3 +15,31 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
+
+# Slug per docs/designs/domains.yaml (in review): the probe exercises the chat
+# front door's delegation plumbing -- receive, plan, file a kanban card.
+domain: chat-and-routing
+
+# We chose the title, so an exact match is fair. The kanban_create call is the
+# whole point of the probe: a green judge score with no kanban call would mean
+# the agent talked about creating a task instead of creating it.
+verification_spec:
+  - name: report-states-the-probe-title
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["devops-bench smoke probe"]
+  - name: the-kanban-card-was-actually-filed
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      # An errored kanban_create filed no card, so only successful
+      # calls count toward this objective.
+      require_success: true

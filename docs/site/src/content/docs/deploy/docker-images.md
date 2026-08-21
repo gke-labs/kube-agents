@@ -69,7 +69,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Published via GitHub Actions workflows on push to `main` (tagged `:latest`) and on SemVer git tag pushes (`*.*.*`, tagged `X.Y.Z`); every publish also adds a commit-SHA tag.
+Built and published via GitHub Actions workflows on push to `main` (tagged with commit SHA and `:latest`). Production SemVer release tags (`X.Y.Z`) are promoted from validated commit images by the release publishing workflow without rebuilding.
 
 ### `platform-agent`
 
@@ -307,4 +307,4 @@ For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is th
 
 ## CI
 
-Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` and on numeric SemVer `*.*.*` tag pushes (the `k8s-operator` workflow can also be dispatched manually; a non-main dispatch publishes only a commit-SHA tag).
+Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` (tagged with commit SHA and `:latest`). Production SemVer tags (`X.Y.Z`) are promoted from validated commit images via the release publishing workflow ([`.github/workflows/release-publish.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/release-publish.yml)) without rebuilding.

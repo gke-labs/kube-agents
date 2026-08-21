@@ -42,8 +42,8 @@ domains:
     name: Consistency (fleet-consistency-drift)
     journey: Drift sweep compares each cluster against the live-fleet majority
   - slug: remediation
-    name: Remediation (github-issue-resolver)
-    journey: Triages a planted issue and files its report; nothing applied directly
+    name: Remediation (fleet-audit cron remediation, RCA chat prompt via submit-suggestion)
+    journey: A proposed fix lands as a pull request; nothing applied directly
   - slug: cluster-debugging
     name: Cluster debugging
     journey: Debugs a workload; the Cluster Agent stays read-only and inside its own cluster
@@ -51,10 +51,9 @@ domains:
     name: Incident triage (autoops)
     journey: A warning event is triaged to a root cause and a pull request, never a cluster write
 
-# Known-uncovered. Today no bench task carries a verification_spec at all, so
-# every domain starts here. Phase 2's exit criterion is an empty list.
+# Known-uncovered. The two kanban probes cover chat-and-routing, so it is
+# already off the list. Phase 2's exit criterion is an empty list.
 allowlist:
-  - chat-and-routing
   - reliability
   - capacity
   - cost
@@ -63,4 +62,7 @@ allowlist:
   - consistency
   - remediation
   - cluster-debugging
+  # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
+  # post-incident RCA, and incident-triage means event-fired autoops triage.
+  # Real coverage arrives with the autoops-warning-event-triage scenario.
   - incident-triage

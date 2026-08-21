@@ -2017,10 +2017,25 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 }
 
+// gatewayProgressDeadlineSeconds is the ceiling over every rollout wait on the
+// gateway Deployment, and it has to outlast both of the budgets under it:
+//
+//	startupProbe budget  <  rollout gate  <  progressDeadlineSeconds
+//
+// Past the deadline the Deployment reports ProgressDeadlineExceeded and any
+// caller's wait returns early however long it asked for, so a gate raised above
+// this number buys nothing. Kubernetes defaults it to 600s, which is *below*
+// the 605s cold boot agentAPIProbe(10, 60) already sanctions — the kubelet is
+// told to tolerate a boot the Deployment gives up on. 1200s clears the 900s
+// deploy gate in .github/workflows/reusable-deploy-agent.yml. hindsight-api
+// carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
+const gatewayProgressDeadlineSeconds int32 = 1200
+
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, opts)
+	progressDeadline := gatewayProgressDeadlineSeconds
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -2036,8 +2051,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Strategy: strategy,
+			Replicas:                &replicas,
+			Strategy:                strategy,
+			ProgressDeadlineSeconds: &progressDeadline,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": agent.Name + "-gateway",
@@ -2525,7 +2541,7 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	if suffix == "" {
 		// The sidecar tag must follow the agent image, which on this path is
 		// untagged or digest-pinned without a tag field — i.e. effectively
-		// "latest", not the build-injected default version.
+		// "latest", not the default platform-agent version.
 		suffix = ":latest"
 	}
 	return prefix + name + suffix
@@ -3546,13 +3562,13 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
-	dnsClusterIP = strings.Trim(dnsClusterIP, "[]")
+	dnsClusterIP := strings.Trim(profile.DNSClusterIP, "[]")
 	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
-		dnsClusterIP = "10.96.0.10"
+		dnsClusterIP = defaultDNSClusterIP
 	}
 	dnsCidr := dnsClusterIP + "/32"
 	if strings.Contains(dnsClusterIP, ":") {
@@ -3571,7 +3587,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 	// Everything the rewritten packet can be addressed to, all of it on port 988:
 	// the metadata daemon's own link-local address on the iptables datapath.
 	// See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, metadataDaemonIP}, true)
+	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{

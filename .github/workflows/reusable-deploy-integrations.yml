@@ -231,8 +231,16 @@ jobs:
 
       - name: Verify LiteLLM Deployment Rollout
         run: |
+          # 420s, not 180s: on Autopilot a rollout onto a scaled-down node pays
+          # node scale-up plus an image pull before the container starts, which
+          # measured over 180s on both installs. See the comment on the agent
+          # rollout in reusable-deploy-agent.yml for the numbers and the
+          # ordering this has to keep. litellm's startupProbe budget is 180s
+          # plus the repo's 240s pull allowance; 420s stays under this
+          # Deployment's 600s default progressDeadlineSeconds, which is the
+          # ceiling any wait here returns at.
           echo "Waiting for rollout of LiteLLM deployment..."
-          if ! kubectl rollout status deployment/litellm -n "$NAMESPACE" --timeout=180s; then
+          if ! kubectl rollout status deployment/litellm -n "$NAMESPACE" --timeout=420s; then
             echo "::error::Rollout failed! Printing debug logs..."
             kubectl describe deployment/litellm -n "$NAMESPACE" || true
             kubectl get pods -n "$NAMESPACE" -l app=litellm || true
@@ -390,8 +398,12 @@ jobs:
 
       - name: Verify GitHub Token Minter Deployment Rollout
         run: |
+          # 420s for the same reason as the LiteLLM rollout above. The minter
+          # has no startupProbe and a small image, so this is pull allowance
+          # and headroom rather than a derived budget; it stays under the 600s
+          # default progressDeadlineSeconds either way.
           echo "Waiting for rollout of github-token-minter deployment..."
-          if ! kubectl rollout status deployment/github-token-minter -n "$NAMESPACE" --timeout=180s; then
+          if ! kubectl rollout status deployment/github-token-minter -n "$NAMESPACE" --timeout=420s; then
             echo "::error::Rollout failed! Printing debug logs..."
             kubectl describe deployment/github-token-minter -n "$NAMESPACE" || true
             kubectl get pods -n "$NAMESPACE" -l app=github-token-minter || true

@@ -120,6 +120,14 @@ type PlatformAgentReconciler struct {
 	// (e.g. from KUBERNETES_API_SERVER_CIDR).
 	APIServerCIDROverride string
 
+	// DNSClusterIPOverride configures static override for the Cluster DNS Service ClusterIP
+	// (e.g. from KUBERNETES_DNS_CLUSTER_IP or --kubernetes-dns-cluster-ip).
+	DNSClusterIPOverride string
+
+	// MetadataDaemonIPOverride configures static override for the Workload Identity metadata daemon IP
+	// (e.g. from KUBERNETES_METADATA_DAEMON_IP or --kubernetes-metadata-daemon-ip).
+	MetadataDaemonIPOverride string
+
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -600,15 +608,7 @@ func (r *PlatformAgentReconciler) clearForeignPDBBudgetField(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string) error {
-	dnsClusterIP := "10.96.0.10"
-	var kubeDnsSvc corev1.Service
-	if err := r.Get(ctx, types.NamespacedName{Namespace: "kube-system", Name: "kube-dns"}, &kubeDnsSvc); err == nil {
-		if ip := strings.TrimSpace(kubeDnsSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
-			dnsClusterIP = ip
-		}
-	} else if !errors.IsNotFound(err) {
-		logf.FromContext(ctx).Info("Failed to discover kube-dns ClusterIP; defaulting to 10.96.0.10", "error", err)
-	}
+	profile := r.resolveNetpolProfile(ctx, agent)
 
 	var apiTargets []string
 	if r.APIServerIP != "" {
@@ -721,7 +721,7 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 	}
 
 	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
-	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint)
+	netpol := buildNetworkPolicy(agent, apiTargets, profile, fqdnEnabled, otlpEndpoint)
 	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
 	}

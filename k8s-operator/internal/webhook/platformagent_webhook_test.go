@@ -746,7 +746,7 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 		}
 
 		// Tag must stay as supplied: persisting "latest" would misrepresent CRs
-		// that omit image and run the operator's build-injected default version.
+		// that omit image and run the operator's default platform-agent version.
 		if agent.Spec.Deployment.Tag == nil || *agent.Spec.Deployment.Tag != "" {
 			t.Errorf("expected Tag to be left as the empty string, got %v", agent.Spec.Deployment.Tag)
 		}

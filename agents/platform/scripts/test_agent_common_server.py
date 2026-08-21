@@ -20,6 +20,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 # Add the directory containing agent_common_server.py to sys.path so it can be imported.
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
@@ -165,6 +167,123 @@ class TestResolveAgentCredentials(unittest.TestCase):
         self.assertEqual(api_key, "s3cret")
         self.assertIn("8642", endpoint)
         self.assertTrue(endpoint.startswith("https://"))
+
+
+class TestRunEnvInheritanceContract(unittest.TestCase):
+    """`_run_env` hands a child the caller's whole environment.
+
+    Sound only while the sandbox container holds no credentials worth passing
+    on. The canonical statement of why that holds is
+    docs/credential-isolation-design.md, "The loopback-only exception".
+
+    The Go side already guards the obvious version of this: TestBuildDeployment
+    in platformagent_manifests_test.go walks the sandbox container's `env` and
+    fails on any entry whose `valueFrom` names a secretKeyRef outside the
+    two-name allowlist, and TestAgentsGolden fails alongside it. This is not a
+    substitute for either. It buys two narrower things:
+
+    - `envFrom.secretRef` bulk-mounts an entire Secret and is invisible to that
+      loop, which only walks `env`. TestAgentsGolden does catch the render
+      diff -- but as a golden mismatch, which `go test ./internal/testing
+      -update` absorbs. Add one line to the operator, regenerate, and every key
+      of platform-agent-secrets is in the sandbox with the whole Go suite green.
+      That is the hole checked below.
+    - When someone does widen the allowlist deliberately -- change the
+      operator, update the Go list, regenerate the golden with
+      `go test ./internal/testing -update` -- three green edits currently leave
+      no signal beside the Python that depends on the invariant. This fails
+      there, next to `_run_env`, and says what to do about it.
+
+    Widening is allowed. It is a decision, and this makes someone take it
+    where the call sites are.
+    """
+
+    # Both are pod-scoped: one authenticates callers of the Session KV server
+    # on this pod's loopback, the other is the HMAC salt for pseudonymising
+    # chat identities, which has to be here because the hashing is here.
+    # Neither grants access to any external system.
+    EXPECTED = {"SESSION_KV_API_KEY", "SESSION_KV_SALT"}
+    SANDBOX_CONTAINER = "platform-agent"
+    PROXY_CONTAINER = "envoy-credential-proxy"
+    # A credential the proxy holds and the sandbox must never see. Named
+    # rather than counted: SESSION_KV_API_KEY is on both containers, so
+    # "the proxy has some Secret-backed env" is satisfied by a pod-scoped
+    # value and would stay true after the last real credential left.
+    PROXY_CREDENTIAL = "API_SERVER_EXTERNAL_KEY"
+    GOLDEN = (
+        Path(__file__).resolve().parents[3]
+        / "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml"
+    )
+
+    def _container(self, name):
+        if not self.GOLDEN.exists():
+            self.fail(
+                f"golden manifest not found at {self.GOLDEN}. This test reads the "
+                "operator's testdata from Python; if that tree moved, update GOLDEN "
+                "— do not delete this test.")
+        with self.GOLDEN.open() as handle:
+            docs = [d for d in yaml.safe_load_all(handle) if d]
+        deployments = [d for d in docs if d.get("kind") == "Deployment"]
+        self.assertEqual(
+            len(deployments), 1,
+            f"expected one Deployment in {self.GOLDEN.name}, found {len(deployments)}")
+        containers = deployments[0]["spec"]["template"]["spec"]["containers"]
+        for container in containers:
+            if container.get("name") == name:
+                return container
+        self.fail(
+            f"no container named {name!r} in the golden; found "
+            f"{[c.get('name') for c in containers]}. If it was renamed, update the "
+            "constant on this class — do not delete this test.")
+
+    @staticmethod
+    def _secret_backed(container):
+        return {
+            env["name"]
+            for env in container.get("env", [])
+            if (env.get("valueFrom") or {}).get("secretKeyRef")
+        }
+
+    def test_the_sandbox_holds_only_the_two_pod_scoped_secrets(self):
+        self.assertEqual(
+            self._secret_backed(self._container(self.SANDBOX_CONTAINER)),
+            self.EXPECTED,
+            "The sandbox container's Secret-backed environment changed. "
+            "_run_env in agent_common_server.py passes the whole environment to "
+            "every gcloud/kubectl/hermes child it spawns, and its docstring "
+            "cites this exact set as the reason that is safe. If the new "
+            "variable is genuinely pod-scoped, add it to EXPECTED here and to "
+            "the allowlist in platformagent_manifests_test.go. If it is a real "
+            "credential, it belongs in the credential-proxy container, or "
+            "_run_env's call sites need an explicit allowlist.")
+
+    def test_the_sandbox_bulk_mounts_no_secret(self):
+        # The half the Go allowlist loop cannot see: it walks `env` only, so an
+        # `envFrom.secretRef` puts every key of a Secret into this container
+        # with TestBuildDeployment still green.
+        bulk = [
+            source for source in self._container(self.SANDBOX_CONTAINER).get("envFrom", [])
+            if source.get("secretRef")
+        ]
+        self.assertEqual(
+            bulk, [],
+            "The sandbox container bulk-mounts a Secret through envFrom, which "
+            "puts every key in it into the environment _run_env hands to each "
+            "child. Name the variables individually under `env` so the allowlist "
+            "above and the Go one both see them.")
+
+    def test_the_credential_proxy_is_where_real_credentials_live(self):
+        # Keeps the test above from passing for the wrong reason. If a refactor
+        # moved credentials out of the proxy, the next question is whether they
+        # landed in the sandbox, and the sandbox assertion alone reads the same
+        # either way.
+        secret_backed = self._secret_backed(self._container(self.PROXY_CONTAINER))
+        self.assertIn(
+            self.PROXY_CREDENTIAL, secret_backed,
+            f"{self.PROXY_CREDENTIAL} is no longer Secret-backed on the "
+            f"{self.PROXY_CONTAINER} container (found {sorted(secret_backed)}). "
+            "If credentials moved, they must not have moved into the sandbox; "
+            "update PROXY_CREDENTIAL to whichever one now anchors this.")
 
 
 if __name__ == "__main__":
