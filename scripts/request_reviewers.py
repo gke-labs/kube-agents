@@ -372,6 +372,12 @@ class GitHubAPI:
     def post(self, path, body):
         return self._request("POST", path, body)
 
+    def patch(self, path, body):
+        return self._request("PATCH", path, body)
+
+    def delete(self, path):
+        return self._request("DELETE", path)
+
 
 def resolve_pull_request(api, head_sha):
     """Find the open pull request the commit `head_sha` belongs to.
