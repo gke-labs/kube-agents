@@ -1747,6 +1747,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
                 "kanban-workspace-gc",
+                "findings-morning-nudge",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
