@@ -12,7 +12,7 @@
 # seeded-debug on seeded cluster A (shared with cluster-agent-crashloop-debug;
 # one planted defect serves two domains). The PR lands on the evaluation
 # GitOps repository submit-suggestion is configured for: per eval project,
-# gke-agentic/kube-agents-evals-infra and -evals-2-infra, throwaway repos that
+# gke-agentic/kube-agents-evals-infra, -evals-2-infra, and -evals-3-infra, throwaway repos that
 # exist for this and for the audit ledgers (DRAFTS.md, activation blocker A1).
 #
 # Every run leaves a pull request behind, permanently. An earlier version of
