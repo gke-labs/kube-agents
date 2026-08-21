@@ -295,9 +295,30 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
 
         self.assertEqual(summary["cap_dropped"], 12)
-        self.assertIn("*12 alerts withheld by the daily ceiling and never reached chat.*", report)
+        self.assertIn("*1 alert withheld by the daily ceiling and never reached chat.*", report)
         # Counted, and still not listed: the breakdown is informational events.
         self.assertNotIn("checkout", report)
+
+    def test_the_withheld_line_sizes_the_loss_in_alerts_not_rows(self):
+        """One failure re-offered all afternoon is one alert chat did not get.
+
+        A quota refusal makes the watcher forget the dedup entry, so the same
+        crash loop writes a fresh row every kubelet re-emit. Chat would have
+        received one alert and deduplicated the rest, so printing the row count
+        sizes the loss two orders of magnitude high. The row count still vetoes
+        the all-clear, where any row at all is the whole question.
+        """
+        events = [
+            event(workload="api", reason="CrashLoopBackOff", notified=False)
+            for _ in range(50)
+        ] + [event(workload="web", reason="OOMKilled", notified=False)]
+        summary = filter_and_aggregate_events(events)
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertEqual(summary["cap_dropped"], 51)
+        self.assertEqual(summary["cap_dropped_alerts"], 2)
+        self.assertIn("*2 alerts withheld by the daily ceiling and never reached chat.*", report)
+        self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("CrashLoopBackOff", report)
 
     def test_a_clean_day_is_not_told_about_alerts_it_did_not_lose(self):
@@ -342,7 +363,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
 
         self.assertEqual(summary["cap_dropped"], 30)
-        self.assertIn("*30 alerts withheld by the daily ceiling and never reached chat.*", report)
+        self.assertIn("*1 alert withheld by the daily ceiling and never reached chat.*", report)
         self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("🟢", report)
         self.assertIn("📊", report)

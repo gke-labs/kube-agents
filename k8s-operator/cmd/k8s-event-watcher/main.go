@@ -614,7 +614,13 @@ func daemonWouldAlert(eventType string) bool {
 // sighting in the canonical family, almost all of which reached nobody. Putting
 // that number on the wire would write it to `occurrences` in the ledger, and
 // the recap sums that column to report how many events were forwarded.
-func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent) (dedupResult, bool) {
+func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupResult, bool) {
+	// An informer rotation re-delivers events whose LastTimestamp has not
+	// moved. Alerting on one costs a stale page and the family's one firing;
+	// an ongoing failure reopens on its next real sighting instead.
+	if replay {
+		return dedupResult{}, false
+	}
 	if !daemonWouldAlert(ev.Type) {
 		return dedupResult{}, false
 	}
@@ -652,7 +658,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
 	d.metrics.activeIncidents.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
-		reopened, ok := d.reopenPolicyFiltered(ev)
+		reopened, ok := d.reopenPolicyFiltered(ev, result.Replay)
 		if !ok {
 			d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
 			log.Printf("dedup %s pod=%s/%s (count=%d, window active)",

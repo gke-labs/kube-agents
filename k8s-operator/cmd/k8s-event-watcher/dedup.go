@@ -53,6 +53,9 @@ type dedupResult struct {
 	Kind      dedupResultKind
 	SessionID string // only set when Kind==dedupDuplicate (referencing the existing active session)
 	Count     int    // window count (1 for new incident, N for duplicates)
+	// Replay marks a duplicate whose LastTimestamp had not advanced. Observe
+	// consumes that timestamp, so the caller cannot re-derive this afterwards.
+	Replay bool
 }
 
 type dedupResultKind int
@@ -158,7 +161,7 @@ func (c *dedupCache) Observe(key EventKey, message string, eventLastTS time.Time
 	if !eventLastTS.After(entry.EventLastTS) {
 		// Case 1: Replay of an event we already processed.
 		entry.Count++
-		return dedupResult{Kind: dedupDuplicate, SessionID: entry.SessionID, Count: entry.Count}
+		return dedupResult{Kind: dedupDuplicate, SessionID: entry.SessionID, Count: entry.Count, Replay: true}
 	}
 	if now.Sub(entry.LastSeen) > c.window {
 		// Case 2: Cooldown expired. Create a new session.
@@ -259,7 +262,8 @@ func (c *dedupCache) MarkPolicyFiltered(key EventKey, message string) {
 //
 // Bounded at one firing per entry by the sticky Reopened flag, so the
 // escape hatch cannot turn into a session per sighting — the churn
-// keeping the entry exists to avoid. reopenPolicyFiltered admits only
+// keeping the entry exists to avoid. Dispatch withholds replays, so only
+// a fresh sighting can spend that firing. reopenPolicyFiltered admits only
 // events daemonWouldAlert says the daemon posts, which rules out the
 // obvious way to spend the firing repeatedly; the flag is what holds if
 // that mirror is ever wrong. An emitter leaving Event.Type empty is not

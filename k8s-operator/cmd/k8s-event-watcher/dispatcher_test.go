@@ -663,6 +663,84 @@ func TestMarkPolicyFilteredFlagsAnEntryThatWasNeverReopened(t *testing.T) {
 	}
 }
 
+// TestReplayCannotSpendTheReopenBudget pins the one-shot reopen against an
+// informer relist, which re-delivers events verbatim. The re-delivered Warning
+// is the same sighting the daemon already graded, so spending the family's
+// single firing on it pages a human about an hour-old event and leaves the next
+// real Warning with nothing to spend.
+func TestReplayCannotSpendTheReopenBudget(t *testing.T) {
+	var injected []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-1"})
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var env injectMessageRequest
+		_ = json.Unmarshal(body, &env)
+		var p InjectPayload
+		_ = json.Unmarshal([]byte(env.Message), &p)
+		w.WriteHeader(http.StatusOK)
+		if p.Type == "Normal" {
+			_, _ = w.Write([]byte(`{"status":"filtered"}`))
+			return
+		}
+		injected = append(injected, p.Reason)
+		_, _ = w.Write([]byte(`{"status":"injected"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     newMetrics(),
+		mode:        "per-incident",
+	}
+
+	base := time.Now().Add(-time.Hour)
+	warning := TriageEvent{
+		Key: EventKey{UID: "pod-1", Reason: "ErrImagePull"}, Type: "Warning",
+		Cluster: "test-cluster", Namespace: "prod", Name: "api",
+		Message: "rpc error: code = NotFound", LastSeen: base, Count: 1,
+	}
+
+	// The Normal-typed back-off takes the canonical key first and comes back
+	// filtered, arming the reopen for the Warnings behind it.
+	disp.Dispatch(context.Background(), TriageEvent{
+		Key: EventKey{UID: "pod-1", Reason: "BackOff"}, Type: "Normal",
+		Cluster: "test-cluster", Namespace: "prod", Name: "api",
+		Message: `Back-off pulling image "repo/api:typo"`, LastSeen: base, Count: 1,
+	})
+
+	disp.Dispatch(context.Background(), warning)
+	if len(injected) != 0 {
+		t.Errorf("a replay alerted: %v — the sighting is as old as the entry holding the key", injected)
+	}
+
+	// The control: the budget survived, so the next real sighting still gets through.
+	warning.LastSeen = base.Add(time.Minute)
+	disp.Dispatch(context.Background(), warning)
+	if len(injected) != 1 {
+		t.Errorf("alerts through = %v, want one ErrImagePull; the guard is refusing live events", injected)
+	}
+}
+
 // TestDispatcherReopenedPayloadCountsFromOne pins the number the reopen puts on
 // the wire, which is not the number Observe returned.
 //

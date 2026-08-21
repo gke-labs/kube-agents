@@ -189,9 +189,11 @@ here — no workload, no reason, no message — because the listing has one subj
 informational churn. Each is **counted**, on its own line above the body:
 
 - **Alerts the daily ceiling withheld.** `ALERT_DAILY_LIMITS` stopped them. Reported as
-  `⚠️ *N alerts withheld by the daily ceiling and never reached chat.*` The
-  `k8s_event_watcher_events_quota_suppressed_total` counter and `GET /v1/alert-quota` report these
-  immediately and severity-accurately, so the detail lives outside this report.
+  `⚠️ *N alerts withheld by the daily ceiling and never reached chat.*` `N` counts distinct
+  workload/reason groups, not ledger rows: a quota refusal makes the watcher forget the dedup entry,
+  so one crash loop writes a row on every kubelet re-emit while chat would have received a single
+  alert. The `k8s_event_watcher_events_quota_suppressed_total` counter and `GET /v1/alert-quota`
+  report these immediately and severity-accurately, so the detail lives outside this report.
 - **Alerts whose delivery failed.** `notified = 1` is written before the chat post is attempted, so
   on its own it records an intention to deliver rather than a delivery. When the post fails the
   ingestion side clears the flag and records why in `delivery_error`. Reported as

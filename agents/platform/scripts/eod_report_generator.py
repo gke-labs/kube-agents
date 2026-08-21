@@ -323,9 +323,9 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     The headline counts and the workload breakdown are derived from the same
     filtered rows, so they describe one scope: an excluded namespace is absent
-    from both, not from one. `cap_dropped` and `delivery_failed` are counted
-    over every row instead, so a withheld or undelivered alert is reported
-    wherever it happened. Anything the namespace filter removed is totalled in
+    from both, not from one. `cap_dropped`, `cap_dropped_alerts` and
+    `delivery_failed` are counted over every row instead, so a withheld or
+    undelivered alert is reported wherever it happened. Anything the namespace filter removed is totalled in
     `excluded_occurrences`, which is what lets the report say it covered part
     of the fleet.
     """
@@ -343,6 +343,12 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     alerts_posted = 0
     suppressed_info = 0
     cap_dropped = 0
+    # Rows and alerts diverge only here. On a quota refusal the watcher forgets
+    # the dedup entry, so every later sighting of the same failure re-offers and
+    # writes another row; chat would have received one alert and deduplicated
+    # the rest. `cap_dropped` rows veto the all-clear, and the printed ⚠️ line
+    # sizes the loss from the groups.
+    cap_dropped_groups: set = set()
     delivery_failed = 0
     workload_map: Dict[str, Dict[str, Any]] = {}
 
@@ -395,6 +401,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # branch and duplicates never reach the dispatch, so the two units
         # agree today; they are written apart so they keep agreeing if a
         # future writer batches sightings into one row.
+        cap_row = False
         event_delivery_failed = bool(event.get("delivery_error"))
         if event_delivery_failed:
             delivery_failed += 1
@@ -406,6 +413,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 suppressed_info += count
         else:
             cap_dropped += 1
+            cap_row = True
 
         # Used as stored. session_kv_server.clean_workload_name already stripped
         # the replica hash on the way in, and only for `kind == pod`. A
@@ -432,6 +440,8 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # without it, the two merge and the pair is listed as two withheld
         # events or as none, while the 📉 total counts one.
         group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(bool(event.get('notified')))}"
+        if cap_row:
+            cap_dropped_groups.add(group_key)
         msg = sanitize_chat_message(event.get("message", ""))
 
         if group_key in workload_map:
@@ -497,6 +507,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "alerts_posted": alerts_posted,
         "suppressed_info": suppressed_info,
         "cap_dropped": cap_dropped,
+        "cap_dropped_alerts": len(cap_dropped_groups),
         "delivery_failed": delivery_failed,
         "entries": filtered_entries,
     }
@@ -658,7 +669,7 @@ def generate_markdown_report(
     if not problems:
         if summary.get("cap_dropped"):
             lines.append(
-                f"⚠️ *{_plural(summary['cap_dropped'], 'alert')} withheld by the daily "
+                f"⚠️ *{_plural(summary['cap_dropped_alerts'], 'alert')} withheld by the daily "
                 "ceiling and never reached chat.*"
             )
         if summary.get("delivery_failed"):
