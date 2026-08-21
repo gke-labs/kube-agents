@@ -1564,17 +1564,15 @@ class TestTheListingHoldsOnlyRowsHeldBackFromChat(unittest.TestCase):
         self.assertIn("*3 informational events* held back", report)
 
 
-class TestTheEnvironmentKnobsFailSoft(unittest.TestCase):
-    """A malformed knob must not stop the recap arriving.
+class TestTheNamespaceFilterReadsItsValue(unittest.TestCase):
+    """Unset, empty and padded are three different answers, not one.
 
-    This job runs `no_agent`: its stdout *is* the chat message, so an exception
-    anywhere in the render is a weekday with no recap and a traceback nobody
-    reads in the container log. Both knobs are read from the environment on
-    every call, so a typo in `kubectl set env` is the realistic trigger.
+    `excluded_namespaces()` is a `getenv`, a `split(",")` and a `strip()`, so no
+    value can raise and no typo can cost the fleet its recap. The hazard these
+    pin is the quieter one: absent takes the three system defaults, while
+    set-but-empty excludes nothing, so clearing the variable widens the recap
+    instead of restoring the default.
     """
-
-    def render(self):
-        return recap([event(severity="Info", notified=False)])[1]
 
     def test_the_defaults_are_the_three_system_namespaces(self):
         with mock.patch.dict(os.environ, {}, clear=True):

@@ -275,8 +275,13 @@ changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the Deployment with 
 a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
 Deployment from the CR and reverts it.
 
-Applying the CR change rolls the pod, and the next tick after it comes up uses the new values. The
-script re-reads both on every run, so nothing further is needed once the pod is up. A value that
-will not parse warns on stderr and falls back to the default rather than failing the run — which
-matters here, because this job's stdout is the chat message and a traceback would be a missing
-recap.
+Applying the CR change rolls the pod, and the next tick after it comes up uses the new value. The
+script re-reads it on every run, so nothing further is needed once the pod is up. No value can fail
+the run: `excluded_namespaces()` is a `getenv`, a `split(",")` and a `strip()`, with no parse step
+to reject anything and no fallback behind it. That matters here because this job's stdout is the
+chat message and a traceback would be a missing recap.
+
+The failure mode is the quiet one instead. Unset and empty are different answers: with the variable
+absent the three system namespaces apply, while a value that leaves nothing usable — `""`, `","`,
+spaces — excludes nothing. Clearing the value widens the recap to control-plane churn rather than
+restoring the default.
