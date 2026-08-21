@@ -374,16 +374,33 @@ def check_run_summary(result):
 
 
 def post_check_run(api, head_sha, result):
-    api.post(
-        f"/repos/{api.repo}/check-runs",
-        {
-            "name": CHECK_NAME,
-            "head_sha": head_sha,
-            "status": "completed",
-            "conclusion": "success",
-            "output": {"title": check_run_title(result), "summary": check_run_summary(result)},
-        },
-    )
+    """Create or update THE check run for this commit.
+
+    `edited`, `reopened` and `ready_for_review` re-classify the same head
+    SHA; a fresh POST each time would stack runs, leaving the stale verdict
+    ("declares low") standing beside the corrected one with nothing marking
+    which is current. So the existing run is PATCHed when there is one --
+    filtered to the github-actions app, because a name alone is not an
+    identity and PATCHing another app's run would 403 anyway.
+    """
+    payload = {
+        "name": CHECK_NAME,
+        "status": "completed",
+        "conclusion": "success",
+        "output": {"title": check_run_title(result), "summary": check_run_summary(result)},
+    }
+
+    existing = api.get(
+        f"/repos/{api.repo}/commits/{head_sha}/check-runs"
+        f"?check_name={urllib.parse.quote(CHECK_NAME)}"
+    )["check_runs"]
+    mine = [run for run in existing if (run.get("app") or {}).get("slug") == "github-actions"]
+
+    if mine:
+        newest = max(mine, key=lambda run: run.get("id") or 0)
+        api.patch(f"/repos/{api.repo}/check-runs/{newest['id']}", payload)
+    else:
+        api.post(f"/repos/{api.repo}/check-runs", {**payload, "head_sha": head_sha})
 
 
 def _tolerate(status, call):

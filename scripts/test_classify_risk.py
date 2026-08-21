@@ -294,9 +294,10 @@ class SummaryHostileInputTest(unittest.TestCase):
 class FakeAPI:
     repo = "gke-labs/kube-agents"
 
-    def __init__(self, fail=None):
+    def __init__(self, fail=None, check_runs=None):
         self.calls = []
         self.fail = fail or {}
+        self.check_runs = check_runs or []
 
     def _record(self, method, path, body=None):
         self.calls.append((method, path) if body is None else (method, path, body))
@@ -304,8 +305,15 @@ class FakeAPI:
         if status:
             raise urllib.error.HTTPError(path, status, "", {}, None)
 
+    def get(self, path):
+        self._record("GET", path)
+        return {"check_runs": self.check_runs}
+
     def post(self, path, body):
         self._record("POST", path, body)
+
+    def patch(self, path, body):
+        self._record("PATCH", path, body)
 
     def delete(self, path):
         self._record("DELETE", path)
@@ -348,6 +356,39 @@ class SyncLabelsTest(unittest.TestCase):
         self.assertEqual(
             api.calls, [("DELETE", "/repos/gke-labs/kube-agents/issues/7/labels/risk%3A%20high")]
         )
+
+
+class PostCheckRunTest(unittest.TestCase):
+    def _result(self):
+        config = _config({"id": "hi", "tier": "high", "why": "w", "match": [".github/workflows/**"]})
+        return classify_risk.build_result(config, [_file(".github/workflows/ci.yml")], "")
+
+    def test_first_classification_creates_the_run(self):
+        api = FakeAPI(check_runs=[])
+        classify_risk.post_check_run(api, "a" * 40, self._result())
+        method, path, body = api.calls[-1]
+        self.assertEqual((method, path), ("POST", "/repos/gke-labs/kube-agents/check-runs"))
+        self.assertEqual(body["head_sha"], "a" * 40)
+
+    def test_reclassifying_the_same_sha_updates_in_place(self):
+        # edited/reopened re-classify the same commit; stacking a fresh run
+        # would leave the stale verdict beside the corrected one.
+        api = FakeAPI(
+            check_runs=[
+                {"id": 5, "app": {"slug": "github-actions"}},
+                {"id": 9, "app": {"slug": "github-actions"}},
+            ]
+        )
+        classify_risk.post_check_run(api, "a" * 40, self._result())
+        method, path, body = api.calls[-1]
+        self.assertEqual((method, path), ("PATCH", "/repos/gke-labs/kube-agents/check-runs/9"))
+        self.assertNotIn("head_sha", body)
+
+    def test_another_apps_run_with_the_same_name_is_not_touched(self):
+        # A name is not an identity, and PATCHing another app's run 403s.
+        api = FakeAPI(check_runs=[{"id": 5, "app": {"slug": "some-other-app"}}])
+        classify_risk.post_check_run(api, "a" * 40, self._result())
+        self.assertEqual(api.calls[-1][0:2], ("POST", "/repos/gke-labs/kube-agents/check-runs"))
 
 
 class RepositoryRulesTest(unittest.TestCase):
