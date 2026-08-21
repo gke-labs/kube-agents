@@ -6,9 +6,9 @@
 > rules (§5.2), the seven endpoints and MCP tools (§6.1), and the inventory sweep's registration
 > path (§5). Item 7 ships in part: `agents/platform/scripts/findings_nudge.py` and the
 > `findings-morning-nudge` cron job post §7.2's message behind its change gate, so an unchanged
-> queue — including an empty one — says nothing. §7.2's weekly message regardless does not ship, and
-> nor does §7.1's backlog document the nudge is meant to link to. §7.5's SOP-driven job is not how it
-> runs; it is a `no_agent` script. Items 8–13 do not ship, so no finding reaches a pull request and
+> queue — including an empty one — says nothing. §7.2's weekly message regardless is deferred, as is
+> §7.1's backlog document the nudge is meant to link to. §7.5's SOP-driven job is not how it runs; it
+> is a `no_agent` script. Items 8–13 do not ship, so no finding reaches a pull request and
 > §8 and §9 remain design. The pipeline
 > this design extends does ship: the sweep in
 > [`inventory.md`](../../agents/platform/governance/inventory.md), the ranking in

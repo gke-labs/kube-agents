@@ -13,9 +13,9 @@ What is left is counting and formatting.
 This is §7.2 of `docs/designs/inventory-findings-queue.md` minus two things.
 The design's nudge links to a backlog document holding the whole queue; that
 publisher (§7.1) is not built, so the message says how many findings it did not
-name rather than pointing at a list of them. And the design's change gate comes
-with a weekly message that posts regardless, so a silent week cannot be confused
-with a broken job; there is no such floor here.
+name rather than pointing at a list of them. And the design pairs the change
+gate with a weekly message that posts regardless, so a silent week cannot be
+confused with a broken job; that floor is deferred.
 """
 
 import hashlib
