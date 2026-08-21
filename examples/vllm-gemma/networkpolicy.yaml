@@ -67,9 +67,10 @@ spec:
         - ipBlock:
             cidr: 169.254.169.254/32
     # GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-    # the node rewrites 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    # the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
     # is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
     # policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
+    # Port 987 (ALTS) is deliberately omitted because standard OAuth2/REST token fetches do not use DirectPath.
     - ports:
         - port: 988
           protocol: TCP
