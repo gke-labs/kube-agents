@@ -11,6 +11,12 @@ nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.m
 exists. Those steps belong to the Platform Agent, and running them here means several agents
 writing one path at once.
 
+**Never block this card, at any step.** Denied permissions, an unreachable API server, a cluster in
+`ERROR`, credentials that will not mint, an MCP tool that errors — every one of them is a `gaps`
+entry and a completed card, not a block. An aggregation card is waiting on this card and every
+other cluster's, so blocking here stops the whole fleet report rather than losing one cluster's row.
+Record what you did get, record what failed and why in `gaps`, and complete.
+
 ---
 
 ## Step 1: Confirm which cluster you are
@@ -169,6 +175,11 @@ report loses.
   "gaps": ["<any step that could not be completed, and why>"]
 }
 ```
+
+One `findings` entry names one workload. `"workload": "multiple workloads"`, a comma-separated list,
+or `"e.g. networking-dra-driver"` all collapse on the way through aggregation into a line the user
+cannot act on; file one entry per affected workload instead, even when the issue and the
+recommendation repeat verbatim.
 
 `workloads` must hold one entry per workload Step 3 listed — every Deployment, StatefulSet,
 DaemonSet, and Job, including the ones with no findings. The aggregation stage has no way to go back
