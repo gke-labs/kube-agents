@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import findings_queue as fq
+import inventory_findings as inv
 
 
 def _load_audit_report():
@@ -818,15 +819,47 @@ class SopRubricParityTests(unittest.TestCase):
         for prefix in ("gke-*", "gmp-*"):
             self.assertIn(f"`{prefix}`", self.text)
 
-    def test_the_sop_names_the_tools_and_enum_values_it_tells_the_worker_to_send(self):
-        self.assertIn("register_findings", self.text)
-        self.assertIn("get_ranked_findings", self.text)
-        self.assertIn('`source`', self.text)
-        self.assertIn('`"inventory"`', self.text)
+    def test_the_sop_names_the_commands_and_enum_values_it_tells_the_worker_to_send(self):
+        self.assertIn("inventory_findings.py extract", self.text)
+        self.assertIn("inventory_findings.py register", self.text)
+        self.assertIn("inventory_findings.py ranked", self.text)
         for kind in fq.REMEDIATION_KINDS:
             self.assertIn(f"`{kind}`", self.text)
         for kind in fq.VERIFICATION_KINDS:
             self.assertIn(f"`{kind}`", self.text)
+
+    def test_the_sop_does_not_send_the_worker_at_the_queue_directly(self):
+        # `source` and the identity fields moved out of the worker's hands when
+        # `inventory_findings.py` took over the call; an SOP that still names
+        # the MCP tools is telling it to bypass the completeness gate — and a
+        # live run blocked outright looking for `get_ranked_findings` as a third
+        # script once the steps either side of it became shell commands.
+        self.assertNotIn("register_findings", self.text)
+        self.assertNotIn("get_ranked_findings", self.text)
+
+    def test_the_extractor_registers_under_a_source_the_queue_accepts(self):
+        self.assertIn(inv.SOURCE, fq.SOURCES)
+
+    def test_the_extractor_scores_only_fields_the_queue_takes_from_a_source(self):
+        # A field the script forwards but `validate_finding` ignores is a score
+        # the worker writes and nothing reads.
+        forwarded = set(inv.SCORE_REQUIRED) | set(inv.SCORE_OPTIONAL)
+        accepted = set(
+            fq.validate_finding(
+                {
+                    "source": inv.SOURCE,
+                    "check": "probes-readiness",
+                    "cluster": "prod",
+                    "object": "api",
+                    "title": "t",
+                    "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+                    "recommendation": {"action": "a", "rationale": "r", "risk": "k"},
+                    "remediation": {"kind": "manual", "note": "n"},
+                    "verification": {"kind": "manual", "still_failing_when": "w"},
+                }
+            )
+        )
+        self.assertEqual(forwarded - accepted, set())
 
 
 if __name__ == "__main__":
