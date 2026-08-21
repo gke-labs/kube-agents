@@ -24,23 +24,24 @@ does not restate them - it only adds the agent-to-agent loop.
 
 Agents **do not review one another's work unless asked to by a human.** Review
 and approval are human responsibilities (assisted by `kube-agents-bot`); merge
-is automated once a human approves and the system applies `lgtm`. An agent's
-job ends at "resolve every review comment and get the human to approve." The
-only coordination _between_ agents is the claim, below.
+is external automation applied once a human approves (see the root
+`AGENTS.md`). An agent's job ends at "resolve every review comment and get the
+human to approve." The only coordination _between_ agents is the claim, below.
 
 ## The loop
 
 Run on your own cadence. Each cycle, take the **first** step below that has
-work, perform **one** action, then stop. Do not do two things per cycle.
+work, do that step fully, then stop. Do not start the next step in the same
+cycle.
 
 1. **Own open pull requests first.** For each of your open PRs
    (`gh pr list --author @me --state open`), check for new review events,
    inline comments, and check status. Address every finding - fix and push, or
-   answer it in the thread. Resolve each thread only once it is genuinely
-   resolved - the bar is owned by the root `AGENTS.md`. After making changes,
-   re-run the review: comment `/review` for a narrow re-check of the diff, or
-   `/review all` for a wider re-check when the changes are substantial. If
-   `lgtm` is present, you are done - the system merges; you never do. If
+   answer it in the thread - and resolve each thread only once it is genuinely
+   resolved, per the bar in the root `AGENTS.md`. You cannot trigger a fresh
+   review yourself (`/review` is for owners and members): on a bot-authored PR
+   a human reviewer is assigned automatically once the bot's check completes.
+   If `lgtm` is present, you are done - the system merges; you never do. If
    `do-not-merge/hold` is present, read the comment explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
    in progress, continue it.
@@ -68,7 +69,8 @@ if yours is first, keep the assignment, otherwise remove yourself and pick a
 different issue. Never try to break the tie by force.
 
 You work only issues assigned to you. Never reassign or close an issue you do
-not own.
+not own. Re-verify you are still the sole assignee before opening the PR - the
+other agent's assignment may have landed after your re-read.
 
 ## Before you claim or file
 
@@ -87,23 +89,22 @@ permission/config change, anything only a maintainer can resolve - do **not**
 silently stall:
 
 1. Apply the `needs-human` label.
-2. Comment, `@mention`ing the relevant maintainer (see `OWNERS` /
-   `OWNERS_ALIASES`), stating: what blocks you, what would unblock you, and who
-   can unblock it.
+2. Comment, `@mention`ing the relevant maintainer (see `OWNERS`), stating: what
+   blocks you, what would unblock you, and who can unblock it.
 
 The label plus the mention **is** the escalation - there is no other channel.
-An issue carrying `needs-human` is not claimable: your claim filter must skip
-it. After applying `needs-human`, stop working the issue until a human removes
-the label - the label, not a comment, is the signal to resume.
-
-`needs-human` is for decisions and blockers, on an issue or a PR.
+The `@mention` is what draws a human to act on it. An issue carrying
+`needs-human` is not claimable: your claim filter must skip it. After applying
+`needs-human`, stop working the issue until a human removes the label - the
+label, not a comment, is the signal to resume.
 
 ## Hard rules
 
 - **Never merge**, not even a PR you authored that is approved. Merging is
-  automated: a human approves, the system applies `lgtm`, then merges. Your
-  account holds `triage` on `upstream` (write on your fork only), so you
-  _cannot_ merge - this rule documents what permissions already enforce.
+  external automation: a human approves, the system applies `lgtm`, then
+  merges. Your account holds `triage` on `upstream` - no write access, push to
+  your fork only - so you _cannot_ merge; this rule documents what permissions
+  already enforce.
 - **Never apply `lgtm` or `approved` to your own PR.** Approval is a human
   signal, and `lgtm` is applied by the system - not by you. You do not
   self-approve.
@@ -122,8 +123,9 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 1. Resolve every review thread (the bot's and any human's) - `main` requires
    all conversations resolved before it can merge. Resolve a thread only once
    genuinely resolved, per the root `AGENTS.md`.
-2. Get a clean bot pass (`/review`, per [The loop](#the-loop)) - a human is
-   assigned only after the bot's check goes green.
+2. A human is assigned once the bot's check completes - on a bot-authored PR
+   this happens automatically, whatever the verdict, because you cannot
+   trigger `/review` yourself.
 3. The human approves; the system applies `lgtm` and merges.
 
 See [`AGENTS.md`](../../AGENTS.md#automated-review-after-opening-a-pull-request)
