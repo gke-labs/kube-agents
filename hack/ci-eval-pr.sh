@@ -145,8 +145,11 @@ TASKS=(
   # Summarised, so a reader here does not have to guess:
   #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
   #       every fleet-audit stream mints a GitHub token and writes a ledger
-  #       issue. They need the eval GitOps repos pinned and the agent deployed
-  #       with a scoped minter before they may run in presubmit.
+  #       issue. ci-deploy.sh installs the PR's agent on every run but never
+  #       sets platformAgent.integration.github.gitRepo, so SETTINGS.md
+  #       carries no `Git Repo:` line and audit_report.py start has nothing
+  #       to clone. Needs that value passed per leased project (the throwaway
+  #       eval GitOps repos) and the minter scoped to it.
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
   #       (2026-08-28 for the pool, 2026-09-20 for the disks).
   #   A4  the six audit scenarios' objectives read the final message, which

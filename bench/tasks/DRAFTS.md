@@ -17,7 +17,11 @@ The mitigation is the pattern the autopush environment already uses. Autopush po
 | `kube-agents-evals`   | `gke-agentic/kube-agents-evals-infra`   |
 | `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
 
-Both repos exist. What remains is the deploy side: no platform agent is installed in either eval project yet (`kubeagents-system` on each `platform-agent-host` is empty), so installing it with `github_repo` set to that project's repo and `enable_github_minter = true`, minter rule keyed on that project's platform GSA, is the work A1 names.
+Both repos exist. The deploy is not the gap: `hack/ci-deploy.sh` already installs the PR's own images into `kubeagents-system` on each run (`helm upgrade --install kube-agents`) and `hack/ci-teardown.sh` uninstalls them after, which is exactly what the eval tier is testing — the agent built from the pull request. An eval project looks empty between runs by design.
+
+What is missing is one value in that install. `ci-deploy.sh` never sets `platformAgent.integration.github.gitRepo`, whose chart default is `""`, so the operator renders a `SETTINGS.md` with no `Git Repo:` line and `audit_report.py start` has nothing to clone. A1 is therefore: pass the repo at deploy time, keyed on the project the run leased, and stand up the minter half (`githubMinter` in the chart plus `terraform/modules/github-minter` per eval project, its rule keyed on that project's platform GSA).
+
+Setting it in CI rather than in the chart default is the point, not a convenience: the deployment under test is built from the pull request, so a change to the chart's default or to the SETTINGS rendering is itself a thing an eval run must be able to catch without being able to redirect where the run writes.
 
 **A2 — `chat-routing-fleet-question` cannot be reached by the harness.** `hack/ci-eval-pr.sh` exports one `AGENT_SERVICE_NAME` (`platform-agent`) and the runner port-forwards that single service, so every entry in `TASKS` talks to the platform agent. The routing scenario needs the chat front door. Until the harness can target an agent per task, this draft is not activatable by uncommenting — the same category as `autoops-warning-event-triage`, which needs a scenario driver to apply its incident workload and gets one with the AutoOps seam work.
 
