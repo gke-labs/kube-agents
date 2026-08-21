@@ -2,8 +2,14 @@
 
 **Purpose:** Turns the raw findings produced by the discovery sweep into two things — the durable
 findings queue that later publishers read, and the short ranked report the user receives now. Reads
-`/opt/data/INVENTORY.raw.md`, registers every finding through `register_findings`, writes
-`/opt/data/INVENTORY.md`.
+`/opt/data/INVENTORY.raw.md`, registers every finding through
+`/opt/data/scripts/inventory_findings.py`, writes `/opt/data/INVENTORY.md`.
+
+**You do not decide what the findings are, and you do not make the registration call.** The sweep
+wrote a machine-readable block into the raw file; `inventory_findings.py extract` turns it into a
+numbered list, `register` refuses to send anything until every number on that list carries a score,
+and `ranked` reads the order back. Your job between those commands is judgement — scoring, and
+choosing what the report shows — and nothing else.
 
 This is the last stage before delivery. The file you write is posted to the user **verbatim** by the
 `bootstrap-inventory-delivery` job — no agent edits or reformats it afterward.
@@ -34,15 +40,16 @@ reach the report is deferred rather than discarded.
 
 Read `/opt/data/INVENTORY.raw.md`, **in one read, in full**. That file is your entire input.
 
-**This task reads exactly two files: this SOP and `/opt/data/INVENTORY.raw.md`.** Nothing else.
+**This task reads exactly two files for its findings: this SOP and `/opt/data/INVENTORY.raw.md`.**
+Nothing else.
 That means no `search_files`, no `grep`, no reading source code, scripts, configs, logs, kanban
 records or other reports, and no `gcloud`, `kubectl`, `lookout` or any other tooling. There is no
 context to gather. The findings file plus the rules below are sufficient, and anything else you read
 is either irrelevant or will tempt you into reporting something the sweep did not find.
 
-The findings-queue tools are the exception, and they run the other direction: `register_findings`
-records what you have already read, and `get_ranked_findings` reads back the order the queue
-computed from it. Neither is a place to look for findings the raw file does not contain.
+`inventory_findings.py` is the exception, and it runs the other direction: it reads the raw file
+you already have, records it, and reads back the order the queue computed. It is not a place to
+look for findings the raw file does not contain, and it is not a licence to run anything else.
 
 **The findings file is complete, however short it looks.** Read it once, whole. Do not page through
 it in line ranges, and do not read past its end to check for more: a read that returns nothing means
@@ -59,9 +66,9 @@ The raw file's format varies by deployment — it may be prose and Markdown tabl
 line-oriented `key=value` findings with a `severity=` field and a trailing
 `scanned=… findings=… elapsed=…` summary. Treat either as a list of findings.
 
-**The severity the file states is evidence, not the answer.** An explicit `severity=` field counts,
-and so does the file's own grouping: `Priority 1 / 2 / 3` headings, or sections named Critical /
-High / Medium / Low. That is the sweep's judgement made while it had the whole cluster in view, and
+**The severity the file states is evidence, not the answer.** A block line's `severity_hint` counts,
+and so does the prose plan's own grouping: `Priority 1 / 2 / 3` headings, or sections named Critical
+/ High / Medium / Low. That is the sweep's judgement made while it had the whole cluster in view, and
 it is the best evidence you have for the likelihood and blast-radius measures in Step 3. Read it,
 then classify against the anchors. Do not carry the word through unchanged — the queue orders
 findings from several sources on one scale, and a sweep's `Priority 1`, an audit stream's `critical`
@@ -89,36 +96,54 @@ the discovery sweep is required to name a cluster whose scan failed rather than 
 
 ---
 
-## Step 2: Collapse Duplicate Records
+## Step 2: Extract the Findings
 
-**Do this before scoring anything.** Raw findings are emitted per affected object, so one
-misconfiguration repeated across a fleet arrives as many near-identical records, and one problem
-reached by two routes arrives twice.
+```
+python3 /opt/data/scripts/inventory_findings.py extract
+```
 
-Merge records into a single finding when either holds:
+It reads the raw file's ```findings block and prints a numbered list — `f001`, `f002`, … — with each
+finding's check, cluster, namespace, object and title. **That list is the complete set, and it is the
+only set.** Do not add an item you noticed in the prose and the block missed, do not drop one that
+reads like a duplicate, and do not merge two into one. The block's lines were written per affected
+object on purpose: a missing `readinessProbe` on three Deployments is three rows in the queue,
+because each has its own manifest to change and its own life — one gets fixed next week and the other
+two do not. Step 5 gathers them back into a single report line ("3 Deployments in `payments`").
 
-- They share a `fingerprint` (tools that emit one have already decided these are the same issue).
-- They are the same underlying misconfiguration reached by different routes — a webhook registered
-  as both a Validating and a Mutating configuration, backed by the same service with the same
-  timeout and the same remedy, is one finding.
+`extract` writes the list to `/opt/data/INVENTORY.items.json`, which is what Step 4's `register`
+reads. Leave both at their defaults.
 
-Merge only what shares a remedy. If fixing one instance would not fix the others, they are separate
-findings however similar they look.
+**Cross-check against the prose plan you read in Step 1 — by problem, not by count.** The two are the
+same findings said twice, but at different grain: the plan groups a recommendation over several
+workloads where the block writes one line each, so the counts are expected to differ and a difference
+is not a defect. What you are looking for is a problem the plan describes that no block line covers
+at all. If you find one, the sweep dropped it on the way out and this stage cannot recover it: block
+the card with `kanban_block` naming the problem, and stop. Registering the rest would put a short
+list in the queue and label it complete.
 
-**The same condition on several objects is several findings here, and one line in the report.** A
-missing `readinessProbe` on three Deployments is three rows in the queue: each has its own object to
-verify against, its own manifest to change, and its own life — one gets fixed next week and the
-other two do not. Step 5 gathers them back into a single report line ("3 Deployments in `payments`").
-This is the one place this SOP has changed shape: it used to merge across objects here, because the
-output was a five-item list and nothing downstream needed the objects back.
+Two exit codes mean you cannot proceed:
+
+- **10 — no block.** The sweep predates the block requirement, or omitted it. Block the card saying
+  so. Do not fall back to reading the findings out of the prose: that is the enumeration this stage
+  was rebuilt to stop doing, and it lost findings every time.
+- **11 — malformed lines.** The output names every bad line and why. The raw file is the sweep's
+  output and not yours to edit, so block the card and quote the errors.
+
+Any other non-zero exit is the command itself being wrong — a mistyped flag, a missing argument.
+Read the error and fix the command; it says nothing about the sweep.
+
+Zero findings is a success, not one of those cases: a clean fleet writes an empty block, `extract`
+prints `extracted 0 findings`, and you go to Step 5 with nothing to register.
 
 ---
 
-## Step 3: Score Every Finding Against the Rubric
+## Step 3: Score Every Extracted Finding
 
-Score all of them, including the ones nobody will be asked to fix. A report is a list and can set
-things aside; the queue is an order, and a row with no score has no place in one. The two gates
-below are flags on a scored row, not filters before scoring.
+One score per id Step 2 printed — all of them, including the ones nobody will be asked to fix. A
+report is a list and can set things aside; the queue is an order, and a row with no score has no
+place in one. Step 4 will not send a partial set, so an id you skip here stops the whole
+registration rather than quietly dropping one row. The two gates below are flags on a scored row,
+not filters before scoring.
 
 Each measure is a lookup against its table. Pick the row that matches; do not interpolate.
 
@@ -219,45 +244,71 @@ penalty would let a B=8 observation float back above work someone could actually
 
 ## Step 4: Register Everything
 
-Call `register_findings` with every finding Step 3 scored. **All of them.** This is the step that
-makes "never drop a finding silently" true rather than aspirational; the five-item report in Step 5
-is a view over what you register here.
+Write one score entry per extracted id to `/opt/data/INVENTORY.scores.json`, then hand the file to
+the script:
 
-Make **one call per cluster**, so the run's scope is stated per cluster:
+```json
+{
+  "complete_clusters": ["prod-eu"],
+  "scores": {
+    "f001": {
+      "rubric": { "B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0 },
+      "recommendation": { "action": "…", "rationale": "…", "risk": "…" },
+      "remediation": {
+        "kind": "manifest",
+        "path": "k8s/checkout.yaml",
+        "note": "…"
+      },
+      "verification": {
+        "kind": "kubectl",
+        "command": "…",
+        "still_failing_when": "…"
+      },
+      "actionable": true,
+      "provider_managed": false
+    }
+  }
+}
+```
 
 ```
-register_findings(
-  findings=[ … every finding on that cluster … ],
-  scope={"cluster": "<cluster name>", "complete": true},
-)
+python3 /opt/data/scripts/inventory_findings.py register --scores /opt/data/INVENTORY.scores.json
 ```
 
-Pass `complete: true` only when the raw file says that cluster was scanned in full. If it records a
-gap, a skipped category, a failed credential mint, or a cluster in `ERROR`, **omit `scope` entirely**
-for that cluster. `complete` lowers the confidence of queued rows this run did not re-report, which
-re-ranks them down; a sweep that died halfway produces the same silence as a fleet that got healthier
-overnight, and asserting the second from the first announces fixes that did not happen.
+**It validates all of it before it sends any of it.** Every id, every required field and every rubric
+is checked before a connection is opened, and every problem is printed in one list — so a rejected
+run costs you one edit, not one round trip per field. If it exits 12, fix everything it named and run
+it again. Do not register a subset by hand and do not fall back to calling the queue directly; a
+partial batch is the silent drop this stage exists to prevent, and two instrumented runs of the old
+hand-rolled call registered seven and three of the same nine findings.
 
-### The fields
+Sending is per cluster, so it is not all-or-nothing on the wire. If one cluster's POST fails the
+others stay registered, the script names which failed, and `registered N of M` will genuinely differ.
+Treat that as what it says — some of it landed — and follow the exit 13 branch below.
+
+The identity of a row is `check` + `cluster` + `namespace` + `object`, which the script takes from
+the extracted item — you cannot set them, and a re-run of this card updates the same rows instead of
+duplicating them.
+
+`complete_clusters` lists the clusters the raw file says were scanned in full. Leave a cluster out
+when the file records a gap, a skipped category, a failed credential mint, or a cluster in `ERROR`.
+Being listed lowers the confidence of queued rows this run did not re-report, which re-ranks them
+down; a sweep that died halfway produces the same silence as a fleet that got healthier overnight,
+and asserting the second from the first announces fixes that did not happen.
+
+### The score fields
 
 | field                            | what to send                                                                     |
 | -------------------------------- | -------------------------------------------------------------------------------- |
-| `source`                         | `"inventory"`                                                                    |
-| `check`                          | the slug from the vocabulary below                                               |
-| `cluster`                        | the cluster name as the raw file states it                                       |
-| `namespace`                      | the object's namespace; omit for a cluster-scoped finding                        |
-| `object`                         | the workload, node pool, namespace or other object — one object, named           |
-| `title`                          | one line naming the problem and where it is                                      |
-| `detail`                         | the raw file's own description, and any sibling records a merge folded in        |
 | `rubric`                         | `{"B": …, "L": …, "detect": …, "recover": …, "C": …}` from Step 3                |
 | `recommendation`                 | `{"action": …, "rationale": …, "risk": …}` — what to do, why, what breaks if not |
 | `remediation`                    | `{"kind": …, "path": …, "note": …}`                                              |
 | `verification`                   | `{"kind": …, "command": …, "still_failing_when": …}`                             |
-| `provider_managed`, `actionable` | the Step 3 gates                                                                 |
+| `provider_managed`, `actionable` | the Step 3 gates; a `provider_managed` line in the block stays true either way   |
+| `root_cause`                     | optional; one line, where the finding has an identified cause                    |
 
-`check`, `cluster`, `namespace` and `object` together are the finding's identity. Registering the
-same problem twice updates one row instead of creating two, which is also what makes a re-run of this
-card safe.
+Nothing else is accepted — a score entry carrying a `title` or a `cluster` is rejected with the list
+of fields that are yours to set.
 
 `remediation.kind` is `manifest` when the fix is a YAML edit — with `path` naming the file where the
 raw file gives one — `gcloud` when it is a cluster or node-pool setting, and `manual` otherwise.
@@ -277,55 +328,48 @@ that has only the row. `still_failing_when` says how to read the output.
 
 A `manual` verification may omit the command; nothing else may.
 
-### The check vocabulary
+### Checks with no owning stream
 
-Use the audit streams' own slugs. The same problem then carries one identity whichever source found
-it, and a promoted finding routes to the stream that owns the check.
+Three of the checks the sweep emits have no audit stream behind them yet: `probes-startup`,
+`readonly-root-fs`, and `no-resourcequota`. Set `remediation.kind` to `manual` for those even though
+each is a YAML edit — there is no stream to route a pull request through until they get one.
 
-| what the sweep found            | check slug                            |
-| ------------------------------- | ------------------------------------- |
-| liveness / readiness probes     | `probes-liveness`, `probes-readiness` |
-| requests, limits, QoS class     | `no-requests`, `no-memory-limit`      |
-| HPA coverage                    | `no-hpa`, `hpa-cannot-scale`          |
-| NetworkPolicy                   | `netpol-missing`                      |
-| Workload Identity               | `workload-identity-off`               |
-| `runAsNonRoot` security context | `podsecurity-gaps`                    |
-| Shielded Nodes                  | `shielded-nodes`                      |
-| Dataplane V2                    | `datapath-provider`                   |
-| Managed Service for Prometheus  | `managed-prometheus`                  |
-| node auto-upgrade               | `no-autoupgrade`                      |
+The vocabulary the slugs come from is the sweep's to choose from; it lives in
+[`inventory.md`](inventory.md) Step 4 beside the block that carries them.
 
-Three checks the sweep makes have no owning stream yet: `probes-startup` for a missing
-`startupProbe`, `readonly-root-fs` for a missing `readOnlyRootFilesystem`, and `no-resourcequota` for
-a namespace with neither a ResourceQuota nor a LimitRange. Use those slugs, and set
-`remediation.kind` to `manual` even though each is a YAML edit — there is no stream to route a pull
-request through until those checks get one.
+### If the script fails
 
-For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it is
-the row's identity across every later sweep.
+Its exit code says which of two failures you are looking at, and they want opposite things.
 
-### If the call fails
+**Exit 12 — your scores are incomplete or malformed, or the scores file is not valid JSON.** Nothing
+was sent. Fix every problem it listed and run it again; the run is repeatable and registering twice
+is safe.
 
-Registration can fail — the queue's service may be down. **Write the report anyway.** Say so in the
-card's completion summary, do not block the card, do not retry more than once, and do not skip
-Step 5. A user waiting on their first report is not served by a stage that stops because a background
-queue was unavailable.
+**Exit 13 — one or more clusters could not be sent.** **Write the report anyway.** The clusters it
+did not name are registered; the ones it named are not. Say which in the card's completion summary,
+do not block the card, do not retry more than once, and do not skip Step 5. A user waiting on their
+first report is not served by a stage that stops because a background queue was unavailable.
 
-Read the outcomes back. Each finding returns `created`, `updated`, or **`suppressed`** — the last
-meaning the user has already dismissed that finding permanently. A suppressed finding must not appear
-in the report or in the roll-up count.
+On success the script prints each cluster's outcomes and a final `registered N of N`. It also names
+any finding that came back **`suppressed`**, meaning the user has already dismissed it permanently: a
+suppressed finding must not appear in the report or in the roll-up count.
 
 ---
 
 ## Step 5: Select What to Show
 
-Call `get_ranked_findings` and **take the order it gives you.** It is computed from the vectors you
-just registered, by the same rule for every source, and it is the reason this stage is reproducible.
-Do not re-sort it, do not second-guess a placement, and do not promote a finding because it reads
-worse than the one above it.
+```
+python3 /opt/data/scripts/inventory_findings.py ranked
+```
 
-If registration failed, rank by the scores you computed in Step 3 instead — actionable before
-unactionable, then highest score first.
+**Take the order it gives you.** It is computed from the vectors you just registered, by the same
+rule for every source, and it is the reason this stage is reproducible. Do not re-sort it, do not
+second-guess a placement, and do not promote a finding because it reads worse than the one above it.
+Each row carries its score, severity, check, object and the `provider_managed` and `not_actionable`
+flags the rules below turn on, and the `total:` line is what the roll-up counts from.
+
+If it exits 13 the queue is unreachable: rank by the scores you computed in Step 3 instead —
+actionable before unactionable, then highest score first — and say so in the card summary.
 
 From the top of that order:
 
@@ -346,7 +390,11 @@ From the top of that order:
   level of the shared risk, name the worst instance concretely, and name or count the others inside
   it. Informational findings never occupy more than one slot while any `major` finding exists.
 - **Anything not shown is rolled up**, not dropped: one line giving the count and where it lives,
-  e.g. `Also found: 14 more items, tracked in the findings queue — ask for the full list.` **Omit
+  e.g. `Also found: 14 more items, tracked in the findings queue — ask for the full list.` The count
+  is the `total:` line `ranked` printed minus the rows you showed or gathered into a shown line —
+  count it off that list, not off what you remember registering. A run that
+  reported "6 more items" against a queue holding three, all three of them shown, is what this
+  sentence is here to stop. **Omit
   this line entirely when nothing remains** — printing `Also found: 0 items` is noise, and it is a
   sign the selection was padded to a target.
 

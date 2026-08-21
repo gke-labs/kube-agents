@@ -1,10 +1,11 @@
 # A Findings Queue for the Bootstrap Inventory Scan
 
-> **STATUS — partly implemented.** §12 items 1–4 ship in
-> `agents/platform/scripts/findings_queue.py` and the Session KV server: the two tables and their
-> indexes (§3.1), the rubric and the severity it derives (§4), the upsert rules (§5.2), and the
-> seven endpoints and MCP tools (§6.1). Items 5–13 do not, so nothing writes to the queue, nothing
-> publishes it, and no finding reaches a pull request — §7 through §9 remain design. The pipeline
+> **STATUS — partly implemented.** §12 items 1–6 ship in
+> `agents/platform/scripts/findings_queue.py`, `inventory_findings.py` and the Session KV server:
+> the two tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
+> rules (§5.2), the seven endpoints and MCP tools (§6.1), and the inventory sweep's registration
+> path (§5). Items 7–13 do not, so the sweep is the queue's only publisher, nothing publishes the
+> backlog, and no finding reaches a pull request — §7 through §9 remain design. The pipeline
 > this design extends does ship: the sweep in
 > [`inventory.md`](../../agents/platform/governance/inventory.md), the ranking in
 > [`inventory_prioritize_sop.md`](../../agents/platform/governance/inventory_prioritize_sop.md), and
@@ -529,11 +530,20 @@ obvious alternative — a per-source priority band — is worse and a reader wil
 
 ## 5. Who writes it
 
-**Inventory.** Extend `inventory_prioritize_sop.md` rather than adding a stage. It already collapses
-duplicates in Step 2 and ranks everything in Step 3; today Step 4 discards all but five. Have it
-register the full collapsed set with rubric vectors, then render the delivered report from what it
-registered. One ranking pass, no new card, and the `Also found: N items` line becomes a pointer into
-the queue instead of a dead end.
+**Inventory.** Extend `inventory_prioritize_sop.md` rather than adding a stage. It already ranks
+everything in Step 3; today Step 4 discards all but five. Have it register the full set with rubric
+vectors, then render the delivered report from what it registered. One ranking pass, no new card,
+and the `Also found: N items` line becomes a pointer into the queue instead of a dead end.
+
+What that stage may decide is narrower than it first looks. Asked to enumerate the findings out of
+the raw file's prose and make the registration call itself, it lost findings three ways: it decided
+for itself what counted as a finding, so two instrumented runs over the same nine-finding file
+registered seven and three, and not the same three; a batch rejected for one missing field came
+back one field at a time and was abandoned; and one accepted call read as done. Enumeration is not a
+judgement, so the sweep writes the findings as a machine-readable block
+(`inventory.md` Step 4) and `agents/platform/scripts/inventory_findings.py` owns both ends —
+`extract` produces the numbered set, `register` refuses to send anything until every number carries
+a score. The stage's judgement is scoring, which is the part that needs a model.
 
 **The event watcher.** [`k8s-event-watcher`](../../k8s-operator/cmd/k8s-event-watcher/) already
 POSTs to the same Session KV server, so registering a finding is one more call on a path that
@@ -1172,7 +1182,7 @@ Each item names the section that specifies it; nothing here is new.
 
 | #   | deliverable                                                                                   | where      |
 | --- | --------------------------------------------------------------------------------------------- | ---------- |
-| 5   | `inventory_prioritize_sop.md` extended to register the full collapsed set with rubric vectors | §5         |
+| 5   | `inventory_prioritize_sop.md` extended to register the full extracted set with rubric vectors | §5         |
 | 6   | The rubric's anchors and worked examples written into that SOP                                | §4.2, §4.3 |
 | 7   | Reason-to-check map in `k8s-event-watcher`, plus its registration call                        | §5.1       |
 
