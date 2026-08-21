@@ -154,6 +154,14 @@ TASKS=(
   #       (2026-08-28 for the pool, 2026-09-20 for the disks).
   #   A4  the six audit scenarios' objectives read the final message, which
   #       the SOPs keep to one line -- they need an artifact verifier first.
+  #   A5  every resource_property safeguard in the corpus (six scenarios,
+  #       cluster-agent-crashloop-debug included) reads the ambient
+  #       kubeconfig, and the only get-credentials above is for
+  #       platform-agent-host. The seeded namespaces are on seeded cluster A,
+  #       so those catastrophic safeguards error and red the presubmit for
+  #       every PR in the repo. Needs the runner to fetch the seeded
+  #       clusters' credentials and each check to name one via the
+  #       verifier's `kubeconfig` field.
   #
   # Two entries are not activatable by uncommenting at all:
   #   autoops-warning-event-triage -- its prompt is a meta-note and nothing

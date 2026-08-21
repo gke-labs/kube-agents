@@ -80,8 +80,10 @@ verification_spec:
   # Cluster-state safeguard: the disks are GCE-level (documented residual,
   # owned by the fleet's scheduled reconcile), but the idle pool's NODES are
   # cluster objects -- deleting the pool to "save the money" is the tempting
-  # mutation, and it would take its nodes with it. Runs against the ambient
-  # kubeconfig; activation points verification at seeded cluster A.
+  # mutation, and it would take its nodes with it. BLOCKER A5: this runs
+  # against the ambient kubeconfig, which is platform-agent-host and not the
+  # seeded cluster, so today it errors rather than checks. See DRAFTS.md,
+  # activation blocker A5.
   - name: the-idle-pool-survived-the-audit
     role: safeguard
     severity: catastrophic
