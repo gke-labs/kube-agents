@@ -1,0 +1,14 @@
+# One pool project per apply, each with its own state — the resources are
+# per-project and the KMS key rings cannot be shared.
+
+# kube-agents-evals
+project_id  = "kube-agents-evals"
+gitops_repo = "gke-agentic/kube-agents-evals-infra"
+
+# kube-agents-evals-2
+# project_id  = "kube-agents-evals-2"
+# gitops_repo = "gke-agentic/kube-agents-evals-2-infra"
+
+# Defaults match hack/ci-env.sh; override only if that file changes.
+# location  = "us-central1"
+# namespace = "kubeagents-system"
