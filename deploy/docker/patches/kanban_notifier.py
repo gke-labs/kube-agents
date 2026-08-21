@@ -1067,8 +1067,9 @@ def note_suppressed_completion(
 # Over loopback HTTP rather than SQLite, unlike
 # ``session_kv_server._store_incident_report``. That function writes the table
 # directly and its docstring says why: it *is* the server that owns the
-# database. The notifier is a different process, in a different container from
-# the one holding the write, so it goes through the same authenticated
+# database. The notifier runs in the same container — ``docker-entrypoint.sh``
+# starts the server in the background and then execs the gateway — but it is a
+# different process, so it goes through the same authenticated
 # ``POST /v1/incidents`` that ``send_notification`` used.
 #
 # What goes in the row is the specialist's report, ``task.result``, and not a

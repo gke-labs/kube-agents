@@ -135,10 +135,10 @@ def verify_api_key(
     """Reject callers that cannot present the pod's session-KV key.
 
     Fails closed when the key is unset. Every caller — the event watcher, the
-    MCP server, the incident_context plugin — gets the value from the same pod
-    secret, so an empty variable means the deployment is misconfigured, and
-    serving chat identifiers to an unauthenticated caller is the worse of the
-    two outcomes.
+    MCP server, the incident_context plugin, the gateway's kanban notifier —
+    gets the value from the same pod secret, so an empty variable means the
+    deployment is misconfigured, and serving chat identifiers to an
+    unauthenticated caller is the worse of the two outcomes.
     """
     expected = _expected_api_key()
     if not expected:
