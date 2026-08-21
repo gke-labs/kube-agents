@@ -44,6 +44,139 @@ export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
 
+# ─── 2b. GitOps Repository for This Run ───────────────────────────────────────
+# Every GitHub-writing eval scenario begins by reading the `Git Repo:` line out
+# of /opt/data/SETTINGS.md — the fleet-audit streams do it in `audit_report.py
+# start`, before anything else happens. The operator renders that line from
+# spec.integration.github.gitRepo on the PlatformAgent CR
+# (buildSettingsConfigMap in k8s-operator/internal/controller/
+# platformagent_manifests.go); with the field unset it writes the literal
+# "None" and those scenarios stop at step 0 with nothing to clone.
+#
+# CI supplies the value and deliberately does NOT lean on the chart default.
+# Everything this job deploys — chart, operator, agent — is built from the pull
+# request, so a PR that blanks `platformAgent.integration.github.gitRepo` in
+# values.yaml, or breaks the CR-to-SETTINGS.md rendering, is precisely the
+# regression the eval should catch as a failed scenario. It can only catch it
+# if the value the run is supposed to use arrives from outside the artefacts
+# under test. Note this is a *correctness* argument, not the containment
+# boundary: what a run can actually write to is fixed by which repositories the
+# GitHub App is installed on, which no PR can change. See
+# docs/site/src/content/docs/deploy/ci-pool-projects.md.
+#
+# One GitOps repo per leasable project, so two concurrent leases can never
+# share a ledger issue or race on a remediation branch. Onboarding a third
+# project (issue #637, Boskos leasing) is one line here plus its row in that
+# same doc — no other edit in this file.
+gitops_repo_for_project() {
+  case "$1" in
+    kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
+    kube-agents-evals-2) echo "gke-agentic/kube-agents-evals-2-infra" ;;
+    *) return 1 ;;
+  esac
+}
+
+# PULL_NUMBER and JOB_NAME are set by Prow and by nothing else, which is what
+# separates a leased CI run from a laptop. The two get different treatment
+# below, but neither gets a silent default: an unmapped project stops the
+# deploy rather than installing an agent that writes somewhere unintended or
+# nowhere at all.
+if [ -n "${PULL_NUMBER:-}" ] || [ -n "${JOB_NAME:-}" ]; then
+  IS_PROW_RUN="true"
+else
+  IS_PROW_RUN="false"
+fi
+
+# The override exists for developers, and only for them. Under Boskos the
+# project is leased per run, so a value pinned in the job environment would
+# eventually point one project's run at another project's GitOps repo — the
+# one failure mode worth refusing outright.
+if [ "${IS_PROW_RUN}" = "true" ] && [ -n "${EVAL_GITOPS_REPO:-}" ]; then
+  echo "ERROR: EVAL_GITOPS_REPO is set in a Prow run (PROJECT_ID=${PROJECT_ID})." >&2
+  echo "       The GitOps repo must follow the leased project, so CI resolves it from" >&2
+  echo "       gitops_repo_for_project() in hack/ci-deploy.sh. Unset EVAL_GITOPS_REPO," >&2
+  echo "       and map the project there if it is missing." >&2
+  exit 1
+fi
+
+if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
+  GITOPS_REPO="${EVAL_GITOPS_REPO}"
+  echo "GitOps repo: ${GITOPS_REPO} (from EVAL_GITOPS_REPO)"
+elif GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID}")"; then
+  echo "GitOps repo: ${GITOPS_REPO} (mapped from PROJECT_ID=${PROJECT_ID})"
+elif [ "${IS_PROW_RUN}" = "true" ]; then
+  echo "ERROR: no GitOps repo is mapped for PROJECT_ID=${PROJECT_ID}." >&2
+  echo "       Every project in the kube-agents-evals-project Boskos pool needs its own" >&2
+  echo "       private GitOps repo; deploying without one would leave the fleet-audit and" >&2
+  echo "       rca-remediation-pr scenarios failing at step 0 for a reason no log explains." >&2
+  echo "       Add the project to gitops_repo_for_project() in hack/ci-deploy.sh and follow" >&2
+  echo "       docs/site/src/content/docs/deploy/ci-pool-projects.md before registering it" >&2
+  echo "       in the pool." >&2
+  exit 1
+else
+  echo "ERROR: no GitOps repo is mapped for PROJECT_ID=${PROJECT_ID}, and this is not a" >&2
+  echo "       Prow run. A local deploy has no lease, so it has to say where it writes:" >&2
+  echo "         EVAL_GITOPS_REPO=owner/repo  — your own throwaway GitOps repo" >&2
+  echo "         EVAL_GITOPS_REPO=none        — deploy with the GitHub integration off" >&2
+  echo "                                        (SETTINGS.md gets 'Git Repo: None', and" >&2
+  echo "                                        every GitHub-writing scenario will fail)" >&2
+  exit 1
+fi
+
+# "none" is the explicit opt-out, and the only route to an empty gitRepo. An
+# empty string here makes the chart omit spec.integration.github entirely.
+if [ "${GITOPS_REPO}" = "none" ]; then
+  echo "GitHub integration: disabled for this deploy (EVAL_GITOPS_REPO=none)"
+  GITOPS_REPO=""
+elif ! printf '%s' "${GITOPS_REPO}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+  echo "ERROR: GitOps repo '${GITOPS_REPO}' is not in owner/repo form." >&2
+  echo "       The minty rule ConfigMap is keyed on the org and repo separately, so the" >&2
+  echo "       shorthand is what CI passes — not a URL." >&2
+  exit 1
+fi
+
+# The in-cluster half of the token path. gitRepo alone only tells the agent
+# where to clone; github-token-minter is what turns the platform GSA's OIDC
+# identity into a repo-scoped GitHub App token (agents/platform/scripts/
+# github_token_refresh.py has no other source, and strips any inherited
+# GITHUB_TOKEN).
+#
+# Off unless EVAL_GITHUB_APP_ID is set, because the minter cannot come up until
+# a human has done the two things terraform cannot: install the GitHub App on
+# this project's GitOps repo, and import the App's private key into the
+# project's KMS signing key. Until then the pod fails its readiness probe, and
+# since the minter Deployment is part of this release, `helm --wait` below
+# would fail every PR. Setting EVAL_GITHUB_APP_ID is therefore the switch that
+# says "the manual half is done for this project" — and if it is not, the
+# deploy failing loudly is the right outcome.
+#
+# The pool's App is kube-agents-evals-token-minter, id 4675512, installed on
+# the two *-infra repos above and nothing else. One App for the whole pool, so
+# the value is the same in every project's job environment; what is per-project
+# is the KMS key its PEM was imported into. That installation list -- not this
+# script, and not the minty rule the chart renders -- is what bounds where a
+# run can write, because a presubmit deploys the pull request's own chart and
+# could otherwise rewrite either of them.
+#
+# githubMinter.allowedServiceAccount is left at its default, which derives
+# kubeagents-platform-gsa@<harness.projectId> — exactly the GSA_NAME/PROJECT_ID
+# pair this deploy annotates the agent KSA with, so the rule is keyed on this
+# project's platform GSA and no other's.
+if [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
+  GITHUB_MINTER_ARGS=(
+    --set "githubMinter.enabled=true"
+    --set-string "githubMinter.org=${GITOPS_REPO%%/*}"
+    --set-string "githubMinter.repo=${GITOPS_REPO##*/}"
+    --set-string "githubMinter.appId=${EVAL_GITHUB_APP_ID}"
+  )
+  echo "GitHub token minter: enabled for ${GITOPS_REPO} (app ${EVAL_GITHUB_APP_ID})"
+else
+  GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
+  echo "GitHub token minter: disabled (EVAL_GITHUB_APP_ID unset) — the agent can read" \
+    "SETTINGS.md but cannot mint a token, so GitHub-writing scenarios will fail."
+fi
+
+# ─── 2c. Image Build Worker ───────────────────────────────────────────────────
 # Where the image builds run. Either a private worker pool or a sized machine
 # on the default pool -- never both, because a pool declares its own machine
 # and rejects being told a different one.
@@ -122,6 +255,8 @@ helm upgrade --install kube-agents ./charts/kube-agents \
   --set-string "platformAgent.harness.location=${REGION}" \
   --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
   --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}" \
+  "${GITHUB_MINTER_ARGS[@]}" \
   --set "platformAgent.credentials.create=true" \
   --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
   --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
