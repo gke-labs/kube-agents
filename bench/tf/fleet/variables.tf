@@ -29,3 +29,9 @@ variable "cluster_prefix" {
   type        = string
   default     = "seeded"
 }
+
+variable "exclusion_window_hours" {
+  description = "Length in hours of seeded-b's NO_MINOR_UPGRADES maintenance exclusion, re-stamped from now on every apply. The GKE API rejects an endTime past the held minor's end of life (observed live: 'endTime needs to be before minor version 1.34 end of life: (2027-1-25)'), so now + this window must stay inside the EOL -- which no fixed window can do forever. When a reconcile starts failing with that 400, that IS the EOL approaching: shorten this variable to fit, or accept the self-heal and re-lag seeded-b by replacement at EOL (see README). 90 days balances a long protective window against how soon the 400s begin."
+  type        = number
+  default     = 2160 # 90 days
+}

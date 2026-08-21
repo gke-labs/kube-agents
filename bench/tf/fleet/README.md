@@ -26,12 +26,39 @@ Drift is corrected by re-applying this stack on a schedule — a scheduled GitHu
 workflow, because the repository's other recurring jobs already live there and the
 apply needs nothing Cloud Build has that Actions lacks. The workflow does not exist
 yet; creating it is the fleet owner's call. Until it does, a manual `tofu apply` after
-any suspected drift is the reconcile. Two defects depend on vigilance to stay planted:
-any cleanup sweep is one `orphan-pd-` deletion away from breaking the cost scenario,
-and `seeded-b`'s version lag is held, not healable — a control plane cannot be
-downgraded, so if GKE ever force-upgrades `seeded-b` past its pin (end of support),
-the fix is replacing the cluster:
-`tofu apply -replace=google_container_cluster.seeded_b`.
+any suspected drift is the reconcile.
+
+The reconcile is load-bearing for `seeded-b` in particular: its version lag is held by
+a `NO_MINOR_UPGRADES` maintenance exclusion whose window (90 days by default,
+`var.exclusion_window_hours`) is re-stamped from now on every apply — the plan always
+shows that one in-place update, by design; it is the window rolling forward, not
+drift. The window has a hard ceiling the API enforces: an exclusion cannot outlive the
+held minor's end of life (observed live: 1.34 capped at 2027-01-25), so as EOL
+approaches, applies start failing with exactly that 400 — the built-in warning to
+shorten the window variable or plan the re-lag. The exclusion therefore dies in one of
+two ways — reconciles lapse for longer than the window, or the minor reaches EOL — and
+either way GKE upgrades the master, the defect self-heals, and the upgrade scenario
+going red is the detection. A control plane cannot be downgraded, so
+the recovery is the same in both cases: replace the cluster and let the derived pin
+re-lag it against the then-current default:
+`tofu apply -replace=google_container_cluster.seeded_b`. The other standing hazard is
+a cleanup sweep — one `orphan-pd-` deletion breaks the cost scenario, and recreating a
+deleted fixture restarts its age gate (below).
+
+## Activation timeline
+
+The cost SOP's collectors are age-gated, so the fleet is not fully assertable on the
+day it is applied. Recreating a fixture restarts its clock — `creationTimestamp` is
+server-set and immutable, so backdating is impossible; do not try.
+
+| Day  | What becomes detectable                                                                                                |
+| ---- | ---------------------------------------------------------------------------------------------------------------------- |
+| D0   | Everything except the cost fixtures: RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag, drift outlier |
+| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                     |
+| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                            |
+
+The `fleet-cost-idle-pool` scenario must stay dormant until D+30, when both of its
+fixtures are visible.
 
 ## The defects
 
@@ -61,9 +88,11 @@ changes the vote.
 
 `seeded-b`'s lag is derived at apply time (REGULAR channel default minus one minor,
 freshest patch of that minor), so the pin re-computes each reconcile instead of
-rotting. Note for the upgrade scenario: `seeded-b` runs with release channel
-UNSPECIFIED, so it reports no channel of its own — the audit reads the available
-versions (`valid_master_versions`), not a channel default, to see the lag.
+rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+SOP's master-behind check compares a cluster's master minor against its own channel's
+default, so a channel-less cluster falls out of that comparison entirely and the lag
+would be invisible to the audit it was planted for. The maintenance exclusion above is
+what stops channel enrollment from healing the lag.
 
 The chat-routing and incident-triage scenarios need no planted defect; the
 silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design

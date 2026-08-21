@@ -188,6 +188,12 @@ resource "google_container_node_pool" "seeded_a_default" {
 # scoring), so without it the other defect workloads would land here and
 # falsify the fixture. GKE's system daemonsets tolerate custom taints, so
 # "zero non-system pods" stays exactly true. The name is the planted noun.
+#
+# AGE-GATED: the cost SOP's idle-nodepool check refuses "pools created
+# < 7 days ago", so this fixture is invisible for its first week and any
+# change that RECREATES the pool restarts that clock. Edit in place or not
+# at all; the README's activation timeline is the schedule the scenario
+# waits on.
 resource "google_container_node_pool" "idle_batch_pool" {
   name       = "idle-batch-pool"
   location   = var.zone
@@ -244,9 +250,33 @@ resource "google_container_node_pool" "pinned_inference_pool" {
   }
 }
 
-# Defect (upgrades): held one minor behind the REGULAR channel default.
-# UNSPECIFIED channel plus a pinned version and auto-upgrade off is what
-# keeps GKE from healing the lag between re-applies.
+# Defect (upgrades): held one minor behind the REGULAR channel default --
+# and ENROLLED in REGULAR, which is what makes the lag visible at all. The
+# upgrade SOP's master-behind check keys every branch off the cluster's
+# channel entry in get-server-config: branch (b), the one this defect
+# exists to trip, is minor(currentMasterVersion) < minor(channel
+# defaultVersion), severity major. A channel-less cluster has no channels[]
+# entry, so (b)/(c) cannot evaluate, and branch (a) -- version absent from
+# validMasterVersions -- is false by construction here because the pin is
+# drawn from that very list. The earlier UNSPECIFIED design hid the defect
+# from the audit it was planted for.
+#
+# What holds the lag under a channel: the maintenance exclusion below, at
+# scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now
+# (var.exclusion_window_hours, default 150 days) -- timestamp() makes this
+# a perpetual in-place diff, ACCEPTED LOUDLY: the scheduled reconcile is
+# what rolls the window forward, so the always-present one-line plan change
+# is the mechanism working, not drift. Two ways the window ends:
+#  - reconciles stop for longer than the window: GKE upgrades the master,
+#    the defect self-heals, the upgrade scenario goes red -- that red is
+#    the detection;
+#  - the held minor reaches its end of life: the API refuses any endTime
+#    past EOL (observed live on 1.34: capped at 2027-01-25), the exclusion
+#    dies for good, and the same self-heal follows.
+# A control plane cannot be downgraded, so recovery either way is
+# replacing the cluster -- the derived pin then re-lags against the
+# then-current default:
+# `tofu apply -replace=google_container_cluster.seeded_b`.
 resource "google_container_cluster" "seeded_b" {
   name     = "${var.cluster_prefix}-b"
   location = var.zone
@@ -256,9 +286,31 @@ resource "google_container_cluster" "seeded_b" {
   resource_labels          = local.cluster_labels
   deletion_protection      = false
 
+  # Assumes the freshest previous-minor patch is offered in REGULAR, which
+  # holds in practice (the channel serves ~3 minors); if GKE ever rejects
+  # the create, re-derive the pin from the channel's own list.
   min_master_version = local.lagging_version
   release_channel {
-    channel = "UNSPECIFIED"
+    channel = "REGULAR"
+  }
+
+  maintenance_policy {
+    # A window is required alongside an exclusion; 03:00 UTC keeps patch
+    # work clear of eval hours. Minors are excluded below; patches within
+    # the lagged minor may roll, which keeps the defect exactly "one minor
+    # behind", never "unpatched".
+    daily_maintenance_window {
+      start_time = "03:00"
+    }
+
+    maintenance_exclusion {
+      exclusion_name = "hold-the-minor-lag"
+      start_time     = timestamp()
+      end_time       = timeadd(timestamp(), "${var.exclusion_window_hours}h")
+      exclusion_options {
+        scope = "NO_MINOR_UPGRADES"
+      }
+    }
   }
 
   logging_config {
@@ -290,8 +342,16 @@ resource "google_container_node_pool" "seeded_b_default" {
   node_count = 1
   version    = local.lagging_version
 
+  # Channel enrollment requires node auto-upgrade on -- the API rejects
+  # false. The NO_MINOR_UPGRADES exclusion on the cluster is what actually
+  # holds the minor; patch upgrades within it may roll, so the version is
+  # ignored after creation rather than fought back down every reconcile.
   management {
-    auto_upgrade = false
+    auto_upgrade = true
+  }
+
+  lifecycle {
+    ignore_changes = [version]
   }
 
   node_config {
@@ -342,6 +402,15 @@ resource "google_container_node_pool" "seeded_c_default" {
 
 # Defect (cost): two unattached disks. The prefix is the planted noun the
 # waste audit must name; nothing ever mounts them.
+#
+# AGE-GATED, harder than the pool: the SOP's unattached-disk collector
+# filters server-side on `creationTimestamp<-P30D` and flags at AGE >= 30d,
+# so these are invisible to the audit for their first THIRTY days, and any
+# change that recreates them (name, size, type, zone all force replacement)
+# silently restarts that clock. creationTimestamp is server-set and
+# immutable -- backdating is impossible, do not try. Label updates are the
+# one safe change (in-place, never touches the timestamp); everything else
+# here forces replacement and is therefore not worth changing at all.
 resource "google_compute_disk" "orphan_pd" {
   count = 2
   name  = "orphan-pd-${count.index + 1}"
