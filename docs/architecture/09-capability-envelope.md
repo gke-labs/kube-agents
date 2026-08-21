@@ -172,11 +172,21 @@ what.
 ## 4. Why this needs no crypto
 
 NATS KV keys live on subjects, and subject write permissions are enforced **at connect**, before a
-message is parsed. So:
+message is parsed. So, writing a bucket named `cap`:
 
-- Only the gateway may publish under `cap.root.*`
-- Each broker may publish only under `cap.hop.<its-own-agent-id>.*`
-- **No broker may read `cap.*` at all.** Only the verification service holds read.
+- Only the gateway may publish under `$KV.cap.root.*`
+- Each broker may publish only under `$KV.cap.hop.<its-own-agent-id>.*`
+- **No broker may read the bucket at all.** Only the verification service holds read, and that
+  means both `$KV.cap.>` and the JetStream API subjects that serve the bucket.
+
+**Spell these in subject space, not key space.** A KV key does not live at its bare name: bucket
+`cap` is stream `KV_cap` on `$KV.cap.>`, and a get is a JetStream API call under `$JS.API.*` rather
+than a subscribe on the key. A permission written as `cap.root.*` matches no subject any KV
+operation touches, so it grants and denies nothing -- and a read denial written that way leaves a
+broker holding broad `$JS.API.>` for any other stream with a working path to the store. The
+denial tests inherit the same requirement: written against the bare names they pass on a server
+where no `$KV` permission has been configured at all, which is the shape of test §9 opens by
+warning about.
 
 That buys the two properties a signature would have bought:
 
@@ -261,7 +271,8 @@ there are no messages to authorize, so that dependency is smaller than it first 
 
 ## 5. What this does not solve
 
-Three things, stated so nobody assumes otherwise.
+Six things, stated so nobody assumes otherwise. The last three are open questions rather than
+accepted limits, and they go to the downscoping design discussion together.
 
 **Attenuation is code.** A hop that forwards without narrowing is a hole, and no token format or
 KV scheme fixes that. Real tension with "structural, not behavioural."
@@ -283,11 +294,15 @@ implementation, which is the only kind there is, but it does not hold under a mi
 read side can be request-scoped because the verifier authenticates a live caller. The write side is
 proved by the subject prefix, which is per agent, so an agent that is concurrently the delegate of
 two roots can still write a child descending from the wider one while serving the narrower one's
-request. Closing that needs a per-request identity on the bus itself, not only at the verifier,
-which is a change to the mechanism rather than to this paragraph.
-`docs/designs/capability-envelope-write-path.md` states the problem, why the obvious fix does not
-drop in, and the options. Treat the sentence above as the target until
-that is settled.
+request. Closing it needs a per-request identity on the bus itself and not only at the verifier, so
+that the publish namespace is per request and the prefix proves both. That is a change to the
+mechanism rather than to this paragraph, and it does not drop straight in: the parent writes the
+child entry before the downstream hop's credential exists, so it would be naming a subject nobody
+has issued yet.
+
+Treat the claim above as the target rather than as the current state. This question is going to the
+downscoping design discussion together with the three below, since all four turn on what "the
+request it is serving" means to a mechanism that cannot observe a request.
 
 **Chain depth is a refusal, not just a cost.** Resolution walks to the root, so a long chain is a
 lot of KV reads. Those are now the verifier's reads rather than every broker's, which makes them
@@ -308,6 +323,25 @@ and the denial tests for both.
 `cap.*`, so compromising it exposes every in-flight capability, and if it is down nothing
 authorizes. That is a real concentration and it is the price of not distributing read. It belongs
 in the same tier of scrutiny as the auth callout, with no model attached to it.
+
+**Nothing expires.** No entry carries an issue time, a use count, or any notion of the request
+being over, and a TTL is rejected elsewhere in this document as a thing revocation saves us from. So
+a root minted at 10:00 for a request that finished at 10:01 is still a valid parent at 03:00, and a
+hop can write a fresh child of its own stale root and drive work attributed to a human who went
+home. "For the request it is serving" is not observable to the mechanism as specified.
+
+**Revocation names no actor.** Deleting an entry is a stated goal and nothing says who deletes. The
+verifier holds read only, so it cannot. The gateway holds `$KV.cap.root.*`, so it can revoke roots
+and nothing else. The only party that can delete a hop entry is the broker that wrote it, which is
+the party being revoked from.
+
+**The envelope has no requester field.** It carries a tier and a scope. [03](03-security-model.md)
+§4a stays canonical for the requirement and that requirement is authorization against the
+requester's own identity, which a hop cannot perform from a resolved capability because it does not
+know who the human is. The goal below is written as "agent ceiling ∩ requester" while the mechanism
+delivers agent ceiling ∩ tier, and the chain walk terminates at a request id rather than at a
+person -- so "who asked" is still a lookup somewhere else. Which way to reconcile that is a
+downscoping question, not one this document should settle alone.
 
 ---
 
@@ -419,13 +453,18 @@ silent.
   `cap.root.*` and all.
 - **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
   including one that terminates at a well-formed `cap.hop.*` entry.
-- **Only the gateway mints roots:** any other connection publishing to `cap.root.*` is rejected by
-  NATS **at connect**, not by application code.
-- **No broker writes in another broker's namespace:** broker A publishing to `cap.hop.<B>.*` is
+- **Only the gateway mints roots:** any other connection publishing to `$KV.cap.root.*` is rejected
+  by NATS **at connect**, not by application code.
+- **No broker writes in another broker's namespace:** broker A publishing to `$KV.cap.hop.<B>.*` is
   rejected at connect.
-- **No broker reads the store:** a broker connection attempting any read on `cap.*` is rejected at
-  connect. Assert this for a broker that legitimately participates in a chain, since the whole point
-  is that participation does not imply read.
+- **No broker reads the store:** a broker connection attempting any read of the bucket is rejected
+  at connect -- both a direct get on `$KV.cap.>` and the JetStream API path to the same stream,
+  since denying only the first leaves the second open. Assert this for a broker that legitimately
+  participates in a chain, since the whole point is that participation does not imply read.
+- **The permissions are actually configured:** a connection with no capability permissions at all is
+  refused the operations above. Written against bare key names rather than `$KV` subjects, each test
+  above passes on a server where nothing was configured, so this one is what distinguishes the
+  control from its absence.
 - **Revocation is immediate:** delete an entry mid-flight; the next resolution of any id descending
   from it fails.
 - **The agent never sees the capability:** from inside an agent container, the capability id and the
