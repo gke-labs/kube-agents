@@ -50,8 +50,15 @@ terraform.tfvars.json
 
 # Per-developer Claude Code state (session settings, local skills). The shared
 # slash commands in .claude/commands/ and the review skills in .agents/skills/
-# are committed. `.claude/*` rather than `.claude/` so git descends into the
-# directory: a rule that excludes the directory itself can never be undone by a
-# nested .gitignore or a negation, because git does not look inside it.
+# are committed; .claude/settings.json and .claude/settings.local.json stay
+# personal. settings.json is deliberately *not* committed even though the
+# live-test lease hooks want to live there -- a settings.json on a branch runs
+# without being asked, and .claude/commands/pr-review-batch.md checks out fork
+# branches. .claude/settings.json.example is the copy you opt into; see
+# docs/designs/live-test-lease.md. `.claude/*` rather than `.claude/` so git
+# descends into the directory: a rule that excludes the directory itself can
+# never be undone by a nested .gitignore or a negation, because git does not
+# look inside it.
 .claude/*
 !.claude/commands/
+!.claude/settings.json.example

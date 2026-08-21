@@ -324,6 +324,14 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
     confirm it goes back.
   - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
     artifacts, restore prior state, and note anything left behind.
+  - **If the install is shared with other agents, take the lease.**
+    `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy
+    `.claude/settings.json.example` to `.claude/settings.json` once per checkout and its
+    `PreToolUse` hook claims the lease for you on the first mutating command and denies the
+    command while somebody else holds it — so two agents cannot overwrite each other's live
+    validation. Without the copy nothing is enforced, and you run `acquire` and `release` by hand.
+    [`docs/designs/live-test-lease.md`](docs/designs/live-test-lease.md) covers what counts as a
+    mutation, how an install is discovered, and why the wiring is not committed.
   - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
     that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
     section is not an answer.

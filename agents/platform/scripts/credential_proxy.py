@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import command_policy
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -861,6 +862,16 @@ class CommandExecutor:
             "GH_CONFIG_DIR": str(self.config_dir / "gh"),
             "KUBECONFIG": str(self.home_dir / ".kube" / "config"),
             "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
+            # kuberc carries per-command default options, including `as`, and it
+            # is on by default in kubectl v1.36.3. command_policy refuses the
+            # `--kuberc` flag, but kubectl also reads `$HOME/.kube/kuberc` with
+            # no flag at all -- verified to set Impersonate-User on an argv that
+            # contains nothing to refuse. That path is out of the agent's reach
+            # only because HOME points at the sidecar-only state dir rather than
+            # the shared PVC, which is deployment geometry and not a control.
+            # This turns the feature off outright so the property survives
+            # someone rearranging the mounts. Nothing here needs kuberc.
+            "KUBECTL_KUBERC": "false",
         }
         # Forward only variables required by supported credential clients. Chat
         # tokens and proxy control variables must never enter an agent-selected
@@ -1325,11 +1336,99 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
+def read_only_enforced() -> bool:
+    """Is the read-only gate armed?
+
+    Defaults to on, and anything that is not exactly "false" leaves it on. A
+    typo in a ConfigMap should not quietly hand an agent write access.
+
+    This switch is deliberately not documented in the customer-facing reference.
+    It is global, unscoped and has no expiry: setting it disables the read-only
+    posture for every command, every agent and every cluster in the Pod, and
+    today there is no impersonation layer underneath to catch what gets through
+    (see command_policy's module docstring).
+
+    **On an operator-managed install there is no supported way to set it, by
+    design.** The operator reserves the name: a `spec.deployment.env` entry is
+    rejected by the validating webhook and dropped by mergeCredentialProxyEnv,
+    no ConfigMap carries it, and a hand edit to the generated Deployment is
+    reverted on the next reconcile. Whoever can edit the PlatformAgent is
+    frequently who the policy is meant to constrain, so the switch is not
+    theirs. An earlier version of this docstring offered it as the way to
+    "recover from a bad allowlist without waiting on an image build"; that
+    route did not exist -- the ConfigMap it named has only ever carried
+    policy.json -- and following it during an outage costs an operator a CR
+    patch that changes nothing and explains nothing.
+
+    The remedy for a command the allowlist should have permitted is to add it
+    to command_policy.KUBECTL_READ_VERBS or GCLOUD_READ_COMMANDS and ship the
+    image, which is what the customer-facing reference already tells the
+    reader to do (docs/site/.../reference/credential-isolation.md).
+
+    What remains is the process environment, which is how the tests arm and
+    disarm the gate and how the proxy behaves when run outside the operator --
+    a standalone or local invocation, where the person setting it is the
+    person running the process.
+    """
+    return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
+
+
+def _sanitize_for_logging(s: str) -> str:
+    """Strip control characters to prevent log forgery, with 64-char length cap.
+
+    Removes C0/C1 control characters, line/paragraph separators (Unicode), and
+    all characters that could be interpreted as line boundaries by consumers
+    (Python splitlines, JS /m, JSON parsers, etc). Also caps length to prevent
+    unbounded agent-controlled hint expansion.
+    """
+    import unicodedata
+
+    # Characters in Cc (control), Cf (format), Zl (line sep), Zp (para sep)
+    # will forge log lines in text-mode consumers.
+    filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))
+    # Cap at 64 chars (no real flag name exceeds this)
+    return filtered[:64]
+
+
+def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
+    """The blocked-response body for `argv`, or None if it may run.
+
+    Returns (response_dict, log_hint) for logging, or None if allowed.
+    log_hint is either verb_tuple or offending_flag, safe to log.
+    Split out from the handler so the decision is testable without standing up
+    a socket, and so the gate reads the class attribute rather than the
+    environment on every request.
+    """
+    if not CredentialProxyHandler.enforce_read_only:
+        return None
+    decision = command_policy.evaluate(argv)
+    if decision.allowed:
+        return None
+
+    # Choose what to log: resolved verb/command path, or the offending flag
+    log_hint = None
+    if decision.verb_tuple:
+        log_hint = ".".join(decision.verb_tuple)
+    elif decision.offending_flag:
+        log_hint = decision.offending_flag
+
+    return (
+        {
+            "status": "blocked",
+            "code": "SECURITY_POLICY_BLOCKED",
+            "rule": decision.rule_id,
+            "message": decision.message,
+        },
+        log_hint,
+    )
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
     max_request_bytes: int
     slack_max_request_bytes: int
+    enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
 
@@ -1461,6 +1560,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": violation,
                 },
             )
+            return
+
+        # Runs after the credential denylist above, so rules like
+        # `kubernetes.token-disclosure` keep their own ids and messages rather
+        # than being reported as read-only refusals. For example, `kubectl create
+        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+        # be refused by the denylist with that rule id. If the gate ran first, it
+        # would refuse as `kubernetes.read-only`, losing the specific rule.
+        refusal_result = read_only_refusal(argv)
+        if refusal_result is not None:
+            refusal, log_hint = refusal_result
+            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
+            LOGGER.warning(
+                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
+            )
+            self._json(HTTPStatus.FORBIDDEN, refusal)
             return
 
         try:
@@ -1709,6 +1824,8 @@ def serve(args: argparse.Namespace) -> None:
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
+    CredentialProxyHandler.enforce_read_only = read_only_enforced()
+    LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

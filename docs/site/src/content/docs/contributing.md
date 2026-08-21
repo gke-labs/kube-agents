@@ -89,6 +89,18 @@ What that section should say:
 
 Some changes can't reach a running installation — docs-only edits, CI workflow changes, code paths that need infrastructure you don't have. Write "Not live-tested" and say why. An empty section is not an answer.
 
+If your team shares one installation, take the lease before you mutate it: `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy `.claude/settings.json.example` to `.claude/settings.json` once per checkout, and its `PreToolUse` hook claims the lease on your first mutating command and blocks the command while another agent holds it. Read-only commands are never blocked, and nothing is protected until a checkout has a `vars.sh` or you configure an install. The hook is not committed — it would be branch content Claude Code runs unprompted — and it is Claude Code-specific, so from any other harness, or a plain shell, run `acquire` and `release` yourself:
+
+```bash
+cp .claude/settings.json.example .claude/settings.json   # opt into the hook
+python3 scripts/live_test_lease.py status
+python3 scripts/live_test_lease.py acquire --env my-cluster --pr 123 --note "why"
+python3 scripts/live_test_lease.py release --env my-cluster
+```
+
+`--env` picks the install when more than one resolves, and the commands that act on one require it
+there; `status` reports all of them either way. [`docs/designs/live-test-lease.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/live-test-lease.md) has the details.
+
 ## Self-review
 
 Nobody reads a change as cheaply as the person who wrote it, and right now the first hostile reader of most pull requests here is a reviewer who has never seen the code. So every pull request is reviewed by its author first, and the template's **Self-Review** section carries what those passes found — merged into one list, since more than one pass is required.

@@ -436,6 +436,30 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
+		// The probe has to reach the listener over loopback. `hermes dashboard`
+		// binds 127.0.0.1, so the tcpSocket probe this replaces was dialled by
+		// kubelet against the pod IP, refused every time, and left the container
+		// — and therefore the whole pod — permanently NotReady (#822). Asserting
+		// the shape is the only guard available here: nothing in this suite can
+		// open a socket against the real CLI.
+		switch probe := dashboardC.ReadinessProbe; {
+		case probe == nil:
+			t.Errorf("expected a readiness probe on the dashboard container")
+		case probe.TCPSocket != nil:
+			t.Errorf("dashboard readiness probe must not be tcpSocket: kubelet dials the pod IP and the listener is loopback-only")
+		case probe.Exec == nil || len(probe.Exec.Command) == 0:
+			t.Errorf("expected an exec readiness probe on the dashboard container, got %+v", probe.ProbeHandler)
+		default:
+			cmd := strings.Join(probe.Exec.Command, " ")
+			if !strings.Contains(cmd, "http://127.0.0.1:9119/") {
+				t.Errorf("expected the dashboard readiness probe to target http://127.0.0.1:9119/, got %q", cmd)
+			}
+			// --fail would turn an auth-gated or non-2xx root path into an
+			// unready pod; the probe only asserts that something answers.
+			if strings.Contains(cmd, "--fail") {
+				t.Errorf("dashboard readiness probe must not use curl --fail: any HTTP response proves the listener is up, got %q", cmd)
+			}
+		}
 		if len(dashboardC.Env) != 6 {
 			t.Errorf("expected 6 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
@@ -1025,6 +1049,44 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// Widening the allowlist must not have widened it to everything.
 	if _, ok := values["SESSION_KV_DB_PATH"]; ok {
 		t.Errorf("SESSION_KV_DB_PATH must stay operator-owned, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
+	// This is the end-of-day recap's whole configuration surface — the script
+	// reads it from the environment on every run and there is no config file
+	// behind it. Off the allowlist, the SOP's documented override renders,
+	// validates, and silently does nothing, and a fleet whose noisy namespace
+	// is not one of the three shipped exclusions has no supported way to quiet
+	// it.
+	custom := []corev1.EnvVar{
+		{Name: "EOD_EXCLUDE_NAMESPACES", Value: "kube-system,istio-system"},
+		{Name: "GKE_CLUSTER_NAME", Value: "impostor"},
+		{
+			Name: "EOD_EXCLUDE_NAMESPACES",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	if values["EOD_EXCLUDE_NAMESPACES"] != "kube-system,istio-system" {
+		t.Errorf("expected the recap's namespace filter to be overridable, got %q", values["EOD_EXCLUDE_NAMESPACES"])
+	}
+	// The recap resolves its own cluster name; letting the CR relabel every
+	// row would make one cluster's noise read as another's.
+	if _, ok := values["GKE_CLUSTER_NAME"]; ok {
+		t.Errorf("GKE_CLUSTER_NAME must stay operator-owned, got %#v", got)
 	}
 }
 
@@ -4835,4 +4897,34 @@ func TestImagePullSecretsReachThePodSpec(t *testing.T) {
 			t.Errorf("StatefulSet pod spec imagePullSecrets = %v, want %v", got, want)
 		}
 	})
+}
+
+// The read-only kill switch. Unlike the two above it is not appended by
+// buildCredentialProxySidecar afterwards, so an unreserved name here does not
+// duplicate or lose a race — it is simply accepted, and the proxy reads the
+// user's value. `CREDENTIAL_PROXY_ENFORCE_READ_ONLY: "false"` under
+// spec.deployment.env turned off every refusal in the policy: all commands,
+// all agents, all clusters in the Pod, no expiry, and nothing in the CR that
+// reads like a security change. Whoever can edit the PlatformAgent is often
+// exactly who the policy is meant to constrain, so the switch cannot be theirs.
+//
+// Asserting absence rather than a value is deliberate: the proxy defaults to
+// enforcing when the variable is unset, so dropping the entry is the fix, and
+// an operator-set "true" would be indistinguishable from the merge having
+// silently passed the user's own "true" through.
+func TestDeploymentEnvCannotDisableReadOnlyEnforcement(t *testing.T) {
+	for _, userValue := range []string{"false", "0", "no", "true"} {
+		t.Run(userValue, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_ENFORCE_READ_ONLY", Value: userValue}},
+			}
+
+			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+				if e.Name == "CREDENTIAL_PROXY_ENFORCE_READ_ONLY" {
+					t.Fatalf("spec.deployment.env set the read-only kill switch to %q; it must be dropped as reserved", e.Value)
+				}
+			}
+		})
+	}
 }
