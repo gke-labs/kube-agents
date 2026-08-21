@@ -29,6 +29,12 @@ TIMEOUT_SECONDS = 30
 # way, so raising this widens the message rather than revealing anything new.
 TOP_N = 2
 
+# `deliver: "chat"` relays this through a Chat Agent turn that is asked to
+# reproduce the report verbatim. Without a heading the empty-queue message is
+# one greeting-shaped sentence, and the agent answers it as conversation
+# instead — the user gets "Understood, I'll keep an eye on the board".
+HEADING = "Findings queue — morning nudge"
+
 
 def _request(endpoint: str, path: str, body: dict | None = None) -> dict:
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -55,6 +61,10 @@ def _where(finding: dict) -> str:
 
 def compose(findings: list[dict]) -> str:
     """The message, from the ranked list. Pure, so the wording earns a test."""
+    return f"{HEADING}\n\n{_body(findings)}"
+
+
+def _body(findings: list[dict]) -> str:
     if not findings:
         return "Good morning. The findings queue is empty."
 

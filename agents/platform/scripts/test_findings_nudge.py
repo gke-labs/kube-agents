@@ -28,7 +28,16 @@ def finding(**overrides) -> dict:
 
 class ComposeTests(unittest.TestCase):
     def test_an_empty_queue_says_so_rather_than_greeting_into_nothing(self):
-        self.assertEqual(nudge.compose([]), "Good morning. The findings queue is empty.")
+        self.assertEqual(
+            nudge.compose([]),
+            f"{nudge.HEADING}\n\nGood morning. The findings queue is empty.",
+        )
+
+    def test_every_message_opens_with_the_heading(self):
+        # The relay turn reproduces a report and answers a greeting, so a
+        # message that starts with "Good morning." never reaches the user.
+        for findings in ([], [finding(severity="major")], [finding()]):
+            self.assertTrue(nudge.compose(findings).startswith(f"{nudge.HEADING}\n\n"))
 
     def test_a_queue_with_no_criticals_names_the_highest_instead(self):
         message = nudge.compose([finding(severity="major", title="no memory limit")])
