@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Extra kube-agents installs that scripts/live_test_lease.py must protect.",
+    "Only needed for an install you have no checkout of: the install a checkout",
+    "is pointed at is discovered from its k8s-operator/scripts/vars.sh.",
+    "Copy to ~/.config/kube-agents/live-test-envs.json, or point",
+    "$KUBE_AGENTS_LIVE_TEST_ENVS at it. `context` is the only required field;",
+    "name, markers, registry, and label are derived from it when omitted.",
+    "`aliases` names the same cluster under a renamed kubectl context, so that",
+    "`kubectl --context <alias>` resolves to this install too.",
+    "See docs/designs/live-test-lease.md."
+  ],
+  "installs": [
+    {
+      "context": "gke_my-project_us-central1_my-cluster"
+    },
+    {
+      "name": "staging",
+      "context": "gke_my-other-project_us-east4_staging-cluster",
+      "namespace": "kubeagents-system",
+      "kubeconfig": "~/.kube/staging.config",
+      "aliases": ["staging"],
+      "markers": ["my-other-project", "staging-cluster", "staging-chat-events"],
+      "registry": "us-east4-docker.pkg.dev/my-other-project/kube-agents"
+    }
+  ]
+}

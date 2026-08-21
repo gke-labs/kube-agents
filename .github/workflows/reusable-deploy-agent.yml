@@ -131,8 +131,30 @@ jobs:
 
       - name: Verify Agent Deployment Rollout
         run: |
+          # This is the only step that waits for the agent to come up. The
+          # helm --wait above returns in seconds because the chart's resource
+          # is the PlatformAgent CR, not the Deployment: the CR is ready
+          # immediately and the operator reconciles it into
+          # platform-agent-gateway afterwards, so --wait never watches the
+          # slow part.
+          #
+          # 180s was under the cold-start cost and failed deploys that had
+          # actually succeeded. On Autopilot a rollout onto a scaled-down node
+          # pays node scale-up plus an agent image pull before the container
+          # even starts: measured 215s in autopush and 259s in staging, the
+          # latter spending 212s of it pre-Initialized. Both reported red
+          # while the pod went Ready moments later.
+          #
+          # 900s, and it has to stay inside the ordering tests/test_hindsight_probes.py
+          # records: startupProbe budget < rollout gate < progressDeadlineSeconds.
+          # The gateway's agentAPIProbe(10, 60) sanctions a 605s cold boot, and
+          # the repo's own derivation adds a 240s pull allowance on top, giving
+          # 845s; 900 rounds that up. The ceiling is the gateway Deployment's
+          # progressDeadlineSeconds, which the operator now pins at 1200s —
+          # above that the Deployment reports ProgressDeadlineExceeded and this
+          # wait returns early however long it was given.
           echo "Waiting for rollout of platform-agent-gateway deployment..."
-          if ! kubectl rollout status deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} --timeout=180s; then
+          if ! kubectl rollout status deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} --timeout=900s; then
             echo "::error::Rollout failed! Printing debug logs..."
             kubectl describe deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} || true
             kubectl get pods -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway || true

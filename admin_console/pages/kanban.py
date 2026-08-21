@@ -16,7 +16,7 @@ import streamlit as st
 from admin_console.connection_session import recover_app_shell
 from admin_console.connection_gate import require_connection
 from admin_console.agent_runtime import AgentRuntimeError, AgentRuntimeProvider
-from admin_console.ui import AGENT_SELECTOR_HELP, paginated_selectable_table
+from admin_console.ui import paginated_selectable_table
 
 ACTIVE_STATUSES = {"todo", "ready", "running"}
 ATTENTION_STATUSES = {"blocked", "failed", "crashed", "cancelled"}
@@ -57,27 +57,15 @@ target = require_connection()
 
 provider = AgentRuntimeProvider(target)
 try:
-    agents = provider.list_agents()
+    selected_agent = provider.canonical_agent()
 except AgentRuntimeError as exc:
     st.error(str(exc))
     if exc.guidance:
         st.caption(exc.guidance)
     st.stop()
 
-if not agents:
-    st.warning("No running kube-agents gateway was found in this scope.")
-    st.stop()
-
-toolbar = st.columns([3, 1])
-requested_agent = query_value("kanban_agent")
-selected_agent = toolbar[0].selectbox(
-    "Agent",
-    agents,
-    index=agents.index(requested_agent) if requested_agent in agents else 0,
-    help=AGENT_SELECTOR_HELP,
-)
-set_query("kanban_agent", selected_agent)
-if toolbar[1].button(
+st.query_params.pop("kanban_agent", None)
+if st.button(
     "Refresh",
     icon=":material/refresh:",
     width="stretch",
@@ -281,7 +269,6 @@ with overview:
                 "project": target.project_id,
                 "cluster": target.cluster_name,
                 "location": target.location,
-                "chat_agent": selected_agent,
                 "chat_window": "all",
                 "chat_session": f"default:{task.session_id}",
             }

@@ -23,6 +23,10 @@ deployment. The JSON document contains only:
 - the last successful verification time; and
 - whether runtime use is verified or requires revalidation.
 
+The file does not persist an agent ID. Runtime pages rediscover the canonical
+stock `PlatformAgent` from the connected Kubernetes target, so a stale cluster,
+Deployment, Service, or Hermes profile name cannot become installation identity.
+
 The account identifier and infrastructure names may be sensitive organizational
 metadata. Treat the file as private even though it is not a credential.
 
@@ -52,6 +56,27 @@ These controls protect against accidental disclosure and unsafe file
 substitution across local accounts. They do not defend against a process already
 running as the same Unix user; that process can also access the user's gcloud
 configuration and is outside the local portal's trust boundary.
+
+## Local API authorization
+
+The loopback listener is reachable by other local accounts, so binding to
+`127.0.0.1` is not the authorization boundary. At launch, the portal creates a
+random process-scoped bearer capability and passes it only to its private
+Streamlit child process. Every `/api/v1` request must present that capability,
+including requests that read the persisted connection lease or change LiteLLM
+configuration. Health probes and the browser-facing Streamlit proxy do not
+receive cluster access through this capability.
+
+The capability exists only in the portal processes' environment. It is not
+printed, placed in a URL, sent to the browser, or written to the persisted
+connection-state document. Restarting the portal replaces it. A same-user
+process remains outside this protection for the reason described above.
+
+An API-only client started separately can opt into the same launch by setting
+`KUBE_AGENTS_PORTAL_API_TOKEN` to the same independently generated value of at
+least 32 characters before starting both the portal and client. The client sends
+that value as `Authorization: Bearer ...`. Do not place it in a command-line
+argument or URL.
 
 ## Resume and revalidation
 

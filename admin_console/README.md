@@ -132,8 +132,9 @@ no-recent-data outcomes. Cluster connectivity depends on the identity, project,
 GKE, and agent-runtime checks; an unavailable Logging or Trace source remains a
 visible checklist failure but does not lock runtime-backed Chat, Task Kanban, or
 Scheduled Cron. A failed cluster connection shows one actionable error by the
-controls. The portal never grants IAM, enables APIs, changes Kubernetes
-resources, or retains access tokens.
+controls. The Connection workflow never grants IAM, enables APIs, changes
+Kubernetes resources, or retains access tokens. The separate **LLM Gateway**
+page has explicit, narrowly scoped configuration actions described below.
 Observe and Chat pages are unavailable until the required checks pass for the
 selected project and cluster.
 
@@ -146,6 +147,24 @@ fails:
 gcloud auth application-default login
 ```
 
+## LLM Gateway
+
+Setup's **LLM Gateway** page reads the connected target's LiteLLM resources and
+runs one bounded request from the Platform Agent through `model-default`.
+**Refresh status** repeats that complete check. Kubernetes resources, recent
+container logs, and operation output stay collapsed under **Raw Logs**.
+
+The provider catalog defines Gemini, Anthropic, OpenAI, Vertex AI, and ChatGPT
+subscription configuration. API keys are write-only Secret patches; Vertex AI
+uses Workload Identity; ChatGPT tokens stay in a cluster PVC while the page
+shows LiteLLM's device-login output. A successful non-device change waits for
+one rollout and tests the updated connection. Device login is polled until the
+rollout completes, then tested. Helm-owned deployments show their live status
+but disable the configuration form; change those releases through Terraform or
+Helm. See the
+[inference gateway guide](../docs/site/src/content/docs/concepts/inference-gateway.md)
+for provider behavior.
+
 ## Chat
 
 Chat is always available in navigation. Without a verified target it provides a
@@ -156,10 +175,20 @@ Selecting a row updates the URL-selected session and renders its transcript and
 composer below the table.
 
 Portal-owned sessions use the connected deployment's default Hermes profile,
-the same front-door Planning Agent used by Google Chat and Slack. The Chat page uses
-the versioned `/api/v1` contract for agent discovery, session reads, messages,
+the same front-door Planning Agent used by Google Chat and Slack. The connected
+installation is the stock `PlatformAgent` named by the Helm default. The portal
+discovers that resource from the selected cluster and
+does not ask for an agent ID. If it is absent, the error lists every discovered
+`PlatformAgent` name. Cluster, Deployment, Service, and Hermes profile names are
+never substituted for the resource name. The Chat page uses the versioned
+`/api/v1` contract for discovery, session reads, messages,
 linked tasks, new interactions, and approvals; it does not call the Hermes
-adapter directly. The selected session is stored in the URL and its transcript
+adapter directly. The public API retains `agentId` in interaction records and
+URLs, but the portal populates it from the discovered canonical resource.
+Every local `/api/v1` request also carries a random launch-scoped bearer
+capability shared only with the private Streamlit child process. The capability
+is replaced on restart and is never stored with connection state.
+The selected session is stored in the URL and its transcript
 is reloaded from Hermes after a refresh. Google Chat and Slack sessions are
 visible but read-only; a portal follow-up creates a separate `portal_*` session
 so the console does not impersonate an external participant or unexpectedly
@@ -190,8 +219,9 @@ deployment boundary are owned by the
 [admin-console design](../docs/designs/admin-console.md#portal-api-and-shared-chat-abstraction).
 
 The portal does not retrieve the external Hermes API key. The transitional
-adapter runs a fixed, size-bounded client inside the selected `platform-agent`
-container. That in-container process reads `API_SERVER_KEY` from its own
+adapter runs a fixed, size-bounded client inside the live gateway container
+that exposes the operator-defined `api` port. That in-container process reads
+`API_SERVER_KEY` from its own
 environment and uses it only for the loopback request; the credential never
 enters the local portal process, stdout, or kubectl arguments. User prompts are
 sent over stdin rather than command arguments. If Hermes requests a tool
@@ -215,8 +245,7 @@ share one connection-gate component that directs the user to Connection;
 provider-backed content becomes available after connecting to a verified
 kube-agents host.
 
-Task Kanban reads the selected Agent's live shared board. Today each Agent entry is
-backed by a Kubernetes `PlatformAgent` custom resource. The page summarizes
+Task Kanban reads the canonical installation's live shared board. The page summarizes
 open, attention, and completed work, filters by status and assignee, and uses a
 25-row selectable table with URL-persisted pagination. Selecting a row keeps
 the task in the URL and renders its details below the table. Task inspection
@@ -230,8 +259,8 @@ values are redacted before rendering, raw delivery destinations and attachment
 storage paths are not returned, and the page never claims, retries, comments
 on, or otherwise changes a task.
 
-Scheduled Cron reads every bounded Hermes profile cron store in the selected
-Agent. Its execution table aggregates the selected history into one row per job
+Scheduled Cron reads every bounded Hermes profile cron store in the canonical
+installation. Its execution table aggregates the selected history into one row per job
 title with run and outcome counts, latest activity, and participating profiles.
 Each row expands in place to list every retained start time, trigger, duration,
 status, profile, and error—there is no separate detail table. The page also shows
@@ -254,10 +283,11 @@ read:
 - complete Hermes traces that contain the trusted `session.id` label.
 
 Chat History reads persisted user and assistant messages from every Hermes
-profile in the selected Agent runtime. Reads are bounded and credential-shaped
+profile in the canonical runtime. Reads are bounded and credential-shaped
 values are redacted. Sessions without trusted user metadata remain explicitly
 unattributed; tool output and model reasoning are not rendered. URL state keeps
-the selected agent, profile, platform, opaque user filter, and session.
+the profile, platform, opaque user filter, and session; it does not expose an
+agent selector.
 Free-text search stays out of the URL because it may contain sensitive data.
 
 The Activity Explorer retains each Logging insert ID or Trace/span ID, provides

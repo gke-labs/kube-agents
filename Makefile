@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check tf-apply tf-destroy
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -203,6 +203,85 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 		exit 1; \
 	fi
 
+# Coverage runs the same suite the same way -- the loop below is test-python's
+# loop with `coverage run` in place of `python3`. That mirroring is the point:
+# a coverage target that discovers tests any other way measures a different
+# suite. Two things differ. COVERAGE_ROOT pins the measured tree to the
+# repository root (the loop cd's into each directory, and .coveragerc reads the
+# variable because `source` cannot be relative from seventeen places), and
+# COVERAGE_FILE parks every per-directory data file in one place for
+# `coverage combine`. Failing directories are reported but do not stop the
+# measurement: test-python is the gate, this is the meter, and the 13
+# pre-existing failures must not hide the number for the other directories.
+COVERAGE_DIR := .coverage-data
+
+coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
+	@rm -rf $(COVERAGE_DIR) coverage.xml coverage-go.xml
+	@mkdir -p $(COVERAGE_DIR)
+	@if [ -z "$(strip $(PYTHON_TEST_DIRS))" ]; then \
+		echo "ERROR: PYTHON_TEST_DIRS expanded to nothing; the globs above are stale."; \
+		exit 1; \
+	fi
+	@failed=""; \
+	for dir in $(PYTHON_TEST_DIRS); do \
+		echo "==> $$dir"; \
+		(cd $$dir && COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+			PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" \
+			python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py") \
+			|| failed="$$failed $$dir"; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "Note: failing test directories (their coverage is still recorded):$$failed"; \
+	fi
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage combine --rcfile=$(CURDIR)/.coveragerc
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o coverage.xml
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | grep '^TOTAL'
+# The Go half is best-effort: it needs gocover-cobertura for the XML diff-cover
+# reads, and the operator's envtest binaries to run at all. CI skips it with
+# COVERAGE_SKIP_GO=1 because k8s-operator-test.yml already runs that suite.
+# -coverpkg=./... matters: without it, packages with no test files of their own
+# drop out of the denominator and the number reads ~10 points high.
+	@if [ "$(COVERAGE_SKIP_GO)" = "1" ]; then \
+		echo "Skipping Go coverage (COVERAGE_SKIP_GO=1)."; \
+	elif ! command -v gocover-cobertura >/dev/null 2>&1; then \
+		echo "Skipping Go coverage: gocover-cobertura not installed."; \
+		echo "  go install github.com/boumenot/gocover-cobertura@latest"; \
+	else \
+		$(MAKE) -C k8s-operator setup-envtest && \
+		(cd k8s-operator && \
+			ENVTEST_V="$$(sed -n 's/^ENVTEST_K8S_VERSION ?= //p' Makefile)" && \
+			test -n "$$ENVTEST_V" && \
+			KUBEBUILDER_ASSETS="$$(bin/setup-envtest use "$$ENVTEST_V" --bin-dir bin -p path)" && \
+			test -n "$$KUBEBUILDER_ASSETS" && \
+			KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" \
+			go test -coverpkg=./... $$(go list ./... | grep -v /e2e) -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/go-cover.out && \
+			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(CURDIR)/coverage-go.xml) \
+		|| echo "Go coverage failed; the Python half above is unaffected."; \
+	fi
+# The envtest version is read from k8s-operator/Makefile's own pin rather than
+# repeated here: a hardcoded copy drifted once already (1.31.0 against the
+# operator's 1.36.0), and the empty-string failure mode -- setup-envtest
+# failing, KUBEBUILDER_ASSETS="" exported, every suite red, all of it
+# swallowed by the || echo above -- is why both reads are guarded with test -n.
+
+# 55 is a deliberately loose placeholder: the real floor gets committed from
+# the first green CI run of the coverage job, not from a laptop measurement,
+# because CI's Python and dependency set produce a different number.
+COVERAGE_FLOOR ?= 55
+
+coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `make coverage` first.
+	@if [ ! -f $(COVERAGE_DIR)/.coverage ]; then \
+		echo "No coverage data. Run: make coverage"; \
+		exit 1; \
+	fi
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc --fail-under=$(COVERAGE_FLOOR) >/dev/null \
+		&& echo "Coverage is at or above the $(COVERAGE_FLOOR)% floor." \
+		|| { echo "Coverage fell below the $(COVERAGE_FLOOR)% floor."; exit 1; }
+
 # bench/tests is the one Python suite that cannot join PYTHON_TEST_DIRS: it is
 # pytest-native (fixtures, parametrize), and `unittest discover` collects two
 # of its tests and errors on both. So it runs under its own target, and
@@ -235,7 +314,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_docs.py --check
@@ -248,6 +327,9 @@ docs-check-terminology:
 
 docs-check-map:
 	@python3 scripts/check_docs_map.py
+
+docs-check-context-budget:
+	@python3 scripts/check_context_budget.py
 
 chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules from k8s-operator/config.
 	@./hack/sync-chart-manifests.sh

@@ -51,8 +51,11 @@ EXCLUDED = {
     "tests/memory": "hermes-agent dependency, decision pending",
 }
 
-# Directory names that are never test homes, at any depth.
-IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data"}
+# Directory names that are never test homes, at any depth. .terraform holds
+# provider and module downloads (an initialized module can carry its own
+# upstream test files), so a worktree where tofu init ever ran would
+# otherwise red this guard on vendored tests.
+IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform"}
 
 
 def discovered_dirs():

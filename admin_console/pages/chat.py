@@ -27,7 +27,7 @@ from admin_console.clients.portal_api import (
 from admin_console.chat.models import is_portal_session_id
 from admin_console.chat.service import ACTIVE_TASK_STATUSES
 from admin_console.project_config import DeploymentTarget
-from admin_console.ui import AGENT_SELECTOR_HELP, paginated_selectable_table
+from admin_console.ui import paginated_selectable_table
 
 HISTORY_WINDOWS = {
     "24h": ("24 hours", 24),
@@ -134,7 +134,6 @@ def render_task_cards(
     result: TaskUpdateResult,
     *,
     target: DeploymentTarget,
-    selected_agent: str,
 ) -> None:
     if not result.tasks:
         return
@@ -169,7 +168,6 @@ def render_task_cards(
                     "project": target.project_id,
                     "cluster": target.cluster_name,
                     "location": target.location,
-                    "kanban_agent": selected_agent,
                     "kanban_task": task.task_id,
                 },
             )
@@ -187,7 +185,7 @@ st.caption(f"{target.project_id} · {target.cluster_name} · {target.namespace}"
 runtime_provider = portal_api(target)
 
 try:
-    agents = runtime_provider.list_agents()
+    selected_agent = runtime_provider.canonical_agent()
 except PortalApiError as exc:
     st.error(str(exc))
     if exc.guidance:
@@ -195,19 +193,7 @@ except PortalApiError as exc:
     st.caption("Choose another project or cluster on Connection.")
     st.stop()
 
-if not agents:
-    st.warning("No running kube-agents gateway was found in this scope.")
-    st.caption("Choose another project or cluster on Connection.")
-    st.stop()
-
-requested_agent = query_value("chat_agent")
-selected_agent = st.selectbox(
-    "Agent",
-    agents,
-    index=agents.index(requested_agent) if requested_agent in agents else 0,
-    help=AGENT_SELECTOR_HELP,
-)
-set_query("chat_agent", selected_agent)
+st.query_params.pop("chat_agent", None)
 st.query_params.pop("chat_view", None)
 
 requested_window = query_value("chat_window") or "all"
@@ -470,7 +456,6 @@ with thread:
         render_task_cards(
             task_snapshot,
             target=target,
-            selected_agent=selected_agent,
         )
     elif state_key in task_read_errors:
         st.caption(f"Agent work unavailable: {task_read_errors[state_key]}")

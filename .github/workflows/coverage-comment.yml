@@ -1,0 +1,273 @@
+name: Coverage Comment
+
+# Posts the sticky coverage comment for python-tests.yml's coverage job.
+#
+# A separate workflow because of who runs where: the coverage job runs on the
+# pull request's own code with the PR's token, and in this repository every
+# PR comes from a fork, so that token is read-only and cannot comment. This
+# workflow runs on workflow_run in the base repository's context, where the
+# token can. The two meet at the diff-cover-report artifact.
+#
+# This workflow is privileged, so it follows the workflow_run safety rules:
+# it never checks out or executes anything from the pull request, it reads
+# the artifact's files as text only, and it validates the PR number the
+# artifact claims against what GitHub says about the run before posting.
+
+on:
+  # zizmor: ignore[dangerous-triggers] - privileged on purpose, and fenced the
+  # way the audit asks: nothing from the pull request is checked out or
+  # executed, the artifact's files are read as text only, and the PR number
+  # the artifact claims is validated against GitHub's own record of the run
+  # before anything is posted.
+  workflow_run:
+    workflows: ["Python Unit Tests"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# One poster per head branch, queued rather than cancelled: two quick pushes
+# otherwise race, both POST, and the sticky-comment lookup pins the older of
+# the two duplicates forever after.
+concurrency:
+  group: coverage-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+
+jobs:
+  comment:
+    name: Post the coverage comment
+    runs-on: ubuntu-latest
+    # Only runs that were pull requests carry a report; pushes to main run
+    # the same workflow but the coverage job skips itself there. The
+    # repository check keeps this credentialed workflow from self-starting
+    # on forks of this repository (AGENTS.md convention).
+    if: github.event.workflow_run.event == 'pull_request' && github.repository == 'gke-labs/kube-agents'
+
+    permissions:
+      pull-requests: write
+      actions: read
+      contents: read
+
+    steps:
+      # Plain gh api rather than a download action: no new SHA pin, and the
+      # artifact is unzipped into a directory nothing ever executes from.
+      - name: Download the coverage artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          aid=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+                --jq '.artifacts[] | select(.name == "diff-cover-report") | .id' \
+                | head -1)
+          if [ -z "$aid" ]; then
+            echo "No diff-cover-report artifact on run $RUN_ID; nothing to post."
+            exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$aid/zip" > artifact.zip \
+            || { echo "artifact download failed (expired?); not posting."; exit 0; }
+          mkdir report
+          # -j flattens paths so a crafted entry cannot traverse out of the
+          # directory. The symlink sweep runs unconditionally BEFORE the exit
+          # code is looked at: unzip exits nonzero on a duplicate-entry
+          # prompt (</dev/null so it can never hang) AFTER extracting the
+          # earlier entries, so an early exit here would leave a partial
+          # tree -- symlinks included -- for later steps to read through.
+          # On any failure the whole tree goes too; no partial extraction
+          # survives this step.
+          rc=0
+          unzip -qj artifact.zip -d report </dev/null || rc=$?
+          find report -type l -delete
+          if [ "$rc" -ne 0 ]; then
+            rm -rf report
+            echo "artifact unusable; not posting."
+            exit 0
+          fi
+
+      # The PR number rides in the artifact because workflow_run does not
+      # reliably carry it for fork PRs. The artifact is PR-authored, so the
+      # number is a claim, not a fact: require digits only, then require
+      # that GitHub's own record of that PR points at exactly the head this
+      # run measured. Every event field is read from the event file on disk
+      # rather than template-expanded into the script -- head_branch is
+      # attacker-named, and zizmor rightly flags the expansion.
+      - name: Validate the PR number against the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        # The only value ever written is PR_NUMBER, digits-only by
+        # construction (tr -cd '0-9' above every write).
+        run: | # zizmor: ignore[github-env]
+          pr=$(tr -cd '0-9' < report/pr-number.txt | head -c 10)
+          if [ -z "$pr" ]; then
+            echo "pr-number.txt is not a number; not posting."
+            exit 0
+          fi
+
+          head_sha=$(jq -r '.workflow_run.head_sha' "$GITHUB_EVENT_PATH")
+          head_owner=$(jq -r '.workflow_run.head_repository.owner.login' "$GITHUB_EVENT_PATH")
+          head_branch=$(jq -r '.workflow_run.head_branch' "$GITHUB_EVENT_PATH")
+
+          # Cheap path: the event already names the PR.
+          if jq -e --argjson pr "$pr" \
+               '.workflow_run.pull_requests[]? | select(.number == $pr)' \
+               "$GITHUB_EVENT_PATH" > /dev/null; then
+            # zizmor: ignore[github-env] - digits-only by construction (tr above)
+            echo "PR_NUMBER=$pr" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Fork path: pull_requests is often empty there. Ask GitHub for
+          # the claimed PR and require its head to be the exact commit,
+          # branch and owner this run measured.
+          claimed=$(gh api "repos/$REPO/pulls/$pr" \
+                    --jq '[.head.sha, .head.ref, .head.repo.owner.login] | join(" ")' \
+                    2>/dev/null || true)
+          if [ "$claimed" = "$head_sha $head_branch $head_owner" ]; then
+            # zizmor: ignore[github-env] - digits-only by construction (tr above)
+            echo "PR_NUMBER=$pr" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "PR $pr does not match this run's head ($head_owner/$head_branch@$head_sha); not posting."
+
+      - name: Render the comment
+        if: env.PR_NUMBER != ''
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, sys
+
+          # Everything under report/ is pull-request-authored, so nothing
+          # from it reaches the comment unsanitized: numbers must parse and
+          # sit in range, and the table cells pass a character whitelist
+          # that excludes @ (mention pings), | (table escapes), backticks
+          # and angle brackets (markup).
+          report = pathlib.Path("report")
+          try:
+              diff_md = (report / "diff-cover.md").read_text(errors="replace")
+          except Exception:
+              print("diff-cover.md missing or unreadable; not rendering.")
+              sys.exit(0)
+          try:
+              repo_total = (report / "coverage-total.txt").read_text(
+                  errors="replace"
+              ).strip()
+          except Exception:
+              repo_total = "?"
+          if not re.fullmatch(r"\d+(\.\d+)?", repo_total):
+              repo_total = "?"
+
+          FOOTER = "Report-only · nothing here blocks this pull request yet."
+          MARKER = "<!-- coverage-report -->"
+
+          no_lines = "No lines with coverage information in this diff." in diff_md
+
+          # Captures feeding int() are bounded to 7 digits: int() on Python
+          # 3.11+ raises on numeric strings past ~4300 digits, so an
+          # unbounded capture would crash exactly the fail-soft path. The
+          # try/except is belt-and-braces for the same reason.
+          pct = None
+          m = re.search(r"^- \*\*Coverage\*\*: (\d{1,7})%", diff_md, re.M)
+          if m:
+              try:
+                  v = int(m.group(1))
+                  if 0 <= v <= 100:
+                      pct = v
+              except Exception:
+                  pass
+          missing = 0
+          m = re.search(r"^- \*\*Missing\*\*: (\d{1,7}) ", diff_md, re.M)
+          if m:
+              try:
+                  missing = int(m.group(1))
+              except Exception:
+                  missing = 0
+
+          # One row per file with misses. diff-cover escapes dots as &#46;.
+          rows = []
+          for m in re.finditer(
+              r"^- (.+?) \(([\d.]+)%\): Missing lines (.+)$", diff_md, re.M
+          ):
+              path = m.group(1).replace("&#46;", ".")
+              path = re.sub(r"[^A-Za-z0-9._/#&;-]", "", path)[:200]
+              lines_cell = re.sub(r"[^0-9,\- ]", "", m.group(3))[:200]
+              rows.append(f"| `{path}` | {lines_cell.replace(',', ', ')} |")
+
+          if no_lines or (pct is not None and pct >= 100 and not rows):
+              headline = (
+                  "no measurable lines changed 🟢" if no_lines else "100% 🟢"
+              )
+              body = "\n".join([
+                  MARKER,
+                  "## 📊 Coverage",
+                  "",
+                  f"**This PR's changed lines: {headline}** · "
+                  "Repository (Python): "
+                  + ("?" if repo_total == "?" else f"{repo_total}%"),
+                  "",
+                  FOOTER,
+                  "",
+              ])
+          else:
+              if pct is None:
+                  # Malformed or out-of-range never renders as a number.
+                  cell = "**?**"
+              else:
+                  light = "🟢" if pct >= 80 else ("🟡" if pct >= 75 else "🔴")
+                  cell = f"**{pct}%** {light}"
+              total_cell = "?" if repo_total == "?" else f"{repo_total}%"
+              lines = [
+                  MARKER,
+                  "## 📊 Coverage",
+                  "",
+                  "| | Coverage | Target |",
+                  "|---|---|---|",
+                  f"| **This PR's changed lines** | {cell} | 80% |",
+                  f"| Repository (Python) | {total_cell} | — |",
+                  "",
+              ]
+              if rows:
+                  noun = "line" if missing == 1 else "lines"
+                  lines += [
+                      f"<details><summary>❌ {missing} uncovered {noun} "
+                      "added (click to expand)</summary>",
+                      "",
+                      "| File | Missing lines |",
+                      "|---|---|",
+                      *rows,
+                      "",
+                      "</details>",
+                      "",
+                  ]
+              lines += [FOOTER, ""]
+              body = "\n".join(lines)
+
+          # GitHub caps a comment at 65,536 characters; keep headroom.
+          pathlib.Path("comment.md").write_text(body[:60000])
+          EOF
+
+      - name: Post or update the sticky comment
+        if: env.PR_NUMBER != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          [ -f comment.md ] || { echo "no comment rendered; nothing to post."; exit 0; }
+          marker='<!-- coverage-report -->'
+          # Only comments this workflow's identity wrote: anyone can start a
+          # comment with the marker, and PATCHing theirs would render the
+          # report under their name.
+          #
+          # gh runs alone rather than piped into head: in a pipeline its
+          # failure is invisible (no pipefail here, and pipefail would
+          # SIGPIPE --paginate when head closes early), so a transient 5xx
+          # would read as "no comment yet" and POST a duplicate the lookup
+          # then pins forever. Standing alone under -e, a lookup failure
+          # fails the step -- a red run beats a permanent duplicate.
+          comments=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+                --jq ".[] | select(.user.login == \"github-actions[bot]\")
+                          | select(.body | startswith(\"$marker\")) | .id")
+          cid=$(head -1 <<<"$comments")
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$cid" -F body=@comment.md
+          else
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@comment.md
+          fi

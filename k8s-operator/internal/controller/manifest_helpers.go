@@ -36,14 +36,15 @@ import (
 )
 
 var (
-	// DefaultPlatformAgentVersion is injected at build time via -ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z"
-	// or defaults to "latest" during local development.
+	// DefaultPlatformAgentVersion is the fallback tag for local development
+	// or environments where OPERATOR_IMAGE is not set (defaults to "latest").
 	DefaultPlatformAgentVersion = "latest"
 )
 
-// fallbackPlatformAgentImage derives its tag from DefaultPlatformAgentVersion
-// at call time (not folded at init), so release builds default to the matching
-// versioned image and tests can pin the derivation by overriding the variable.
+// fallbackPlatformAgentImage returns the default platform-agent image using
+// DefaultPlatformAgentVersion at call time (not folded at init), serving as the
+// static fallback when neither PLATFORM_AGENT_IMAGE nor OPERATOR_IMAGE is configured.
+// Tests can pin the derivation by overriding DefaultPlatformAgentVersion.
 func fallbackPlatformAgentImage() string {
 	return "ghcr.io/gke-labs/kube-agents/platform-agent:" + DefaultPlatformAgentVersion
 }
@@ -55,6 +56,7 @@ const (
 	// private registry. Set on the controller-manager Deployment; a CR's
 	// spec.deployment.image still takes precedence over PLATFORM_AGENT_IMAGE.
 	platformAgentImageEnvVar   = "PLATFORM_AGENT_IMAGE"
+	operatorImageEnvVar        = "OPERATOR_IMAGE"
 	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	fluentBitImageEnvVar       = "FLUENT_BIT_IMAGE"
 
@@ -171,12 +173,46 @@ func otelTelemetryEnvVars(agentType, name, namespace, endpoint string) []corev1.
 	}
 }
 
+// deriveAgentImageFromOperator derives the platform-agent image from an operator image reference.
+// It maps the operator image to the platform-agent image while preserving the registry prefix
+// and tag. If the operator image is digest-pinned (@sha256:...), the digest cannot name the
+// platform-agent manifest, so it falls back to a tag if present before the digest (e.g. :v1@sha256:...)
+// or :latest.
+// E.g.:
+//   "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0"                -> "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
+//   "ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a" -> "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a"
+//   "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:111111..."    -> "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+//   "mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
+//   "k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
+func deriveAgentImageFromOperator(operatorImage string) string {
+	lastSlash := strings.LastIndex(operatorImage, "/")
+	prefix := ""
+	refPart := operatorImage
+	if lastSlash >= 0 {
+		prefix = operatorImage[:lastSlash+1]
+		refPart = operatorImage[lastSlash+1:]
+	}
+	// Digest pins (@sha256:...) cannot name a different repository manifest.
+	// Strip digest and fall back to tag or :latest.
+	if digestIdx := strings.Index(refPart, "@"); digestIdx >= 0 {
+		refPart = refPart[:digestIdx]
+	}
+	suffix := ":latest"
+	if tagIdx := strings.Index(refPart, ":"); tagIdx >= 0 {
+		suffix = refPart[tagIdx:]
+	}
+	return prefix + appNamePlatformAgent + suffix
+}
+
 // defaultPlatformAgentImage returns the agent image used when a CR omits
-// spec.deployment.image: the PLATFORM_AGENT_IMAGE env var if set, else the
-// public ghcr.io default.
+// spec.deployment.image: the PLATFORM_AGENT_IMAGE env var if set, else derived
+// from OPERATOR_IMAGE if set, else the public ghcr.io default.
 func defaultPlatformAgentImage() string {
 	if img := os.Getenv(platformAgentImageEnvVar); img != "" {
 		return img
+	}
+	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" {
+		return deriveAgentImageFromOperator(opImg)
 	}
 	return fallbackPlatformAgentImage()
 }

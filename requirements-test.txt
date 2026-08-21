@@ -64,3 +64,11 @@ mcp<2
 
 python-dotenv
 pyyaml
+
+# `make coverage` and the CI coverage job. coverage runs the unittest suite
+# under measurement; diff-cover reads the resulting coverage.xml plus the
+# branch diff to report coverage of changed lines only. Neither is imported by
+# anything under test -- they are tooling, listed here so the local and CI
+# installs cannot drift.
+coverage
+diff-cover

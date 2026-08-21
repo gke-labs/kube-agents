@@ -56,6 +56,11 @@ const (
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
 	credentialProxyPort         = 8765
+	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
+	// (see the readiness probe in buildBaseContainers), so the container port, the
+	// Service port, and the NetworkPolicy rule below all describe a listener that
+	// only kubelet's port-forward can reach.
+	dashboardPort = 9119
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -1630,7 +1635,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	//
 	//   SESSION_KV_API_KEY  authenticates callers of the Session KV server on
 	//                       127.0.0.1:8699. This container both serves it and
-	//                       calls it (platform_mcp_server, incident_context).
+	//                       calls it (platform_mcp_server, incident_context,
+	//                       and the gateway's kanban notifier).
 	//   SESSION_KV_SALT     the HMAC salt for pseudonymising chat identities.
 	//                       It has to be here because the hashing happens here,
 	//                       at the point the identity is first seen.
@@ -1955,10 +1961,25 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 }
 
+// gatewayProgressDeadlineSeconds is the ceiling over every rollout wait on the
+// gateway Deployment, and it has to outlast both of the budgets under it:
+//
+//	startupProbe budget  <  rollout gate  <  progressDeadlineSeconds
+//
+// Past the deadline the Deployment reports ProgressDeadlineExceeded and any
+// caller's wait returns early however long it asked for, so a gate raised above
+// this number buys nothing. Kubernetes defaults it to 600s, which is *below*
+// the 605s cold boot agentAPIProbe(10, 60) already sanctions — the kubelet is
+// told to tolerate a boot the Deployment gives up on. 1200s clears the 900s
+// deploy gate in .github/workflows/reusable-deploy-agent.yml. hindsight-api
+// carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
+const gatewayProgressDeadlineSeconds int32 = 1200
+
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, opts)
+	progressDeadline := gatewayProgressDeadlineSeconds
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -1974,8 +1995,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Strategy: strategy,
+			Replicas:                &replicas,
+			Strategy:                strategy,
+			ProgressDeadlineSeconds: &progressDeadline,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": agent.Name + "-gateway",
@@ -2334,6 +2356,20 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	}
 	for _, name := range []string{
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		// The read-only kill switch. Unreserved, a one-line
+		// `CREDENTIAL_PROXY_ENFORCE_READ_ONLY: "false"` under
+		// spec.deployment.env turns off every refusal the policy makes --
+		// for all commands, all agents and all clusters in the Pod, with no
+		// expiry and nothing in the CR that reads like a security change.
+		// A control that its own subject can switch off is not a control.
+		//
+		// Listed here as well as in SensitiveEnvVars, which this loop already
+		// folds in above, because the two do different jobs: the webhook's
+		// rejection is the explanation and this drop is the enforcement. The
+		// chart defaults failurePolicy to Ignore, so a webhook that cannot be
+		// reached admits the CR with validation skipped, and this line is
+		// what still holds when that happens.
+		"CREDENTIAL_PROXY_ENFORCE_READ_ONLY",
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
@@ -2375,10 +2411,35 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// destinations qualify, and so do the alert ceilings — they bound how many
 	// notifications the session server posts in a day and nothing else. A
 	// path, a credential or an image reference would not.
+	//
+	// EOD_EXCLUDE_NAMESPACES is the end-of-day recap's only tunable. It
+	// narrows what its listing prints and reaches nothing the notifier does: no
+	// event stops being forwarded, no alert stops being posted, and a ceiling
+	// drop or a failed delivery in an excluded namespace is still counted and
+	// still withholds the recap's all-clear — `eod_report_generator.py` flags
+	// an excluded row rather than skipping it, so the loop keeps tallying it.
+	// That is the property this allowlist entry rests on: no value of
+	// EOD_EXCLUDE_NAMESPACES can tune the recap into hiding a withheld alert
+	// or a refused post.
+	//
+	// It buys less than that in one respect, and the difference is worth
+	// stating rather than rounding off. What an exclusion does reach is the
+	// informational tally, which is the point of it, and the exclusion count
+	// is deliberately not a veto term — so a day whose only informational
+	// churn sat in an excluded namespace still grades green, over a window the
+	// recap did not fully read. The scope caveat rides a qualifier line in the
+	// report body instead. The bound is that the overclaim is confined to
+	// informational churn; the two alert tallies above are what an operator
+	// setting this variable cannot touch.
+	//
+	// Any value parses: `excluded_namespaces` comma-splits the string and
+	// matches the parts literally, so an arbitrary one names namespaces that do
+	// not exist and excludes nothing. There is no validation to fail.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
+		"EOD_EXCLUDE_NAMESPACES":      {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
@@ -2463,7 +2524,7 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	if suffix == "" {
 		// The sidecar tag must follow the agent image, which on this path is
 		// untagged or digest-pinned without a tag field — i.e. effectively
-		// "latest", not the build-injected default version.
+		// "latest", not the default platform-agent version.
 		suffix = ":latest"
 	}
 	return prefix + name + suffix
@@ -2586,7 +2647,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// APPENDED LAST, and that position is the guard, not a style choice. It is not routed
 	// through mergeEnvVars because this is the operator's own declaration rather than a
 	// default a user may replace, and one caller can in fact try: `spec.deployment.env`
-	// cannot reach this container (safeSandboxEnvOverrides copies five OTEL_* names and
+	// cannot reach this container (safeSandboxEnvOverrides copies a fixed allowlist and
 	// drops the rest), but extractAgentPluginEnvVars copies an AgentPlugin's spec.env
 	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
 	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
@@ -2766,7 +2827,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			Ports: []corev1.ContainerPort{
 				{
 					Name:          "dashboard",
-					ContainerPort: 9119,
+					ContainerPort: dashboardPort,
 				},
 			},
 			Env: dashboardEnvVars,
@@ -2781,17 +2842,51 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
-			// The Service publishes :9119 whenever the dashboard is enabled, so
-			// without this the UI port is advertised before anything listens on it.
+			// What this buys is not what a probe on a serving container buys. The
+			// Service's :9119 endpoint is unreachable over the pod network either
+			// way (see dashboardPort), so nothing is being kept out of rotation.
+			// Pod readiness is the AND of every container, so this reports a
+			// broken dashboard through the pod's own Ready condition — and, the
+			// other side of the same coin, a dashboard that hangs or OOM-loops
+			// now withdraws the agent API on :8642 with it. That coupling is the
+			// price of reporting it at all; the alternative is no probe here,
+			// which leaves a dead dashboard silent.
 			//
-			// tcpSocket rather than httpGet: this one binds all interfaces, so kubelet
-			// can reach it on the pod IP, but `hermes dashboard` exposes no health
-			// path we have verified — and a probe against a guessed path that 404s
-			// would hold the whole pod unready, taking the API down with it.
+			// exec on loopback, not tcpSocket. `hermes dashboard` takes no --host
+			// argument here and the CLI's default is 127.0.0.1, so a tcpSocket probe
+			// — which kubelet dials against the pod IP — was refused on every
+			// attempt and this container never went Ready. That held the whole pod
+			// NotReady, drove the CR to Ready=False, and failed the install's
+			// rollout gate on any install that did not pin dashboardEnabled=false
+			// (#822). The comment this replaces asserted the opposite binding.
+			// Same shape, and the same reason, as agentAPIProbe above.
+			//
+			// Binding all interfaces instead is not the smaller fix, and not just
+			// because no auth provider is configured: the dashboard's auth gate
+			// keys on the bind host, so 0.0.0.0 switches authentication on and the
+			// server then exits at startup rather than serve unauthenticated. The
+			// loopback bind is what keeps it usable. scripts/hermes-dashboard-
+			// tunnel.py is canonical on that and on how a human reaches it.
+			//
+			// No --fail and no health path: `hermes dashboard` exposes no health
+			// endpoint we have verified, and demanding a 2xx from a guessed one
+			// would 404 and hold the pod unready for the wrong reason. Without
+			// --fail curl exits 0 on any HTTP status, so serving the SPA at / is
+			// enough and so would be a 401. Plain http:// is right — that tunnel
+			// script relays cleartext HTTP off this port.
+			//
+			// So the exit code passes straight through: 0 means it answered, 7
+			// means connection refused — the exact state that made this container
+			// never go Ready — and 28 means it accepted and then hung. --max-time
+			// sits under TimeoutSeconds so 28 is curl's to report rather than
+			// kubelet's to kill.
 			ReadinessProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{
-					TCPSocket: &corev1.TCPSocketAction{
-						Port: intstr.FromString("dashboard"),
+					Exec: &corev1.ExecAction{
+						Command: []string{
+							"sh", "-c",
+							fmt.Sprintf("curl --silent --show-error --max-time 3 -o /dev/null http://127.0.0.1:%d/", dashboardPort),
+						},
 					},
 				},
 				InitialDelaySeconds: 5,
@@ -3188,9 +3283,14 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	}
 
 	if dashboardEnabled {
+		// Connecting to this port from another pod gets connection refused: the
+		// dashboard listens on loopback only (see dashboardPort). It is published
+		// anyway because `kubectl port-forward svc/<agent> 9119:9119` needs the
+		// Service to name the port, and port-forward is how the dashboard is
+		// reached.
 		ports = append(ports, corev1.ServicePort{
 			Name:       "dashboard",
-			Port:       9119,
+			Port:       dashboardPort,
 			TargetPort: intstr.FromString("dashboard"),
 		})
 	}
@@ -3484,13 +3584,13 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
-	dnsClusterIP = strings.Trim(dnsClusterIP, "[]")
+	dnsClusterIP := strings.Trim(profile.DNSClusterIP, "[]")
 	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
-		dnsClusterIP = "10.96.0.10"
+		dnsClusterIP = defaultDNSClusterIP
 	}
 	dnsCidr := dnsClusterIP + "/32"
 	if strings.Contains(dnsClusterIP, ":") {
@@ -3509,7 +3609,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 	// Everything the rewritten packet can be addressed to, all of it on port 988:
 	// the metadata daemon's own link-local address on the iptables datapath.
 	// See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, metadataDaemonIP}, true)
+	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
@@ -3532,9 +3632,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 	}
 
 	if isDashboardEnabled(agent) {
+		// Kept in step with the Service port rather than because pod-network
+		// traffic reaches the dashboard — it does not, the listener is loopback
+		// (see dashboardPort). Removing the rule would make the policy the reason
+		// a future non-loopback bind fails, which is not the failure to leave
+		// behind.
 		ingressRules[0].Ports = append(ingressRules[0].Ports, networkingv1.NetworkPolicyPort{
 			Protocol: &tcp,
-			Port:     ptr.To(intstr.FromInt32(9119)),
+			Port:     ptr.To(intstr.FromInt32(dashboardPort)),
 		})
 	}
 

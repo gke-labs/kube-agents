@@ -31,7 +31,9 @@ Change a default here and every front door follows. Do **not** restate these val
 
 `vars.sh` (git-ignored, `chmod 600`) is the install's machine-readable record, written by
 `install.sh` and read by the Day-2 menu, `uninstall.sh`, `upgrade.sh`, the admin console,
-and the e2e tests. The `terraform.tfvars` the engine consumes is generated from it on
+the e2e tests, and `scripts/live_test_lease.py` — which, being run by a hook on a
+contributor's machine, matches an allowlist of `export K=V` lines with a regex and never
+sources the file. The `terraform.tfvars` the engine consumes is generated from it on
 every run, so the two cannot disagree. Set `PERSIST_SECRETS_ON_DISK=false` to keep
 credentials out of both files: the generator omits them from `terraform.tfvars` and
 exports them as `TF_VAR_*` for the apply instead, and later runs recover them from the

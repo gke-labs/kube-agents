@@ -459,6 +459,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1200
   replicas: 1
   selector:
     matchLabels:
@@ -632,11 +633,14 @@ spec:
             - containerPort: 9119
               name: dashboard
           readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl --silent --show-error --max-time 3 -o /dev/null http://127.0.0.1:9119/
             failureThreshold: 3
             initialDelaySeconds: 5
             periodSeconds: 15
-            tcpSocket:
-              port: dashboard
             timeoutSeconds: 5
           resources:
             limits:

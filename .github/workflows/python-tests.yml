@@ -78,3 +78,120 @@ jobs:
 
       - name: Run the bench harness tests
         run: make test-bench
+
+  # Report-only for now: it posts numbers on the pull request and blocks
+  # nothing. The blocking rules (diff-coverage floor, no-test detector, total
+  # ratchet) turn on in stages once a baseline of merged-PR data exists --
+  # first the no-test detector, then the floor and the ratchet, with the
+  # thresholds set from the observed distribution rather than this file.
+  #
+  # The job also runs on pushes to main -- measurement only, no diff, no
+  # comment. Those runs are what give the total ratchet a per-commit baseline
+  # and the coverage-check floor a number measured in CI rather than on a
+  # laptop; without them "commit the first green run's total" has no run to
+  # read.
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+
+    # No pull-requests: write here, deliberately. This job runs the pull
+    # request's own Makefile and tests, and on a fork PR the token is
+    # read-only whatever this block asks for -- which in this repository is
+    # every PR, since branches live on forks. The comment is posted by
+    # coverage-comment.yml on the workflow_run trigger, which runs in the
+    # base repository's context; this job's whole hand-off is the artifact.
+    permissions:
+      contents: read
+
+    env:
+      HERMES_HOME: ${{ github.workspace }}/.hermes-home
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # diff-cover diffs against the merge base, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+          # Nothing after checkout needs git credentials (diff-cover diffs
+          # locally), and this job executes the pull request's own Makefile
+          # and tests -- don't leave a token on disk for them to read.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the third-party imports the modules under test need
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-test.txt
+
+      # COVERAGE_SKIP_GO=1: k8s-operator-test.yml already runs the Go suite,
+      # and the envtest setup is not worth repeating for a report-only job.
+      # `make coverage` tolerates failing test directories by design -- the
+      # `test` job above is the gate, this one is the meter.
+      - name: Measure coverage
+        run: make coverage COVERAGE_SKIP_GO=1
+
+      # fnmatch quirk: diff-cover matches exclusions against the basename and
+      # then the ABSOLUTE path (diff_cover/diff_reporter.py, _is_path_excluded),
+      # so a bare repo-relative pattern matches nothing and fails open. A `*`
+      # prefix with no slash matches under absolute-path semantics AND under
+      # plain relative matching -- diff-cover is deliberately unpinned in
+      # requirements-test.txt, so the patterns must not depend on which of the
+      # two an upstream release uses.
+      #
+      # The same six paths are omitted in .coveragerc, so the diff number and
+      # the repository total in the comment are computed over one file set --
+      # otherwise a PR adding uncovered lines under an excluded path reads
+      # 100% on the diff while dragging down a total the floor is blind to.
+      - name: Diff coverage against the merge base
+        if: github.event_name == 'pull_request'
+        env:
+          # Through the environment rather than interpolated into the script:
+          # zizmor flags template expansion inside `run:` as an injection
+          # surface, and the env var is inert text to the shell parser.
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          diff-cover coverage.xml \
+            --compare-branch "origin/${BASE_REF}" \
+            --markdown-report diff-cover.md \
+            --fail-under 0 \
+            --exclude \
+              "*deploy/docker/patches/verify_*.py" \
+              "*deploy/docker/patches/kanban*.py" \
+              "*deploy/docker/patches/cron*.py" \
+              "*deploy/docker/patches/channel_directory_threads*.py" \
+              "*deploy/docker/patches/slack_code_emphasis*.py" \
+              "*examples/*"
+
+      # The hand-off to coverage-comment.yml, which posts the sticky PR
+      # comment from the base repository's context (this job's fork token
+      # cannot). The PR number rides inside the artifact because the
+      # workflow_run event on the poster's side does not reliably carry it
+      # for fork PRs; the poster validates it before use rather than
+      # trusting it. Skipped on the measurement-only pushes to main: there
+      # is no PR to hand off to, and the poster ignores runs without one.
+      - name: Write the comment hand-off data
+        if: github.event_name == 'pull_request'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          echo "$PR" > pr-number.txt
+          COVERAGE_ROOT="$PWD" COVERAGE_FILE="$PWD/.coverage-data/.coverage" \
+            python3 -m coverage report --rcfile=.coveragerc --format=total \
+            > coverage-total.txt
+
+      - name: Upload the diff coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diff-cover-report
+          path: |
+            diff-cover.md
+            coverage.xml
+            pr-number.txt
+            coverage-total.txt
+          if-no-files-found: ignore

@@ -520,3 +520,124 @@ func TestResolveImagePullSecrets(t *testing.T) {
 		}
 	})
 }
+
+func TestDeriveAgentImageFromOperator(t *testing.T) {
+	tests := []struct {
+		name          string
+		operatorImage string
+		expected      string
+	}{
+		{
+			name:          "standard ghcr SemVer release",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "standard ghcr RC release candidate tag",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a",
+		},
+		{
+			name:          "standard ghcr full commit SHA",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba",
+		},
+		{
+			name:          "standard ghcr short commit SHA",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:1c06e1a",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:1c06e1a",
+		},
+		{
+			name:          "custom mirror registry with pure SemVer",
+			operatorImage: "mirror.corp.internal/kube-agents/k8s-operator:0.2.0",
+			expected:      "mirror.corp.internal/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "digest pinned image falls back to latest",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "tag and digest pinned image preserves tag",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "latest tag",
+			operatorImage: "ghcr.io/gke-labs/kube-agents/k8s-operator:latest",
+			expected:      "ghcr.io/gke-labs/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "registry host with port and SemVer tag",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator:0.2.0",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "localhost with port and latest tag",
+			operatorImage: "localhost:5000/k8s-operator:latest",
+			expected:      "localhost:5000/platform-agent:latest",
+		},
+		{
+			name:          "registry host with port and digest falls back to latest",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "registry host with port, tag and digest preserves tag",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator:0.2.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:0.2.0",
+		},
+		{
+			name:          "registry host with port and no tag",
+			operatorImage: "registry.example.com:5000/kube-agents/k8s-operator",
+			expected:      "registry.example.com:5000/kube-agents/platform-agent:latest",
+		},
+		{
+			name:          "unqualified image with tag",
+			operatorImage: "k8s-operator:0.2.0",
+			expected:      "platform-agent:0.2.0",
+		},
+		{
+			name:          "unqualified image without tag",
+			operatorImage: "k8s-operator",
+			expected:      "platform-agent:latest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveAgentImageFromOperator(tt.operatorImage)
+			if got != tt.expected {
+				t.Errorf("deriveAgentImageFromOperator(%q) = %q, want %q", tt.operatorImage, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDefaultPlatformAgentImagePrecedence(t *testing.T) {
+	t.Run("explicit PLATFORM_AGENT_IMAGE overrides OPERATOR_IMAGE and fallback", func(t *testing.T) {
+		t.Setenv(platformAgentImageEnvVar, "custom-registry/agent:explicit")
+		t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0")
+
+		want := "custom-registry/agent:explicit"
+		if got := defaultPlatformAgentImage(); got != want {
+			t.Errorf("defaultPlatformAgentImage() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("OPERATOR_IMAGE derives platform-agent and credential-proxy when PLATFORM_AGENT_IMAGE unset", func(t *testing.T) {
+		t.Setenv(platformAgentImageEnvVar, "")
+		t.Setenv(credentialProxyImageEnvVar, "")
+		t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0")
+
+		wantAgent := "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
+		if got := defaultPlatformAgentImage(); got != wantAgent {
+			t.Errorf("defaultPlatformAgentImage() = %q, want %q", got, wantAgent)
+		}
+
+		wantSidecar := "ghcr.io/gke-labs/kube-agents/credential-proxy:0.2.0"
+		if got := resolveCredentialProxyImage(nil); got != wantSidecar {
+			t.Errorf("resolveCredentialProxyImage(nil) = %q, want %q", got, wantSidecar)
+		}
+	})
+}
