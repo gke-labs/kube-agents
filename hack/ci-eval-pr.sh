@@ -61,16 +61,25 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
-# TODO(testing-strategy): the judge and the agent are the same model, so the
-# judged trend partly measures the judge grading itself -- the drift argument
-# wants them split and the judge pinned across releases. Left as-is here
-# because this environment's API key has only been proven against this model;
-# verify a second model is enabled for kube-agents-gemini-api-key before
-# splitting, or a wrong guess reds every eval. The deterministic keys below
-# carry the merge decision either way, which is what makes this safe to defer.
-export JUDGE_MODEL="gemini-3.1-pro-preview"
+# The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
+# upgrading AGENT_MODEL must never move JUDGE_MODEL. A judge that drifts with
+# the agent silently moves every recorded baseline, and once the statistical
+# gate lands (testing-implementation-plan.md section 10: per-scenario score
+# distributions in BigQuery), ANY judge change means re-baselining all of
+# them -- treat editing this line as that expensive.
+#
+# The judge and agent VALUES are still equal today, which partly measures the
+# judge grading itself. The split to a distinct judge model is blocked on one
+# fact this repository cannot prove: that kube-agents-gemini-api-key serves a
+# second model. The tree says it should -- the chart's default for the same
+# GEMINI_API_KEY family is gemini-3.5-flash (charts/kube-agents/templates/
+# litellm.yaml, docs/site .../inference-gateway.md) -- so the switch is one
+# verified run away: confirm the key against the candidate model, then set
+# JUDGE_MODEL_OVERRIDE in the Prow job env (or flip the default here) without
+# touching the agent line.
+export JUDGE_MODEL="${JUDGE_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 export AGENT_PROVIDER="google"
-export AGENT_MODEL="gemini-3.1-pro-preview"
+export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE
