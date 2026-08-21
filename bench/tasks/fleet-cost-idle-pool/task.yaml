@@ -16,12 +16,14 @@
 # PersistentDisks with the prefix "orphan-pd-". We chose the names.
 #
 # ACTIVATION IS DATE-GATED, by the SOP's own do-not-flag rules rather than by
-# anything in this spec. Check 3.5 lists disks with the literal filter
-# `creationTimestamp<-P30D` and flags only at AGE >= 30d; check 3.7 will not
-# flag "pools created < 7 days ago". The fleet in both eval projects was
-# created 2026-08-21, so the idle-pool half of this scenario cannot pass
-# before 2026-08-28 and the orphan-disk half not before 2026-09-20. Turning
-# it on earlier produces a red presubmit that is the SOP behaving correctly.
+# anything in this spec. Check 3.4 (`unattached-disk`) lists disks with the
+# literal filter `creationTimestamp<-P30D` and flags only at AGE >= 30d;
+# check 3.7 (`idle-nodepool`) will not flag "pools created < 7 days ago".
+# (Check 3.5 is `idle-address` at AGE >= 14d and is unrelated to either.)
+# The fleet in both eval projects was created 2026-08-21, so the idle-pool
+# half of this scenario cannot pass before 2026-08-28 and the orphan-disk
+# half not before 2026-09-20. Turning it on earlier produces a red presubmit
+# that is the SOP behaving correctly.
 # Any replant of the fixtures restarts both clocks. One unsettled detail: the
 # 3.7 command (`gcloud container node-pools list`) returns no creation field,
 # so pool age is whatever the agent infers -- if it reads node age, the
