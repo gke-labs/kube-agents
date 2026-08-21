@@ -28,12 +28,13 @@ default_model_for_provider() {
   case "${1:-}" in
     openai) echo "gpt-5.4" ;;
     anthropic) echo "claude-opus-5" ;;
+    gemma4 | vllm) echo "google/gemma-4-E2B-it" ;;
     *) echo "gemini-3.5-flash" ;;
   esac
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|gemma4|vllm)$ ]]
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is

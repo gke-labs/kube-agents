@@ -112,6 +112,7 @@ init_var() {
   fi
 }
 
+
 # ─── Container Registry ───────────────────────────────────────────────────────
 # DEFAULT_REGISTRY_PREFIX comes from installer_common.sh; individual *_IMAGE
 # variables still win over the prefix.
@@ -331,11 +332,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai, gemma4, vllm)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai, gemma4, vllm."
     exit 1
   fi
 
@@ -351,6 +352,12 @@ init_var_model_provider() {
     init_var "VERTEX_PROJECT_ID" "${PROJECT_ID:-}" "Enter Vertex AI Project ID"
     init_var "VERTEX_LOCATION" "${REGION:-$DEFAULT_REGION}" "Enter Vertex AI Location"
   fi
+}
+
+init_var_gpu_accelerator() {
+  init_var "GPU_ACCELERATOR_TYPE" "nvidia-l4" "Enter GKE GPU Accelerator Type (nvidia-l4, nvidia-tesla-a100, nvidia-rtx-pro-6000)"
+  init_var "GPU_MACHINE_TYPE" "g2-standard-8" "Enter GKE GPU Node Machine Type (e.g. g2-standard-8 for L4, a2-highgpu-1g for A100)"
+  init_var "GPU_POOL_NAME" "gpu-l4-pool" "Enter GKE GPU Node Pool Name"
 }
 
 init_var_platform_agent_permission_set() {
