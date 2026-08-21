@@ -508,6 +508,76 @@ type TelemetrySpec struct {
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
 }
 
+// NetworkPolicySpec configures the operator-generated egress NetworkPolicy.
+// Tier-2 typed equivalent of the kubeagents.x-k8s.io/{dns-cluster-ip,metadata-daemon-ip}
+// annotations; the annotations remain as the escape hatch and win over this field.
+type NetworkPolicySpec struct {
+	// Enabled turns operator-managed NetworkPolicy generation off entirely, for
+	// installs that manage network policy through their own tooling. Unset means on.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// DNSClusterIPs pins the cluster DNS Service ClusterIPs. Setting it disables
+	// discovery, like spec.telemetry.otlpEndpoint.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	DNSClusterIPs []string `json:"dnsClusterIPs,omitempty"`
+
+	// MetadataDaemon describes the node-local cloud metadata daemon. Leave nil to
+	// let the operator detect it. Present with Endpoint "" emits no post-NAT rule at
+	// all, for datapaths that evaluate pre-NAT or clouds without one.
+	// +optional
+	MetadataDaemon *MetadataDaemonSpec `json:"metadataDaemon,omitempty"`
+
+	// AdditionalEgress is appended verbatim to the generated policy.
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
+}
+
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+type MetadataDaemonSpec struct {
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// the empty alternative in the pattern is required because the API server
+	// validates an explicitly-set "", which omitempty does not suppress.
+	// +kubebuilder:validation:Pattern=`^($|(([0-9]{1,3}\.){3}[0-9]{1,3})|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
+	// +kubebuilder:validation:MaxLength=45
+	Endpoint string `json:"endpoint"`
+}
+
+// EgressRule is a deliberately narrow projection of networkingv1.NetworkPolicyEgressRule:
+// CIDR + port list only. It keeps the CRD OpenAPI small and forbids the selector-based
+// peers that would let a CR reference pods/namespaces the operator does not vet.
+type EgressRule struct {
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	To []EgressPeer `json:"to"`
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Ports []EgressPort `json:"ports,omitempty"`
+}
+
+// EgressPeer defines a CIDR block and optional exclusions.
+type EgressPeer struct {
+	// CIDR is an IPv4/IPv6 block or host IP, e.g. 10.0.0.0/24 or 10.0.0.1.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=49
+	// +kubebuilder:validation:Pattern=`^((([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?)|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?))$`
+	CIDR string `json:"cidr"`
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Except []string `json:"except,omitempty"`
+}
+
+// EgressPort defines a port and transport protocol.
+type EgressPort struct {
+	// +kubebuilder:validation:Enum=TCP;UDP;SCTP
+	Protocol string `json:"protocol"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+}
+
 // AgentSpec defines the common infrastructure configuration shared across all agent types.
 type AgentSpec struct {
 	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
@@ -521,6 +591,10 @@ type AgentSpec struct {
 	// Telemetry configures OpenTelemetry export for this agent.
 	// +optional
 	Telemetry *TelemetrySpec `json:"telemetry,omitempty"`
+
+	// NetworkPolicy configures the operator-generated egress NetworkPolicy.
+	// +optional
+	NetworkPolicy *NetworkPolicySpec `json:"networkPolicy,omitempty"`
 }
 
 type DeploymentStatus struct {
@@ -559,6 +633,31 @@ type TelemetryStatus struct {
 	// OperatorEnv, Discovered, or Default.
 	// +optional
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
+}
+
+// NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
+// the same diagnostic split as TelemetryStatus: the value alone cannot say whether a DNS
+// IP was discovered or pinned.
+type NetworkPolicyStatus struct {
+	// Generated is false when spec.networkPolicy.enabled is false.
+	// +optional
+	Generated bool `json:"generated,omitempty"`
+
+	// DNSClusterIPs are the ClusterIPs written into rule 1.
+	// +optional
+	DNSClusterIPs []string `json:"dnsClusterIPs,omitempty"`
+
+	// DNSClusterIPsSource reports which rung answered the DNS ClusterIP (Annotation, Spec, OperatorEnv, Discovered, or Default).
+	// +optional
+	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
+
+	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// +optional
+	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
+
+	// MetadataDaemonIPSource reports which rung answered the metadata daemon IP (Annotation, Spec, OperatorEnv, Default, or Suppressed).
+	// +optional
+	MetadataDaemonIPSource string `json:"metadataDaemonIPSource,omitempty"`
 }
 
 // AgentStatus defines the observed state of an agent.
@@ -603,6 +702,17 @@ type AgentStatus struct {
 	// Telemetry reports the resolved OpenTelemetry export configuration.
 	// +optional
 	Telemetry TelemetryStatus `json:"telemetry,omitempty"`
+
+	// Note, deliberately not a doc comment — the blank line below keeps it out of the
+	// CRD description that `kubectl explain` prints. As on the three status structs
+	// above, omitempty does nothing here: encoding/json has no notion of an empty
+	// struct, so this key is always serialised, as `{}` before the first reconcile. It
+	// is kept for consistency with its neighbours — read the field, not the key's
+	// absence, to tell whether network policy has been resolved.
+
+	// NetworkPolicy reports the resolved egress NetworkPolicy configuration.
+	// +optional
+	NetworkPolicy NetworkPolicyStatus `json:"networkPolicy,omitempty"`
 }
 
 const (

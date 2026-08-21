@@ -9177,6 +9177,114 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
                             && has(self.appTokenSecretRef))"
                   type: object
+                networkPolicy:
+                  description:
+                    NetworkPolicy configures the operator-generated egress
+                    NetworkPolicy.
+                  properties:
+                    additionalEgress:
+                      description:
+                        AdditionalEgress is appended verbatim to the generated
+                        policy.
+                      items:
+                        description:
+                          'EgressRule is a deliberately narrow projection
+                          of networkingv1.NetworkPolicyEgressRule: CIDR + port list
+                          only. It keeps the CRD OpenAPI small and forbids the selector-based
+                          peers that would let a CR reference pods/namespaces
+                          the operator does not vet.'
+                        properties:
+                          ports:
+                            items:
+                              description:
+                                EgressPort defines a port and transport
+                                protocol.
+                              properties:
+                                port:
+                                  description:
+                                    Port is the port number (1-65535).
+                                  format: int32
+                                  maximum: 65535
+                                  minimum: 1
+                                  type: integer
+                                protocol:
+                                  enum:
+                                    - TCP
+                                    - UDP
+                                    - SCTP
+                                  type: string
+                              required:
+                                - port
+                                - protocol
+                              type: object
+                            maxItems: 16
+                            type: array
+                          to:
+                            items:
+                              description:
+                                EgressPeer defines a CIDR block and optional
+                                exclusions.
+                              properties:
+                                cidr:
+                                  description:
+                                    CIDR is an IPv4/IPv6 block or host
+                                    IP, e.g. 10.0.0.0/24 or 10.0.0.1.
+                                  maxLength: 49
+                                  minLength: 1
+                                  pattern:
+                                    ^((([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?)|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?))$
+                                  type: string
+                                except:
+                                  items:
+                                    type: string
+                                  maxItems: 16
+                                  type: array
+                              required:
+                                - cidr
+                              type: object
+                            maxItems: 16
+                            minItems: 1
+                            type: array
+                        required:
+                          - to
+                        type: object
+                      maxItems: 32
+                      type: array
+                    dnsClusterIPs:
+                      description:
+                        DNSClusterIPs pins the cluster DNS Service ClusterIPs.
+                        Setting it disables discovery, like spec.telemetry.otlpEndpoint.
+                      items:
+                        type: string
+                      maxItems: 8
+                      type: array
+                    enabled:
+                      description:
+                        Enabled turns operator-managed NetworkPolicy generation
+                        off entirely, for installs that manage network policy through
+                        their own tooling. Unset means on.
+                      type: boolean
+                    metadataDaemon:
+                      description:
+                        MetadataDaemon describes the node-local cloud metadata
+                        daemon. Leave nil to let the operator detect it. Present
+                        with Endpoint "" emits no post-NAT rule at all, for datapaths
+                        that evaluate pre-NAT or clouds without one.
+                      properties:
+                        endpoint:
+                          description:
+                            'Endpoint is the daemon IP. "" (explicitly
+                            set) suppresses rule 3 entirely; the empty alternative
+                            in the pattern is required because the API server validates
+                            an explicitly-set "", which omitempty does not suppress.'
+                          maxLength: 45
+                          pattern:
+                            ^($|(([0-9]{1,3}\.){3}[0-9]{1,3})|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$
+                          type: string
+                      required:
+                        - endpoint
+                      type: object
+                  type: object
                 security:
                   description:
                     Security configures RBAC, Pod Security, and Workload
@@ -9307,6 +9415,41 @@ spec:
                     last updated this status.
                   format: date-time
                   type: string
+                networkPolicy:
+                  description:
+                    NetworkPolicy reports the resolved egress NetworkPolicy
+                    configuration.
+                  properties:
+                    dnsClusterIPs:
+                      description:
+                        DNSClusterIPs are the ClusterIPs written into rule
+                        1.
+                      items:
+                        type: string
+                      type: array
+                    dnsClusterIPsSource:
+                      description:
+                        DNSClusterIPsSource reports which rung answered the
+                        DNS ClusterIP (Annotation, Spec, OperatorEnv, Discovered, or
+                        Default).
+                      type: string
+                    generated:
+                      description:
+                        Generated is false when spec.networkPolicy.enabled
+                        is false.
+                      type: boolean
+                    metadataDaemonIP:
+                      description:
+                        MetadataDaemonIP is the post-NAT daemon IP in rule
+                        3, empty when suppressed.
+                      type: string
+                    metadataDaemonIPSource:
+                      description:
+                        MetadataDaemonIPSource reports which rung answered
+                        the metadata daemon IP (Annotation, Spec, OperatorEnv, Default,
+                        or Suppressed).
+                      type: string
+                  type: object
                 phase:
                   description:
                     Phase is the overall state (Pending, Provisioning, Ready,

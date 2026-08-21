@@ -19,18 +19,17 @@ import (
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/testing/testutil"
 )
 
-var (
-	update     = flag.Bool("update", false, "update golden files")
-	testScheme = runtime.NewScheme()
-)
+var update = flag.Bool("update", false, "update golden files")
 
-func init() {
-	_ = agentv1alpha1.AddToScheme(testScheme)
-	_ = corev1.AddToScheme(testScheme)
-	_ = appsv1.AddToScheme(testScheme)
-	_ = networkingv1.AddToScheme(testScheme)
-	_ = policyv1.AddToScheme(testScheme)
-	_ = rbacv1.AddToScheme(testScheme)
+func newTestScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = agentv1alpha1.AddToScheme(s)
+	_ = corev1.AddToScheme(s)
+	_ = appsv1.AddToScheme(s)
+	_ = networkingv1.AddToScheme(s)
+	_ = policyv1.AddToScheme(s)
+	_ = rbacv1.AddToScheme(s)
+	return s
 }
 
 func TestAgentsGolden(t *testing.T) {
@@ -80,7 +79,7 @@ func TestAgentsGolden(t *testing.T) {
 				tt.inputPath,
 				tt.expectedPath,
 				*update,
-				testScheme,
+				newTestScheme(),
 				tt.newAgent,
 				tt.newReconciler,
 			)

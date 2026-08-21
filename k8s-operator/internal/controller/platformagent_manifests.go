@@ -3484,17 +3484,13 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
-func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
-	dnsClusterIP = strings.Trim(dnsClusterIP, "[]")
-	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
-		dnsClusterIP = "10.96.0.10"
-	}
-	dnsCidr := dnsClusterIP + "/32"
-	if strings.Contains(dnsClusterIP, ":") {
-		dnsCidr = dnsClusterIP + "/128"
+	dnsIPs := profile.DNSClusterIPs
+	if len(dnsIPs) == 0 {
+		dnsIPs = []string{defaultDNSClusterIP}
 	}
 
 	apiPeers := formatCIDRPeers(apiCIDRs, true)
@@ -3505,11 +3501,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 	// The link-local address a workload actually connects to. Every datapath rewrites
 	// it before the policy is evaluated, so it only ever matches on the pre-DNAT ports.
 	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
-	// Everything the rewritten packet can be addressed to, all of it on port 988:
-	// the metadata daemon's own link-local address on the iptables datapath.
-	// See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, metadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
@@ -3568,11 +3559,22 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 				CIDR: "169.254.20.10/32",
 			},
 		},
-		{
+	}
+
+	for _, rawIP := range dnsIPs {
+		dnsClusterIP := strings.Trim(rawIP, "[]")
+		if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
+			dnsClusterIP = defaultDNSClusterIP
+		}
+		dnsCidr := dnsClusterIP + "/32"
+		if strings.Contains(dnsClusterIP, ":") {
+			dnsCidr = dnsClusterIP + "/128"
+		}
+		dnsPeers = append(dnsPeers, networkingv1.NetworkPolicyPeer{
 			IPBlock: &networkingv1.IPBlock{
 				CIDR: dnsCidr,
 			},
-		},
+		})
 	}
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
@@ -3594,17 +3596,24 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 			},
 			To: linkLocalPeers,
 		},
-		// 3. GKE Workload Identity host-network daemon (port 988). This is where a
-		//    metadata request lands after the node DNATs it, so it has to permit every
-		//    rewrite target the datapath can pick.
-		{
+	}
+
+	// 3. GKE Workload Identity host-network daemon (port 988). This is where a
+	//    metadata request lands after the node DNATs it, so it has to permit every
+	//    rewrite target the datapath can pick. If profile.MetadataDaemonIP == "", rule 3 is suppressed.
+	if profile.MetadataDaemonIP != "" {
+		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(988))},
 			},
 			To: metadataDaemonPeers,
-		},
+		})
+	}
+
+	egressRules = append(egressRules,
 		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
@@ -3628,7 +3637,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 			},
 		},
 		// 5. vLLM Gemma Server in the agent namespace (Service port 80 and container port 8000)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8000))},
@@ -3644,7 +3653,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 			},
 		},
 		// 6. Kubernetes API Server (Control Plane Endpoints and ClusterIP VIP)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(6443))},
@@ -3652,7 +3661,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 			},
 			To: apiPeers,
 		},
-	}
+	)
 
 	// 7. External HTTPS (Google APIs, GitHub, etc.)
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
@@ -3713,6 +3722,11 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, d
 			},
 		},
 	})
+
+	// Additional Egress rules from spec
+	if len(profile.AdditionalEgress) > 0 {
+		egressRules = append(egressRules, profile.AdditionalEgress...)
+	}
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{

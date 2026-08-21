@@ -120,6 +120,14 @@ type PlatformAgentReconciler struct {
 	// (e.g. from KUBERNETES_API_SERVER_CIDR).
 	APIServerCIDROverride string
 
+	// DNSClusterIPOverride configures static override for the Cluster DNS Service ClusterIP
+	// (e.g. from KUBERNETES_DNS_CLUSTER_IP or --kubernetes-dns-cluster-ip).
+	DNSClusterIPOverride string
+
+	// MetadataDaemonIPOverride configures static override for the Workload Identity metadata daemon IP
+	// (e.g. from KUBERNETES_METADATA_DAEMON_IP or --kubernetes-metadata-daemon-ip).
+	MetadataDaemonIPOverride string
+
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -258,6 +266,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	netpolProf := r.resolveNetpolProfile(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -271,7 +280,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	// Reconcile NetworkPolicy
-	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
@@ -279,7 +288,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 9. Update status phase to Ready
-	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource)
+	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -599,15 +608,32 @@ func (r *PlatformAgentReconciler) clearForeignPDBBudgetField(ctx context.Context
 	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string) error {
-	dnsClusterIP := "10.96.0.10"
-	var kubeDnsSvc corev1.Service
-	if err := r.Get(ctx, types.NamespacedName{Namespace: "kube-system", Name: "kube-dns"}, &kubeDnsSvc); err == nil {
-		if ip := strings.TrimSpace(kubeDnsSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
-			dnsClusterIP = ip
+func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile, otlpEndpoint string) error {
+	if !profile.Generated {
+		var existingNetpol networkingv1.NetworkPolicy
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway-netpol"}, &existingNetpol); err == nil {
+			if metav1.IsControlledBy(&existingNetpol, agent) {
+				if err := r.Delete(ctx, &existingNetpol); err != nil && !errors.IsNotFound(err) {
+					return fmt.Errorf("failed to delete disabled NetworkPolicy %s/%s: %w", existingNetpol.Namespace, existingNetpol.Name, err)
+				}
+				logf.FromContext(ctx).Info("Deleted owner-referenced NetworkPolicy because spec.networkPolicy.enabled is false", "namespace", existingNetpol.Namespace, "name", existingNetpol.Name)
+			}
+		} else if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to get NetworkPolicy %s/%s: %w", agent.Namespace, agent.Name+"-gateway-netpol", err)
 		}
-	} else if !errors.IsNotFound(err) {
-		logf.FromContext(ctx).Info("Failed to discover kube-dns ClusterIP; defaulting to 10.96.0.10", "error", err)
+
+		fqdnNetpol := &unstructured.Unstructured{}
+		fqdnNetpol.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "networking.gke.io",
+			Version: "v1alpha1",
+			Kind:    "FQDNNetworkPolicy",
+		})
+		fqdnNetpol.SetName(agent.Name + "-fqdn-netpol")
+		fqdnNetpol.SetNamespace(agent.Namespace)
+		if err := r.Delete(ctx, fqdnNetpol); err != nil && !isCRDNotInstalledError(err) {
+			return fmt.Errorf("failed to clean up disabled FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+		return nil
 	}
 
 	var apiTargets []string
@@ -721,7 +747,7 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 	}
 
 	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
-	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint)
+	netpol := buildNetworkPolicy(agent, apiTargets, profile, fqdnEnabled, otlpEndpoint)
 	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
 	}
@@ -915,10 +941,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging. otlpEndpoint and
-// otlpSource are the resolved telemetry wiring; they are reported rather than derived
-// because discovery is otherwise invisible to anyone reading the CR.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string) (string, error) {
+// the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
+// and netpolProfile are the resolved telemetry and network policy wiring; they are reported
+// rather than derived because discovery is otherwise invisible to anyone reading the CR.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -1034,6 +1060,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Address == newAddress &&
 		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
+		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
@@ -1049,6 +1076,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agent.Status.Address = newAddress
 	agent.Status.Telemetry.OTLPEndpoint = otlpEndpoint
 	agent.Status.Telemetry.OTLPEndpointSource = otlpSource
+	agent.Status.NetworkPolicy.Generated = netpolProfile.Generated
+	agent.Status.NetworkPolicy.DNSClusterIPs = append([]string(nil), netpolProfile.DNSClusterIPs...)
+	agent.Status.NetworkPolicy.DNSClusterIPsSource = netpolProfile.DNSSource
+	agent.Status.NetworkPolicy.MetadataDaemonIP = netpolProfile.MetadataDaemonIP
+	agent.Status.NetworkPolicy.MetadataDaemonIPSource = netpolProfile.MetadataDaemonSource
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -1088,6 +1120,30 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	return newPhase, r.Status().Update(ctx, agent)
+}
+
+func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, profile netpolProfile) bool {
+	if status.Generated != profile.Generated {
+		return false
+	}
+	if status.DNSClusterIPsSource != profile.DNSSource {
+		return false
+	}
+	if status.MetadataDaemonIP != profile.MetadataDaemonIP {
+		return false
+	}
+	if status.MetadataDaemonIPSource != profile.MetadataDaemonSource {
+		return false
+	}
+	if len(status.DNSClusterIPs) != len(profile.DNSClusterIPs) {
+		return false
+	}
+	for i := range status.DNSClusterIPs {
+		if status.DNSClusterIPs[i] != profile.DNSClusterIPs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (phase string, reason string, message string) {
