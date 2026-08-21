@@ -25,7 +25,7 @@ action, and every hop is somewhere "who asked" can be dropped. This specifies an
 capability**: minted at ingress from the human's verified identity, narrowed at each hop, never
 widened.
 
-**No token format. Nothing signed. No cryptographic key anywhere in the design.** The capability
+**No token format. Nothing signed. No key on the capability path.** The capability
 lives in NATS KV and the message carries only a lookup id. Integrity comes from subject
 permissions the server evaluates on every operation, fixed when the connection authenticates. Three rules make it hold: a
 parent **names the one agent permitted to descend from it**, the verifier resolves an entry **only
@@ -80,11 +80,15 @@ four is necessary rather than sufficient. Against that:
   readable after the fact by anyone auditing. The store does not give append-only on its own -- see
   "every reference pins a revision" below -- so the audit value rests on that pinning, not on the
   bucket.
-- **Attributable.** This is the property the document exists to carry. The root is minted from the
-  requester's verified identity and every hop descends from it, so "which human" is a chain walk
-  rather than a correlation exercise across logs. Conditional on a request-scoped caller identity,
-  below: where one identity serves several requests at once, a resolution can attach to the wrong
-  chain and the walk then names the wrong human confidently, which is worse than naming none.
+- **Attributable.** This is the property the document exists to carry, and as specified it does not
+  fully carry it -- so read this bullet as the target rather than as a claim of conformance. The
+  root is minted from the requester's verified identity and every hop descends from it, so the
+  chain ties the work to one origin without a correlation exercise across logs. Two gaps, both in
+  §5. The chain terminates at a request id and no entry holds a requester, so turning that origin
+  into "which human" is still a lookup elsewhere, and `02` §2.3 asks for the human by name. And it
+  is conditional on a request-scoped caller identity: where one identity serves several requests at
+  once a resolution can attach to the wrong chain, and the walk then names the wrong origin
+  confidently, which is worse than naming none.
 - **Non-escalating.** Also this document, and the stronger claim: a message confers no authority
   because authority does not travel in the message at all. It travels in an entry the receiver
   cannot read, cannot widen, and cannot resolve unless it was named. Same condition -- "named"
@@ -115,12 +119,21 @@ to do it to -- see the north-star note at the top.
 
 ## 2. The recommendation, first
 
-**No token format. Nothing signed. No cryptographic key anywhere in the design.**
+**No token format. Nothing signed. No key on the capability path.**
 
 The capability lives in NATS KV. The message on the bus carries only a lookup id.
 
 **"Key" below means a KV lookup key** -- a string like `cap.root.req-8f2a` -- and never a
-cryptographic key. There are none in this design.
+cryptographic key. No capability is signed, and nothing has to hold a key to mint or verify one.
+
+**One cryptographic key does exist, and it is not on this path.** A NATS auth callout answers each
+authorization request with a user JWT it signs with the issuer account's seed, so adopting the
+callout means custodying and rotating that seed. It is worth being exact about this because the
+comparison in §7 turns on key custody, and a claim of "no keys anywhere" is false the moment
+somebody looks. What the design avoids is a key **on the capability path** -- nothing mints, signs
+or verifies a capability, so no component needs a key to participate in one, and no compromise of a
+key forges authority. The auth callout's seed authenticates connections, which is the thing NATS
+would need a key for whatever we built on top of it.
 
 ## 3. How it works
 
@@ -201,8 +214,9 @@ it attached when you authenticated and cannot be talked out of afterwards.
 **Did each link narrow.** The verifier reads parent and child and compares. A compromised broker
 that writes something wider than it received is caught when the next hop resolves the chain.
 
-The integrity comes from server-enforced permissions rather than from cryptography. Same
-guarantee, no key to custody, rotate, distribute or recover.
+The integrity comes from server-enforced permissions rather than from cryptography. Same guarantee,
+and no key that can forge a capability if it leaks -- the callout seed in §2 authenticates
+connections and cannot mint one.
 
 **Every reference pins a revision.** A KV put on an existing key is an update rather than an error,
 and a KV delete is itself a publish to the key's own subject -- so the one permission that lets a
@@ -429,11 +443,11 @@ Nothing in the current topology needs that.
 
 The same reasoning decided three separate questions:
 
-| Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                 |
-| :------------------------------------------------------- | :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **We hold no signing key.** |
-| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                              |
-| What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                   |
+| Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                                                                 |
+| :------------------------------------------------------- | :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **We custody one account seed for the callout, and none for capabilities.** |
+| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                                                                              |
+| What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                                                                   |
 
 > **Prefer a boundary that already exists and is enforced by someone else over a check we have to
 > write, distribute and operate.**
@@ -452,8 +466,9 @@ layer down.
 
 - Make **effective authority = agent ceiling ∩ requester** hold across process boundaries, not only
   inside one process.
-- Carry it with **no cryptographic key anywhere** -- nothing to custody, rotate, distribute or
-  recover.
+- Carry it with **no key on the capability path** -- nothing mints, signs or verifies a capability,
+  so no component needs a key to participate in one. The auth callout's account seed is the one key
+  the design custodies, and it authenticates connections rather than capabilities (§2).
 - **Revocation that takes effect now**, by deleting an entry, rather than waiting out a TTL.
 - Give audit "who asked" directly, without a correlation step across hops.
 
