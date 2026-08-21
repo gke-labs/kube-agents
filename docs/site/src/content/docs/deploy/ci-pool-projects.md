@@ -31,7 +31,7 @@ A long-lived GKE cluster hosting the Platform Agent and evaluation infrastructur
 
 - **Cluster Name**: `platform-agent-host`
 - **Location**: `us-central1` (regional or zonal, matching `hack/ci-env.sh`)
-- **Database Encryption**: CMEK encryption enabled (`ALL_OBJECTS_ENCRYPTION_ENABLED`), required by `hack/ci-deploy.sh` when `ALLOW_UNENCRYPTED_SECRETS=false`.
+- **Database Encryption**: CMEK encryption enabled (`ALL_OBJECTS_ENCRYPTION_ENABLED`), matching the standard cluster setup provisioned by Terraform (enforced by `hack/ci-deploy.sh` unless `ALLOW_UNENCRYPTED_SECRETS=true`).
 
 The cluster can be provisioned using the Terraform modules in `terraform/examples/full-install`:
 
