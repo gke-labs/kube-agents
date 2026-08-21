@@ -506,8 +506,8 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     completed = completed_evidence(interaction)
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
-    final_output_available = "finalOutput" in interaction
-    result_text = str(interaction.get("finalOutput") or "")
+    final_output_available = "output" in interaction
+    result_text = str(interaction.get("output") or "")
     claims_met, claims_observed = capacity_claims(result_text)
     opaque_calls = opaque_tool_calls(interaction, OPAQUE_TOOLS)
     suite = MilestoneSuite(MILESTONES)
@@ -568,7 +568,7 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
         claims_observed,
         blocked_by=()
         if final_output_available
-        else ("portal interaction projection omits finalOutput",),
+        else ("portal interaction projection omits output",),
     )
     suite.record(
         "m8-computeclass-validates",

@@ -73,7 +73,7 @@ ACCEPTANCE_CRITERIA = (
         "ac05-start-window-recommended",
         "The user receives an exact recommended UTC start time and zone whose "
         "12-hour run finishes within the 48-hour horizon.",
-        "finalOutput names the top window's zone and UTC time",
+        "output names the top window's zone and UTC time",
     ),
     AcceptanceCriterion(
         "ac06-provisioning-request-generated",
@@ -297,8 +297,8 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     final_output_blocker = (
         ()
-        if "finalOutput" in interaction
-        else ("portal interaction projection omits finalOutput",)
+        if "output" in interaction
+        else ("portal interaction projection omits output",)
     )
 
     evidence = projected_records(interaction, "evidence")
@@ -344,7 +344,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and created_at <= top_start
         and top_start + JOB_DURATION <= created_at + PLANNING_HORIZON
     )
-    final_output = str(interaction.get("finalOutput") or "")
+    final_output = str(interaction.get("output") or "")
     recommended_in_output = (
         bool(top)
         and str(top.get("zone") or "") in final_output
@@ -422,7 +422,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         {
             "createdAt": interaction.get("createdAt"),
             "topWindow": top,
-            "finalOutput": final_output,
+            "output": final_output,
         },
         blocked_by=tuple(
             dict.fromkeys(
