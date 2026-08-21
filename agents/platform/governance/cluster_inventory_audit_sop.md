@@ -11,14 +11,23 @@ nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.m
 exists. Those steps belong to the Platform Agent, and running them here means several agents
 writing one path at once.
 
-**Never block this card, at any step — this SOP overrides `SOUL.md` §6 step 2 here.** A failed
-preflight normally means `kanban_block`; on this card it means a `gaps` entry and a completed card,
-because a block stops the whole fleet report rather than losing one cluster's row. Denied
-permissions, an unreachable API server, a cluster in
-`ERROR`, credentials that will not mint, an MCP tool that errors — every one of them is a `gaps`
-entry and a completed card, not a block. An aggregation card is waiting on this card and every
-other cluster's, so blocking here stops the whole fleet report rather than losing one cluster's row.
-Record what you did get, record what failed and why in `gaps`, and complete.
+**Do not block this card for a failure that only costs you data.** Denied permissions, an
+unreachable API server, a cluster in `ERROR`, credentials that will not mint, an MCP tool that
+errors — every one of them is a `gaps` entry and a completed card. An aggregation card is waiting
+on this card and every other cluster's, so blocking for one of those stops the whole fleet report
+rather than losing one cluster's row. Record what you did get, record what failed and why in
+`gaps`, and complete.
+
+**One class of failure is different, and there you block exactly as `SOUL.md` §6 step 2 says.** If
+`cluster_preflight.sh` fails because it cannot establish _which cluster you are_ — no `USER.md`, a
+kubeconfig that selects a different cluster than `USER.md` declares, or a plain `kubectl` that
+resolves somewhere other than your pinned context — call `kanban_block(kind="needs_input", ...)`
+and stop. Those are the script's identity checks, and every one of their remediations begins "Do
+not proceed". A `gaps` entry does not cover them: you would go on to audit a reachable cluster that
+is not yours and file its namespaces, workloads and findings under the name `USER.md` gave you.
+Aggregation copies `metadata` verbatim and the Platform Agent is forbidden to re-audit, so nothing
+downstream can catch it — the fleet report simply carries confidently mislabelled rows. Losing the
+fleet report to a block is recoverable; publishing another cluster's posture as this one's is not.
 
 ---
 
@@ -37,8 +46,9 @@ If `USER.md` is missing or does not parse, stop and complete the card with that 
 Guessing your own identity from a profile name or a cluster list is how a report ends up describing
 somebody else's cluster.
 
-If the audit cannot be done at all, record what failed in `gaps`, leave the other fields empty, and
-complete — see the rule above.
+If the audit cannot be done at all for one of the data-cost reasons above, record what failed in
+`gaps`, leave the other fields empty, and complete. If it is your identity that will not resolve,
+block — see the rule above.
 
 ---
 

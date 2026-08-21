@@ -193,7 +193,8 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
     read the script's stderr and interpreted it: on 2026-08-21 the reconcile
     succeeded — ``created=0 pruned=1 kept=4`` — while printing two ENOENT warnings,
     and the worker reported the roster as unavailable and audited the fleet alone.
-    An exit code cannot be misread that way.
+    An exit code cannot be misread that way — but only under
+    ``--require-create-pass``, without which the script exits 0 whatever happened.
     """
     script = _reconcile_script(data_dir)
     if not script.exists():
@@ -225,7 +226,12 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
         _record_reconcile_attempt(data_dir, attempts + 1)
         try:
             proc = subprocess.run(
-                [sys.executable, str(script)],
+                # `--require-create-pass` is what makes the exit code mean anything: on
+                # the cron path the script swallows every failure and exits 0, so a bare
+                # run cannot tell "this project has no clusters" from "the list call
+                # failed" — and the second one files a solo sweep that `.bootstrap_scan_filed`
+                # then makes permanent.
+                [sys.executable, str(script), "--require-create-pass"],
                 capture_output=True,
                 text=True,
                 timeout=RECONCILE_TIMEOUT_SECONDS,
@@ -304,7 +310,8 @@ def _task_body() -> str:
         f"    {_roster_command()}\n\n"
         "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
         "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
-        "this step and do the whole sweep yourself in Step 4.** That is the normal case for a "
+        "this step and do the whole sweep yourself in Step 4, following Steps 3 and 4 of the "
+        "single-cluster audit SOP for each cluster so the workload checks still happen.** That is the normal case for a "
         "single-cluster install and it is not an error. Use the command as written — the "
         "absolute path and the `HERMES_HOME` are both required, and a bare `hermes profile "
         "list` will either fail or quietly return an incomplete roster.\n\n"

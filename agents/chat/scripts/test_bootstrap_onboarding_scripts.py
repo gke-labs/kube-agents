@@ -374,9 +374,31 @@ class ScanGateTest(unittest.TestCase):
         # moves the tree, and a path that misses silently files a solo sweep.
         self.assertIn(str(self.d / "scripts" / bootstrap_scan_gate.RECONCILE_SCRIPT_NAME), calls[0])
 
-    def test_a_failed_reconcile_defers_the_sweep_without_marking_it(self):
+    def test_the_gate_asks_the_reconcile_for_an_exit_code_that_means_something(self):
+        """Without `--require-create-pass` the exit code is always 0.
+
+        The script is a cron producer and swallows every failure — a `gcloud
+        container clusters list` that 403s is logged and the run exits 0. The gate
+        would then reset the attempt count and file a solo sweep that
+        `.bootstrap_scan_filed` makes permanent, which is the failure this whole
+        arm exists to prevent.
+        """
+        calls = []
+
         def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(cmd, 1, "", "boom")
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            bootstrap_scan_gate.ensure_cluster_agents(self.d)
+        self.assertIn("--require-create-pass", calls[0])
+
+    def test_a_failed_reconcile_defers_the_sweep_without_marking_it(self):
+        # EXIT_CREATE_PASS_SKIPPED: the CREATE direction did not run, so the roster
+        # is not reconciled and the sweep must not be filed against it.
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 3, "", "boom")
 
         with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
                 mock.patch.object(Path, "exists", lambda self: True):
@@ -459,6 +481,10 @@ class ScanGateTest(unittest.TestCase):
         body = bootstrap_scan_gate._task_body()
         self.assertIn("there are no Cluster Agents", body)
         self.assertIn("do the whole sweep yourself", body)
+        # The workload checks live only in the single-cluster SOP now, so the solo
+        # walk has to be sent there or it produces a topology table with empty
+        # workload columns — the empty report this card exists to prevent.
+        self.assertIn("single-cluster audit SOP", body)
 
     def test_body_propagates_idempotency_keys_to_the_fan_out(self):
         # The root card is guarded by a marker and a key; the cards it spawns

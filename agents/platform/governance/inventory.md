@@ -102,6 +102,13 @@ per-cluster results are then metadata on cards nobody reads.
 re-audit a cluster to fill a hole; a cluster that reported a `gaps` entry is a cluster whose gap you
 record.
 
+**A cluster with no Cluster Agent has no `metadata`, and you audit it here yourself.** That is the
+whole install when the roster is empty, and one or two clusters otherwise. Follow Steps 3 and 4 of
+`cluster_inventory_audit_sop.md` for each of them — the same probes, requests/limits and QoS, HPA,
+security context, namespace governance, addons, observability and hardening checks the Cluster
+Agents ran — and produce the same per-cluster shape for yourself. Step 1 gathered control-plane
+topology only; the tables below have workload columns, and nothing else on this path fills them.
+
 One check is yours rather than theirs, because it reads a resource only this cluster has: before
 you record an observability gap, read `.status.telemetry` on the PlatformAgent to see which
 collector the agents are actually exporting to. A Cluster Agent pinned to a workload cluster cannot

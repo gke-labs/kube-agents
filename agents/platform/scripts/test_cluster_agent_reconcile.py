@@ -166,7 +166,7 @@ class AllClustersTest(unittest.TestCase):
         )
         with mock.patch.object(rec.subprocess, "run", side_effect=err), \
              mock.patch.object(rec, "log") as logged:
-            self.assertEqual(rec._all_clusters("p"), [])
+            self.assertIsNone(rec._all_clusters("p"))
         self.assertIn("Reauthentication required", " ".join(str(c) for c in logged.call_args_list))
 
     def test_uses_check_true_so_nonzero_exit_cannot_pass_silently(self):
@@ -181,8 +181,52 @@ class AllClustersTest(unittest.TestCase):
         with mock.patch.object(rec.subprocess, "run",
                                side_effect=subprocess.TimeoutExpired(["gcloud"], 120)), \
              mock.patch.object(rec, "log") as logged:
-            self.assertEqual(rec._all_clusters("p"), [])
+            self.assertIsNone(rec._all_clusters("p"))
         self.assertTrue(logged.called)
+
+
+class CreatePassSignalTest(unittest.TestCase):
+    """`create_pass_ran` is the only honest answer to "is the roster reconciled?".
+
+    Everything in this script is caught and logged so the cron path always exits 0,
+    which leaves the exit code saying nothing. The bootstrap scan gate has to know
+    the difference: filing its sweep against a roster the CREATE pass never touched
+    produces a solo audit that `.bootstrap_scan_filed` then makes permanent.
+    """
+
+    def _reconcile(self, clusters):
+        with mock.patch.object(rec, "list_profiles", return_value=[]), \
+             mock.patch.object(rec, "_project", return_value="p"), \
+             mock.patch.object(rec, "_all_clusters", return_value=clusters), \
+             mock.patch.object(rec, "log"):
+            return rec.reconcile(dry_run=True)
+
+    def test_an_empty_project_still_counts_as_reconciled(self):
+        self.assertTrue(self._reconcile([])["create_pass_ran"])
+
+    def test_a_failed_cluster_list_does_not(self):
+        self.assertFalse(self._reconcile(None)["create_pass_ran"])
+
+    def test_an_unresolvable_project_does_not(self):
+        with mock.patch.object(rec, "list_profiles", return_value=[]), \
+             mock.patch.object(rec, "_project", return_value=None), \
+             mock.patch.object(rec, "log"):
+            self.assertFalse(rec.reconcile(dry_run=True)["create_pass_ran"])
+
+    def test_the_flag_turns_a_skipped_create_pass_into_an_exit_code(self):
+        with mock.patch.object(rec, "reconcile", return_value={"create_pass_ran": False}), \
+             mock.patch.object(rec.sys, "argv", ["x", "--require-create-pass"]), \
+             mock.patch.object(rec, "log"):
+            with self.assertRaises(SystemExit) as caught:
+                rec.main()
+        self.assertEqual(caught.exception.code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_without_the_flag_the_cron_path_still_exits_zero(self):
+        with mock.patch.object(rec, "reconcile", return_value={"create_pass_ran": False}), \
+             mock.patch.object(rec.sys, "argv", ["x"]), \
+             mock.patch.object(rec, "_notify"), \
+             mock.patch.object(rec, "log"):
+            self.assertIsNone(rec.main())
 
 
 class MetadataTest(unittest.TestCase):
