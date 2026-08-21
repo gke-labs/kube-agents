@@ -16,6 +16,7 @@ The mitigation is the pattern the autopush environment already uses. Autopush po
 | --------------------- | --------------------------------------- |
 | `kube-agents-evals`   | `gke-agentic/kube-agents-evals-infra`   |
 | `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
+| `kube-agents-evals-3` | `gke-agentic/kube-agents-evals-3-infra` |
 
 Both repos exist. The deploy is not the gap: `hack/ci-deploy.sh` already installs the PR's own images into `kubeagents-system` on each run (`helm upgrade --install kube-agents`) and `hack/ci-teardown.sh` uninstalls them after, which is exactly what the eval tier is testing — the agent built from the pull request. An eval project looks empty between runs by design.
 
