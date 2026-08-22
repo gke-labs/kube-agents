@@ -4945,8 +4945,11 @@ func TestDeploymentEnvCannotDisableReadOnlyEnforcement(t *testing.T) {
 // 2026-08-10.
 //
 // A native sidecar -- an init container with restartPolicy: Always -- starts
-// before any app container, and the kubelet will not start app containers until
-// it reports ready. There is no start line for the agent to beat.
+// before any app container, so the sandbox no longer begins from the same instant
+// and cannot win the bind by starting first. The kubelet gates on the sidecar
+// having STARTED, plus its startupProbe if it declares one; this container
+// declares only a readinessProbe, so a window remains between the sidecar's exec
+// and Envoy's listen. Narrowed, not closed -- see buildPodTemplateSpec.
 //
 // Asserting the restart policy rather than list membership: an init container
 // WITHOUT it is an ordinary init container that the kubelet waits to exit, so a

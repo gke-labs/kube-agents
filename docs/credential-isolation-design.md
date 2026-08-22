@@ -30,7 +30,15 @@ is shaped that way because it owns port 8643, which the Service targets, and it
 shares a network namespace with the sandbox: as two ordinary containers they
 started together and raced for the bind, and the sandbox could take the port
 external callers reach. A native sidecar starts before any app container, which
-removes that race. Requires Kubernetes 1.29+, where `SidecarContainers` is GA.
+narrows that race but does not close it: the kubelet waits for the sidecar to have
+**started**, plus its `startupProbe` if it declares one, and this container declares
+only a `readinessProbe`. So the ordering guaranteed is of process creation, not of
+Envoy having bound 8643. Giving the container a `startupProbe` on that port would
+close it; see `buildPodTemplateSpec` in the operator.
+
+Requires Kubernetes 1.29+, where `SidecarContainers` is beta and enabled by default.
+It is alpha and off in 1.28 -- the API server drops `restartPolicy` there, so the
+proxy becomes an ordinary init container -- and GA in 1.33.
 
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
 send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards
