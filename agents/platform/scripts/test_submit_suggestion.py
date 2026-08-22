@@ -195,6 +195,16 @@ class TestCheckBranch(unittest.TestCase):
                     submit_suggestion.check_branch(branch)
                 self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
 
+    def test_a_protected_branch_is_refused_through_a_ref_prefix(self):
+        # "refs/heads/main".lower() is not in PROTECTED_BRANCHES, but pushing
+        # it moves main all the same. The check must compare the short name,
+        # whatever form the caller used.
+        for branch in ("refs/heads/main", "refs/heads/MASTER", "REFS/HEADS/production"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.check_branch(branch)
+                self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
     def test_an_empty_branch_is_refused_before_the_protected_list(self):
         # `"".lower() in PROTECTED_BRANCHES` is False, so an empty name would
         # otherwise sail through and push whatever HEAD happens to be.

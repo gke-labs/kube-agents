@@ -4,7 +4,7 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 
 ## Prerequisites
 
-- Kubernetes 1.28+ (GKE Autopilot or Standard)
+- Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
 - A Google Service Account (GSA) with a Workload Identity binding to the agent's
   Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
   namespace by default (`platformAgent.security.serviceAccountName`):
@@ -33,8 +33,8 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   `create=true` the chart generates them on install and carries the existing
   values forward on upgrade — rotating the salt would re-anonymise every user,
   severing their past sessions from their future ones. With `create=false`,
-  whatever created the Secret supplies them; `provision_07_gcp_k8s_secrets.sh`
-  and the Terraform example both do.
+  whatever created the Secret supplies them; the Terraform full-install
+  composition does.
 
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
   authenticates with `SESSION_KV_API_KEY`, treats an empty value as fatal, and
@@ -78,6 +78,90 @@ helm install kube-agents ./charts/kube-agents \
   --set platformAgent.deployment.image.tag=latest
 ```
 
+### Installing from a mirrored registry
+
+Clusters that may only pull from an approved registry need every image copied
+there first — `make mirror-images MIRROR_PREFIX=<prefix>` from the repository
+root does that, driven by `images.json`. Then point the chart at the copy:
+
+```bash
+helm install kube-agents ./charts/kube-agents \
+  --namespace kubeagents-system --create-namespace \
+  --set global.imageRegistry=registry.example.com/kube-agents \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set operator.image.tag=latest \
+  --set platformAgent.deployment.image.tag=latest
+```
+
+This example installs from a checkout, so the two tag overrides above still
+apply — and they have to name the tag the mirror was populated with, which is
+whatever `IMAGE_TAG` `make mirror-images` copied (`latest` by default). From a
+published chart, drop them and let `appVersion` pick the release.
+
+`global.imageRegistry` rewrites each image onto the prefix keeping the trailing
+name only, matching the flat layout `mirror-images` writes. Set
+`global.thirdPartyImageRegistry` as well if the mirror keeps LiteLLM and
+fluent-bit under a different path; it defaults to `global.imageRegistry`.
+
+It reaches more than the containers the chart renders. The operator resolves
+two images at reconcile time that appear in no chart template — the agent image
+for a `PlatformAgent` that omits `spec.deployment.image`, and the fluent-bit
+logging sidecar it injects into every agent pod — so the chart passes both to
+the operator as `PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE`. Without that a
+mirrored install reaches `ghcr.io` and Docker Hub minutes after `helm install`
+reported success. `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the
+operator derives that sidecar from the agent image by swapping the trailing
+name, so it follows the mirror on its own.
+
+The prefix is not a per-image default — it replaces every image's registry and
+path, keeping the trailing name, because that is the flat layout
+`make mirror-images` writes. Setting `litellm.image.repository` while
+`global.imageRegistry` is set therefore changes only the name the prefix is
+joined to, not where the image is pulled from. To place images individually —
+most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
+give each `*.image.repository` its full mirrored path instead; the operator's
+`PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE` are rendered from those values
+either way.
+
+Anything in `operator.extraEnv` is appended after the env vars above and
+therefore wins.
+
+`global.imagePullSecrets` is the pull identity for a mirror the nodes' own
+credentials cannot read — Harbor or Artifactory with token auth, rather than an
+in-project Artifact Registry. An entry is either a bare Secret **name**, so a
+single one is reachable with `--set global.imagePullSecrets[0]=regcred`, or the
+`{name: <secret>}` map a `PodSpec` takes; any other shape fails the render. It
+reaches the same two populations `global.imageRegistry` does: every pod the chart renders
+(operator, LiteLLM, the pre-delete cleanup Job) and the agent pods the operator
+renders, via `IMAGE_PULL_SECRETS` on the manager and `spec.deployment.imagePullSecrets`
+on the `PlatformAgent`. A hand-written `PlatformAgent` that sets that field
+replaces the operator's default rather than adding to it.
+
+The Secrets are referenced, never created: keeping registry credentials out of
+Helm release data is the point, and the chart has no way to write one that would
+not end up there. Create them yourself before installing, which for the usual
+case means creating the namespace first, since Helm has not made it yet:
+
+```bash
+kubectl create namespace kubeagents-system
+kubectl create secret docker-registry regcred \
+  --namespace kubeagents-system \
+  --docker-server=harbor.example.com \
+  --docker-username=robot\$kube-agents \
+  --docker-password="$TOKEN"
+```
+
+Both commands are idempotent against what Helm then finds. The cleanup Job is
+the one to get right: it is a `pre-delete` hook, so a pull it cannot
+authenticate fails `helm uninstall` at the one moment the operator is still
+running to clear the CR's finalizer.
+
+It does not reach cert-manager, which this chart never renders and which
+`operator.webhooks.enabled` requires you to have installed already. Pull that
+one from the mirror through its own chart's values.
+
 ### LiteLLM gateway
 
 The agent's baked default model endpoint is
@@ -87,12 +171,35 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
 uses Workload Identity (below); `litellm.modelDefaultName`
-overrides the per-provider default model. `chatgpt` mode is rejected (it needs
-the OAuth-token PVC from the kustomize overlay). Set `litellm.enabled=false`
+overrides the per-provider default model. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
+
+### Hindsight memory store
+
+`hindsight.*` renders the agents' long-term memory store — the Hindsight API
+Deployment, the Postgres/pgvector StatefulSet behind it, an ingress-only
+NetworkPolicy standing in for the database's deliberate lack of a password,
+and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
+follows `platformAgent.harness.memory.provider`, so selecting a
+Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
+with it and everything else renders nothing; `true`/`false` override. The
+image pins mirror `images.json`; `hindsight.postgresql.storage` sizes the
+volumeClaimTemplate (immutable once the StatefulSet exists), and the PVC —
+which **is** the memory — survives uninstall.
+
+### GitHub token minter
+
+`githubMinter.*` renders the minty Deployment, Service, NetworkPolicy,
+Workload Identity KSA, and rule ConfigMap, plus the `github-app-credentials`
+Secret when `githubMinter.appId` is set (leave it empty to manage that Secret
+yourself). `org` and `repo` are required when enabled. This is the Kubernetes
+half only: the minter GSA, its Workload Identity binding, and the import-only
+KMS signing key come from `terraform/modules/github-minter`, and the App
+private key must be imported into that key (see the module README) before the
+Deployment passes its readiness probe.
 
 ### Telemetry
 
@@ -112,7 +219,7 @@ fails the render, so set `telemetry.collectorNamespace` (or
 `gke-managed-otel`, since nothing exports through it. Full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
-#### Vertex AI (`litellm.modelProvider=vertex`)
+#### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
 Vertex AI has no API key. The gateway calls
 `projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
@@ -133,17 +240,38 @@ resolves to that GSA:
 ```
 
 `terraform/examples/full-install` wires all of this up when
-`model_provider = "vertex_ai"`. The provisioning-script path does the same via
-`make gcp-provision-04-iam` (identity and roles) plus
-`make gcp-provision-09-litellm` (the annotated KSA), both run from
-`k8s-operator/`.
+`model_provider = "vertex_ai"` — the second `kube-agents-iam` module
+instantiation creates the identity and roles, and the chart values above carry
+the annotated KSA.
+
+### Turning telemetry off
+
+The operator's endpoint ladder always resolves to something — a collector it
+discovers in the cluster, otherwise the GKE Managed OpenTelemetry collector — so
+`telemetry.otlpEndpoint` can move the exporter but cannot switch it off. On a
+cluster running neither (a plain `gke-cluster` module cluster has no
+`gke-managed-otel` namespace) the exporter then retries a hostname that never
+resolves, for the life of the pod.
+
+`platformAgent.deployment.env` is the off switch. The operator applies it after
+its own container environment, so it wins:
+
+```yaml
+platformAgent:
+  deployment:
+    env:
+      - name: OTEL_SDK_DISABLED
+        value: "true"
+```
+
+Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 
 ### Integrations
 
 - **Google Chat** — `platformAgent.integration.googleChat.enabled=true` plus the
-  topic/subscription names (defaults match the provisioning scripts and the
-  `chat-pubsub` Terraform module). Requires the Chat Pub/Sub backend to exist
-  (`provision_05_gcp_gchat.sh` or `terraform/modules/chat-pubsub`); `projectId`
+  topic/subscription names (defaults match the `chat-pubsub` Terraform
+  module). Requires the Chat Pub/Sub backend to exist
+  (`terraform/modules/chat-pubsub`); `projectId`
   is taken from `platformAgent.harness.projectId`. Restrict access via
   `allowedUsers` (empty = everyone).
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
@@ -155,8 +283,43 @@ resolves to that GSA:
 Chat and Slack each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
 the Pub/Sub topic; Socket Mode + bot scopes in the Slack app console) —
-[INSTALL.md § Enable Google Chat & Slack Integrations](../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps)
+[INSTALL.md § Enable Google Chat & Slack Integrations](../../INSTALL.md#step-4-enable-google-chat--slack-integrations-manual-required-steps)
 is the canonical walkthrough, including the pairing-code approval.
+
+### Agent runtime knobs
+
+`platformAgent.harness.hermes`, `platformAgent.harness.memory`, and
+`platformAgent.deployment.availability` expose the remaining PlatformAgent CR
+fields, so a chart install can reach every field of the CR without editing it
+by hand. Each one defaults
+to `null`/`""`, which **omits** the field and lets the CRD's own default apply
+— setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
+means zero rather than unset.
+
+`platformAgent.deployment.image.pullPolicy` defaults to `Always`. Under
+`IfNotPresent` a node that has already cached the tag never
+picks up a rebuild, which is the normal case for the Terraform composition's
+default `image_tag = "latest"`.
+
+**Consider `IfNotPresent` when you pin the tag.** The chart's own default tag is
+`.Chart.AppVersion`, which the release workflow overwrites with the git tag — an
+immutable tag, where `Always` buys nothing and costs a registry round-trip on
+every pod start. It also removes a fallback: if the agent pod is rescheduled
+while ghcr.io is unreachable or rate-limiting, `Always` fails the pull and the
+pod sits in `ImagePullBackOff` where `IfNotPresent` would have started from the
+node's cache. The chart and the Terraform composition agree on `Always` for the
+mutable-tag case they were both written for; an install at a pinned release
+tag is the case that wants the override.
+
+Two knobs need context beyond the chart:
+
+- `deployment.availability.runtimeClassName: gvisor` needs a GKE Sandbox node
+  pool on a Standard cluster — the `gke-cluster` module's
+  `enable_gvisor_node_pool` creates one; Autopilot ships the RuntimeClass
+  natively.
+- `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
+  out of the CR so the CRD default (`true`) applies. Set it explicitly when an
+  install must pin the dashboard on or off rather than float with the CRD.
 
 ### ServiceAccount ownership
 
@@ -171,9 +334,54 @@ Exactly one owner creates the agent's KSA, depending on
 
 ## Uninstalling
 
+```bash
+helm uninstall kube-agents -n kubeagents-system
+```
+
 The `PlatformAgent` resource carries a finalizer that only the operator can
-clear. Delete the CR and wait for it to disappear **before** uninstalling the
-release (which removes the operator), otherwise the CR strands:
+clear, and Helm deletes the CR and the operator in the same pass — so nothing
+would be left to clear it, the CR would strand, and the namespace would hang in
+`Terminating`. `platformAgent.cleanupHook` (on by default) prevents that with a
+`pre-delete` hook that deletes the CR and waits for the finalizer while the
+operator is still running.
+
+The hook runs `kubectl` from `alpine/k8s`, because the operator image is
+distroless and carries no client — and because the hook needs a shell: it is
+best-effort on purpose, exiting 0 (`|| true`) even when the wait times out,
+since a failed `pre-delete` hook aborts the entire uninstall — worse than the
+stranded CR it prevents. It follows `global.thirdPartyImageRegistry` like the
+other third-party images, so a mirrored install needs nothing extra; set
+`platformAgent.cleanupHook.image.repository` and `.tag` to point somewhere else
+entirely — any image with `kubectl` and `/bin/sh` works.
+
+> **Breaking:** `platformAgent.cleanupHook.image` was a single string
+> (`alpine/k8s:1.34.9`) and is now a `{repository, tag}` map, because the
+> registry rewrite needs the two halves separately. A values file that still
+> sets the string form fails the render rather than installing something wrong:
+>
+> ```
+> coalesce.go:286: warning: cannot overwrite table with non table for
+>   kube-agents.platformAgent.cleanupHook.image
+> Error: template: kube-agents/templates/platform-agent-cr-cleanup.yaml:94:85:
+>   can't evaluate field repository in type interface {}
+> ```
+>
+> Split it:
+>
+> ```yaml
+> platformAgent:
+>   cleanupHook:
+>     image:
+>       repository: docker.io/alpine/k8s # was: image: alpine/k8s:1.34.9
+>       tag: "1.34.9"
+> ```
+>
+> The default reference also gained its registry — `alpine/k8s:1.34.9` is now
+> spelled `docker.io/alpine/k8s:1.34.9`. That resolves to the same image on a
+> default install; it is written out because a prefix cannot be prepended to a
+> reference whose registry is implied.
+
+With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 
 ```bash
 kubectl delete platformagent platform-agent -n kubeagents-system --wait
@@ -182,14 +390,40 @@ helm uninstall kube-agents -n kubeagents-system
 
 ## Notes
 
-- **Admission webhooks are not part of chart installs** (deliberate follow-up
-  scope, not an oversight: they need cert-manager wiring and carry
-  `failurePolicy: Fail` risk, so they warrant their own change). The chart
-  ships no webhook Service, certificate, or `*WebhookConfiguration`, and pins
-  `ENABLE_WEBHOOKS=false` on the manager; the webhooks' validation, defaulting,
-  and delete-protection therefore don't apply (CRD-level CEL validation and
-  OpenAPI defaulting still do). The provisioning-script / kustomize install
-  path provides them.
+- **Admission webhooks are off by default** (`operator.webhooks.enabled=false`)
+  and the chart renders the full wiring when you turn them on: the webhook
+  Service, a self-signed `Issuer` and `Certificate`, both
+  `*WebhookConfiguration`s with cert-manager's `inject-ca-from` annotation, and
+  the manager's cert mount on `:10250`. Left off, the webhooks' validation,
+  defaulting, and delete-protection don't apply (CRD-level CEL validation and
+  OpenAPI defaulting still do).
+
+  They are off by default only because they need **cert-manager** and the chart
+  cannot install it for you — a default-on chart would fail at apply time on
+  every cluster without the CRDs. Install cert-manager, then:
+
+  ```bash
+  helm upgrade kube-agents … --set operator.webhooks.enabled=true
+  ```
+
+  `terraform/examples/full-install` does both in one apply.
+
+  Two behaviours worth knowing before you enable them:
+
+  - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
+    `Fail`.** Helm applies the webhook configurations before both the
+    `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server
+    rejects this chart's own CR on a fresh install and the release never
+    completes. The chart refuses that combination at render time rather than
+    letting you discover it half-applied. `Fail` is available and correct once
+    the operator is serving — set it on a later upgrade, or on a release
+    installed with `platformAgent.enabled=false`.
+  - **The configurations are cluster-scoped and match every namespace**, as
+    they do under kustomize, because the manager reconciles PlatformAgents
+    cluster-wide. Two releases with webhooks on therefore both intercept every
+    PlatformAgent in the cluster; under `Fail` an outage of either one blocks
+    writes for both. Run webhooks from one release.
+
 - **CRDs** live in `crds/` and are installed by Helm on first install but never
   upgraded (a Helm limitation) — apply `k8s-operator/config/crd/bases/`
   manually when upgrading across CRD changes. Automating this (pre-upgrade

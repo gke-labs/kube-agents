@@ -103,7 +103,7 @@ user-permission awareness).
    enforces the target agent's `AllowedUsers` before dispatch. Per-request user-scoped authorization
    (the SAR/IAM check + down-scoping) is deferred (§5).
 10. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
-    co-located multiplexer and no direct agent-to-agent messaging.
+    co-located multiplexer and no synchronous agent-to-agent messaging.
 
 ## 3. Deliberately out of scope (this is where the simplicity comes from)
 
@@ -236,7 +236,7 @@ metadata-server escape must be closed with `NetworkPolicy`. So the sandbox layer
 read-only ceiling, the egress allowlist, and the PR gate — it does not replace them.
 
 **Why deferred.** v1 agents don't execute untrusted code, so there is nothing to sandbox yet. The
-sandbox **node pool already exists** in provisioning today (`make gcp-provision-02-gvisor`, `INSTALL.md`),
+sandbox **node pool already exists** in provisioning today (the `gke-cluster` module's `enable_gvisor_node_pool`, `INSTALL.md`),
 so the deferred piece is the **capability + its wiring** (`RuntimeClass` `gvisor`, the air-gapped
 execution pod, the warm pool), **not** the infrastructure. The capability and its sandbox therefore ship
 **together**, as a unit, post-v1 — never code execution first, sandbox later. Until then the v1 floor is

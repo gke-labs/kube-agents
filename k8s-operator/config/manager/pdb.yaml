@@ -1,0 +1,24 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # maxUnavailable, not minAvailable: the Deployment above runs one replica, so
+  # a minAvailable of 1 would leave zero allowed disruptions and hang every node
+  # drain — the critical `blocking-pdb` finding in the Workload Reliability
+  # Audit this project ships (agents/platform/governance/obtainability_audit_sop.md
+  # §3.4). This says the manager may be evicted, which is true: it is a
+  # controller, not a serving path, and its work resumes on the new node.
+  maxUnavailable: 1
+  # Copied from the Deployment's own spec.selector, which is immutable — keep
+  # the two in step. The audit matches a PDB to its workload by selector
+  # (§3.3), never by name.
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: kube-agents-operator

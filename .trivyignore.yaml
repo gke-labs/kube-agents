@@ -1,0 +1,64 @@
+# .trivyignore.yaml
+# Scoped vulnerability and misconfiguration ignore rules for Trivy scanner.
+misconfigurations:
+  # Ignore sample, testing, plugin scratch bundles, and legacy test-workload misconfigurations in repository manifests
+  - id: DS-0002
+    paths:
+      - "agentplugins/**"
+      - "examples/**"
+      - "k8s-operator/internal/testing/**"
+      - "k8s-operator/testing/**"
+      - "tests/**"
+  - id: KSV-0014
+    paths:
+      - "examples/**"
+      - "k8s-operator/config/integrations/**"
+      - "k8s-operator/internal/testing/**"
+      - "k8s-operator/testing/**"
+      - "tests/**"
+  - id: KSV-0050
+    paths:
+      - "examples/**"
+      - "k8s-operator/config/integrations/**"
+      - "k8s-operator/internal/testing/**"
+      - "k8s-operator/testing/**"
+      - "tests/**"
+  # Ignore GCP-0048 and GCP-0061: quickstart companion module uses public control plane for direct developer kubectl access without bastion
+  - id: GCP-0048
+    paths:
+      - "k8s-operator/internal/testing/**"
+      - "k8s-operator/testing/**"
+      - "terraform/examples/full-install/**"
+      - "terraform/modules/gke-cluster/**"
+      - "tests/**"
+  - id: GCP-0061
+    paths:
+      - "k8s-operator/internal/testing/**"
+      - "k8s-operator/testing/**"
+      - "terraform/examples/full-install/**"
+      - "terraform/modules/gke-cluster/**"
+      - "tests/**"
+
+  # Ignore KSV-0056: manager-role requires networkpolicies access to manage agent sandboxes
+  - id: KSV-0056
+    paths:
+      - "k8s-operator/config/rbac/**"
+
+  # Ignore KSV-0118: sample manifests, testdata, and kustomize overlays do not define full security contexts
+  - id: KSV-0118
+    paths:
+      - "examples/**"
+      - "k8s-operator/config/integrations/**"
+      - "k8s-operator/internal/testing/**"
+      - "k8s-operator/testing/**"
+      - "tests/**"
+
+  # Ignore KSV-0046: read-only explorer ClusterRoles in sample manifests use wildcard resource read
+  - id: KSV-0046
+    paths:
+      - "examples/**"
+
+  # Ignore KSV-0112: read-only explorer Roles in sample manifests use wildcard resource read
+  - id: KSV-0112
+    paths:
+      - "examples/**"

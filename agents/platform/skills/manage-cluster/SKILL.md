@@ -31,11 +31,11 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
 
 4. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent and is delegable (kanban).
 
-> This step gives the cluster an agent **immediately**. Even without it, the `cluster-agent-reconcile` cron automatically gives every cluster in the project (except the management cluster where kube-agents runs) an agent on its next run — this skill just does it now.
+> This step gives the cluster an agent **immediately**. Even without it, the `cluster-agent-reconcile` cron automatically gives every cluster in the project — including the management cluster where kube-agents runs — an agent on its next run; this skill just does it now.
 
 ## Stop managing
 
-Because reconciliation manages **all** project clusters except the management cluster, deleting a still-existing cluster's profile alone won't stick — the next reconcile recreates it. To stop managing a cluster:
+Because reconciliation manages **all** project clusters, deleting a still-existing cluster's profile alone won't stick — the next reconcile recreates it. To stop managing a cluster:
 
 - **Tear down the cluster** (see `gke-cluster-creation`); reconcile prunes its profile automatically.
 - Or **exclude it**: add its name to the `cluster-agent-reconcile` cron's `RECONCILE_EXCLUDE`, then delete the profile with `cluster_agent_profile.py delete --project … --cluster … --location …`.

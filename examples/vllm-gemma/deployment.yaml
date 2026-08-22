@@ -57,6 +57,27 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: vllm-gemma
 
+          # /health is vLLM's own endpoint and answers only once the model is
+          # resident on the GPU. That is the whole point here: pulling and
+          # loading Gemma takes minutes, and without a readinessProbe the
+          # Service publishes this pod immediately and every request in the
+          # meantime fails. The startupProbe carries that load — 60 failures at
+          # 10s is a 10-minute budget — so readiness can stay tight afterwards.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - mountPath: /dev/shm
               name: dshm
@@ -67,3 +88,21 @@ spec:
       nodeSelector:
         cloud.google.com/gke-accelerator: nvidia-rtx-pro-6000
         cloud.google.com/gke-gpu-driver-version: latest
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-gemma
+  namespace: kubeagents-system
+spec:
+  # One replica pinned to a single GPU node, so there is no second pod to keep
+  # up. maxUnavailable: 1 states the intent — this workload may be evicted —
+  # while a minAvailable here would allow zero disruptions and hang every node
+  # drain, which is `blocking-pdb` in
+  # agents/platform/governance/obtainability_audit_sop.md §3.4.
+  maxUnavailable: 1
+  # Copied from the Deployment's own spec.selector: a PDB is matched to its
+  # workload by selector, never by name.
+  selector:
+    matchLabels:
+      app: gemma-server

@@ -21,6 +21,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 
+# Coverage measurement (`make coverage`)
+.coverage-data/
+coverage.xml
+coverage-go.xml
+
 # Terraform working directories. Lock files are ignored because this repo
 # ships modules and a copy-paste example, not a deployed root configuration —
 # consumers should commit their own multi-platform lock in their own repo.
@@ -35,13 +40,25 @@ __pycache__/
 !*.tfvars.example
 terraform.tfvars.json
 
+# Terraform override files are environment-local by convention: lifecycle.sh
+# writes (and normally removes) providers_lifecycle_override.tf mid-import,
+# and a user's backend override belongs to their environment, not the example.
+*_override.tf
+
 # Local helm package output
 *.tgz
 
 # Per-developer Claude Code state (session settings, local skills). The shared
 # slash commands in .claude/commands/ and the review skills in .agents/skills/
-# are committed. `.claude/*` rather than `.claude/` so git descends into the
-# directory: a rule that excludes the directory itself can never be undone by a
-# nested .gitignore or a negation, because git does not look inside it.
+# are committed; .claude/settings.json and .claude/settings.local.json stay
+# personal. settings.json is deliberately *not* committed even though the
+# live-test lease hooks want to live there -- a settings.json on a branch runs
+# without being asked, and .claude/commands/pr-review-batch.md checks out fork
+# branches. .claude/settings.json.example is the copy you opt into; see
+# docs/designs/live-test-lease.md. `.claude/*` rather than `.claude/` so git
+# descends into the directory: a rule that excludes the directory itself can
+# never be undone by a nested .gitignore or a negation, because git does not
+# look inside it.
 .claude/*
 !.claude/commands/
+!.claude/settings.json.example

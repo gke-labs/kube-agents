@@ -124,10 +124,11 @@ func TestInjectorInject(t *testing.T) {
 	}
 }
 
-// TestInjectorInjectReportsSuppressedStatus covers the case the HTTP status
-// code cannot express: the daemon accepted the inject, then dropped the alert
-// against its daily ceiling. Inject must surface that so the caller can roll
-// back its dedup entry rather than record a delivery that never happened.
+// TestInjectorInjectReportsSuppressedStatus covers the two cases the HTTP
+// status code cannot express: the daemon accepted the inject and then dropped
+// the alert against its daily ceiling, or held it back as informational.
+// Inject must surface the body's word for which, because the caller rolls back
+// its dedup entry for one of them and keeps it for the other.
 func TestInjectorInjectReportsSuppressedStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -135,6 +136,7 @@ func TestInjectorInjectReportsSuppressedStatus(t *testing.T) {
 		want string
 	}{
 		{name: "suppressed", body: `{"status":"suppressed","severity":"Warning","suppressed_today":"3"}`, want: injectStatusSuppressed},
+		{name: "filtered", body: `{"status":"filtered"}`, want: injectStatusFiltered},
 		{name: "injected", body: `{"status":"injected"}`, want: "injected"},
 		{name: "empty body", body: "", want: ""},
 		{name: "unparseable body", body: "not json", want: ""},

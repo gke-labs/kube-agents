@@ -12,9 +12,34 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+# Stub the hermes runtime deps only when mcp is not installed at all, so this
+# module still imports in a bare checkout. ABSENT is not BROKEN, and only the
+# first earns a stub -- see test_mcp_package_contract.py.
 try:
     import mcp.server.fastmcp
 except Exception:
+    import importlib
+    import importlib.metadata
+
+    # importlib.metadata, not find_spec -- see test_mcp_package_contract.py.
+    try:
+        importlib.metadata.distribution("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        pass  # absent: a bare checkout, which is what the stubs are for
+    else:
+        raise  # installed and incompatible: the ImportError is the finding
+
+    def _stub_if_missing(name, module):
+        # Stub only a module that really cannot be imported. These entries
+        # outlive this file: unittest discovery imports every test module into
+        # one process, and a fake pydantic left here (a ModuleType bearing
+        # nothing but Field) is what fastapi finds when test_session_kv_server
+        # imports it later in the same run.
+        try:
+            importlib.import_module(name)
+        except Exception:
+            sys.modules[name] = module
+
     mcp_module = types.ModuleType("mcp")
     mcp_module.__path__ = []
     mcp_server = types.ModuleType("mcp.server")
@@ -25,18 +50,16 @@ except Exception:
     )
     pydantic = types.ModuleType("pydantic")
     pydantic.Field = lambda *a, **k: None
-    sys.modules.update({
-        "mcp": mcp_module,
-        "mcp.server": mcp_server,
-        "mcp.server.fastmcp": fastmcp,
-        "pydantic": pydantic,
-    })
+    _stub_if_missing("mcp", mcp_module)
+    _stub_if_missing("mcp.server", mcp_server)
+    _stub_if_missing("mcp.server.fastmcp", fastmcp)
+    _stub_if_missing("pydantic", pydantic)
 
 import platform_mcp_server
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
 platform_mcp_server._run_env = lambda extra=None: {"HOME": "/tmp", "SLACK_BOT_TOKEN": "dummy-token", **(extra or {})}
 
-from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
+from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, report_to_chat, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
 
 class TestVerifyGkeCluster(unittest.TestCase):
 
@@ -317,6 +340,16 @@ class TestSwitchKubeContext(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.home = home
 
+        # gke_endpoint calls gcloud through its own subprocess.run, which the
+        # per-test patch of platform_mcp_server.subprocess.run does not cover.
+        # Left alone these tests shell out to a real gcloud and describe a
+        # cluster that does not exist. Default to "no flag"; the test that cares
+        # overrides it. gke_endpoint's own predicate is covered in
+        # test_gke_endpoint.py.
+        dns = patch('platform_mcp_server.dns_endpoint_args', return_value=[])
+        self.mock_dns = dns.start()
+        self.addCleanup(dns.stop)
+
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_all_empty_noop(self, mock_run):
         err, env = switch_kube_context("", "", "")
@@ -366,6 +399,29 @@ class TestSwitchKubeContext(unittest.TestCase):
                 "--project=my-project"
             ],
             capture_output=True, text=True, check=True, timeout=30, env=env
+        )
+        # The cluster is asked about by the same triple that is being switched to.
+        self.mock_dns.assert_called_once_with(
+            "my-project", "my-cluster", "us-central1", env=env
+        )
+
+    @patch('platform_mcp_server.subprocess.run')
+    def test_switch_kube_context_appends_dns_endpoint_when_detected(self, mock_run):
+        # A cluster reachable only over its DNS endpoint: the flag has to reach
+        # gcloud, or the kubeconfig names an IP endpoint nothing can route to.
+        self.mock_dns.return_value = ["--dns-endpoint"]
+
+        err, env = switch_kube_context("my-project", "my-cluster", "us-central1")
+
+        self.assertEqual(err, "")
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            [
+                "gcloud", "container", "clusters", "get-credentials", "my-cluster",
+                "--location=us-central1",
+                "--project=my-project",
+                "--dns-endpoint",
+            ],
         )
 
     @patch('platform_mcp_server.subprocess.run')
@@ -685,6 +741,111 @@ class TestSessionKvHeaders(unittest.TestCase):
         config = yaml.safe_load(config_path.read_text())
         env = config["mcp_servers"]["platform_control"]["env"]
         self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
+
+
+class TestReportToChat(unittest.TestCase):
+    """The specialist's hand-off to the Chat Agent relay."""
+
+    def _urlopen(self, payload=b'{"status": "accepted", "session_id": "cron-platform-j1-20260813"}'):
+        resp = MagicMock()
+        resp.read.return_value = payload
+        ctx = MagicMock()
+        ctx.__enter__.return_value = resp
+        return ctx
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_posts_the_report_to_the_relay_route(self, mock_urlopen):
+        mock_urlopen.return_value = self._urlopen()
+
+        result = report_to_chat("the finding", job_id="compliance-audit", title="Audit")
+
+        self.assertIn("SUCCESS", result)
+        request = mock_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/cron-reports")
+        body = json.loads(request.data.decode())
+        self.assertEqual(body["report"], "the finding")
+        self.assertEqual(body["job_id"], "compliance-audit")
+        # Authenticated: an unauthenticated POST is a 401 this tool would only print.
+        self.assertEqual(request.get_header("Authorization"), "Bearer k")
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/cluster-prod-a", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_profile_comes_from_hermes_home_not_the_prompt(self, mock_urlopen):
+        """A scaffolded cluster profile reports under its own name."""
+        mock_urlopen.return_value = self._urlopen()
+        report_to_chat("finding", job_id="j1")
+        body = json.loads(mock_urlopen.call_args.args[0].data.decode())
+        self.assertEqual(body["profile"], "cluster-prod-a")
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_unprofiled_home_does_not_report_as_data(self, mock_urlopen):
+        mock_urlopen.return_value = self._urlopen()
+        report_to_chat("finding", job_id="j1")
+        body = json.loads(mock_urlopen.call_args.args[0].data.decode())
+        self.assertEqual(body["profile"], "platform")
+
+    def test_empty_report_and_missing_job_id_are_refused_locally(self):
+        """Refused before the HTTP call, so the agent gets a usable error."""
+        self.assertIn("ERROR", report_to_chat("   ", job_id="j1"))
+        self.assertIn("ERROR", report_to_chat("finding", job_id=" "))
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"})
+    @patch("urllib.request.urlopen", side_effect=OSError("connection refused"))
+    def test_a_dead_relay_returns_an_error_the_agent_can_act_on(self, _mock_urlopen):
+        # The job prompt tells the agent to fall back to returning the report as
+        # its final response on ERROR, so this string is load-bearing.
+        self.assertIn("ERROR", report_to_chat("finding", job_id="j1"))
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_the_wait_outlasts_the_relay_it_is_waiting_on(self, mock_urlopen):
+        """The route relays synchronously — it runs a whole Chat Agent turn, with
+        its own 300s ceiling, before it answers.
+
+        Timing out first is not a harmless retry: nothing cancels the server, so
+        the report is posted anyway while this tool returns an ERROR the job
+        prompt tells the agent to recover from by returning the report as its
+        final response — which on a `deliver: "chat"` job relays it a second
+        time. The bound must therefore sit above the work, not above a connect
+        stall.
+        """
+        mock_urlopen.return_value = self._urlopen()
+        report_to_chat("finding", job_id="j1")
+        self.assertGreater(platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS, 300.0)
+        self.assertEqual(
+            mock_urlopen.call_args.kwargs.get("timeout"),
+            platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS,
+        )
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_a_degraded_relay_is_not_reported_as_a_clean_success(self, mock_urlopen):
+        """The route answers 200 for a composed delivery and for a degraded one,
+        and says which in `relay`. Reading it is the difference between the agent
+        knowing its raw text went out and it believing the Chat Agent framed it.
+        """
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "degraded", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("degraded", result)
+        # Delivered, so the recovery path the job prompt describes must not fire:
+        # returning the report as the final response would post it twice.
+        self.assertNotIn("ERROR", result)
+        self.assertIn("do not send it again", result.lower())
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_a_composed_relay_is_a_plain_success(self, mock_urlopen):
+        """`ok` is what the route sends when the Chat Agent framed the report."""
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "ok", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("SUCCESS", result)
+        self.assertNotIn("degraded", result)
 
 
 class TestSanitizationAndMutationRemoval(unittest.TestCase):

@@ -1,0 +1,19 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: github-token-minter
+  labels:
+    app: github-token-minter
+spec:
+  # maxUnavailable, never minAvailable, at any replica count: §3.3 of
+  # agents/platform/governance/obtainability_audit_sop.md requires this shape
+  # because minAvailable is the one that deadlocks drains. Here the replica
+  # count is static in the Deployment beside it, so a minAvailable: 1 would be
+  # safe as written and become `blocking-pdb` (§3.4) the first time someone
+  # scaled to one replica — the budget is not reconciled when they do.
+  maxUnavailable: 1
+  # Copied from the Deployment's own immutable spec.selector; §3.3 of that
+  # audit matches a PDB to its workload by selector, never by name.
+  selector:
+    matchLabels:
+      app: github-token-minter

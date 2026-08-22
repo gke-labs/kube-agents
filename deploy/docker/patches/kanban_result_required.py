@@ -314,10 +314,13 @@ NEW_RESULT_DESCRIPTION = (
     "whole answer goes here. Do not summarise it away, and "
     "do not leave it only in your transcript, in a file, or "
     "in a comment — none of those reach the user. Write it "
-    "as standard Markdown: `##`/`###` for sections and never "
-    "`#` (the chat message already shows the card title), a "
-    "pipe table for tabular data, and backticks around raw "
-    "values like ids, paths and timestamps."
+    "as standard Markdown: `##` for sections and never `#` "
+    "(the chat message already shows the card title), "
+    "`[text](url)` for every artifact you name, backticks "
+    "around raw values like ids, paths and timestamps, and a "
+    "pipe table for tabular data — but keep the table to a few "
+    "short columns and never let it be the only place a fact "
+    "lives, because Google Chat drops tables."
 )
 
 OLD_GATE = (

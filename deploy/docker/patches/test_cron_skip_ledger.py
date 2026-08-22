@@ -469,6 +469,9 @@ from apply_cron_skip_ledger import (  # noqa: E402
     SCHED_JOB_LOCK_GUARD,
     SCHED_RUNNING_GUARD,
     SCHED_SHUTDOWN_GUARD,
+    TOOLS_IMPORT,
+    TOOLS_LOCK_GUARD,
+    TOOLS_REGISTER_GUARD,
     apply,
 )
 
@@ -517,11 +520,47 @@ FAKE_HEALTH = (
     + HEALTH_FLUSH
 )
 
+# _run_claimed_job as it stands *after* apply_cron_tick_lock_scope.py has run:
+# the flock guard is that patch's insertion, and this applier anchors on it. A
+# fixture written against pristine upstream would test an ordering the image
+# never has.
+FAKE_CRONJOB_TOOLS = (
+    "from cron.jobs import (\n"
+    + TOOLS_IMPORT
+    + "\n\ndef _run_claimed_job(job):\n"
+    '    job_id = job["id"]\n'
+    "    _registered = False\n"
+    "    _run_lock = None\n"
+    "    try:\n"
+    "        from cron.scheduler import (\n"
+    "            _job_locks,\n"
+    "            release_running_job,\n"
+    "            run_one_job,\n"
+    "            try_register_running_job,\n"
+    "        )\n\n"
+    + TOOLS_REGISTER_GUARD
+    + '                "claimed": True,\n'
+    '                "success": False,\n'
+    '                "error": "already running",\n'
+    "            }\n"
+    "        _registered = True\n"
+    + TOOLS_LOCK_GUARD
+    + '                "claimed": True,\n'
+    '                "success": False,\n'
+    '                "error": "already running in another process",\n'
+    "            }\n"
+    "        return run_one_job(job)\n"
+    "    finally:\n"
+    "        if _run_lock is not None:\n"
+    "            _run_lock.release()\n"
+)
+
 FAKE_TREE = {
     "cron/executions.py": FAKE_EXECUTIONS,
     "cron/scheduler.py": FAKE_SCHEDULER,
     "cron/jobs.py": FAKE_JOBS,
     "agent/monitoring/cron_health.py": FAKE_HEALTH,
+    "tools/cronjob_tools.py": FAKE_CRONJOB_TOOLS,
 }
 
 
@@ -584,21 +623,76 @@ class ApplierTest(unittest.TestCase):
         self.assertIn('"unknown", "skipped"}', health)
         self.assertIn("_normalize_skip_reason(record.get(\"skip_reason\"))", health)
 
-    def test_the_ledger_write_moves_out_of_the_running_lock(self):
-        """A SQLite write inside _running_lock would serialise the dispatch pass."""
+        tools = self.read("tools/cronjob_tools.py")
+        self.assertIn("from tools.cron_skip_ledger import (", tools)
+        for reason in ("SKIP_ALREADY_RUNNING,", "SKIP_ALREADY_RUNNING_ELSEWHERE,"):
+            self.assertIn("reason=%s" % reason.rstrip(","), tools)
+
+    def test_both_dispatch_refusals_record_a_skip(self):
+        """Each guard in _run_claimed_job drops an occurrence, so each writes.
+
+        The pair mirrors tick's: an in-process register refusal and a
+        cross-process flock refusal, taking the same two reasons. What makes
+        them recordable at all is that both sit after ``claim_job_for_fire`` has
+        advanced ``next_run_at`` — before v2026.8.13 the flock was taken ahead
+        of the claim and a refusal cost nothing, so recording one would have
+        manufactured a false skip.
+        """
+        apply_quietly(self.root)
+        tools = self.read("tools/cronjob_tools.py")
+        register = tools.split("if not try_register_running_job(job_id):", 1)
+        self.assertEqual(len(register), 2, "the in-flight guard is not where it was")
+        self.assertLess(
+            register[1].index("reason=SKIP_ALREADY_RUNNING,"),
+            register[1].index("return {"),
+            "the skip is recorded after the guard has already returned",
+        )
+        flock = tools.split("if _run_lock is None:", 1)
+        self.assertEqual(len(flock), 2, "the flock guard is not where it was")
+        self.assertLess(
+            flock[1].index("reason=SKIP_ALREADY_RUNNING_ELSEWHERE,"),
+            flock[1].index("return {"),
+            "the skip is recorded after the guard has already returned",
+        )
+
+    def test_the_dispatched_job_is_released_before_its_skip_is_recorded(self):
+        """Same constraint as the scheduler's flock guard, one file over.
+
+        ``record_skip`` is a SQLite write on a PVC; holding the job in the
+        scheduler's running set across it would wedge the job for as long as
+        the write takes, on the path where nothing is waiting to notice.
+        """
+        apply_quietly(self.root)
+        guard = self.read("tools/cronjob_tools.py").split("if _run_lock is None:", 1)[1]
+        self.assertLess(
+            guard.index("release_running_job(job_id)"),
+            guard.index("SKIP_ALREADY_RUNNING_ELSEWHERE"),
+        )
+
+    def test_the_ledger_write_stays_out_of_the_running_lock(self):
+        """A SQLite write inside _running_lock would serialise the dispatch pass.
+
+        v2026.8.13 moved the lock inside ``try_register_running_job``, so this
+        patch no longer has to restructure the guard to get the write out of the
+        critical section — but the constraint is the same and the day upstream
+        inlines the guard again this has to fail rather than pass silently. So
+        it asserts the property — the lock is still encapsulated, and the write
+        happens after the call that holds it has returned — rather than the
+        restructuring it used to have to perform.
+        """
         apply_quietly(self.root)
         scheduler = self.read("cron/scheduler.py")
-        body = scheduler.split("with _running_lock:", 1)[1].split("if _already_running:", 1)
-        self.assertEqual(len(body), 2, "the guard was not restructured")
-        self.assertNotIn("record_skip", body[0])
-        self.assertIn("record_skip", body[1])
+        self.assertNotIn("with _running_lock:", scheduler)
+        guard = scheduler.split("if not try_register_running_job(job_id):", 1)
+        self.assertEqual(len(guard), 2, "the in-flight guard is not where it was")
+        self.assertIn("SKIP_ALREADY_RUNNING,", guard[1])
 
     def test_the_job_is_released_before_the_cross_process_skip_is_recorded(self):
         """Otherwise a slow ledger write leaves the job wedged in the running set."""
         apply_quietly(self.root)
         guard = self.read("cron/scheduler.py").split("_job_lock is None:", 1)[1]
         self.assertLess(
-            guard.index("_running_job_ids.discard(job_id)"),
+            guard.index("release_running_job(job_id)"),
             guard.index("SKIP_ALREADY_RUNNING_ELSEWHERE"),
         )
 

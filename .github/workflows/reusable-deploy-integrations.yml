@@ -17,6 +17,9 @@ on:
         type: string
         description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
+permissions:
+  contents: read
+
 jobs:
   detect-changes:
     runs-on: ubuntu-latest
@@ -38,13 +41,23 @@ jobs:
         with:
           filters: |
             litellm:
+              # The chart is what the deploy jobs below apply; the kustomize
+              # base is kept in step with it, so a change there is a chart
+              # change waiting to be mirrored — redeploying on either keeps
+              # the environment on whichever landed.
+              - 'charts/kube-agents/templates/litellm.yaml'
+              - 'charts/kube-agents/templates/_helpers.tpl'
+              - 'charts/kube-agents/values.yaml'
               - 'k8s-operator/config/integrations/litellm/**'
-              - 'k8s-operator/scripts/provision_09_deploy_litellm.sh'
-              - 'k8s-operator/Makefile'
+              # The pin lives in the inventory, so a LiteLLM bump changes this
+              # file and nothing else above.
+              - 'images.json'
             github:
+              - 'charts/kube-agents/templates/github-minter.yaml'
+              - 'charts/kube-agents/values.yaml'
               - 'k8s-operator/config/integrations/github/**'
-              - 'k8s-operator/scripts/provision_10_deploy_github_minter.sh'
-              - 'k8s-operator/Makefile'
+              # Same for the token-minter pin.
+              - 'images.json'
 
       - name: Determine target deployments
         id: set-targets
@@ -53,12 +66,12 @@ jobs:
           FILTER_LITELLM: ${{ steps.filter.outputs.litellm }}
           FILTER_GITHUB: ${{ steps.filter.outputs.github }}
         run: |
-          if [ "$FORCE_DEPLOY" = "true" ]; then
+          if [ "${FORCE_DEPLOY}" = "true" ]; then
             echo "litellm=true" >> "$GITHUB_OUTPUT"
             echo "github=true" >> "$GITHUB_OUTPUT"
           else
-            echo "litellm=$FILTER_LITELLM" >> "$GITHUB_OUTPUT"
-            echo "github=$FILTER_GITHUB" >> "$GITHUB_OUTPUT"
+            echo "litellm=${FILTER_LITELLM}" >> "$GITHUB_OUTPUT"
+            echo "github=${FILTER_GITHUB}" >> "$GITHUB_OUTPUT"
           fi
 
   provision-secrets:
@@ -66,10 +79,14 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.litellm == 'true' || needs.detect-changes.outputs.github == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-secrets
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       NAMESPACE: "kubeagents-system"
     steps:
@@ -120,19 +137,46 @@ jobs:
           SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
-          echo "Provisioning secrets via provision_07"
-          cd k8s-operator
-          make gcp-provision-07-secrets ARGS="--no-confirm"
+          # The credentials Secret is chart-managed now: re-render it with the
+          # current workflow secrets, leaving every other value as it is. Only
+          # non-empty secrets are set, so an unset workflow secret cannot blank
+          # a key the environment already has; SESSION_KV_* are carried forward
+          # by the chart's lookup and never touched here.
+          if ! helm status kube-agents -n kubeagents-system >/dev/null 2>&1; then
+            echo "::error::No Helm release 'kube-agents' in kubeagents-system — this environment predates the Terraform + Helm engine and must be re-installed from terraform/examples/full-install before redeploys can run."
+            exit 1
+          fi
+          echo "Reconciling the credentials Secret via helm upgrade"
+          args=()
+          [ -n "$API_SERVER_KEY" ] && args+=(--set-string "platformAgent.credentials.data.API_SERVER_KEY=$API_SERVER_KEY")
+          [ -n "$GEMINI_API_KEY" ] && args+=(--set-string "platformAgent.credentials.data.GEMINI_API_KEY=$GEMINI_API_KEY")
+          [ -n "$OPENAI_API_KEY" ] && args+=(--set-string "platformAgent.credentials.data.OPENAI_API_KEY=$OPENAI_API_KEY")
+          [ -n "$ANTHROPIC_API_KEY" ] && args+=(--set-string "platformAgent.credentials.data.ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+          [ -n "$SLACK_BOT_TOKEN" ] && args+=(--set-string "platformAgent.credentials.data.SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN")
+          [ -n "$SLACK_APP_TOKEN" ] && args+=(--set-string "platformAgent.credentials.data.SLACK_APP_TOKEN=$SLACK_APP_TOKEN")
+          [ -n "$GITHUB_APP_ID" ] && args+=(--set-string "githubMinter.appId=$GITHUB_APP_ID")
+          # --reset-then-reuse-values, not --reuse-values: reuse snapshots the
+          # previous release's chart defaults into its config, so a default
+          # bumped in the checkout's chart (the image pins this workflow
+          # triggers on) would never reach the cluster again. Reset-then-reuse
+          # keeps the release's own values and lets chart defaults refresh.
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
+            --reset-then-reuse-values --set "platformAgent.credentials.create=true" \
+            "${args[@]}" --wait --timeout 10m
 
   deploy-litellm:
     name: Redeploy LiteLLM Gateway Integration
     needs: [detect-changes, provision-secrets]
     if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-litellm
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       NAMESPACE: "kubeagents-system"
     steps:
@@ -167,20 +211,36 @@ jobs:
 
       - name: Perform LiteLLM Redeployment
         env:
-          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          REGION: ${{ vars.GCP_REGION }}
-          CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
         run: |
-          echo "Redeploying LiteLLM gateway via provision_09"
-          cd k8s-operator
-          make gcp-provision-09-litellm ARGS="--no-confirm"
+          if ! helm status kube-agents -n kubeagents-system >/dev/null 2>&1; then
+            echo "::error::No Helm release 'kube-agents' in kubeagents-system — this environment predates the Terraform + Helm engine and must be re-installed from terraform/examples/full-install before redeploys can run."
+            exit 1
+          fi
+          echo "Redeploying LiteLLM gateway via helm upgrade"
+          args=()
+          [ -n "$MODEL_PROVIDER" ] && args+=(--set-string "litellm.modelProvider=$MODEL_PROVIDER")
+          [ -n "$MODEL_DEFAULT_NAME" ] && args+=(--set-string "litellm.modelDefaultName=$MODEL_DEFAULT_NAME")
+          # --reset-then-reuse-values so the checkout's chart defaults refresh:
+          # this job's main trigger is a litellm.image.tag bump in values.yaml
+          # / images.json, which --reuse-values would shadow forever behind
+          # the previous release's snapshot of the old default.
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
+            --reset-then-reuse-values "${args[@]}" --wait --timeout 10m
 
       - name: Verify LiteLLM Deployment Rollout
         run: |
+          # 420s, not 180s: on Autopilot a rollout onto a scaled-down node pays
+          # node scale-up plus an image pull before the container starts, which
+          # measured over 180s on both installs. See the comment on the agent
+          # rollout in reusable-deploy-agent.yml for the numbers and the
+          # ordering this has to keep. litellm's startupProbe budget is 180s
+          # plus the repo's 240s pull allowance; 420s stays under this
+          # Deployment's 600s default progressDeadlineSeconds, which is the
+          # ceiling any wait here returns at.
           echo "Waiting for rollout of LiteLLM deployment..."
-          if ! kubectl rollout status deployment/litellm -n "$NAMESPACE" --timeout=180s; then
+          if ! kubectl rollout status deployment/litellm -n "$NAMESPACE" --timeout=420s; then
             echo "::error::Rollout failed! Printing debug logs..."
             kubectl describe deployment/litellm -n "$NAMESPACE" || true
             kubectl get pods -n "$NAMESPACE" -l app=litellm || true
@@ -230,13 +290,26 @@ jobs:
 
   deploy-github:
     name: Redeploy GitHub Token Minter Integration
-    needs: [detect-changes, provision-secrets, check-github-config]
-    if: ${{ needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
+    # deploy-litellm is a serializer, not a dependency: both jobs run
+    # `helm upgrade` on the same release, and concurrent
+    # upgrades either collide on the release lock or silently drop whichever
+    # --set committed first. The filters overlap (values.yaml, images.json),
+    # so an ordinary chart bump would start both at once without this edge.
+    # !cancelled() + explicit result checks keep this job running when
+    # deploy-litellm is skipped by its filter, or failed — a finished failed
+    # upgrade is sequential, which is all this ordering exists to guarantee.
+    needs:
+      [detect-changes, provision-secrets, check-github-config, deploy-litellm]
+    if: ${{ !cancelled() && needs.provision-secrets.result == 'success' && needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-github
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       GITHUB_PEM_PATH: "/tmp/github_app_pem_path"
       NAMESPACE: "kubeagents-system"
@@ -285,19 +358,52 @@ jobs:
         env:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_REGION }}
-          CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           GITHUB_ORG: ${{ vars.GH_ORG }}
           GITHUB_REPO: ${{ vars.GH_REPO }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
-          echo "Redeploying GitHub Token Minter via provision_10"
-          cd k8s-operator
-          make gcp-provision-10-github ARGS="--no-confirm"
+          if ! helm status kube-agents -n kubeagents-system >/dev/null 2>&1; then
+            echo "::error::No Helm release 'kube-agents' in kubeagents-system — this environment predates the Terraform + Helm engine and must be re-installed from terraform/examples/full-install before redeploys can run."
+            exit 1
+          fi
+          # The App private key import stays outside Helm and Terraform (the
+          # PEM must not enter state or values). One-shot: skipped whenever an
+          # ENABLED key version already exists.
+          KMS_LOCATION=$(echo "$REGION" | sed -E 's/-[a-z]$//')
+          enabled=$(gcloud kms keys versions list --key github-token-minter-key \
+            --keyring github-token-minter-keyring --location "$KMS_LOCATION" \
+            --project "$PROJECT_ID" --filter='state=ENABLED' --format='value(name)' 2>/dev/null | head -1 || true)
+          if [ -z "$enabled" ] && [ -s "$GITHUB_PEM_PATH" ]; then
+            echo "Importing the GitHub App private key into KMS via the Minty CLI..."
+            # Clone-and-run, not `go run <module>@v2.7.1`: upstream's go.mod
+            # lacks the /v2 suffix its v2 tags require, so Go rejects the
+            # module form outright.
+            git clone --quiet --depth 1 --branch v2.7.1 \
+              https://github.com/abcxyz/github-token-minter.git "$RUNNER_TEMP/minty"
+            (cd "$RUNNER_TEMP/minty" && go run ./cmd/minty tools import-pk \
+              -project-id="$PROJECT_ID" -location="$KMS_LOCATION" \
+              -key-ring=github-token-minter-keyring -key=github-token-minter-key \
+              -private-key=@"$GITHUB_PEM_PATH")
+          fi
+          echo "Redeploying GitHub Token Minter via helm upgrade"
+          # --reset-then-reuse-values for the same reason as deploy-litellm:
+          # a githubMinter.image.tag bump is this job's trigger, and only a
+          # refreshed chart default can deliver it.
+          ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
+            --reset-then-reuse-values --set "githubMinter.enabled=true" \
+            --set-string "githubMinter.org=$GITHUB_ORG" \
+            --set-string "githubMinter.repo=$GITHUB_REPO" \
+            --set-string "githubMinter.appId=$GITHUB_APP_ID" \
+            --wait --timeout 10m
 
       - name: Verify GitHub Token Minter Deployment Rollout
         run: |
+          # 420s for the same reason as the LiteLLM rollout above. The minter
+          # has no startupProbe and a small image, so this is pull allowance
+          # and headroom rather than a derived budget; it stays under the 600s
+          # default progressDeadlineSeconds either way.
           echo "Waiting for rollout of github-token-minter deployment..."
-          if ! kubectl rollout status deployment/github-token-minter -n "$NAMESPACE" --timeout=180s; then
+          if ! kubectl rollout status deployment/github-token-minter -n "$NAMESPACE" --timeout=420s; then
             echo "::error::Rollout failed! Printing debug logs..."
             kubectl describe deployment/github-token-minter -n "$NAMESPACE" || true
             kubectl get pods -n "$NAMESPACE" -l app=github-token-minter || true

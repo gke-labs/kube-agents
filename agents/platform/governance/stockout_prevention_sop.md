@@ -194,7 +194,10 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 - **Do NOT flag:** Clusters with clean autoscaler visibility logs over 24h.
 - **Severity:** `critical`.
 - **Impact:** "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion."
-- **Remediation:** `kind: manifest`. Add secondary fallback families/zones to affected ComputeClasses, expand pod subnet CIDR if IP-exhausted, or request regional quota increase.
+- **Remediation:**
+  - `scale.up.error.out.of.resources`: If a `ComputeClass` manifest exists in the GitOps repo for the affected workload, `kind: manifest` (add secondary fallback machine families and multi-zone support). If no `ComputeClass` manifest exists in the GitOps clone (such as default Autopilot workloads), `kind: manual` (adopting a custom ComputeClass requires a workload-owner decision on which workloads adopt it and which families are acceptable; provide the recommended ComputeClass YAML definition with fallback priorities in `recommendation.action` verified against the §4 feasibility gate).
+  - `scale.up.error.quota.exceeded`: `kind: manual` (request a regional/family GCP compute quota increase via Google Cloud Console or `gcloud compute project-info describe`).
+  - `scale.up.error.ip.space.exhausted`: `kind: manual` (expand the VPC pod subnet secondary CIDR range).
 
 #### 3.12 Dangling, unlabelled, or invalid ComputeClass configurations (`dangling-compute-class`)
 
@@ -209,9 +212,14 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 ### 4. Generate remediation artifacts
 
 - Locate the existing declaration in the GitOps clone (`grep -rl "name: <object>" --include='*.yaml' <workspace>`).
+- **The Declaration Rule**:
+  - A remediation that changes an object that already exists must go to that object's **existing declaration in the GitOps repo**: locate it (`grep -rl "name: <object>" --include='*.yaml' .`), give that file's repo-relative path as `remediation.path`, and rewrite it as the object's complete desired manifest.
+  - If the workload or ComputeClass has no declaration in the clone, the finding is `kind: manual`. Put the manifest you would have written in `recommendation.action`.
+  - Never invent a new path for an object that is not declared in the repository.
 - **Remediation Feasibility Gate**: Before proposing a new machine family or Spot tier, verify that:
   1. The target GCP zone actually offers the machine type (`gcloud compute machine-types list --zones=<zone>`).
-  2. The project quota for that family (`N4_CPUS`, `C4_CPUS`, `PREEMPTIBLE_CPUS`, GPU types) is greater than 0.
+  2. For On-Demand proposals, the project quota for that family (`N4_CPUS`, `C4_CPUS`, GPU types) is greater than 0 (`gcloud compute regions describe <region> --project=<project>`).
+  3. For Spot proposals, the project's preemptible CPU quota (`PREEMPTIBLE_CPUS`) is greater than 0 (and `PREEMPTIBLE_LOCAL_SSD_GB` is greater than 0 if requesting local SSDs).
 - Edit the manifest directly in `<workspace>`, adding the necessary fallback machine families, zones, or quota adjustments.
 - **Mandatory Remediation Comments**: For every modified line in YAML, append an inline `# Remediation: <reason>` comment.
 - Set `remediation.path` to the repo-relative file path, with `kind: manifest`.

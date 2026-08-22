@@ -58,8 +58,13 @@ Every stream's cron job lives in this profile's own roster, ticked once a minute
 picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
 stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
 
-`cronjob(action='run')` is not the route: it executes the job synchronously inside the session that
-calls it, which is the re-enactment the next paragraph exists to prevent.
+`cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
+one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the
+dispatch pool is full, it
+executes the job synchronously inside the session that calls it, which is the re-enactment the next
+paragraph exists to prevent. Elsewhere it hands the run to the background delegation executor and
+returns a handle; that is closer to what you want, but `hermes cron run` is the one route that
+behaves identically on every runtime and always runs in a fresh process.
 
 **Do not run the audit yourself in the session that received the request.** A triggered run gets its
 own process and its own turn budget. A session that improvises the audit instead has neither — and

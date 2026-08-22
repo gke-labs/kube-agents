@@ -4,21 +4,30 @@
 # Cluster Agents are Hermes profiles on the data PVC ($HERMES_HOME/profiles/<name>), one per
 # managed GKE cluster, each stamped with a `cluster_identity` block in its config.yaml.
 #
-# Policy: **every cluster in the project gets a Cluster Agent profile, EXCEPT the management
-# cluster where kube-agents itself runs** (and any names in RECONCILE_EXCLUDE). Per run this
-# deterministic engine:
+# Policy: **every cluster in the project gets a Cluster Agent profile**, including the
+# management cluster where kube-agents itself runs. Only names listed in RECONCILE_EXCLUDE
+# are left unmanaged. Per run this deterministic engine:
 #   • CREATE — scaffolds a profile for every project cluster that doesn't have one yet;
 #   • PRUNE  — deletes a profile whose cluster is *definitively* gone (a NotFound/404 from
-#     `gcloud container clusters describe`), or whose cluster is the management/excluded one
-#     (it must not carry a profile). Any other error path — auth, network, timeout, quota, an
-#     unreadable identity — is treated as "unknown" and the profile is left untouched: we never
-#     delete on ambiguity.
+#     `gcloud container clusters describe`), or whose cluster was added to RECONCILE_EXCLUDE
+#     after the fact. Any other error path — auth, network, timeout, quota, an unreadable
+#     identity — is treated as "unknown" and the profile is left untouched: we never delete
+#     on ambiguity.
 #
-# The management cluster is identified by **self-identity, not by name**: the pod asks the GKE
-# metadata server which cluster its node belongs to (instance/attributes/cluster-name +
-# cluster-location), so it works no matter what the customer named the cluster. If self-identity
-# or the project can't be resolved, the CREATE direction is skipped for that run (prune-only
-# degradation) so we never accidentally create a profile for the management cluster.
+# The management cluster used to be excluded, identified via the GKE metadata server. It is
+# not any more, because an event on that cluster now needs an agent scoped to it like every
+# other cluster's does: the triage session runs on the Planning Agent, whose one instruction is
+# to delegate it to the profile scoped to the cluster that raised the event
+# (session_kv_server.trigger_agent_troubleshooter), so a cluster without a profile is a
+# cluster whose alerts have nobody to answer them. Two consequences worth knowing:
+#   • the event watcher must not then watch that cluster twice, once through --in-cluster and
+#     once through the new profile — buildWatchSet in cmd/k8s-event-watcher/main.go drops the
+#     duplicate;
+#   • the management cluster's Cluster Agent can read the harness's own namespace with the pod's
+#     GSA — not the KSA, since create_profile pins a get-credentials kubeconfig — so how far that
+#     reaches is the GSA's permission set: no Secrets on the default read-only roles, Secrets
+#     included on gke-admin. That is a deliberate widening of the blast radius, not an oversight;
+#     RECONCILE_EXCLUDE is the opt-out, and the security reference is the canonical statement.
 #
 # It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
 # profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
@@ -77,15 +86,6 @@ def _project() -> str | None:
         return r.stdout.strip() or None
     except Exception:  # noqa: BLE001
         return None
-
-
-def _self_cluster():
-    """(name, location) of the management cluster this pod runs on, or None if unknown."""
-    name = _metadata("instance/attributes/cluster-name")
-    location = _metadata("instance/attributes/cluster-location")
-    if name and location:
-        return (name, location)
-    return None
 
 
 def _all_clusters(project: str) -> list:
@@ -161,7 +161,7 @@ def reconcile(dry_run: bool = False) -> dict:
     """
     report: dict[str, list] = {
         "created": [],           # profile scaffolded for a cluster that lacked one
-        "pruned": [],            # profile removed (cluster gone, or management/excluded)
+        "pruned": [],            # profile removed (cluster gone, or RECONCILE_EXCLUDE'd)
         "kept": [],              # cluster still exists and should be managed
         "skipped_no_identity": [],  # config.yaml lacked a usable cluster_identity
         "skipped_error": [],     # liveness check was inconclusive (auth/network/etc.)
@@ -173,15 +173,14 @@ def reconcile(dry_run: bool = False) -> dict:
         (i["project"], i["cluster"], i["location"]) for i in identities.values() if i
     }
 
-    # --- CREATE: ensure every project cluster (except the management/self cluster and
-    #     RECONCILE_EXCLUDE names) has a profile. Requires self-identification + a project.
-    me = _self_cluster()
-    project = _project() if me else None
-    if me and project:
-        self_name, _self_loc = me
-        exclude_names = {self_name} | EXTRA_EXCLUDE
+    # --- CREATE: ensure every project cluster (except RECONCILE_EXCLUDE names) has a
+    #     profile. Requires only a resolvable project now that the management cluster is
+    #     managed like any other — the metadata-server self-identification this used to
+    #     gate on existed solely to recognise the cluster being skipped.
+    project = _project()
+    if project:
         for (proj, cluster, location) in sorted(_all_clusters(project)):
-            if cluster in exclude_names or (proj, cluster, location) in existing_keys:
+            if cluster in EXTRA_EXCLUDE or (proj, cluster, location) in existing_keys:
                 continue
             if dry_run:
                 log(f"{cluster} ({proj}/{location}) has no profile — WOULD create (dry-run).")
@@ -194,12 +193,11 @@ def reconcile(dry_run: bool = False) -> dict:
             except (SystemExit, Exception) as e:  # noqa: BLE001 - one failure never aborts the sweep
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
     else:
-        self_name, exclude_names = None, set()
-        log("could not self-identify the management cluster / project via the metadata server "
-            "— skipping the CREATE direction this run (prune-only).")
+        log("could not resolve the project — skipping the CREATE direction this run "
+            "(prune-only).")
 
-    # --- PRUNE: remove profiles whose cluster is gone, or whose cluster is the management/
-    #     excluded one (which must not carry a profile).
+    # --- PRUNE: remove profiles whose cluster is gone, or whose cluster has since been
+    #     added to RECONCILE_EXCLUDE (it must not carry a profile).
     log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
     for name in profiles:
         identity = identities[name]
@@ -208,12 +206,14 @@ def reconcile(dry_run: bool = False) -> dict:
             report["skipped_no_identity"].append(name)
             continue
 
-        # Policy prune: the management/excluded cluster must not carry a profile.
-        if self_name is not None and identity["cluster"] in exclude_names:
+        # Policy prune: an excluded cluster must not carry a profile, so adding a name to
+        # RECONCILE_EXCLUDE removes the profile it already has rather than merely stopping
+        # a new one being made.
+        if identity["cluster"] in EXTRA_EXCLUDE:
             if dry_run:
-                log(f"{name}: {identity['cluster']} is the management/excluded cluster — WOULD prune (dry-run).")
+                log(f"{name}: {identity['cluster']} is in RECONCILE_EXCLUDE — WOULD prune (dry-run).")
             else:
-                log(f"{name}: {identity['cluster']} is the management/excluded cluster — pruning.")
+                log(f"{name}: {identity['cluster']} is in RECONCILE_EXCLUDE — pruning.")
                 delete_profile(name)
             report["pruned"].append(name)
             continue
@@ -272,7 +272,7 @@ def _notify(message: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Reconcile Cluster Agent profiles with the project's GKE clusters "
-                    "(create for all clusters except the management cluster; prune orphans)."
+                    "(create for every cluster except RECONCILE_EXCLUDE names; prune orphans)."
     )
     parser.add_argument(
         "--dry-run", action="store_true",

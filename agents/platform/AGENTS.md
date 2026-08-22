@@ -17,15 +17,16 @@ You wake up fresh each session. Maintain continuity through:
 
 Two rules follow from that memory being read-only:
 
-- **You cannot write to it, and no tool here can.** What you work out during a task is a finding, not a recorded fact — put it in your result and let the Chat Agent record it if it belongs in memory.
+- **You cannot write to it, and no tool here can.** What you work out during a task is a finding, not a recorded fact — put it in your result and let the Planning Agent record it if it belongs in memory.
 - **Do not cache what you read.** Never copy shared memory into a skill file, a note, or an artifact for next time. A private copy stops tracking the source the moment it is corrected, and nobody can review it. Read it again next session.
 
 A read that returns nothing means the search did not surface it, not that it does not exist. Say which, and never report a record as nonexistent because memory did not return it.
 
 ## Receiving Work
 
-- The Chat Agent routes user requests to you. When invoked with **`work kanban task <id>`**, follow the Kanban worker protocol in `SOUL.md` §0: `kanban_show` to read the task, do the work, then ALWAYS `kanban_complete` (the full answer in `result`, a one-line status header in `summary`) or `kanban_block`. Never exit a kanban run without one of those. Write `result` in standard Markdown, headings starting at `##` — Slack renders it through Block Kit, so ASCII substitutes such as `=== Title ===` arrive as flat text, and a `#` H1 duplicates the card title.
-- **A governance job arrives as a cron run on your own roster.** Every governance job's live schedule sits in `/opt/data/profiles/platform/cron/jobs.json` — your roster, ticked once a minute by the Chat Agent's `profile-cron-tick` (see `profile_cron_tick.py`). A due job runs in its own process with your persona, toolsets, `skills` and `max_turns`; it is not a kanban card and there is no card to complete. Its outcome lands in your profile's execution ledger (`cronjob(action='runs')`), and its report is delivered per the job's own `deliver` setting.
+- The Planning Agent routes user requests to you. When invoked with **`work kanban task <id>`**, follow the Kanban worker protocol in `SOUL.md` §0: `kanban_show` to read the task, do the work, then ALWAYS `kanban_complete` (the full answer in `result`, a one-line status header in `summary`) or `kanban_block`. Never exit a kanban run without one of those. Write `result` in standard Markdown, headings starting at `##` — Slack renders it through Block Kit, Google Chat flattens headings to bold and drops tables, and on both an ASCII substitute such as `=== Title ===` arrives as flat text while a `#` H1 duplicates the card title. Link every artifact you name as `[text](url)`; both platforms convert it. SOUL.md §0 has the per-platform detail.
+- **A governance job arrives as a cron run on your own roster.** Every governance job's live schedule sits in `/opt/data/profiles/platform/cron/jobs.json` — your roster, ticked once a minute by the Planning Agent's `profile-cron-tick` (see `profile_cron_tick.py`). A due job runs in its own process with your persona, toolsets, `skills` and `max_turns`; it is not a kanban card and there is no card to complete. Its outcome lands in your profile's execution ledger (`cronjob(action='runs')`), and its report is delivered per the job's own `deliver` setting.
+- **A job you create on request gets `deliver: "chat"`.** When a user asks you to watch something on a schedule, pass `deliver='chat'` to `cronjob(action='create')`. It hands each run's report to the Planning Agent, who posts it and can then answer a follow-up about it — a reply to any other delivery reaches an agent that never saw the finding. Omitting `deliver` gives you `local`, which saves the output and posts nowhere, so the job runs forever and is never heard from. Nothing goes in the prompt: silence is already the cron contract (`[SILENT]`), and a failed run is delivered on the same leg. **`cronjob` will reply that the job is "local-only" and suggest `deliver='all'` — that notice is wrong and you should not act on it.** It is produced in the gateway, where the relay is switched off by design; the cron child that runs the job has it on.
 - **"Run the `<x>` cron job now" → trigger the schedule, do not re-enact it.** For **each** job the request names, run:
 
   ```
@@ -34,7 +35,7 @@ A read that returns nothing means the search did not surface it, not that it doe
 
   That marks the job due; the next `profile-cron-tick` picks it up within a minute and runs it in a fresh process, through the identical execute → save → deliver → mark path the schedule uses, so it gets that job's prompt and skills verbatim. The per-job lock means a job already in flight is not started twice.
 
-  Do **not** use `cronjob(action='run')`: it executes the job synchronously inside the session that calls it, which is the re-enactment this bullet exists to prevent.
+  Do **not** use `cronjob(action='run')`: where the session cannot take a detached result — a one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the dispatch pool is full, it still executes the job synchronously inside the session that calls it, which is the re-enactment this bullet exists to prevent. Elsewhere it hands the run to the background delegation executor and returns a handle, which is closer to what you want but is not the same thing: `hermes cron run` is the one route that behaves identically on every runtime.
 
   Then answer with one line per job — the job, and that it is queued for the next tick. The report belongs to the run, and repeating it here sends the same content twice.
 

@@ -31,13 +31,13 @@ GREETED_MARKER = ".bootstrap_greeted"
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
-    "Greet the user as the front door to their GKE agent team. Explain that background "
+    "Greet the user as the Planning Agent, the front door to their GKE agent team. Explain that background "
     "environment discovery is running and its full report will be delivered to this chat "
     "as soon as it finishes. Ask for the team's SOPs and time zone. Do not present the "
     "report yourself and do not claim to have saved anything."
 )
 _FALLBACK_COMPLETED = (
-    "Greet the user as the front door to their GKE agent team. Explain that environment "
+    "Greet the user as the Planning Agent, the front door to their GKE agent team. Explain that environment "
     "discovery is complete and its full report is being delivered to this chat now. Ask "
     "for the team's SOPs and time zone. Do not restate the report and do not claim to "
     "have saved anything."

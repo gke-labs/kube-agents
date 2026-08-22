@@ -1092,6 +1092,9 @@ class GatewayKanbanWatchers:
         while self._running:
             try:
                 for d in deliveries:
+                    mode = sub.get("delivery_mode") or "notify"
+                    wake_agent = mode in ("notify+wake", "wake")
+                    send_passive = mode != "wake"
                     for ev in d["events"]:
                         kind = ev.kind
                         if kind == "completed":
@@ -1103,10 +1106,12 @@ class GatewayKanbanWatchers:
                                 lines = payload_summary.strip().splitlines()
                                 h = lines[0][:200] if lines else payload_summary[:200]
                                 handoff = f"\\n{h}"
+                                wake_handoff = h
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\\n{r}"
+                                wake_handoff = r
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
@@ -1115,7 +1120,11 @@ class GatewayKanbanWatchers:
                             msg = "blocked"
                         await adapter.send(sub["chat_id"], msg)
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = (
+                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            if wake_agent
+                            else set()
+                        )
                         if "completed" in _wake_kinds:
                             pass
             except Exception:
@@ -1155,11 +1164,19 @@ class ApplyTest(unittest.TestCase):
 
     def test_the_hardcoded_tuple_is_replaced_by_the_helper(self):
         patched = patch_tree(UPSTREAM_WATCHERS)
-        # `adapter=adapter` is part of the assertion: the notifier must hand the
-        # helper the adapter, or the non-push carve-out above never engages.
-        self.assertIn('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)', patched)
-        self.assertNotIn("_WAKE_KINDS = (", patched)
+        # Both keyword arguments are part of the assertion: the notifier must
+        # hand the helper the adapter and the delivery mode, or neither no-send
+        # carve-out above ever engages.
+        self.assertIn(
+            'd["events"], adapter=adapter, passive_delivered=send_passive', patched
+        )
+        self.assertNotIn('_WAKE_KINDS = ("completed"', patched)
         self.assertNotIn("in _WAKE_KINDS}", patched)
+        # Upstream's own per-subscription gate survives the replacement. Losing
+        # it would wake a mode="notify" subscriber this patch never had an
+        # opinion about.
+        self.assertIn("if wake_agent", patched)
+        self.assertIn("else set()", patched)
 
     def test_the_hook_lands_after_the_clip_and_before_the_message(self):
         # Ordering is the whole contract: the hook has to see the handoff the
@@ -1259,8 +1276,16 @@ LEGACY_CLIP = (
 )
 LEGACY_WAKE = (
     '                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")\n'
-    '                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}\n',
-    '                        _wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)\n',
+    '                        _wake_kinds = (\n'
+    '                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}\n'
+    '                            if wake_agent\n'
+    '                            else set()\n'
+    '                        )\n',
+    '                        _wake_kinds = (\n'
+    '                            _wake_kinds_for(d["events"], adapter=adapter)\n'
+    '                            if wake_agent\n'
+    '                            else set()\n'
+    '                        )\n',
 )
 LEGACY_DELIVERY = (
     '                            msg = (\n',
@@ -1280,24 +1305,46 @@ def legacy_pipeline(source):
     return source
 
 
-def strip_patch_furniture(text, drop_marker_call=True):
+#: The wake call as the merged applier emits it, and as the three superseded
+#: appliers emitted it. They differ by ``passive_delivered=send_passive``, which
+#: is a behaviour change and not a refactor: v2026.8.13's ``delivery_mode="wake"``
+#: skips the text ping on a push adapter, so the narrowing had to learn a second
+#: way for "the answer is already in the thread" to be false. Held as literals
+#: rather than read off the applier so that changing the applier changes this
+#: file too, where a reviewer will see it.
+WAKE_CALL_MERGED = (
+    "                            _wake_kinds_for(\n"
+    '                                d["events"], adapter=adapter, passive_delivered=send_passive\n'
+    "                            )\n"
+)
+WAKE_CALL_LEGACY = '                            _wake_kinds_for(d["events"], adapter=adapter)\n'
+
+
+def strip_patch_furniture(text, drop_marker_call=True, normalise_wake_call=True):
     """Reduce patched source to the part the legacy pipeline can be compared to.
 
-    Three things are dropped, and only three:
+    Four things are dropped or rewritten, and only four:
 
     * the import trailer — three trailers became one;
     * the ``see <module>`` comments — they now name one module;
-    * the marker call, when ``drop_marker_call`` is set. This is the one piece
-      of emitted code with no legacy counterpart, because it is the one new
-      behaviour (section 4 of ``kanban_notifier.py``). Subtracting it is what
-      lets :class:`LegacyEquivalenceTest` keep making its original claim about
-      everything else; that the subtraction is the *whole* difference is
-      asserted separately, so nothing can hide behind it.
+    * the marker call, when ``drop_marker_call`` is set. This is one of the two
+      pieces of emitted code with no legacy counterpart, because it is one of
+      the two new behaviours (section 4 of ``kanban_notifier.py``);
+    * the wake call's ``passive_delivered=`` argument, when
+      ``normalise_wake_call`` is set — the other new behaviour, and the reason
+      the merged call wraps where the legacy one did not.
+
+    Subtracting those two is what lets :class:`LegacyEquivalenceTest` keep
+    making its original claim about everything else; that the subtractions are
+    the *whole* difference is asserted separately for each, so nothing can hide
+    behind either.
     """
     marker = "\n\n# kube-agents patch: see gateway/"
     body = text[: text.index(marker)] if marker in text else text
     if drop_marker_call:
         body = body.replace(MARKER_CALL, "")
+    if normalise_wake_call:
+        body = body.replace(WAKE_CALL_MERGED, WAKE_CALL_LEGACY)
     return "\n".join(
         line for line in body.splitlines()
         if "# kube-agents patch: see gateway/" not in line
@@ -1314,10 +1361,12 @@ class LegacyEquivalenceTest(unittest.TestCase):
     shipped once is exactly the kind of thing that hides in "while I was in
     there".
 
-    The completion marker added afterwards is a deliberate exception and the
-    only one: it is subtracted before the comparison and pinned by
-    :meth:`test_the_marker_call_is_the_only_departure_from_legacy`, so the
-    equivalence claim narrowed by exactly one reviewable block rather than
+    Two later additions are deliberate exceptions, and they are the only ones:
+    the completion marker, and the wake call's ``passive_delivered=`` argument.
+    Each is normalised away before the comparison and pinned by its own test —
+    :meth:`test_the_marker_call_is_the_only_departure_from_legacy` and
+    :meth:`test_the_wake_call_carries_the_delivery_mode_argument` — so the
+    equivalence claim narrowed by exactly two reviewable blocks rather than
     quietly weakening.
     """
 
@@ -1339,7 +1388,14 @@ class LegacyEquivalenceTest(unittest.TestCase):
             patch_tree(UPSTREAM_WATCHERS), drop_marker_call=False
         ).splitlines()
         added = [line for line in merged if line not in legacy]
-        self.assertEqual(added, MARKER_CALL.splitlines())
+        # The marker call's closing `)` is not among them: since v2026.8.13 the
+        # wake-set assignment legacy also produces is a parenthesized
+        # conditional, so a bare `)` at that indent already appears in both.
+        # Membership, not identity, is what this comparison can see.
+        self.assertEqual(added, [
+            line for line in MARKER_CALL.splitlines() if line not in legacy
+        ])
+        self.assertIn("wake_configured=wake_agent,", "\n".join(added))
         # ...and nothing was removed, either.
         self.assertEqual([line for line in legacy if line not in merged], [])
 
@@ -1356,9 +1412,24 @@ class LegacyEquivalenceTest(unittest.TestCase):
         # It subtracts the wake set from what upstream would have woken for, so
         # it cannot run before `_wake_kinds` exists.
         patched = patch_tree(UPSTREAM_WATCHERS)
-        wake = patched.index('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)')
+        wake = patched.index(
+            'd["events"], adapter=adapter, passive_delivered=send_passive'
+        )
         note = patched.index("_kanban_note_suppressed(\n")
         self.assertLess(wake, note)
+
+    def test_the_wake_call_carries_the_delivery_mode_argument(self):
+        # The second departure from legacy, pinned the way the marker call is:
+        # strip_patch_furniture rewrites the merged call back to the legacy
+        # one-liner, and without this that rewrite would be a hole a dropped
+        # argument could vanish through — leaving a build that narrows the wake
+        # for delivery_mode="wake" subscribers, whose wake IS the delivery.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertIn(WAKE_CALL_MERGED, patched)
+        self.assertNotIn(WAKE_CALL_LEGACY, patched)
+        # And it binds upstream's own name for "this mode gets a text ping",
+        # not a literal that would silently stop tracking the mode.
+        self.assertIn('send_passive = mode != "wake"', patched)
 
     def test_upstreams_own_lines_are_left_alone(self):
         # Both `lines = …` assignments are dead once the clip lands, but they

@@ -49,10 +49,22 @@ Follow these steps to make, commit, and submit your GitOps suggestions asynchron
 Never run `git` from wherever your shell happens to be. You share one volume with
 every other agent in this pod — the fleet audits, the other kanban workers — and
 a bare `git checkout` there lands inside a clone somebody else is mid-way
-through. `prepare` hands you a clone that is yours alone:
+through. `prepare` hands you a clone that is yours alone.
+
+The script path is spelled out from `$HERMES_HOME` rather than as `./skills/…`
+because this skill is reached from a kanban card as well as from a cron turn,
+and a card dispatch starts you in the task's workspace, not the profile
+directory. `$HERMES_HOME` is the profile directory in both. Use that form
+everywhere below, including for `github_token_refresh.py` in Step 5.
+
+If you do meet a `No such file or directory` on one of these scripts, do **not**
+recover by writing the absolute path out: `/opt/data/profiles/platform/…` is
+refused by the gateway lifecycle guard, under an error about restarting the
+gateway that has nothing to do with what you ran. Observed live — the refusal
+sent one worker on to report a change it had not made.
 
 ```bash
-./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
   --branch "platform-agent/<change_type>-<target_id>"
 ```
 
@@ -105,7 +117,7 @@ the `workspace` and the `lease` from Step 1 — the script verifies the lease on
 that tree is still yours and refuses outright if it belongs to another agent:
 
 ```bash
-./skills/submit-suggestion/scripts/submit_suggestion.py submit \
+"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --workspace "<workspace>" \
   --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \
@@ -135,7 +147,7 @@ Record the PR link returned by the script, update the pending status inside your
 
 When you are asked to **address review comments / reviewer feedback** on an existing PR, **read the comments yourself — never expect them pasted into the task.** You have GitHub access via the minted, repo-scoped App token (cached into `gh` and the git credential store by `scripts/github_token_refresh.py`).
 
-1. **Refresh auth** if a call is unauthorized: `./scripts/github_token_refresh.py`.
+1. **Refresh auth** if a call is unauthorized: `"$HERMES_HOME"/scripts/github_token_refresh.py`.
 2. **Read the PR and all its feedback** — both the conversation and inline (diff) review comments:
    ```bash
    gh pr view <PR_NUMBER> --repo <owner/repo> --json title,url,headRefName,body,comments,reviews

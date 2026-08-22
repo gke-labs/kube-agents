@@ -3,7 +3,7 @@ title: Uninstall
 description: Remove the Platform Agent, operator, and provisioned GCP resources.
 ---
 
-There are two levels of cleanup: removing just the Platform Agent (keeping the cluster and operator), or a full teardown of everything the provisioner created.
+There are two levels of cleanup: removing just the Platform Agent (keeping the cluster and operator), or a full teardown of everything the installer created.
 
 ## Uninstall the Platform Agent only
 
@@ -48,34 +48,29 @@ Once the CR is gone, the operator's finalizer first removes the cluster-scoped R
 ## Full teardown
 
 ```bash
-cd k8s-operator/scripts
-./teardown.sh
+./uninstall.sh
 ```
 
-The script runs the `teardown_12_*.sh` through `teardown_01_*.sh` steps in order, undoing each provisioning step. It reads state from `vars.sh` (created during provisioning) so you don't need to re-answer prompts.
+`uninstall.sh` runs the install engine in reverse: it finds the install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix `kube-agents/<cluster>` — derived from the install coordinates, so a fresh clone works), regenerates `terraform.tfvars`, and drives `terraform destroy` through the composition's [`lifecycle.sh destroy`](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/lifecycle.sh). Pass `--project-id`, `--cluster-name`, and `--region` to name the target explicitly; otherwise they come from the saved `vars.sh`.
 
-## Per-step teardown
+Four things in the stack are not symmetric — destroying them is not the inverse of applying them — and `lifecycle.sh destroy` handles each one before `terraform destroy` runs:
 
-You can also run individual `teardown_NN_*.sh` scripts to remove one layer at a time:
+| Asymmetry                                                                                                              | What `lifecycle.sh destroy` does                                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Cloud KMS key rings and keys can never be deleted, and destroying the key resource schedules its versions' destruction | Forgets them from Terraform state so they stay usable in GCP; the next `lifecycle.sh apply` adopts them back automatically |
+| The `PlatformAgent` CR carries a finalizer only the operator can clear                                                 | Deletes the CR up front and waits, force-clearing the finalizer (and removing the orphaned cluster-scoped RBAC) if wedged  |
+| A GKE `BackupPlan` cannot be deleted while it still owns backups                                                       | Permanently deletes every backup the plan owns first                                                                       |
+| The cluster's `deletion_protection = true` cannot be overridden by a destroy alone                                     | Applies it as `false` first, then destroys                                                                                 |
 
-| Script                                   | Removes                                                                                    |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `teardown_12_gke_backup_plan.sh`         | GKE BackupPlan and any existing backup snapshots (set `PRESERVE_BACKUPS=true` to preserve) |
-| `teardown_11_deploy_inference_replay.sh` | Inference-replay proxy + PVC; restores original LiteLLM Service                            |
-| `teardown_10_deploy_github_minter.sh`    | Minty deployment, GSAs, KMS resources                                                      |
-| `teardown_09_deploy_litellm.sh`          | LiteLLM Gateway                                                                            |
-| `teardown_08_deploy_platform_agent.sh`   | `PlatformAgent` CR and rendered manifests                                                  |
-| `teardown_07_gcp_k8s_secrets.sh`         | Kubernetes secrets in the target namespace                                                 |
-| `teardown_06_slack.sh`                   | Slack tokens and state                                                                     |
-| `teardown_05_gcp_gchat.sh`               | Google Chat Pub/Sub topic + subscription                                                   |
-| `teardown_04_gcp_iam.sh`                 | GCP service accounts and Workload Identity bindings                                        |
-| `teardown_03_gcp_gke_operator.sh`        | Operator manager deployment and CRDs                                                       |
-| `teardown_02_gvisor_nodepool.sh`         | gVisor node pool only (optional)                                                           |
-| `teardown_01_gcp_cluster.sh`             | GKE cluster and the local `vars.sh` state file                                             |
+These steps are irreversible and run **before** Terraform's own prompt, which is why the script asks for one confirmation up front (`--non-interactive` skips it).
 
-Each script is idempotent — safe to re-run if it fails partway through.
+**Installs that predate the Terraform engine.** An install with no Terraform state anywhere was created by a pre-Terraform release; this uninstaller cannot take it apart, and it exits saying so. Re-run with `--source-ref=<the release that installed it>` — the uninstaller fetches that release and hands over to its own `uninstall.sh`, so the code that made the install is what takes it apart:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- --source-ref=<old release tag>
+```
 
 ## Where to go next
 
-- [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — what each `provision_NN_*` / `teardown_NN_*` step does.
-- [Security & IAM](/kube-agents/reference/security-and-iam/) — the GCP service accounts and bindings removed by `teardown_04_gcp_iam.sh`.
+- [Full-install composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install#teardown-and-re-apply) — the teardown asymmetries in detail, and running `terraform destroy` by hand.
+- [Security & IAM](/kube-agents/reference/security-and-iam/) — the GCP service accounts and bindings the teardown removes.

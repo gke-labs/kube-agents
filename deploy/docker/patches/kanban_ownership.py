@@ -30,9 +30,10 @@ of dispatcher ownership, and both of upstream's kanban gates
 dispatching worker, and ``tools/cron_run_scope.py`` deliberately leaves
 ``HERMES_KANBAN_TASK`` pointing at the dispatcher's card for the duration, so
 ``heartbeat_current_worker_from_env`` can keep a 15-minute claim alive across a
-20-minute audit. The run is explicitly barred from terminating that card:
-``resolve_default_task_id`` returns ``None`` inside a run, and
-``cron_ownership_violation`` rejects it by name.
+20-minute audit. The run is explicitly barred from terminating that card: upstream's
+``_default_task_id`` returns ``None`` inside a run (via
+``agent.delegation_context.non_dispatcher_owned_context``, which v2026.8.13
+added), and ``cron_ownership_violation`` rejects it by name.
 
 The cron marker is read through ``cron_run_scope.current_cron_job`` rather than
 from the environment, and that is the point: it lives in a context variable

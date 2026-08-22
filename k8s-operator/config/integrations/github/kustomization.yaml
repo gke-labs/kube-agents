@@ -2,6 +2,7 @@ resources:
   - serviceaccount.yaml.template
   - configmap.yaml.template
   - deployment.yaml.template
+  - pdb.yaml.template
 
 # See config/default/kustomization.yaml for why includeSelectors stays false.
 labels:

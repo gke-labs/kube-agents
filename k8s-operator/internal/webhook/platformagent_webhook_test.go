@@ -224,6 +224,43 @@ func TestPlatformAgentValidation(t *testing.T) {
 		assertFieldError(t, err, "spec.deployment.env[0].name")
 	})
 
+	// The read-only gate is reserved by mergeCredentialProxyEnv, which drops it
+	// silently -- an accepted CR, a reconciled Deployment, and no behaviour
+	// change. Rejecting it here is what tells the operator why, so the drop and
+	// this refusal are one control with two halves; see SensitiveEnvVars.
+	t.Run("fails if the credential proxy read-only gate is overridden", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		for _, value := range []string{"false", "true"} {
+			t.Run(value, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-agent",
+						Namespace: "default",
+					},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{
+							Deployment: &agentv1alpha1.DeploymentSpec{
+								Env: []corev1.EnvVar{
+									{Name: "CREDENTIAL_PROXY_ENFORCE_READ_ONLY", Value: value},
+								},
+							},
+						},
+					},
+				}
+
+				// Rejected whatever the value: an operator-set "true" is
+				// indistinguishable from the reservation having failed, and
+				// accepting it would teach the habit that the name is settable.
+				_, err := val.ValidateCreate(ctx, agent)
+				assertFieldError(t, err, "spec.deployment.env[0].name")
+
+				_, err = val.ValidateUpdate(ctx, agent, agent)
+				assertFieldError(t, err, "spec.deployment.env[0].name")
+			})
+		}
+	})
+
 	t.Run("fails if HERMES_HOME environment variable is overridden", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 
@@ -586,6 +623,63 @@ func TestPlatformAgentValidation(t *testing.T) {
 			t.Errorf("expected create validation to succeed for bare owner/repo gitRepo, got: %v", err)
 		}
 	})
+
+	// corev1.LocalObjectReference makes Name optional and the CRD schema defaults
+	// it to "", so a blank entry is admitted by the API server's structural
+	// validation and the kubelet then pulls anonymously. A repeat is admitted
+	// too, and fails further away still: the generated Deployment's PodSpec has
+	// imagePullSecrets as a server-side-apply list-map keyed on name, so every
+	// apply errors with "duplicate entries for key" — a reconcile failure on an
+	// object the CR's author never wrote.
+	t.Run("rejects malformed imagePullSecrets", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		for _, tc := range []struct {
+			name string
+			refs []corev1.LocalObjectReference
+		}{
+			{name: "empty name", refs: []corev1.LocalObjectReference{{Name: ""}}},
+			{name: "whitespace name", refs: []corev1.LocalObjectReference{{Name: "  "}}},
+			{name: "one good one blank", refs: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: ""}}},
+			{name: "duplicate", refs: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "regcred"}}},
+			{
+				name: "duplicate only after trimming",
+				refs: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: " regcred "}},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{
+							Deployment: &agentv1alpha1.DeploymentSpec{ImagePullSecrets: tc.refs},
+						},
+					},
+				}
+				if _, err := val.ValidateCreate(ctx, agent); err == nil {
+					t.Error("expected validation to reject the imagePullSecrets list")
+				}
+			})
+		}
+	})
+
+	t.Run("allows named imagePullSecrets", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "harbor-pull"}},
+					},
+				},
+			},
+		}
+		if _, err := val.ValidateCreate(ctx, agent); err != nil {
+			t.Errorf("expected named imagePullSecrets to pass validation, got: %v", err)
+		}
+	})
 }
 
 func TestPlatformAgentDefaulter(t *testing.T) {
@@ -689,7 +783,7 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 		}
 
 		// Tag must stay as supplied: persisting "latest" would misrepresent CRs
-		// that omit image and run the operator's build-injected default version.
+		// that omit image and run the operator's default platform-agent version.
 		if agent.Spec.Deployment.Tag == nil || *agent.Spec.Deployment.Tag != "" {
 			t.Errorf("expected Tag to be left as the empty string, got %v", agent.Spec.Deployment.Tag)
 		}

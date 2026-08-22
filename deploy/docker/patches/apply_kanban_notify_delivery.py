@@ -100,7 +100,7 @@ CLAIM_PATCHED = (
 # not unique in this file. See the module docstring.
 
 ADVANCE_ANCHOR = (
-    f"{ADVANCE_INDENT}# of the same event on subsequent ticks.\n"
+    f"{ADVANCE_INDENT}# event on subsequent ticks.\n"
     f"{ADVANCE_INDENT}await asyncio.to_thread(\n"
     f'{ADVANCE_INDENT}    self._kanban_advance, sub, d["cursor"], board_slug,\n'
     f"{ADVANCE_INDENT})\n"
@@ -113,7 +113,7 @@ ADVANCE_ANCHOR = (
 # delivery in the tick, which is the `kanban notifier tick failed: disk I/O
 # error` line in the 2026-08-09 log.
 ADVANCE_PATCHED = (
-    f"{ADVANCE_INDENT}# of the same event on subsequent ticks.\n"
+    f"{ADVANCE_INDENT}# event on subsequent ticks.\n"
     f"{ADVANCE_INDENT}# kube-agents patch: this is now the ONLY cursor write, and\n"
     f"{ADVANCE_INDENT}# it happens after delivery. See\n"
     f"{ADVANCE_INDENT}# gateway/kanban_notify_delivery.py.\n"

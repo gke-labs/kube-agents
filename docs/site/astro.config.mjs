@@ -1,8 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
-import { unified } from '@astrojs/markdown-remark';
 import starlight from '@astrojs/starlight';
-import { remarkPrependBase } from './src/plugins/remark-prepend-base.mjs';
 
 const BASE = '/kube-agents';
 
@@ -13,9 +11,6 @@ const BASE = '/kube-agents';
 export default defineConfig({
   site: 'https://gke-labs.github.io',
   base: BASE,
-  markdown: {
-    processor: unified({ remarkPlugins: [remarkPrependBase(BASE)] }),
-  },
   integrations: [
     starlight({
       title: 'kube-agents',

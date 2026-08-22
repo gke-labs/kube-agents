@@ -1,7 +1,6 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -94,7 +93,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -115,7 +113,6 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -144,7 +141,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -173,7 +169,6 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -212,7 +207,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -239,7 +233,6 @@ subjects:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -265,7 +258,6 @@ status: {}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -315,7 +307,6 @@ data:
       provider: ""
 kind: ConfigMap
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -377,7 +368,6 @@ data:
         Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
 kind: ConfigMap
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -400,7 +390,6 @@ data:
     - **Git Repo:** None
 kind: ConfigMap
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -440,7 +429,6 @@ data:
     }
 kind: ConfigMap
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -459,7 +447,6 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  creationTimestamp: null
   labels:
     app: platformagent-gateway
     app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -477,6 +464,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1200
   replicas: 1
   selector:
     matchLabels:
@@ -490,7 +478,6 @@ spec:
         kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
-      creationTimestamp: null
       labels:
         app: platformagent-gateway
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -564,12 +551,26 @@ spec:
               value: owner
             - name: API_SERVER_MODEL_NAME
               value: model-default
+            - name: HERMES_GATEWAY_PROFILE
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: Always
           name: platform-agent
           ports:
             - containerPort: 8642
               name: api
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'curl --fail --silent --show-error -o /dev/null -H "Authorization: Bearer
+                  $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
+                  [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
+                  = "true" ] && exit 0; exit "$rc"'
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
           resources:
             limits:
               cpu: "3"
@@ -582,6 +583,19 @@ spec:
             capabilities:
               drop:
                 - ALL
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'curl --fail --silent --show-error -o /dev/null -H "Authorization: Bearer
+                  $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
+                  [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
+                  = "true" ] && exit 0; exit "$rc"'
+            failureThreshold: 60
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
@@ -623,6 +637,16 @@ spec:
           ports:
             - containerPort: 9119
               name: dashboard
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl --silent --show-error --max-time 3 -o /dev/null http://127.0.0.1:9119/
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
           resources:
             limits:
               cpu: "1"
@@ -766,7 +790,8 @@ spec:
             - name: CREDENTIAL_PROXY_BOOTSTRAP_COMMAND
               value: |-
                 gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
-                gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
+                GKE_DNS_FLAG="$(gcloud container clusters describe "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" --format='value(controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)' 2>/dev/null | awk -F'\t' '$1 != "" && $2 == "True" { print "--dns-endpoint" }')" &&
+                gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" $GKE_DNS_FLAG &&
                 kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
                 kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
@@ -915,7 +940,6 @@ status: {}
 apiVersion: v1
 kind: Service
 metadata:
-  creationTimestamp: null
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -943,10 +967,37 @@ spec:
 status:
   loadBalancer: {}
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-gateway
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  creationTimestamp: null
   labels:
     app: platformagent-gateway
     app.kubernetes.io/instance: kubeagents-system-platformagent

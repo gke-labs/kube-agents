@@ -46,6 +46,33 @@ spec:
               value: litellm
           ports:
             - containerPort: 8080
+          # Without these the Service publishes an endpoint the instant the
+          # container process starts, ~50s before uvicorn binds :8080, and the
+          # agent's first call after a cold boot dies on `Connection refused`.
+          # Endpoint names are LiteLLM's own and unauthenticated (`liveliness`
+          # is spelled that way upstream). Kept in step with
+          # charts/kube-agents/templates/litellm.yaml, which is canonical.
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: config-volume
               mountPath: /app/config.yaml
@@ -59,3 +86,21 @@ spec:
         - name: token-storage
           persistentVolumeClaim:
             claimName: litellm-pvc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: litellm
+  namespace: kubeagents-system
+spec:
+  # One replica on an RWO volume, so there is no second pod to keep up.
+  # maxUnavailable: 1 states the intent — this workload may be evicted — while
+  # a minAvailable here would allow zero disruptions and hang every node
+  # drain, which is `blocking-pdb` in
+  # agents/platform/governance/obtainability_audit_sop.md §3.4.
+  maxUnavailable: 1
+  # Copied from the Deployment's own spec.selector: a PDB is matched to its
+  # workload by selector, never by name.
+  selector:
+    matchLabels:
+      app: litellm

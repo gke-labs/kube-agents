@@ -20,10 +20,12 @@ if [ -n "${COMMIT_INPUT}" ]; then
 elif [ -n "${RC_TAG}" ]; then
   target_repo="$(get_target_repo)"
 
-  if [ -n "${target_repo}" ]; then
-    git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || true
-  else
-    git fetch --tags >/dev/null 2>&1 || true
+  if is_ci_pipeline; then
+    if [ -n "${target_repo}" ]; then
+      git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || true
+    else
+      git fetch --tags >/dev/null 2>&1 || true
+    fi
   fi
 
   if ! COMMIT_SHA=$(git rev-parse --verify "${RC_TAG}^{commit}" 2>/dev/null); then

@@ -51,9 +51,10 @@ laptop reliably has, and the installers have to work there.
 
 `AR_LOCATION`, `AR_PROJECT` and `AR_REPOSITORY` each pin one part of the reference and
 switch discovery off for that part alone. `REGION` and `GCP_ARTIFACT_REGISTRY_REPO_NAME` —
-the variables the provisioning scripts export, and the last fallbacks for the location and
-the repository — are deliberately not pins: one left in your shell by `dev_rebuild_agent.sh`
-must not outrank the registry the agent is demonstrably being pulled from.
+the variables the installer and dev tooling save into `vars.sh`, and the last fallbacks for
+the location and the repository — are deliberately not pins: one left in your shell by
+`dev_rebuild_agent.sh` must not outrank the registry the agent is demonstrably being pulled
+from.
 
 What the image leaves out is the plugin's `.dockerignore`, read once and applied to the
 content tag, to `docker build` and to the crane layer alike. It is the only place to write
@@ -63,6 +64,11 @@ got there first would define that image for good. Keeping one reader means keepi
 patterns it implements — `**/name`, anchored paths, `*` and `?` within a path segment — and
 it refuses a `.dockerignore` that uses anything else (`!` re-includes, a `**` anywhere but
 the front) rather than matching it differently from Docker.
+
+A source tree may hold only regular files and directories, and an installer refuses one
+that does not. A symlink is the case worth naming: it lands in the layer but not in the
+digest, so re-pointing one would change the image without changing the tag — and the two
+builders do not agree on what it becomes in the first place.
 
 Two defaults are load-bearing:
 
@@ -80,7 +86,7 @@ Two defaults are load-bearing:
   has no reader binding of its own.
 
   There is only something to copy when the agent runs from Artifact Registry, which is the
-  provisioning scripts' install but not the chart's: `charts/kube-agents` defaults the agent
+  dev-rebuild path but not the chart's default: `charts/kube-agents` defaults the agent
   to `ghcr.io/gke-labs/kube-agents/platform-agent`, and an agent pulled from ghcr.io says
   nothing about where a plugin image should go. The fallbacks then apply — `$REGION` or
   `us-central1`, `$GCP_ARTIFACT_REGISTRY_REPO_NAME` or `kube-agents`, the install project —
@@ -112,8 +118,15 @@ Two defaults are load-bearing:
 | Kind             | Where                                  | Needs a cluster |
 | ---------------- | -------------------------------------- | --------------- |
 | Unit             | `<plugin>/tests/test_*.py`             | no              |
+| Shared library   | `lib/tests/test_plugin_image.py`       | no              |
 | Live deployment  | `<plugin>/tests/*_e2e_test.py`         | yes             |
 | Manual scenarios | `gke-stockout-investigator/scenarios/` | yes             |
+
+The shared-library suite shells out to bash and covers the parts of
+[`lib/plugin_image.sh`](lib/plugin_image.sh) whose failures are silent: the `.dockerignore`
+matcher, the content tag moving when it should and standing still when it should not, and
+the registry discovery. It lives under `lib/tests/` so the same CI loop that discovers
+`<plugin>/tests/` picks it up.
 
 A live-deployment test installs what it tests by running the plugins' own `install.sh`
 first, so what it exercises is the chart in this repository rather than whatever happens

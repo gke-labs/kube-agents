@@ -25,6 +25,17 @@ spec:
               value: "/data/replay_cache.json"
             - name: MODE_FILE
               value: "/etc/replay/mode"
+          # /admin/mode is a real FastAPI route declared before the catch-all
+          # proxy route, so it answers without forwarding upstream to LiteLLM —
+          # a probe on /v1/... would report the gateway's health, not this pod's.
+          readinessProbe:
+            httpGet:
+              path: /admin/mode
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: "100m"

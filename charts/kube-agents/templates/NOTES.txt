@@ -38,7 +38,35 @@ away BEFORE `helm uninstall {{ .Release.Name }}`, otherwise the CR strands:
   helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
 {{- end }}
 
-Admission webhooks are not part of chart installs (CRD-level CEL validation and
-OpenAPI defaulting still apply; the webhooks' extra validation, defaulting, and
-delete-protection do not); the provisioning scripts / kustomize path provides
-them.
+{{ if and .Values.operator.enabled .Values.operator.webhooks.enabled -}}
+Admission webhooks are ON. The API server calls {{ include "kube-agents.webhookServiceName" . }}
+{{- if .Values.operator.webhooks.certManager.enabled }}
+on :10250, using a certificate cert-manager issues into
+{{ include "kube-agents.webhookCertSecretName" . }}. If the operator pod stays in
+ContainerCreating, that Secret has not been issued yet — check cert-manager:
+
+  kubectl get certificate {{ include "kube-agents.webhookCertificateName" . }} -n {{ .Release.Namespace }}
+{{- else }}
+on :10250, using the certificate you provide in the Secret
+{{ include "kube-agents.webhookCertSecretName" . }} — certManager.enabled=false, so
+this release renders no Issuer and no Certificate. If the operator pod stays in
+ContainerCreating, that Secret does not exist in {{ .Release.Namespace }} yet.
+{{- end }}
+
+failurePolicy is {{ .Values.operator.webhooks.failurePolicy }}.
+{{- if eq .Values.operator.webhooks.failurePolicy "Ignore" }} With Ignore, a PlatformAgent
+written while the operator is down is admitted without the webhook's validation
+and defaulting. Set operator.webhooks.failurePolicy=Fail on a later upgrade for
+the kustomize path's guarantee.
+{{- end }}
+{{- else if .Values.operator.webhooks.enabled -}}
+Admission webhooks are NOT rendered: operator.webhooks.enabled=true has no
+effect while operator.enabled=false, because the webhooks are served by the
+operator pod this release does not install.
+{{- else -}}
+Admission webhooks are off (operator.webhooks.enabled=false), so CRD-level CEL
+validation and OpenAPI defaulting apply but the webhooks' extra validation,
+defaulting, and delete-protection do not. Install cert-manager and re-run with
+--set operator.webhooks.enabled=true to turn them on; the provisioning scripts /
+kustomize path enables them by default.
+{{- end }}

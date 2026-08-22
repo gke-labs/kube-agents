@@ -26,6 +26,17 @@ spec:
               value: "/data/replay_cache.json"
             - name: MODE_FILE
               value: "/etc/replay/mode"
+          # /admin/mode is a real FastAPI route declared before the catch-all
+          # proxy route, so it answers without forwarding upstream to LiteLLM —
+          # a probe on /v1/... would report the gateway's health, not this pod's.
+          readinessProbe:
+            httpGet:
+              path: /admin/mode
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: "100m" # Lightweight request to schedule instantly
@@ -46,3 +57,21 @@ spec:
         - name: mode-config
           configMap:
             name: inference-replay-config
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: standalone-replay
+  namespace: kubeagents-system
+spec:
+  # One replica on an RWO cache volume, so there is no second pod to keep up.
+  # maxUnavailable: 1 states the intent — this workload may be evicted — while
+  # a minAvailable here would allow zero disruptions and hang every node
+  # drain, which is `blocking-pdb` in
+  # agents/platform/governance/obtainability_audit_sop.md §3.4.
+  maxUnavailable: 1
+  # Copied from the Deployment's own spec.selector: a PDB is matched to its
+  # workload by selector, never by name.
+  selector:
+    matchLabels:
+      app: standalone-replay

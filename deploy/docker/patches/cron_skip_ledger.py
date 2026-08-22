@@ -1,8 +1,9 @@
 """Record cron occurrences that were due and did not run, and keep history per job.
 
 Installed into the image at ``/opt/hermes/tools/cron_skip_ledger.py`` and wired
-into ``cron/executions.py``, ``cron/scheduler.py``, ``cron/jobs.py`` and
-``agent/monitoring/cron_health.py`` by ``deploy/docker/Dockerfile``.
+into ``cron/executions.py``, ``cron/scheduler.py``, ``cron/jobs.py``,
+``tools/cronjob_tools.py`` and ``agent/monitoring/cron_health.py`` by
+``deploy/docker/Dockerfile``.
 
 Two independent holes in the execution ledger, both of which make a watchdog
 that stopped firing look exactly like a watchdog with nothing to report. That
@@ -32,11 +33,13 @@ reason (the codes below are the vocabulary, and they are content-free so they
 can also be projected to monitoring):
 
 ``already_running``
-    ``tick``'s in-process dedup guard: ``job_id`` is still in
-    ``_running_job_ids`` from a previous tick. The occurrence is genuinely
-    lost, because ``advance_next_runs`` has *already* moved ``next_run_at``
-    forward for the whole due set before dispatch begins. This is the common
-    case above: a job whose run outlives its own period.
+    An in-process dedup guard refused: ``job_id`` is still in the scheduler's
+    ``_running_job_ids`` from an earlier fire. The occurrence is genuinely
+    lost, because the schedule has *already* moved past it — in ``tick``,
+    ``advance_next_runs`` moved ``next_run_at`` for the whole due set before
+    dispatch begins; in ``_run_claimed_job``, ``claim_job_for_fire`` moved it
+    for this job before the guard ran. This is the common case above: a job
+    whose run outlives its own period.
 
 ``already_running_elsewhere``
     The cross-process mirror of the same thing — ``_job_locks.claim`` refused,
@@ -44,6 +47,12 @@ can also be projected to monitoring):
     ``tools/cron_tick_lock_scope.py``). Distinct from ``already_running``
     because the remedy is different: one says the job is too slow for its
     schedule, the other says two tickers are racing for the same profile.
+
+Each of those two is recorded at both of its sites — ``tick``'s dispatch loop
+and ``_run_claimed_job``, the run half a manual fire and a background dispatch
+share. The second pair is new at v2026.8.13: the split that gave ``run_one_job``
+four callers put both guards after the fire claim, so a refusal there now costs
+an occurrence where it used to cost nothing.
 
 ``interpreter_shutdown``
     The gateway began finalizing between ``advance_next_runs`` and

@@ -21,10 +21,12 @@ from admin_console.agent_runtime import (
     MessageResult,
     TaskUpdateResult,
 )
+from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app, target_runtime_factory
 from admin_console.chat.backend import RuntimeChatBackend
 from admin_console.chat.service import ChatService
 from admin_console.project_config import DeploymentTarget, deployment_target_headers
+from admin_console.runtime_contract import canonical_platform_agent_name
 
 
 class Response(Protocol):
@@ -87,7 +89,10 @@ class PortalApiClient:
                 raise ValueError("target is required when using the portal API")
             self._transport = httpx.Client(
                 base_url=f"{base_url.rstrip('/')}/",
-                headers=deployment_target_headers(target),
+                headers={
+                    **deployment_target_headers(target),
+                    **portal_api_headers(),
+                },
                 timeout=httpx.Timeout(30, connect=5),
             )
             return
@@ -103,8 +108,10 @@ class PortalApiClient:
             create_app(
                 service,
                 runtime_provider_factory=target_runtime_factory(target),
+                bound_target=target,
             ),
             base_url="http://testserver/api/v1/",
+            headers=portal_api_headers(),
         )
         self._in_process = True
 
@@ -138,9 +145,74 @@ class PortalApiClient:
         )
         raise PortalApiError(message, guidance)
 
+    def _get(self, path: str, **kwargs) -> Response:
+        try:
+            return self._transport.get(path, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise PortalApiError(
+                "Portal API request timed out.",
+                "The cluster may be slow or unreachable. Reconnect, then retry.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise PortalApiError(
+                f"Portal API request failed: {exc}",
+                "Reconnect the portal or inspect the FastAPI service logs before retrying.",
+            ) from exc
+
+    def _post(self, path: str, **kwargs) -> Response:
+        try:
+            return self._transport.post(path, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise PortalApiError(
+                "Portal API request timed out.",
+                "The cluster may be slow or unreachable. Reconnect, then retry.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise PortalApiError(
+                f"Portal API request failed: {exc}",
+                "Reconnect the portal or inspect the FastAPI service logs before retrying.",
+            ) from exc
+
     def list_agents(self) -> tuple[str, ...]:
-        payload = self._payload(self._transport.get("agents"))
+        payload = self._payload(self._get("agents"))
         return tuple(str(item) for item in payload.get("agents", []))
+
+    def canonical_agent(self) -> str:
+        agents = self.list_agents()
+        if len(agents) != 1:
+            expected = canonical_platform_agent_name()
+            raise PortalApiError(
+                "The portal API did not select one canonical PlatformAgent.",
+                f"Reconnect the target and confirm PlatformAgent/{expected} exists.",
+            )
+        return agents[0]
+
+    def inspect_llm_gateway(self) -> dict[str, Any]:
+        return self._payload(self._get("llm-gateway", timeout=120))
+
+    def llm_gateway_device_status(self) -> dict[str, Any]:
+        return self._payload(self._get("llm-gateway/device-status", timeout=30))
+
+    def configure_llm_gateway(
+        self,
+        *,
+        provider_id: str,
+        model: str,
+        credential: str = "",
+        settings: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self._payload(
+            self._post(
+                "llm-gateway/configuration",
+                json={
+                    "providerId": provider_id,
+                    "model": model,
+                    "credential": credential,
+                    "settings": settings or {},
+                },
+                timeout=360,
+            )
+        )
 
     def list_conversations(
         self,
@@ -150,7 +222,7 @@ class PortalApiClient:
         limit: int = 200,
     ) -> HistoryResult:
         payload = self._payload(
-            self._transport.get(
+            self._get(
                 f"agents/{quote(agent, safe='')}/sessions",
                 params={"cutoff": cutoff.isoformat(), "limit": limit},
             )
@@ -188,7 +260,7 @@ class PortalApiClient:
             f"agents/{quote(agent, safe='')}/sessions/"
             f"{quote(profile, safe='')}/{quote(session_id, safe='')}/messages"
         )
-        payload = self._payload(self._transport.get(path, params={"limit": limit}))
+        payload = self._payload(self._get(path, params={"limit": limit}))
         messages = tuple(
             AgentMessage(
                 message_id=int(row["message_id"]),
@@ -211,7 +283,7 @@ class PortalApiClient:
             f"agents/{quote(agent, safe='')}/sessions/"
             f"{quote(session_id, safe='')}/tasks"
         )
-        payload = self._payload(self._transport.get(path, params={"limit": limit}))
+        payload = self._payload(self._get(path, params={"limit": limit}))
         tasks = tuple(
             AgentTaskUpdate(
                 task_id=str(row["task_id"]),
@@ -245,7 +317,7 @@ class PortalApiClient:
         profile: str = "default",
     ) -> InteractionView:
         payload = self._payload(
-            self._transport.post(
+            self._post(
                 "interactions",
                 json={
                     "agentId": agent,
@@ -268,7 +340,7 @@ class PortalApiClient:
 
     def get_interaction(self, interaction_id: str) -> InteractionView:
         payload = self._payload(
-            self._transport.get(f"interactions/{quote(interaction_id, safe='')}")
+            self._get(f"interactions/{quote(interaction_id, safe='')}")
         )
         return self._interaction(payload)
 
@@ -279,7 +351,7 @@ class PortalApiClient:
         choice: str,
     ) -> InteractionView:
         payload = self._payload(
-            self._transport.post(
+            self._post(
                 f"interactions/{quote(interaction_id, safe='')}/approval",
                 json={"choice": choice},
             )
@@ -288,7 +360,7 @@ class PortalApiClient:
 
     def cancel_interaction(self, interaction_id: str) -> InteractionView:
         payload = self._payload(
-            self._transport.post(
+            self._post(
                 f"interactions/{quote(interaction_id, safe='')}/cancel"
             )
         )

@@ -167,7 +167,7 @@ start_event_watcher() {
   # An install upgraded from before this key existed is exactly the case that
   # lands here — see the backfill in upgrade.sh.
   if [ -z "${SESSION_KV_API_KEY:-}" ]; then
-    echo "start-services: ALERT SESSION_KV_API_KEY is empty, so k8s-event-watcher cannot authenticate to the Session KV server and will exit on every start — NO cluster events are being watched. Add the key to the agent Secret (upgrade.sh backfills it; provision_07_gcp_k8s_secrets.sh generates it on a fresh install) and restart the pod." >&2
+    echo "start-services: ALERT SESSION_KV_API_KEY is empty, so k8s-event-watcher cannot authenticate to the Session KV server and will exit on every start — NO cluster events are being watched. Add the key to the agent Secret (upgrade.sh backfills it; the chart and the Terraform composition generate it on a fresh install) and restart the pod." >&2
   fi
 
   # An empty value disables persistence, which is what should happen if the

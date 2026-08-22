@@ -25,6 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from gke_endpoint import dns_endpoint_args
 from profile_scaffold import ensure_profile, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
@@ -236,6 +237,10 @@ def create_profile(project: str, cluster: str, location: str) -> str:
             [
                 "gcloud", "container", "clusters", "get-credentials", cluster,
                 f"--location={location}", f"--project={project}",
+                # Onboarded clusters are arbitrary fleet members: some are reachable
+                # only over the DNS endpoint, others publish one that refuses
+                # external traffic. gke_endpoint reads which before deciding.
+                *dns_endpoint_args(project, cluster, location, env=env),
             ],
             check=True, capture_output=True, text=True, timeout=60, env=env,
         )
