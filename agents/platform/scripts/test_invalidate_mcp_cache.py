@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from invalidate_mcp_cache import (
     invalidate_all_mcp_caches,
     invalidate_cache_file,
