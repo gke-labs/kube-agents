@@ -38,6 +38,7 @@ import inspect
 import logging
 import os
 import sys
+import unittest
 from types import SimpleNamespace
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +46,48 @@ _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
 if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
+
+try:
+    import agent
+except ImportError:
+    import sys, types
+    agent = types.ModuleType("agent")
+    sys.modules["agent"] = agent
+    agent.memory_provider = types.ModuleType("agent.memory_provider")
+    sys.modules["agent.memory_provider"] = agent.memory_provider
+    class MemoryProvider:
+        pass
+    agent.memory_provider.MemoryProvider = MemoryProvider
+    
+    agent.memory_manager = types.ModuleType("agent.memory_manager")
+    sys.modules["agent.memory_manager"] = agent.memory_manager
+    class MemoryManager:
+        @staticmethod
+        def _provider_sync_accepts_messages(*args, **kwargs): return True
+        def __init__(self, *args, **kwargs): pass
+        def _submit_background(self, *args, **kwargs): pass
+        def add_provider(self, *args, **kwargs): pass
+        def sync_all(self, *args, **kwargs): pass
+    agent.memory_manager.MemoryManager = MemoryManager
+
+try:
+    import plugins.memory.hindsight
+except ImportError:
+    plugins = types.ModuleType("plugins")
+    sys.modules["plugins"] = plugins
+    plugins.memory = types.ModuleType("plugins.memory")
+    sys.modules["plugins.memory"] = plugins.memory
+    plugins.memory.hindsight = types.ModuleType("plugins.memory.hindsight")
+    sys.modules["plugins.memory.hindsight"] = plugins.memory.hindsight
+    class HindsightMemoryProvider:
+        def shutdown(self): pass
+        def queue_prefetch(self, *a, **kw): pass
+        def prefetch(self, *a, **kw): pass
+        def on_turn_start(self, *a, **kw): pass
+        def on_session_switch(self, *a, **kw): pass
+        def sync_turn(self, *a, **kw): pass
+        def on_session_end(self, *a, **kw): pass
+    plugins.memory.hindsight.HindsightMemoryProvider = HindsightMemoryProvider
 
 from agent.memory_manager import MemoryManager  # noqa: E402
 from kube_agents_memory import KubeAgentsMemoryProvider  # noqa: E402
@@ -123,121 +166,105 @@ def assert_binds(log):
             )
 
 
-def test_the_harness_always_sends_messages_to_this_provider():
-    """The trap, stated as an assertion so it cannot quietly stop being true.
+class TestForwardingMatchesHindsight(unittest.TestCase):
+    def test_the_harness_always_sends_messages_to_this_provider(self):
+        """The trap, stated as an assertion so it cannot quietly stop being true.
 
-    ``**kwargs`` on sync_turn is read as "send everything". Narrowing the
-    wrapper's own signature to make this False would silence the bug by giving
-    up the message context for good, so the fix has to survive this staying True.
-    """
-    p, _ = provider()
-    assert MemoryManager._provider_sync_accepts_messages(p) is True
+        ``**kwargs`` on sync_turn is read as "send everything". Narrowing the
+        wrapper's own signature to make this False would silence the bug by giving
+        up the message context for good, so the fix has to survive this staying True.
+        """
+        p, _ = provider()
+        assert MemoryManager._provider_sync_accepts_messages(p) is True
 
+    def test_a_synced_turn_lands_on_the_stock_provider(self):
+        p, log = provider()
+        manager_for(p).sync_all(
+            "what is RB-114?",
+            "Drain the node before upgrading.",
+            session_id="20260818_120000_abcd1234",
+            messages=[{"role": "user", "content": "what is RB-114?"}],
+        )
+        assert [m for m, _, _ in log] == ["sync_turn"], log
+        assert_binds(log)
 
-def test_a_synced_turn_lands_on_the_stock_provider():
-    p, log = provider()
-    manager_for(p).sync_all(
-        "what is RB-114?",
-        "Drain the node before upgrading.",
-        session_id="20260818_120000_abcd1234",
-        messages=[{"role": "user", "content": "what is RB-114?"}],
-    )
-    assert [m for m, _, _ in log] == ["sync_turn"], log
-    assert_binds(log)
+        _, args, kwargs = log[0]
+        assert args == ("what is RB-114?", "Drain the node before upgrading."), args
+        # session_id survives — it is what ties a retained document back to a
+        # conversation, and dropping it would turn one bug into a quieter one.
+        assert kwargs == {"session_id": "20260818_120000_abcd1234"}, kwargs
 
-    _, args, kwargs = log[0]
-    assert args == ("what is RB-114?", "Drain the node before upgrading."), args
-    # session_id survives — it is what ties a retained document back to a
-    # conversation, and dropping it would turn one bug into a quieter one.
-    assert kwargs == {"session_id": "20260818_120000_abcd1234"}, kwargs
+    def test_a_read_only_profile_still_syncs_nothing(self):
+        """#112's guarantee, re-checked through the real caller this time."""
+        p, log = provider(read_only=True)
+        manager_for(p).sync_all("u", "a", session_id="s", messages=[{"role": "user"}])
+        assert log == [], log
 
+    def test_every_forwarded_hook_binds(self):
+        """The general drift guard: not just the one method that broke.
 
-def test_a_read_only_profile_still_syncs_nothing():
-    """#112's guarantee, re-checked through the real caller this time."""
-    p, log = provider(read_only=True)
-    manager_for(p).sync_all("u", "a", session_id="s", messages=[{"role": "user"}])
-    assert log == [], log
+        A base image can narrow any of these. Exercising them together means the
+        next mismatch fails here rather than in a bank nobody thinks to query.
+        """
+        p, log = provider()
+        p.queue_prefetch("RB-114", session_id="s1")
+        p.prefetch("RB-114", session_id="s1")
+        p.on_turn_start(3, "what is RB-114?", session_id="s1", messages=[])
+        p.on_session_switch("s2", user_id="alice@example.com")
+        p.on_session_end([{"role": "user", "content": "u"}])
+        p.shutdown()
+        manager_for(p).sync_all("u", "a", session_id="s2", messages=[{"role": "user"}])
 
+        assert sorted({m for m, _, _ in log}) == sorted(FORWARDED), log
+        assert_binds(log)
 
-def test_every_forwarded_hook_binds():
-    """The general drift guard: not just the one method that broke.
+    def test_a_keyword_the_target_learns_about_is_forwarded(self):
+        """Filtering has to be read off the target, not hardcoded.
 
-    A base image can narrow any of these. Exercising them together means the
-    next mismatch fails here rather than in a bank nobody thinks to query.
-    """
-    p, log = provider()
-    p.queue_prefetch("RB-114", session_id="s1")
-    p.prefetch("RB-114", session_id="s1")
-    p.on_turn_start(3, "what is RB-114?", session_id="s1", messages=[])
-    p.on_session_switch("s2", user_id="alice@example.com")
-    p.on_session_end([{"role": "user", "content": "u"}])
-    p.shutdown()
-    manager_for(p).sync_all("u", "a", session_id="s2", messages=[{"role": "user"}])
+        Spelling out today's parameters would drop ``messages`` forever, including
+        the day the stock provider grows a use for it. That is the failure #780
+        removed from the Slack relay's register() shim, in the opposite direction.
+        """
+        p, log = provider()
 
-    assert sorted({m for m, _, _ in log}) == sorted(FORWARDED), log
-    assert_binds(log)
+        def wide(user_content, assistant_content, *, session_id="", messages=None):
+            log.append(("sync_turn", (user_content, assistant_content),
+                        {"session_id": session_id, "messages": messages}))
 
-
-def test_a_keyword_the_target_learns_about_is_forwarded():
-    """Filtering has to be read off the target, not hardcoded.
-
-    Spelling out today's parameters would drop ``messages`` forever, including
-    the day the stock provider grows a use for it. That is the failure #780
-    removed from the Slack relay's register() shim, in the opposite direction.
-    """
-    p, log = provider()
-
-    def wide(user_content, assistant_content, *, session_id="", messages=None):
-        log.append(("sync_turn", (user_content, assistant_content),
-                    {"session_id": session_id, "messages": messages}))
-
-    p._hindsight.sync_turn = wide
-    manager_for(p).sync_all("u", "a", session_id="s1", messages=[{"role": "user"}])
-    assert log[0][2]["messages"] == [{"role": "user"}], log
-
-
-def test_a_failed_forward_is_not_silent():
-    """DEBUG is what let this run for five days; the level is part of the fix."""
-    p, log = provider()
-
-    def explodes(*a, **kw):
-        raise RuntimeError("hindsight daemon is unreachable")
-
-    explodes.__signature__ = inspect.signature(_recording_stub("sync_turn", log))
-    p._hindsight.sync_turn = explodes
-
-    records = []
-
-    class Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    logger = logging.getLogger("kube_agents_memory.session")
-    handler = Capture()
-    logger.addHandler(handler)
-    try:
+        p._hindsight.sync_turn = wide
         manager_for(p).sync_all("u", "a", session_id="s1", messages=[{"role": "user"}])
-    finally:
-        logger.removeHandler(handler)
+        assert log[0][2]["messages"] == [{"role": "user"}], log
 
-    warned = [r for r in records if r.levelno >= logging.WARNING]
-    assert warned, [(r.levelname, r.getMessage()) for r in records]
-    assert "sync_turn" in warned[0].getMessage(), warned[0].getMessage()
-    # The traceback has to come with it, or the line names the method and not
-    # the reason, and the next person is back to guessing.
-    assert warned[0].exc_info is not None
+    def test_a_failed_forward_is_not_silent(self):
+        """DEBUG is what let this run for five days; the level is part of the fix."""
+        p, log = provider()
 
+        def explodes(*a, **kw):
+            raise RuntimeError("hindsight daemon is unreachable")
+
+        explodes.__signature__ = inspect.signature(_recording_stub("sync_turn", log))
+        p._hindsight.sync_turn = explodes
+
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger("kube_agents_memory.session")
+        handler = Capture()
+        logger.addHandler(handler)
+        try:
+            manager_for(p).sync_all("u", "a", session_id="s1", messages=[{"role": "user"}])
+        finally:
+            logger.removeHandler(handler)
+
+        warned = [r for r in records if r.levelno >= logging.WARNING]
+        assert warned, [(r.levelname, r.getMessage()) for r in records]
+        assert "sync_turn" in warned[0].getMessage(), warned[0].getMessage()
+        # The traceback has to come with it, or the line names the method and not
+        # the reason, and the next person is back to guessing.
+        assert warned[0].exc_info is not None
 
 if __name__ == "__main__":
-    failed = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            fn()
-            print(f"ok    {name}")
-        except AssertionError as e:
-            failed += 1
-            print(f"FAIL  {name}: {e}")
-    print("\nall pass" if not failed else f"\n{failed} failed")
-    sys.exit(1 if failed else 0)
+    unittest.main()

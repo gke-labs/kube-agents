@@ -1261,7 +1261,7 @@ class PlatformFrontDoorTest(unittest.TestCase):
         is the branch under test. Returns (CompletedProcess, live text or None).
         """
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
-        starts = [i for i, line in enumerate(lines) if line.startswith("if platform_is_front_door ")]
+        starts = [i for i, line in enumerate(lines) if line.startswith('if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \\')]
         self.assertEqual(len(starts), 1, "expected exactly one step 2.6b block")
         end = next(i for i in range(starts[0], len(lines)) if lines[i] == "fi")
         block = "\n".join(lines[starts[0] : end + 1])
@@ -1280,21 +1280,33 @@ class PlatformFrontDoorTest(unittest.TestCase):
 
             script = "set -e\n" + _extract_shell_function("platform_is_front_door") + "\n"
             script += _extract_shell_function("backfill_config_from_template") + "\n" + block
+
+            # We must use `python3` un-aliased so that the subprocess call in backfill_config_from_template
+            # resolves properly on systems where sys.executable is a shim or virtualenv binary
+            # with incomplete library access (e.g. PyYAML missing).
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": "",
+                "HERMES_GATEWAY_PROFILE": "platform",
+                "IS_BOOTSTRAP_PRIMARY": "1",
+                "INSTALL_DIR": str(root / "install"),
+                "PLATFORM_TEMPLATE": str(root / "template"),
+                "TARGET_DIR": str(root / "data"),
+            }
+            
+            (venv / "python3").unlink()
+            (venv / "python3").symlink_to("/usr/bin/python3")
+            env["PATH"] = str(venv) + ":" + env["PATH"]
+
             proc = subprocess.run(
                 ["sh", "-c", script],
                 capture_output=True,
                 text=True,
                 timeout=60,
-                env={
-                    "PATH": "/usr/bin:/bin",
-                    "HERMES_GATEWAY_PROFILE": "platform",
-                    "IS_BOOTSTRAP_PRIMARY": "1",
-                    "PLATFORM_TEMPLATE": str(root / "template"),
-                    "TARGET_DIR": str(root / "data"),
-                    "INSTALL_DIR": str(root / "install"),
-                },
+                env=env,
             )
             written = (profile / "config.yaml").read_text(encoding="utf-8") if (profile / "config.yaml").exists() else None
+            # If written is somehow not a string here, just return what we have so tests can fail normally.
             return proc, written
 
     def test_step_2_6b_seeds_the_config_when_the_profile_has_none(self):
@@ -1314,6 +1326,8 @@ class PlatformFrontDoorTest(unittest.TestCase):
         template = "platform_toolsets:\n  google_chat: [kanban]\nmonitoring: {}\n"
         proc, written = self._run_step_2_6b(template, live=None)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        if not written:
+            self.fail(f"written output is None. stderr: {proc.stderr}")
         self.assertEqual(written, template, "an absent config must be seeded from the image template")
 
     def test_step_2_6b_fills_an_existing_config_without_overruling_it(self):
@@ -1328,6 +1342,8 @@ class PlatformFrontDoorTest(unittest.TestCase):
         live = "platform_toolsets:\n  google_chat: [kanban, memory]\n"
         proc, written = self._run_step_2_6b(template, live=live)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        if not written:
+            self.fail(f"written output is None. stderr: {proc.stderr}")
         parsed = yaml.safe_load(written)
         self.assertEqual(
             parsed["platform_toolsets"]["google_chat"],

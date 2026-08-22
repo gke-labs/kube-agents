@@ -119,7 +119,7 @@ class TestDelegationHeaderSecurity(unittest.TestCase):
             conn.close()
 
             sm = SessionManager(db_path=db_path)
-            for key in ("HERMES_USER_ID", "HERMES_SENDER_ID"):
+            for key in ("HERMES_USER_ID", "HERMES_SENDER_ID") + sm.ENV_SESSION_KEYS:
                 os.environ.pop(key, None)
             context = sm.current_context("slack-1")
 
