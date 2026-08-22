@@ -103,16 +103,42 @@ per-cluster results are then metadata on cards nobody reads.
 
 **This step and the two after it run on the aggregation card from Step 3.** Your input is the
 `metadata` of every per-cluster card in your context — their `topology`, `workloads`,
-`namespace_governance`, `findings` and `gaps` — plus your own fleet discovery from Step 1. Do not
-re-audit a cluster to fill a hole; a cluster that reported a `gaps` entry is a cluster whose gap you
-record.
+`namespace_governance`, `findings` and `gaps`.
+
+**Get the fleet list before you write anything.** If you came here as the aggregation card you did
+not run Step 1 — a different card did, and none of its output reaches you — so run it now:
+
+```
+gcloud config get-value project
+gcloud container clusters list --project=<that project>
+```
+
+If instead you are the Step 2 worker continuing here because no cluster had an agent, you already
+have that list and must not re-run the enumeration. Either way the list, not the child cards, is
+what makes the report whole: the children tell you only about clusters that had an agent to report,
+the `Status` column has no other source, and any listed cluster that returned no `metadata` is one
+nobody has audited.
 
 **A cluster with no Cluster Agent has no `metadata`, and you audit it here yourself.** That is the
-whole install when the roster is empty, and one or two clusters otherwise. Follow Steps 3 and 4 of
-`cluster_inventory_audit_sop.md` for each of them — the same probes, requests/limits and QoS, HPA,
-security context, namespace governance, addons, observability and hardening checks the Cluster
-Agents ran — and produce the same per-cluster shape for yourself. Step 1 gathered control-plane
-topology only; the tables below have workload columns, and nothing else on this path fills them.
+whole install when the roster is empty, and usually none of them otherwise — the reconcile gives
+every listed cluster a profile — but derive the set by comparing the list against the clusters that
+reported rather than assuming it is empty. Follow Steps 2 to 4 of `cluster_inventory_audit_sop.md`
+for each, and record what you find in that SOP's Step 5 `metadata` shape: Step 2 is the
+control-plane topology the fleet table's columns need, and Steps 3 and 4 are the probes,
+requests/limits and QoS, HPA, security context, namespace governance, addons, observability and
+hardening checks the Cluster Agents ran. Do not re-audit a cluster that did report; a cluster that
+returned a `gaps` entry is a cluster whose gap you record.
+
+**Pin `kubectl` to each cluster before you run a single command against it.** That SOP is written
+for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does not. Bare
+`kubectl` from this profile resolves to the credential proxy's own context — the management cluster
+— so an audit run unpinned files the management cluster's workloads under someone else's name, and
+nothing downstream catches it. Use the per-target recipe under **Cluster Credentials** in `AGENTS.md`
+in your own profile home, and build the MCP `projects/…/clusters/…` parent from the row you got out
+of `gcloud container clusters list` — that SOP says to take it from `USER.md`, which describes a
+Cluster Agent's own cluster and not one you are auditing on its behalf. A cluster is very often
+uncovered precisely because credentials for it could not be minted; if that happens to you too,
+record it as unaudited and why, and audit nothing on it.
 
 One check is yours rather than theirs, because it reads a resource only this cluster has: before
 you record an observability gap, read `.status.telemetry` on the PlatformAgent to see which

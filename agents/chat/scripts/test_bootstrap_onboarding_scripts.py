@@ -550,6 +550,10 @@ class ScanGateTest(unittest.TestCase):
         # walk has to be sent there or it produces a topology table with empty
         # workload columns — the empty report this card exists to prevent.
         self.assertIn("single-cluster audit SOP", body)
+        # Topology is that SOP's Step 2, so a range starting at 3 leaves the fleet
+        # table's K8s version, node pool and Workload Identity columns unsourced on
+        # the one path where no Cluster Agent supplies them.
+        self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
     def test_body_propagates_idempotency_keys_to_the_fan_out(self):
         # The root card is guarded by a marker and a key; the cards it spawns

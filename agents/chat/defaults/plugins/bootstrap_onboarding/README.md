@@ -261,7 +261,7 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/da
 onboarding cron jobs after a successful delivery, so there is nothing left to fire and a marker
 reset produces silence. Check with `grep bootstrap /opt/data/cron/jobs.json` inside the pod; if the jobs are gone, either
 re-add them or skip the gate entirely and file the sweep card yourself. Filing directly skips the
-gate's reconcile, and the card body promises the worker that the roster is already current, so run
+gate's reconcile, and the card body forbids the worker from reconciling the roster itself, so run
 `python3 /opt/data/scripts/cluster_agent_reconcile.py` first or the sweep fans out to a stale roster:
 
 ```bash
