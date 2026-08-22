@@ -697,6 +697,11 @@ def build_parser() -> argparse.ArgumentParser:
             # did not, and saying which is what `_check_claim` verifies. A
             # refusal never claims a change, so it is not asked.
             claim = cmd.add_mutually_exclusive_group(required=True)
+            # default=None ensures an explicitly passed `--verify-commit ""`
+            # is recognized by argparse as supplied (since `"" is not None`) rather
+            # than comparing equal to default and failing the mutually-exclusive
+            # group required check. This allows empty SHAs to reach `_check_claim`'s
+            # explicit empty-value safety guard.
             claim.add_argument(
                 "--verify-commit",
                 default=None,
