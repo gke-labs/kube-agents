@@ -86,13 +86,18 @@ class ComposeTests(unittest.TestCase):
         self.assertFalse(message.endswith("\n   "))
 
 
-class ProviderManagedTests(unittest.TestCase):
-    """§4.4: scored and on the list, but never named in a nudge."""
+def observation(**overrides) -> dict:
+    """A provider-managed row with no next step: §4.4 keeps it out of the nudge."""
+    return finding(provider_managed=True, actionable=False, **overrides)
 
-    def test_a_provider_managed_critical_is_not_named(self):
+
+class ProviderManagedTests(unittest.TestCase):
+    """§4.4: a provider-managed observation is rolled up, a provider-managed fault is named."""
+
+    def test_a_provider_managed_observation_is_not_named(self):
         message = nudge.compose(
             [
-                finding(id="a", title="kube-system has no limits", provider_managed=True),
+                observation(id="a", title="kube-system has no limits"),
                 finding(id="b", title="payments api has no probe"),
             ]
         )
@@ -101,19 +106,38 @@ class ProviderManagedTests(unittest.TestCase):
         self.assertIn("1 critical finding is open, 2 in the queue", message)
         self.assertIn("1 provider-managed item is also on the list", message)
 
-    def test_a_provider_managed_row_is_not_the_highest_when_nothing_is_critical(self):
+    def test_a_provider_managed_fault_is_named_like_any_other(self):
+        # The fault exception: a support case is a next step, so `actionable`
+        # stays true and suppressing the row would be the silence §4.4 forbids.
+        message = nudge.compose(
+            [finding(id="a", title="kube-dns is crash-looping", provider_managed=True)]
+        )
+        self.assertIn("kube-dns is crash-looping", message)
+        self.assertNotIn("provider-managed item is also on the list", message)
+
+    def test_an_observation_is_not_the_highest_when_nothing_is_critical(self):
         message = nudge.compose(
             [
-                finding(id="a", severity="major", title="gke-managed thing", provider_managed=True),
+                observation(id="a", severity="major", title="gke-managed thing"),
                 finding(id="b", severity="minor", title="yours"),
             ]
         )
         self.assertIn("The highest is minor: yours", message)
         self.assertNotIn("gke-managed thing", message)
 
-    def test_a_queue_of_nothing_but_provider_managed_rows_says_so(self):
-        message = nudge.compose([finding(id="a", provider_managed=True)])
-        self.assertIn("Nothing on the queue is yours to act on", message)
+    def test_a_hidden_critical_is_never_reported_as_no_criticals_open(self):
+        message = nudge.compose(
+            [
+                observation(id="a", severity="critical", title="gke-managed thing"),
+                finding(id="b", severity="minor", title="yours"),
+            ]
+        )
+        self.assertNotIn("No critical findings are open", message)
+        self.assertIn("No critical findings name work for you (1 provider-managed open)", message)
+
+    def test_a_queue_of_nothing_but_observations_says_so(self):
+        message = nudge.compose([observation(id="a")])
+        self.assertIn("Nothing on the queue has a next step you can take", message)
 
 
 class NudgeHarness(unittest.TestCase):
@@ -176,9 +200,9 @@ class MainTests(NudgeHarness):
             ],
         )
 
-    def test_a_provider_managed_critical_is_not_marked_surfaced(self):
+    def test_a_rolled_up_observation_is_not_marked_surfaced(self):
         _, calls = self.run_with(
-            [finding(id="managed", provider_managed=True), finding(id="mine")]
+            [observation(id="managed"), finding(id="mine")]
         )
         self.assertIn("/v1/findings/mine/surfaced", calls)
         self.assertNotIn("/v1/findings/managed/surfaced", calls)

@@ -66,15 +66,22 @@ def compose(findings: list[dict]) -> str:
     return f"{HEADING}\n\n{_body(findings)}"
 
 
-def _managed_line(findings: list[dict]) -> str:
-    managed = [f for f in findings if f.get("provider_managed")]
-    if not managed:
+def _rolled_up(finding: dict) -> bool:
+    """§4.4: a provider-managed observation is not named, a provider-managed fault is.
+
+    The fault exception turns on `actionable`, which the design defines as
+    whether a next step exists rather than who takes it -- a support case counts.
+    """
+    return bool(finding.get("provider_managed")) and not finding.get("actionable", True)
+
+
+def _managed_line(rolled_up: list[dict]) -> str:
+    if not rolled_up:
         return ""
     return (
-        f"\n\n{len(managed)} provider-managed "
-        f"{'item is' if len(managed) == 1 else 'items are'} also on the list. "
-        "The operator does not own those manifests, so they are observations rather "
-        "than work."
+        f"\n\n{len(rolled_up)} provider-managed "
+        f"{'item is' if len(rolled_up) == 1 else 'items are'} also on the list, with no next "
+        "step the operator can take. Not named here."
     )
 
 
@@ -82,21 +89,28 @@ def _body(findings: list[dict]) -> str:
     if not findings:
         return "Good morning. The findings queue is empty."
 
-    # §4.4: a provider-managed row is scored and stays on the list, but naming it
-    # here would be asking the operator to change a manifest they do not own.
-    nameable = [f for f in findings if not f.get("provider_managed")]
+    rolled_up = [f for f in findings if _rolled_up(f)]
+    nameable = [f for f in findings if not _rolled_up(f)]
     criticals = [f for f in nameable if f.get("severity") == "critical"]
     if not criticals:
         if not nameable:
             return (
-                f"Good morning. Nothing on the queue is yours to act on: all "
-                f"{len(findings)} open items are provider-managed."
+                f"Good morning. Nothing on the queue has a next step you can take: all "
+                f"{len(findings)} open items are provider-managed observations."
             )
+        # Never "no criticals are open" on its own: a rolled-up row can be
+        # critical, and the queue would then hold one this message did not name.
+        hidden = [f for f in rolled_up if f.get("severity") == "critical"]
+        opener = (
+            "No critical findings are open"
+            if not hidden
+            else f"No critical findings name work for you ({len(hidden)} provider-managed open)"
+        )
         top = nameable[0]
         return (
-            f"Good morning. No critical findings are open, and {len(findings)} "
+            f"Good morning. {opener}, and {len(findings)} "
             f"in the queue. The highest is {top.get('severity')}: {top.get('title')} "
-            f"({_where(top)})." + _managed_line(findings)
+            f"({_where(top)})." + _managed_line(rolled_up)
         )
 
     lines = [
@@ -119,7 +133,7 @@ def _body(findings: list[dict]) -> str:
             f"{'finding' if remaining == 1 else 'findings'} not named here. "
             "Ask for the full list."
         )
-    return "\n".join(lines) + _managed_line(findings)
+    return "\n".join(lines) + _managed_line([f for f in findings if _rolled_up(f)])
 
 
 PUBLISHER = "nudge"
@@ -176,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     # problem, and leaving them at zero would make that undetectable. A failure
     # here costs that bookkeeping, not the message, which is already out.
     named = [
-        f for f in findings if f.get("severity") == "critical" and not f.get("provider_managed")
+        f for f in findings if f.get("severity") == "critical" and not _rolled_up(f)
     ][:TOP_N]
     for finding in named:
         try:
