@@ -27,6 +27,7 @@ to run it.
 import json
 import os
 import sys
+import unittest
 from types import SimpleNamespace
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,36 +37,9 @@ if os.path.isdir(_HERMES):
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
 
 try:
-    import agent
-except ImportError:
-    import sys, types
-    agent = types.ModuleType("agent")
-    sys.modules["agent"] = agent
-    agent.memory_provider = types.ModuleType("agent.memory_provider")
-    sys.modules["agent.memory_provider"] = agent.memory_provider
-    class MemoryProvider:
-        pass
-    agent.memory_provider.MemoryProvider = MemoryProvider
-    
-    agent.memory_manager = types.ModuleType("agent.memory_manager")
-    sys.modules["agent.memory_manager"] = agent.memory_manager
-    class MemoryManager:
-        pass
-    agent.memory_manager.MemoryManager = MemoryManager
-
-try:
-    import plugins.memory.hindsight
-except ImportError:
-    plugins = types.ModuleType("plugins")
-    sys.modules["plugins"] = plugins
-    plugins.memory = types.ModuleType("plugins.memory")
-    sys.modules["plugins.memory"] = plugins.memory
-    plugins.memory.load_memory_provider = lambda *a, **kw: None
-    plugins.memory.hindsight = types.ModuleType("plugins.memory.hindsight")
-    sys.modules["plugins.memory.hindsight"] = plugins.memory.hindsight
-    class HindsightMemoryProvider:
-        pass
-    plugins.memory.hindsight.HindsightMemoryProvider = HindsightMemoryProvider
+    from . import _stubs  # noqa: F401
+except (ImportError, ValueError):
+    import _stubs  # type: ignore # noqa: F401
 
 from kube_agents_memory import (  # noqa: E402
     NO_IDENTITY_NOTICE,
@@ -125,29 +99,26 @@ def _write_scope(p):
     raise AssertionError("memory_retain is not advertised")
 
 
-def test_an_unattended_write_with_no_scope_reaches_shared_memory():
-    """The whole bug, in one call: the shape an agent writes without thinking.
-
-    The old default was 'personal', so this exact call returned an error in
-    every cron and event session there has ever been.
-    """
-    p, retained = provider()
-    r = json.loads(p.handle_tool_call("memory_retain", {
-        "content": "Dataplane V2 is off on kage-management, so NetworkPolicies are inert."
-    }))
-    assert r.get("result") == "Stored in shared memory.", r
-    assert retained["items"][0]["tags"] == [SHARED_TAG], retained
-
-
-import unittest
-
 class TestUnattendedSharedWrites(unittest.TestCase):
+    def test_an_unattended_write_with_no_scope_reaches_shared_memory(self):
+        """The whole bug, in one call: the shape an agent writes without thinking.
+
+        The old default was 'personal', so this exact call returned an error in
+        every cron and event session there has ever been.
+        """
+        p, retained = provider()
+        r = json.loads(p.handle_tool_call("memory_retain", {
+            "content": "Dataplane V2 is off on kage-management, so NetworkPolicies are inert."
+        }))
+        self.assertEqual(r.get("result"), "Stored in shared memory.", r)
+        self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
+
     def test_an_attributed_write_with_no_scope_is_still_personal(self):
         """The guardrail on the line above: DMs must not start writing to everyone."""
         p, retained = provider(user_tag="user:alice")
         r = json.loads(p.handle_tool_call("memory_retain", {"content": "Alice prefers dry runs."}))
-        assert r.get("result") == "Stored in personal memory.", r
-        assert retained["items"][0]["tags"] == ["user:alice"], retained
+        self.assertEqual(r.get("result"), "Stored in personal memory.", r)
+        self.assertEqual(retained["items"][0]["tags"], ["user:alice"], retained)
 
     def test_an_unqualified_write_in_a_group_thread_is_refused_not_published(self):
         """The mirror image of the headline test, and the reason it is keyed on
@@ -162,9 +133,9 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         r = json.loads(p.handle_tool_call("memory_retain", {
             "content": "Dmitry is on call for networking next week.",
         }))
-        assert "error" in r, r
-        assert r["error"] == SHARED_SESSION_NOTICE, r
-        assert not retained, retained
+        self.assertIn("error", r, r)
+        self.assertEqual(r["error"], SHARED_SESSION_NOTICE, r)
+        self.assertFalse(retained, retained)
 
     def test_a_group_thread_can_still_write_shared_when_it_says_so(self):
         """Refusing the default must not amount to refusing the scope. A team-wide
@@ -173,17 +144,17 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         r = json.loads(p.handle_tool_call("memory_retain", {
             "content": "Releases are cut on Tuesdays.", "scope": "shared",
         }))
-        assert r.get("result") == "Stored in shared memory.", r
-        assert retained["items"][0]["tags"] == [SHARED_TAG], retained
+        self.assertEqual(r.get("result"), "Stored in shared memory.", r)
+        self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
 
     def test_a_group_thread_keeps_personal_in_its_schema(self):
         """Dropping 'personal' from the enum would remove the only way to say "this
         is one person's" — and with it the refusal that keeps the fact unpublished.
         The space is told, in the description, that personal is the default."""
         scope = _write_scope(provider(unattended=False)[0])
-        assert scope["enum"] == ["personal", "shared"], scope
-        assert "no user identity" not in scope["description"], scope
-        assert "nobody is present" not in scope["description"], scope
+        self.assertEqual(scope["enum"], ["personal", "shared"], scope)
+        self.assertNotIn("no user identity", scope["description"], scope)
+        self.assertNotIn("nobody is present", scope["description"], scope)
 
     def test_asking_for_personal_without_an_identity_still_fails_loudly(self):
         """Defaulting to shared must not become 'silently reroute a personal write'.
@@ -195,28 +166,28 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         r = json.loads(p.handle_tool_call("memory_retain", {
             "content": "secret", "scope": "personal",
         }))
-        assert "error" in r, r
-        assert "no user identity" in r["error"], r
-        assert not retained, retained
+        self.assertIn("error", r, r)
+        self.assertIn("no user identity", r["error"], r)
+        self.assertFalse(retained, retained)
 
     def test_the_unattended_schema_offers_shared_and_only_shared(self):
         """A scope the session is refused has no business in the enum."""
         scope = _write_scope(provider()[0])
-        assert scope["enum"] == ["shared"], scope
-        assert "only option" in scope["description"], scope
+        self.assertEqual(scope["enum"], ["shared"], scope)
+        self.assertIn("only option", scope["description"], scope)
         # And the attributed session keeps both, or personal memory just vanished.
-        assert _write_scope(provider(user_tag="user:x")[0])["enum"] == ["personal", "shared"]
+        self.assertEqual(_write_scope(provider(user_tag="user:x")[0])["enum"], ["personal", "shared"])
 
     def test_every_variant_carries_the_test_for_what_belongs(self):
         """The old wording ('a fact the user states') excluded the unattended case
         by construction. Whatever replaces it has to reach all three."""
         for p in (provider()[0], provider(unattended=False)[0], provider(user_tag="user:alice")[0]):
             d = _write_scope(p)["description"]
-            assert "could not find out for itself" in d, d
+            self.assertIn("could not find out for itself", d, d)
             # The two exclusions are the point; a description that keeps only the
             # invitation would fill the corpus with stale state and self-echo.
-            assert "query that instead" in d, d
-            assert "conclusion you reached this session" in d, d
+            self.assertIn("query that instead", d, d)
+            self.assertIn("conclusion you reached this session", d, d)
 
     def test_a_session_with_no_identity_is_not_told_capture_is_automatic(self):
         """It is not, for either of them — `_auto_retain` is off without a user tag,
@@ -228,14 +199,14 @@ class TestUnattendedSharedWrites(unittest.TestCase):
             return next(s for s in p.get_tool_schemas() if s["name"] == "memory_retain")["description"]
 
         unattended = _retain_description(provider()[0])
-        assert "only way anything you learn here is kept" in unattended, unattended
-        assert "captured automatically at the end of a session" not in unattended, unattended
+        self.assertIn("only way anything you learn here is kept", unattended, unattended)
+        self.assertNotIn("captured automatically at the end of a session", unattended, unattended)
 
         space = _retain_description(provider(unattended=False)[0])
-        assert "only way anything you learn here is kept" not in space, space
-        assert "belongs to the whole team" in space, space
+        self.assertNotIn("only way anything you learn here is kept", space, space)
+        self.assertIn("belongs to the whole team", space, space)
 
-        assert "captured automatically" in _retain_description(provider(user_tag="user:alice")[0])
+        self.assertIn("captured automatically", _retain_description(provider(user_tag="user:alice")[0]))
 
     def test_a_read_only_profile_is_unaffected_in_every_state(self):
         """Specialists stay barred; none of this reaches them."""
@@ -245,7 +216,8 @@ class TestUnattendedSharedWrites(unittest.TestCase):
                     read_only=True, has_identity=has_identity, unattended=unattended,
                 )
             ]
-            assert "memory_retain" not in names, names
+            self.assertNotIn("memory_retain", names, names)
+
 
 if __name__ == "__main__":
     unittest.main()

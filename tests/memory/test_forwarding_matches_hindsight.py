@@ -48,47 +48,9 @@ if os.path.isdir(_HERMES):
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
 
 try:
-    import agent
-except ImportError:
-    import sys, types
-    agent = types.ModuleType("agent")
-    sys.modules["agent"] = agent
-    agent.memory_provider = types.ModuleType("agent.memory_provider")
-    sys.modules["agent.memory_provider"] = agent.memory_provider
-    class MemoryProvider:
-        pass
-    agent.memory_provider.MemoryProvider = MemoryProvider
-    
-    agent.memory_manager = types.ModuleType("agent.memory_manager")
-    sys.modules["agent.memory_manager"] = agent.memory_manager
-    class MemoryManager:
-        @staticmethod
-        def _provider_sync_accepts_messages(*args, **kwargs): return True
-        def __init__(self, *args, **kwargs): pass
-        def _submit_background(self, *args, **kwargs): pass
-        def add_provider(self, *args, **kwargs): pass
-        def sync_all(self, *args, **kwargs): pass
-    agent.memory_manager.MemoryManager = MemoryManager
-
-try:
-    import plugins.memory.hindsight
-except ImportError:
-    plugins = types.ModuleType("plugins")
-    sys.modules["plugins"] = plugins
-    plugins.memory = types.ModuleType("plugins.memory")
-    sys.modules["plugins.memory"] = plugins.memory
-    plugins.memory.load_memory_provider = lambda *a, **kw: None
-    plugins.memory.hindsight = types.ModuleType("plugins.memory.hindsight")
-    sys.modules["plugins.memory.hindsight"] = plugins.memory.hindsight
-    class HindsightMemoryProvider:
-        def shutdown(self): pass
-        def queue_prefetch(self, *a, **kw): pass
-        def prefetch(self, *a, **kw): pass
-        def on_turn_start(self, *a, **kw): pass
-        def on_session_switch(self, *a, **kw): pass
-        def sync_turn(self, *a, **kw): pass
-        def on_session_end(self, *a, **kw): pass
-    plugins.memory.hindsight.HindsightMemoryProvider = HindsightMemoryProvider
+    from . import _stubs  # noqa: F401
+except (ImportError, ValueError):
+    import _stubs  # type: ignore # noqa: F401
 
 from agent.memory_manager import MemoryManager  # noqa: E402
 from kube_agents_memory import KubeAgentsMemoryProvider  # noqa: E402
@@ -176,7 +138,7 @@ class TestForwardingMatchesHindsight(unittest.TestCase):
         up the message context for good, so the fix has to survive this staying True.
         """
         p, _ = provider()
-        assert MemoryManager._provider_sync_accepts_messages(p) is True
+        self.assertTrue(MemoryManager._provider_sync_accepts_messages(p))
 
     def test_a_synced_turn_lands_on_the_stock_provider(self):
         p, log = provider()
@@ -186,20 +148,20 @@ class TestForwardingMatchesHindsight(unittest.TestCase):
             session_id="20260818_120000_abcd1234",
             messages=[{"role": "user", "content": "what is RB-114?"}],
         )
-        assert [m for m, _, _ in log] == ["sync_turn"], log
+        self.assertEqual([m for m, _, _ in log], ["sync_turn"])
         assert_binds(log)
 
         _, args, kwargs = log[0]
-        assert args == ("what is RB-114?", "Drain the node before upgrading."), args
+        self.assertEqual(args, ("what is RB-114?", "Drain the node before upgrading."))
         # session_id survives — it is what ties a retained document back to a
         # conversation, and dropping it would turn one bug into a quieter one.
-        assert kwargs == {"session_id": "20260818_120000_abcd1234"}, kwargs
+        self.assertEqual(kwargs, {"session_id": "20260818_120000_abcd1234"})
 
     def test_a_read_only_profile_still_syncs_nothing(self):
         """#112's guarantee, re-checked through the real caller this time."""
         p, log = provider(read_only=True)
         manager_for(p).sync_all("u", "a", session_id="s", messages=[{"role": "user"}])
-        assert log == [], log
+        self.assertEqual(log, [])
 
     def test_every_forwarded_hook_binds(self):
         """The general drift guard: not just the one method that broke.
@@ -216,7 +178,7 @@ class TestForwardingMatchesHindsight(unittest.TestCase):
         p.shutdown()
         manager_for(p).sync_all("u", "a", session_id="s2", messages=[{"role": "user"}])
 
-        assert sorted({m for m, _, _ in log}) == sorted(FORWARDED), log
+        self.assertEqual(sorted({m for m, _, _ in log}), sorted(FORWARDED))
         assert_binds(log)
 
     def test_a_keyword_the_target_learns_about_is_forwarded(self):
@@ -234,7 +196,7 @@ class TestForwardingMatchesHindsight(unittest.TestCase):
 
         p._hindsight.sync_turn = wide
         manager_for(p).sync_all("u", "a", session_id="s1", messages=[{"role": "user"}])
-        assert log[0][2]["messages"] == [{"role": "user"}], log
+        self.assertEqual(log[0][2]["messages"], [{"role": "user"}])
 
     def test_a_failed_forward_is_not_silent(self):
         """DEBUG is what let this run for five days; the level is part of the fix."""
@@ -261,11 +223,12 @@ class TestForwardingMatchesHindsight(unittest.TestCase):
             logger.removeHandler(handler)
 
         warned = [r for r in records if r.levelno >= logging.WARNING]
-        assert warned, [(r.levelname, r.getMessage()) for r in records]
-        assert "sync_turn" in warned[0].getMessage(), warned[0].getMessage()
+        self.assertTrue(warned, [(r.levelname, r.getMessage()) for r in records])
+        self.assertIn("sync_turn", warned[0].getMessage())
         # The traceback has to come with it, or the line names the method and not
         # the reason, and the next person is back to guessing.
-        assert warned[0].exc_info is not None
+        self.assertIsNotNone(warned[0].exc_info)
+
 
 if __name__ == "__main__":
     unittest.main()

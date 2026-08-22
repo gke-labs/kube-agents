@@ -29,6 +29,7 @@ import importlib.util
 import itertools
 import os
 import sys
+import unittest
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -37,33 +38,9 @@ if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
 
 try:
-    import agent
-except ImportError:
-    import sys, types
-    agent = types.ModuleType("agent")
-    sys.modules["agent"] = agent
-    agent.memory_provider = types.ModuleType("agent.memory_provider")
-    sys.modules["agent.memory_provider"] = agent.memory_provider
-    class MemoryProvider: pass
-    agent.memory_provider.MemoryProvider = MemoryProvider
-    
-    agent.memory_manager = types.ModuleType("agent.memory_manager")
-    sys.modules["agent.memory_manager"] = agent.memory_manager
-    class MemoryManager: pass
-    agent.memory_manager.MemoryManager = MemoryManager
-
-try:
-    import plugins.memory.hindsight
-except ImportError:
-    plugins = types.ModuleType("plugins")
-    sys.modules["plugins"] = plugins
-    plugins.memory = types.ModuleType("plugins.memory")
-    sys.modules["plugins.memory"] = plugins.memory
-    plugins.memory.load_memory_provider = lambda *a, **kw: None
-    plugins.memory.hindsight = types.ModuleType("plugins.memory.hindsight")
-    sys.modules["plugins.memory.hindsight"] = plugins.memory.hindsight
-    class HindsightMemoryProvider: pass
-    plugins.memory.hindsight.HindsightMemoryProvider = HindsightMemoryProvider
+    from . import _stubs  # noqa: F401
+except (ImportError, ValueError):
+    import _stubs  # type: ignore # noqa: F401
 
 PLUGIN_DIR = _REPO / "agents" / "chat" / "plugins" / "memory" / "kube_agents_memory"
 SUBMODULES = sorted(f.stem for f in PLUGIN_DIR.glob("*.py") if f.name != "__init__.py")
@@ -113,18 +90,16 @@ def _load_like_hermes(order):
     return module
 
 
-import unittest
-
 class TestPluginLoads(unittest.TestCase):
     def test_the_package_registers_under_every_submodule_order(self):
         """glob order is the filesystem's business; none of them may break the load."""
-        assert len(SUBMODULES) >= 4, SUBMODULES
+        self.assertGreaterEqual(len(SUBMODULES), 4, SUBMODULES)
         for order in itertools.permutations(SUBMODULES):
             module = _load_like_hermes(order)
             collector = _Collector()
             module.register(collector)
-            assert collector.provider is not None, order
-            assert collector.provider.name == "kube_agents_memory", order
+            self.assertIsNotNone(collector.provider, order)
+            self.assertEqual(collector.provider.name, "kube_agents_memory", order)
 
     def test_the_entry_point_still_exports_what_the_scripts_import(self):
         """`__init__` is a facade now; the names other code reads must survive it."""
@@ -133,14 +108,15 @@ class TestPluginLoads(unittest.TestCase):
                      "CHECKPOINT_STRATEGY", "RETAIN_STRATEGIES", "NO_IDENTITY_NOTICE",
                      "KubeAgentsMemoryProvider", "sanitize_user_id",
                      "memory_is_read_only", "apply_scoping", "register"):
-            assert hasattr(module, name), name
-            assert name in module.__all__ or name == "register", name
+            self.assertTrue(hasattr(module, name), name)
+            self.assertTrue(name in module.__all__ or name == "register", name)
 
     def test_every_submodule_is_reachable_from_the_package(self):
         """A module nothing imports is a module the loader would exec and forget."""
         module = _load_like_hermes(SUBMODULES)
         for stem in SUBMODULES:
-            assert f"{module.__name__}.{stem}" in sys.modules, stem
+            self.assertIn(f"{module.__name__}.{stem}", sys.modules, stem)
+
 
 if __name__ == "__main__":
     unittest.main()
