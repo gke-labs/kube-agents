@@ -222,8 +222,12 @@ known credential-disclosure, credential-replacement, and self-modification
 operations, and the GitHub **write** path: merging a pull request
 (`github.merge`), approving a review (`github.assent`), mutating through the
 REST API (`github.api-mutation`), triggering workflows or releases
-(`github.pipeline-trigger`), and repository administration such as secrets,
-variables, rulesets and repository deletion (`github.repo-administration`).
+(`github.pipeline-trigger`), and repository administration — secrets,
+variables, and repository deletion, archiving or editing
+(`github.repo-administration`). Rulesets are not in that last list because
+`gh ruleset` cannot change one: it has only `check`, `list` and `view`.
+Reshaping a ruleset goes through `gh api`, so `github.api-mutation` is the
+rule that refuses it and the id an operator will see.
 Those five exist because the agent is the proposer: the review gate is only a
 gate if the thing that opens a pull request cannot also merge it. Pipelines and redirections are interpreted by the sandbox shell
 around an individual wrapper invocation, so they cannot execute inside the

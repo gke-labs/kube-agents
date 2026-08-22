@@ -148,6 +148,39 @@ class ShippedPolicyTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertBlocked(argv, "github.repo-administration")
 
+    def test_a_ruleset_is_covered_where_the_docs_say_it_is(self):
+        """Rulesets are refused by `github.api-mutation`, not by the rule above.
+
+        Worth a case of its own because the docs make that claim in prose.
+        `docs/credential-isolation-design.md` and the site reference page are
+        where an operator looks up a rule id from a SECURITY_POLICY_BLOCKED
+        line, and both of them said `github.repo-administration` enumerated
+        rulesets after the `ruleset` branch had been dropped from it -- a page
+        describing a deny surface the shipped policy did not have. The prose now
+        names `github.api-mutation` instead, so this is what stops the two
+        drifting apart again.
+        """
+        for argv in (
+            ["gh", "api", "-X", "PUT", "repos/o/r/rulesets/1"],
+            ["gh", "api", "-X", "POST", "repos/o/r/rulesets"],
+            ["gh", "api", "-X", "DELETE", "repos/o/r/rulesets/1"],
+            ["gh", "api", "-XPUT", "repos/o/r/rulesets/1"],
+            ["gh", "api", "repos/o/r/rulesets", "-f", "name=main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertBlocked(argv, "github.api-mutation")
+
+        # And the read verbs `gh ruleset` actually has stay usable, which is the
+        # other half of why the branch was dropped rather than fixed.
+        for argv in (
+            ["gh", "ruleset", "list"],
+            ["gh", "ruleset", "view", "1"],
+            ["gh", "ruleset", "check", "main"],
+            ["gh", "api", "repos/o/r/rulesets"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertAllowed(argv)
+
     def test_a_denied_command_cannot_be_re_spelled_as_an_alias(self):
         """gh remembers a new name for any command, in a dir it keeps.
 
