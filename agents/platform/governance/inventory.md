@@ -10,6 +10,11 @@ chat as `/opt/data/INVENTORY.md`. Your job is to be thorough; being brief is the
 
 ## Pre-Execution Check
 
+0. **Which card are you?** If your card body told you to resume this SOP at Step 4, you are the
+   aggregation worker: go straight there and skip the status check below. It describes the state
+   you are in — no `INVENTORY.raw.md`, no `INVENTORY.md` — and would send you back through
+   discovery and the fan-out you were created to collect, re-filing your own card as its own
+   parent and finishing onboarding with no report written.
 1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.raw.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.raw.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
    - If `/opt/data/INVENTORY.md` is already built on disk, the whole flow has run: return strictly `[SILENT]` immediately and do nothing.
    - If `/opt/data/INVENTORY.raw.md` exists but `/opt/data/INVENTORY.md` does not, the sweep already finished and the handoff is what did not: **skip discovery entirely and go straight to Step 5** to file the prioritization card. Do not re-scan the fleet, and do not write the report yourself.
@@ -30,43 +35,115 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 
 ---
 
-## Step 2: Workload & Service SRE Audit
+## Step 2: Fan the per-cluster audit out to the Cluster Agents
 
-For each running cluster discovered in Step 1, perform an SRE production-readiness audit across all namespaces and active workloads:
+The workload audit is single-cluster runtime work, so each cluster's own Cluster Agent runs it, not
+you (`SOUL.md` §6). Create one card per cluster from Step 1 that has a Cluster Agent on the
+roster, **all of them up front, in one
+burst and with no `parents`**, so the dispatcher runs them concurrently:
 
-1. **Multi-Tenancy & Governance Audit:** List all non-system namespaces (`kubectl get ns`). Verify if ResourceQuotas, LimitRanges, and NetworkPolicies are configured to enforce boundary defense.
-2. **Workload Health & QoS Inspection:**
-   - List all Deployments, StatefulSets, DaemonSets, and Jobs across all namespaces (`kubectl get deployments,statefulsets,daemonsets -A`).
-   - **Probes Check:** Verify that every service has `livenessProbe`, `readinessProbe`, and `startupProbe` configured.
-   - **Resource Management Check:** Verify that containers define explicit `requests` and `limits` (check Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
-   - **Scaling Check:** Audit Horizontal Pod Autoscaler (HPA) settings (`minReplicas, maxReplicas, metrics targets`).
-   - **Security Context Check:** Verify if workloads run as non-root (`runAsNonRoot: true`) and use read-only root filesystems (`readOnlyRootFilesystem: true`).
-3. **Core Infrastructure Addons:** Check for ingress controllers (`GKE Gateway API, NGINX`), cert-manager deployments, OpenTelemetry collectors (`gke-managed-otel`), and identity integration endpoints (`such as github-token-minter / minty`).
+```
+kanban_create(
+  assignee='<that cluster's Cluster Agent profile>',
+  idempotency_key='bootstrap-inventory-cluster-<cluster>-<location>',
+  title='Report cluster inventory: <cluster>',
+  body=<the instructions below>,
+)
+```
+
+The body must send that agent to the single-cluster SOP, reading whichever of these exists:
+
+- `/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md`
+- `/opt/platform-template/governance/cluster_inventory_audit_sop.md`
+
+and tell it to complete its card with the structured `metadata` that SOP specifies.
+
+**Point at the SOP; do not summarise it in the card body.** The checks are specific — probes,
+requests and limits and the resulting QoS class, HPA coverage, `privileged` / `hostPID` /
+`hostNetwork`, ResourceQuotas, LimitRanges, NetworkPolicies, Workload Identity — and so is the
+`metadata` shape the aggregation stage reads. A body written freehand loses both, and what comes
+back is a topology listing with no findings in it. That has been observed: four cards completed in
+under two minutes each, every one of them with no `metadata` at all, and the fleet report that
+followed named zero problems on a fleet that had them.
+
+**Do not create, repair, or delete a Cluster Agent profile.** Profile lifecycle belongs to
+`cluster_agent_reconcile.py`, which holds the `RECONCILE_EXCLUDE` opt-out and the create/prune
+rules; a profile you create by hand is one the next reconcile run may immediately prune, and you
+will loop. A cluster the roster does not cover is yours to audit in Step 4 — or, if you cannot
+reach it, a row in the report saying so.
 
 ---
 
-## Step 3: Proactive GKE Infrastructure Improvement Analysis
+## Step 3: File the aggregation card and stand down
 
-Based on your discovery and engineering best practices (`use the developer_knowledge tool to query for up-to-date Google Cloud and GKE best practices when appropriate`), proactively evaluate gaps against modern GKE patterns:
+Create one more card, assigned to **yourself**, listing every per-cluster card from Step 2 in
+`parents`. That is the fan-in: the dispatcher spawns you on it once all of them are done, with each
+one's `metadata` in your context.
 
-### 1. Observability & Telemetry (`OpenTelemetry & Managed Prometheus`)
+```
+kanban_create(
+  assignee='platform',
+  idempotency_key='bootstrap-inventory-aggregate',
+  title='Aggregate cluster inventory reports',
+  parents=[<every per-cluster card id from Step 2>],
+  body=<tell yourself to resume this SOP at Step 4>,
+)
+```
 
-- Check if an OpenTelemetry collector is deployed and actively receiving workload traces/metrics. `gke-managed-otel` is the default, but a self-hosted collector (commonly `otel-collector.otel-collector`) is equally valid — read `.status.telemetry` on the PlatformAgent to see which one the agents are actually exporting to, rather than inferring from the namespace list. Note a high-priority recommendation to enable OTel collection (`OTLP / Telemetry API`) only if no collector is reachable at all.
-- Check if Google Cloud `Managed Service for Prometheus` (`gmp-system` / PodMonitoring CRDs) is enabled to eliminate manual Prometheus scraping overhead.
+Run `python3 /opt/data/scripts/kanban_notify_propagate.py --to <card_id>` for the fan-in card so the user gets one closing
+summary, then **complete this card**. Steps 4 to 6 run on the aggregation card, not this one.
 
-### 2. Alerting Hygiene & SLO Definition
-
-- Evaluate whether alerting relies on Service Level Objectives (`SLOs`) and error budget burn rates rather than noisy, transient infrastructure thresholds (`such as CPU usage`).
-- Identify missing standard SRE health alerts: `Pod CrashLoopBackOff / OOMKilled events`, `Control Plane API latency spikes`, `PersistentVolumeClaim exhaustion`, and `Workload probe failures`.
-
-### 3. GKE Security Hardening & Workload Identity
-
-- Verify whether pods accessing Google Cloud APIs (`e.g., Cloud KMS, Cloud Storage, BigQuery`) use **GKE Workload Identity** (`serviceAccountName` with `iam.gke.io/gcp-service-account` annotation) rather than static service accounts or JSON key files.
-- For Standard mode clusters, evaluate adherence to baseline hardening: **Shielded GKE Nodes**, **Dataplane V2 (`eBPF`)**, **Node Auto-Upgrades**, and **Pod Security Admission (`PSA`)**.
+**Do not wait here.** Blocking this card on the per-cluster cards deadlocks the board (`SOUL.md`
+§0), and completing this card before the fan-in exists loses the fleet report entirely — the
+per-cluster results are then metadata on cards nobody reads.
 
 ---
 
 ## Step 4: Compile Raw Inventory (`/opt/data/INVENTORY.raw.md`)
+
+**This step and the two after it run on the aggregation card from Step 3.** Your input is the
+`metadata` of every per-cluster card in your context — their `topology`, `workloads`,
+`namespace_governance`, `findings` and `gaps`.
+
+**Get the fleet list before you write anything.** If you came here as the aggregation card you did
+not run Step 1 — a different card did, and none of its output reaches you — so run it now:
+
+```
+gcloud config get-value project
+gcloud container clusters list --project=<that project>
+```
+
+If instead you are the Step 2 worker continuing here because no cluster had an agent, you already
+have that list and must not re-run the enumeration. Either way the list, not the child cards, is
+what makes the report whole: the children tell you only about clusters that had an agent to report,
+the `Status` column has no other source, and any listed cluster that returned no `metadata` is one
+nobody has audited.
+
+**A cluster with no Cluster Agent has no `metadata`, and you audit it here yourself.** That is the
+whole install when the roster is empty, and usually none of them otherwise — the reconcile gives
+every listed cluster a profile — but derive the set by comparing the list against the clusters that
+reported rather than assuming it is empty. Follow Steps 2 to 4 of `cluster_inventory_audit_sop.md`
+for each, and record what you find in that SOP's Step 5 `metadata` shape: Step 2 is the
+control-plane topology the fleet table's columns need, and Steps 3 and 4 are the probes,
+requests/limits and QoS, HPA, security context, namespace governance, addons, observability and
+hardening checks the Cluster Agents ran. Do not re-audit a cluster that did report; a cluster that
+returned a `gaps` entry is a cluster whose gap you record.
+
+**Pin `kubectl` to each cluster before you run a single command against it.** That SOP is written
+for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does not. Bare
+`kubectl` from this profile resolves to the credential proxy's own context — the management cluster
+— so an audit run unpinned files the management cluster's workloads under someone else's name, and
+nothing downstream catches it. Use the per-target recipe under **Cluster Credentials** in `AGENTS.md`
+in your own profile home, and build the MCP `projects/…/clusters/…` parent from the row you got out
+of `gcloud container clusters list` — that SOP says to take it from `USER.md`, which describes a
+Cluster Agent's own cluster and not one you are auditing on its behalf. A cluster is very often
+uncovered precisely because credentials for it could not be minted; if that happens to you too,
+record it as unaudited and why, and audit nothing on it.
+
+One check is yours rather than theirs, because it reads a resource only this cluster has: before
+you record an observability gap, read `.status.telemetry` on the PlatformAgent to see which
+collector the agents are actually exporting to. A Cluster Agent pinned to a workload cluster cannot
+see it, so it reports what it found on its own cluster and you reconcile.
 
 Write the unified file `/opt/data/INVENTORY.raw.md`. **This is the complete findings set, and it is the only record of what the sweep saw — the prioritization stage reads this file and nothing else, so anything you omit here is invisible for the rest of onboarding.** Write in clean Markdown. Do not leave placeholders, "TODO", or truncated tables; fill in every value you discovered (use `n/a` only when a value genuinely does not apply).
 
@@ -92,6 +169,12 @@ Structure the file in this order:
    - **Priority 3 — Observability & Telemetry** (OpenTelemetry collection, Managed Service for Prometheus, SLO/error-budget alerting, missing standard SRE alerts).
 
    For each item, name the affected cluster/namespace/workload where applicable and state the recommended action concisely, so the reader can act on it directly.
+
+   **Every `findings[]` entry from every per-cluster card belongs in one of these three groups.**
+   This section is the only part of the file the prioritization stage can rank, so a finding a
+   Cluster Agent reported and this list omits is a finding the user never sees. Carry its
+   `severity` through — the next stage classifies against its own anchors, but it reads yours as
+   the evidence for doing so.
 
 ---
 

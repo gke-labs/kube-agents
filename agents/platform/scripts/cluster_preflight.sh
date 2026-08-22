@@ -54,6 +54,7 @@ fi
 USER_MD="$HERMES_HOME/USER.md"
 
 STATUS="ok"
+CHECK=""
 REASON=""
 REMEDIATION=""
 EVIDENCE=""
@@ -70,11 +71,15 @@ else
     capped() { "$@"; }
 fi
 
+# The check number is reported, not merely used for ordering: two checks can share a
+# remediation ("Re-scaffold the profile") while meaning different things to the caller,
+# and the single-cluster inventory-audit SOP routes on which check failed.
 fail() {
     STATUS="failed"
-    REASON="$1"
-    REMEDIATION="$2"
-    EVIDENCE="${3:-}"
+    CHECK="$1"
+    REASON="$2"
+    REMEDIATION="$3"
+    EVIDENCE="${4:-}"
 }
 
 # Read one `- <field>: <value>` line out of USER.md, as written by
@@ -96,7 +101,7 @@ EXPECTED_CONTEXT=""
 #    name from them, and a partial identity cannot be checked against anything.
 if [ "$STATUS" = "ok" ]; then
     if [ ! -f "$USER_MD" ]; then
-        fail "This Cluster Agent has no identity file (USER.md missing at $USER_MD)." \
+        fail "1" "This Cluster Agent has no identity file (USER.md missing at $USER_MD)." \
              "Re-scaffold the profile via the Platform Agent (cluster_agent_profile.py create)." \
              "expected identity file not found: $USER_MD"
     else
@@ -108,7 +113,7 @@ if [ "$STATUS" = "ok" ]; then
         [ -z "$CLUSTER" ] && MISSING="$MISSING cluster"
         [ -z "$LOCATION" ] && MISSING="$MISSING location"
         if [ -n "$MISSING" ]; then
-            fail "This Cluster Agent's identity file is present but incomplete (no cluster identity)." \
+            fail "1" "This Cluster Agent's identity file is present but incomplete (no cluster identity)." \
                  "Re-scaffold the profile so USER.md records its project/cluster/location." \
                  "USER.md at $USER_MD is missing:$MISSING"
         else
@@ -123,11 +128,11 @@ fi
 # 2. Kubeconfig pinned and non-empty.
 if [ "$STATUS" = "ok" ]; then
     if [ ! -f "$KUBECONFIG" ]; then
-        fail "Kubeconfig is not pinned for this cluster (no file at $KUBECONFIG)." \
+        fail "2" "Kubeconfig is not pinned for this cluster (no file at $KUBECONFIG)." \
              "Re-scaffold the profile; scaffolding runs 'gcloud container clusters get-credentials' and pins KUBECONFIG via <home>/.env." \
              "missing kubeconfig: $KUBECONFIG"
     elif [ ! -s "$KUBECONFIG" ]; then
-        fail "Kubeconfig at $KUBECONFIG is empty." \
+        fail "2" "Kubeconfig at $KUBECONFIG is empty." \
              "Re-scaffold the profile to re-fetch cluster credentials." \
              "empty kubeconfig: $KUBECONFIG"
     fi
@@ -135,7 +140,7 @@ fi
 
 # 2b. kubectl present. Checks 3-5 all need it, so establish it once.
 if [ "$STATUS" = "ok" ] && ! command -v kubectl >/dev/null 2>&1; then
-    fail "kubectl is not available in this agent's environment." \
+    fail "2b" "kubectl is not available in this agent's environment." \
          "This indicates a broken image/toolset; escalate to the Platform Agent." \
          "kubectl not found on PATH"
 fi
@@ -169,15 +174,15 @@ if [ "$STATUS" = "ok" ]; then
     [ "$CTX_RC" -eq 124 ] && CTX_ERR="timed out after 15s"
 
     if [ "$CTX_RC" -ne 0 ]; then
-        fail "Could not read the pinned kubeconfig: kubectl itself failed." \
+        fail "3" "Could not read the pinned kubeconfig: kubectl itself failed." \
              "This is not a bad pin — the command did not run. The credential proxy sidecar is the usual cause; check it is up and reachable, then re-run preflight. Do not re-scaffold: that runs through the same proxy." \
              "kubectl --kubeconfig=$KUBECONFIG config current-context exited $CTX_RC: ${CTX_ERR:-no error output}"
     elif [ -z "$PINNED_CONTEXT" ]; then
-        fail "The pinned kubeconfig does not select a cluster (no current-context)." \
+        fail "3" "The pinned kubeconfig does not select a cluster (no current-context)." \
              "Re-scaffold the profile to re-fetch cluster credentials." \
              "kubectl --kubeconfig=$KUBECONFIG config current-context returned nothing"
     elif [ "$PINNED_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
-        fail "The pinned kubeconfig is for a different cluster than this agent is scoped to." \
+        fail "3" "The pinned kubeconfig is for a different cluster than this agent is scoped to." \
              "Do not proceed: any finding would describe the wrong cluster. Escalate to the Platform Agent to re-pin this profile's kubeconfig for $CLUSTER." \
              "USER.md declares $EXPECTED_CONTEXT, but $KUBECONFIG selects $PINNED_CONTEXT"
     fi
@@ -200,13 +205,13 @@ fi
 #    context. This has to run exactly as a skill would.
 if [ "$STATUS" = "ok" ]; then
     if [ "$KUBECONFIG_EXPORTED" = "0" ]; then
-        fail "This agent's environment does not export KUBECONFIG." \
+        fail "4" "This agent's environment does not export KUBECONFIG." \
              "Do not proceed: the pinned kubeconfig exists but no command will use it, so every kubectl resolves to the credential proxy's own cluster. Escalate to the Platform Agent to re-pin the profile (cluster_agent_profile.py writes KUBECONFIG into <home>/.env)." \
              "$KUBECONFIG selects $PINNED_CONTEXT, but KUBECONFIG is unset in the environment; preflight only found the file by falling back to \$HERMES_HOME/kubeconfig.yaml"
     else
         EFFECTIVE_CONTEXT="$(capped kubectl config current-context 2>/dev/null | tr -d '[:space:]')"
         if [ "$EFFECTIVE_CONTEXT" != "$PINNED_CONTEXT" ]; then
-            fail "kubectl in this environment does not use this agent's pinned kubeconfig." \
+            fail "4" "kubectl in this environment does not use this agent's pinned kubeconfig." \
                  "Do not proceed: plain kubectl is talking to another cluster. Escalate to the Platform Agent — the agent image or its credential proxy is not carrying KUBECONFIG through to the command." \
                  "KUBECONFIG=$KUBECONFIG selects ${EFFECTIVE_CONTEXT:-<none>}, but the file itself selects $PINNED_CONTEXT"
         fi
@@ -222,7 +227,7 @@ if [ "$STATUS" = "ok" ]; then
     if [ "$rc" -ne 0 ]; then
         # Collapse to a single line so it reads cleanly on the kanban card.
         ERR_ONE="$(printf '%s' "$ERR" | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-500)"
-        fail "Cannot reach the target cluster's API server." \
+        fail "5" "Cannot reach the target cluster's API server." \
              "The cluster may be deleted, unreachable, or the agent's credentials lack access. Verify the cluster exists and the agent's service account has GKE access; then re-scaffold if needed." \
              "kubectl cluster-info: $ERR_ONE"
     fi
@@ -232,8 +237,9 @@ fi
 json_escape() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 
 if [ "$JSON" = "1" ]; then
-    printf '{"status": %s, "reason": %s, "remediation": %s, "evidence": %s}\n' \
+    printf '{"status": %s, "check": %s, "reason": %s, "remediation": %s, "evidence": %s}\n' \
         "$(json_escape "$STATUS")" \
+        "$(json_escape "$CHECK")" \
         "$(json_escape "$REASON")" \
         "$(json_escape "$REMEDIATION")" \
         "$(json_escape "$EVIDENCE")"
@@ -242,6 +248,7 @@ else
         echo "PREFLIGHT: OK"
     else
         echo "PREFLIGHT: FAILED"
+        echo "check: $CHECK"
         echo "reason: $REASON"
         echo "remediation: $REMEDIATION"
         [ -n "$EVIDENCE" ] && echo "evidence: $EVIDENCE"

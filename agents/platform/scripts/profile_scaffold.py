@@ -73,6 +73,13 @@ def _clear_mount_skeleton(home: Path) -> bool:
     return not home.exists()
 
 
+# Absolute, because a kanban worker's terminal runs with a stripped environment in
+# which /opt/hermes/.venv/bin is not on PATH — a bare `hermes` raises ENOENT there
+# while working fine from an interactive shell. Same trap as `_roster_command` in
+# agents/chat/scripts/bootstrap_scan_gate.py.
+HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
+
+
 def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
     """Base env for Hermes/gcloud subprocesses (shared across the profile scripts).
 
@@ -103,18 +110,18 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
         pre_existing = home.exists()
         try:
             subprocess.run(
-                ["hermes", "profile", "create", name, "--no-skills", "--description", description],
+                [HERMES_BIN, "profile", "create", name, "--no-skills", "--description", description],
                 check=True, capture_output=True, text=True, timeout=60, env=run_env(hermes_home),
             )
         except subprocess.CalledProcessError as e:
             detail = e.stderr.strip() or e.stdout.strip()
             if not pre_existing and not is_scaffolded(home):
-                raise SystemExit(f"ERROR: 'hermes profile create {name}' failed: {detail}")
+                raise SystemExit(f"ERROR: '{HERMES_BIN} profile create {name}' failed: {detail}")
             # The home was already on disk, so an "already exists" refusal is expected and
             # harmless — the caller overlays the template onto it either way, which is what
             # happened before this gate existed. Still worth a line: a home Hermes has not
             # registered may not be selectable as `hermes -p <name>`.
-            log(f"'hermes profile create {name}' failed against an existing home ({detail}); continuing")
+            log(f"'{HERMES_BIN} profile create {name}' failed against an existing home ({detail}); continuing")
         except subprocess.TimeoutExpired:
             raise SystemExit(f"ERROR: 'hermes profile create {name}' timed out after 60s")
         except OSError as e:
