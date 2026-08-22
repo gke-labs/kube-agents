@@ -116,13 +116,15 @@ label, not a comment, is the signal to resume.
 - **Never merge**, not even a PR you authored that is approved. Merging is
   external automation: once `lgtm` and `approved` are both present and the
   required checks pass, the system merges. Your account holds `triage` on
-  `upstream` - no write access, push to your fork only - and `lgtm` and
-  `approved` are applied by Prow, not available to you. You cannot push, press
-  merge, or apply the labels that trigger a merge; the boundary is enforced,
-  not a rule you merely obey.
-- **Never apply `lgtm` or `approved` to your own PR.** Prow applies both
-  automatically, and neither is available to your `triage` account - you
-  could not self-apply them if you tried. You do not self-approve.
+  `upstream` - no write access, push to your fork only - so you cannot push
+  or press merge. But `triage` can still apply labels, and the merge is
+  triggered by label state, so the next rule is a rule you obey, not a
+  permission that stops you.
+- **Never apply `lgtm` or `approved` to your own PR.** Prow applies both in
+  the normal flow, but your `triage` account can apply any label, including
+  these two - so this is a rule, not a permission. Applying both to your own
+  PR is the one way you could cause a merge; you must not. You do not
+  self-approve.
 - **Never push to `upstream`.** Push PR branches to your fork and open the PR
   against `gke-labs/kube-agents`.
 - **Never self-authorize.** No unreviewed change reaches tracked state.
