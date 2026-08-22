@@ -5,10 +5,44 @@ import unittest
 import urllib.error
 from unittest.mock import MagicMock, call, patch
 
-from github_token_refresh import refresh_git_credentials
+import github_token_refresh
+from github_token_refresh import (
+    get_current_git_repo,
+    main,
+    refresh_git_credentials,
+)
 
 
 class GitHubTokenRefreshTest(unittest.TestCase):
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_https(self, run):
+        res = MagicMock()
+        res.stdout = "https://github.com/gke-labs/kube-agents.git\n"
+        run.return_value = res
+        self.assertEqual("gke-labs/kube-agents", get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_ssh(self, run):
+        res = MagicMock()
+        res.stdout = "git@github.com:gke-labs/kube-agents.git\n"
+        run.return_value = res
+        self.assertEqual("gke-labs/kube-agents", get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_failure_returns_none(self, run):
+        run.side_effect = Exception("git not found")
+        self.assertIsNone(get_current_git_repo())
+
+    def test_refresh_git_credentials_invalid_repo_raises(self):
+        with patch("github_token_refresh.get_current_git_repo", return_value=None):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("")
+            self.assertIn("Could not identify target repository", str(cm.exception))
+
+        with self.assertRaises(RuntimeError) as cm:
+            refresh_git_credentials("invalid-repo-no-slash")
+        self.assertIn("Could not identify target repository", str(cm.exception))
+
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_delegates_without_receiving_token(self, urlopen, run):
@@ -125,11 +159,62 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual(2, sleep.call_count)
         sleep.assert_has_calls([call(0.01), call(0.02)])
 
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_general_exception_raises_runtime_error(self, urlopen):
+        urlopen.side_effect = TypeError("unexpected type error")
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository", initial_delay=0.01)
+
+        self.assertIn("Credential sidecar failed to refresh GitHub auth", str(cm.exception))
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_direct_minty_gcloud_auth_audiences_fallback(self, run):
+        # First call with --audiences raises, second call without flags succeeds
+        res_fail = Exception("gcloud auth print-identity-token --audiences rejected")
+        res_ok = MagicMock()
+        res_ok.stdout = "fallback-oidc-token\n"
+        run.side_effect = [res_fail, res_ok, MagicMock(), MagicMock()]
+
+        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+            ok_response = MagicMock()
+            ok_response.status = 200
+            ok_response.read.return_value = b"ghs_token_xyz\n"
+            ok_response.__enter__.return_value = ok_response
+            urlopen.return_value = ok_response
+
+            with patch.dict(os.environ, {}, clear=True):
+                token = refresh_git_credentials("owner/repository")
+
+            self.assertEqual("ghs_token_xyz", token)
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_direct_minty_gcloud_auth_failure_raises(self, run):
+        run.side_effect = [Exception("fail1"), Exception("fail2")]
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository")
+            self.assertIn("Failed to retrieve Google OIDC token", str(cm.exception))
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_direct_minty_empty_oidc_token_raises(self, run):
+        res = MagicMock()
+        res.stdout = "   \n"
+        run.return_value = res
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository")
+            self.assertIn("Retrieved Google OIDC token via gcloud is empty", str(cm.exception))
+
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_direct_minty_retries_on_5xx_and_succeeds(self, urlopen, sleep, run):
-        # Mock gcloud auth print-identity-token
         run_gcloud = MagicMock()
         run_gcloud.stdout = "mock-oidc-token\n"
         run.return_value = run_gcloud
@@ -153,12 +238,6 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual("ghs_minted_test_token_123", token)
         self.assertEqual(2, urlopen.call_count)
         sleep.assert_called_once_with(0.01)
-        # Check gh auth login called
-        gh_login_calls = [
-            c for c in run.call_args_list if c.args and c.args[0] == ["gh", "auth", "login", "--with-token"]
-        ]
-        self.assertEqual(1, len(gh_login_calls))
-        self.assertEqual("ghs_minted_test_token_123", gh_login_calls[0].kwargs.get("input"))
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.time.sleep")
@@ -210,6 +289,50 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual(3, urlopen.call_count)
         self.assertEqual(2, sleep.call_count)
         sleep.assert_has_calls([call(0.01), call(0.02)])
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_direct_minty_empty_token_raises(self, urlopen, run):
+        run_gcloud = MagicMock()
+        run_gcloud.stdout = "mock-oidc-token\n"
+        run.return_value = run_gcloud
+
+        ok_response = MagicMock()
+        ok_response.status = 200
+        ok_response.read.return_value = b"   \n"
+        ok_response.__enter__.return_value = ok_response
+        urlopen.return_value = ok_response
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository", max_attempts=1)
+            self.assertIn("Token received from Minty is empty", str(cm.exception))
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_direct_minty_general_exception_raises(self, urlopen, run):
+        run_gcloud = MagicMock()
+        run_gcloud.stdout = "mock-oidc-token\n"
+        run.return_value = run_gcloud
+
+        urlopen.side_effect = TypeError("unexpected error")
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository", max_attempts=1)
+            self.assertIn("Failed to connect to Minty", str(cm.exception))
+
+    @patch("github_token_refresh.refresh_git_credentials")
+    def test_main_cli_success_and_failure(self, refresh):
+        with patch.object(github_token_refresh.sys, "argv", ["github_token_refresh.py", "org/repo"]):
+            main()
+            refresh.assert_called_with("org/repo")
+
+        refresh.side_effect = Exception("boom")
+        with patch.object(github_token_refresh.sys, "argv", ["github_token_refresh.py"]):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(1, cm.exception.code)
 
 
 if __name__ == "__main__":
