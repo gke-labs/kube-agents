@@ -3419,13 +3419,27 @@ func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
 			// Exactly the shape the kubelet produces: the sidecar is stuck and no
 			// app container was ever created.
 			InitContainerStatuses: []corev1.ContainerStatus{{
+				// A preceding init container that is merely waiting its turn.
+				// Measured on a cluster: this is what the list actually looks
+				// like, and reporting this entry names no fault.
+				Name: "sandbox-credential-cleanup",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason: "PodInitializing",
+				}},
+			}, {
 				Name: "envoy-credential-proxy",
 				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
 					Reason:  "ImagePullBackOff",
 					Message: "Back-off pulling image",
 				}},
 			}},
-			ContainerStatuses: nil,
+			// Not empty while the pod is stuck in Init -- the kubelet fills this
+			// in with placeholders, which is why the old code reported
+			// PodInitializing rather than nothing at all.
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
 			Conditions:        []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
 		},
 	}
