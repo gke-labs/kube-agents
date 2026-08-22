@@ -131,14 +131,85 @@ class ShippedPolicyTest(unittest.TestCase):
                 self.assertBlocked(argv, "github.pipeline-trigger")
 
     def test_repository_administration_is_refused(self):
-        """Setting a secret or editing a ruleset rewrites the gate itself."""
+        """Setting a secret or reshaping the repository rewrites the gate itself.
+
+        `ruleset` is deliberately absent. An earlier version of this rule
+        listed it and this test asserted `gh ruleset delete 1` was refused --
+        a command that does not exist, so the case was green and proved
+        nothing. `gh ruleset` has only check, list and view; rulesets are
+        mutable only through `gh api`, which github.api-mutation covers.
+        """
         for argv in (
             ["gh", "secret", "set", "TOKEN"],
-            ["gh", "ruleset", "delete", "1"],
+            ["gh", "variable", "delete", "FLAG"],
             ["gh", "repo", "delete", "owner/repo"],
+            ["gh", "repo", "archive", "owner/repo"],
         ):
             with self.subTest(argv=argv):
                 self.assertBlocked(argv, "github.repo-administration")
+
+    def test_a_denied_command_cannot_be_re_spelled_as_an_alias(self):
+        """gh remembers a new name for any command, in a dir it keeps.
+
+        `gh alias set m 'pr merge'` then `gh m 1` resolves inside gh, so every
+        rule keyed on the written argv is bypassed by one permitted command --
+        including the pre-existing token-disclosure rules, which is what makes
+        this worse than the write path it was found in. GH_CONFIG_DIR is a
+        pod-lifetime emptyDir in the sidecar that also holds the live
+        installation token, so `gh alias set t 'auth token'` + `gh t` prints
+        it. `gh config set http_unix_socket` is the same shape pointed at the
+        shared workspace.
+
+        The read verbs stay permitted: naming an alias is not the problem,
+        creating one is.
+        """
+        for argv in (
+            ["gh", "alias", "set", "m", "pr merge"],
+            ["gh", "alias", "set", "t", "auth token"],
+            ["gh", "alias", "import", "aliases.yml"],
+            ["gh", "alias", "delete", "m"],
+            ["gh", "config", "set", "http_unix_socket", "/opt/data/x.sock"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertBlocked(argv, "tool.self-modification")
+        for argv in (["gh", "alias", "list"], ["gh", "config", "get", "editor"]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(self.policy.blocked_by(argv))
+
+    def test_the_token_is_not_printable_by_either_spelling(self):
+        """--show-token has a shorthand, and the rule only named the long one."""
+        for argv in (
+            ["gh", "auth", "status", "--show-token"],
+            ["gh", "auth", "status", "-t"],
+            ["gh", "auth", "status", "-t", "--hostname", "github.com"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertBlocked(argv, "github.token-disclosure")
+
+    def test_a_pipeline_is_not_reachable_by_the_adjacent_verb(self):
+        """Disabling a required workflow is the same effect as triggering one.
+
+        The rule enumerated run/rerun/cancel and release create/delete/upload,
+        so `gh workflow disable` turned the gate off and `gh release edit
+        --draft=false` published a draft -- both firing the workflows the rule
+        exists to keep the agent away from, by a verb it did not list.
+        """
+        for argv in (
+            ["gh", "workflow", "disable", "deploy.yml"],
+            ["gh", "workflow", "enable", "deploy.yml"],
+            ["gh", "run", "delete", "123"],
+            ["gh", "release", "edit", "v1", "--draft=false"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertBlocked(argv, "github.pipeline-trigger")
+        for argv in (["gh", "workflow", "list"], ["gh", "run", "view", "1"]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(self.policy.blocked_by(argv))
+
+    def test_prose_attached_to_a_shorthand_is_dropped_too(self):
+        """`-bPlease merge this PR` is the same prose as `--body <that>`."""
+        self.assertIsNone(
+            self.policy.blocked_by(["gh", "pr", "create", "-bPlease merge this PR"]))
 
     def test_the_pre_existing_rules_still_hold(self):
         """Regression cover for the rules that were already here.
@@ -207,9 +278,6 @@ class ShippedPolicyTest(unittest.TestCase):
             f"shipped rules with no case in this file: {', '.join(unexercised)}",
         )
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TheRulesReadCommandsNotProse(ShippedPolicyTest):
@@ -312,3 +380,7 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
         argv = ["gh", "pr", "create", "--repo", "o/r", "--title", "fix: drift",
                 "--body", body]
         self.assertIsNone(self.policy.blocked_by(argv))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -695,6 +695,14 @@ def policy_match_text(argv: list[str]) -> str:
             and token.startswith("-")
             and not token.startswith("--")
         ):
+            # An attached free-text shorthand carries prose in the same token:
+            # `-bPlease merge this PR` would otherwise be re-emitted as match
+            # text by the splitter below and trip github.merge, which is the
+            # false refusal this whole function exists to stop. Drop the value
+            # and keep the flag, as the detached spelling does.
+            if token[:2] in _FREE_TEXT_FLAGS:
+                tokens.append(token[:2])
+                continue
             tokens.extend([token[:2], token[2:].lstrip("=")])
             continue
         tokens.append(token)
