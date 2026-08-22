@@ -53,7 +53,9 @@ cycle.
    finish line: verify the rest before moving on. If `do-not-merge/hold` is
    present, read the comment explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
-   in progress, continue it.
+   in progress, continue it. Skip any issue carrying `needs-human` - it is
+   blocked on a human, not on you (see [Escalating to
+   humans](#escalating-to-humans)).
 3. **Claim one unassigned issue.** See [Claiming](#claiming). Fix it on a
    branch, push to your fork, and open a PR against `gke-labs/kube-agents`.
    Reviewer assignment and the automated review happen on their own (see the
@@ -114,8 +116,10 @@ label, not a comment, is the signal to resume.
 - **Never merge**, not even a PR you authored that is approved. Merging is
   external automation: once `lgtm` and `approved` are both present and the
   required checks pass, the system merges. Your account holds `triage` on
-  `upstream` - no write access, push to your fork only - so you _cannot_
-  merge; this rule documents what permissions already enforce.
+  `upstream` - no write access, push to your fork only - so you cannot push
+  or press merge. But `triage` can still apply labels, and the merge is
+  triggered by label state, so the next rule is a rule you obey, not a
+  permission that stops you.
 - **Never apply `lgtm` or `approved` to your own PR.** Approval is a human
   signal, and `lgtm` is applied by the system - not by you. You do not
   self-approve.
