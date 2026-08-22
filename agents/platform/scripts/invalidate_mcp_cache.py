@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+Invalidate local stdio MCP server schemas in on-disk mcp_schema_cache.json files.
+
+When container images upgrade, new tools in local scripts (e.g. platform_mcp_server.py,
+router_server.py) must be discovered on first use instead of being shadowed by stale
+schema caches on persistent storage (Issue #854).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+# Known local stdio MCP servers in kube-agents whose tool definitions
+# are backed by image-provided local scripts.
+KNOWN_LOCAL_MCP_SERVERS = frozenset({"platform_control", "router"})
+
+
+def is_local_mcp_server(server_name: str, config: dict | None = None) -> bool:
+    """Return True if the MCP server is locally hosted rather than a remote proxy."""
+    if server_name in KNOWN_LOCAL_MCP_SERVERS:
+        return True
+    if not config or not isinstance(config, dict):
+        return False
+    # Remote servers have a direct URL or use mcp-remote proxy to an https:// endpoint
+    if config.get("url"):
+        return False
+    args = config.get("args") or []
+    for arg in args:
+        if isinstance(arg, str):
+            if "/opt/mcp-remote" in arg or arg.startswith("https://") or arg.startswith("http://"):
+                return False
+    # If it's a command like python / script inside scripts/ or local file, it's local
+    command = str(config.get("command") or "")
+    if "python" in command or any(str(a).endswith(".py") or "scripts/" in str(a) for a in args):
+        return True
+    return False
+
+
+def get_profile_mcp_configs(profile_dir: Path) -> dict[str, dict]:
+    """Try to read mcp_servers from a profile's config.yaml or template."""
+    config_file = profile_dir / "config.yaml"
+    if not config_file.is_file():
+        return {}
+    try:
+        import yaml  # type: ignore
+        with open(config_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            if isinstance(data, dict):
+                servers = data.get("mcp_servers")
+                if isinstance(servers, dict):
+                    return servers
+    except Exception:
+        pass
+    return {}
+
+
+def invalidate_cache_file(cache_file: Path, mcp_configs: dict[str, dict] | None = None) -> list[str]:
+    """Remove local MCP server entries from a single mcp_schema_cache.json file."""
+    if not cache_file.is_file():
+        return []
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return []
+    except Exception:
+        return []
+
+    removed: list[str] = []
+    for server_name in list(data.keys()):
+        cfg = (mcp_configs or {}).get(server_name)
+        if is_local_mcp_server(server_name, cfg):
+            del data[server_name]
+            removed.append(server_name)
+
+    if removed:
+        try:
+            tmp_file = cache_file.with_suffix(".tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_file, cache_file)
+        except Exception:
+            pass
+    return removed
+
+
+def invalidate_all_mcp_caches(target_dir: Path) -> dict[str, list[str]]:
+    """Scan root and all profile directories under target_dir and invalidate local MCP caches."""
+    results: dict[str, list[str]] = {}
+
+    # 1. Root / default profile cache
+    root_cache = target_dir / "cache" / "mcp_schema_cache.json"
+    root_configs = get_profile_mcp_configs(target_dir)
+    removed_root = invalidate_cache_file(root_cache, root_configs)
+    if removed_root:
+        results["default"] = removed_root
+
+    # 2. Named profiles under profiles/
+    profiles_dir = target_dir / "profiles"
+    if profiles_dir.is_dir():
+        for p in sorted(profiles_dir.iterdir()):
+            if p.is_dir():
+                p_cache = p / "cache" / "mcp_schema_cache.json"
+                p_configs = get_profile_mcp_configs(p)
+                removed_p = invalidate_cache_file(p_cache, p_configs)
+                if removed_p:
+                    results[p.name] = removed_p
+
+    return results
+
+
+def main():
+    target_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ.get("PLATFORM_AGENT_HOME", "/opt/data"))
+    results = invalidate_all_mcp_caches(target_path)
+    for profile, servers in results.items():
+        print(f"[ENTRYPOINT] Invalidated local MCP schema cache for profile '{profile}': {', '.join(servers)}")
+
+
+if __name__ == "__main__":
+    main()
