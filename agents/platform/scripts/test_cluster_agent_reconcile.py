@@ -340,6 +340,21 @@ class CreatePassSignalTest(unittest.TestCase):
                                       "kept": ["cluster-beta"],
                                       "create_failed": ["alpha/us-central1"]}))
 
+    def test_the_wreckage_of_a_failed_create_does_not_count_as_a_roster(self):
+        # Tick 2 of the same permanent failure: PRUNE keeps the half-built home the
+        # step-2b identity stamp left behind, so `kept` is non-empty while the roster
+        # is no more usable than it was on tick 1.
+        code = self._main({"create_pass_ran": True, "created": [],
+                           "kept": ["cluster-alpha"], "incomplete": ["cluster-alpha"],
+                           "create_failed": ["alpha/us-central1"]})
+        self.assertEqual(code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_a_scaffolded_profile_alongside_a_broken_one_still_reconciles(self):
+        self.assertIsNone(self._main({"create_pass_ran": True, "created": [],
+                                      "kept": ["cluster-alpha", "cluster-beta"],
+                                      "incomplete": ["cluster-alpha"],
+                                      "create_failed": ["alpha/us-central1"]}))
+
     def test_the_cron_path_exits_zero_even_when_every_create_failed(self):
         # The hourly producer must never exit non-zero; only --require-create-pass
         # turns a bad roster into an exit code.

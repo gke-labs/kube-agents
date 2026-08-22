@@ -401,10 +401,17 @@ def main() -> None:
         )
     )
 
+    # PRUNE walks every profile including the half-built ones: their cluster exists, so
+    # they land in `kept` alongside the healthy homes. Counting them as "already in
+    # place" would let a run whose only create failed report a reconciled roster from
+    # the second tick onward, the tick where the failure's own wreckage is on disk.
+    incomplete = set(report.get("incomplete", []))
+    kept_scaffolded = [n for n in report.get("kept", []) if n not in incomplete]
+
     unreconciled = None
     if not report.get("create_pass_ran"):
         unreconciled = "CREATE direction did not run"
-    elif report.get("create_failed") and not (report.get("created") or report.get("kept")):
+    elif report.get("create_failed") and not (report.get("created") or kept_scaffolded):
         # Every create failed and nothing was already in place, so the roster is empty
         # apart from the half-built homes those failures left behind — `create_profile`
         # stamps the identity before it fetches credentials. The caller that gates a
