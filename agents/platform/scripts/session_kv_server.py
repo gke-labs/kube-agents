@@ -604,7 +604,43 @@ def get_active_platform() -> str:
             return "google_chat"
     except Exception as exc:
         logger.error(f"Failed to parse config.yaml for active platform: {exc}")
-    if os.environ.get("SLACK_BOT_TOKEN"):
+    # This is the selector on an operator-managed pod, not a corner case.
+    # CONFIG_PATH is $PLATFORM_AGENT_HOME/config.yaml — the agent's own
+    # writable file, seeded from agents/chat/config.yaml. The operator's
+    # `platforms.<p>.enabled` does not go there: renderConfigYAML writes it to
+    # the managed scope mounted read-only at /etc/hermes, which Hermes overlays
+    # per leaf key inside its own config loader rather than merging to disk
+    # (docker-entrypoint.sh, "The pins do NOT come through this file"; the
+    # template block at agents/chat/config.yaml:257 says the same from the
+    # other side). The open() above therefore reads a `platforms` subtree with
+    # no `enabled` key at all, both branches fall through, and control arrives
+    # here on every alert.
+    #
+    # So SLACK_RELAY_URL is not a better fallback signal, it is the answer.
+    # SLACK_BOT_TOKEN never reaches this container — it is a credential, so it
+    # lives in the credential-proxy container, which is what
+    # TestBuildDeploymentSlackIntegration in platformagent_manifests_test.go
+    # pins (TestBuildDeployment holds the general "no Secret-backed env in the
+    # sandbox" rule, but its fixture configures Google Chat only and never
+    # renders a Slack variable to check). Asking for the token here was asking
+    # a question whose answer in a deployed pod is always "no", so every
+    # Slack-only install called itself google_chat and lost the alert to a
+    # `hermes send` against a platform that is not configured. SLACK_RELAY_URL
+    # is set on this container exactly when spec.integration.slack.enabled is.
+    #
+    # Slack-before-Google-Chat matches the try block above, so an install with
+    # both integrations enabled resolves the same way whichever branch answers.
+    # That is a routing change for a dual-platform install, which until now
+    # always landed on google_chat here; see Risk & Rollout on the PR.
+    #
+    # The token is still accepted rather than replaced: it is the signal that
+    # works for a bare `docker run` off the image, where no operator has
+    # rendered anything and an exported token is all there is.
+    # platform_mcp_server.py:690 is the same test with the same wrong signal
+    # and is deliberately left alone here — open PR #735 fixes that copy, and
+    # it needs the MCP env allowlist widened to pass SLACK_RELAY_URL through,
+    # which is that PR's to do.
+    if os.environ.get("SLACK_RELAY_URL") or os.environ.get("SLACK_BOT_TOKEN"):
         return "slack"
     return "google_chat"
 
