@@ -5,8 +5,14 @@ import json
 import sys
 import types
 
+HAS_REAL_HERMES = False
+
 
 def ensure_hermes_stubs():
+    global HAS_REAL_HERMES
+    real_agent = False
+    real_plugins = False
+
     # 1. tools.registry
     try:
         import tools.registry
@@ -41,6 +47,7 @@ def ensure_hermes_stubs():
     try:
         import agent.memory_provider
         import agent.memory_manager
+        real_agent = True
     except ImportError:
         if "agent" not in sys.modules:
             agent = types.ModuleType("agent")
@@ -59,6 +66,7 @@ def ensure_hermes_stubs():
             class MemoryProvider:
                 def shutdown(self): pass
                 def initialize(self, session_id="", **kwargs): pass
+                def is_available(self): return True
                 def queue_prefetch(self, query: str, *, session_id: str = ""): pass
                 def prefetch(self, query: str, *, session_id: str = ""): pass
                 def on_turn_start(self, turn_number: int, user_message: str, *, session_id: str = "", messages: list = None): pass
@@ -114,6 +122,7 @@ def ensure_hermes_stubs():
                     return HindsightMemoryProvider()
                 return None
             sys.modules["plugins.memory"].load_memory_provider = load_memory_provider
+        real_plugins = True
     except ImportError:
         if "plugins" not in sys.modules:
             plugins = types.ModuleType("plugins")
@@ -148,6 +157,7 @@ def ensure_hermes_stubs():
             class HindsightMemoryProvider(base):
                 def shutdown(self): pass
                 def initialize(self, session_id="", **kwargs): pass
+                def is_available(self): return True
                 def _get_client(self): return None
                 def queue_prefetch(self, query: str, *, session_id: str = ""): pass
                 def prefetch(self, query: str, *, session_id: str = ""): pass
@@ -178,6 +188,8 @@ def ensure_hermes_stubs():
             def load_config():
                 return {}
             hermes_cli_config.load_config = load_config
+
+    HAS_REAL_HERMES = real_agent and real_plugins
 
 
 ensure_hermes_stubs()

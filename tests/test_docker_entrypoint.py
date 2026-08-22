@@ -1255,7 +1255,7 @@ class PlatformFrontDoorTest(unittest.TestCase):
         copy would keep passing after the block it stands in for changed. Everything the
         block reads is a variable, so a temp tree and an env is the whole fixture — the
         one exception being `$INSTALL_DIR/.venv/bin/python3`, which the fill arm calls
-        and which is faked here with a symlink to the interpreter running the tests.
+        and which is faked here with a wrapper script executing the interpreter running the tests.
 
         `template` and `live` are YAML text; `live=None` means the file is absent, which
         is the branch under test. Returns (CompletedProcess, live text or None).

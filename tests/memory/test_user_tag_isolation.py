@@ -16,7 +16,7 @@ memory), and the parity between the provider's sanitizer and the copy in
 provider later reads them back with, so a drift between the two strands every
 migrated memory silently.
 
-Standalone: plain asserts, no pytest. See ``test_recall_reporting.py`` for how to
+Standalone unittest suite. See ``test_recall_reporting.py`` for how to
 run it.
 
     HERMES_ROOT=~/git/hermes-agent python3 tests/memory/test_user_tag_isolation.py
