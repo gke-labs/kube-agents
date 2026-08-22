@@ -299,6 +299,122 @@ class CreatePassSignalTest(unittest.TestCase):
              mock.patch.object(rec, "log"):
             self.assertIsNone(rec.main())
 
+    def test_a_failed_create_is_recorded_rather_than_only_logged(self):
+        with mock.patch.object(rec, "list_profiles", return_value=[]), \
+             mock.patch.object(rec, "_project", return_value="p"), \
+             mock.patch.object(rec, "_all_clusters", return_value=[("p", "alpha", "us-central1")]), \
+             mock.patch.object(rec, "create_profile", side_effect=SystemExit("no credentials")), \
+             mock.patch.object(rec, "log"):
+            report = rec.reconcile(dry_run=False)
+        self.assertEqual(report["create_failed"], ["alpha/us-central1"])
+        self.assertEqual(report["created"], [])
+
+    def _main(self, report, argv=("x", "--require-create-pass")):
+        """Run main() over a hand-built report; returns the exit code or None."""
+        with mock.patch.object(rec, "reconcile", return_value=report), \
+             mock.patch.object(rec.sys, "argv", list(argv)), \
+             mock.patch.object(rec, "_notify"), \
+             mock.patch.object(rec, "log"):
+            try:
+                rec.main()
+            except SystemExit as e:
+                return e.code
+        return None
+
+    def test_the_flag_fails_when_the_pass_ran_but_every_create_did(self):
+        # The half-built home a failed create leaves behind is worse than no profile:
+        # the gate would file its one-shot sweep and fan a card out to a profile with
+        # no kubeconfig.
+        code = self._main({"create_pass_ran": True, "created": [],
+                           "create_failed": ["alpha/us-central1"]})
+        self.assertEqual(code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_one_failed_create_among_several_still_reconciles(self):
+        # Holding the whole fleet report back for one unscaffoldable cluster buys
+        # nothing: the cause is often permanent, and the sweep records it as a gap.
+        self.assertIsNone(self._main({"create_pass_ran": True, "created": ["cluster-beta"],
+                                      "create_failed": ["alpha/us-central1"]}))
+
+    def test_a_failure_against_an_already_populated_roster_still_reconciles(self):
+        self.assertIsNone(self._main({"create_pass_ran": True, "created": [],
+                                      "kept": ["cluster-beta"],
+                                      "create_failed": ["alpha/us-central1"]}))
+
+    def test_the_cron_path_exits_zero_even_when_every_create_failed(self):
+        # The hourly producer must never exit non-zero; only --require-create-pass
+        # turns a bad roster into an exit code.
+        self.assertIsNone(self._main({"create_pass_ran": True, "created": [],
+                                      "create_failed": ["alpha/us-central1"]}, argv=("x",)))
+
+    def test_a_failed_create_alone_does_not_post_to_chat(self):
+        # It repeats every run until the cause is fixed, and during onboarding the gate
+        # re-runs this script every minute.
+        with mock.patch.object(rec, "reconcile",
+                               return_value={"create_pass_ran": True, "created": [],
+                                             "create_failed": ["alpha/us-central1"]}), \
+             mock.patch.object(rec.sys, "argv", ["x"]), \
+             mock.patch.object(rec, "_notify") as notify, \
+             mock.patch.object(rec, "log"):
+            rec.main()
+        notify.assert_not_called()
+
+    def test_a_failed_create_is_named_when_a_message_goes_out_anyway(self):
+        with mock.patch.object(rec, "reconcile",
+                               return_value={"create_pass_ran": True,
+                                             "created": ["cluster-beta"],
+                                             "create_failed": ["alpha/us-central1"]}), \
+             mock.patch.object(rec.sys, "argv", ["x"]), \
+             mock.patch.object(rec, "_notify") as notify, \
+             mock.patch.object(rec, "log"):
+            rec.main()
+        self.assertIn("alpha/us-central1", notify.call_args[0][0])
+
+
+class ExclusiveRunTest(unittest.TestCase):
+    """Two schedules run this script, and the cron lock is per job id.
+
+    The hourly `cluster-agent-reconcile` job and the bootstrap scan gate (every
+    minute until the roster is usable) would otherwise call create_profile and
+    delete_profile against the same profile homes concurrently.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.dict(rec.os.environ, {"HERMES_HOME": self._tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _hold_the_lock(self):
+        import fcntl
+        handle = open(Path(self._tmp.name) / rec.RECONCILE_LOCK, "w")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        self.addCleanup(handle.close)
+
+    def test_the_second_run_does_not_reconcile(self):
+        self._hold_the_lock()
+        with mock.patch.object(rec, "reconcile", side_effect=AssertionError("must not run")), \
+             mock.patch.object(rec.sys, "argv", ["x"]), \
+             mock.patch.object(rec, "log"):
+            self.assertIsNone(rec.main())  # the cron producer still exits 0
+
+    def test_the_gate_is_told_to_retry_rather_than_that_the_roster_failed(self):
+        self._hold_the_lock()
+        with mock.patch.object(rec, "reconcile", side_effect=AssertionError("must not run")), \
+             mock.patch.object(rec.sys, "argv", ["x", "--require-create-pass"]), \
+             mock.patch.object(rec, "log"):
+            with self.assertRaises(SystemExit) as caught:
+                rec.main()
+        self.assertEqual(caught.exception.code, rec.EXIT_ALREADY_RUNNING)
+        self.assertNotEqual(rec.EXIT_ALREADY_RUNNING, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_an_uncontended_run_proceeds(self):
+        with mock.patch.object(rec, "reconcile", return_value={"create_pass_ran": True}), \
+             mock.patch.object(rec.sys, "argv", ["x", "--require-create-pass"]), \
+             mock.patch.object(rec, "_notify"), \
+             mock.patch.object(rec, "log"):
+            self.assertIsNone(rec.main())
+
 
 class MetadataTest(unittest.TestCase):
     def test_response_is_closed(self):

@@ -86,6 +86,12 @@ both directions:
   carry a profile even though that cluster exists. This closes the loop when a cluster is deleted
   out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
 
+A create that fails is recorded, not just logged: the cluster goes into a `create_failed` bucket,
+the chat summary names it, and under `--require-create-pass` the run exits non-zero even though the
+CREATE direction itself ran. That flag's caller (the bootstrap scan gate) gates a one-shot fleet
+sweep on the exit code, and a roster carrying a half-built profile is worse for it than a roster
+missing one.
+
 A profile whose `cluster_identity` is stamped but whose `kubeconfig.yaml` or `USER.md` is missing is
 treated as absent and recreated. Profile creation stamps the identity before it writes either file,
 so a run killed mid-create leaves a home that satisfies the create direction's existence check and

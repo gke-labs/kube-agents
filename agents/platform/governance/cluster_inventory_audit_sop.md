@@ -23,13 +23,14 @@ complete.
 **A preflight failure other than check 5 means you audit nothing.** Complete with the failure in
 `gaps` and every other field empty. The script stops at the first failure, so a failure in checks
 1–4 means you have not established which cluster you are — you have only failed to check. Decide
-from the check number, not the remediation text: a missing `USER.md` and a missing kubeconfig both
-say "Re-scaffold the profile", and both leave you as unidentified as a context mismatch does. An
+from the `check` field the script reports, not the remediation text: a missing `USER.md` and a
+missing kubeconfig both say "Re-scaffold the profile", and both leave you as unidentified as a
+context mismatch does. An
 unpinned `kubectl` resolves to the credential proxy's own context, the management cluster, so an
 audit run anyway files another cluster's workloads under your name. Aggregation copies `metadata`
 verbatim and the Platform Agent is forbidden to re-audit, so nothing downstream catches it.
 
-Check 5, "Cannot reach the target cluster's API server", is the exception: your identity is
+Check `5`, "Cannot reach the target cluster's API server", is the exception: your identity is
 established and the cluster is simply unreachable, so record it in `gaps` and complete like any
 other data-cost failure.
 

@@ -57,7 +57,6 @@ scheduler treats every run as silent. The report reaches the user through
 
 import json
 import os
-import fcntl
 import re
 import shlex
 import subprocess
@@ -117,9 +116,12 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 # roster up to 59 minutes before anything has populated it, reads it as empty, and the
 # sweep degrades to the Platform Agent walking the whole fleet alone. So the gate runs
 # the reconcile itself and waits for it, rather than racing it.
-RECONCILE_LOCK = ".bootstrap_reconcile.lock"
 RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
 RECONCILE_TIMEOUT_SECONDS = 240
+# `cluster_agent_reconcile.EXIT_ALREADY_RUNNING`. Mutual exclusion lives in that
+# script, because the hourly `cluster-agent-reconcile` job runs it too and the
+# gateway's cron lock is per job id — a lock held here would not keep the two apart.
+RECONCILE_ALREADY_RUNNING = 4
 # After this many failed reconciles, AND this much wall clock since the first of them,
 # the sweep proceeds anyway. A reconcile that cannot succeed (no IAM to list clusters)
 # must not hold onboarding shut forever — a solo sweep is a worse report, no report is
@@ -236,48 +238,43 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
         )
         return True
 
-    lock_path = data_dir / RECONCILE_LOCK
+    # The attempt is recorded before the run, not after: this process can itself be
+    # killed mid-reconcile, and an attempt that leaves no trace is one the ceiling
+    # never counts.
+    _record_reconcile_attempt(data_dir, attempts + 1, since if since is not None else time.time())
     try:
-        lock = open(lock_path, "w")  # noqa: SIM115 - held for the duration of the run
-    except Exception as e:  # noqa: BLE001 - never fail the cron run
-        sys.stderr.write(f"bootstrap_scan_gate: could not open {lock_path}: {e}\n")
+        proc = subprocess.run(
+            # `--require-create-pass` is what makes the exit code mean anything: on
+            # the cron path the script swallows every failure and exits 0, so a bare
+            # run cannot tell "this project has no clusters" from "the list call
+            # failed" — and the second one files a solo sweep that `.bootstrap_scan_filed`
+            # then makes permanent.
+            [sys.executable, str(script), "--require-create-pass"],
+            capture_output=True,
+            text=True,
+            timeout=RECONCILE_TIMEOUT_SECONDS,
+            env={**os.environ, "HERMES_HOME": str(data_dir)},
+        )
+    except Exception as e:  # noqa: BLE001 - timeout or spawn failure; retry next tick
+        sys.stderr.write(f"bootstrap_scan_gate: reconcile did not complete: {e}\n")
         return False
 
-    with lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            # A previous tick is still reconciling. The gate fires every minute and
-            # the reconcile takes tens of seconds, so overlap is expected, not an error.
-            return False
+    if proc.returncode == RECONCILE_ALREADY_RUNNING:
+        # A previous tick, or the hourly reconcile job, still holds the script's lock.
+        # The gate fires every minute and a reconcile takes tens of seconds, so overlap
+        # is expected. Give the attempt back: nothing was learned about the roster, and
+        # counting it would spend the ceiling on contention.
+        _record_reconcile_attempt(data_dir, attempts, since)
+        return False
 
-        _record_reconcile_attempt(data_dir, attempts + 1, since if since is not None else time.time())
-        try:
-            proc = subprocess.run(
-                # `--require-create-pass` is what makes the exit code mean anything: on
-                # the cron path the script swallows every failure and exits 0, so a bare
-                # run cannot tell "this project has no clusters" from "the list call
-                # failed" — and the second one files a solo sweep that `.bootstrap_scan_filed`
-                # then makes permanent.
-                [sys.executable, str(script), "--require-create-pass"],
-                capture_output=True,
-                text=True,
-                timeout=RECONCILE_TIMEOUT_SECONDS,
-                env={**os.environ, "HERMES_HOME": str(data_dir)},
-            )
-        except Exception as e:  # noqa: BLE001 - timeout or spawn failure; retry next tick
-            sys.stderr.write(f"bootstrap_scan_gate: reconcile did not complete: {e}\n")
-            return False
+    if proc.returncode != 0:
+        sys.stderr.write(
+            f"bootstrap_scan_gate: reconcile exited {proc.returncode}; "
+            f"retrying next tick. stderr: {proc.stderr.strip()[:500]}\n"
+        )
+        return False
 
-        if proc.returncode != 0:
-            sys.stderr.write(
-                f"bootstrap_scan_gate: reconcile exited {proc.returncode}; "
-                f"retrying next tick. stderr: {proc.stderr.strip()[:500]}\n"
-            )
-            return False
-
-        _record_reconcile_attempt(data_dir, 0)
-
+    _record_reconcile_attempt(data_dir, 0)
     sys.stderr.write("bootstrap_scan_gate: Cluster Agent roster reconciled\n")
     return True
 
@@ -326,6 +323,9 @@ def _task_body() -> str:
         "answer another way. A step that cannot answer is a finding, not a puzzle. Guessing "
         "costs far more than the missing answer is worth, and it produces a report that looks "
         "complete while resting on invented data.\n\n"
+        "**The step numbers below are the inventory SOP's.** Step 2 here covers the SOP's "
+        "Steps 2 and 3, which is why there is no Step 3 — the numbering is aligned so a "
+        "reference to a step means the same thing in both documents.\n\n"
         "**Step 1 — the Cluster Agent roster is already reconciled.** This card was filed only "
         f"after `{RECONCILE_SCRIPT_NAME}` ran to completion and exited 0, so the roster you read in "
         "Step 2 is current. Do not run it yourself. It may legitimately have created no agents; "
@@ -339,7 +339,8 @@ def _task_body() -> str:
         "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
         "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
         "this step and do the whole sweep yourself in Step 4, following Steps 3 and 4 of the "
-        "single-cluster audit SOP for each cluster so the workload checks still happen.** That is the normal case for a "
+        "single-cluster audit SOP (its own numbering) for each cluster so the workload checks "
+        "still happen.** That is the normal case for a "
         "single-cluster install and it is not an error. Use the command as written — the "
         "absolute path and the `HERMES_HOME` are both required, and a bare `hermes profile "
         "list` will either fail or quietly return an incomplete roster.\n\n"
@@ -358,7 +359,7 @@ def _task_body() -> str:
         f"`idempotency_key='{AGGREGATE_IDEMPOTENCY_KEY}'` — a fan-in child receives every "
         "parent's `metadata` in its worker context, which is how you collect the results. "
         "**Its body must send that worker to the same inventory SOP you are following, "
-        "resuming at Steps 4 and 5**, reading whichever of these exists:\n"
+        "resuming at Step 4**, reading whichever of these exists:\n"
         f"{instruction_list}\n\n"
         "Steps 4 and 5 below are that worker's job, not yours, and it has only the card body to "
         "learn them from: a one-line 'aggregate the children' body produces a summary and stops "

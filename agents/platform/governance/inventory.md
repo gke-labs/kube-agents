@@ -10,6 +10,11 @@ chat as `/opt/data/INVENTORY.md`. Your job is to be thorough; being brief is the
 
 ## Pre-Execution Check
 
+0. **Which card are you?** If your card body told you to resume this SOP at Step 4, you are the
+   aggregation worker: go straight there and skip the status check below. It describes the state
+   you are in — no `INVENTORY.raw.md`, no `INVENTORY.md` — and would send you back through
+   discovery and the fan-out you were created to collect, re-filing your own card as its own
+   parent and finishing onboarding with no report written.
 1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.raw.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.raw.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
    - If `/opt/data/INVENTORY.md` is already built on disk, the whole flow has run: return strictly `[SILENT]` immediately and do nothing.
    - If `/opt/data/INVENTORY.raw.md` exists but `/opt/data/INVENTORY.md` does not, the sweep already finished and the handoff is what did not: **skip discovery entirely and go straight to Step 5** to file the prioritization card. Do not re-scan the fleet, and do not write the report yourself.

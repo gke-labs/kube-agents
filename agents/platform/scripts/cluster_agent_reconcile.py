@@ -37,11 +37,13 @@
 # whether the roster is actually reconciled; the bootstrap scan gate is the only one.
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
 import sys
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 from cluster_agent_profile import (
@@ -161,6 +163,39 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
 
 # Distinct from 1 so a caller can tell "the roster is not reconciled" from a crash.
 EXIT_CREATE_PASS_SKIPPED = 3
+# Another reconcile holds the lock. Also distinct from 1: the caller has learned
+# nothing about the roster and should retry rather than count this as a failure.
+EXIT_ALREADY_RUNNING = 4
+
+RECONCILE_LOCK = ".cluster_agent_reconcile.lock"
+
+
+@contextmanager
+def _exclusive_run():
+    """Hold the reconcile lock, or yield False if another run already has it.
+
+    Two schedules drive this script — the hourly `cluster-agent-reconcile` job and
+    the bootstrap scan gate, which runs it every minute until the roster is usable —
+    and the gateway's cron lock is per job id, so nothing upstream keeps the two
+    apart. Overlapping runs would call `create_profile` and `delete_profile` against
+    the same profile home: interleaved read-modify-writes of `config.yaml` and
+    `.env`, or an rmtree under a scaffold in progress. The lock lives here rather
+    than in either caller because it has to cover both.
+    """
+    path = Path(os.environ.get("HERMES_HOME", "/opt/data")) / RECONCILE_LOCK
+    try:
+        handle = open(path, "w")  # noqa: SIM115 - closed by this contextmanager
+    except Exception as e:  # noqa: BLE001 - an unlockable path must not block the roster
+        log(f"could not open {path} ({e}); running without the lock.")
+        yield True
+        return
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
 
 # Written by create_profile after the identity stamp, so their absence means the
 # scaffold was interrupted between the two.
@@ -195,6 +230,7 @@ def reconcile(dry_run: bool = False) -> dict:
         "skipped_no_identity": [],  # config.yaml lacked a usable cluster_identity
         "skipped_error": [],     # liveness check was inconclusive (auth/network/etc.)
         "incomplete": [],        # identity stamped but the scaffold never finished
+        "create_failed": [],     # cluster that should have a profile and could not get one
     }
     # Not a bucket: whether the CREATE direction ran at all this run. Every failure
     # below is caught and logged so a cron producer can always exit 0, which leaves
@@ -237,6 +273,7 @@ def reconcile(dry_run: bool = False) -> dict:
                 report["created"].append(name)
             except (SystemExit, Exception) as e:  # noqa: BLE001 - one failure never aborts the sweep
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
+                report["create_failed"].append(f"{cluster}/{location}")
     elif not project:
         log("could not resolve the project — skipping the CREATE direction this run "
             "(prune-only).")
@@ -295,6 +332,12 @@ def _format_notification(report: dict) -> str:
         lines.append(f"  🧹 pruned {len(pruned)} profile(s):")
         for name in pruned:
             lines.append(f"     • `{name}` (cluster gone or unmanaged)")
+    failed = report.get("create_failed", [])
+    if failed:
+        lines.append(
+            f"  ❌ {len(failed)} cluster(s) could not be given a profile "
+            f"(retried next run): {', '.join(f'`{n}`' for n in failed)}."
+        )
     if report.get("skipped_error"):
         lines.append(
             f"  ⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
@@ -326,37 +369,67 @@ def main() -> None:
     parser.add_argument(
         "--require-create-pass", action="store_true",
         help="Exit non-zero if the CREATE direction could not run (no project, or the "
-             "cluster list failed). Off by default: the cron producer must always exit 0.",
+             "cluster list failed), or if it ran and every create failed. Off by default: "
+             "the cron producer must always exit 0.",
     )
     args = parser.parse_args()
 
-    try:
-        report = reconcile(dry_run=args.dry_run)
-    except Exception as e:  # noqa: BLE001 - resilient: a cron producer must always exit 0
-        log(f"Reconcile aborted unexpectedly: {e}")
-        if args.require_create_pass:
-            raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
-        return
+    with _exclusive_run() as acquired:
+        if not acquired:
+            log("another reconcile is already running; leaving the roster to it.")
+            # The cron producer still exits 0 — an overlap is expected, not an error.
+            # Only the caller that asked to be told about the roster hears about it,
+            # and what it hears is "ask again", not "reconcile failed".
+            if args.require_create_pass:
+                raise SystemExit(EXIT_ALREADY_RUNNING)
+            return
+
+        try:
+            report = reconcile(dry_run=args.dry_run)
+        except Exception as e:  # noqa: BLE001 - resilient: a cron producer must always exit 0
+            log(f"Reconcile aborted unexpectedly: {e}")
+            if args.require_create_pass:
+                raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
+            return
 
     log(
-        "Done: created={} pruned={} kept={} no_identity={} unknown={}.".format(
-            len(report.get("created", [])), len(report.get("pruned", [])),
+        "Done: created={} failed={} pruned={} kept={} no_identity={} unknown={}.".format(
+            len(report.get("created", [])), len(report.get("create_failed", [])),
+            len(report.get("pruned", [])),
             len(report.get("kept", [])), len(report.get("skipped_no_identity", [])),
             len(report.get("skipped_error", [])),
         )
     )
 
-    if args.require_create_pass and not report.get("create_pass_ran"):
-        log("CREATE direction did not run; the roster is not reconciled.")
-        raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
+    unreconciled = None
+    if not report.get("create_pass_ran"):
+        unreconciled = "CREATE direction did not run"
+    elif report.get("create_failed") and not (report.get("created") or report.get("kept")):
+        # Every create failed and nothing was already in place, so the roster is empty
+        # apart from the half-built homes those failures left behind — `create_profile`
+        # stamps the identity before it fetches credentials. The caller that gates a
+        # one-shot fan-out on this exit code must not file against that; a retry either
+        # succeeds or repairs the home on the next run.
+        #
+        # A partial failure is deliberately not reported here. One unscaffoldable cluster
+        # among several costs the sweep one `gaps` row — the audit SOP's preflight branch
+        # catches the missing kubeconfig — and holding the whole report back for it buys
+        # nothing when the cause is permanent (no IAM, a private control plane).
+        unreconciled = "every CREATE failed: " + ", ".join(report["create_failed"])
 
     if args.dry_run:
         print(json.dumps(report, indent=2))
-        return
+    else:
+        # Notify only when there's something actionable to report (avoid idle hourly
+        # noise). A failed create rides along on a run that already has something to say
+        # rather than triggering its own message: it repeats every run until the cause is
+        # fixed, and the gate re-runs this script every minute during onboarding.
+        if report.get("created") or report.get("pruned"):
+            _notify(_format_notification(report))
 
-    # Notify only when there's something actionable to report (avoid idle hourly noise).
-    if report.get("created") or report.get("pruned"):
-        _notify(_format_notification(report))
+    if args.require_create_pass and unreconciled:
+        log(f"{unreconciled}; the roster is not reconciled.")
+        raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
 
 
 if __name__ == "__main__":

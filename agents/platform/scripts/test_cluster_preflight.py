@@ -212,6 +212,27 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertNotIn("does not select a cluster", result["reason"])
         self.assertNotIn("Re-scaffold the profile to re-fetch", result["remediation"])
 
+    # ---- The check number is reported ----------------------------------------
+
+    # The inventory-audit SOP routes on which check failed: 1-4 mean the agent never
+    # established which cluster it is and must audit nothing, while 5 means it is
+    # identified and merely cut off. The remediation text cannot carry that
+    # distinction — a missing USER.md and a missing kubeconfig share one.
+
+    def test_a_missing_identity_reports_check_1(self):
+        self.user_md.unlink()
+        self.assertEqual("1", self.run_preflight()["check"])
+
+    def test_a_missing_kubeconfig_reports_check_2(self):
+        self.kubeconfig.unlink()
+        self.assertEqual("2", self.run_preflight()["check"])
+
+    def test_an_unreachable_cluster_reports_check_5(self):
+        self.assertEqual("5", self.run_preflight(FAKE_UNREACHABLE="1")["check"])
+
+    def test_a_passing_run_names_no_check(self):
+        self.assertEqual("", self.run_preflight()["check"])
+
     # ---- The pre-existing checks still work ----------------------------------
 
     def test_fails_when_user_md_is_missing(self):

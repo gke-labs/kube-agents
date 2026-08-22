@@ -16,7 +16,6 @@ again.
 """
 
 import contextlib
-import fcntl
 import io
 import os
 import subprocess
@@ -482,24 +481,33 @@ class ScanGateTest(unittest.TestCase):
             self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
 
-    def test_a_concurrent_tick_defers_rather_than_reconciling_twice(self):
-        # The gate fires every minute and a reconcile takes tens of seconds, so
-        # overlap is the normal case. The loser must not run a second reconcile.
-        holder = open(self.d / bootstrap_scan_gate.RECONCILE_LOCK, "w")
-        fcntl.flock(holder, fcntl.LOCK_EX)
-        calls = []
+    def test_a_concurrent_reconcile_defers_the_sweep(self):
+        # The gate fires every minute and a reconcile takes tens of seconds, so overlap
+        # is the normal case. Mutual exclusion lives in the reconcile script, which the
+        # hourly cron job also runs; the gate only has to read its refusal.
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_ALREADY_RUNNING, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_losing_the_race_does_not_spend_an_attempt(self):
+        # Contention says nothing about the roster. Counting it would spend the ceiling
+        # that exists for a reconcile which genuinely cannot succeed.
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
 
         def fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_ALREADY_RUNNING, "", "")
 
-        try:
-            with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
-                    mock.patch.object(Path, "exists", lambda self: True):
-                self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
-        finally:
-            holder.close()
-        self.assertEqual(calls, [])
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
+        self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
 
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
