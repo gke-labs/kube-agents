@@ -255,6 +255,15 @@ class ChangeGateTests(NudgeHarness):
         self.assertEqual(code, 0)
         self.assertEqual(self.out.getvalue(), "")
 
+    def test_a_critical_the_last_sweep_stopped_seeing_stops_defeating_the_gate(self):
+        # The user fixed it, so the sweep no longer reports it and the absence
+        # rule drops C to 0.6 -- but the floor rule keeps the row `critical`.
+        # Without this test's behaviour the nag never ends.
+        ranked = [finding(id="a", rubric={"C": nudge.CONFIDENCE_ABSENT})]
+        code, _ = self.run_with(ranked, last_hash=self._digest(ranked))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.out.getvalue(), "")
+
     def test_a_first_run_has_no_recorded_hash_and_posts(self):
         code, _ = self.run_with([])
         self.assertEqual(code, 0)
