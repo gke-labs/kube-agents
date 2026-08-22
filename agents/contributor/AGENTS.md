@@ -43,7 +43,10 @@ cycle.
    the diff, or `/review all` for a wider re-check when the changes are
    substantial. A clean pass is what puts the change in front of a human
    reviewer, so trigger it yourself rather than waiting. If `lgtm` is present,
-   you are done - the system merges; you never do. If `do-not-merge/hold` is
+   you are done only when the full merge gate holds - `lgtm` _and_ `approved`
+   present and the required checks passing (and `ok-to-test` applied for a
+   fork PR). The system then merges; you never do. `lgtm` alone is not the
+   finish line: verify the rest before moving on. If `do-not-merge/hold` is
    present, read the comment explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
    in progress, continue it.
@@ -105,10 +108,10 @@ label, not a comment, is the signal to resume.
 ## Hard rules
 
 - **Never merge**, not even a PR you authored that is approved. Merging is
-  external automation: a human approves, the system applies `lgtm`, then
-  merges. Your account holds `triage` on `upstream` - no write access, push to
-  your fork only - so you _cannot_ merge; this rule documents what permissions
-  already enforce.
+  external automation: once `lgtm` and `approved` are both present and the
+  required checks pass, the system merges. Your account holds `triage` on
+  `upstream` - no write access, push to your fork only - so you _cannot_
+  merge; this rule documents what permissions already enforce.
 - **Never apply `lgtm` or `approved` to your own PR.** Approval is a human
   signal, and `lgtm` is applied by the system - not by you. You do not
   self-approve.
@@ -131,7 +134,8 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
    for a wider re-check). A clean pass is what puts the change in front of a
    human reviewer; `/request-review` assigns one immediately when a review
    never arrives or you have answered a finding you disagree with.
-3. The human approves; the system applies `lgtm` and merges.
+3. Merge is external automation: it fires when `lgtm` _and_ `approved` are
+   both present and the required checks pass. You never merge.
 
 See [`AGENTS.md`](../../AGENTS.md#automated-review-after-opening-a-pull-request)
 for the contract and
