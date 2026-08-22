@@ -606,8 +606,14 @@ class Policy:
         return cls(rules=rules, blocked_message=blocked_message)
 
     def blocked_by(self, argv: list[str]) -> Rule | None:
+        # Normalised once, not once per rule. This was inside the generator, so
+        # a thirteen-rule policy rebuilt the match text thirteen times for every
+        # brokered command -- pre-existing rather than anything the cluster fix
+        # introduced, but it multiplied that fix's worst case by thirteen, which
+        # is how it was noticed.
+        match_text = policy_match_text(argv)
         return next(
-            (rule for rule in self.rules if rule.pattern.search(policy_match_text(argv))),
+            (rule for rule in self.rules if rule.pattern.search(match_text)),
             None,
         )
 
@@ -637,15 +643,22 @@ _FREE_TEXT_FLAGS = frozenset(
 )
 
 
-# The single-dash shorthands a shipped rule keys on. Only these need a dash
-# kept when they are buried in a cluster, so this is the whole table rather
-# than pflag's arity for four upstream CLIs.
+# The single-dash shorthands a shipped rule keys on, split by whether the rule
+# needs a value beside the flag. Only these need a dash kept when they are
+# buried in a cluster, so this is the whole table rather than pflag's arity for
+# four upstream CLIs.
+#
+# `github.api-mutation` is the only rule that reads a value: `-X PUT` has to be
+# adjacent. Everything else keys on the flag being present at all, which is why
+# the split is worth making -- see `_cluster_readings`, where it is the
+# difference between one remainder and one per letter.
 #
 # It is a copy of something that lives in the operator, so it is pinned:
 # `test_every_shorthand_a_rule_keys_on_is_covered` reads the shipped policy and
 # fails if a rule keys on a shorthand missing here. Add the rule, run the
 # tests, and that test tells you to come back.
-_KEYED_SHORTHANDS = frozenset({"-X", "-f", "-F", "-t", "-a"})
+_VALUE_TAKING_SHORTHANDS = frozenset({"-X", "-f", "-F"})
+_KEYED_SHORTHANDS = _VALUE_TAKING_SHORTHANDS | frozenset({"-t", "-a"})
 
 
 def _cluster_readings(token: str) -> list[str]:
@@ -669,22 +682,42 @@ def _cluster_readings(token: str) -> list[str]:
     letters by definition and everything from a non-letter on is somebody's
     value: without that, `-nkube-system` would emit a `-t` off `system` and a
     `gh auth status` somewhere in the same command would be refused for it.
+
+    Two bounds, because the argv is chosen by the sandbox and the sidecar holds
+    every agent's credentials. A keyed flag is emitted **once**, since the rules
+    ask whether it is present and a millionth `-a` answers nothing a first one
+    did not. And a remainder is emitted **once at most**, at the first
+    value-taking shorthand, which is also where pflag stops reading the cluster.
+    Emitting a fresh copy of the suffix per keyed letter made this quadratic:
+    `["gh", "-" + "a" * 1000000]` fits inside `max_request_bytes`, reaches here
+    because `gh` is an allowed executable, and exhausted the container's 2Gi on
+    a single request. This walk allocates one slice, at the break.
     """
     readings: list[str] = []
-    letters = token[1:]
-    for position, letter in enumerate(letters[1:], start=1):
+    seen: set[str] = set()
+    # From 2: `token[0]` is the dash and `token[1]` is the shorthand the caller
+    # has already split off. Indexed rather than sliced -- a slice per letter is
+    # the quadratic this function was rewritten to lose.
+    for position in range(2, len(token)):
+        letter = token[position]
         if not letter.isalpha():
             break
         flag = f"-{letter}"
         if flag in _FREE_TEXT_FLAGS:
             # Prose from here on, dropped as the detached spelling drops it.
-            readings.append(flag)
+            if flag not in seen:
+                readings.append(flag)
             break
-        if flag in _KEYED_SHORTHANDS:
+        if flag not in _KEYED_SHORTHANDS:
+            continue
+        if flag not in seen:
+            seen.add(flag)
             readings.append(flag)
-            remainder = letters[position + 1 :].lstrip("=")
+        if flag in _VALUE_TAKING_SHORTHANDS:
+            remainder = token[position + 1 :].lstrip("=")
             if remainder:
                 readings.append(remainder)
+            break
     return readings
 
 

@@ -404,6 +404,84 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
                 self.assertIsNotNone(rule, f"{desc} slipped past: {argv}")
                 self.assertEqual(expected, rule.rule_id, desc)
 
+    def test_a_long_cluster_costs_the_sidecar_nothing(self):
+        """The argv is the sandbox's to choose, and the sidecar holds the keys.
+
+        Re-emitting the suffix once per keyed letter was quadratic: every letter
+        of `-aaaa...` is a keyed `-a`, so an N-letter token materialised about
+        N**2/2 bytes. `["gh", "-" + "a" * 1000000]` fits inside
+        `max_request_bytes`, and `gh` is an allowed executable, so it reached
+        the walk and exhausted the container's 2Gi on one request -- against a
+        single-threaded handler holding every agent's credentials.
+
+        Bounded two ways: a keyed flag is emitted once, and a remainder only at
+        the first value-taking shorthand. Growth is asserted rather than timed,
+        so this does not turn into a flaky benchmark.
+        """
+        from credential_proxy import _cluster_readings
+
+        small = _cluster_readings("-" + "a" * 1_000)
+        large = _cluster_readings("-" + "a" * 100_000)
+        self.assertEqual(["-a"], small)
+        self.assertEqual(
+            small,
+            large,
+            "output grows with token length: the walk is re-emitting per letter",
+        )
+
+        # A hundredfold more input for the same output is the property; the
+        # quadratic version returned 1_999 and 199_999 pieces here.
+        self.assertEqual(1, len(large))
+
+    def test_a_long_cluster_still_cannot_hide_the_keyed_flag(self):
+        """Bounding the walk must not buy an escape back.
+
+        Emitting each keyed flag once is safe because the rules ask whether it
+        is present. Stopping at the first value-taking shorthand is safe because
+        pflag stops reading the cluster there too. Neither lets a longer cluster
+        smuggle the flag past.
+        """
+        for argv, expected, desc in (
+            (["gh", "api", "-" + "i" * 40 + "XPUT", "repos/o/r/pulls/1/merge"],
+             "github.api-mutation", "forty booleans then the method"),
+            (["gh", "auth", "status", "-" + "a" * 500 + "t"],
+             "github.token-disclosure", "five hundred booleans then --show-token"),
+        ):
+            with self.subTest(desc=desc):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule, f"{desc} slipped past")
+                self.assertEqual(expected, rule.rule_id, desc)
+
+    def test_the_match_text_is_built_once_per_command(self):
+        """Not once per rule.
+
+        Pre-existing -- the call sat inside the generator `blocked_by` returns
+        from -- but it multiplied the walk above by the rule count, which is how
+        it surfaced. A thirteen-rule policy normalising thirteen times is thirteen
+        times the work on every brokered command, escape or not.
+        """
+        import credential_proxy
+
+        calls = []
+        original = credential_proxy.policy_match_text
+
+        def counting(argv):
+            calls.append(argv)
+            return original(argv)
+
+        credential_proxy.policy_match_text = counting
+        try:
+            self.policy.blocked_by(["gh", "pr", "list", "--state", "open"])
+        finally:
+            credential_proxy.policy_match_text = original
+
+        self.assertEqual(
+            1,
+            len(calls),
+            f"normalised {len(calls)} times for one command; it is hoisted out "
+            "of the generator so that it is once",
+        )
+
     def test_every_shorthand_a_rule_keys_on_is_covered(self):
         """`_KEYED_SHORTHANDS` is a copy of something the operator owns.
 
