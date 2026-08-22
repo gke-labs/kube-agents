@@ -7,4 +7,4 @@
 
 ## Pull Request Descriptions
 
-- Mention in the PR description that the PR was generated with the help of Claude.
+- Follow the AI attribution guidance in `AGENTS.md` (mention in the PR description that the PR was generated with the help of Claude or an AI agent).
