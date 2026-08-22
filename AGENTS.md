@@ -362,8 +362,7 @@ Three things to do with it:
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review** — an active branch would otherwise pay for a re-read on every push. To get a
-fresh review of the current commit, comment `/review` on a line of its own (repository owners,
-members, and collaborators only) — that pass is the strict one, only what the bot is certain of,
+fresh review of the current commit, comment `/review` on a line of its own (anyone with `triage` access or higher) — that pass is the strict one, only what the bot is certain of,
 while `/review all` re-reads at the width of the automatic first review and includes findings it
 believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
 outranks both.
@@ -375,7 +374,7 @@ anyone from `.github/auto_request_review.yml`. Opening a pull request no longer 
 clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
 a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
 completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
-owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
+anyone with `triage` access or higher can comment `/request-review` (at the start of the comment) to
 assign a reviewer immediately — the override for a finding you have answered but disagree with, or
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.
 
