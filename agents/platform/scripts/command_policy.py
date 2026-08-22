@@ -285,10 +285,11 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "get-value"),
         ("config", "list"),
         # `beta` is a word like any other here, so a beta path has to be
-        # listed on its own -- the GA entry above it grants nothing. These two
+        # listed on its own -- the GA entry above it grants nothing. These
         # are the stockout SOP's capacity forecast; the data has no GA
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
+        ("beta", "compute", "advice", "capacity"),
         ("beta", "compute", "advice", "capacity-history"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
@@ -392,6 +393,8 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # machine-types list uses --zones (plural; --zone alone was listed).
         # An allowlist entry whose flags are not here is unreachable.
         "--instance-selection-machine-types", "--size", "--types", "--zones",
+        "--machine-type", "--provisioning-model", "--target-distribution-shape",
+        "--instance-selection",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud
