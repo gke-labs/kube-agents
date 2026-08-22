@@ -193,7 +193,8 @@ class MainTests(NudgeHarness):
             calls,
             [
                 "/v1/findings/ranked",
-                f"/v1/findings/publication/{nudge.PUBLISHER}",
+                # One call, not two: with a critical to name the gate is skipped,
+                # so only the PUT that records the hash happens.
                 f"/v1/findings/publication/{nudge.PUBLISHER}",
                 "/v1/findings/a/surfaced",
                 "/v1/findings/b/surfaced",
@@ -233,8 +234,23 @@ class ChangeGateTests(NudgeHarness):
         self.assertEqual(self.out.getvalue(), "")
         self.assertNotIn(f"/v1/findings/publication/{nudge.PUBLISHER}", calls[2:])
 
-    def test_an_unchanged_queue_of_findings_says_nothing_either(self):
+    def test_an_unchanged_queue_with_no_criticals_says_nothing_either(self):
+        ranked = [finding(id="a", severity="major")]
+        code, _ = self.run_with(ranked, last_hash=self._digest(ranked))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.out.getvalue(), "")
+
+    def test_an_open_critical_is_repeated_even_when_nothing_changed(self):
         ranked = [finding(id="a")]
+        code, calls = self.run_with(ranked, last_hash=self._digest(ranked))
+        self.assertEqual(code, 0)
+        self.assertIn("no readinessProbe on api", self.out.getvalue())
+        # The gate is not consulted at all, so a delivery that fails silently
+        # gets another go tomorrow rather than being suppressed forever.
+        self.assertNotIn(f"/v1/findings/publication/{nudge.PUBLISHER}", calls[:1])
+
+    def test_a_critical_the_nudge_may_not_name_does_not_defeat_the_gate(self):
+        ranked = [observation(id="a", severity="critical"), finding(id="b", severity="major")]
         code, _ = self.run_with(ranked, last_hash=self._digest(ranked))
         self.assertEqual(code, 0)
         self.assertEqual(self.out.getvalue(), "")
@@ -245,7 +261,7 @@ class ChangeGateTests(NudgeHarness):
         self.assertIn("The findings queue is empty", self.out.getvalue())
 
     def test_a_changed_queue_posts_and_records_the_new_hash(self):
-        ranked = [finding(id="a")]
+        ranked = [finding(id="a", severity="major")]
         code, _ = self.run_with(ranked, last_hash=self._digest([]))
         self.assertEqual(code, 0)
         self.assertIn("no readinessProbe on api", self.out.getvalue())

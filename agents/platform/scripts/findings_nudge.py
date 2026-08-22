@@ -13,9 +13,12 @@ What is left is counting and formatting.
 This is §7.2 of `docs/designs/inventory-findings-queue.md` minus two things.
 The design's nudge links to a backlog document holding the whole queue; that
 publisher (§7.1) is not built, so the message says how many findings it did not
-name rather than pointing at a list of them. And the design pairs the change
-gate with a weekly message that posts regardless, so a silent week cannot be
-confused with a broken job; that floor is deferred.
+name rather than pointing at a list of them. And the design gates every message
+on the list having changed, paired with a weekly message so a silent week
+cannot be confused with a broken job. Here the gate applies only to a morning
+with no critical finding to name: an open critical is repeated daily until it
+is gone, which makes the weekly floor unnecessary for the case that would cost
+something to lose.
 """
 
 import hashlib
@@ -161,16 +164,24 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"findings_nudge: could not read the queue at {endpoint}: {detail}\n")
         return 1
 
+    named = [f for f in findings if f.get("severity") == "critical" and not _rolled_up(f)][:TOP_N]
+
     message = compose(findings)
     # The message itself is what "the list changed" is about, so hash that
     # rather than the findings it was built from.
     digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
-    try:
-        if _last_posted_hash(endpoint) == digest:
-            return 0
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        # Post anyway: a repeated message is a smaller failure than a lost one.
-        sys.stderr.write(f"findings_nudge: could not read the last posted hash: {exc}\n")
+    # An open critical is nagged about every morning until it is gone. The gate
+    # is for the quiet mornings, which are the ones that train the reader to
+    # stop opening this. It also means the run cannot lose a critical to a
+    # delivery failure it never sees: the hash is recorded before anything is
+    # delivered, so a suppressed morning is a morning the message is gone.
+    if not named:
+        try:
+            if _last_posted_hash(endpoint) == digest:
+                return 0
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # Post anyway: a repeated message is a smaller failure than a lost one.
+            sys.stderr.write(f"findings_nudge: could not read the last posted hash: {exc}\n")
 
     sys.stdout.write(message + "\n")
     sys.stdout.flush()
@@ -189,9 +200,6 @@ def main(argv: list[str] | None = None) -> int:
     # how a finding stuck at the top of the list becomes visible as its own
     # problem, and leaving them at zero would make that undetectable. A failure
     # here costs that bookkeeping, not the message, which is already out.
-    named = [
-        f for f in findings if f.get("severity") == "critical" and not _rolled_up(f)
-    ][:TOP_N]
     for finding in named:
         try:
             _request(endpoint, f"/v1/findings/{finding['id']}/surfaced", {})
