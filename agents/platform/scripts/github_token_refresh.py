@@ -20,7 +20,7 @@ import urllib.request
 
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [SRE-AUTH] {msg}", flush=True)
+    print(f"[{timestamp}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
 
 
 TOKEN_BROKER_URL = os.getenv(
@@ -214,6 +214,9 @@ def refresh_git_credentials(
 
     # 3. Configure gh CLI authentication and Git credentials
     try:
+        env = os.environ.copy()
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GH_TOKEN", None)
         subprocess.run(
             ["gh", "auth", "login", "--with-token"],
             input=token,
@@ -221,12 +224,14 @@ def refresh_git_credentials(
             check=True,
             capture_output=True,
             timeout=15,
+            env=env,
         )
         subprocess.run(
             ["gh", "auth", "setup-git"],
             check=True,
             capture_output=True,
             timeout=15,
+            env=env,
         )
         log(
             f"GitHub authentication successfully configured for repository: {repository}"
