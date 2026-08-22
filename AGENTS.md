@@ -10,6 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Planning Agent front door — the `default` Hermes profile that receives chat ingress, plans the work, and delegates each piece to a specialist.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
+  - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
@@ -173,6 +174,13 @@ Run `make docs-check` before pushing. It verifies generated regions are current,
 resolve, identifiers match their source, every Markdown document has an entry in the documentation
 map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context budget
 (`scripts/check_context_budget.py`) — the same five checks CI runs.
+
+## Contributing as an agent
+
+If you are an agent collaborating on issues and pushing PRs, also read
+[`agents/contributor/AGENTS.md`](agents/contributor/AGENTS.md). It defines the
+agent-to-agent loop (claiming, escalating, and the review you'll receive) on
+top of the PR hygiene and `kube-agents-bot` contract in this file.
 
 ## Pull Request Hygiene
 
@@ -411,6 +419,15 @@ call, a reviewer asking for something you chose not to do, a rebuttal nobody has
 reply and leave it to them. Resolving says the conversation is finished; it is not a way to end a
 disagreement. Reply first, always: a resolved thread collapses, so the reply naming what changed and
 the commit that changed it is the only record the reviewer may ever see.
+
+**Merge is external.** Nothing in this repository merges. Once every
+conversation is resolved and a human has approved, external automation (tide)
+merges when the `lgtm` and `approved` labels are present and the required checks
+pass. Fork contributors wait on `needs-ok-to-test` until a human applies
+`ok-to-test`, and `do-not-merge/hold` holds a PR. These labels and the merge
+config live in the external tide setup, not in this repository, so `git grep`
+will not find them; the live repo's label set and tide status are the source of
+truth. The contributor protocol in `agents/contributor/AGENTS.md` names them.
 
 ## Before Reviewing Someone Else's Pull Request
 
