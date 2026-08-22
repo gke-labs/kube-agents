@@ -29,12 +29,18 @@ import importlib.util
 import itertools
 import os
 import sys
+import unittest
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
 _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
 if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
+
+try:
+    from . import _stubs  # noqa: F401
+except (ImportError, ValueError):
+    import _stubs  # type: ignore # noqa: F401
 
 PLUGIN_DIR = _REPO / "agents" / "chat" / "plugins" / "memory" / "kube_agents_memory"
 SUBMODULES = sorted(f.stem for f in PLUGIN_DIR.glob("*.py") if f.name != "__init__.py")
@@ -84,45 +90,33 @@ def _load_like_hermes(order):
     return module
 
 
-def test_the_package_registers_under_every_submodule_order():
-    """glob order is the filesystem's business; none of them may break the load."""
-    assert len(SUBMODULES) >= 4, SUBMODULES
-    for order in itertools.permutations(SUBMODULES):
-        module = _load_like_hermes(order)
-        collector = _Collector()
-        module.register(collector)
-        assert collector.provider is not None, order
-        assert collector.provider.name == "kube_agents_memory", order
+class TestPluginLoads(unittest.TestCase):
+    def test_the_package_registers_under_every_submodule_order(self):
+        """glob order is the filesystem's business; none of them may break the load."""
+        self.assertGreaterEqual(len(SUBMODULES), 4, SUBMODULES)
+        for order in itertools.permutations(SUBMODULES):
+            module = _load_like_hermes(order)
+            collector = _Collector()
+            module.register(collector)
+            self.assertIsNotNone(collector.provider, order)
+            self.assertEqual(collector.provider.name, "kube_agents_memory", order)
 
+    def test_the_entry_point_still_exports_what_the_scripts_import(self):
+        """`__init__` is a facade now; the names other code reads must survive it."""
+        module = _load_like_hermes(SUBMODULES)
+        for name in ("DEFAULT_BANK_ID", "SHARED_TAG", "USER_TAG_PREFIX",
+                     "CHECKPOINT_STRATEGY", "RETAIN_STRATEGIES", "NO_IDENTITY_NOTICE",
+                     "KubeAgentsMemoryProvider", "sanitize_user_id",
+                     "memory_is_read_only", "apply_scoping", "register"):
+            self.assertTrue(hasattr(module, name), name)
+            self.assertTrue(name in module.__all__ or name == "register", name)
 
-def test_the_entry_point_still_exports_what_the_scripts_import():
-    """`__init__` is a facade now; the names other code reads must survive it."""
-    module = _load_like_hermes(SUBMODULES)
-    for name in ("DEFAULT_BANK_ID", "SHARED_TAG", "USER_TAG_PREFIX",
-                 "CHECKPOINT_STRATEGY", "RETAIN_STRATEGIES", "NO_IDENTITY_NOTICE",
-                 "KubeAgentsMemoryProvider", "sanitize_user_id",
-                 "memory_is_read_only", "apply_scoping", "register"):
-        assert hasattr(module, name), name
-        assert name in module.__all__ or name == "register", name
-
-
-def test_every_submodule_is_reachable_from_the_package():
-    """A module nothing imports is a module the loader would exec and forget."""
-    module = _load_like_hermes(SUBMODULES)
-    for stem in SUBMODULES:
-        assert f"{module.__name__}.{stem}" in sys.modules, stem
+    def test_every_submodule_is_reachable_from_the_package(self):
+        """A module nothing imports is a module the loader would exec and forget."""
+        module = _load_like_hermes(SUBMODULES)
+        for stem in SUBMODULES:
+            self.assertIn(f"{module.__name__}.{stem}", sys.modules, stem)
 
 
 if __name__ == "__main__":
-    failures = 0
-    for test_name, fn in sorted(globals().items()):
-        if not test_name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            fn()
-            print(f"ok    {test_name}")
-        except AssertionError as e:
-            failures += 1
-            print(f"FAIL  {test_name}: {e}")
-    print("\nall pass" if not failures else f"\n{failures} failed")
-    sys.exit(1 if failures else 0)
+    unittest.main()

@@ -24,6 +24,7 @@ run it.
 import json
 import os
 import sys
+import unittest
 from types import SimpleNamespace
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,6 +32,11 @@ _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
 if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
+
+try:
+    from . import _stubs  # noqa: F401
+except (ImportError, ValueError):
+    import _stubs  # type: ignore # noqa: F401
 
 import kube_agents_memory  # noqa: E402
 from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
@@ -66,142 +72,126 @@ def _names(p):
     return [s["name"] for s in p.get_tool_schemas()]
 
 
-def test_the_write_tool_is_not_advertised():
-    """Advertising it and refusing the call would read as a transient failure."""
-    assert "memory_retain" not in _names(provider(read_only=True)[0])
-    # ...and is still there when the setting is off, or every profile just lost
-    # its write path.
-    assert "memory_retain" in _names(provider(read_only=False)[0])
+class TestReadOnlyProfile(unittest.TestCase):
+    def test_the_write_tool_is_not_advertised(self):
+        """Advertising it and refusing the call would read as a transient failure."""
+        self.assertNotIn("memory_retain", _names(provider(read_only=True)[0]))
+        # ...and is still there when the setting is off, or every profile just lost
+        # its write path.
+        self.assertIn("memory_retain", _names(provider(read_only=False)[0]))
 
+    def test_reads_are_untouched(self):
+        p, calls = provider(read_only=True)
+        self.assertEqual(_names(p), ["memory_recall", "memory_reflect"])
+        r = json.loads(p.handle_tool_call("memory_recall", {"query": "RB-114"}))
+        self.assertEqual(r["status"], "found", r)
+        self.assertIn("RB-114", r["result"], r)
+        self.assertEqual(calls["recall"]["tags"], ["user:alice", SHARED_TAG], calls)
 
-def test_reads_are_untouched():
-    p, calls = provider(read_only=True)
-    assert _names(p) == ["memory_recall", "memory_reflect"], _names(p)
-    r = json.loads(p.handle_tool_call("memory_recall", {"query": "RB-114"}))
-    assert r["status"] == "found", r
-    assert "RB-114" in r["result"], r
-    assert calls["recall"]["tags"] == ["user:alice", SHARED_TAG], calls
+    def test_the_write_call_is_refused_anyway(self):
+        """Backstop: an invented call, or a schema cached across a config change."""
+        p, calls = provider(read_only=True)
+        r = json.loads(p.handle_tool_call("memory_retain", {"content": "x", "scope": "shared"}))
+        self.assertEqual(r["status"], "read_only", r)
+        self.assertIn("read-only", r["error"], r)
+        # The refusal has to land before anything reaches Hindsight.
+        self.assertNotIn("retain", calls, calls)
+        # And it must not read as retryable — a model that retries burns the task.
+        self.assertIn("retrying will not change that", r["error"], r)
 
+    def test_automatic_capture_is_off(self):
+        """The tool surface is not the only write path; the turn hooks are one too.
 
-def test_the_write_call_is_refused_anyway():
-    """Backstop: an invented call, or a schema cached across a config change."""
-    p, calls = provider(read_only=True)
-    r = json.loads(p.handle_tool_call("memory_retain", {"content": "x", "scope": "shared"}))
-    assert r["status"] == "read_only", r
-    assert "read-only" in r["error"], r
-    # The refusal has to land before anything reaches Hindsight.
-    assert "retain" not in calls, calls
-    # And it must not read as retryable — a model that retries burns the task.
-    assert "retrying will not change that" in r["error"], r
+        Scoped to the read-only decision, and only that. Stubbing ``_call`` is fine
+        for "does the hook return before forwarding"; it is worthless for "does the
+        forward arrive", because ``_call`` is the method that forwards and, until
+        #784, swallowed the result. That half lives in
+        ``test_forwarding_matches_hindsight.py``, which drives the same hooks through
+        ``MemoryManager`` and binds each forward against the real stock signature.
+        """
+        p, _ = provider(read_only=True)
+        seen = []
+        p._call = lambda name, *a, **kw: seen.append(name)
+        p.sync_turn("u", "a")
+        p.on_session_end([{"role": "user", "content": "u"}])
+        self.assertEqual(seen, [], seen)
 
+        # Same hooks, writable profile: both must fire, or this test would pass on a
+        # provider that had simply stopped working.
+        p, _ = provider(read_only=False)
+        seen = []
+        p._call = lambda name, *a, **kw: seen.append(name)
+        p.sync_turn("u", "a")
+        p.on_session_end([{"role": "user", "content": "u"}])
+        self.assertEqual(seen, ["sync_turn", "on_session_end"], seen)
 
-def test_automatic_capture_is_off():
-    """The tool surface is not the only write path; the turn hooks are one too.
+    def test_scoping_clears_the_stock_providers_own_write_state(self):
+        """`_auto_retain` is read by Hindsight itself, below our hooks."""
+        stock = SimpleNamespace(
+            _config={"recall_budget": "low"},
+            _prefetch_method="recall",
+            _auto_retain=True,
+            _retain_tags=["stale"],
+            _tags=["stale"],
+            _observation_scopes=[["stale"]],
+        )
+        kube_agents_memory.apply_scoping(stock, user_tag="user:alice", read_only=True)
+        self.assertFalse(stock._auto_retain)
+        self.assertEqual(stock._retain_tags, [])
+        self.assertIsNone(stock._tags)
+        self.assertIsNone(stock._observation_scopes)
+        # The read filter still has to be set, including the user's own tag: a
+        # specialist that cannot write can still be handed a user's session.
+        self.assertEqual(stock._recall_tags, ["user:alice", SHARED_TAG])
 
-    Scoped to the read-only decision, and only that. Stubbing ``_call`` is fine
-    for "does the hook return before forwarding"; it is worthless for "does the
-    forward arrive", because ``_call`` is the method that forwards and, until
-    #784, swallowed the result. That half lives in
-    ``test_forwarding_matches_hindsight.py``, which drives the same hooks through
-    ``MemoryManager`` and binds each forward against the real stock signature.
-    """
-    p, _ = provider(read_only=True)
-    seen = []
-    p._call = lambda name, *a, **kw: seen.append(name)
-    p.sync_turn("u", "a")
-    p.on_session_end([{"role": "user", "content": "u"}])
-    assert seen == [], seen
+    def test_the_prompt_says_read_only_and_says_not_to_cache(self):
+        """#122: with no sanctioned route the specialist forked the corpus into its
+        own skill file. Prose is the only mitigation the provider itself can carry."""
+        p, _ = provider(read_only=True)
+        block = p.system_prompt_block()
+        self.assertIn("cannot write", block, block)
+        self.assertIn("skill", block, block)
+        # The #113 rule has to survive into this variant too.
+        self.assertIn("Memory is a search, not an index", block, block)
+        # No write guidance leaks in from the writable prompt.
+        self.assertNotIn("memory_retain", block, block)
 
-    # Same hooks, writable profile: both must fire, or this test would pass on a
-    # provider that had simply stopped working.
-    p, _ = provider(read_only=False)
-    seen = []
-    p._call = lambda name, *a, **kw: seen.append(name)
-    p.sync_turn("u", "a")
-    p.on_session_end([{"role": "user", "content": "u"}])
-    assert seen == ["sync_turn", "on_session_end"], seen
+    def test_read_only_defaults_off_and_is_read_from_the_profile_config(self):
+        """A profile that says nothing keeps its write tools; a broken config too."""
+        read = kube_agents_memory.memory_is_read_only
 
+        saved = sys.modules.get("hermes_cli.config")
 
-def test_scoping_clears_the_stock_providers_own_write_state():
-    """`_auto_retain` is read by Hindsight itself, below our hooks."""
-    stock = SimpleNamespace(
-        _config={"recall_budget": "low"},
-        _prefetch_method="recall",
-        _auto_retain=True,
-        _retain_tags=["stale"],
-        _tags=["stale"],
-        _observation_scopes=[["stale"]],
-    )
-    kube_agents_memory.apply_scoping(stock, user_tag="user:alice", read_only=True)
-    assert stock._auto_retain is False
-    assert stock._retain_tags == []
-    assert stock._tags is None
-    assert stock._observation_scopes is None
-    # The read filter still has to be set, including the user's own tag: a
-    # specialist that cannot write can still be handed a user's session.
-    assert stock._recall_tags == ["user:alice", SHARED_TAG]
+        def with_config(value):
+            sys.modules["hermes_cli.config"] = SimpleNamespace(load_config=lambda: value)
+            try:
+                return read()
+            finally:
+                if saved is None:
+                    sys.modules.pop("hermes_cli.config", None)
+                else:
+                    sys.modules["hermes_cli.config"] = saved
 
+        self.assertTrue(with_config({"memory": {"read_only": True}}))
+        self.assertFalse(with_config({"memory": {"read_only": False}}))
+        self.assertFalse(with_config({"memory": {}}))
+        self.assertFalse(with_config({}))
+        self.assertFalse(with_config(None))
+        # A provider whose config read blows up must not silently go read-only and
+        # drop the front door's writes on the floor.
 
-def test_the_prompt_says_read_only_and_says_not_to_cache():
-    """#122: with no sanctioned route the specialist forked the corpus into its
-    own skill file. Prose is the only mitigation the provider itself can carry."""
-    p, _ = provider(read_only=True)
-    block = p.system_prompt_block()
-    assert "cannot write" in block, block
-    assert "skill" in block, block
-    # The #113 rule has to survive into this variant too.
-    assert "Memory is a search, not an index" in block, block
-    # No write guidance leaks in from the writable prompt.
-    assert "memory_retain" not in block, block
+        def exploding():
+            raise RuntimeError("no profile")
 
-
-def test_read_only_defaults_off_and_is_read_from_the_profile_config():
-    """A profile that says nothing keeps its write tools; a broken config too."""
-    read = kube_agents_memory.memory_is_read_only
-
-    saved = sys.modules.get("hermes_cli.config")
-
-    def with_config(value):
-        sys.modules["hermes_cli.config"] = SimpleNamespace(load_config=lambda: value)
+        sys.modules["hermes_cli.config"] = SimpleNamespace(load_config=exploding)
         try:
-            return read()
+            self.assertFalse(read())
         finally:
             if saved is None:
                 sys.modules.pop("hermes_cli.config", None)
             else:
                 sys.modules["hermes_cli.config"] = saved
 
-    assert with_config({"memory": {"read_only": True}}) is True
-    assert with_config({"memory": {"read_only": False}}) is False
-    assert with_config({"memory": {}}) is False
-    assert with_config({}) is False
-    assert with_config(None) is False
-    # A provider whose config read blows up must not silently go read-only and
-    # drop the front door's writes on the floor.
-
-    def exploding():
-        raise RuntimeError("no profile")
-
-    sys.modules["hermes_cli.config"] = SimpleNamespace(load_config=exploding)
-    try:
-        assert read() is False
-    finally:
-        if saved is None:
-            sys.modules.pop("hermes_cli.config", None)
-        else:
-            sys.modules["hermes_cli.config"] = saved
-
 
 if __name__ == "__main__":
-    failed = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            fn()
-            print(f"ok    {name}")
-        except AssertionError as e:
-            failed += 1
-            print(f"FAIL  {name}: {e}")
-    print("\nall pass" if not failed else f"\n{failed} failed")
-    sys.exit(1 if failed else 0)
+    unittest.main()
