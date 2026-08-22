@@ -188,8 +188,10 @@ code, first check which era it belongs to:
   the agent at runtime. Similarly, every `SOUL.md`, `AGENTS.md`,
   `CAPABILITIES.md`, `SKILL.md`, and governance SOP under `agents/` is agent
   runtime material, copied into images or scaffolded into the pod — editing
-  them changes agent behavior, not just prose. (The human-facing glossary is
-  the separate site page `reference/glossary.md`.)
+  them changes agent behavior, not just prose. The exception is
+  `agents/contributor/AGENTS.md`, a non-runtime contributor protocol that is
+  not shipped in the images. (The human-facing glossary is the separate
+  site page `reference/glossary.md`.)
 
 ## 4. Inventory
 
