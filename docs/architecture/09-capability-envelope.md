@@ -307,8 +307,15 @@ worry you.
 capability is per-request, and a check that compares it against a per-agent identity is comparing
 against the wrong thing. This is a requirement 09 places on the runtime rather than something the
 KV scheme can fix from inside: whatever issues the broker's credential must issue a distinct one
-per request, so that "the caller" and "the request" are the same subject. The per-request scoped
-ServiceAccount pool being built for the agent runtime is the obvious place for it to come from.
+per request, so that "the caller" and "the request" are the same subject.
+
+**Nothing in the design set provides that today, and the nearest thing to it is deferred on
+purpose.** [08](08-agent-runtime-and-identity.md) §5 lists a scope broker issuing per-run ephemeral
+tokens among the options held out of v1, and its non-goals rule out "per-request credential
+enforcement" by name; [02](02-agent-personas.md) §8 and [06](06-api-and-data-contracts.md) §2 fix
+agent identity as one pre-created, tier-scoped ServiceAccount per agent. So this is a new
+requirement 09 raises and not a dependency on work already in flight -- which makes it a cost of
+the design rather than something arriving on its own.
 
 **Until that exists the guarantee is weaker, and it is worth saying which weaker.** With a shared
 agent identity the bound is the widest capability concurrently delegated to that agent, not the
@@ -348,18 +355,16 @@ That is the sentence to have ready when someone probes the design, and it is wor
 what carries it: the two delegate rules above, a per-request principal both of them can name, and
 nothing else. The write half stops a hop descending from an origin it was never handed. The read
 half stops it presenting that origin directly. The principal is what makes "it" mean this request
-rather than this agent, and neither half has one today -- see §5, and read the last five words of
-the claim as the target. It holds under imperfect
-implementation, which is the only kind there is, but it does not hold under a missing rule.
+rather than this agent, and neither half has one today -- so read the last five words of the claim
+as the target. What follows is why. It holds under imperfect implementation, which is the only kind
+there is, but it does not hold under a missing rule.
 
-**One of the three is not carried yet, and the claim is ahead of the mechanism until it is.** The
-read side can be request-scoped because the verifier authenticates a live caller. The write side is
-proved by the subject prefix, which is per agent, so an agent that is concurrently the delegate of
-two roots can still write a child descending from the wider one while serving the narrower one's
+**Neither side is carried, and the claim is ahead of the mechanism until they are.** The write side
+is proved by the subject prefix, which is per agent, so an agent that is concurrently the delegate
+of two roots can write a child descending from the wider one while serving the narrower one's
 request.
 
-**Neither side is carried, and an earlier version of this paragraph claimed the read side was.** It
-is not, and for the same reason. The read check compares the caller against the entry's `delegate`
+The read side looks better and is not. The check compares the caller against the entry's `delegate`
 field, and that field holds an agent id written by the parent -- so making the caller's credential
 per-request changes one side of a comparison whose other side is still per-agent. Compare at agent
 granularity and the concurrent-capability escalation survives untouched, because the wider entry
