@@ -280,3 +280,35 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
                 rule = self.policy.blocked_by(argv)
                 self.assertIsNotNone(rule, expected)
                 self.assertEqual(expected, rule.rule_id)
+
+    def test_a_free_text_flag_cannot_swallow_the_next_flag(self):
+        """A name on the free-text list is not always value-taking.
+
+        The list is applied without knowing which subcommand is running, and
+        `--comment` takes prose on `gh issue close` while being a boolean on
+        `gh pr review`. Swallowing the token after it there drops `--approve`
+        out of the match text and hides an approval from github.assent.
+
+        gh refuses this particular argv itself ("need exactly one of
+        --approve, --request-changes, or --comment"), so it was not an escape
+        -- but it is one flag's arity away from being one, which is not a
+        margin to leave to the upstream CLI's flag table.
+        """
+        for argv in (
+            ["gh", "pr", "review", "--comment", "--approve", "1"],
+            ["gh", "pr", "review", "--body", "--approve", "1"],
+            ["gh", "pr", "review", "--title", "--approve", "1"],
+        ):
+            with self.subTest(argv=argv):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(
+                    rule, f"{argv} slipped past: a flag value swallowed --approve")
+                self.assertEqual("github.assent", rule.rule_id)
+
+    def test_prose_is_still_dropped_when_it_is_ordinary_text(self):
+        """The guard above must not undo the prose fix it sits inside."""
+        body = ("Drift detected.\n\nPlease review the code diffs and merge this "
+                "PR to trigger the GitOps CI/CD rollout!")
+        argv = ["gh", "pr", "create", "--repo", "o/r", "--title", "fix: drift",
+                "--body", body]
+        self.assertIsNone(self.policy.blocked_by(argv))

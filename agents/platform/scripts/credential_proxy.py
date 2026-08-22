@@ -665,7 +665,7 @@ def policy_match_text(argv: list[str]) -> str:
     """
     tokens: list[str] = []
     skip_next = False
-    for token in argv:
+    for index, token in enumerate(argv):
         if skip_next:
             skip_next = False
             continue
@@ -673,7 +673,21 @@ def policy_match_text(argv: list[str]) -> str:
         if name in _FREE_TEXT_FLAGS:
             # `--body=<prose>` carries its value in the same token; `--body
             # <prose>` in the next one.
-            skip_next = not separator
+            #
+            # Never swallow a token that looks like a flag. This set is applied
+            # without knowing which subcommand is running, and a name in it is
+            # not always value-taking: `--comment` takes prose on `gh issue
+            # close` and is a boolean on `gh pr review`, where the next token is
+            # the next flag. Swallowing it there would drop `--approve` out of
+            # `gh pr review --comment --approve 1` and hide it from
+            # github.assent. gh happens to refuse that particular argv itself
+            # ("need exactly one of --approve, --request-changes, or
+            # --comment"), so it is not an escape today -- but it is one flag's
+            # arity away from being one, and the guard costs nothing. The only
+            # thing it gives up is prose beginning with a dash, which stays in
+            # the match text and can at worst cause a visible refusal.
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            skip_next = not separator and not following.startswith("-")
             tokens.append(name)
             continue
         if (
