@@ -11,26 +11,27 @@ nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.m
 exists. Those steps belong to the Platform Agent, and running them here means several agents
 writing one path at once.
 
-**A failed `cluster_preflight.sh` blocks this card, exactly as `SOUL.md` §6 step 2 says** — call
-`kanban_block(kind="needs_input", ...)` with the script's own `reason` and `remediation`, and stop.
-One exception: its check 5, "Cannot reach the target cluster's API server", is a liveness failure —
-record it in `gaps` and complete. For this card that exception also overrides your own `AGENTS.md`
-("Fail loud, never silent") and `SOUL.md` §2.
+**Never block this card, whatever fails** — not for a failed `cluster_preflight.sh`, denied
+permissions, a cluster in `ERROR`, credentials that will not mint, or an MCP tool that errors. This
+overrides `SOUL.md` §6 step 2, your own `AGENTS.md` ("Fail loud, never silent"), and `SOUL.md` §2.
+The aggregation card lists this card in its `parents`, and `claim_task` will not claim it while any
+parent is anything but `done` or `archived`. A block is not `done`, nothing re-arms
+`.bootstrap_scan_filed`, and the notifier reaches nobody on a card the cron gate filed — so one
+blocked card costs the fleet report permanently and silently. Record what failed in `gaps`, and
+complete.
 
-**Decide from the check that failed, not from its remediation text.** Everything except check 5 is
-checks 1–4, and the script stops at the first failure, so a failure there means you have not
-established which cluster you are — you have only failed to check. A missing `USER.md` and a
-missing kubeconfig both say "Re-scaffold the profile", and both leave you as unidentified as a
-context mismatch does. An unpinned `kubectl` resolves to the credential proxy's own context, the
-management cluster, so the alternative to blocking is filing another cluster's workloads under your
-name. Aggregation copies `metadata` verbatim and the Platform Agent is forbidden to re-audit, so
-nothing downstream catches it.
+**A preflight failure other than check 5 means you audit nothing.** Complete with the failure in
+`gaps` and every other field empty. The script stops at the first failure, so a failure in checks
+1–4 means you have not established which cluster you are — you have only failed to check. Decide
+from the check number, not the remediation text: a missing `USER.md` and a missing kubeconfig both
+say "Re-scaffold the profile", and both leave you as unidentified as a context mismatch does. An
+unpinned `kubectl` resolves to the credential proxy's own context, the management cluster, so an
+audit run anyway files another cluster's workloads under your name. Aggregation copies `metadata`
+verbatim and the Platform Agent is forbidden to re-audit, so nothing downstream catches it.
 
-**Preflight passed and something else failed? Do not block.** Denied permissions, a cluster in
-`ERROR`, credentials that will not mint, an MCP tool that errors — each is a `gaps` entry and a
-completed card. An aggregation card is waiting on this card and every other cluster's, so blocking
-there costs the whole fleet report to save one row. Record what you did get, record what failed and
-why in `gaps`, and complete.
+Check 5, "Cannot reach the target cluster's API server", is the exception: your identity is
+established and the cluster is simply unreachable, so record it in `gaps` and complete like any
+other data-cost failure.
 
 ---
 
@@ -45,8 +46,9 @@ are pinned to.
 yours. An agent that trusts them audits the wrong cluster and reports the result as if it were
 right.
 
-If `USER.md` is missing, incomplete, or does not parse, block. Guessing your own identity from a
-profile name or a cluster list is how a report ends up describing somebody else's cluster.
+If `USER.md` is missing, incomplete, or does not parse, complete the card with that as the finding
+and audit nothing. Guessing your own identity from a profile name or a cluster list is how a report
+ends up describing somebody else's cluster.
 
 If the audit cannot be done at all for one of the data-cost reasons above, record what failed in
 `gaps`, leave the other fields empty, and complete.
