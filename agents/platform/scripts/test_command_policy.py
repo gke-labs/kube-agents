@@ -963,9 +963,14 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         # were consulted. These are the SOP's spellings (lines 73 and 220).
         for argv, desc in (
             (["gcloud", "beta", "compute", "advice", "capacity-history",
-              "--region=r", "--instance-selection-machine-types=g2-standard-4",
-              "--size=1", "--types=PREEMPTION,PRICE", "--format=json"],
-             "capacity forecast as the SOP spells it"),
+              "--region=r", "--provisioning-model=SPOT", "--machine-type=g2-standard-4",
+              "--types=PREEMPTION,PRICE", "--format=json"],
+             "capacity-history as the SOP spells it"),
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--region=r", "--provisioning-model=SPOT", "--size=1",
+              "--instance-selection-machine-types=g2-standard-4",
+              "--target-distribution-shape=any", "--format=json"],
+             "capacity advice as the SOP spells it"),
             (["gcloud", "compute", "machine-types", "list", "--zones=z"],
              "machine-types with --zones (plural)"),
             (["gcloud", "billing", "budgets", "list", "--billing-account=A",
