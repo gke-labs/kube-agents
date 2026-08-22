@@ -42,18 +42,6 @@ EXCLUDED = {
     # already-gating unit and coverage jobs. Joins the unit sweep when the
     # job becomes a required check.
     "tests/integration": "own CI job during probation, make test-integration",
-    # tests/e2e is deliberately NOT here: its file is gchat_agent_test.py,
-    # which the test_*.py pattern never matches. If a test_*.py ever lands
-    # there, the orphan check below fires and forces this list to say why the
-    # live-cluster suite must not join PYTHON_TEST_DIRS. That is the point.
-    #
-    # Imports kube_agents_memory, which imports hermes-agent's `agent` module
-    # at module scope -- a dependency requirements-test.txt deliberately does
-    # not install ("far too heavy to install for a unit-test run"). Whether to
-    # stub the provider or pay for the dependency is an open decision; until
-    # it is made, the suite cannot load, and this entry is the record that the
-    # omission is known rather than accidental.
-    "tests/memory": "hermes-agent dependency, decision pending",
 }
 
 # Directory names that are never test homes, at any depth. .terraform holds
