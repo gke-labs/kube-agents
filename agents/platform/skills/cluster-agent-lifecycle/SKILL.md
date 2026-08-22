@@ -86,6 +86,12 @@ both directions:
   carry a profile even though that cluster exists. This closes the loop when a cluster is deleted
   out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
 
+A profile whose `cluster_identity` is stamped but whose `kubeconfig.yaml` or `USER.md` is missing is
+treated as absent and recreated. Profile creation stamps the identity before it writes either file,
+so a run killed mid-create leaves a home that satisfies the create direction's existence check and
+the prune direction's "identity present, cluster exists" check — unrepaired, it stays half-built
+forever.
+
 It never deletes on ambiguity: any inconclusive check (auth/network/timeout, or a missing
 `cluster_identity`) leaves the profile untouched. `created=0 pruned=0 kept=0` is a normal,
 successful result. When it creates or prunes anything it posts a Google Chat summary.

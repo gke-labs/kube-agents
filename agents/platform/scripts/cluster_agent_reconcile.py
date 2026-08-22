@@ -42,6 +42,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from pathlib import Path
 
 from cluster_agent_profile import (
     HERMES_BIN,
@@ -161,6 +162,25 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
 # Distinct from 1 so a caller can tell "the roster is not reconciled" from a crash.
 EXIT_CREATE_PASS_SKIPPED = 3
 
+# Written by create_profile after the identity stamp, so their absence means the
+# scaffold was interrupted between the two.
+SCAFFOLD_ARTIFACTS = ("kubeconfig.yaml", "USER.md")
+
+
+def _scaffold_gaps(home: Path) -> list[str]:
+    """Artifacts create_profile writes after the identity stamp that this home lacks.
+
+    ``create_profile`` stamps ``cluster_identity`` into ``config.yaml`` (step 2b)
+    before it fetches the kubeconfig (step 3) and writes ``USER.md`` (step 4). A
+    process killed in that window -- the bootstrap gate runs this script under a
+    240s timeout, and Python SIGKILLs on expiry -- leaves a home that reads as fully
+    managed: CREATE finds its identity tuple and skips the cluster, PRUNE keeps it
+    because the cluster still exists, and the half-scaffolded profile survives with
+    no credentials for the life of the volume. Treating it as absent re-runs the
+    scaffold, which is idempotent.
+    """
+    return [f for f in SCAFFOLD_ARTIFACTS if not (home / f).exists()]
+
 
 def reconcile(dry_run: bool = False) -> dict:
     """Reconcile Cluster Agent profiles with the project's clusters (create + prune).
@@ -174,6 +194,7 @@ def reconcile(dry_run: bool = False) -> dict:
         "kept": [],              # cluster still exists and should be managed
         "skipped_no_identity": [],  # config.yaml lacked a usable cluster_identity
         "skipped_error": [],     # liveness check was inconclusive (auth/network/etc.)
+        "incomplete": [],        # identity stamped but the scaffold never finished
     }
     # Not a bucket: whether the CREATE direction ran at all this run. Every failure
     # below is caught and logged so a cron producer can always exit 0, which leaves
@@ -184,9 +205,16 @@ def reconcile(dry_run: bool = False) -> dict:
 
     profiles = list_profiles()
     identities = {name: read_cluster_identity(profile_home(name)) for name in profiles}
-    existing_keys = {
-        (i["project"], i["cluster"], i["location"]) for i in identities.values() if i
-    }
+    existing_keys = set()
+    for name, identity in identities.items():
+        if not identity:
+            continue
+        missing = _scaffold_gaps(profile_home(name))
+        if missing:
+            log(f"{name}: incomplete scaffold ({', '.join(missing)} missing) — recreating.")
+            report["incomplete"].append(name)
+            continue
+        existing_keys.add((identity["project"], identity["cluster"], identity["location"]))
 
     # --- CREATE: ensure every project cluster (except RECONCILE_EXCLUDE names) has a
     #     profile. Requires only a resolvable project now that the management cluster is

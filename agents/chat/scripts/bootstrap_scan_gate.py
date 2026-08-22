@@ -120,10 +120,19 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 RECONCILE_LOCK = ".bootstrap_reconcile.lock"
 RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
 RECONCILE_TIMEOUT_SECONDS = 240
-# After this many failed reconciles the sweep proceeds anyway. A reconcile that cannot
-# succeed (no IAM to list clusters, a project with one cluster and nothing to create) must
-# not hold onboarding shut forever — a solo sweep is a worse report, no report is none.
+# After this many failed reconciles, AND this much wall clock since the first of them,
+# the sweep proceeds anyway. A reconcile that cannot succeed (no IAM to list clusters)
+# must not hold onboarding shut forever — a solo sweep is a worse report, no report is
+# none.
+#
+# The clock is what makes the count safe. The gate ticks every minute with no backoff, so
+# a count alone gives up five minutes into the pod's life — and a brand-new install is
+# both the only state this gate runs in and the one where `gcloud container clusters list`
+# fails for reasons that clear on their own, IAM propagation being routine minutes. Giving
+# up there files the solo sweep that `.bootstrap_scan_filed` then makes permanent, which
+# is the failure this gate exists to remove.
 MAX_RECONCILE_ATTEMPTS = 5
+RECONCILE_GIVE_UP_SECONDS = 1800
 
 
 def _data_dir() -> Path:
@@ -168,14 +177,30 @@ def _roster_command() -> str:
 
 def _reconcile_attempts(data_dir: Path) -> int:
     try:
-        return int((data_dir / RECONCILE_ATTEMPTS_MARKER).read_text(encoding="utf-8").strip())
+        first = (data_dir / RECONCILE_ATTEMPTS_MARKER).read_text(encoding="utf-8").splitlines()[0]
+        return int(first.strip())
     except Exception:  # noqa: BLE001 - absent or unreadable counts as no attempts yet
         return 0
 
 
-def _record_reconcile_attempt(data_dir: Path, attempts: int) -> None:
+def _reconcile_since(data_dir: Path) -> float | None:
+    """Epoch seconds of the first failure in the current streak, or None.
+
+    Second line of the counter file. None on a marker written before this line
+    existed, which is read as "the clock has run out" so an upgrade cannot extend
+    a streak that already exhausted the count.
+    """
     try:
-        (data_dir / RECONCILE_ATTEMPTS_MARKER).write_text(f"{attempts}\n", encoding="utf-8")
+        lines = (data_dir / RECONCILE_ATTEMPTS_MARKER).read_text(encoding="utf-8").splitlines()
+        return float(lines[1].strip())
+    except Exception:  # noqa: BLE001 - absent, short, or unparseable
+        return None
+
+
+def _record_reconcile_attempt(data_dir: Path, attempts: int, since: float | None = None) -> None:
+    body = f"{attempts}\n" if since is None else f"{attempts}\n{since}\n"
+    try:
+        (data_dir / RECONCILE_ATTEMPTS_MARKER).write_text(body, encoding="utf-8")
     except Exception as e:  # noqa: BLE001 - never fail the cron run
         sys.stderr.write(f"bootstrap_scan_gate: could not record reconcile attempt: {e}\n")
 
@@ -201,9 +226,12 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
         return True  # deployment without Cluster Agents; the solo sweep is correct here
 
     attempts = _reconcile_attempts(data_dir)
-    if attempts >= MAX_RECONCILE_ATTEMPTS:
+    since = _reconcile_since(data_dir)
+    elapsed = time.time() - since if since is not None else None
+    if attempts >= MAX_RECONCILE_ATTEMPTS and (elapsed is None or elapsed >= RECONCILE_GIVE_UP_SECONDS):
         sys.stderr.write(
-            f"bootstrap_scan_gate: reconcile failed {attempts} times; "
+            f"bootstrap_scan_gate: reconcile failed {attempts} times over "
+            f"{'an unknown period' if elapsed is None else f'{int(elapsed)}s'}; "
             "filing the sweep anyway against whatever roster exists\n"
         )
         return True
@@ -223,7 +251,7 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
             # the reconcile takes tens of seconds, so overlap is expected, not an error.
             return False
 
-        _record_reconcile_attempt(data_dir, attempts + 1)
+        _record_reconcile_attempt(data_dir, attempts + 1, since if since is not None else time.time())
         try:
             proc = subprocess.run(
                 # `--require-create-pass` is what makes the exit code mean anything: on

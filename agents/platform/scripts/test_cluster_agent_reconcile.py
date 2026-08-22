@@ -24,7 +24,32 @@ def _identity(project="p", cluster="c", location="us-central1"):
     return {"project": project, "cluster": cluster, "location": location}
 
 
-class ReconcileTest(unittest.TestCase):
+def _home_factory(root: Path, incomplete=frozenset()):
+    """A ``profile_home`` stub over real directories.
+
+    reconcile() reads the filesystem to tell a finished scaffold from one killed
+    after the identity stamp, so these have to exist. Names in ``incomplete`` get
+    the directory without the artifacts ``create_profile`` writes last.
+    """
+    def factory(name: str) -> Path:
+        home = root / name
+        home.mkdir(parents=True, exist_ok=True)
+        if name not in incomplete:
+            for artifact in rec.SCAFFOLD_ARTIFACTS:
+                (home / artifact).touch()
+        return home
+
+    return factory
+
+
+class HomesMixin(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.homes = Path(self._tmp.name)
+
+
+class ReconcileTest(HomesMixin):
     def _run(self, profiles, identities, existence, dry_run=False):
         """Drive reconcile() with stubbed enumeration/identity/liveness/delete.
 
@@ -37,7 +62,7 @@ class ReconcileTest(unittest.TestCase):
         # under test (and avoiding any real metadata/gcloud calls).
         with mock.patch.object(rec, "_project", return_value=None), \
              mock.patch.object(rec, "list_profiles", return_value=profiles), \
-             mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
+             mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity", side_effect=lambda home: identities[home.name]), \
              mock.patch.object(rec, "_cluster_exists", side_effect=lambda **kw: existence[_name_for(kw, identities)]), \
              mock.patch.object(rec, "delete_profile", side_effect=deleted.append):
@@ -88,7 +113,7 @@ def _name_for(identity_kwargs, identities):
     raise KeyError(identity_kwargs)
 
 
-class CreateDirectionTest(unittest.TestCase):
+class CreateDirectionTest(HomesMixin):
     def test_creates_missing_including_the_management_cluster(self):
         # "mgmt" is the cluster this pod runs on. It used to be excluded by name via the
         # metadata server; it is now managed like any other, because the triage session for
@@ -101,7 +126,7 @@ class CreateDirectionTest(unittest.TestCase):
                  ("p", "mgmt", "us-central1"),    # the management cluster -> CREATE too
              ]), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
-             mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
+             mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity",
                                side_effect=lambda home: {"project": "p", "cluster": "beta", "location": "us-central1"}), \
              mock.patch.object(rec, "_cluster_exists", return_value=True), \
@@ -121,7 +146,7 @@ class CreateDirectionTest(unittest.TestCase):
              mock.patch.object(rec, "EXTRA_EXCLUDE", {"skipme"}), \
              mock.patch.object(rec, "_all_clusters", return_value=[("p", "skipme", "us-central1")]), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-skipme"]), \
-             mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
+             mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity",
                                side_effect=lambda home: {"project": "p", "cluster": "skipme", "location": "us-central1"}), \
              mock.patch.object(rec, "_cluster_exists", return_value=True), \
@@ -138,13 +163,59 @@ class CreateDirectionTest(unittest.TestCase):
              mock.patch.object(rec, "_all_clusters", return_value=[
                  ("p", "keep", "us-central1"), ("p", "skipme", "us-central1")]), \
              mock.patch.object(rec, "list_profiles", return_value=[]), \
-             mock.patch.object(rec, "profile_home", side_effect=lambda n: Path("/fake") / n), \
+             mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity", return_value=None), \
              mock.patch.object(rec, "_cluster_exists", return_value=True), \
              mock.patch.object(rec, "delete_profile"), \
              mock.patch.object(rec, "create_profile", side_effect=lambda pr, c, l: created.append(c) or f"cluster-{c}"):
             rec.reconcile(dry_run=False)
         self.assertEqual(created, ["keep"])  # skipme excluded via RECONCILE_EXCLUDE
+
+
+class IncompleteScaffoldTest(HomesMixin):
+    """A scaffold killed after the identity stamp must be finished, not adopted.
+
+    The bootstrap gate runs this script under a timeout and Python SIGKILLs on
+    expiry. ``create_profile`` writes ``cluster_identity`` into ``config.yaml``
+    before it fetches the kubeconfig and writes ``USER.md``, so a kill in that
+    window leaves a home that reads as managed: CREATE would skip the cluster and
+    PRUNE would keep it, stranding the profile for the life of the volume.
+    """
+
+    def _reconcile(self, incomplete):
+        created: list = []
+        with mock.patch.object(rec, "_project", return_value="p"), \
+             mock.patch.object(rec, "_all_clusters", return_value=[("p", "beta", "us-central1")]), \
+             mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
+             mock.patch.object(rec, "profile_home",
+                               side_effect=_home_factory(self.homes, incomplete=incomplete)), \
+             mock.patch.object(rec, "read_cluster_identity", side_effect=lambda home: _identity(cluster="beta")), \
+             mock.patch.object(rec, "_cluster_exists", return_value=True), \
+             mock.patch.object(rec, "delete_profile", side_effect=AssertionError("must never prune a live cluster")), \
+             mock.patch.object(rec, "create_profile",
+                               side_effect=lambda pr, c, l: created.append(c) or f"cluster-{c}"):
+            report = rec.reconcile(dry_run=False)
+        return report, created
+
+    def test_a_half_scaffolded_profile_is_recreated(self):
+        report, created = self._reconcile(incomplete={"cluster-beta"})
+        self.assertEqual(created, ["beta"])
+        self.assertEqual(report["incomplete"], ["cluster-beta"])
+
+    def test_a_finished_profile_is_left_alone(self):
+        report, created = self._reconcile(incomplete=frozenset())
+        self.assertEqual(created, [])
+        self.assertEqual(report["incomplete"], [])
+        self.assertEqual(report["kept"], ["cluster-beta"])
+
+    def test_scaffold_gaps_names_what_is_missing(self):
+        home = self.homes / "cluster-beta"
+        home.mkdir()
+        self.assertEqual(rec._scaffold_gaps(home), list(rec.SCAFFOLD_ARTIFACTS))
+        (home / "kubeconfig.yaml").touch()
+        self.assertEqual(rec._scaffold_gaps(home), ["USER.md"])
+        (home / "USER.md").touch()
+        self.assertEqual(rec._scaffold_gaps(home), [])
 
 
 class AllClustersTest(unittest.TestCase):

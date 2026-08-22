@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -410,11 +411,54 @@ class ScanGateTest(unittest.TestCase):
         No IAM to list clusters is a permanent condition on some installs. A
         solo sweep is a worse report; no report at all is none.
         """
+        stale = time.time() - bootstrap_scan_gate.RECONCILE_GIVE_UP_SECONDS - 1
         (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
-            str(bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS)
+            f"{bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS}\n{stale}\n"
         )
         with mock.patch.object(Path, "exists", lambda self: True):
             self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_the_attempt_ceiling_alone_does_not_give_up_in_the_first_minutes(self):
+        """The count is exhausted but the streak is young: keep waiting.
+
+        The gate ticks every minute with no backoff, so five attempts is five
+        minutes — and IAM propagation on a fresh install routinely takes longer
+        than that. Giving up there files the solo sweep that
+        ``.bootstrap_scan_filed`` makes permanent.
+        """
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
+            f"{bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS}\n{time.time()}\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 3, "", "no IAM to list clusters")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_a_counter_written_before_the_clock_existed_still_gives_up(self):
+        # An install upgraded mid-streak carries a single-line marker. It must not
+        # win another 30 minutes of waiting from the upgrade alone.
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
+            f"{bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS}\n"
+        )
+        with mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_the_first_failure_stamps_the_streak_start(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 3, "", "boom")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            bootstrap_scan_gate.ensure_cluster_agents(self.d)
+            first = bootstrap_scan_gate._reconcile_since(self.d)
+            self.assertIsNotNone(first)
+            # A later tick extends the streak rather than restarting its clock.
+            bootstrap_scan_gate.ensure_cluster_agents(self.d)
+        self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), first)
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
 
     def test_a_reconcile_that_times_out_defers_the_sweep(self):
         # subprocess.run raising is the timeout path; it must read as "not yet",
