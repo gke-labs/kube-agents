@@ -6,10 +6,12 @@
 > rules (§5.2), the seven endpoints and MCP tools (§6.1), and the inventory sweep's registration
 > path (§5). Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Items 8 and
 > 10 ship in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
-> entry in `jobs.json` post §7.2's message behind item 10's `content_hash` change gate, so an
-> unchanged queue — including an empty one — says nothing. Item 10's weekly floor and its alarm are
-> deferred, and item 8's `findings_publish_sop.md` is not written: the nudge runs as a `no_agent`
-> script rather than as §7.5's SOP-driven job. Items 9 and 11–13 do not ship, so nothing publishes
+> entry in `jobs.json` post §7.2's message behind item 10's `content_hash` change gate. The gate is
+> narrower than the design's: it applies only to a morning with no critical finding to name, so an
+> unchanged quiet queue — including an empty one — says nothing, while an open critical is repeated
+> every morning until it is gone. That removes the case item 10's weekly floor exists to protect,
+> and the floor and its alarm are deferred. Item 8's `findings_publish_sop.md` is not written: the
+> nudge runs as a `no_agent` script rather than as §7.5's SOP-driven job. Items 9 and 11–13 do not ship, so nothing publishes
 > the backlog and no finding reaches a pull request — §7.1, §7.4 and §9 remain design. The pipeline
 > this design extends does ship: the sweep in
 > [`inventory.md`](../../agents/platform/governance/inventory.md), the ranking in
