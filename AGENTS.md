@@ -277,6 +277,10 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
     confirm it goes back.
   - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
     artifacts, restore prior state, and note anything left behind.
+  - **Screenshots of graphical surfaces go through `scripts/pr_evidence_screenshot.sh`**, which
+    publishes the image where a PR body can render it and prints Markdown stamped with the
+    commit and capture time. Command output stays as fenced text transcripts — a screenshot of a
+    terminal is evidence degraded, not evidence.
   - **If the install is shared with other agents, take the lease.**
     `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy
     `.claude/settings.json.example` to `.claude/settings.json` once per checkout and its
