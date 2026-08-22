@@ -126,14 +126,23 @@ The capability lives in NATS KV. The message on the bus carries only a lookup id
 **"Key" below means a KV lookup key** -- a string like `cap.root.req-8f2a` -- and never a
 cryptographic key. No capability is signed, and nothing has to hold a key to mint or verify one.
 
-**One cryptographic key does exist, and it is not on this path.** A NATS auth callout answers each
-authorization request with a user JWT it signs with the issuer account's seed, so adopting the
-callout means custodying and rotating that seed. It is worth being exact about this because the
-comparison in §7 turns on key custody, and a claim of "no keys anywhere" is false the moment
-somebody looks. What the design avoids is a key **on the capability path** -- nothing mints, signs
-or verifies a capability, so no component needs a key to participate in one, and no compromise of a
-key forges authority. The auth callout's seed authenticates connections, which is the thing NATS
-would need a key for whatever we built on top of it.
+**One cryptographic key does exist, and it is the most powerful thing in the design.** A NATS auth
+callout answers each authorization request with a user JWT it signs with the issuer account's seed,
+and that JWT carries the publish and subscribe permissions the server then enforces. So the seed
+does not merely authenticate connections. It decides what every connection may do, including the
+two permissions the whole integrity argument rests on: whoever holds it can issue itself a user
+with publish on `$KV.cap.root.>` and read on `$KV.cap.>`, and then mint a root capability at any
+tier and scope and read every capability in flight.
+
+What the design avoids is narrower than "no keys", and it is still worth having: **no key on the
+capability path**. Nothing mints, signs or verifies a capability, so no component needs a key in
+order to participate in one, and there is no verification key to distribute to every hop. That is
+the property §7's comparison turns on and it survives intact.
+
+What it does not buy is immunity to key compromise, and an earlier version of this paragraph
+claimed it did. The seed is the root of authority for the bus, so it wants gateway-grade custody, a
+rotation story and a compromise runbook -- not the handling a credential described as
+"authenticating connections" would get. §5 lists it with the other concentrations.
 
 ## 3. How it works
 
@@ -216,8 +225,10 @@ it attached when you authenticated and cannot be talked out of afterwards.
 that writes something wider than it received is caught when the next hop resolves the chain.
 
 The integrity comes from server-enforced permissions rather than from cryptography. Same guarantee,
-and no key that can forge a capability if it leaks -- the callout seed in §2 authenticates
-connections and cannot mint one.
+and no key on the capability path to distribute -- with the one exception §2 names: the permissions
+above are carried in the user JWT the auth callout signs, so the seed that signs it can grant
+itself any of them. The refusal is the server's rather than our code's, which is what this section
+claims; it is not independent of the seed.
 
 **Every reference pins a revision.** A KV put on an existing key is an update rather than an error,
 and a KV delete is itself a publish to the key's own subject -- so the one permission that lets a
@@ -339,7 +350,7 @@ there are no messages to authorize, so that dependency is smaller than it first 
 
 ## 5. What this does not solve
 
-Six things, stated so nobody assumes otherwise. The last three are open questions rather than
+Seven things, stated so nobody assumes otherwise. The last three are open questions rather than
 accepted limits, and they go to the downscoping design discussion together.
 
 **Attenuation is code.** A hop that forwards without narrowing is a hole, and no token format or
@@ -405,8 +416,14 @@ and the denial tests for both.
 
 **The verifier is trusted and on the request path.** It is the only component holding read across
 `cap.*`, so compromising it exposes every in-flight capability, and if it is down nothing
-authorizes. That is a real concentration and it is the price of not distributing read. It belongs
-in the same tier of scrutiny as the auth callout, with no model attached to it.
+authorizes. That is a real concentration and it is the price of not distributing read.
+
+**The auth callout's signing seed is a larger one.** It signs the user JWTs that carry the
+permissions §4 relies on, so its holder can grant itself publish under `$KV.cap.root.>` and read
+across the bucket -- mint a root at any tier, and read every capability in flight. Compromising the
+verifier exposes what is in the store; compromising the seed lets you write to it as the gateway.
+Neither is a reason not to do this, and both belong in the same tier of scrutiny, but the seed is
+the one to write the custody and rotation story for first.
 
 **Nothing expires.** No entry carries an issue time, a use count, or any notion of the request
 being over, and a TTL is rejected elsewhere in this document as a thing revocation saves us from. So
@@ -452,6 +469,12 @@ In hub-and-spoke that means shipping a fleet-wide minting key to every broker in
 compromised broker becomes a fleet-wide authority. Bad trade, and easy to walk into if someone
 reads the citation and reaches for a library.
 
+**The difference is copies, not kind, and the argument is weaker than it first reads.** The auth
+callout's seed can mint too (§2), so this design also has a key whose holder gets fleet-wide
+authority -- it has one copy of it, in one service, instead of one in every broker in every spoke.
+That is a real and large difference in blast radius and it is the honest version of the claim. It
+is not "we avoided the key".
+
 **If we ever need self-contained tokens, use biscuit, not macaroons.** Same append-only
 attenuation, built on Ed25519 rather than HMAC: verification needs only the root _public_ key, so
 verifiers verify and cannot mint. <https://www.biscuitsec.org/>
@@ -463,11 +486,11 @@ Nothing in the current topology needs that.
 
 The same reasoning decided three separate questions:
 
-| Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                                                                 |
-| :------------------------------------------------------- | :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **We custody one account seed for the callout, and none for capabilities.** |
-| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                                                                              |
-| What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                                                                   |
+| Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                                                                                         |
+| :------------------------------------------------------- | :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **One account seed for the callout, none for capabilities -- and see §5 on what that seed can do.** |
+| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                                                                                                      |
+| What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                                                                                           |
 
 > **Prefer a boundary that already exists and is enforced by someone else over a check we have to
 > write, distribute and operate.**
@@ -487,8 +510,9 @@ layer down.
 - Make **effective authority = agent ceiling ∩ requester** hold across process boundaries, not only
   inside one process.
 - Carry it with **no key on the capability path** -- nothing mints, signs or verifies a capability,
-  so no component needs a key to participate in one. The auth callout's account seed is the one key
-  the design custodies, and it authenticates connections rather than capabilities (§2).
+  so no component needs a key to participate in one and there is no verification key to hand every
+  hop. Not a claim of key-compromise immunity: the auth callout's account seed signs the JWTs that
+  carry the bus permissions, so its holder can mint a root (§2, §5).
 - **Revocation that takes effect now**, by deleting an entry, rather than waiting out a TTL.
 - Give audit "who asked" directly, without a correlation step across hops.
 
