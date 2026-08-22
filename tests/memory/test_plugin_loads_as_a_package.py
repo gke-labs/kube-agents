@@ -52,6 +52,19 @@ except ImportError:
     class MemoryManager: pass
     agent.memory_manager.MemoryManager = MemoryManager
 
+try:
+    import plugins.memory.hindsight
+except ImportError:
+    plugins = types.ModuleType("plugins")
+    sys.modules["plugins"] = plugins
+    plugins.memory = types.ModuleType("plugins.memory")
+    sys.modules["plugins.memory"] = plugins.memory
+    plugins.memory.load_memory_provider = lambda *a, **kw: None
+    plugins.memory.hindsight = types.ModuleType("plugins.memory.hindsight")
+    sys.modules["plugins.memory.hindsight"] = plugins.memory.hindsight
+    class HindsightMemoryProvider: pass
+    plugins.memory.hindsight.HindsightMemoryProvider = HindsightMemoryProvider
+
 PLUGIN_DIR = _REPO / "agents" / "chat" / "plugins" / "memory" / "kube_agents_memory"
 SUBMODULES = sorted(f.stem for f in PLUGIN_DIR.glob("*.py") if f.name != "__init__.py")
 
