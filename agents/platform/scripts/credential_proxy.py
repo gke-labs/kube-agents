@@ -1668,9 +1668,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 result.exit_code,
                 f": {detail[:1000]}" if detail else "",
             )
-            self._json(
-                HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"}
-            )
+            # Differentiate policy refusal / client error from upstream gateway failure
+            status = HTTPStatus.BAD_GATEWAY
+            if "HTTP 403" in detail or "HTTP 401" in detail:
+                status = HTTPStatus.FORBIDDEN
+            elif "HTTP 400" in detail or "HTTP 404" in detail:
+                status = HTTPStatus.BAD_REQUEST
+            self._json(status, {"error": "GitHub credential refresh failed"})
             return
         self._json(HTTPStatus.OK, {"status": "refreshed"})
 

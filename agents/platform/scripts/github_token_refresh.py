@@ -61,7 +61,7 @@ def refresh_git_credentials(
     target_repo: str | None = None,
     *,
     max_attempts: int = 3,
-    initial_delay: float = 1.0,
+    initial_delay: float = 0.5,
     backoff_factor: float = 2.0,
 ) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
@@ -71,6 +71,13 @@ def refresh_git_credentials(
 
     proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
     if proxy_url:
+        # Client leg (agent sandbox -> sidecar proxy over loopback).
+        # The sidecar runs the internal helper which already does bounded retry
+        # against Minty (budgeted at ~20s max). The client uses a 45s socket timeout
+        # to allow the sidecar to finish its attempts. If the sidecar answers with
+        # an HTTP status (200, 4xx, or 502), the client accepts it immediately
+        # without nested retries. It only retries if the loopback connection itself drops
+        # (e.g. sidecar restart).
         url = proxy_url.rstrip("/") + "/v1/github/refresh"
         request = urllib.request.Request(
             url,
@@ -79,46 +86,31 @@ def refresh_git_credentials(
             method="POST",
         )
         last_exc = None
-        for attempt in range(1, max_attempts + 1):
+        proxy_attempts = 2
+        for attempt in range(1, proxy_attempts + 1):
             try:
-                with urllib.request.urlopen(request, timeout=30) as response:
+                with urllib.request.urlopen(request, timeout=45) as response:
                     if response.status == 200:
                         log(
                             f"GitHub credentials refreshed in credential sidecar for {repository}."
                         )
                         return ""
-                    if response.status >= 500:
-                        raise urllib.error.HTTPError(
-                            url,
-                            response.status,
-                            f"HTTP {response.status}",
-                            response.headers,
-                            None,
-                        )
                     raise RuntimeError(
                         f"Credential sidecar rejected refresh: HTTP {response.status}"
                     )
             except urllib.error.HTTPError as exc:
-                last_exc = exc
-                if exc.code >= 500:
-                    if attempt < max_attempts:
-                        delay = initial_delay * (backoff_factor ** (attempt - 1))
-                        log(
-                            f"Credential sidecar returned HTTP {exc.code} on attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s..."
-                        )
-                        time.sleep(delay)
-                        continue
+                # The sidecar returned an HTTP error response. The sidecar has already
+                # executed its retries internally. Fail fast with the sidecar's status.
                 raise RuntimeError(
                     f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
                 ) from exc
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 last_exc = exc
-                if attempt < max_attempts:
-                    delay = initial_delay * (backoff_factor ** (attempt - 1))
+                if attempt < proxy_attempts:
                     log(
-                        f"Credential sidecar transport error ({exc}) on attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s..."
+                        f"Credential sidecar transport error ({exc}) on attempt {attempt}/{proxy_attempts}; retrying in {initial_delay:.1f}s..."
                     )
-                    time.sleep(delay)
+                    time.sleep(initial_delay)
                     continue
                 raise RuntimeError(
                     f"Credential sidecar failed to refresh GitHub auth: {exc}"
@@ -140,7 +132,7 @@ def refresh_git_credentials(
             capture_output=True,
             text=True,
             check=True,
-            timeout=10,
+            timeout=5,
         ).stdout.strip()
     except Exception as e1:
         # If --audiences fails (e.g., when running with human user credentials), retry without flags
@@ -150,7 +142,7 @@ def refresh_git_credentials(
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=10,
+                timeout=5,
             ).stdout.strip()
         except Exception as e2:
             raise RuntimeError(
@@ -188,7 +180,7 @@ def refresh_git_credentials(
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=5) as response:
                 if response.status == 200:
                     token = response.read().decode("utf-8").strip()
                     break

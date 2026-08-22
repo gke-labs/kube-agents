@@ -66,7 +66,8 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
-    def test_sandbox_retries_on_5xx_and_succeeds(self, urlopen, sleep):
+    def test_sandbox_fails_immediately_on_sidecar_502(self, urlopen, sleep):
+        # The sidecar has already executed retries internally; client fails fast
         err_502 = urllib.error.HTTPError(
             "http://127.0.0.1:8765/v1/github/refresh",
             502,
@@ -74,20 +75,19 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             email.message.Message(),
             io.BytesIO(b"Bad Gateway"),
         )
-        ok_response = MagicMock()
-        ok_response.__enter__.return_value.status = 200
-        urlopen.side_effect = [err_502, ok_response]
+        urlopen.side_effect = err_502
 
         with patch.dict(
             os.environ,
             {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
             clear=False,
         ):
-            token = refresh_git_credentials("owner/repository", initial_delay=0.01)
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository", initial_delay=0.01)
 
-        self.assertEqual("", token)
-        self.assertEqual(2, urlopen.call_count)
-        sleep.assert_called_once_with(0.01)
+        self.assertIn("HTTP 502", str(cm.exception))
+        self.assertEqual(1, urlopen.call_count)
+        sleep.assert_not_called()
 
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
@@ -134,15 +134,9 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
-    def test_sandbox_fails_after_max_attempts_on_5xx(self, urlopen, sleep):
-        err_503 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
-            503,
-            "Service Unavailable",
-            email.message.Message(),
-            io.BytesIO(b"Service Unavailable"),
-        )
-        urlopen.side_effect = err_503
+    def test_sandbox_fails_after_max_attempts_on_persistent_transport_error(self, urlopen, sleep):
+        err_conn = urllib.error.URLError("Connection refused")
+        urlopen.side_effect = err_conn
 
         with patch.dict(
             os.environ,
@@ -150,14 +144,12 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaises(RuntimeError) as cm:
-                refresh_git_credentials(
-                    "owner/repository", max_attempts=3, initial_delay=0.01
-                )
+                refresh_git_credentials("owner/repository", initial_delay=0.01)
 
         self.assertIn("Credential sidecar failed to refresh GitHub auth", str(cm.exception))
-        self.assertEqual(3, urlopen.call_count)
-        self.assertEqual(2, sleep.call_count)
-        sleep.assert_has_calls([call(0.01), call(0.02)])
+        self.assertEqual(2, urlopen.call_count)
+        self.assertEqual(1, sleep.call_count)
+        sleep.assert_called_once_with(0.01)
 
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_general_exception_raises_runtime_error(self, urlopen):
@@ -238,6 +230,12 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual("ghs_minted_test_token_123", token)
         self.assertEqual(2, urlopen.call_count)
         sleep.assert_called_once_with(0.01)
+        # Check gh auth login called
+        gh_login_calls = [
+            c for c in run.call_args_list if c.args and c.args[0] == ["gh", "auth", "login", "--with-token"]
+        ]
+        self.assertEqual(1, len(gh_login_calls))
+        self.assertEqual("ghs_minted_test_token_123", gh_login_calls[0].kwargs.get("input"))
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.time.sleep")
