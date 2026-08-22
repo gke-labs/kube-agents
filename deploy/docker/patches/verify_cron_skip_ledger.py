@@ -93,6 +93,9 @@ LEGACY_DDL = """CREATE TABLE executions (
 
 CHATTY_JOB = "profile-cron-tick"
 QUIET_JOB = "compliance-audit"
+#: A third id, used only by the dispatch guards. Retention is asserted against
+#: exact row counts for the two above, so the driven skips must land elsewhere.
+DISPATCH_JOB = "fleet-audit"
 LEGACY_ROWS = 40
 
 FAILURES: list = []
@@ -172,13 +175,54 @@ def check_shape() -> None:
             "dispatch pass",
         )
         src = ast.unparse(guard)
-        released = src.find("_running_job_ids.discard(job_id)")
+        # ``release_running_job(job_id)``, not the bare ``discard``: v2026.8.13
+        # moved ``_running_lock`` behind that helper, so the discard is no
+        # longer written here at all. The ordering it stands for is unchanged
+        # and is still the thing being asserted.
+        released = src.find("release_running_job(job_id)")
         recorded = src.find("SKIP_ALREADY_RUNNING_ELSEWHERE")
         check(
             "the running slot is released before the cross-process skip is written",
             0 <= released < recorded,
             "a slow ledger write would leave the job wedged in the running "
             "set, suppressing it on the next tick as well",
+        )
+        check(
+            "and the slot is released through the scheduler's own helper",
+            "_running_job_ids.discard" not in src,
+            "reaching into the set here re-implements the lock discipline "
+            "that release_running_job now owns",
+        )
+
+    # The same pair of guards, in the run half a manual fire and a background
+    # dispatch share. Both sit after claim_job_for_fire, so both drop a
+    # scheduled occurrence; an unrecorded one is invisible to `hermes cron runs`
+    # and to cron_health, which is the silence this whole module exists to end.
+    tools = HERMES / "tools" / "cronjob_tools.py"
+    claimed = function_named(tools, "_run_claimed_job")
+    check("_run_claimed_job still holds the dispatch guards", claimed is not None)
+    if claimed is not None:
+        src = ast.unparse(claimed)
+        for reason, what in (
+            ("SKIP_ALREADY_RUNNING", "the in-process register refusal"),
+            ("SKIP_ALREADY_RUNNING_ELSEWHERE", "the cross-process flock refusal"),
+        ):
+            check(
+                # The trailing comma matters: SKIP_ALREADY_RUNNING is a prefix
+                # of SKIP_ALREADY_RUNNING_ELSEWHERE, so without it the first
+                # check passes on the second guard's row.
+                f"{what} records a skip",
+                f"reason={reason}," in src,
+                "the occurrence is gone either way; without the row nothing "
+                "can tell a refused dispatch from a job that was never due",
+            )
+        released = src.find("release_running_job(job_id)")
+        recorded = src.find("SKIP_ALREADY_RUNNING_ELSEWHERE")
+        check(
+            "the running slot is released before the dispatched skip is written",
+            0 <= released < recorded,
+            "same hazard as the tick's guard: a slow ledger write would hold "
+            "the job in the running set and suppress the next fire too",
         )
 
 
@@ -451,6 +495,77 @@ def check_tick_guards(sched, reasons) -> None:
     )
 
 
+def check_dispatch_guards(sched, reasons) -> None:
+    """The same two overlaps, one layer up, where a manual fire lands.
+
+    Shape checks above prove the calls are *in* ``_run_claimed_job``. These
+    prove they fire: both guards are driven for real and the row is read back
+    out of the ledger, so a ``record_skip`` that raised, wrote nothing, or wrote
+    under the wrong job fails here rather than passing a text match.
+    """
+    print("the dispatch guards (driven through _run_claimed_job):")
+    import tools.cronjob_tools as cronjob_tools
+
+    job = {"id": DISPATCH_JOB, "name": "Fleet Audit"}
+
+    real_register = sched.try_register_running_job
+    sched.try_register_running_job = lambda job_id: False
+    try:
+        result = cronjob_tools._run_claimed_job(dict(job))
+    finally:
+        sched.try_register_running_job = real_register
+    check(
+        "the refusal still reports the fire claim as spent",
+        result.get("claimed") is True and result.get("success") is False,
+        f"{result!r} — a caller told the claim was not taken would refire, "
+        "which is the double-run the guard just prevented",
+    )
+    rows = [
+        r
+        for r in skips_for(reasons.SKIP_ALREADY_RUNNING)
+        if r["job_id"] == DISPATCH_JOB
+    ]
+    check(
+        "an in-process dispatch overlap is recorded",
+        bool(rows),
+        "claim_job_for_fire advanced next_run_at before this guard ran, so "
+        "the occurrence is gone and nothing records it",
+    )
+    check(
+        # bool(rows) as well as all(): over an empty set all() is vacuously
+        # true, so without it this check reports ok on the very tree that just
+        # failed the one above.
+        "against the direct source, not the ticker's",
+        bool(rows) and all(r["source"] == "direct" for r in rows),
+        f"sources {sorted({r['source'] for r in rows})!r} — a refused manual "
+        "or dispatched fire is indistinguishable from a refused tick",
+    )
+
+    class RefusingLocks:
+        def claim(self, job_id):
+            return None
+
+    real_locks = sched._job_locks
+    sched._job_locks = RefusingLocks()
+    try:
+        cronjob_tools._run_claimed_job(dict(job))
+    finally:
+        sched._job_locks = real_locks
+    check(
+        "a cross-process dispatch overlap is recorded",
+        any(
+            r["job_id"] == DISPATCH_JOB
+            for r in skips_for(reasons.SKIP_ALREADY_RUNNING_ELSEWHERE)
+        ),
+        "on the background-dispatch path the returned error goes to a daemon "
+        "worker with nobody reading it, so the ledger is the only record",
+    )
+    check(
+        "and the dispatched job is not left wedged in the running set",
+        DISPATCH_JOB not in sched.get_running_job_ids(),
+    )
+
+
 def check_missed_window(reasons) -> None:
     print("the outage that hides itself (cron/jobs.py::get_due_jobs):")
     from hermes_time import now as hermes_now
@@ -584,6 +699,7 @@ if __name__ == "__main__":
     skip_record = check_write_path(executions_module, skip_reasons)
     check_telemetry(skip_record, skip_reasons)
     check_tick_guards(scheduler_module, skip_reasons)
+    check_dispatch_guards(scheduler_module, skip_reasons)
     check_missed_window(skip_reasons)
     check_retention()
 

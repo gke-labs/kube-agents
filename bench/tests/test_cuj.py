@@ -142,6 +142,11 @@ class CUJEvaluatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must use HTTPS"):
             PortalTransport("http://portal.example.test/api/v1", token="secret")
 
+    def test_credentialed_transport_allows_loopback_http(self):
+        transport = PortalTransport("http://127.0.0.1:8501/api/v1", token="secret")
+
+        self.assertEqual(transport.headers["Authorization"], "Bearer secret")
+
     def test_transport_does_not_follow_redirects(self):
         PortalHandler.redirect_target_count = 0
         server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)

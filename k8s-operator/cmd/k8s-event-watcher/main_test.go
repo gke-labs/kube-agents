@@ -386,6 +386,141 @@ func TestDiscoverClusterProfiles_UnreadableDirIsNotFatal(t *testing.T) {
 	}
 }
 
+// The management cluster is reached twice: --in-cluster covers it from the
+// first second of a fresh install, and cluster_agent_reconcile.py now also gives
+// it a Cluster Agent profile. Watching it through both would raise two alerts
+// per event — each watched cluster has its own dedup cache and EventKey carries
+// no cluster — so one of the two has to go, and it is the profile: its GSA
+// credential can be denied by IAM or by master authorized networks, and nothing
+// would find out until the informer's initial list, long after the entry that
+// could not be denied was discarded.
+func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	if err := os.WriteFile(kubeconfig,
+		[]byte(minimalKubeconfig("https://example.invalid", gkeContext("projA", "mgmt", "us-central1"))), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+
+	f := &flags{
+		profilesDir: dir,
+		kubeconfig:  kubeconfig,
+		clusterName: "mgmt",
+	}
+	clusters, err := buildWatchSet(context.Background(), f, newMetrics())
+	if err != nil {
+		t.Fatalf("buildWatchSet: %v", err)
+	}
+	if got, want := len(clusters), 2; got != want {
+		t.Fatalf("got %d watched clusters, want %d (mgmt is watched once, prod once)", got, want)
+	}
+
+	var mgmt []targetCluster
+	for _, c := range clusters {
+		if c.Name == "mgmt" {
+			mgmt = append(mgmt, c)
+		}
+	}
+	if len(mgmt) != 1 {
+		t.Fatalf("got %d entries for mgmt, want 1 — a second one doubles every alert on it", len(mgmt))
+	}
+	if mgmt[0].Profile != "direct" {
+		t.Errorf("mgmt is watched through profile %q, want the direct client: the profile's credential can be refused and this one cannot", mgmt[0].Profile)
+	}
+	// The whole reason the profile entry looked preferable. Losing the triple
+	// would blank the payload's project/location and every metric label.
+	if mgmt[0].ProjectID != "projA" || mgmt[0].Location != "us-central1" {
+		t.Errorf("direct entry is stamped %s, want projA/us-central1/mgmt from the profile it absorbed", mgmt[0].identity())
+	}
+	// Absorbing one profile must not disturb the others.
+	if clusters[0].Name != "prod" || clusters[0].Profile != "cluster-projA-prod-us-central1" {
+		t.Errorf("prod is watched as %s/%s, want it untouched", clusters[0].Name, clusters[0].Profile)
+	}
+}
+
+// The other half of the same rule: before reconcile has created the management
+// cluster's profile, --in-cluster is the only thing watching it, so the direct
+// entry must survive.
+func TestBuildWatchSet_DirectClusterSurvivesWhenNoProfileCoversIt(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	if err := os.WriteFile(kubeconfig,
+		[]byte(minimalKubeconfig("https://example.invalid", gkeContext("projA", "mgmt", "us-central1"))), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+
+	f := &flags{
+		profilesDir: dir,
+		kubeconfig:  kubeconfig,
+		clusterName: "mgmt",
+	}
+	clusters, err := buildWatchSet(context.Background(), f, newMetrics())
+	if err != nil {
+		t.Fatalf("buildWatchSet: %v", err)
+	}
+	var direct []targetCluster
+	for _, c := range clusters {
+		if c.Profile == "direct" {
+			direct = append(direct, c)
+		}
+	}
+	if len(direct) != 1 {
+		t.Fatalf("got %d direct entries in %d clusters, want 1 — nothing else is watching mgmt", len(direct), len(clusters))
+	}
+	// No profile to take an identity from, so the entry carries only its name.
+	// That is the pre-existing single-cluster shape, not a regression.
+	if direct[0].ProjectID != "" || direct[0].Location != "" {
+		t.Errorf("direct entry is stamped %s; nothing supplied a project or location", direct[0].identity())
+	}
+}
+
+// GKE names are unique per (project, location), so two profiles can answer to
+// one name and the direct entry — which knows only a name — cannot tell them
+// apart. Absorbing a guess would unwatch the other cluster and mis-stamp this
+// one, so nothing is absorbed and no direct entry is added.
+func TestBuildWatchSet_AmbiguousNameAbsorbsNothing(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
+	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-east1", "projA", "mgmt", "us-east1")
+
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	if err := os.WriteFile(kubeconfig,
+		[]byte(minimalKubeconfig("https://example.invalid", gkeContext("projA", "mgmt", "us-central1"))), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+
+	f := &flags{
+		profilesDir: dir,
+		kubeconfig:  kubeconfig,
+		clusterName: "mgmt",
+	}
+	clusters, err := buildWatchSet(context.Background(), f, newMetrics())
+	if err != nil {
+		t.Fatalf("buildWatchSet: %v", err)
+	}
+	if got, want := len(clusters), 2; got != want {
+		t.Fatalf("got %d watched clusters, want %d — both same-named clusters keep their profile", got, want)
+	}
+	byIdentity := map[string]string{}
+	for _, c := range clusters {
+		if c.Profile == "direct" {
+			t.Errorf("a direct entry was added for an ambiguous name; it would have taken one of the two identities at random")
+		}
+		byIdentity[c.identity()] = c.Profile
+	}
+	// The dropped-cluster case: neither may go missing.
+	for _, want := range []string{"projA/us-central1/mgmt", "projA/us-east1/mgmt"} {
+		if _, ok := byIdentity[want]; !ok {
+			t.Errorf("%s is not watched; the watch set is %v", want, byIdentity)
+		}
+	}
+}
+
 func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 	cases := []struct {
 		name    string

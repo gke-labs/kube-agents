@@ -107,6 +107,14 @@ class ProgressNoteTest(unittest.TestCase):
 # would ship an image whose gateway raises on import.
 
 _KINDS_ANCHOR_HOST = "class Watcher:\n    def run(self):\n"
+# The tuple the applier widens. Spelled out here rather than imported from the
+# applier, because the whole point of locating it by name is that the applier no
+# longer holds a copy of upstream's membership: a fixture that imported one
+# could not tell the locator from the literal anchor it replaced.
+_KINDS_ASSIGN = (
+    '        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", '
+    '"timed_out", "status", "archived", "unblocked", "block_loop_detected")\n'
+)
 _RENDER_ANCHOR_HOST_TAIL = (
     "            if True:\n"
     "                if True:\n"
@@ -123,11 +131,12 @@ _SEND_ANCHOR_TAIL = (
 )
 
 
-def _watchers_source(loop: bool) -> str:
+def _watchers_source(loop: bool, kinds: str = _KINDS_ASSIGN) -> str:
     """A stand-in kanban_watchers.py carrying both anchors at their real indents.
 
     ``loop=False`` puts the elif chain at the same indentation but outside any
-    loop — the shape the applier has to reject.
+    loop — the shape the applier has to reject. ``kinds`` overrides the
+    TERMINAL_KINDS assignment, for the drift cases the locator has to survive.
     """
     outer = (
         "    for d in deliveries:\n        for ev in d:\n"
@@ -136,7 +145,7 @@ def _watchers_source(loop: bool) -> str:
     )
     return (
         _KINDS_ANCHOR_HOST
-        + applier.KINDS_ANCHOR
+        + kinds
         # `async def`, because the send anchor's replacement awaits: compile()
         # rejects an await that lands outside a coroutine, so this shape is
         # also what proves the anchor is inside one.
@@ -163,12 +172,14 @@ _TOOLS_SOURCE = (
 
 
 class ApplierTest(unittest.TestCase):
-    def _tree(self, loop: bool) -> Path:
+    def _tree(self, loop: bool, kinds: str = _KINDS_ASSIGN) -> Path:
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
         (root / "gateway").mkdir()
         (root / "tools").mkdir()
-        (root / "gateway" / "kanban_watchers.py").write_text(_watchers_source(loop))
+        (root / "gateway" / "kanban_watchers.py").write_text(
+            _watchers_source(loop, kinds)
+        )
         (root / "tools" / "kanban_tools.py").write_text(_TOOLS_SOURCE)
         return root
 
@@ -177,7 +188,7 @@ class ApplierTest(unittest.TestCase):
         applier.apply(root)
         patched = (root / "gateway" / "kanban_watchers.py").read_text()
         self.assertIn('elif kind == "heartbeat":', patched)
-        self.assertIn('"block_loop_detected", "heartbeat")', patched)
+        self.assertIn('+ ("heartbeat",)', patched)
         self.assertIn("from gateway.kanban_progress_lines import progress_note", patched)
         self.assertIn("from gateway.kanban_progress_lines import deliver", patched)
         # Every line the notifier posts now goes through deliver(), so a
@@ -204,6 +215,70 @@ class ApplierTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)
         self.assertIn("found 0", str(caught.exception))
+
+
+# --- what the TERMINAL_KINDS locator buys over the literal it replaced --------
+#
+# The literal anchor on that line failed the build on every upstream edit to the
+# tuple, and v2026.8.13 made exactly such an edit ("review_requested"). These
+# pin the trade the locator makes: membership upstream owns may change, the
+# tuple still being the terminal-kind filter may not.
+
+
+class TerminalKindsLocatorTest(ApplierTest):
+    def test_an_upstream_added_kind_still_patches(self):
+        widened = _KINDS_ASSIGN.replace(
+            '"block_loop_detected")', '"block_loop_detected", "review_requested")'
+        )
+        root = self._tree(loop=True, kinds=widened)
+        applier.apply(root)
+        patched = (root / "gateway" / "kanban_watchers.py").read_text()
+        # Upstream's addition survives, and heartbeat is appended to it.
+        self.assertIn('"review_requested"', patched)
+        self.assertIn('+ ("heartbeat",)', patched)
+
+    def test_a_reformatted_tuple_still_patches(self):
+        multiline = (
+            "        TERMINAL_KINDS = (\n"
+            '            "completed",\n'
+            '            "blocked",\n'
+            '            "gave_up",\n'
+            '            "crashed",\n'
+            '            "timed_out",\n'
+            "        )\n"
+        )
+        root = self._tree(loop=True, kinds=multiline)
+        applier.apply(root)
+        self.assertIn(
+            '+ ("heartbeat",)',
+            (root / "gateway" / "kanban_watchers.py").read_text(),
+        )
+
+    def test_a_filter_that_lost_a_kind_fails_the_build(self):
+        # Membership this patch reasons about is asserted, not searched on, so
+        # a repurposed tuple fails with what it expected rather than vanishing.
+        gutted = _KINDS_ASSIGN.replace('"crashed", ', "")
+        root = self._tree(loop=True, kinds=gutted)
+        with self.assertRaises(SystemExit) as caught:
+            applier.apply(root)
+        self.assertIn("no longer holds 'crashed'", str(caught.exception))
+
+    def test_a_renamed_filter_fails_the_build(self):
+        renamed = _KINDS_ASSIGN.replace("TERMINAL_KINDS", "CLAIMED_KINDS")
+        root = self._tree(loop=True, kinds=renamed)
+        with self.assertRaises(SystemExit) as caught:
+            applier.apply(root)
+        self.assertIn("expected 1 assignment to TERMINAL_KINDS", str(caught.exception))
+
+    def test_a_second_run_is_refused(self):
+        # The kinds edit does not consume an anchor, so the count check cannot
+        # catch a re-run; without refuse_if_patched it would append a second
+        # "heartbeat".
+        root = self._tree(loop=True)
+        applier.apply(root)
+        with self.assertRaises(SystemExit) as caught:
+            applier.apply(root)
+        self.assertIn("already patched", str(caught.exception))
 
 
 # --- what goes into the rolling message --------------------------------------

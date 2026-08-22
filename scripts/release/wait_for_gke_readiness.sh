@@ -22,7 +22,11 @@ echo "Target Commit SHA: ${COMMIT_SHA:-(not specified)}"
 echo "Readiness Timeout: ${READINESS_TIMEOUT} (5 minutes)"
 echo "======================================================================"
 
-gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" --project "${PROJECT_ID}"
+gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
+# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+# shellcheck disable=SC2086
+gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" --project "${PROJECT_ID}" \
+  ${GKE_DNS_ENDPOINT_FLAG}
 
 if [ -n "${COMMIT_SHA}" ]; then
   echo "🔍 Verifying platform-agent-gateway deployment container image matches commit ${COMMIT_SHA}..."

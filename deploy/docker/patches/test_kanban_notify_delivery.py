@@ -390,9 +390,10 @@ class GatewayKanbanWatchers:
                         await adapter.send(sub["chat_id"], msg)
                     else:
                         # Delivery complete (text ping for push adapters, wake
-                        # self-post for non-push): advance cursor. The cursor
-                        # is the dedup mechanism — it prevents re-delivery
-                        # of the same event on subsequent ticks.
+                        # self-post for non-push, wake injection for wake-only
+                        # push subs): advance cursor. The cursor is the dedup
+                        # mechanism — it prevents re-delivery of the same
+                        # event on subsequent ticks.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
@@ -530,8 +531,8 @@ class ApplyTest(unittest.TestCase):
         # The comment line is load-bearing. If upstream rewords it the build
         # must stop, because the remaining lines match two different sites.
         drifted = UPSTREAM_WATCHERS.replace(
-            "# of the same event on subsequent ticks.",
-            "# of the same event on later ticks.",
+            "# event on subsequent ticks.",
+            "# event on later ticks.",
         )
         with self.assertRaises(SystemExit) as ctx:
             patch_tree(drifted)

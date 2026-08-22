@@ -1,0 +1,58 @@
+# Coverage configuration for `make coverage`.
+#
+# The suite is run per-directory (mirroring PYTHON_TEST_DIRS in the Makefile),
+# so the Makefile exports two variables this file leans on:
+#
+#   COVERAGE_ROOT  the repository root. `source` must resolve to the same tree
+#                  from every test directory the loop cd's into, so it cannot
+#                  be a relative path. Defaults to "." for a bare
+#                  `coverage run` at the repository root.
+#   COVERAGE_FILE  the shared data file under .coverage-data/ (a coverage.py
+#                  built-in, set in the Makefile, not here).
+
+[run]
+source = ${COVERAGE_ROOT-.}
+branch = False
+parallel = True
+omit =
+    */.venv/*
+    */node_modules/*
+    */site-packages/*
+    */__pycache__/*
+    ${COVERAGE_ROOT-.}/k8s-operator/*
+    ${COVERAGE_ROOT-.}/docs/*
+    */test_*.py
+    */tests/*
+    */conftest.py
+    */setup.py
+    # Mirror of the diff-cover --exclude list in python-tests.yml, so the
+    # repository total and the per-PR diff number are computed over ONE file
+    # set. Without this, a PR adding uncovered lines under an excluded path
+    # reads 100% on the diff while dragging down a total the diff floor is
+    # structurally blind to -- and the two numbers in one comment cannot be
+    # reconciled. Change the two lists together.
+    */deploy/docker/patches/verify_*.py
+    */deploy/docker/patches/kanban*.py
+    */deploy/docker/patches/cron*.py
+    */deploy/docker/patches/channel_directory_threads*.py
+    */deploy/docker/patches/slack_code_emphasis*.py
+    */examples/*
+
+[report]
+# Almost nothing in this repository is a package: without this flag coverage
+# skips directories that lack an __init__.py when hunting for files the suite
+# never imported, which hides a third of the in-scope files and inflates the
+# total by ~20 points. It is a [report] option -- under [run] it is silently
+# unrecognized and the number comes out wrong with only a stderr warning.
+include_namespace_packages = True
+show_missing = False
+skip_empty = True
+precision = 1
+# A patch test creates a synthetic module with no source file on disk;
+# without this, `coverage combine`/`report` errors on it.
+ignore_errors = True
+
+# The coverage floor deliberately does NOT live here as fail_under: every
+# reporting command honors it, so `coverage xml` inside `make coverage` would
+# fail the measurement itself. The floor is COVERAGE_FLOOR in the Makefile and
+# only `make coverage-check` enforces it.

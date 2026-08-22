@@ -258,6 +258,223 @@ class FindDefTest(unittest.TestCase):
         self.assertIn("does not parse", str(ctx.exception))
 
 
+#: v2026.8.3's one-line spelling of cron.scheduler.run_one_job, and v2026.8.13's
+#: wrapped one with an extra parameter. The same insert has to work on both.
+FLAT_SIGNATURE = (
+    "def run_one_job(job: dict, *, adapters=None, loop=None, "
+    "verbose: bool = False) -> bool:\n    return True\n"
+)
+
+WRAPPED_SIGNATURE = (
+    "def run_one_job(\n"
+    "    job: dict, *, adapters=None, loop=None, verbose: bool = False,\n"
+    "    extra_prompt: Optional[str] = None,\n"
+    ") -> bool:\n"
+    "    return True\n"
+)
+
+
+class KeywordOnlyTest(unittest.TestCase):
+    """Adding a parameter must survive upstream reformatting the signature."""
+
+    def add_outcome(self, source):
+        p, target = patch(source=source)
+        site = p.find_def("run_one_job", label="run entry point")
+        site.expect_keyword_only("adapters", "loop", "verbose")
+        p.insert(site.keyword_only_end(), ", outcome=None")
+        p.commit("param")
+        return target.read_text()
+
+    def test_a_flat_signature_gains_the_parameter(self):
+        self.assertIn(
+            "verbose: bool = False, outcome=None) -> bool:",
+            self.add_outcome(FLAT_SIGNATURE),
+        )
+
+    def test_a_wrapped_signature_gains_it_too(self):
+        # The literal anchor this replaced found nothing here, which is the
+        # whole reason the locator exists.
+        self.assertIn(
+            "extra_prompt: Optional[str] = None, outcome=None,\n) -> bool:",
+            self.add_outcome(WRAPPED_SIGNATURE),
+        )
+
+    def test_a_parameter_with_no_default_still_gives_an_end(self):
+        source = "def run_one_job(job: dict, *, adapters) -> bool:\n    return True\n"
+        p, target = patch(source=source)
+        site = p.find_def("run_one_job", label="run entry point")
+        p.insert(site.keyword_only_end(), ", outcome=None")
+        p.commit("param")
+        self.assertIn("*, adapters, outcome=None)", target.read_text())
+
+    def test_a_lost_parameter_fails_loudly(self):
+        p, _ = patch(source=FLAT_SIGNATURE)
+        site = p.find_def("run_one_job", label="run entry point")
+        with self.assertRaises(SystemExit) as ctx:
+            site.expect_keyword_only("adapters", "delivery")
+        self.assertIn("no longer takes keyword-only delivery", str(ctx.exception))
+        self.assertIn("run entry point", str(ctx.exception))
+
+    def test_a_positional_only_signature_fails_loudly(self):
+        # ``*`` gone means the call sites changed shape; refuse rather than
+        # splice a keyword argument into a positional list.
+        p, _ = patch(source="def run_one_job(job, adapters=None):\n    return True\n")
+        site = p.find_def("run_one_job", label="run entry point")
+        with self.assertRaises(SystemExit) as ctx:
+            site.keyword_only_end()
+        self.assertIn("takes no keyword-only parameters", str(ctx.exception))
+
+    def test_nothing_is_written_when_the_expectation_fails(self):
+        p, target = patch(source=FLAT_SIGNATURE)
+        site = p.find_def("run_one_job", label="run entry point")
+        with contextlib.suppress(SystemExit):
+            site.expect_keyword_only("delivery")
+        self.assertEqual(target.read_text(), FLAT_SIGNATURE)
+
+
+class SubstituteAllTest(unittest.TestCase):
+    """The anchor whose occurrence count is upstream's business, not ours."""
+
+    def test_every_occurrence_is_replaced(self):
+        p, target = patch(source='a = "x"\nb = "x"\nc = "x"\n')
+        p.substitute_all('"x"', "helper()", label="message")
+        p.commit("all")
+        self.assertEqual(target.read_text(), "a = helper()\nb = helper()\nc = helper()\n")
+
+    def test_one_occurrence_satisfies_the_default_floor(self):
+        p, _ = patch(source='a = "x"\n')
+        p.substitute_all('"x"', "helper()", label="message")
+        self.assertEqual(p.source, "a = helper()\n")
+
+    def test_no_occurrence_fails_loudly(self):
+        p, _ = patch(source="a = 1\n")
+        with self.assertRaises(SystemExit) as ctx:
+            p.substitute_all('"x"', "helper()", label="message")
+        self.assertIn("at least 1 occurrence(s) of the message anchor", str(ctx.exception))
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn(patchlib.DRIFT_NOTE, str(ctx.exception))
+
+    def test_a_floor_below_the_count_fails_loudly(self):
+        p, _ = patch(source='a = "x"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            p.substitute_all('"x"', "helper()", label="message", at_least=2)
+        self.assertIn("at least 2 occurrence(s)", str(ctx.exception))
+
+    def test_a_second_run_finds_nothing_and_fails(self):
+        # The anchor is consumed, so idempotency comes free — running the
+        # applier twice must not stack a second replacement.
+        p, _ = patch(source='a = "x"\n')
+        p.substitute_all('"x"', "helper()", label="message")
+        with self.assertRaises(SystemExit):
+            p.substitute_all('"x"', "helper()", label="message")
+
+
+ASSIGN_SOURCE = '''\
+class Watcher:
+    def run(self):
+        TERMINAL_KINDS = ("completed", "blocked", "crashed")
+        return TERMINAL_KINDS
+'''
+
+
+class FindAssignTest(unittest.TestCase):
+    def test_an_assignment_nested_in_a_method_is_located(self):
+        # The point of find_assign over find_def/find_call: the constants these
+        # patches widen are locals, not module-level names.
+        p, _ = patch(source=ASSIGN_SOURCE)
+        site = p.find_assign("TERMINAL_KINDS", label="filter")
+        self.assertEqual(site.value_text, '("completed", "blocked", "crashed")')
+        self.assertEqual(site.indent, " " * 8)
+
+    def test_the_value_can_be_rewritten_without_touching_the_target(self):
+        p, target = patch(source=ASSIGN_SOURCE)
+        site = p.find_assign("TERMINAL_KINDS", label="filter")
+        p.splice(site.value_start, site.value_end, f'{site.value_text} + ("extra",)')
+        p.commit("widen")
+        self.assertIn(
+            '        TERMINAL_KINDS = ("completed", "blocked", "crashed")'
+            ' + ("extra",)\n',
+            target.read_text(),
+        )
+
+    def test_a_comment_can_be_inserted_at_the_assignment_indent(self):
+        p, target = patch(source=ASSIGN_SOURCE)
+        site = p.find_assign("TERMINAL_KINDS", label="filter")
+        p.insert(site.line_start, f"{site.indent}# why\n")
+        p.commit("comment")
+        self.assertIn("        # why\n        TERMINAL_KINDS =", target.read_text())
+
+    def test_a_reformatted_value_is_still_located(self):
+        source = ASSIGN_SOURCE.replace(
+            '("completed", "blocked", "crashed")',
+            '(\n            "completed",\n            "blocked",\n'
+            '            "crashed",\n        )',
+        )
+        p, _ = patch(source=source)
+        site = p.find_assign("TERMINAL_KINDS", label="filter")
+        self.assertIn('"crashed"', site.value_text)
+
+    def test_an_absent_name_fails_loudly(self):
+        p, _ = patch(source=ASSIGN_SOURCE)
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_assign("CLAIMED_KINDS", label="filter")
+        self.assertIn("expected 1 assignment to CLAIMED_KINDS", str(ctx.exception))
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn("for the filter", str(ctx.exception))
+
+    def test_a_duplicated_name_fails_loudly(self):
+        # Two assignments and the patch has no way to know which one is meant.
+        p, _ = patch(source=ASSIGN_SOURCE + "\nTERMINAL_KINDS = ()\n")
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_assign("TERMINAL_KINDS", label="filter")
+        self.assertIn("found 2", str(ctx.exception))
+
+    def test_an_augmented_assignment_is_not_matched(self):
+        p, _ = patch(source="KINDS = ()\nKINDS += ('x',)\n")
+        site = p.find_assign("KINDS", label="filter")
+        self.assertEqual(site.value_text, "()")
+
+    def test_a_tuple_unpacking_target_is_not_matched(self):
+        p, _ = patch(source="KINDS, OTHER = (), ()\n")
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_assign("KINDS", label="filter")
+        self.assertIn("found 0", str(ctx.exception))
+
+
+class ExpectContainsTest(unittest.TestCase):
+    def test_the_required_members_are_asserted(self):
+        p, _ = patch(source=ASSIGN_SOURCE)
+        site = p.find_assign("TERMINAL_KINDS", label="filter")
+        site.expect_contains("completed", "crashed")
+
+    def test_an_extra_member_is_allowed(self):
+        # The whole trade: upstream owns membership, so an addition must not
+        # fail the build the way the literal anchor it replaced did.
+        source = ASSIGN_SOURCE.replace('"crashed")', '"crashed", "review_requested")')
+        p, _ = patch(source=source)
+        p.find_assign("TERMINAL_KINDS", label="filter").expect_contains("completed")
+
+    def test_a_missing_member_fails_loudly(self):
+        p, _ = patch(source=ASSIGN_SOURCE)
+        site = p.find_assign("TERMINAL_KINDS", label="filter")
+        with self.assertRaises(SystemExit) as ctx:
+            site.expect_contains("completed", "gave_up")
+        self.assertIn("no longer holds 'gave_up'", str(ctx.exception))
+        self.assertNotIn("completed", str(ctx.exception).split("no longer holds")[1])
+
+    def test_a_value_that_is_not_a_sequence_literal_fails_loudly(self):
+        p, _ = patch(source="class W:\n    def r(self):\n        KINDS = _upstream()\n")
+        site = p.find_assign("KINDS", label="filter")
+        with self.assertRaises(SystemExit) as ctx:
+            site.expect_contains("completed")
+        self.assertIn("not a tuple/list/set literal", str(ctx.exception))
+
+    def test_a_list_and_a_set_both_count(self):
+        for literal in ('["a", "b"]', '{"a", "b"}'):
+            p, _ = patch(source=f"KINDS = {literal}\n")
+            p.find_assign("KINDS", label="filter").expect_contains("a", "b")
+
+
 class FindCallTest(unittest.TestCase):
     def test_a_call_is_located_by_a_keyword_argument(self):
         p, _ = patch()

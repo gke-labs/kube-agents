@@ -76,15 +76,15 @@ The roster is also reconciled automatically. An hourly, deterministic `no_agent`
 (`cluster-agent-reconcile`) runs `scripts/cluster_agent_reconcile.py`, which drives the roster in
 both directions:
 
-- **Create** — every cluster in the project gets a profile, except the management cluster
-  kube-agents itself runs on (identified by asking the metadata server, not by name) and any names
-  in `RECONCILE_EXCLUDE`. If the pod cannot self-identify or resolve the project, the create
-  direction is skipped for that run rather than guessed at.
+- **Create** — every cluster in the project gets a profile, including the management cluster
+  kube-agents itself runs on. The only exceptions are names listed in `RECONCILE_EXCLUDE`. If the
+  pod cannot resolve the project, the create direction is skipped for that run rather than guessed
+  at. The management cluster is included because its own workloads fail like any other cluster's,
+  and the agent that triages a Kubernetes event is the one scoped to the cluster that raised it.
 - **Prune** — a profile is deleted when its GKE cluster is definitively gone (a `NotFound` from
-  `gcloud container clusters describe`), or when it belongs to the management/excluded cluster,
-  which must not carry a profile even though that cluster exists. This closes the loop when a
-  cluster is deleted out-of-band, so its profile is never left orphaned pointing at a dead
-  kubeconfig.
+  `gcloud container clusters describe`), or when it belongs to an excluded cluster, which must not
+  carry a profile even though that cluster exists. This closes the loop when a cluster is deleted
+  out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
 
 It never deletes on ambiguity: any inconclusive check (auth/network/timeout, or a missing
 `cluster_identity`) leaves the profile untouched. `created=0 pruned=0 kept=0` is a normal,
@@ -92,7 +92,7 @@ successful result. When it creates or prunes anything it posts a Google Chat sum
 
 Profile lifecycle belongs to this script and to the explicit onboarding/teardown paths above. Do
 not repair the roster from other work by calling `cluster_agent_profile.py` directly — a profile
-created around the reconciler's management-cluster guard is one the next run will prune.
+created for an excluded cluster is one the next run will prune.
 
 To preview what would change without touching anything:
 

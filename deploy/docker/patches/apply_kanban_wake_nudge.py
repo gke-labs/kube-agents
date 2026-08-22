@@ -74,19 +74,25 @@ COMPLETE_PATCHED = (
     "    _kanban_record_wake(conn)\n"
 )
 
-UNBLOCK_ANCHOR = (
+# The payload is carried verbatim rather than matched loosely: v2026.8.13 grew
+# a ``resume_status`` key and wrapped the conditional in parentheses, and an
+# anchor that skipped over it would have gone on matching a payload this patch
+# had never seen. The ``return True`` is the part being moved; everything above
+# it is context that pins the edit to the one ``"unblocked"`` event in the file.
+UNBLOCK_EVENT = (
     "        _append_event(\n"
     '            conn, task_id, "unblocked",\n'
-    '            {"status": new_status} if new_status != "ready" else None,\n'
+    "            (\n"
+    '                {"status": new_status, "resume_status": resume_status}\n'
+    '                if new_status != "ready" or resume_status != "ready"\n'
+    "                else None\n"
+    "            ),\n"
     "        )\n"
-    "        return True\n"
 )
 
-UNBLOCK_PATCHED = (
-    "        _append_event(\n"
-    '            conn, task_id, "unblocked",\n'
-    '            {"status": new_status} if new_status != "ready" else None,\n'
-    "        )\n"
+UNBLOCK_ANCHOR = UNBLOCK_EVENT + "        return True\n"
+
+UNBLOCK_PATCHED = UNBLOCK_EVENT + (
     "    # kube-agents patch: the return is dedented out of the write txn so the\n"
     "    # nudge runs after the commit, not inside it — a watcher woken mid-txn\n"
     "    # would scan pre-commit state and burn the edge for nothing.\n"
@@ -104,16 +110,21 @@ DB_TRAILER = (
 
 # --- gateway/kanban_watchers.py ----------------------------------------------
 
+# The monitor goes on the last line before the loop, whatever that line is.
+# It used to be the startup ``asyncio.sleep(5)``; v2026.8.13 put the done-sub GC
+# cadence in between, so the anchor moved down to the setup that now sits there.
+# ``_gc_next_at`` is the anchor rather than the ``while`` because the ``while``
+# alone is not unique in this file — the dispatcher loop below opens the same
+# way — and because a monitor constructed above the GC setup would be dead
+# weight for the length of a block upstream is evidently still growing.
 NOTIFIER_MONITOR_ANCHOR = (
-    "        # Initial delay so the gateway can finish wiring adapters.\n"
-    "        await asyncio.sleep(5)\n"
+    "        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup\n"
     "\n"
     "        while self._running:\n"
 )
 
 NOTIFIER_MONITOR_PATCHED = (
-    "        # Initial delay so the gateway can finish wiring adapters.\n"
-    "        await asyncio.sleep(5)\n"
+    "        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup\n"
     "\n"
     "        # kube-agents patch: cross-process wake monitor, one per watcher\n"
     "        # loop. See hermes_cli/kanban_wake_nudge.py.\n"

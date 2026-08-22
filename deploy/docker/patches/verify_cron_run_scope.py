@@ -45,6 +45,7 @@ def main() -> int:
 
     import tools.cronjob_tools as ct
     import tools.kanban_tools as kt
+    from agent.delegation_context import non_dispatcher_owned_context
     from tools.cron_run_scope import cron_run_scope, current_cron_job
 
     # --- outside a cron run: the worker keeps its ambient card --------------
@@ -56,11 +57,11 @@ def main() -> int:
         True,
     )
 
-    # --- upstream's delegate_task guard must survive the patch --------------
+    # --- upstream's delegate_task guard is still there ----------------------
     # v2026.8.3 added an _is_delegated_child_context() early return to
-    # _default_task_id. The patch rewrites that whole function, so the guard can
-    # be dropped on a base-image bump without any anchor failing — an earlier
-    # revision of the patch did exactly that. Assert the behaviour, not the line.
+    # _default_task_id. Assert the behaviour rather than the line: the ownership
+    # rules below are written on the assumption that a context which does not
+    # own the dispatcher's card cannot silently inherit it.
     _real_delegated = kt._is_delegated_child_context
     kt._is_delegated_child_context = lambda: True
     try:
@@ -71,7 +72,13 @@ def main() -> int:
     check("ambient card back after delegation", kt._default_task_id(None), CALLER_CARD)
 
     # --- inside a cron run: the caller's card is out of reach ---------------
-    with cron_run_scope(JOB_ID):
+    # Both markers, because the real path sets both: cron.scheduler.run_job
+    # enters upstream's non_dispatcher_owned_context, and the patch wraps the
+    # call to run_one_job in its own scope. Upstream's is what withholds the
+    # ambient card as of v2026.8.13 — the patch stopped rewriting
+    # _default_task_id when it did — so this is the one place left that would
+    # notice if that mechanism went away underneath us.
+    with cron_run_scope(JOB_ID), non_dispatcher_owned_context():
         check("cron run has no ambient card", kt._default_task_id(None), None)
         denied = kt._enforce_worker_task_ownership(CALLER_CARD)
         check("cron run refused the caller's card", bool(denied), True)
@@ -81,6 +88,7 @@ def main() -> int:
         out = kt._handle_complete({"summary": "done"})
         check("kanban_complete refused", "error" in out.lower(), True)
         check("refusal points at the final response", "final response" in out, True)
+        check("refusal names the job too", JOB_ID in out, True)
 
     check("card is back after the run", kt._default_task_id(None), CALLER_CARD)
     check("ownership restored", kt._enforce_worker_task_ownership(CALLER_CARD), None)
@@ -127,9 +135,20 @@ def main() -> int:
     # --- the run action still produces valid JSON ---------------------------
     # The regression: a Path here made json.dumps raise and the caller got an
     # error instead of the report it had waited six minutes for.
-    ct._execute_job_now = lambda job: dict(exec_result)
+    #
+    # ``**kw``, not ``(job)``: v2026.8.13 passes ``extra_prompt`` here, and a
+    # stub that refuses it fails inside the tool's own try/except — which
+    # reports as every downstream check going false at once and blames the
+    # patch for a stale stand-in.
+    ct._execute_job_now = lambda job, **kw: dict(exec_result)
     ct.resolve_job_ref = lambda ref: {"id": JOB_ID, "name": "Workload Reliability Audit"}
     ct._format_job = lambda job: {"id": JOB_ID, "name": "Workload Reliability Audit"}
+    # Pin the branch. v2026.8.13 made background dispatch the *preferred* path
+    # for a manual run and inline execution the fallback, so which one the
+    # assertions below are describing is no longer implied by calling the tool.
+    # This is the fallback; the dispatched path is checked on its own after it.
+    _real_dispatch = ct._try_dispatch_background_run
+    ct._try_dispatch_background_run = lambda job, **kw: None
 
     try:
         raw = ct.cronjob(action="run", job_id=JOB_ID)
@@ -150,6 +169,33 @@ def main() -> int:
         check("output_file is a string", isinstance(job.get("output_file"), str), True)
         check("output_file is the real path", job.get("output_file"), str(OUTPUT_FILE))
         check("delivery_error in the JSON", bool(job.get("delivery_error")), True)
+
+    # --- and the dispatched path, which carries no report at all ------------
+    # v2026.8.13's preferred path hands the run to the background and returns a
+    # handle; the outcome re-enters the conversation as a completion event
+    # instead of being merged into this response, so the merge above never
+    # runs. That is upstream's design and not a hole in this patch — asserted
+    # rather than assumed, because "the caller gets the report" and "the caller
+    # gets it eventually" are different promises and only one of them is the
+    # one this file used to be able to make. The scope is unaffected either
+    # way: it wraps ``_run_claimed_job``, which both paths execute, which is
+    # what "run_one_job ran inside the scope" above proves.
+    ct._try_dispatch_background_run = lambda job, **kw: {
+        "dispatched": True,
+        "delegation_id": "d_cron_1",
+    }
+    try:
+        dispatched = json.loads(ct.cronjob(action="run", job_id=JOB_ID))
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"dispatched run action did not return JSON: {exc}")
+        dispatched = {}
+    finally:
+        ct._try_dispatch_background_run = _real_dispatch
+    dispatched_job = dispatched.get("job", {})
+    check("dispatched run reports success", dispatched.get("success"), True)
+    check("dispatched run says so", dispatched_job.get("execution_mode"), "background")
+    check("dispatched run carries a handle", dispatched_job.get("delegation_id"), "d_cron_1")
+    check("dispatched run merges no report", "response" in dispatched_job, False)
 
     if failures:
         print("\nVERIFY FAILED:")

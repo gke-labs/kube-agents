@@ -1101,5 +1101,252 @@ class SyncProfileSkillsTest(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in (tmp / "profile").iterdir()), ["skills"])
 
 
+class PlatformFrontDoorTest(unittest.TestCase):
+    """The startup decisions that turn on spec.harness.experimental.platformFrontDoor.
+
+    The operator renders that flag as HERMES_GATEWAY_PROFILE=platform on the gateway
+    container, and the gateway then runs as the platform profile instead of the default
+    one. That moves profiles/platform/config.yaml out of the image's ownership and into
+    the agent's: `/sethome` persists the home channel into it and the monitoring policy
+    mints monitoring.install_id there. Step 2.6 must therefore stop force-syncing it, and
+    step 2.6b must back-fill it instead — the same bargain step 2d strikes for the default
+    profile's own file.
+
+    Both ask the same predicate, so it is tested once and each caller is tested against
+    it — the failure worth catching is the two disagreeing, which is either a config.yaml
+    force-synced out from under the agent or one that never takes a key the image added.
+
+    Extracted rather than run through the whole script for the reason step 2.6a's tests
+    give: the surrounding steps are guarded on /opt/hermes and /opt/agent-config, which
+    exist only inside the image.
+    """
+
+    def _run(self, snippet, profile=None):
+        """Run `snippet` under `set -e` with the front-door helpers in scope."""
+        script = "set -e\n"
+        for name in ("platform_is_front_door", "platform_sync_items"):
+            script += _extract_shell_function(name) + "\n"
+        script += snippet
+        env = {"PATH": "/usr/bin:/bin"}
+        if profile is not None:
+            env["HERMES_GATEWAY_PROFILE"] = profile
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
+        )
+
+    def _predicate(self, snippet, profile=None):
+        proc = self._run(f'if {snippet}; then echo YES; else echo NO; fi\n', profile=profile)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip() == "YES"
+
+    def _items(self, profile=None):
+        proc = self._run("platform_sync_items\n", profile=profile)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split()
+
+    def test_the_front_door_is_off_unless_the_operator_names_this_profile(self):
+        """Only the exact value opts in; everything else is the behaviour every install has.
+
+        The empty string matters on its own: Kubernetes renders an absent value as one
+        rather than omitting the variable, so a half-wired manifest arrives here as `""`.
+        """
+        for profile in (None, "", "  ", "default", "cluster-prod", "Platform", "platform2"):
+            self.assertFalse(
+                self._predicate("platform_is_front_door", profile=profile),
+                f"HERMES_GATEWAY_PROFILE={profile!r} must not opt an install in",
+            )
+        self.assertTrue(self._predicate("platform_is_front_door", profile="platform"))
+
+    def test_the_front_door_drops_config_yaml_and_nothing_else(self):
+        """config.yaml is the only entry whose ownership the flag changes.
+
+        Asserted as a set difference rather than against a spelled-out list, because the
+        bug to catch is a persona or a directory quietly falling out of the sync on
+        front-door installs only — where it would present months later as an agent whose
+        skills never updated, on the one install nobody compares against the image.
+        """
+        default = self._items()
+        front_door = self._items(profile="platform")
+
+        self.assertIn("config.yaml", default)
+        self.assertEqual(
+            set(default) - set(front_door),
+            {"config.yaml"},
+            "the front door must drop config.yaml from the force-sync and keep the rest",
+        )
+        self.assertEqual(
+            set(front_door) - set(default), set(), "the front door must not add entries"
+        )
+
+    def test_step_2_6b_fills_the_platform_config_with_step_2ds_own_program(self):
+        """One program, two callers — asserted on the source, not on a copy of it.
+
+        The rule step 2.6b needs is exactly step 2d's: restore a key the image declares
+        and the live file has lost, never overrule one the agent wrote. Re-implementing
+        it here is the failure this catches, because the second copy would drift towards
+        the three-way merge that #658 removed — and the two files it governs are the two
+        an agent writes to, so a divergence surfaces as `/sethome` sticking on one
+        profile and not the other.
+        """
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        callers = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith("backfill_config_from_template")
+            and not line.strip().endswith("() {")
+        ]
+        self.assertEqual(
+            len(callers),
+            2,
+            f"expected step 2d and step 2.6b to be the only callers, found {callers}",
+        )
+        self.assertIn(
+            "$PLATFORM_TEMPLATE/config.yaml",
+            source,
+            "step 2.6b must fill from the platform profile's image template",
+        )
+
+    def test_step_2_6b_runs_only_at_the_front_door_and_only_on_the_primary(self):
+        """The guard, read off the source, because both halves are silent when wrong.
+
+        Without the predicate the fill runs on every install, on a file step 2.6 has
+        already force-synced — harmless the first time and wrong the moment the template
+        and the overlay disagree. Without the primary check a second container races the
+        first over one file on a shared PVC, which is what step 1.5 exists to stop.
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        call = next(
+            i
+            for i, line in enumerate(lines)
+            if line.strip().startswith("backfill_config_from_template")
+            and "PLATFORM_TEMPLATE" in "\n".join(lines[i : i + 3])
+        )
+        guard = next(lines[i] for i in range(call, -1, -1) if lines[i].startswith("if "))
+        self.assertIn("platform_is_front_door", guard)
+        self.assertIn("IS_BOOTSTRAP_PRIMARY", guard)
+
+    def test_step_2_6_asks_the_helper_rather_than_carrying_its_own_list(self):
+        """The call site, not just the helper — a literal here re-opens the whole bug.
+
+        Everything above tests platform_sync_items in isolation, which stays green if
+        step 2.6's `--items` is edited back to the spelled-out list it used to carry:
+        the helper would go on answering correctly and nothing would ask it. The result
+        is config.yaml force-synced over the front door's own file on every restart,
+        discarding `/sethome` and monitoring.install_id, silently.
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        # Two invocations name this profile — step 2.5 scaffolds it when absent, step 2.6
+        # force-syncs it on every boot — and only the second passes --items at all.
+        items = []
+        for i, line in enumerate(lines):
+            if line.strip() != "--name platform \\":
+                continue
+            items += [a.strip() for a in lines[i : i + 8] if a.strip().startswith("--items")]
+        self.assertEqual(
+            items,
+            ['--items "$(platform_sync_items)" \\'],
+            "step 2.6 must resolve its --items through platform_sync_items, not a literal",
+        )
+
+    def _run_step_2_6b(self, template, live):
+        """Run the shipped step 2.6b block over a real profile tree.
+
+        Lifted out by its guard rather than copied, for `_extract_heredoc`'s reason: a
+        copy would keep passing after the block it stands in for changed. Everything the
+        block reads is a variable, so a temp tree and an env is the whole fixture — the
+        one exception being `$INSTALL_DIR/.venv/bin/python3`, which the fill arm calls
+        and which is faked here with a symlink to the interpreter running the tests.
+
+        `template` and `live` are YAML text; `live=None` means the file is absent, which
+        is the branch under test. Returns (CompletedProcess, live text or None).
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        starts = [i for i, line in enumerate(lines) if line.startswith("if platform_is_front_door ")]
+        self.assertEqual(len(starts), 1, "expected exactly one step 2.6b block")
+        end = next(i for i in range(starts[0], len(lines)) if lines[i] == "fi")
+        block = "\n".join(lines[starts[0] : end + 1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "template").mkdir()
+            (root / "template" / "config.yaml").write_text(template, encoding="utf-8")
+            profile = root / "data" / "profiles" / "platform"
+            profile.mkdir(parents=True)
+            if live is not None:
+                (profile / "config.yaml").write_text(live, encoding="utf-8")
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            (venv / "python3").symlink_to(sys.executable)
+
+            script = "set -e\n" + _extract_shell_function("platform_is_front_door") + "\n"
+            script += _extract_shell_function("backfill_config_from_template") + "\n" + block
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HERMES_GATEWAY_PROFILE": "platform",
+                    "IS_BOOTSTRAP_PRIMARY": "1",
+                    "PLATFORM_TEMPLATE": str(root / "template"),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            written = (profile / "config.yaml").read_text(encoding="utf-8") if (profile / "config.yaml").exists() else None
+            return proc, written
+
+    def test_step_2_6b_seeds_the_config_when_the_profile_has_none(self):
+        """The absent-file arm, which is the only thing left that can recreate this file.
+
+        With config.yaml off the force-sync, the four steps that could write it are step
+        2.5 (gated on the profile being ABSENT, so not once profile.yaml exists), step
+        2.6 (no longer carries the name in --items), this block, and step 2.7 (skips a
+        profile whose config.yaml is missing). If this arm does not seed, a profile that
+        registered without a config — profile_scaffold writes profile.yaml before it
+        copies the template, and step 2.5's caller swallows a failure between the two
+        with a WARN — never gets one back for the life of the volume. It is also the
+        profile receiving chat, and an absent `platform_toolsets` does not fail closed:
+        `resolve_toolset` auto-generates the full core bundle plus every enabled MCP
+        server, with no `agent.disabled_toolsets` ceiling and no operator overlay.
+        """
+        template = "platform_toolsets:\n  google_chat: [kanban]\nmonitoring: {}\n"
+        proc, written = self._run_step_2_6b(template, live=None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(written, template, "an absent config must be seeded from the image template")
+
+    def test_step_2_6b_fills_an_existing_config_without_overruling_it(self):
+        """The other arm, on the same fixture: fill what is missing, keep what is there.
+
+        Pinned next to the seed so the two cannot be confused for each other. Seeding
+        over a live file would discard `/sethome` and monitoring.install_id on every
+        restart, which is the failure taking config.yaml off the force-sync exists to
+        prevent.
+        """
+        template = "platform_toolsets:\n  google_chat: [kanban]\nmonitoring: {}\n"
+        live = "platform_toolsets:\n  google_chat: [kanban, memory]\n"
+        proc, written = self._run_step_2_6b(template, live=live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        parsed = yaml.safe_load(written)
+        self.assertEqual(
+            parsed["platform_toolsets"]["google_chat"],
+            ["kanban", "memory"],
+            "the fill must not overrule a key the agent already wrote",
+        )
+        self.assertIn("monitoring", parsed, "the fill must add a key the template declares")
+
+    def test_the_predicate_survives_set_e_when_it_is_false(self):
+        """The off path is every existing install, so a false return must not end the boot.
+
+        `platform_is_front_door || _items=...` and `if platform_is_front_door` are both
+        exempt from `set -e`, but a future caller written as a bare command would not be,
+        and the symptom is a CrashLoopBackOff on the installs that did NOT opt in.
+        """
+        proc = self._run("platform_sync_items >/dev/null\necho SURVIVED\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SURVIVED", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

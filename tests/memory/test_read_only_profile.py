@@ -96,7 +96,15 @@ def test_the_write_call_is_refused_anyway():
 
 
 def test_automatic_capture_is_off():
-    """The tool surface is not the only write path; the turn hooks are one too."""
+    """The tool surface is not the only write path; the turn hooks are one too.
+
+    Scoped to the read-only decision, and only that. Stubbing ``_call`` is fine
+    for "does the hook return before forwarding"; it is worthless for "does the
+    forward arrive", because ``_call`` is the method that forwards and, until
+    #784, swallowed the result. That half lives in
+    ``test_forwarding_matches_hindsight.py``, which drives the same hooks through
+    ``MemoryManager`` and binds each forward against the real stock signature.
+    """
     p, _ = provider(read_only=True)
     seen = []
     p._call = lambda name, *a, **kw: seen.append(name)

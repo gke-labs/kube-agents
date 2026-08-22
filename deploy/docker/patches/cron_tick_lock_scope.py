@@ -6,7 +6,7 @@ The platform profile has no cron ticker thread. It is ticked once a minute by
 whose CLI body is verbatim ``tick(verbose=True)``. Everything Hermes attaches to
 the ticker's lifetime -- the in-flight job set, the startup recovery sweep, the
 assumption that a tick is a short scheduling pass inside a long-lived process --
-is therefore either absent or wrong on that profile. This module and the eleven
+is therefore either absent or wrong on that profile. This module and the twelve
 anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is missing.
 
 Head-of-line blocking: the tick lock covered execution
@@ -114,34 +114,53 @@ job becomes claimable again -- no exception, no log line. ``if
 _job_locks.claim(job_id) is None: ...`` and nothing further would compile, pass
 a single-process smoke test, and guard nothing. That is why the patched
 ``tick`` binds ``_job_lock`` and passes it into ``_run_and_release`` as a
-default argument, and why ``_execute_job_now`` binds ``_run_lock`` for the
+default argument, and why ``_run_claimed_job`` binds ``_run_lock`` for the
 whole body.
 ``test_cron_tick_lock_scope.py::test_dropping_the_last_reference_to_a_claim_hands_the_job_back``
 pins it.
 
 A dispatched run takes the same lock
 ------------------------------------
-``tools/cronjob_tools.py::_execute_job_now`` -- the body of
-``cronjob(action='run')`` -- called ``run_one_job`` with no per-job lock at all.
-Its only guard was ``cron/jobs.py::claim_job_for_fire``, and the comment above
-the call site claiming that guard "blocks a concurrent tick from double-firing"
-was simply untrue in both directions: ``tick`` reaches ``run_one_job`` via
+``tools/cronjob_tools.py`` -- the body of ``cronjob(action='run')`` -- called
+``run_one_job`` with no per-job lock at all. Its only guard was
+``cron/jobs.py::claim_job_for_fire``, and the comment above the call site
+claiming that guard "blocks a concurrent tick from double-firing" was simply
+untrue in both directions: ``tick`` reaches ``run_one_job`` via
 ``advance_next_runs``, which never stamps a ``fire_claim``, so a dispatch always
 wins the CAS against a run already in flight; and the ``fire_claim`` a dispatch
 does stamp expires after ``claim_ttl_seconds=300`` while a compliance audit runs
 for twenty minutes, so the tick then fires a second copy on top of the first.
 Two concurrent runs of one audit share the job's output file and the profile's
 scratch state, which is how a fleet audit came to publish another run's
-findings. ``_execute_job_now`` now claims the same flock before the CAS -- before,
-so that a refusal does not leave ``next_run_at`` advanced for a run that never
-happened -- and releases it in a ``finally``.
+findings.
+
+The flock is claimed in ``_run_claimed_job`` -- the run half v2026.8.13 split
+out of ``_execute_job_now``, so that a background dispatch can take the claim
+synchronously and hand the run to a daemon worker -- and released in a
+``finally``. Four call sites reach that run half and ``_execute_job_now`` is
+only one of them, so guarding the run rather than the entry point is what keeps
+the other three covered.
+
+Guarding there puts the flock AFTER ``claim_job_for_fire``, and that costs one
+thing: the CAS has already advanced ``next_run_at``, so a refusal skips a
+scheduled occurrence of a job this call never ran. It is a deliberate trade, and
+the same one upstream makes two lines above for its own
+``try_register_running_job`` guard. A skipped occurrence of a job that is
+*already executing* is a far smaller harm than the two overlapping runs sharing
+one output file that this patch exists to stop.
 
 A refused dispatch returns immediately rather than waiting for the lock. The
 caller is an agent blocked inside a tool call, the run it would wait for can
 last twenty minutes, and what it would get at the end is a redundant second run
-of a job that has just finished. ``cronjob``'s ``run`` branch already surfaces a
-lost claim as ``execution_skipped``, so the refusal arrives as a sentence the
-model can act on instead of as a stall.
+of a job that has just finished. The refusal is returned as ``claimed: True``
+with an ``error``, which ``cronjob``'s ``run`` branch surfaces to the model as
+``execution_error``. ``claimed: False`` would read better -- nothing ran, and
+``result["executed"]`` consequently says ``True`` when it should not -- but it
+would also be a lie about the CAS, which did succeed and did advance
+``next_run_at``. That branch skips ``_notify_provider_jobs_changed_safe()`` on
+an unclaimed result, so reporting the refusal as unclaimed would leave an
+external provider's one-shot un-reconciled against an occurrence this call has
+already consumed.
 
 A spawned tick is a scheduler restart
 -------------------------------------

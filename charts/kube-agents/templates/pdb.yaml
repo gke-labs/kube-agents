@@ -1,0 +1,108 @@
+{{/*
+PodDisruptionBudgets for the workloads this chart owns.
+
+maxUnavailable: 1 at every replica count, per the Workload Reliability Audit
+this project ships: agents/platform/governance/obtainability_audit_sop.md §3.3
+requires "Always maxUnavailable, never minAvailable", because minAvailable is
+the shape that deadlocks drains and maxUnavailable: 1 is structurally safe at
+any replica count >= 2.
+
+Keying the field to replicaCount instead would be safe only while that value
+holds. minAvailable: 1 against a single replica sets disruptionsAllowed to 0,
+and `kubectl drain` on that node never completes: node-pool upgrades, node
+auto-repair, and autoscaler scale-down all stall until a human deletes the PDB
+— the critical `blocking-pdb` finding of §3.4. A template that switched on
+replicaCount would avoid that at render time and still produce it the first
+time an operator runs `kubectl scale --replicas=1`, or an autoscaler does.
+
+Selectors reuse the Deployments' own selector labels. The audit's §3.3 matches
+a PDB to a workload by selector, never by name, so these must stay in step
+with the pod templates in operator-deployment.yaml, litellm.yaml,
+hindsight.yaml, and github-minter.yaml.
+*/}}
+{{- if and .Values.operator.enabled .Values.operator.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-controller-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "kube-agents.operatorSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if and .Values.litellm.enabled .Values.litellm.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: litellm
+{{- end }}
+{{- if and (include "kube-agents.hindsightEnabled" .) .Values.hindsight.podDisruptionBudget.enabled }}
+---
+# Both Hindsight workloads run a single replica, so neither budget can protect
+# anything — maxUnavailable: 1 states the intent instead: these may be evicted.
+# The API is stateless and restarts; the database is disk-bound and
+# single-member by design, and holding a node drain hostage to it would be
+# worse than the short gap while it reschedules.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hindsight-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hindsight-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: postgresql
+{{- end }}
+{{- if and .Values.githubMinter.enabled .Values.githubMinter.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: github-token-minter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: github-token-minter
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: github-token-minter
+{{- end }}

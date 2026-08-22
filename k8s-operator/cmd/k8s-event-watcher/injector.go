@@ -125,13 +125,63 @@ type injectResponse struct {
 // the body is where the difference is stated.
 const injectStatusSuppressed = "suppressed"
 
+// injectStatusFiltered is the daemon's word for "accepted, and then dropped on
+// purpose" — the event graded Info, so it was recorded in the daily recap
+// instead of being announced. Unlike injectStatusSuppressed this is not a
+// transient condition: the same event will grade Info again on its next
+// sighting, so the dedup entry stays and the incident is not reopened.
+// Rolling it back would re-offer routine churn at the event's own repeat
+// cadence for as long as the workload keeps emitting.
+//
+// The two skew directions are not equally safe. A daemon predating this status
+// answers "suppressed" for both, which reads as a ceiling drop and reopens: one
+// redundant session, no silence.
+//
+// A watcher predating it is the harmful direction. It reads "filtered" as
+// delivered and keeps the entry, but it has no MarkPolicyFiltered, so the entry
+// carries no flag and ReopenIfPolicyFiltered can never fire for it. The key is
+// canonical, so it is then held on behalf of the family's one Info member and
+// every Warning behind it takes Case 3 in Observe, sliding LastSeen on each
+// sighting — at the deployed 24h window a failing image pull keeps its own
+// entry alive and never alerts.
+//
+// That direction is reachable on an ordinary install, which is why the watcher
+// has to ask for this status rather than the daemon volunteering it — see
+// injectFeaturesHeader. The two halves do not ship together: the daemon is
+// session_kv_server.py, which the agent container runs from $TARGET_DIR/scripts
+// on the shared PVC, while the watcher is a binary baked into the credential
+// proxy sidecar image. One is replaced by an entrypoint copy onto a volume and
+// the other by a container image pull, so they version independently on every
+// install and a pod is not all-old or all-new.
+const injectStatusFiltered = "filtered"
+
+// injectFeaturesHeader lists the response behaviours this watcher understands,
+// so the daemon can answer an older one the way that older one expects.
+//
+// This exists because the skew is not symmetric. A watcher that does not know
+// injectStatusFiltered reads it as delivered and keeps a dedup entry it will
+// never reopen, silencing the whole canonical family — and the two halves are
+// deployed by different mechanisms, so that pairing is an ordinary state rather
+// than an edge case. Rather than requiring the daemon and the sidecar to roll in
+// a fixed order, the watcher states what it can handle and the daemon falls back
+// to injectStatusSuppressed for anyone who does not claim policy-filtered. The
+// fallback costs one redundant session per Info sighting, which is the behaviour
+// that shipped before this status existed.
+//
+// Comma-separated so a later feature is added without a second header.
+const injectFeaturesHeader = "X-Watcher-Features"
+
+// injectFeaturePolicyFiltered is the token that opts this watcher in to
+// injectStatusFiltered. Matched against by the daemon's `_watcher_features`.
+const injectFeaturePolicyFiltered = "policy-filtered"
+
 // Inject posts the triage event details to the specified session's queue.
 //
 // Returns the daemon's status string alongside the error, because a 2xx does
-// not by itself mean anyone was told — see injectStatusSuppressed. An empty
-// or unparseable body reads as delivered: a daemon predating this field is
-// one that always delivers, and guessing "dropped" would reopen every
-// incident on every sighting.
+// not by itself mean anyone was told — see injectStatusSuppressed and
+// injectStatusFiltered. An empty or unparseable body reads as delivered: a
+// daemon predating this field is one that always delivers, and guessing
+// "dropped" would reopen every incident on every sighting.
 func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
 	if sessionID == "" {
 		return "", errors.New("injector: Inject: sessionID is required")
@@ -151,6 +201,7 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 	}
 	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(injectFeaturesHeader, injectFeaturePolicyFiltered)
 	if i.cfg.assertedCaller != "" {
 		req.Header.Set("X-Asserted-Caller", i.cfg.assertedCaller)
 	}

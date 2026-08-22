@@ -10,6 +10,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# gke_dns_endpoint_flag: reach each cluster over the endpoint deploy_infra.sh used.
+# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+source "${SCRIPT_DIR}/../../scripts/gke_dns_endpoint.sh"
+
 # ANSI Colors
 C_CYAN='\033[96m'
 C_GREEN='\033[92m'
@@ -47,7 +51,11 @@ if command -v helm &> /dev/null && command -v kubectl &> /dev/null; then
     
     if [ -n "$c_name" ]; then
       log_info "Configuring kubectl credentials for ${c_name}..."
-      gcloud container clusters get-credentials "${c_name}" --region "${c_loc}" --project "${p_id}" &>/dev/null || return 0
+      gke_dns_endpoint_flag "${c_name}" "${c_loc}" "${p_id}"
+      # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+      # shellcheck disable=SC2086
+      gcloud container clusters get-credentials "${c_name}" --region "${c_loc}" --project "${p_id}" \
+        ${GKE_DNS_ENDPOINT_FLAG} &>/dev/null || return 0
       
       log_info "Attempting to uninstall Helm workloads from cluster '${c_name}'..."
       if helm status workload-bundle --namespace "$NAMESPACE" &>/dev/null; then

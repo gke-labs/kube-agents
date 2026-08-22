@@ -16,9 +16,14 @@ description:
 
 This skill delegates all deterministic GitHub CLI operations, label creation,
 stale sweeps, and safe comment uploading to the helper script
-`./skills/github-issue-resolver/scripts/resolver.py`. The LLM's
+`"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py`. The LLM's
 role is strictly constrained to **reasoning, diagnostic investigation, and root
 cause determination**.
+
+The script path is spelled out from `$HERMES_HOME` rather than as `./skills/…`
+because you now reach this skill from a kanban card as well as from a cron turn,
+and a card dispatch starts you in the task's workspace, not the profile
+directory. `$HERMES_HOME` is the profile directory in both.
 
 ## Procedure
 
@@ -28,18 +33,28 @@ Run the deterministic polling script to sweep stale investigations and check for
 new unaddressed open issues:
 
 ```bash
-./skills/github-issue-resolver/scripts/resolver.py poll
+"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll
 ```
 
-- If the script outputs `{"status": "NO_ISSUES", ...}`, your final response MUST
-  BE exactly `[SILENT]` to suppress chat noise. Terminate the turn immediately.
+Run it even when a kanban card sent you here already naming an issue. The
+`github-repo-watcher` cron job polls on your behalf and files that card, but the
+card is a pointer written minutes ago, not a transcript: the issue may have been
+claimed, closed, or labelled `agent:ignore` since. Re-reading the truth costs one
+API call. It also performs the stale sweep, which the card cannot.
+
+- If the script outputs `{"status": "NO_ISSUES", ...}`, there is nothing to do.
+  End the turn per [Ending the turn](#ending-the-turn). Arriving here from a card
+  is normal and is not a fault — it means the issue was addressed between the
+  poll and your dispatch.
 - If the script outputs `{"status": "NOT_CONFIGURED"}`, this deployment has no
-  target repository. That is a supported state, not a fault: your final response
-  MUST BE exactly `[SILENT]`. Terminate the turn immediately.
+  target repository. That is a supported state, not a fault. End the turn per
+  [Ending the turn](#ending-the-turn).
 - If the script outputs `{"status": "ERROR", "reason": <reason>, ...}`, the
-  resolver could not run. Do NOT respond `[SILENT]` — this is a fault that would
-  otherwise recur silently on every scheduled poll. Alert the chat room:
-  `⚠️ **GitHub issue resolver is not running:** <reason>` and terminate the turn.
+  resolver could not run. This is a fault that would otherwise recur silently on
+  every poll, so it is never silent: alert the chat room with
+  `⚠️ **GitHub issue resolver is not running:** <reason>`, then end the turn per
+  [Ending the turn](#ending-the-turn) — on a card, `kanban_block` rather than
+  `kanban_complete`.
 - If the script outputs `{"status": "FOUND", "issue_number": <number>, ...}`,
   proceed to Step 2.
 
@@ -49,7 +64,7 @@ Immediately claim the issue before starting your investigation so other agents
 or engineers do not duplicate work:
 
 ```bash
-./skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
+"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
 ```
 
 ### Step 3: Investigate & Diagnose (Reasoning Phase)
@@ -79,24 +94,51 @@ Once your investigation is complete:
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
-     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
+     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
-     - Your final turn response MUST BE exactly `[SILENT]`.
+     - Then end the turn per [Ending the turn](#ending-the-turn).
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
-     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
+     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
      - You MUST message the chat room to alert the on-call engineer:
        `🚨 **Human Escalation Required — Action Needed:**`
        `- [#<number> (<Title>)](https://github.com/<owner>/<repo>/issues/<number>) — *<1-sentence summary of root cause requiring human intervention>*`
+     - Then end the turn per [Ending the turn](#ending-the-turn).
+
+## Ending the turn
+
+Two callers reach this skill, and they end differently. Check `$HERMES_KANBAN_TASK`.
+
+- **Dispatched from a kanban card** (`$HERMES_KANBAN_TASK` is set) — the usual
+  case, because `github-repo-watcher` files a card for every issue it finds. Call
+  `kanban_complete(result=..., summary=...)`, or `kanban_block(kind=...)` if you
+  could not finish. **Never end a card run without one of them**, whatever the
+  outcome and however little there was to do: a worker that just stops exits
+  rc=0, is reaped as a `protocol_violation`, and burns one of the card's
+  attempts. `result` is the only field the requester receives, so put the outcome
+  there — the issue number and
+  what you did, or one line saying there was nothing to do. Do **not** answer
+  `[SILENT]`: the card is the channel, and a completed card notifies nobody who
+  was not already subscribed.
+- **Any other caller** — a cron turn, or a person asking in chat. Where the steps
+  above say the outcome is silent (`NO_ISSUES`, `NOT_CONFIGURED`,
+  `status:resolved`), your final turn response MUST BE exactly `[SILENT]`, to
+  suppress chat noise.
+
+Either way an `ERROR` from Step 1 and an escalation from Step 3 are never silent:
+post the chat message the step names first, then end the turn.
 
 ## MANDATORY ISSUE TURN COMPLETION CHECKLIST
 
 Before ending any turn where an issue `#<number>` was claimed, you MUST verify:
 
-1. **Deterministic Transition Called:** `./skills/github-issue-resolver/scripts/resolver.py transition` was executed
+1. **Deterministic Transition Called:** `"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition` was executed
    with your report file (`/opt/data/scratch/report_<number>.md`).
 2. **Chat Alert Handled:** If `status:escalation-needed`, you posted the chat
-   alert. If `status:resolved` or `NO_ISSUES`, your final response is exactly
-   `[SILENT]`.
+   alert.
+3. **The Turn Is Ended Correctly:** per [Ending the turn](#ending-the-turn) —
+   `kanban_complete` / `kanban_block` on a card, `[SILENT]` otherwise. This
+   applies to every exit from this skill, including the ones with nothing to
+   report.

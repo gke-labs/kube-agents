@@ -20,13 +20,15 @@ SKILL_AGENT_OVERRIDES = {
 
 # Marker that identifies our auto-injected footer, so injection is idempotent and
 # the footer can be recognized/stripped later if needed.
-FOOTER_MARKER = "<!-- kube-agents: cluster-agent coupling (auto-injected by sync-upstream-skills.py) -->"
+FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->"
 
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
-# local edits are wiped. The GKE create/lifecycle skills must, however, keep pointing at this repo's
-# Cluster Agent profile lifecycle (which upstream knows nothing about). These footers are the single
-# source of truth for that coupling and are re-appended after each sync. See
-# agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference.
+# local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
+# here rather than in the skill file: these footers are the single source of truth for it and are
+# re-appended after each sync. Two things need saying today — the GKE create/lifecycle skills must
+# keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
+# (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
+# and gke-networking must not present `--dns-endpoint` as unconditionally safe.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -45,7 +47,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \\
 
 The command is idempotent, so it is safe to re-run. This gives the new cluster an agent
 immediately. (The `cluster-agent-reconcile` cron would also pick it up on its next run — it
-manages every cluster in the project except the management cluster — so no labeling is required.)
+manages every cluster in the project, so no labeling is required.)
 
 ## Cluster Agent Profile Teardown
 
@@ -64,11 +66,36 @@ Deleting the profile here is the immediate, preferred path. As a backstop, the h
 `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone, so a
 profile missed during teardown is cleaned up on the next reconcile cycle.
 """,
+    "gke-networking": f"""{FOOTER_MARKER}
+
+## Before you pass `--dns-endpoint`
+
+The `get-credentials --dns-endpoint` example above works only on a cluster that publishes a DNS
+endpoint **and** has `controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic` set to
+true. Check first:
+
+```bash
+gcloud container clusters describe {{cluster_name}} --region {{region}} \\
+  --format='value(controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)'
+```
+
+Do not infer support from the command succeeding. When external traffic is disabled, a caller that
+Google treats as internal gets a warning rather than an error, plus a kubeconfig pointing at the
+DNS endpoint that then returns HTTP 403 on first use — a failure that surfaces one step later than
+its cause. `gcloud container clusters update {{cluster_name}} --enable-dns-access` turns the
+setting on.
+
+The Platform Agent's own tooling makes this decision per cluster in
+`/opt/data/scripts/gke_endpoint.py`, so `switch_kube_context` and the Cluster Agent profile
+scaffolding already pass the flag exactly when it applies; the check above is for the times you
+run `get-credentials` by hand. That decision is re-read about once a minute per cluster, so after
+enabling the setting, wait a moment before retrying rather than concluding it did not work.
+""",
 }
 
 
 def inject_footer(dest_path, skill_name):
-    """Append the Cluster Agent coupling footer to a freshly-synced skill's SKILL.md.
+    """Append this repository's footer for a skill to its freshly-synced SKILL.md.
 
     Idempotent: does nothing if the skill has no footer configured or the footer marker is
     already present. Returns True if a footer was written, else False.
@@ -166,7 +193,7 @@ def main():
 
                     # Re-inject the Cluster Agent coupling footer (wiped by the copy above).
                     if inject_footer(dest_path, skill_name):
-                        print(f"  Injected Cluster Agent coupling footer into {skill_name}/SKILL.md")
+                        print(f"  Injected kube-agents footer into {skill_name}/SKILL.md")
 
             print("\nSynchronization complete!")
     except subprocess.CalledProcessError:

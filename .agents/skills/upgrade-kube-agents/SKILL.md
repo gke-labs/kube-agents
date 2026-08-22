@@ -11,8 +11,8 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
 
 To non-interactively upgrade `kube-agents` on a GKE cluster, run the one-liner **from the
 directory holding the original install checkout** — the upgrade refuses to proceed without the
-saved `k8s-operator/scripts/vars.sh` configuration state, because the provisioning scripts
-re-render the PlatformAgent Custom Resource from it:
+saved `k8s-operator/scripts/vars.sh` configuration state, because a full upgrade re-renders the
+whole install (the `PlatformAgent` CR included) from it:
 
 ```bash
 curl -fsSL https://gke-labs.github.io/kube-agents/upgrade.sh | bash -s -- \
@@ -26,9 +26,14 @@ curl -fsSL https://gke-labs.github.io/kube-agents/upgrade.sh | bash -s -- \
 
 ## Upgrade Modes
 
-- `--upgrade-mode=harness`: Upgrades Platform Agent deployment and controller container images.
-- `--upgrade-mode=operator`: Upgrades Kubernetes Operator CRDs and controller manager.
-- `--upgrade-mode=full` (Default): Upgrades both the operator and Platform Agent harness.
+- `--upgrade-mode=harness`: `helm upgrade --reuse-values` re-tagging only the Platform Agent image (`platformAgent.deployment.image.tag`).
+- `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then `helm upgrade --reuse-values` re-tagging only the operator image.
+- `--upgrade-mode=full` (Default): applies the CRDs, then runs a full `terraform apply` at the new `--image-tag` through the install engine — both image tags move and every setting saved in `vars.sh` is re-rendered. This mode additionally requires the `terraform` CLI.
+
+Every mode requires the `kube-agents` Helm release to exist in the target namespace. An install
+without one predates the Terraform + Helm engine: upgrade it with the release that installed it
+(curl the matching versioned `upgrade.sh`), or re-install with `install.sh` to adopt the new
+engine.
 
 ## Dry-Run Mode
 

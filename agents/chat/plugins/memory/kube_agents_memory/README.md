@@ -37,7 +37,7 @@ Hermes profile on the path, which is why they copy rather than import; both say 
 ## Choosing it
 
 `install.sh --memory=hindsight` selects this provider. It is opt-in rather than the default: it needs
-the in-cluster Hindsight API and its Postgres database, which provisioning step 13 deploys, and an
+the in-cluster Hindsight API and its Postgres database, which the chart deploys whenever a Hindsight-backed memory provider is selected, and an
 install that says nothing about memory must not grow those. The default is
 [`multiuser_memory`](../multiuser_memory/README.md), which is what a small or personal install wants
 and what every install got before this provider existed.

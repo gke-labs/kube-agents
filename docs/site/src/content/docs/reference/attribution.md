@@ -19,13 +19,13 @@ Every agent action can be traced back to a requester. The full design rationale 
 ## What ships today
 
 - **OTel defaults on the Platform Agent Deployment.** Collector endpoint, OTLP protocol, service name, namespace, and agent identity. The endpoint is resolved per reconcile — `spec.deployment.env` still wins, then `spec.telemetry.otlpEndpoint`, then discovery, then the GKE managed collector; see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
-- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and a pseudonymised user id) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. Both plugins run on the Chat Agent (`default`) profile, which owns chat ingress; work the Chat Agent delegates to the Platform Agent runs as a kanban worker whose card links back to the originating chat session. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
+- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and a pseudonymised user id) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. Both plugins run on the Planning Agent (`default`) profile, which owns chat ingress; work the Planning Agent delegates to the Platform Agent runs as a kanban worker whose card links back to the originating chat session. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
 - **Structured chat and tool audit records on stdout.** Collected by GKE's log agent without giving the workload direct write access to Cloud Logging.
 - **Reference API-server audit policy for self-managed clusters:** [`k8s-operator/config/audit/audit-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/audit/audit-policy.yaml).
 
 ## Enable Managed OpenTelemetry on an existing cluster
 
-The provisioner enables Managed OTel on new clusters. For an existing cluster:
+The installer enables Managed OTel on the clusters it installs to. For a cluster it did not touch:
 
 ```bash
 gcloud container clusters update "$CLUSTER_NAME" \
@@ -47,7 +47,7 @@ Runtime follow-up will set these on objects the agent creates:
 
 Annotations (not labels) because label values reject characters common in email addresses, and annotations avoid placing PII in selector indexes.
 
-These are per-requester attribution on objects the agent creates, and are distinct from the project-identity labels the operator, kustomizations, and provisioner stamp on the infrastructure kube-agents installs — see [Resource labels](/kube-agents/reference/resource-labels/).
+These are per-requester attribution on objects the agent creates, and are distinct from the project-identity labels the operator, kustomizations, and Helm chart stamp on the infrastructure kube-agents installs — see [Resource labels](/kube-agents/reference/resource-labels/).
 
 ## Trust boundary
 

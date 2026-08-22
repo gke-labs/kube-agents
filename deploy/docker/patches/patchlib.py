@@ -21,15 +21,18 @@ running image imports it.
 
 Two kinds of edit site
 ----------------------
-**Literal anchors** (:meth:`Patch.substitute`) pin an edit to an exact slice of
-upstream source. They are precise and they fail loudly, but every one of them is
-a separate way that a base-image bump breaks the build, so the number of them is
-the cost metric this directory is managed against.
+**Literal anchors** (:meth:`Patch.substitute`, :meth:`Patch.substitute_all`) pin
+an edit to an exact slice of upstream source. They are precise and they fail
+loudly, but every one of them is a separate way that a base-image bump breaks the
+build, so the number of them is the cost metric this directory is managed
+against.
 
-**AST locators** (:meth:`Patch.find_call`, :meth:`Patch.find_def`) pin an edit to
-a *node* instead — the ``registry.register`` call that registers a named tool,
-the ``def`` whose tail an import has to land after. Reformatting upstream, or
-adding a keyword argument, moves the text but not the node, so a locator
+**AST locators** (:meth:`Patch.find_call`, :meth:`Patch.find_def`,
+:meth:`Patch.find_assign`) pin an edit to a *node* instead — the
+``registry.register`` call that registers a named tool, the ``def`` whose
+signature gains a parameter or whose tail an import has to land after, the
+constant tuple a filter is spelled as. Reformatting upstream, adding a keyword
+argument, or appending an element moves the text but not the node, so a locator
 survives churn that a literal anchor does not.
 
 An AST locator that silently matched the wrong node would be strictly worse than
@@ -134,6 +137,113 @@ class _Site:
 
 class Definition(_Site):
     """A module-level ``def`` located by name."""
+
+    def expect_keyword_only(self, *names: str) -> None:
+        """Assert the signature still declares each keyword-only parameter.
+
+        The half of a signature anchor worth keeping, in the same sense as
+        :meth:`CallSite.expect`. A patch that adds a parameter of its own is
+        entitled to fail when the parameters it reasons about have gone; it is
+        not entitled to fail because upstream added one, which is what the
+        literal signature anchor this replaces did on every base-image bump.
+        """
+        present = {argument.arg for argument in self.node.args.kwonlyargs}
+        missing = [name for name in names if name not in present]
+        if missing:
+            raise self.patch._fail(
+                f"the {self.label} def {self.node.name}() no longer takes "
+                f"keyword-only {', '.join(missing)}. {self.patch.note}"
+            )
+
+    def keyword_only_end(self) -> int:
+        """Offset just past the last keyword-only parameter, for adding one.
+
+        Splicing ``", name=default"`` here appends a parameter without
+        respelling the signature, so wrapping it onto three lines — which
+        v2026.8.13 did to ``cron.scheduler.run_one_job`` — moves the offset
+        instead of breaking the edit. A trailing comma after the last
+        parameter is fine: the insert lands in front of it.
+        """
+        arguments = self.node.args
+        if not arguments.kwonlyargs:
+            raise self.patch._fail(
+                f"the {self.label} def {self.node.name}() takes no "
+                f"keyword-only parameters, so there is nowhere to add one. "
+                f"{self.patch.note}"
+            )
+        # The default outruns the parameter it belongs to (``verbose: bool =
+        # False`` ends at False, not at bool), and kw_defaults holds None for
+        # a keyword-only parameter that has no default.
+        last = arguments.kw_defaults[-1] or arguments.kwonlyargs[-1]
+        starts = _line_starts(self.patch.source)
+        return _offset(
+            self.patch.source, starts, last.end_lineno, last.end_col_offset
+        )
+
+
+class Assignment(_Site):
+    """A single-target ``NAME = ...`` located by name, at any nesting depth.
+
+    Unlike :class:`Definition` and :class:`CallSite` this looks inside function
+    bodies, because the constants worth pinning are not all module-level: the
+    kind filter the kanban notifier claims events with is a local in the method
+    that uses it. The uniqueness check is what keeps that honest — a name
+    assigned in two places is refused rather than guessed at.
+    """
+
+    def __init__(self, patch: "Patch", node: ast.Assign, label: str) -> None:
+        super().__init__(patch, node, label)
+        self.node: ast.Assign = node
+        starts = _line_starts(patch.source)
+        #: Offsets of the right-hand side alone, for rewriting the value while
+        #: leaving the target, the indent and any comment above it untouched.
+        self.value_start = _offset(
+            patch.source, starts, node.value.lineno, node.value.col_offset
+        )
+        self.value_end = _offset(
+            patch.source, starts, node.value.end_lineno, node.value.end_col_offset
+        )
+        #: Start of the line the assignment begins on, for inserting a comment
+        #: ahead of it at the statement's own indentation.
+        self.line_start = starts[node.lineno]
+        #: The assignment's own indentation, as literal text.
+        self.indent = " " * node.col_offset
+
+    @property
+    def value_text(self) -> str:
+        """The right-hand side exactly as it is spelled in the source."""
+        return self.patch.source[self.value_start : self.value_end]
+
+    def expect_contains(self, *values: object) -> None:
+        """Assert the value is a tuple/list/set literal holding each of ``values``.
+
+        This is the half of a literal anchor worth keeping, in the same sense as
+        :meth:`CallSite.expect`. The five-element anchor this replaces was not
+        only *finding* the tuple, it was asserting the tuple still held the
+        kinds the patch reasons about; a locator that skipped that would happily
+        widen a filter upstream had repurposed underneath us. What it
+        deliberately does not assert is the *absence* of anything else, which is
+        precisely the churn — a new upstream kind — that used to break the build
+        for no reason.
+        """
+        node = self.node.value
+        if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            raise self.patch._fail(
+                f"the {self.label} is {_render(node)}, not a tuple/list/set "
+                f"literal. {self.patch.note}"
+            )
+        present = {
+            element.value
+            for element in node.elts
+            if isinstance(element, ast.Constant)
+        }
+        missing = [value for value in values if value not in present]
+        if missing:
+            raise self.patch._fail(
+                f"the {self.label} no longer holds "
+                f"{', '.join(repr(value) for value in missing)}. "
+                f"{self.patch.note}"
+            )
 
 
 class CallSite(_Site):
@@ -255,6 +365,27 @@ class Patch:
             )
         self.source = self.source.replace(anchor, replacement)
 
+    def substitute_all(
+        self, anchor: str, replacement: str, *, label: str, at_least: int = 1
+    ) -> None:
+        """Replace every occurrence, requiring at least ``at_least`` of them.
+
+        For the anchor whose *number* of occurrences is upstream's business
+        rather than this patch's. ``tools/kanban_tools.py`` emits the same
+        "task_id is required" message once per Kanban lifecycle tool, and
+        v2026.8.13 shipped two more tools; an exact count there fails the build
+        to announce that upstream grew a feature, which is precisely the noise
+        the AST locators exist to remove. Finding the anchor nowhere at all
+        still means the edit would silently not happen, so the floor is checked.
+        """
+        found = self.source.count(anchor)
+        if found < at_least:
+            raise self._fail(
+                f"expected at least {at_least} occurrence(s) of the {label} "
+                f"anchor, found {found}. {self.note}\n--- anchor ---\n{anchor}"
+            )
+        self.source = self.source.replace(anchor, replacement)
+
     def append(self, trailer: str) -> None:
         """Add text to the end of the file, for imports resolved at call time."""
         self.source += trailer
@@ -281,6 +412,30 @@ class Patch:
                 f"{len(found)}. {self.note}"
             )
         return Definition(self, found[0], label)
+
+    def find_assign(self, name: str, *, label: str) -> Assignment:
+        """Locate the one ``name = ...`` anywhere in the file.
+
+        ``ast.walk`` rather than ``tree.body``: the constants these patches
+        widen live inside the method that reads them, not at module level.
+        Augmented and annotated assignments are deliberately not matched — a
+        patch that means to rewrite a value should fail rather than splice into
+        a ``name += ...`` it was not derived against.
+        """
+        found = [
+            node
+            for node in ast.walk(self._tree())
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        ]
+        if len(found) != 1:
+            raise self._fail(
+                f"expected 1 assignment to {name} for the {label}, found "
+                f"{len(found)}. {self.note}"
+            )
+        return Assignment(self, found[0], label)
 
     def find_call(self, callee: str, *, label: str, **select: object) -> CallSite:
         """Locate the one module-level call to ``callee`` matching ``select``.
@@ -341,7 +496,12 @@ class Patch:
         """
         if parse:
             try:
-                ast.parse(self.source)
+                # compile(), not ast.parse(). ast.parse accepts a ``continue``
+                # outside a loop and only the compile step rejects it, so a
+                # branch spliced one indent level out of its ``for`` would parse
+                # here and fail at import, inside the running gateway.
+                # apply_kanban_progress_lines.py inserts exactly such a branch.
+                compile(self.source, self.relative, "exec")
             except SyntaxError as e:
                 raise SystemExit(
                     f"{self.prefix} patch: {self.relative} no longer parses "

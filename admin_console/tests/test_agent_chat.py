@@ -32,11 +32,35 @@ class ChatRunner:
         line_callback: Callable[[str], None] | None = None,
     ) -> ChatCommandResult:
         self.calls.append((arguments, input_text))
+        if "platformagents" in arguments:
+            return ChatCommandResult(
+                0,
+                json.dumps({"items": [{"metadata": {"name": "platform-agent"}}]}),
+            )
         if "get" in arguments and "pods" in arguments:
             return ChatCommandResult(
                 0,
                 json.dumps(
-                    {"items": [{"metadata": {"name": "test-agent-01-gateway-1"}}]}
+                    {
+                        "items": [
+                            {
+                                "metadata": {"name": "platform-agent-gateway-1"},
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "runtime-from-pod",
+                                            "ports": [
+                                                {
+                                                    "name": "api",
+                                                    "containerPort": 8642,
+                                                }
+                                            ],
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
                 ),
             )
         output = json.dumps(self.response)
@@ -55,7 +79,7 @@ class AgentChatProviderTest(unittest.TestCase):
 
     def test_run_uses_fixed_in_pod_client_and_stdin_payload(self):
         result = self.provider.run(
-            "test-agent-01",
+            "platform-agent",
             prompt="Deploy the game",
             session_id="portal_0123456789abcdef0123456789abcdef",
             history=({"role": "assistant", "content": "Ready"},),
@@ -67,6 +91,7 @@ class AgentChatProviderTest(unittest.TestCase):
         arguments, input_text = self.runner.calls[-1]
         self.assertIn("exec", arguments)
         self.assertIn("-i", arguments)
+        self.assertEqual(arguments[arguments.index("-c") + 1], "runtime-from-pod")
         self.assertNotIn("sh", arguments)
         self.assertNotIn("Deploy the game", arguments)
         embedded_client = arguments[-1]
@@ -77,10 +102,42 @@ class AgentChatProviderTest(unittest.TestCase):
         self.assertEqual(payload["profile"], "default")
         self.assertEqual(payload["user_email"], "admin@example.com")
 
+    def test_direct_chat_fails_with_all_discovered_noncanonical_names(self):
+        class MissingCanonicalRunner(ChatRunner):
+            def run(self, arguments, **kwargs):
+                if "platformagents" in arguments:
+                    self.calls.append((arguments, kwargs.get("input_text", "")))
+                    return ChatCommandResult(
+                        0,
+                        json.dumps(
+                            {
+                                "items": [
+                                    {"metadata": {"name": "ux-e2e"}},
+                                    {"metadata": {"name": "custom-agent"}},
+                                ]
+                            }
+                        ),
+                    )
+                return super().run(arguments, **kwargs)
+
+        provider = AgentChatProvider(
+            self.provider.target,
+            runner=MissingCanonicalRunner(),
+        )
+
+        with self.assertRaises(AgentChatError) as caught:
+            provider.run(
+                "platform-agent",
+                prompt="hello",
+                session_id="portal_0123456789abcdef0123456789abcdef",
+            )
+
+        self.assertIn("custom-agent, ux-e2e", str(caught.exception))
+
     def test_rejects_invalid_portal_identity_before_kubectl(self):
         with self.assertRaises(ValueError):
             self.provider.run(
-                "test-agent-01",
+                "platform-agent",
                 prompt="hello",
                 session_id="portal_0123456789abcdef0123456789abcdef",
                 user_email="invalid identity",
@@ -90,13 +147,13 @@ class AgentChatProviderTest(unittest.TestCase):
     def test_approval_is_limited_to_once_or_deny(self):
         with self.assertRaises(ValueError):
             self.provider.resolve_approval(
-                "test-agent-01",
+                "platform-agent",
                 run_id="run_0123456789abcdef0123456789abcdef",
                 choice="always",
             )
 
         self.provider.resolve_approval(
-            "test-agent-01",
+            "platform-agent",
             run_id="run_0123456789abcdef0123456789abcdef",
             choice="once",
         )
@@ -113,7 +170,7 @@ class AgentChatProviderTest(unittest.TestCase):
         }
 
         result = self.provider.run(
-            "test-agent-01",
+            "platform-agent",
             prompt="Deploy the game",
             session_id="portal_0123456789abcdef0123456789abcdef",
             on_update=updates.append,
@@ -124,7 +181,7 @@ class AgentChatProviderTest(unittest.TestCase):
 
     def test_embedded_client_keeps_event_stream_open_across_approval(self):
         self.provider.run(
-            "test-agent-01",
+            "platform-agent",
             prompt="Deploy the game",
             session_id="portal_0123456789abcdef0123456789abcdef",
         )
@@ -154,7 +211,7 @@ class AgentChatProviderTest(unittest.TestCase):
 
         with self.assertRaises(AgentChatError) as caught:
             provider.run(
-                "test-agent-01",
+                "platform-agent",
                 prompt="hello",
                 session_id="portal_0123456789abcdef0123456789abcdef",
             )
@@ -165,7 +222,7 @@ class AgentChatProviderTest(unittest.TestCase):
     def test_rejects_oversized_prompt_before_kubectl(self):
         with self.assertRaises(ValueError):
             self.provider.run(
-                "test-agent-01",
+                "platform-agent",
                 prompt="x" * 32_001,
                 session_id="portal_0123456789abcdef0123456789abcdef",
             )

@@ -7,53 +7,84 @@
 # all three at once, so the multi-image shape lives here and the single-target
 # contract those two depend on stays untouched.
 #
-# What this buys, and why one build instead of three submits: credential-proxy
-# is `FROM platform AS credential-proxy` and adds an envoy binary, two configs
-# and one apt/gh-CLI layer. As its own submit it lands on a fresh worker with a
-# cold daemon, so it rebuilds the whole agent-base/platform chain before it can
-# run any of those five instructions. Built on the same worker right after
-# platform, they are already in the daemon's cache and only the delta runs
+# What this buys, and why one build instead of three submits: the two agent
+# images share the whole `agent-base` chain, which is nearly all of either
+# build. As its own submit, credential-proxy lands on a fresh worker with a cold
+# daemon and rebuilds that chain from scratch before it can run any of its own
+# instructions. Built on the same worker right after platform, agent-base is
+# already in the daemon's cache and only the delta runs
 # (gke-labs/kube-agents#635).
 steps:
-  # Only platform's cache is seeded. credential-proxy's own :latest is not
-  # pulled: the step below builds directly on top of the platform image this
-  # build just produced, so its five remaining instructions are cheap, and
-  # pulling the whole image to save them would cost far more than it saves.
+  # Only platform's cache is seeded from the canonical postsubmit image
+  # maintained by .github/workflows/docker-publish-gcp.yml in kube-agents-prow.
+  # credential-proxy's own cache is not pulled: the step below inherits
+  # agent-base from the platform build on this worker, and pulling a second
+  # whole image to save the handful of instructions above that would cost far
+  # more than it saves.
   - id: warm-cache
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
     args:
       - "-c"
-      - "docker pull $_PLATFORM_LATEST || true"
+      - |
+        echo "Pulling cache image: $_CACHE_IMAGE"
+        max_attempts=3
+        attempt=1
+        pulled=false
+        until [ "$attempt" -gt "$max_attempts" ]; do
+          if docker pull "$_CACHE_IMAGE"; then
+            pulled=true
+            echo "✓ Cache image pulled successfully."
+            break
+          fi
+          echo "⚠ Attempt $attempt/$max_attempts failed to pull $_CACHE_IMAGE."
+          if [ "$attempt" -lt "$max_attempts" ]; then
+            echo "Retrying in 5s..."
+            sleep 5
+          fi
+          attempt=$((attempt + 1))
+        done
+
+        if [ "$pulled" != "true" ]; then
+          echo "WARNING: CACHE MISS — could not pull $_CACHE_IMAGE after $max_attempts attempts."
+          echo "Check that docker-publish-gcp.yml is green on main and that Cloud Build"
+          echo "holds roles/artifactregistry.reader on kube-agents-prow."
+          if [ "$_REQUIRE_CACHE" = "true" ]; then
+            echo "ERROR: _REQUIRE_CACHE is set to true. Failing build."
+            exit 1
+          fi
+          echo "Building cold without cache."
+        fi
 
   - id: platform
     name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
     env:
       - "DOCKER_BUILDKIT=1"
     args:
-      - "build"
-      # Deployment targets are always amd64 GKE nodes; the multi-arch bases
-      # otherwise resolve to the build host (#560).
-      - "--platform"
-      - "linux/amd64"
-      - "-t"
-      - "$_PLATFORM_URI"
-      - "-t"
-      - "$_PLATFORM_LATEST"
-      - "--cache-from"
-      - "$_PLATFORM_LATEST"
-      - "-f"
-      - "deploy/docker/Dockerfile"
-      - "--target"
-      - "platform"
-      - "--build-arg"
-      - "BUILDKIT_INLINE_CACHE=1"
-      - "--build-arg"
-      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
-      - "."
+      - "-c"
+      - |
+        CACHE_ARGS=()
+        if [ -n "$_CACHE_IMAGE" ]; then
+          CACHE_ARGS=(--cache-from "$_CACHE_IMAGE")
+        fi
+
+        # Deployment targets are always amd64 GKE nodes; the multi-arch bases
+        # otherwise resolve to the build host (#560).
+        docker build \
+          --platform linux/amd64 \
+          -t "$_PLATFORM_URI" \
+          "$${CACHE_ARGS[@]}" \
+          -f deploy/docker/Dockerfile \
+          --target platform \
+          --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          .
 
   # No --cache-from and no waitFor: this runs straight after platform on the
-  # same worker, which is the entire point of collapsing the submits.
+  # same worker, which is the entire point of collapsing the submits. What it
+  # inherits is agent-base, the ancestor the two images share -- it does not
+  # build on the platform image itself, and has not since the proxy-tools stage
+  # landed.
   - id: credential-proxy
     name: "gcr.io/cloud-builders/docker"
     env:
@@ -64,14 +95,10 @@ steps:
       - "linux/amd64"
       - "-t"
       - "$_PROXY_URI"
-      - "-t"
-      - "$_PROXY_LATEST"
       - "-f"
       - "deploy/docker/Dockerfile"
       - "--target"
       - "credential-proxy"
-      - "--build-arg"
-      - "BUILDKIT_INLINE_CACHE=1"
       - "--build-arg"
       - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
       - "."
@@ -94,11 +121,11 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
+# Presubmits push only PR-scoped immutable tags, avoiding cross-PR cache pollution
+# (gke-labs/kube-agents#635).
 images:
   - "$_PLATFORM_URI"
-  - "$_PLATFORM_LATEST"
   - "$_PROXY_URI"
-  - "$_PROXY_LATEST"
   - "$_OPERATOR_URI"
 
 # No `options.machineType` here on purpose. The operator step only genuinely
@@ -115,8 +142,8 @@ timeout: 3600s
 
 substitutions:
   _PLATFORM_URI: ""
-  _PLATFORM_LATEST: ""
   _PROXY_URI: ""
-  _PROXY_LATEST: ""
   _OPERATOR_URI: ""
+  _CACHE_IMAGE: ""
   _HERMES_AGENT_TAG: ""
+  _REQUIRE_CACHE: "false"

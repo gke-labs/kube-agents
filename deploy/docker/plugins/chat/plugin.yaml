@@ -1,0 +1,52 @@
+name: chat-platform
+label: Chat Agent
+kind: platform
+version: 1.0.0
+description: >
+  Delivery-only platform that hands a cron job's finished report to the Chat
+  Agent instead of posting it, so the finding lands in a thread that can answer
+  the follow-up. Registers no inbound adapter: the only hook it implements is
+  standalone_sender_fn, which POSTs the report to the Session KV server's
+  /v1/cron-reports route over loopback.
+
+  Hermes derives the platform name by stripping "-platform" from this manifest
+  name, so `deliver: "chat"` is what a job sets. See
+  docs/designs/cron-report-relay.md.
+author: kube-agents
+
+# Naming a variable here is not free: it is not documentation, it is a scrub
+# rule. `hermes_cli/config.py` folds every plugin-declared variable into
+# OPTIONAL_ENV_VARS under the default `category: "messaging"`, and
+# `tools/environments/local.py::_build_provider_env_blocklist` blocks that
+# bucket whole — so the name is then stripped from every child process
+# `build_subprocess_env()` spawns. The `profile-cron-tick` job is one of those
+# children, which makes anything declared here unreachable by the very cron run
+# that needs it.
+#
+# So only variables this plugin's own children must NOT inherit belong in this
+# block. The other two the relay reads are deliberately absent:
+#
+#   SESSION_KV_API_KEY    the pod's, not the plugin's — declared by
+#                         agents/platform/config.yaml and the operator's
+#                         Secret. Declaring it here blocklisted it, and the
+#                         relay then failed every delivery with "SESSION_KV_API_KEY
+#                         is unset" on an install where the pod had it all along.
+#   CRON_REPORT_RELAY_URL an operator override with a working default. Declared,
+#                         it could never reach a cron child, so setting it would
+#                         be silently ignored.
+#
+# `verify_chat_relay.py` check 0 drives the real `build_subprocess_env()` and
+# fails the image build if either name lands on the blocklist again.
+optional_env:
+  - name: CHAT_HOME_CHANNEL
+    description: >
+      Set to enable the relay in this process. profile_cron_tick.py sets it
+      explicitly on every cron child — it does not rely on inheritance, which is
+      why this one is safe to declare and why blocklisting it is a feature: the
+      gateway leaves it unset, and a stale inherited value cannot re-enable the
+      platform in a child that was not meant to have it. Keeping the gateway
+      unset is what keeps this platform out of `hermes gateway status` and stops
+      it being started as an adapter. Its value is a label only — the relay
+      route has one destination.
+    prompt: "Chat Agent relay label (leave empty to disable)"
+    password: false

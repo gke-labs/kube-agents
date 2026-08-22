@@ -28,9 +28,9 @@ gitops-repo/
   teams when forking) + the security review gate (06 §7).
 - **Version pins:** kube-agents artifacts referenced from this repo are pinned to immutable SemVer
   releases — Terraform modules via
-  `git::https://github.com/gke-labs/kube-agents.git//terraform/modules/<name>?ref=vX.Y.Z`, the Helm
-  chart via `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents --version X.Y.Z`, container
-  images via `vX.Y.Z` tags — never `:latest` or a branch ref. Canonical rules:
+  `git::https://github.com/gke-labs/kube-agents.git//terraform/modules/<name>?ref=1.2.0`, the Helm
+  chart via `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents --version 1.2.0`, container
+  images via `1.2.0` tags — never `:latest` or a branch ref. Canonical rules:
   [release versioning & promotion](../../docs/site/src/content/docs/deploy/release-versioning.md).
 
 `cluster-a/` and its `namespaces/team-x/` are illustrative scaffolding, not a live target.

@@ -16,7 +16,10 @@ Why the patch exists is documented in the module docstring of
 from __future__ import annotations
 
 import sys
+import textwrap
 from pathlib import Path
+
+import patchlib
 
 # --- claim heartbeat events ------------------------------------------------
 #
@@ -24,22 +27,25 @@ from pathlib import Path
 # is not terminal and the name now undersells it, but widening this tuple is
 # what puts the events in front of the render below; the alternative is a
 # second claim path for one kind.
+#
+# Located rather than spelled out. Upstream owns this tuple's membership and
+# adds to it — v2026.8.13 appended "review_requested" — so a literal anchor on
+# the whole line failed the build every time upstream gained a kind, which is
+# churn this patch has no opinion about. What it does have an opinion about is
+# that the tuple is still the terminal-kind filter, which is what
+# expect_contains asserts.
 
-KINDS_ANCHOR = (
-    '        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", '
-    '"timed_out", "status", "archived", "unblocked", "block_loop_detected")\n'
+KINDS_COMMENT = (
+    '# kube-agents patch: "heartbeat" is NOT terminal. It is claimed\n'
+    "# here so mid-run progress notes reach the subscriber's thread;\n"
+    "# the render below drops the noteless auto-heartbeats, and the\n"
+    "# kind is deliberately absent from _WAKE_KINDS so a progress line\n"
+    "# costs no LLM turn. See gateway/kanban_progress_lines.py.\n"
 )
 
-KINDS_PATCHED = (
-    "        # kube-agents patch: \"heartbeat\" is NOT terminal. It is claimed\n"
-    "        # here so mid-run progress notes reach the subscriber's thread;\n"
-    "        # the render below drops the noteless auto-heartbeats, and the\n"
-    "        # kind is deliberately absent from _WAKE_KINDS so a progress line\n"
-    "        # costs no LLM turn. See gateway/kanban_progress_lines.py.\n"
-    '        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", '
-    '"timed_out", "status", "archived", "unblocked", "block_loop_detected", '
-    '"heartbeat")\n'
-)
+#: Kinds the filter must still carry for it to be the one this patch means.
+#: Not the whole tuple: upstream may add to it, and this patch does not care.
+KINDS_EXPECTED = ("completed", "blocked", "gave_up", "crashed", "timed_out")
 
 # --- render a note as a chat line ------------------------------------------
 #
@@ -162,59 +168,32 @@ NOTE_PATCHED = (
     "            },\n"
 )
 
-# (relative path, [(anchor, replacement, expected occurrences)], appended text)
-PATCHES = (
-    (
-        "gateway/kanban_watchers.py",
-        (
-            (KINDS_ANCHOR, KINDS_PATCHED, 1),
-            (RENDER_ANCHOR, RENDER_PATCHED, 1),
-            (SEND_ANCHOR, SEND_PATCHED, 1),
-        ),
-        IMPORT_LINE,
-    ),
-    (
-        "tools/kanban_tools.py",
-        (
-            (SCHEMA_ANCHOR, SCHEMA_PATCHED, 1),
-            (NOTE_ANCHOR, NOTE_PATCHED, 1),
-        ),
-        "",
-    ),
-)
+PREFIX = "kanban_progress_lines"
 
 
 def apply(root: Path) -> None:
     """Apply every patch under ``root``, or raise SystemExit with the reason."""
-    for relative, edits, append in PATCHES:
-        path = root / relative
-        if not path.is_file():
-            raise SystemExit(f"kanban_progress_lines patch: {path} does not exist")
-        source = path.read_text()
-        for anchor, replacement, expected in edits:
-            found = source.count(anchor)
-            if found != expected:
-                raise SystemExit(
-                    f"kanban_progress_lines patch: {relative}: expected "
-                    f"{expected} occurrence(s) of anchor, found {found}. "
-                    f"Upstream Hermes changed — re-derive the anchor before "
-                    f"bumping the base image.\n--- anchor ---\n{anchor}"
-                )
-            source = source.replace(anchor, replacement)
-        source += append
-        try:
-            # compile(), not ast.parse(): the inserted branch ends in a `continue`,
-            # and ast.parse accepts a `continue` outside a loop — only the compile
-            # step rejects it. A misplaced insertion would otherwise reach the
-            # image and fail at import, in the gateway, at runtime.
-            compile(source, str(relative), "exec")
-        except SyntaxError as e:
-            raise SystemExit(
-                f"kanban_progress_lines patch: {relative} no longer parses "
-                f"after patching: {e}"
-            )
-        path.write_text(source)
-        print(f"kanban_progress_lines patch: {relative} ({len(edits)} anchors)")
+    watchers = patchlib.Patch(root, "gateway/kanban_watchers.py", prefix=PREFIX)
+    # The kinds edit widens a tuple in place instead of consuming an anchor, so
+    # the count check cannot tell a fresh file from one this has already run
+    # against; without this a second pass would append a second "heartbeat".
+    watchers.refuse_if_patched(KINDS_COMMENT.splitlines()[0])
+    kinds = watchers.find_assign("TERMINAL_KINDS", label="terminal-kind filter")
+    kinds.expect_contains(*KINDS_EXPECTED)
+    widened = f'{kinds.value_text} + ("heartbeat",)'
+    watchers.splice(kinds.value_start, kinds.value_end, widened)
+    watchers.insert(
+        kinds.line_start, textwrap.indent(KINDS_COMMENT, kinds.indent)
+    )
+    watchers.substitute(RENDER_ANCHOR, RENDER_PATCHED, label="heartbeat render")
+    watchers.substitute(SEND_ANCHOR, SEND_PATCHED, label="notifier send")
+    watchers.append(IMPORT_LINE)
+    watchers.commit("1 locator, 2 anchors")
+
+    tools = patchlib.Patch(root, "tools/kanban_tools.py", prefix=PREFIX)
+    tools.substitute(SCHEMA_ANCHOR, SCHEMA_PATCHED, label="heartbeat description")
+    tools.substitute(NOTE_ANCHOR, NOTE_PATCHED, label="heartbeat note description")
+    tools.commit("2 anchors")
 
 
 if __name__ == "__main__":

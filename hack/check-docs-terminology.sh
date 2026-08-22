@@ -63,6 +63,27 @@ forbid 'platform-agent-ksa' \
 forbid 'platform-agent-system' \
   "Stale namespace. The namespace is kubeagents-system."
 
+# --- GKE host-discovery label -------------------------------------------
+# Ground truth: k8s-operator/scripts/common.sh. The Terraform full-install
+# composition must mirror the stable key because it cannot source Bash.
+HOST_LABEL=$(awk -F'"' '/^KUBE_AGENTS_HOST_LABEL=/{print $2; exit}' k8s-operator/scripts/common.sh)
+if [ -z "$HOST_LABEL" ]; then
+  echo "ERROR: could not read KUBE_AGENTS_HOST_LABEL from k8s-operator/scripts/common.sh." >&2
+  exit 1
+fi
+
+WRONG_HOST_LABEL=$(search 'kube-?agents-host=true' | grep -vF "${HOST_LABEL}=true" || true)
+if [ -n "$WRONG_HOST_LABEL" ]; then
+  echo "::error::Documented host-discovery label does not match KUBE_AGENTS_HOST_LABEL=${HOST_LABEL}."
+  printf '%s\n\n' "$WRONG_HOST_LABEL" | sed 's/^/    /'
+  FAILED=1
+fi
+
+if ! grep -qE "\"${HOST_LABEL}\"[[:space:]]*=[[:space:]]*\"true\"" terraform/examples/full-install/main.tf; then
+  echo "::error::Terraform full-install composition does not apply ${HOST_LABEL}=true."
+  FAILED=1
+fi
+
 # --- Go toolchain ---------------------------------------------------------
 # Ground truth: k8s-operator/go.mod
 GO_MOD_VERSION=$(awk '/^go /{print $2; exit}' k8s-operator/go.mod)
@@ -76,6 +97,31 @@ WRONG_GO=$(search 'Go[^0-9]{0,20}1\.[0-9]+\+' | grep -vF "${GO_MINOR}+" || true)
 if [ -n "$WRONG_GO" ]; then
   echo "::error::Documented Go version does not match k8s-operator/go.mod (go ${GO_MOD_VERSION}; expected \"${GO_MINOR}+\")."
   printf '%s\n\n' "$WRONG_GO" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# --- cert-manager version -------------------------------------------------
+# Ground truth: images.json, which the mirror tooling also reads to build the release
+# URL it applies. Three pages quote the version back — two of them inside a
+# copy-pasteable `kubectl apply` URL — and there is nothing else to catch them,
+# because the pin has no other consumer to disagree with. Left unguarded, the
+# next cert-manager bump would hand readers a manifest the install does not use.
+CERT_MANAGER_VERSION=$(jq -r '.images[] | select(.name == "cert-manager-controller") | .tag' images.json)
+if [ -z "$CERT_MANAGER_VERSION" ] || [ "$CERT_MANAGER_VERSION" = "null" ]; then
+  echo "ERROR: no cert-manager-controller pin in images.json; the version guard cannot run." >&2
+  exit 1
+fi
+
+# `v1.13.0+` is a floor — the oldest release the operator's webhook works
+# against — not a claim about what provisioning installs, so the trailing `+`
+# form is exempt. A line carrying both a floor and a pin is exempted too; that
+# has not happened, and the alternative is a regex nobody can maintain.
+WRONG_CERT_MANAGER=$(search 'cert-manager[^.]{0,40}v[0-9]+\.[0-9]+\.[0-9]+([^+]|$)' \
+  | grep -Ev 'v[0-9]+\.[0-9]+\.[0-9]+\+' \
+  | grep -vF "$CERT_MANAGER_VERSION" || true)
+if [ -n "$WRONG_CERT_MANAGER" ]; then
+  echo "::error::Documented cert-manager version does not match images.json (${CERT_MANAGER_VERSION})."
+  printf '%s\n\n' "$WRONG_CERT_MANAGER" | sed 's/^/    /'
   FAILED=1
 fi
 

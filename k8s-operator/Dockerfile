@@ -1,5 +1,14 @@
+# Base images are build args so this can be rebuilt where the public
+# registries are unreachable; see deploy/docker/Dockerfile for why each takes
+# a full reference rather than a shared prefix. Defaults are upstream, so an
+# ordinary build is unchanged.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.26-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
 # Build stage
-FROM golang:1.26-alpine AS builder
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -26,7 +35,7 @@ RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "${TARGETPLATFORM}/${PREBUILT_BINARY}" 
     fi
 
 # Runtime stage - use distroless for minimal attack surface
-FROM gcr.io/distroless/static:nonroot
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
 
 WORKDIR /
 

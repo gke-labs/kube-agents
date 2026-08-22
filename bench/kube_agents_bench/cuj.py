@@ -173,7 +173,8 @@ class PortalTransport:
             raise ValueError("portal endpoint must be an absolute HTTP(S) URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("portal endpoint cannot contain credentials, query, or fragment")
-        if token and parsed.scheme != "https":
+        loopback = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+        if token and parsed.scheme != "https" and not loopback:
             raise ValueError("credentialed portal endpoints must use HTTPS")
         self.endpoint = endpoint
         self.timeout = timeout

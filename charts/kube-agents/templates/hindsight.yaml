@@ -1,0 +1,336 @@
+{{- /*
+The Hindsight memory store, mirroring k8s-operator/config/integrations/hindsight:
+the API Deployment the agents call for long-term memory, the Postgres/pgvector
+StatefulSet behind it, the NetworkPolicy that stands in for the database's
+missing password, and the PodMonitoring that watches recall latency.
+
+Renders when kube-agents.hindsightEnabled says so: hindsight.enabled = true or
+false is an answer, and null (the default) follows
+platformAgent.harness.memory.provider — the hindsight-backed providers
+(kube_agents_memory, hindsight) get the store, everything else gets nothing.
+*/}}
+{{- if include "kube-agents.hindsightEnabled" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hindsight
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    {{- include "kube-agents.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hindsight-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8888
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hindsight-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # 15 minutes, above the default 600s: a cold roll pulls 1.4 GB before the
+  # container starts and only then spends the startupProbe budget loading
+  # models. k8s-operator/config/integrations/hindsight/api.yaml carries the
+  # canonical account of these timings.
+  progressDeadlineSeconds: 900
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hindsight
+        app.kubernetes.io/component: api
+        {{- include "kube-agents.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: hindsight
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: api
+          image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.api.image.repository "tag" .Values.hindsight.api.image.tag "root" .) }}
+          imagePullPolicy: {{ .Values.hindsight.api.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8888
+              protocol: TCP
+          env:
+            - name: HINDSIGHT_API_PORT
+              value: "8888"
+            # The embedding and reranking models are baked into the image, so
+            # the pod needs no Hugging Face egress. Both flags must stay set:
+            # without them the libraries reach out on every cold start and hang
+            # where there is no route out of the cluster.
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            # Extraction and consolidation run through the same LiteLLM gateway
+            # the agents use, so model routing and cost attribution stay in one
+            # place. Short name, not an FQDN: it resolves to LiteLLM in the
+            # release namespace.
+            - name: HINDSIGHT_API_LLM_BASE_URL
+              value: http://litellm/v1
+            - name: HINDSIGHT_API_LLM_MODEL
+              value: model-default
+            # LiteLLM runs with no master key; the client library insists on a
+            # non-empty value, so this is a placeholder rather than a credential.
+            - name: HINDSIGHT_API_LLM_API_KEY
+              value: none
+            # Passwordless by design; see POSTGRES_HOST_AUTH_METHOD below.
+            # Nothing here is a secret, so nothing here needs a Secret.
+            - name: HINDSIGHT_API_DATABASE_URL
+              value: postgresql://hindsight@hindsight-postgresql:5432/hindsight
+            # Length-sorted bucket batching roughly halves recall latency on the
+            # cross-encoder reranker; see docs/designs/memory.md, "What a recall
+            # costs". Grouping only — same units, same scores.
+            - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
+              value: "true"
+          # Recall is CPU-bound on the in-process reranker. Do not raise these
+          # expecting a speedup — that experiment has been run (2/4 vs 500m/2
+          # left latency unchanged on e2-standard-4: hyperthreads share the
+          # vector units this saturates). The request also cannot match the
+          # limit: system daemonsets hold ~1250m of a node's 3920m allocatable,
+          # so a 4-CPU request would leave the pod Pending forever.
+          resources:
+            {{- toYaml .Values.hindsight.api.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          # Model loading dominates cold start, so startup gets its own probe
+          # (5s × 60 = 5 minutes of budget) and liveness/readiness stay tight
+          # with no initialDelaySeconds — neither runs until the startupProbe
+          # first succeeds. The kustomize copy's api.yaml comment is the
+          # canonical account of these timings.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hindsight-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+  ports:
+    - name: postgresql
+      protocol: TCP
+      port: 5432
+      targetPort: postgresql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hindsight-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  serviceName: hindsight-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: postgresql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hindsight
+        app.kubernetes.io/component: postgresql
+        {{- include "kube-agents.labels" . | nindent 8 }}
+    spec:
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: postgresql
+          # pgvector supplies the vector extension Hindsight's embeddings need.
+          # Pinned by digest in values (from images.json): upstream publishes
+          # only a floating `latest`, so without the pin a pod reschedule can
+          # silently change the database engine. A mirrored install pulls the
+          # copy by tag, because that is what `make mirror-images` pushes.
+          image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.postgresql.image.repository "tag" .Values.hindsight.postgresql.image.tag "name" "hindsight-postgresql" "root" .) }}
+          imagePullPolicy: {{ .Values.hindsight.postgresql.image.pullPolicy }}
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              value: hindsight
+            - name: POSTGRES_DB
+              value: hindsight
+            # A subdirectory, not the mount root: the RWO volume arrives with a
+            # lost+found entry and initdb refuses a non-empty data directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # No password. The database is reachable only from the Hindsight
+            # API pod (see the NetworkPolicy below) and holds nothing that is
+            # not already in the agent's context, so a credential here would
+            # buy nothing and cost an install step. Read by initdb ONCE: an
+            # existing volume keeps whatever auth method it was created with.
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: trust
+          # Readiness only, deliberately: the Service above publishes this pod's
+          # address the moment the container starts, and initdb takes several
+          # seconds on a fresh volume, so the Hindsight API otherwise races the
+          # database on first install. A *liveness* probe on Postgres is the
+          # opposite of helpful — a busy database that misses a check gets
+          # restarted mid-transaction.
+          #
+          # -h 127.0.0.1 is what makes this probe close that race rather than
+          # look like it does. The postgres entrypoint runs a *temporary* server
+          # while it applies extensions and init scripts, and that server sets
+          # listen_addresses='' — it answers on the Unix socket only. A bare
+          # pg_isready connects over that socket and so reports ready during
+          # initialisation, minutes before the real server accepts a TCP
+          # connection; measured on this image, the socket says ready for the
+          # entire time the init scripts run while 127.0.0.1 is still refused.
+          # The API connects over TCP, so TCP is what has to be probed.
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - 127.0.0.1
+                - -U
+                - hindsight
+                - -d
+                - hindsight
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.hindsight.postgresql.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: {{ .Values.hindsight.postgresql.storage }}
+{{- if .Values.hindsight.networkPolicy }}
+---
+# The database takes no password, so this is what keeps it private: only the
+# Hindsight API pod may open a connection to it. Ingress only — Postgres makes
+# no outbound calls, and restricting egress it does not use would buy nothing
+# while adding DNS rules to keep correct. On clusters without network policy
+# enforcement the object applies cleanly and does nothing, which is why the
+# database is also on a ClusterIP Service with no external route.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hindsight-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: postgresql
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: postgresql
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hindsight
+              app.kubernetes.io/component: api
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}
+{{- if .Values.hindsight.podMonitoring }}
+---
+# Scraped by GKE Managed Prometheus, the same way the LiteLLM gateway is. The
+# API serves Prometheus text on its ordinary HTTP port, so the selector pins
+# the api component — the Postgres image ships no exporter and would be
+# scraped for 404s if it matched too. The metric worth watching is
+# hindsight_operation_duration_seconds (see docs/designs/memory.md).
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: hindsight-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+{{- end }}
+{{- end }}
