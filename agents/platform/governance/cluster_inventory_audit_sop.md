@@ -42,10 +42,10 @@ Read `USER.md` in your own profile home — the absolute path is in the `Active 
 of your system prompt, as `<profile home>/USER.md`. It names the project, cluster, and location you
 are pinned to.
 
-**Do not derive your cluster from the environment.** `GKE_CLUSTER_NAME`, `GKE_LOCATION`, and
-`GCP_PROJECT_ID` are set by the pod and name the management cluster the harness itself runs on, not
-yours. An agent that trusts them audits the wrong cluster and reports the result as if it were
-right.
+**Do not derive your cluster from the environment.** `GKE_CLUSTER_NAME`, `GKE_LOCATION`,
+`GKE_PROJECT_ID`, and `GCP_PROJECT_ID` are all set by the pod and name the management cluster the
+harness itself runs on, not yours. An agent that trusts them audits the wrong cluster and reports
+the result as if it were right.
 
 If `USER.md` is missing, incomplete, or does not parse, complete the card with that as the finding
 and audit nothing. Guessing your own identity from a profile name or a cluster list is how a report

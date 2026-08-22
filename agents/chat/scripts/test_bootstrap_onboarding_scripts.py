@@ -522,9 +522,22 @@ class ScanGateTest(unittest.TestCase):
         shell calls against arm 1a's 65.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn("Do not create, repair, or delete a profile yourself", body)
-        self.assertIn("an empty roster is a supported state", body)
-        self.assertIn("Do not run it yourself", body)
+        self.assertIn("do not repair or delete a profile", body)
+        self.assertIn("may immediately prune", body)
+        self.assertIn("not yours to fix", body)
+
+    def test_the_body_does_not_promise_the_roster_was_reconciled(self):
+        # The gate files the card on the give-up path too, after MAX_RECONCILE_ATTEMPTS
+        # failures over RECONCILE_GIVE_UP_SECONDS. A body asserting the roster is current
+        # is false there, and it tells the worker to trust a roster that may be empty —
+        # then `.bootstrap_scan_filed` makes the thin report permanent.
+        body = bootstrap_scan_gate._task_body()
+        self.assertNotIn("already reconciled", body)
+        self.assertNotIn("exited 0", body)
+        self.assertIn("may be empty or incomplete", body)
+        # The degradation has to reach the user: the report is delivered verbatim.
+        self.assertIn("names each one as lacking an agent", body)
+        self.assertIn("file it anyway", body)
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
         # A single-cluster install reconciles to an empty roster, and that is the

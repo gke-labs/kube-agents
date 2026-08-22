@@ -86,11 +86,18 @@ both directions:
   carry a profile even though that cluster exists. This closes the loop when a cluster is deleted
   out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
 
-A create that fails is recorded, not just logged: the cluster goes into a `create_failed` bucket,
-the chat summary names it, and under `--require-create-pass` the run exits non-zero even though the
-CREATE direction itself ran. That flag's caller (the bootstrap scan gate) gates a one-shot fleet
-sweep on the exit code, and a roster carrying a half-built profile is worse for it than a roster
-missing one.
+A create that fails is recorded rather than only logged: the cluster goes into a `create_failed`
+bucket. Both places that bucket surfaces are narrower than it looks. The chat summary names the
+failures only on a run that also created or pruned something — a run whose sole outcome is a failed
+create posts nothing, because a permanent cause repeats every minute while the bootstrap gate is
+ticking. A failed create is only one of the things `--require-create-pass` reports. Under that flag the run
+exits `3` when the CREATE direction never ran (the project would not resolve, or listing the
+clusters failed), when `reconcile()` raised, or when it ran and every create failed with no fully
+scaffolded profile already on the roster — and `4` when another reconcile holds the lock. One
+failure alongside a success exits 0 and costs the sweep one `gaps` row. Without the flag every one
+of those exits 0, because a cron producer must. That flag's caller is the bootstrap scan gate,
+which gates a one-shot fleet sweep on the exit code, so a non-zero exit means "the roster is not
+worth fanning out against yet", not specifically "a create failed".
 
 A profile whose `cluster_identity` is stamped but whose `kubeconfig.yaml` or `USER.md` is missing is
 treated as absent and recreated. Profile creation stamps the identity before it writes either file,
