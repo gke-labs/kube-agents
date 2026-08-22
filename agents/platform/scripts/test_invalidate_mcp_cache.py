@@ -76,11 +76,12 @@ class InvalidateMcpCacheTest(unittest.TestCase):
         non_existent = Path("/tmp/non_existent_cache_dir_12345/mcp_schema_cache.json")
         self.assertEqual([], invalidate_cache_file(non_existent))
 
-    def test_invalidate_cache_file_corrupted_json(self):
+    def test_invalidate_cache_file_corrupted_json_raises(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_file = Path(tmpdir) / "mcp_schema_cache.json"
             cache_file.write_text("invalid-json{", encoding="utf-8")
-            self.assertEqual([], invalidate_cache_file(cache_file))
+            with self.assertRaises(json.JSONDecodeError):
+                invalidate_cache_file(cache_file)
 
     def test_invalidate_all_mcp_caches_scans_root_and_profiles(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -62,12 +62,9 @@ def invalidate_cache_file(cache_file: Path, mcp_configs: dict[str, dict] | None 
     """Remove local MCP server entries from a single mcp_schema_cache.json file."""
     if not cache_file.is_file():
         return []
-    try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return []
-    except Exception:
+    with open(cache_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
         return []
 
     removed: list[str] = []
@@ -78,13 +75,14 @@ def invalidate_cache_file(cache_file: Path, mcp_configs: dict[str, dict] | None 
             removed.append(server_name)
 
     if removed:
+        tmp_file = cache_file.with_suffix(".tmp")
         try:
-            tmp_file = cache_file.with_suffix(".tmp")
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_file, cache_file)
-        except Exception:
-            pass
+        finally:
+            if tmp_file.exists():
+                tmp_file.unlink(missing_ok=True)
     return removed
 
 
