@@ -164,21 +164,22 @@ The first is about the caller and the rest are about the chain, which is why an 
 only the chain ones. See "The subject prefix does not prove entitlement" below.
 
 ```
-   gateway   writes  cap.root.req-8f2a      = {tier: operator, scope: project-P,
+   gateway   writes  cap.root.req-8f2a      = {tier: platform, scope: project-P,
                                                delegate: fleet-recon}
                      └─ the write returns revision 412
                      └─ message carries "req-8f2a @412"
 
    hop A     asks the verifier to resolve it, and is authenticated as fleet-recon --
              the delegate the entry names, so it resolves and fleet-recon may descend
-             writes  cap.hop.fleet-recon.1  = {..., scope: cluster-C,
+             writes  cap.hop.fleet-recon.1  = {tier: cluster-admin, scope: cluster-C,
                                                delegate: platform-a}
                                               parent: cap.root.req-8f2a @412
                      └─ message carries "cap.hop.fleet-recon.1 @418"
 
    hop B     resolves that as platform-a: chain narrows, and platform-a is the delegate
              the entry names.  fleet-recon asking for the same id would be refused
-             writes  cap.hop.platform-a.7   = {tier: reader, scope: cluster-C, ...}
+             writes  cap.hop.platform-a.7   = {tier: developer-team,
+                                               scope: cluster-C/ns-web, ...}
                      └─ and so on
 ```
 
@@ -296,8 +297,8 @@ Both delegate rules are only as sharp as the identity they compare against, and 
 sharp enough. [02](02-agent-personas.md) fixes cardinality at one Cluster Admin Agent per cluster
 and one Developer Team Agent per namespace, so a single agent id is the named delegate of every
 request routed through it, for every human, at the same time. Check the rules against that and they
-stop separating anything. A broker serving a reader-tier request presents the id of a concurrent
-operator-tier one, is the named delegate of that entry too, and passes every check holding a
+stop separating anything. A broker serving a developer-team-tier request presents the id of a
+concurrent platform-tier one, is the named delegate of that entry too, and passes every check holding a
 capability minted for someone else. No forged write and no second compromise -- and a concurrency
 bug in an honest broker reaches the same place as a malicious one, which is the part that should
 worry you.
@@ -344,25 +345,39 @@ chain terminates at a root the gateway minted from the requester's own authority
 > "narrowed less than intended", never "escalated past the human who asked."
 
 That is the sentence to have ready when someone probes the design, and it is worth knowing exactly
-what carries it: the two delegate rules above, a request-scoped caller identity, and nothing else.
-The write half stops a hop descending from an origin it was never handed. The read half stops it
-presenting that origin directly. The identity is what makes "it" mean this request rather than this
-agent -- drop that and the last five words of the claim go with it. It holds under imperfect
+what carries it: the two delegate rules above, a per-request principal both of them can name, and
+nothing else. The write half stops a hop descending from an origin it was never handed. The read
+half stops it presenting that origin directly. The principal is what makes "it" mean this request
+rather than this agent, and neither half has one today -- see §5, and read the last five words of
+the claim as the target. It holds under imperfect
 implementation, which is the only kind there is, but it does not hold under a missing rule.
 
 **One of the three is not carried yet, and the claim is ahead of the mechanism until it is.** The
 read side can be request-scoped because the verifier authenticates a live caller. The write side is
 proved by the subject prefix, which is per agent, so an agent that is concurrently the delegate of
 two roots can still write a child descending from the wider one while serving the narrower one's
-request. Closing it needs a per-request identity on the bus itself and not only at the verifier, so
-that the publish namespace is per request and the prefix proves both. That is a change to the
-mechanism rather than to this paragraph, and it does not drop straight in: the parent writes the
-child entry before the downstream hop's credential exists, so it would be naming a subject nobody
-has issued yet.
+request.
 
-Treat the claim above as the target rather than as the current state. This question is going to the
-downscoping design discussion together with the three below, since all four turn on what "the
-request it is serving" means to a mechanism that cannot observe a request.
+**Neither side is carried, and an earlier version of this paragraph claimed the read side was.** It
+is not, and for the same reason. The read check compares the caller against the entry's `delegate`
+field, and that field holds an agent id written by the parent -- so making the caller's credential
+per-request changes one side of a comparison whose other side is still per-agent. Compare at agent
+granularity and the concurrent-capability escalation survives untouched, because the wider entry
+really does name that agent and the caller really is it. Demand exact equality and no legitimate
+resolution matches at all. A per-request caller identity on its own buys nothing.
+
+**What both sides actually need is a principal whose name the parent can predict.** The obstacle
+this paragraph used to give -- that the parent writes the entry before the downstream hop's
+credential exists -- is not the real one, and it applies equally to `delegate`, which the same
+parent writes at the same moment. The credential does not have to exist for the parent to name it;
+the _name_ has to be derivable. It is, if the principal is the pair of an agent and the request id,
+because the parent allocates the request id it is dispatching. Whether that is the right shape, and
+what issues such a principal, is the design question rather than this document's to settle.
+
+Treat the claim above as the target rather than as the current state, and as missing two of its
+three supports rather than one. This is going to the downscoping design discussion together with
+the three below, since all four turn on what "the request it is serving" means to a mechanism that
+cannot observe a request.
 
 **Chain depth is a refusal, not just a cost.** Resolution walks to the root, so a long chain is a
 lot of KV reads. Those are now the verifier's reads rather than every broker's, so caching them is
@@ -483,8 +498,8 @@ layer down.
   handed to the API server is a separate mechanism (a per-cluster ServiceAccount token, §1).
 - **Not a defence against a compromised gateway.** The gateway is the root of trust for the whole
   chain; if it lies about who asked, everything below inherits the lie.
-- **Not per-user granularity.** Capabilities carry tiers, so this is as fine-grained as the tier map
-  and no finer.
+- **Not per-user granularity.** Capabilities carry the same `tier` the `Agent` CR does
+  ([02](02-agent-personas.md) §6.1), so this is as fine-grained as that field and no finer.
 
 ## 9. Verification
 
