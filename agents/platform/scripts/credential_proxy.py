@@ -637,6 +637,57 @@ _FREE_TEXT_FLAGS = frozenset(
 )
 
 
+# The single-dash shorthands a shipped rule keys on. Only these need a dash
+# kept when they are buried in a cluster, so this is the whole table rather
+# than pflag's arity for four upstream CLIs.
+#
+# It is a copy of something that lives in the operator, so it is pinned:
+# `test_every_shorthand_a_rule_keys_on_is_covered` reads the shipped policy and
+# fails if a rule keys on a shorthand missing here. Add the rule, run the
+# tests, and that test tells you to come back.
+_KEYED_SHORTHANDS = frozenset({"-X", "-f", "-F", "-t", "-a"})
+
+
+def _cluster_readings(token: str) -> list[str]:
+    """The keyed shorthands buried inside a single-dash cluster, re-dashed.
+
+    pflag accepts a boolean shorthand and a value-taking one in the same token:
+    `gh api -iX PUT` is `--include --method PUT`, because `parseSingleShortArg`
+    consumes `-i`, sets the remainder as the shorts still to read, and re-enters
+    the loop. The splitter above only ever takes the *first* shorthand off, so
+    that argv reaches the rules as `-i X ...` -- with the `-X` that
+    `github.api-mutation` matches on reduced to a bare letter. The merge went
+    through. `gh auth status -at` is the same shape against
+    `github.token-disclosure`, and that one returns the installation token to
+    the agent.
+
+    So each subsequent letter that a rule keys on is re-emitted with its dash,
+    followed by whatever is left of the token, which is where pflag would take
+    that shorthand's value from.
+
+    The walk stops at the first non-letter, because a cluster of shorthands is
+    letters by definition and everything from a non-letter on is somebody's
+    value: without that, `-nkube-system` would emit a `-t` off `system` and a
+    `gh auth status` somewhere in the same command would be refused for it.
+    """
+    readings: list[str] = []
+    letters = token[1:]
+    for position, letter in enumerate(letters[1:], start=1):
+        if not letter.isalpha():
+            break
+        flag = f"-{letter}"
+        if flag in _FREE_TEXT_FLAGS:
+            # Prose from here on, dropped as the detached spelling drops it.
+            readings.append(flag)
+            break
+        if flag in _KEYED_SHORTHANDS:
+            readings.append(flag)
+            remainder = letters[position + 1 :].lstrip("=")
+            if remainder:
+                readings.append(remainder)
+    return readings
+
+
 def policy_match_text(argv: list[str]) -> str:
     """The command as the policy rules should read it.
 
@@ -657,11 +708,15 @@ def policy_match_text(argv: list[str]) -> str:
     spellings. `-fmerge_method=squash` becomes `-f merge_method=squash` for the
     same reason.
 
-    Splitting is deliberately unconditional for single-dash tokens rather than
+    Splitting the first shorthand off is deliberately unconditional rather than
     gated on a table of value-taking shorthands: emitting `-A w` for the
     boolean cluster `-Aw` costs nothing, since no rule keys on a bare letter,
     and a table would be one more thing to keep in step with four upstream
     CLIs.
+
+    That reasoning holds for a cluster of booleans and fails for a cluster
+    whose *later* member is the one a rule keys on, which is why
+    `_KEYED_SHORTHANDS` exists -- see `_cluster_readings`.
     """
     tokens: list[str] = []
     skip_next = False
@@ -704,6 +759,7 @@ def policy_match_text(argv: list[str]) -> str:
                 tokens.append(token[:2])
                 continue
             tokens.extend([token[:2], token[2:].lstrip("=")])
+            tokens.extend(_cluster_readings(token))
             continue
         tokens.append(token)
     return shlex.join(tokens)

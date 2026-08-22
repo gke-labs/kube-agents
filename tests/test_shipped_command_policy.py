@@ -373,6 +373,104 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
                     rule, f"{argv} slipped past: a flag value swallowed --approve")
                 self.assertEqual("github.assent", rule.rule_id)
 
+    def test_a_cluster_cannot_bury_the_flag_the_rule_keys_on(self):
+        """pflag reads a boolean shorthand and a value-taking one in one token.
+
+        `parseSingleShortArg` consumes the boolean, sets the remainder as the
+        shorts still to read, and re-enters the loop -- so `gh api -iX PUT` is
+        `--include --method PUT` and performs the merge. Splitting only the
+        first shorthand off left the `-X` the rule matches on as a bare `X`,
+        and both commands this file exists to refuse went through. Verified
+        against real `gh`: `gh api -iX GET repos/cli/cli` returns headers and a
+        200, so the cluster parses exactly this way.
+        """
+        for argv, expected, desc in (
+            (["gh", "api", "-iX", "PUT", "repos/o/r/pulls/1/merge"],
+             "github.api-mutation", "boolean then detached method"),
+            (["gh", "api", "-iXPUT", "repos/o/r/pulls/1/merge"],
+             "github.api-mutation", "boolean then attached method"),
+            (["gh", "api", "-if", "merge_method=squash",
+              "repos/o/r/pulls/1/merge"],
+             "github.api-mutation", "boolean then field flag"),
+            (["gh", "api", "-viXPUT", "repos/o/r/pulls/1/merge"],
+             "github.api-mutation", "two booleans then method"),
+            (["gh", "auth", "status", "-at"],
+             "github.token-disclosure", "--active then --show-token"),
+            (["gh", "auth", "status", "-ta"],
+             "github.token-disclosure", "the ordering that already worked"),
+        ):
+            with self.subTest(desc=desc):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule, f"{desc} slipped past: {argv}")
+                self.assertEqual(expected, rule.rule_id, desc)
+
+    def test_every_shorthand_a_rule_keys_on_is_covered(self):
+        """`_KEYED_SHORTHANDS` is a copy of something the operator owns.
+
+        The broker cannot read the rules to learn which shorthands matter, so
+        the table is written out by hand -- and a rule added later that keys on
+        a shorthand missing from it is the same escape again, silently. This
+        reads the shipped patterns and fails here instead.
+        """
+        from credential_proxy import _FREE_TEXT_FLAGS, _KEYED_SHORTHANDS
+
+        keyed = set()
+        for rule in shipped_policy_document()["rules"]:
+            for match in re.finditer(r"(?<![-\w])-([A-Za-z])(?![\w-])", rule["pattern"]):
+                keyed.add(f"-{match.group(1)}")
+        self.assertTrue(keyed, "no shorthand found in the shipped rules at all")
+
+        # A free-text shorthand is re-emitted by the walk's own break branch,
+        # so it is covered without being in the table.
+        missing = sorted(keyed - set(_KEYED_SHORTHANDS) - set(_FREE_TEXT_FLAGS))
+        self.assertEqual(
+            [],
+            missing,
+            "a shipped rule keys on these shorthands and a cluster can still "
+            f"bury them: {', '.join(missing)}",
+        )
+
+    def test_a_cluster_does_not_invent_a_flag_out_of_a_value(self):
+        """The re-dashing walk must stop where the value starts.
+
+        A cluster of shorthands is letters by definition. Without stopping at
+        the first non-letter, `-nkube-system` yields a `-t` off `system`, and
+        anything holding `gh auth status` in the same command is refused for a
+        namespace.
+        """
+        for argv, desc in (
+            (["kubectl", "get", "pods", "-nkube-system"], "namespace shorthand"),
+            (["kubectl", "get", "pods", "-oyaml"], "output shorthand"),
+            (["kubectl", "logs", "-fdeploy/gateway"], "follow then a value"),
+            (["gh", "pr", "create", "-bPlease merge this PR"], "attached prose"),
+            (["gh", "api", "repos/o/r/pulls/1/comments"], "an ordinary read"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertAllowed(argv)
+
+    def test_the_clusters_the_product_actually_runs_are_permitted(self):
+        """Every clustered shorthand in executable product code, verbatim.
+
+        Enumerated across `agents/`, `agentplugins/` and `scripts/` rather than
+        guessed at: these two are the whole set, and both put a letter a rule
+        keys on inside a cluster -- `-fdq` carries `-f`, `-it` carries `-t`.
+        A re-dashing walk that did not stop where the value starts would refuse
+        the agent's own workspace reset.
+        """
+        for argv, site in (
+            (["git", "clean", "-fdq"],
+             "gitops_workspace.py:548"),
+            (["kubectl", "exec", "-it", "gateway", "-n", "kubeagents-system",
+              "--", "/bin/sh"],
+             "gke-basics/references/cli-reference.md:258"),
+            (["gh", "issue", "comment", "7", "-R", "o/r", "-F", "/tmp/report.md"],
+             "audit_report.py:4403"),
+            (["gh", "pr", "comment", "7", "-R", "o/r", "-F", "/tmp/report.md"],
+             "audit_report.py:4420"),
+        ):
+            with self.subTest(site=site):
+                self.assertAllowed(argv)
+
     def test_prose_is_still_dropped_when_it_is_ordinary_text(self):
         """The guard above must not undo the prose fix it sits inside."""
         body = ("Drift detected.\n\nPlease review the code diffs and merge this "

@@ -240,8 +240,8 @@ Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
 
 The current deny policy applies regular expressions to a normalised rendering of
-the argument vector and permits flags before or between subcommands. Two
-normalisations, and both matter for predicting what a rule will match:
+the argument vector and permits flags before or between subcommands. Three
+normalisations, and all of them matter for predicting what a rule will match:
 
 - **Free-text flag values are dropped**, so prose the agent wrote is not searched
   as though it were a command path. Without this a pull request body containing
@@ -251,6 +251,13 @@ normalisations, and both matter for predicting what a rule will match:
   kubectl and gcloud are all Cobra/pflag, which accepts a shorthand's value with
   no separator, and a rule written for the separated spelling would otherwise
   miss it.
+- **A shorthand buried in a cluster keeps its dash**, so `-iX PUT` reads as
+  `-i -X PUT`. pflag also accepts a boolean shorthand and a value-taking one in
+  the same token, and splitting only the first one off left the `-X` a rule
+  matches on as a bare letter — enough for `gh api -iX PUT …/merge` and
+  `gh auth status -at` to get through. Only the shorthands a shipped rule keys
+  on are re-dashed, and the walk stops at the first non-letter, since
+  everything from there is somebody's value rather than another flag.
 
 A value that looks like a flag is never dropped: the free-text set is applied
 without knowing the subcommand, and a name on it is not always value-taking.
