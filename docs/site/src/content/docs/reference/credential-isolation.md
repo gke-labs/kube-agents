@@ -11,7 +11,9 @@ This page summarizes the architecture. The canonical design — including scope,
 
 ## Pod anatomy
 
-Each PlatformAgent runs as one long-lived Pod with these managed containers:
+Each PlatformAgent runs as one long-lived Pod with these managed containers. The credential proxy
+is a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`, needing Kubernetes
+1.29+ — so it starts before the others and does not appear in `spec.containers`:
 
 | Container                  | Trust level | Role                                                                                                                                                |
 | -------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -117,7 +119,7 @@ kubectl run wi-check -n kubeagents-system --rm -it --restart=Never \
   -- gcloud auth print-access-token
 ```
 
-**The sidecar exits during startup.** The credential runtime runs `CREDENTIAL_PROXY_BOOTSTRAP_COMMAND` before it begins serving, and a non-zero exit stops the container — the Pod then crashloops while the other containers stay healthy. The command's stdout and stderr are written to the sidecar's log, so `kubectl logs -c envoy-credential-proxy` carries the reason. Bootstrap failures usually mean the Pod cannot reach the cluster or mint a token; see [Security & IAM](/kube-agents/reference/security-and-iam/) for the Workload Identity binding it depends on.
+**The sidecar exits during startup.** The credential runtime runs `CREDENTIAL_PROXY_BOOTSTRAP_COMMAND` before it begins serving, and a non-zero exit stops the container — and because the proxy is a native sidecar the app containers never start at all, so the Pod sits in `Init:CrashLoopBackOff` rather than running with one container unhealthy. The command's stdout and stderr are written to the sidecar's log, so `kubectl logs -c envoy-credential-proxy` carries the reason. Bootstrap failures usually mean the Pod cannot reach the cluster or mint a token; see [Security & IAM](/kube-agents/reference/security-and-iam/) for the Workload Identity binding it depends on.
 
 ## Where to go next
 

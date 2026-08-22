@@ -3391,3 +3391,57 @@ func TestClearForeignPDBBudgetField_LeavesAgreeingBudgetAlone(t *testing.T) {
 		t.Fatalf("expected NotFound to be tolerated, got %v", err)
 	}
 }
+
+// TestABrokenNativeSidecarIsReportedDegraded guards the status path against the
+// container-list split the native sidecar introduced.
+//
+// The credential proxy is an init container now, so it reports into
+// InitContainerStatuses. When it cannot start, the kubelet never creates the app
+// containers at all and ContainerStatuses is empty -- so a status check that reads
+// only the app list finds nothing wrong, PodScheduled is True, and the CR sits in
+// Provisioning saying it is waiting for replicas while the pod is in
+// Init:CrashLoopBackOff. That is the pod's worst failure reported as silence, and
+// it is the failure this whole change makes more likely to matter, since a proxy
+// that will not start now blocks the entire pod rather than one container.
+func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			// Exactly the shape the kubelet produces: the sidecar is stuck and no
+			// app container was ever created.
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "envoy-credential-proxy",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+			ContainerStatuses: nil,
+			Conditions:        []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded -- a pod stuck in Init reports as healthy", phase)
+	}
+	if reason != "ImagePullBackOff" {
+		t.Errorf("reason = %q, want ImagePullBackOff", reason)
+	}
+	if !strings.Contains(message, "envoy-credential-proxy") {
+		t.Errorf("message does not name the failing container: %q", message)
+	}
+}

@@ -1103,7 +1103,19 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 
 	for _, pod := range podList.Items {
 		// 1. Check container waiting states (CrashLoopBackOff, ImagePullBackOff, ErrImagePull, etc.)
-		for _, cs := range pod.Status.ContainerStatuses {
+		//
+		// Init statuses first, and they are not optional. The credential proxy is a
+		// native sidecar, so it reports into InitContainerStatuses -- and when it
+		// cannot start, the kubelet never creates the app containers, so
+		// ContainerStatuses is empty. Reading only that list turns the pod's worst
+		// failure into silence: no waiting container is found, PodScheduled is True,
+		// and the CR sits in Provisioning with "waiting for replicas" while the pod
+		// is in Init:CrashLoopBackOff. Degraded with the real reason is the point of
+		// this function.
+		initThenApp := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+		initThenApp = append(initThenApp, pod.Status.InitContainerStatuses...)
+		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
+		for _, cs := range initThenApp {
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" && cs.State.Waiting.Reason != "ContainerCreating" {
 				phase = "Degraded"
 				reason = cs.State.Waiting.Reason

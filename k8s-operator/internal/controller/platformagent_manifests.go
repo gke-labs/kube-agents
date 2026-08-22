@@ -1876,15 +1876,27 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// EADDRINUSE into CrashLoopBackOff, leaving the agent holding the port the
 	// Service routes to. Reproduced on a live cluster on 10 August.
 	//
-	// A native sidecar starts before any app container and the kubelet does not
-	// start app containers until it reports ready. So the proxy holds 8643
-	// before the sandbox process exists, and the race has no start line.
+	// A native sidecar starts before any app container, so the proxy is running
+	// before the sandbox process exists and the race stops being one the agent
+	// can win by starting first.
+	//
+	// Note what the kubelet actually waits for: the sidecar having STARTED, plus
+	// its startupProbe if it declares one. This container declares only a
+	// readinessProbe, which gates pod readiness and gates nothing about app
+	// container startup -- so the guarantee is ordering of process creation, not
+	// "Envoy has bound 8643". That is a much smaller window than two containers
+	// racing from the same instant, and it is not zero. Give this container a
+	// startupProbe on 8643 if the remaining window ever matters.
 	//
 	// This is also the ordering the pod needs for its own sake: every credentialed
 	// call the agent makes goes through this proxy, so an agent that starts first
 	// is an agent whose early tool calls fail.
 	//
-	// Requires Kubernetes 1.29+ for SidecarContainers to be GA.
+	// Requires Kubernetes 1.29+. SidecarContainers is beta and on by default there;
+	// it went GA in 1.33 and was alpha (off) in 1.28. 1.29 is the floor because that
+	// is where restartPolicy on an init container starts being honoured without a
+	// feature gate -- on 1.28 the API server drops the field and the pod hangs in
+	// Init forever. charts/kube-agents/Chart.yaml pins the same floor.
 	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
 
 	defaultAnnotations := map[string]string{
@@ -2179,16 +2191,14 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return true
 }
 
-// buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
-// Its environment and volume mounts are intentionally disjoint from the agent
-// container even though both containers share a Pod network namespace.
 // asNativeSidecar converts a container into a Kubernetes native sidecar: an init
 // container that never exits and that the kubelet keeps running for the life of
 // the pod.
 //
 // The distinction that matters here is ordering. App containers do not start
-// until every native sidecar reports ready, which is what lets the credential
-// proxy claim its ports before the agent sandbox exists to contest them.
+// until every native sidecar has started, which is what lets the credential
+// proxy claim its ports before the agent sandbox exists to contest them. See
+// buildPodTemplateSpec for what "has started" does and does not guarantee.
 //
 // A native sidecar also needs a restart policy of its own -- without it the
 // kubelet treats the container as an ordinary init container and waits for it to
@@ -2198,6 +2208,9 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 	return c
 }
 
+// buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
+// Its environment and volume mounts are intentionally disjoint from the agent
+// container even though both containers share a Pod network namespace.
 func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
 	image := resolveCredentialProxyImage(agent.Spec.Deployment)
 	pullPolicy := corev1.PullAlways
