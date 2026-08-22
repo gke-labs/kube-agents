@@ -1103,8 +1103,27 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 
 	for _, pod := range podList.Items {
 		// 1. Check container waiting states (CrashLoopBackOff, ImagePullBackOff, ErrImagePull, etc.)
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" && cs.State.Waiting.Reason != "ContainerCreating" {
+		//
+		// Init statuses first, and PodInitializing filtered out with
+		// ContainerCreating. Both were measured on a cluster rather than reasoned
+		// about, because the obvious theory is wrong: while a pod is stuck in Init
+		// the kubelet does populate ContainerStatuses -- every app container sits
+		// there waiting with reason PodInitializing. So the old code did find a
+		// waiting container and did report Degraded. What it reported was
+		// "PodInitializing", which names no fault and points at a container that is
+		// only waiting its turn, while the init container that actually failed to
+		// pull went unmentioned. The credential proxy is a native sidecar now, so
+		// the container that strands the pod is usually in the init list.
+		//
+		// Scanning init first and skipping the two placeholder reasons gets the
+		// reason an operator can act on: ImagePullBackOff on the container that has
+		// it, rather than PodInitializing on one that does not.
+		initThenApp := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+		initThenApp = append(initThenApp, pod.Status.InitContainerStatuses...)
+		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
+		for _, cs := range initThenApp {
+			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" &&
+				cs.State.Waiting.Reason != "ContainerCreating" && cs.State.Waiting.Reason != "PodInitializing" {
 				phase = "Degraded"
 				reason = cs.State.Waiting.Reason
 				message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - %s", cs.Name, pod.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)

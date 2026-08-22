@@ -4,7 +4,7 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 
 ## Prerequisites
 
-- Kubernetes 1.28+ (GKE Autopilot or Standard)
+- Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
 - A Google Service Account (GSA) with a Workload Identity binding to the agent's
   Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
   namespace by default (`platformAgent.security.serviceAccountName`):
