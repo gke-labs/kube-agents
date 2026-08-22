@@ -579,8 +579,12 @@ def _downgrade_absent(conn: sqlite3.Connection, cluster: str, seen: set[str]) ->
     # Matched case-insensitively because the caller's `scope.cluster` and the
     # row's `cluster` reach here by different routes, and a byte-for-byte miss
     # is silent: the sweep reports zero downgrades, which reads as a clean run.
+    # `surfaced` as well as `queued`: surfacing records that the nudge named the
+    # row, which says nothing about whether the problem is still there. Exempting
+    # it would make the rows the nudge names the only ones absence never reaches.
     rows = conn.execute(
-        "SELECT id, rubric FROM findings WHERE cluster = ? COLLATE NOCASE AND state = 'queued'",
+        "SELECT id, rubric FROM findings WHERE cluster = ? COLLATE NOCASE "
+        "AND state IN ('queued', 'surfaced')",
         (cluster,),
     ).fetchall()
     downgraded = 0

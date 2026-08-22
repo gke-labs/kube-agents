@@ -16,9 +16,9 @@ publisher (§7.1) is not built, so the message says how many findings it did not
 name rather than pointing at a list of them. And the design gates every message
 on the list having changed, paired with a weekly message so a silent week
 cannot be confused with a broken job. Here the gate applies only to a morning
-with no critical finding to name: an open critical is repeated daily until it
-is gone, which makes the weekly floor unnecessary for the case that would cost
-something to lose.
+that names no critical the last sweep still saw: such a critical is repeated
+daily until it is fixed, which makes the weekly floor unnecessary for the case
+that would cost something to lose.
 """
 
 import hashlib
@@ -141,6 +141,14 @@ def _body(findings: list[dict]) -> str:
 
 PUBLISHER = "nudge"
 
+# The rubric's confidence for "inferred from absence" (§5.2), as the ranked
+# payload renders it.
+CONFIDENCE_ABSENT = 0.6
+
+
+def _still_seen(finding: dict) -> bool:
+    return ((finding.get("rubric") or {}).get("C") or 1.0) > CONFIDENCE_ABSENT
+
 
 def _last_posted_hash(endpoint: str) -> str | None:
     try:
@@ -170,12 +178,13 @@ def main(argv: list[str] | None = None) -> int:
     # The message itself is what "the list changed" is about, so hash that
     # rather than the findings it was built from.
     digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
-    # An open critical is nagged about every morning until it is gone. The gate
-    # is for the quiet mornings, which are the ones that train the reader to
-    # stop opening this. It also means the run cannot lose a critical to a
-    # delivery failure it never sees: the hash is recorded before anything is
-    # delivered, so a suppressed morning is a morning the message is gone.
-    if not named:
+    # A critical the last complete sweep still saw is nagged about every
+    # morning: the gate is for the quiet mornings, and it would otherwise lose a
+    # critical to a delivery failure the script cannot observe. `C` is the only
+    # shipped signal that a finding stopped being reported -- the absence rule
+    # drops it to 0.6 -- and without that test a critical the user has fixed
+    # keeps its floor severity and repeats forever.
+    if not any(_still_seen(f) for f in named):
         try:
             if _last_posted_hash(endpoint) == digest:
                 return 0

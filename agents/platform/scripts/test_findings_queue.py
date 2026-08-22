@@ -316,6 +316,20 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(row["rubric"]["C"], 0.6)
         self.assertEqual(row["rank_score"], 54)
 
+    def test_a_surfaced_finding_is_downgraded_by_absence_like_any_other(self):
+        # The nudge marks what it names surfaced. Exempting that state would
+        # make the rows the nudge repeats daily the only ones absence never
+        # reaches, so a fixed one is nagged about forever.
+        other = sample(object="Deployment/ledger", detail="also missing")
+        self.register(sample(), other)
+        absent_id = fq.validate_finding(other)["id"]
+        fq.mark_surfaced(self.conn, absent_id)
+
+        result = self.register(sample(), scope={"cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, absent_id)["rubric"]["C"], 0.6)
+
     def test_a_partial_run_touches_nothing(self):
         other = sample(object="Deployment/ledger")
         self.register(sample(), other)
