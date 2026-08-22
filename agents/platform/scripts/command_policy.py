@@ -285,7 +285,7 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "get-value"),
         ("config", "list"),
         # `beta` is a word like any other here, so a beta path has to be
-        # listed on its own -- the GA entry above it grants nothing. These two
+        # listed on its own -- the GA entry above it grants nothing. These
         # are the stockout SOP's capacity forecast; the data has no GA
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
