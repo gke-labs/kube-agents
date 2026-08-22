@@ -3440,7 +3440,7 @@ func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
 				Name:  "platform-agent",
 				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
 			}},
-			Conditions:        []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
 		},
 	}
 

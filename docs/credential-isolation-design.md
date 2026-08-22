@@ -36,9 +36,15 @@ only a `readinessProbe`. So the ordering guaranteed is of process creation, not 
 Envoy having bound 8643. Giving the container a `startupProbe` on that port would
 close it; see `buildPodTemplateSpec` in the operator.
 
-Requires Kubernetes 1.29+, where `SidecarContainers` is beta and enabled by default.
-It is alpha and off in 1.28 -- the API server drops `restartPolicy` there, so the
-proxy becomes an ordinary init container -- and GA in 1.33.
+Requires Kubernetes 1.29+, where `SidecarContainers` is beta and enabled by
+default. It is alpha and off in 1.28, and GA in 1.33.
+
+On 1.28 the install fails rather than degrading. The API server strips
+`restartPolicy` from the init container, which leaves it declaring a readiness
+probe that a non-restartable init container may not have, so the pod template is
+rejected and the apply fails. There is no configuration in which the proxy runs
+as an ordinary init container with credential isolation quietly weakened. The
+chart's `kubeVersion` refuses the install before that point.
 
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
 send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards

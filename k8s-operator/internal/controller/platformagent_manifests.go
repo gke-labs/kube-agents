@@ -1895,8 +1895,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// Requires Kubernetes 1.29+. SidecarContainers is beta and on by default there;
 	// it went GA in 1.33 and was alpha (off) in 1.28. 1.29 is the floor because that
 	// is where restartPolicy on an init container starts being honoured without a
-	// feature gate -- on 1.28 the API server drops the field and the pod hangs in
-	// Init forever. charts/kube-agents/Chart.yaml pins the same floor.
+	// feature gate.
+	//
+	// On 1.28 the install fails fast rather than degrading: dropDisabledFields
+	// strips restartPolicy, which leaves an ordinary init container still
+	// declaring the readinessProbe buildCredentialProxySidecar sets, and
+	// validateInitContainers does not permit probes without restartPolicy:
+	// Always. So the API server rejects the pod template and the operator's
+	// apply fails -- nothing is created, nothing hangs, and there is no window
+	// where the proxy is running without sidecar semantics.
+	// charts/kube-agents/Chart.yaml pins the same floor, so Helm refuses the
+	// install before it gets that far.
 	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
 
 	defaultAnnotations := map[string]string{
@@ -2200,9 +2209,12 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // proxy claim its ports before the agent sandbox exists to contest them. See
 // buildPodTemplateSpec for what "has started" does and does not guarantee.
 //
-// A native sidecar also needs a restart policy of its own -- without it the
+// A native sidecar also needs a restart policy of its own. Without it the
 // kubelet treats the container as an ordinary init container and waits for it to
-// exit, which for a long-running proxy means the pod never progresses.
+// exit, which a long-running proxy never does. For this container the failure
+// arrives earlier than that: it declares a readinessProbe, which an init
+// container may not have unless it is restartable, so the API server rejects the
+// pod template rather than admitting one that would stall.
 func asNativeSidecar(c corev1.Container) corev1.Container {
 	c.RestartPolicy = ptr.To(corev1.ContainerRestartPolicyAlways)
 	return c

@@ -4952,8 +4952,11 @@ func TestDeploymentEnvCannotDisableReadOnlyEnforcement(t *testing.T) {
 // and Envoy's listen. Narrowed, not closed -- see buildPodTemplateSpec.
 //
 // Asserting the restart policy rather than list membership: an init container
-// WITHOUT it is an ordinary init container that the kubelet waits to exit, so a
-// long-running proxy there would hang the pod forever. Both halves are the fix.
+// WITHOUT it is one the kubelet waits to exit, which a long-running proxy never
+// does. In practice this container never gets that far -- it carries a
+// readinessProbe, which is not permitted on a non-restartable init container, so
+// the API server refuses the pod template. Either way the policy is half the fix
+// and not decoration, which is what this asserts.
 func TestCredentialProxyBindsBeforeTheSandboxExists(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
