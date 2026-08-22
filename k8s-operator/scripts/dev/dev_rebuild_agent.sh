@@ -233,7 +233,10 @@ execute_redeploy() {
         # Set image in case it's a standalone deployment not managed by a CR
         local container_name
         local container_names
-        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+        # Both lists: the credential proxy is a native sidecar, so it is an
+        # initContainer. Querying only .containers[] silently skips its image
+        # update and leaves the dev loop running a stale proxy.
+        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
         container_name=$(echo "$container_names" | grep -E "agent|${AGENT_TARGET}" | head -n 1)
         if [ -n "$container_name" ]; then
           local image_updates=("${container_name}=${IMAGE_URI}")

@@ -1866,7 +1866,48 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
-	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
+
+	// The credential proxy is a NATIVE SIDECAR -- an init container carrying
+	// restartPolicy: Always -- and not an ordinary container.
+	//
+	// It owns port 8643, which the Service targets, and it shares a network
+	// namespace with the agent sandbox. As an ordinary container the two started
+	// in parallel and raced for the bind. The agent wins that race whenever it
+	// wants to: bind 0.0.0.0:8643 from the sandbox and the proxy dies with
+	// EADDRINUSE into CrashLoopBackOff, leaving the agent holding the port the
+	// Service routes to. Reproduced on a live cluster on 10 August.
+	//
+	// A native sidecar starts before any app container, so the proxy is running
+	// before the sandbox process exists and the race stops being one the agent
+	// can win by starting first.
+	//
+	// Note what the kubelet actually waits for: the sidecar having STARTED, plus
+	// its startupProbe if it declares one. This container declares only a
+	// readinessProbe, which gates pod readiness and gates nothing about app
+	// container startup -- so the guarantee is ordering of process creation, not
+	// "Envoy has bound 8643". That is a much smaller window than two containers
+	// racing from the same instant, and it is not zero. Give this container a
+	// startupProbe on 8643 if the remaining window ever matters.
+	//
+	// This is also the ordering the pod needs for its own sake: every credentialed
+	// call the agent makes goes through this proxy, so an agent that starts first
+	// is an agent whose early tool calls fail.
+	//
+	// Requires Kubernetes 1.29+. SidecarContainers is beta and on by default there;
+	// it went GA in 1.33 and was alpha (off) in 1.28. 1.29 is the floor because that
+	// is where restartPolicy on an init container starts being honoured without a
+	// feature gate.
+	//
+	// On 1.28 the install fails fast rather than degrading: dropDisabledFields
+	// strips restartPolicy, which leaves an ordinary init container still
+	// declaring the readinessProbe buildCredentialProxySidecar sets, and
+	// validateInitContainers does not permit probes without restartPolicy:
+	// Always. So the API server rejects the pod template and the operator's
+	// apply fails -- nothing is created, nothing hangs, and there is no window
+	// where the proxy is running without sidecar semantics.
+	// charts/kube-agents/Chart.yaml pins the same floor, so Helm refuses the
+	// install before it gets that far.
+	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2158,6 +2199,26 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 		return *harness.EventWatcher.Enabled
 	}
 	return true
+}
+
+// asNativeSidecar converts a container into a Kubernetes native sidecar: an init
+// container that never exits and that the kubelet keeps running for the life of
+// the pod.
+//
+// The distinction that matters here is ordering. App containers do not start
+// until every native sidecar has started, which is what lets the credential
+// proxy claim its ports before the agent sandbox exists to contest them. See
+// buildPodTemplateSpec for what "has started" does and does not guarantee.
+//
+// A native sidecar also needs a restart policy of its own. Without it the
+// kubelet treats the container as an ordinary init container and waits for it to
+// exit, which a long-running proxy never does. For this container the failure
+// arrives earlier than that: it declares a readinessProbe, which an init
+// container may not have unless it is restartable, so the API server rejects the
+// pod template rather than admitting one that would stall.
+func asNativeSidecar(c corev1.Container) corev1.Container {
+	c.RestartPolicy = ptr.To(corev1.ContainerRestartPolicyAlways)
+	return c
 }
 
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.

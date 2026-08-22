@@ -23,6 +23,29 @@ Each PlatformAgent runs as one long-lived Pod with these managed containers:
    and the `k8s-event-watcher`, which forwards cluster events using a
    non-secret internal key.
 
+The proxy is a **native sidecar** -- an entry in `initContainers` carrying
+`restartPolicy: Always` -- and not an ordinary container, so
+`kubectl get pod -o jsonpath='{.spec.containers[*].name}'` will not list it. It
+is shaped that way because it owns port 8643, which the Service targets, and it
+shares a network namespace with the sandbox: as two ordinary containers they
+started together and raced for the bind, and the sandbox could take the port
+external callers reach. A native sidecar starts before any app container, which
+narrows that race but does not close it: the kubelet waits for the sidecar to have
+**started**, plus its `startupProbe` if it declares one, and this container declares
+only a `readinessProbe`. So the ordering guaranteed is of process creation, not of
+Envoy having bound 8643. Giving the container a `startupProbe` on that port would
+close it; see `buildPodTemplateSpec` in the operator.
+
+Requires Kubernetes 1.29+, where `SidecarContainers` is beta and enabled by
+default. It is alpha and off in 1.28, and GA in 1.33.
+
+On 1.28 the install fails rather than degrading. The API server strips
+`restartPolicy` from the init container, which leaves it declaring a readiness
+probe that a non-restartable init container may not have, so the pod template is
+rejected and the apply fails. There is no configuration in which the proxy runs
+as an ordinary init container with credential isolation quietly weakened. The
+chart's `kubeVersion` refuses the install before that point.
+
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
 send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards
 requests over a private Unix socket to the credential runtime. Slack and Google
@@ -118,10 +141,13 @@ sandbox cannot bypass Envoy by calling the runtime directly. A separate sidecar
 listener authenticates the existing PlatformAgent API on port 8643 and forwards
 to the sandbox API on loopback using a non-secret sentinel.
 
-The containers have the same lifecycle because they are part of the same
-Deployment and Pod. If the sidecar is not ready, the Pod is not ready. If either
-Envoy or the credential runtime exits, the sidecar exits and Kubernetes restarts
-it.
+The containers share a Pod, but not the same lifecycle: the credential proxy is
+a native sidecar, so the kubelet starts it before every app container and stops
+it after them. If the sidecar is not ready, the Pod is not ready -- a restartable
+init container counts toward Pod readiness. If either Envoy or the credential
+runtime exits, the sidecar exits and Kubernetes restarts it; during startup that
+means the app containers have not begun yet, so a bootstrap failure shows up as
+`Init:CrashLoopBackOff` rather than a running Pod with one bad container.
 
 ## Credential Placement
 
