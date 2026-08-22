@@ -851,6 +851,14 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/incidents/recent?chat_id=c", None),
         ("GET", "/v1/alert-quota", None),
         ("POST", "/v1/cron-reports", {"job_id": "j", "report": "r"}),
+        ("POST", "/v1/findings", {"findings": []}),
+        ("GET", "/v1/findings/ranked", None),
+        ("GET", "/v1/findings", None),
+        ("POST", "/v1/findings/f-1/surfaced", {}),
+        ("PATCH", "/v1/findings/f-1", {"state": "accepted"}),
+        ("POST", "/v1/findings/f-1/verified", {"outcome": "resolved"}),
+        ("GET", "/v1/findings/publication/backlog", None),
+        ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
     )
 
     def setUp(self):
@@ -877,7 +885,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
     def _call(self, method, path, body, headers=None):
         if method == "GET":
             return self.client.get(path, headers=headers or {})
-        return self.client.post(path, json=body, headers=headers or {})
+        return getattr(self.client, method.lower())(path, json=body, headers=headers or {})
 
     def test_declared_routes_are_all_covered(self):
         """Fails when a route is added without deciding whether it needs a key."""
@@ -885,10 +893,16 @@ class TestSessionKvServerAuth(unittest.TestCase):
             (method, route.path)
             for route in session_kv_server.app.routes
             for method in getattr(route, "methods", set()) or set()
-            if method in ("GET", "POST")
+            if method in ("GET", "POST", "PATCH", "PUT")
         }
         covered = {
-            (method, path.split("?")[0].replace("sess-1", "{session_id}"))
+            (
+                method,
+                path.split("?")[0]
+                .replace("sess-1", "{session_id}")
+                .replace("f-1", "{finding_id}")
+                .replace("publication/backlog", "publication/{publisher}"),
+            )
             for method, path, _ in self.PROTECTED_ROUTES
         } | {("GET", "/healthz")}
         self.assertEqual(declared, covered)
@@ -2172,6 +2186,198 @@ class TestRecentReportsIndex(unittest.TestCase):
         self.assertEqual(report["thread_id"], "T-watcher")
         self.assertEqual(report["job_id"], "")
         self.assertEqual(report["profile"], "")
+
+
+class TestFindingsQueueApi(unittest.TestCase):
+    """The seven /v1/findings routes. The rules they enforce are pinned in
+    test_findings_queue.py; these tests are about the HTTP surface."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM findings")
+                conn.execute("DELETE FROM queue_publications")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _finding(self, **overrides):
+        finding = {
+            "source": "inventory",
+            "check": "probes-readiness",
+            "cluster": "prod-eu",
+            "namespace": "payments",
+            "object": "Deployment/checkout",
+            "title": "No readinessProbe on a 3-replica serving Deployment",
+            "detail": "no readinessProbe on any container",
+            "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+            "recommendation": {"action": "Add one", "rationale": "Rollouts shift traffic early", "risk": "Tight probes restart healthy pods"},
+            "remediation": {"kind": "manifest", "path": "apps/checkout.yaml", "note": "Add the probe"},
+            "verification": {"kind": "kubectl", "command": "kubectl get deploy checkout -o json", "still_failing_when": "no probe"},
+        }
+        finding.update(overrides)
+        return finding
+
+    def _register(self, *findings, scope=None):
+        response = self.client.post("/v1/findings", json={"findings": list(findings), "scope": scope})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_register_then_rank(self):
+        self._register(self._finding())
+        findings = self.client.get("/v1/findings/ranked").json()["findings"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["rank_score"], 90)
+        self.assertEqual(findings[0]["severity"], "major")
+        self.assertEqual(findings[0]["state"], "queued")
+
+    def test_a_bad_rubric_is_a_400_not_a_500(self):
+        response = self.client.post(
+            "/v1/findings",
+            json={"findings": [self._finding(rubric={"B": 4, "L": 6, "detect": 2, "recover": 2, "C": 1.0})]},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("B", response.json()["detail"])
+
+    def test_the_lifecycle_over_http(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+
+        surfaced = self.client.post(f"/v1/findings/{fid}/surfaced", json={"chat_id": "spaces/AAA"})
+        self.assertEqual(surfaced.json()["surface_count"], 1)
+
+        accepted = self.client.patch(f"/v1/findings/{fid}", json={"state": "accepted"})
+        self.assertEqual(accepted.json()["state"], "accepted")
+
+        verified = self.client.post(f"/v1/findings/{fid}/verified", json={"outcome": "resolved", "observed": "probe present"})
+        self.assertEqual(verified.json()["state"], "resolved")
+        self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_unknown_findings_are_404(self):
+        self.assertEqual(self.client.post("/v1/findings/nope/surfaced", json={}).status_code, 404)
+        self.assertEqual(self.client.patch("/v1/findings/nope", json={"state": "accepted"}).status_code, 404)
+        self.assertEqual(
+            self.client.post("/v1/findings/nope/verified", json={"outcome": "resolved"}).status_code, 404
+        )
+
+    def test_two_writers_registering_the_same_finding_do_not_collide(self):
+        # The event watcher (Go) and the agent are both first-class writers, so
+        # a check-then-act INSERT under a deferred transaction is the designed
+        # concurrency here, not an edge case.
+        import sqlite3
+        import threading
+
+        from fastapi.testclient import TestClient
+
+        barrier = threading.Barrier(2)
+        codes = []
+
+        def register():
+            client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+            barrier.wait()
+            codes.append(client.post("/v1/findings", json={"findings": [self._finding()]}).status_code)
+
+        threads = [threading.Thread(target=register) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sorted(codes), [200, 200], "a concurrent registration was rejected")
+        self.assertEqual(len(self.client.get("/v1/findings/ranked").json()["findings"]), 1)
+
+    def test_a_broken_stored_rubric_is_not_reported_as_a_missing_finding(self):
+        # A bare KeyError anywhere in the call tree used to surface as
+        # "no finding 'L'", telling the agent to drop a row that is right there.
+        import sqlite3
+
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute('UPDATE findings SET rubric = \'{"B": 3}\' WHERE id = ?', (fid,))
+
+        response = self.client.post(
+            f"/v1/findings/{fid}/verified",
+            json={
+                "outcome": "still_failing",
+                "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+            },
+        )
+
+        self.assertNotEqual(response.status_code, 404, response.text)
+
+    def test_a_rejected_value_is_not_echoed_back_whole(self):
+        payload = "A" * 20000
+        responses = (
+            self.client.post(
+                "/v1/findings",
+                json={
+                    "findings": [
+                        self._finding(rubric={"B": payload, "L": 6, "detect": 3, "recover": 2, "C": 1.0})
+                    ]
+                },
+            ),
+            self.client.get("/v1/findings", params={"state": payload}),
+            self.client.put(f"/v1/findings/publication/{payload}", json={"target_kind": "chat"}),
+        )
+        for response in responses:
+            self.assertEqual(response.status_code, 400, response.text[:200])
+            detail = response.json()["detail"]
+            self.assertLess(len(detail), 300, detail[:200])
+            self.assertNotIn(payload, detail)
+
+    def test_list_filters_pass_through(self):
+        self._register(
+            self._finding(),
+            self._finding(cluster="prod-us", object="Deployment/ledger"),
+        )
+        self.assertEqual(len(self.client.get("/v1/findings?cluster=prod-eu").json()["findings"]), 1)
+        self.assertEqual(len(self.client.get("/v1/findings?severity=major").json()["findings"]), 2)
+        self.assertEqual(self.client.get("/v1/findings?state=pending").status_code, 400)
+
+    def test_publication_round_trip(self):
+        self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 404)
+        put = self.client.put(
+            "/v1/findings/publication/backlog",
+            json={"target_kind": "github-issue", "target_ref": "https://example.invalid/i/1", "content_hash": "abc"},
+        )
+        self.assertEqual(put.status_code, 200, put.text)
+        self.assertEqual(
+            self.client.get("/v1/findings/publication/backlog").json()["content_hash"], "abc"
+        )
+
+    def test_the_backlog_has_no_ttl(self):
+        """`cleanup_old_records` must not treat a finding as an expiring record.
+
+        Every other table in this database ages out at CLEANUP_TTL_DAYS. A
+        backlog item that did the same would be silently re-created by the next
+        sweep, and a `dismissed` one would come back as if nobody had answered.
+        """
+        import sqlite3
+
+        self._register(self._finding())
+        self.client.put(
+            "/v1/findings/publication/backlog",
+            json={"target_kind": "github-issue", "target_ref": "https://example.invalid/i/1"},
+        )
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                aged = f"-{session_kv_server.CLEANUP_TTL_DAYS * 3} days"
+                conn.execute(
+                    "UPDATE findings SET first_seen = datetime('now', ?), last_verified = datetime('now', ?)",
+                    (aged, aged),
+                )
+                conn.execute("UPDATE queue_publications SET last_published = datetime('now', ?)", (aged,))
+                session_kv_server.cleanup_old_records(conn)
+
+        self.assertEqual(len(self.client.get("/v1/findings/ranked").json()["findings"]), 1)
+        self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 200)
 
 
 if __name__ == "__main__":
