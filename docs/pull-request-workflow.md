@@ -10,8 +10,8 @@ review passes, live-test the change, resolve every thread — is stated in
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
 
 A rule about how to run a command correctly can sit here rather than in `AGENTS.md`, because it
-means nothing until you have the command in front of you — that a contributor on a fork cannot
-self-assign an issue is the example. The test is when a rule has to fire, though, not how
+means nothing until you have the command in front of you — that self-assigning an issue needs
+`triage` access is the example. The test is when a rule has to fire, though, not how
 procedural it sounds: that a draft is not in the review queue reads like mechanics, but it has to
 reach an agent before it decides to wait, so `AGENTS.md` states it and only the measurement behind
 it is here. `AGENTS.md` is loaded into every session and this page is not, so anything that has to
@@ -50,8 +50,8 @@ gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me
 ```
 
 `@me` is the account whose token you hold, and `AGENTS.md` is explicit that this makes it a person
-you are volunteering. A contributor working from a fork without write access cannot self-assign at
-all; offer a comment instead.
+you are volunteering. A contributor without `triage` access cannot self-assign; offer a comment
+instead.
 
 ## Measure how far a branch has drifted from `main`
 

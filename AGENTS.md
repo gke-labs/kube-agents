@@ -373,7 +373,7 @@ run alongside its review — `success` when it found nothing, `neutral` when it 
 anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
 clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
 a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
-completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and
 anyone with `triage` access or higher can comment `/request-review` (at the start of the comment) to
 assign a reviewer immediately — the override for a finding you have answered but disagree with, or
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.
