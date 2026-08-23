@@ -186,12 +186,14 @@ Authority blocks earliest because it is binary and cannot flake. Drift is the op
 
 ## 5. Eval-driven development
 
-Most changes need no new case. A change that alters what the agent says or does ships with the case that proves it. That is the development model, not a courtesy. The case is the spec: it lands marked expected-fail, the implementation flips it to expected-pass, and it stays as a regression check forever. That flip is a reviewed diff, so "this change improves X" is evidence rather than a sentence in a pull request body.
+The rule: if your change alters what the agent says or does, it ships with a case that proves it. Most changes do not alter behaviour and need no case.
 
-Two rules attach, both bought with experience:
+Write the case first, marked expected-fail. Your change flips it to expected-pass. It then stays in the suite as a regression check. The flip is visible in the diff, so "this change improves X" is something a reviewer can check rather than take on trust.
 
-- **The case is reviewed as hard as the code.** Building the first corpus produced roughly fifty review findings, half of them cases that could not fail (a safeguard naming a tool that does not exist, a defect the audit's own SOP never flags) or could not pass (grading the router's paraphrase instead of the report). An agent implemented against a weak spec produces confident garbage that gates green, and the case is where that failure lives.
-- **A holdout guards against saturation.** A suite grown this way trends monotonically green: its regression value persists, its discrimination decays. New cases periodically land un-optimized-against and rotate into the gate.
+Two things we learned building the first corpus:
+
+- **Review the case as hard as the code.** That corpus produced about fifty review findings. Half were cases that could never fail (a safeguard naming a tool that does not exist, a defect no SOP looks for) or could never pass (grading the router's paraphrase instead of the report). A bad case gates green however bad the agent is.
+- **Hold some cases back.** A suite you develop against stops discriminating: everything in it goes green and stays green, so it catches regressions but finds nothing new. Some new cases land unseen and rotate into the gate later.
 
 ### 5.1 What runs, without you doing anything
 
