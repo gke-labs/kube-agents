@@ -120,6 +120,7 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 | --- | --- |
 | `kube-agents-evals` | `gke-agentic/kube-agents-evals-infra` |
 | `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
+| `kube-agents-evals-3` | `gke-agentic/kube-agents-evals-3-infra` |
 
 The repository is seeded from the layout in [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) and kept private: it is throwaway state a bot rewrites on every run.
 

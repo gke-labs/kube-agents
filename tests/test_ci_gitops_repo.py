@@ -44,6 +44,7 @@ _SECTION_END_RE = re.compile(r"^# ─── (?!2b\.)", re.MULTILINE)
 _EXPECTED_MAPPING = {
     "kube-agents-evals": "gke-agentic/kube-agents-evals-infra",
     "kube-agents-evals-2": "gke-agentic/kube-agents-evals-2-infra",
+    "kube-agents-evals-3": "gke-agentic/kube-agents-evals-3-infra",
 }
 
 
@@ -115,7 +116,7 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
 
     def test_unmapped_project_fails_the_prow_deploy(self):
         rc, out, err = self._resolve(
-            "kube-agents-evals-3", PULL_NUMBER="123", JOB_NAME="pull-eval"
+            "kube-agents-evals-4", PULL_NUMBER="123", JOB_NAME="pull-eval"
         )
         self.assertNotEqual(rc, 0)
         self.assertNotIn("RESOLVED", out)

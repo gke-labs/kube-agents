@@ -72,6 +72,7 @@ gitops_repo_for_project() {
   case "$1" in
     kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
     kube-agents-evals-2) echo "gke-agentic/kube-agents-evals-2-infra" ;;
+    kube-agents-evals-3) echo "gke-agentic/kube-agents-evals-3-infra" ;;
     *) return 1 ;;
   esac
 }

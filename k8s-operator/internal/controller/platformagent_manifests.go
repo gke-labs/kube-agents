@@ -2537,7 +2537,7 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 // while readiness afterwards should withdraw the pod quickly.
 //
 // /api/sessions is the endpoint the agent's own callers use — see the pubsub
-// adapter and admin_console — and the Authorization: Bearer $API_SERVER_KEY is theirs too.
+// adapter and admin_console — and the Authorization: Bearer form is theirs too.
 // Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
 // 1-second default timeout is far too tight for a container this busy at boot.
 //
