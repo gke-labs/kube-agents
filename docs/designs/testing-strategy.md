@@ -143,28 +143,9 @@ Our cases will not be 99.9% reliable, and a gate that reds seven pull requests i
 
 **Worked example.** Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the **aggregate**. Fails all three: it has **collapsed**, and that one case reds the job — a case that passes 19 times in 20 does not fail three in a row by chance.
 
-**Why all three, and not two of three.** This is the one place the threshold is forced rather than chosen. Across 200 admitted cases, a rule that fires on two failures out of three is wrong far too often to use:
-
-| Collapse fires when a case | False collapses per pull request, 200 cases at 95% reliability | Catches a case broken to 30% |
-| -------------------------- | -------------------------------------------------------------- | ---------------------------- |
-| fails 2 or 3 of its 3 runs | **1.5 — reds essentially every run**                           | 78% of the time              |
-| fails all 3 of its 3 runs  | 0.03 — one false red every 30-odd runs                         | 34% of the time              |
-
-So collapse means all three. What that costs is real and worth stating: a case degraded rather than destroyed — one that still passes a third of the time — is caught by collapse only about a third of the time on the pull request that broke it. Three things cover that gap. The **aggregate** still sees 600 observations per run and catches damage spread across cases. The release gate re-runs the same suite on `main` within three hours, where the same case gets more attempts. And a case that is genuinely broken keeps failing, so it collapses on someone's pull request within a few merges.
-
-**If that turns out to be too slow, the fix is more repetitions, not a looser threshold** — 3 is a starting point, re-checked against measured `main`-against-`main` variance, the same way the non-inferiority margin is.
-
 Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out.
 
-Three simpler designs were considered and rejected, each for one reason:
-
-- **Aggregate alone** misses a change that destroys exactly one case — half a point on a 200-case average.
-- **Collapse alone** misses broad drift, where nothing collapses but everything slips.
-- **A significance test per case** manufactures roughly ten false regressions every run, at 200 cases and a 5% threshold.
-
-The one number not fixed here is the non-inferiority margin, because it is measured rather than chosen: run the suite twice against `main`, see how far the score moves on its own, and set the bar above that. A margin picked on paper either fires constantly or never fires, and which one it is will not be apparent for a month.
-
-Admission is also what makes §5 a development model rather than an obligation. A case reports its own measured reliability on the pull request that added it, so its author finds out it is too noisy before it starts reddening other people's work.
+**Every number here is a starting point.** Three runs, all-three-fail for collapse, 19 of 20 for admission, and the non-inferiority margin are set to be tuned, not defended. The way to tune them is to run the suite twice against `main`, see how much it moves when nothing has changed, and set the bars above that. If a real regression is getting through, add repetitions before loosening a threshold — a looser threshold buys detection with false reds, and a gate that reds pull requests it should not is a gate people learn to ignore.
 
 #### Pinning and baselines
 
