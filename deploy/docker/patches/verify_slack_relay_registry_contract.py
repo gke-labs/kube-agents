@@ -143,15 +143,20 @@ UPSTREAM_SIGNATURES = {
 }
 
 # Default values the relay patches depend on. Keyed by (callable label, parameter name).
-# Only reimplemented methods where a changed upstream default creates silent drift
-# are pinned here; delegating wrappers (PlatformRegistry.register, create_adapter)
-# pass through arguments unchanged and are exempt from default pinning.
+# Only reimplemented methods/functions where a changed upstream default creates silent
+# drift are pinned here; delegating wrappers (PlatformRegistry.register,
+# PlatformRegistry.create_adapter) pass through *args/**kwargs unchanged and are exempt
+# from default pinning.
 PINNED_DEFAULTS: dict[tuple[str, str], object] = {
     ("SlackAdapter.connect", "is_reconnect"): False,
     ("GoogleChatAdapter.connect", "is_reconnect"): False,
     ("SlackAdapter._download_slack_file", "audio"): False,
     ("SlackAdapter._download_slack_file", "team_id"): "",
     ("SlackAdapter._download_slack_file_bytes", "team_id"): "",
+    ("slack._standalone_send", "thread_id"): None,
+    ("slack._standalone_send", "media_files"): None,
+    ("slack._standalone_send", "force_document"): False,
+    ("slack._standalone_send", "caption"): None,
     ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): None,
 }
 
