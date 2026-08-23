@@ -441,6 +441,13 @@ DRY_RUN_PR_SEPARATOR = "=== WOULD OPEN PULL REQUEST ==="
 # ends the block early and leaves the lines after it exposed. That is how a
 # `/remediate` a reader quoted inside a code block gets read as a command.
 FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# A block quote opener (CommonMark §5.1): 0-3 spaces followed by '>'.
+BLOCKQUOTE_OPEN_RE = re.compile(r"^ {0,3}>")
+# Block starters that terminate a paragraph's lazy continuation in a blockquote:
+# Heading (#), thematic break (---, ***, ___), list item (-, *, +, 1.), fence (```, ~~~)
+PARAGRAPH_BREAK_RE = re.compile(
+    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|(?:[*+-]|\d+[.)])\s|`{3,}|~{3,})"
+)
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
@@ -2162,6 +2169,41 @@ def strip_fenced_blocks(text: str) -> str:
     return "\n".join(out)
 
 
+def strip_block_quotes(text: str) -> str:
+    """Drop block quotes, including CommonMark lazy paragraph continuation lines.
+
+    A block quote line opens with `>` (indented 0-3 spaces). Under CommonMark / GFM,
+    subsequent non-blank lines that continue the paragraph without a `>` prefix
+    are lazy continuation lines that render inside the enclosing block quote.
+
+    Lazy continuation ends when:
+    1. A blank line appears.
+    2. A line starts with another block structure (code fence, heading, HR, list item, or new quote).
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    in_quote = False
+    for line in text.split("\n"):
+        if BLOCKQUOTE_OPEN_RE.match(line):
+            in_quote = True
+            continue
+        if not line.strip():
+            in_quote = False
+            out.append(line)
+            continue
+        if in_quote:
+            if PARAGRAPH_BREAK_RE.match(line):
+                in_quote = False
+                out.append(line)
+            else:
+                # Lazy continuation line inside the block quote
+                continue
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def parse_gh_timestamp(value: str | None) -> datetime | None:
     """A `gh --json` RFC 3339 timestamp as an aware `datetime`, or None.
 
@@ -2347,7 +2389,9 @@ def parse_remediate_commands(
     requested_at: dict[str, str] = {}
 
     for comment in comments or []:
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(
+            strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        )
         matches = REMEDIATE_RE.findall(body)
         # Nothing at the start of a line, but the word is in there somewhere and
         # not inside a code span: an attempt at the command, not a discussion of
@@ -2509,7 +2553,9 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for comment in comments or []:
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(
+            strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        )
         targets = [raw.strip().strip("`") for raw in REMEDIATE_RE.findall(body)]
         if not targets and not REMEDIATE_MENTION_RE.search(strip_inline_code(body)):
             continue
@@ -2552,7 +2598,9 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         association = str(comment.get("authorAssociation", "") or "").upper()
         if association not in WRITE_ASSOCIATIONS:
             continue
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(
+            strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        )
         for raw in REMEDIATE_RE.findall(body):
             target = raw.strip().strip("`")
             if target and target != "all":

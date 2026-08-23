@@ -4146,6 +4146,25 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_quoted_command_never_fires(self):
+        body = "> /remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_lazy_continuation_quoted_command_never_fires(self):
+        """CommonMark lazy continuation includes following lines in the blockquote."""
+        body = "> Quoting a suggestion:\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_blank_line_following_a_quote_fires(self):
+        body = "> Quoting context:\n\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -6291,6 +6310,49 @@ class TestFenceScanning(unittest.TestCase):
 
     def test_a_closer_may_carry_trailing_whitespace(self):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
+
+
+class TestBlockQuoteScanning(unittest.TestCase):
+    def strip(self, text):
+        return audit_report.strip_block_quotes(text)
+
+    def test_a_single_line_blockquote_is_stripped(self):
+        out = self.strip("> /remediate x\n\nrest")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("rest", out)
+
+    def test_a_lazy_continuation_line_is_stripped(self):
+        out = self.strip("> Quote header:\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_blank_line_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_heading_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n# Heading\n/remediate real")
+        self.assertIn("# Heading", out)
+        self.assertIn("/remediate real", out)
+
+    def test_a_thematic_break_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n---\n/remediate real")
+        self.assertIn("---", out)
+        self.assertIn("/remediate real", out)
+
+    def test_a_list_item_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n- list item\n/remediate real")
+        self.assertIn("- list item", out)
+        self.assertIn("/remediate real", out)
+
+    def test_three_spaces_indent_is_a_blockquote(self):
+        out = self.strip("   > /remediate x\n\nrest")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("rest", out)
+
+    def test_empty_string_returns_empty(self):
+        self.assertEqual(self.strip(""), "")
+        self.assertEqual(self.strip(None), "")
 
 
 class TestPathContainment(unittest.TestCase):
