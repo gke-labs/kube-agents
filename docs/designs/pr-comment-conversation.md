@@ -466,11 +466,10 @@ they are worth naming precisely because nothing in this branch closes them now.
 
 Alongside the list-item fence opener, and two backtracking patterns reachable before any trust
 check — `REMEDIATE_RE`, quadratic, and `INLINE_CODE_RE`, measured cubic at 20.7s on a
-16,384-backtick run. A quoted `> /remediate` does not fire, but a lazy continuation under one does;
-that is [#782](https://github.com/gke-labs/kube-agents/issues/782), the one that _is_ filed. Its
-description of the `audit_report.py` half holds, while its premise that both paths share
-`pr_triggers.visible_text` is stale as of this branch: the shared helper is deleted, so only the
-ledger half survives.
+16,384-backtick run. A quoted `> /remediate` and lazy continuations under one are stripped by
+`strip_block_quotes` ([#782](https://github.com/gke-labs/kube-agents/issues/782)).
+Its premise that both paths share `pr_triggers.visible_text` is stale as of this branch: the shared
+helper is deleted, so only the ledger half survives.
 
 **The others are unfiled**, by decision rather than oversight. They are pre-existing on `main`, they
 need the ledger's own visibility model rather than this one's, and filing them against a path this
