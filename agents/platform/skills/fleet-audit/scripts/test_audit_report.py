@@ -4189,6 +4189,24 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_lazy_continuation_after_quoted_list_item_never_fires(self):
+        body = "> Findings:\n> - netpol-missing\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_lazy_continuation_after_quoted_numbered_list_item_never_fires(self):
+        body = "> Findings:\n> 1. netpol-missing\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_blank_quote_line_following_quoted_list_item_fires(self):
+        body = "> Findings:\n> - netpol-missing\n>\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -6384,6 +6402,29 @@ class TestBlockQuoteScanning(unittest.TestCase):
         out = self.strip("> Quote header:\n- list item\n/remediate real")
         self.assertIn("- list item", out)
         self.assertIn("/remediate real", out)
+
+    def test_a_lazy_continuation_under_quoted_bullet_list_item_is_stripped(self):
+        out = self.strip("> Findings:\n> - netpol-missing\n/remediate netpol-missing\n\nreal text")
+        self.assertNotIn("/remediate netpol-missing", out)
+        self.assertIn("real text", out)
+
+    def test_a_lazy_continuation_under_quoted_numbered_list_item_is_stripped(self):
+        out = self.strip("> 1. netpol-missing\n/remediate netpol-missing\n\nreal text")
+        self.assertNotIn("/remediate netpol-missing", out)
+        self.assertIn("real text", out)
+
+    def test_an_empty_quote_line_after_quoted_list_item_terminates_lazy_continuation(self):
+        out = self.strip("> - netpol-missing\n>\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_list_item_inside_quote_terminates_lazy_continuation(self):
+        out = self.strip("> -\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_nested_quote_with_list_item_lazy_continuation_is_stripped(self):
+        out = self.strip("> > - item\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
 
     def test_three_spaces_indent_is_a_blockquote(self):
         out = self.strip("   > /remediate x\n\nrest")

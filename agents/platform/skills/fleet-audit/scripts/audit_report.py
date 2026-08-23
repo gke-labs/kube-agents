@@ -448,6 +448,13 @@ BLOCKQUOTE_OPEN_RE = re.compile(r"^ {0,3}>")
 PARAGRAPH_BREAK_RE = re.compile(
     r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|(?:[*+-]|\d+[.)])\s|`{3,}|~{3,})"
 )
+# Block structures inside a block quote that do NOT contain an open paragraph:
+# Heading (#), thematic break (---, ***, ___), fence (```, ~~~), or empty list item.
+# Note: list items with content (e.g. `> - item`) contain open paragraphs and accept
+# CommonMark lazy continuations.
+NON_PARAGRAPH_BLOCK_RE = re.compile(
+    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|`{3,}|~{3,}|(?:[*+-]|\d+[.)])\s*$)"
+)
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
@@ -2182,11 +2189,11 @@ def strip_block_quotes(text: str) -> str:
     subsequent non-blank lines that continue the paragraph without a `>` prefix
     are lazy continuation lines that render inside the enclosing block quote.
 
-    Lazy continuation applies only to an open paragraph within the block quote.
-    It ends when:
+    Lazy continuation applies to open paragraphs (including list items) within
+    the block quote. It ends when:
     1. An empty or blank line appears (unprefixed, or a `>`-only line inside the quote).
-    2. A line starts with another block structure (code fence, heading, HR, list item, or new quote).
-    3. A non-paragraph block inside the block quote (such as a fenced code block or list) closes or ends.
+    2. An unprefixed line starts with another block structure (code fence, heading, HR, list item).
+    3. A non-paragraph block inside the block quote (such as a code fence, heading, HR, or empty list item) resets the open paragraph.
     """
     if not text:
         return ""
@@ -2197,15 +2204,21 @@ def strip_block_quotes(text: str) -> str:
             # A line starting with '>' is part of a blockquote and is stripped.
             # Determine whether this line opens/continues a paragraph or closes/resets it.
             rest = line.lstrip()[1:]  # content after '>'
-            if not rest.strip():
-                # A blank line inside the quote (e.g. '>' or '> ') terminates
+            inner = rest.lstrip()
+            while inner.startswith(">"):
+                inner = inner[1:].lstrip()
+
+            if not inner.strip():
+                # A blank line inside the quote (e.g. '>', '> >', '>   ') terminates
                 # any open paragraph, so following lines cannot lazily continue.
                 in_quote_paragraph = False
-            elif PARAGRAPH_BREAK_RE.match(rest.lstrip()):
-                # A block starter inside the quote (fence, heading, HR, list)
-                # interrupts paragraph continuation.
+            elif NON_PARAGRAPH_BLOCK_RE.match(inner):
+                # A block starter inside the quote that does not contain an open
+                # paragraph (fence, heading, HR, empty list) interrupts paragraph continuation.
                 in_quote_paragraph = False
             else:
+                # A paragraph line or a list item with content (e.g. '> - item')
+                # contains an open paragraph that accepts CommonMark lazy continuations.
                 in_quote_paragraph = True
             continue
 

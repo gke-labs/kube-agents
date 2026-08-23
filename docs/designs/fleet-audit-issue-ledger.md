@@ -724,8 +724,9 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
   ` ``` `, which CommonMark and GitHub both render as literal text, read as a closer.
 - **Block quotes and lazy continuations are stripped.** `strip_block_quotes` drops blockquote
   lines starting with `>` (indented 0-3 spaces) and consumes subsequent lazy continuation lines
-  that CommonMark (§5.1) includes in the block quote until a paragraph break (blank line, code fence,
-  heading, HR, or list item) is encountered, preventing quoted `/remediate` suggestions from firing.
+  that CommonMark (§5.1) includes in the block quote until a paragraph break (such as an empty quote line,
+  blank line, code fence, heading, or thematic break) is encountered, preserving lazy continuations
+  for both quoted paragraphs and list items inside the quote to prevent quoted `/remediate` suggestions from firing.
 - **Table cells escape `|` and flatten newlines**; identifiers additionally replace a backtick,
   because one backtick closes the inline code span they sit in and the rest of the value renders as
   live Markdown.
