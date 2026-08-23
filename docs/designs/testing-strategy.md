@@ -193,7 +193,7 @@ Write the case first, marked expected-fail. Your change flips it to expected-pas
 Two things we learned building the first corpus:
 
 - **Review the case as hard as the code.** That corpus produced about fifty review findings. Half were cases that could never fail (a safeguard naming a tool that does not exist, a defect no SOP looks for) or could never pass (grading the router's paraphrase instead of the report). A bad case gates green however bad the agent is.
-- **Hold some cases back.** A suite you develop against stops discriminating: everything in it goes green and stays green, so it catches regressions but finds nothing new. Some new cases land unseen and rotate into the gate later.
+- **Keep writing new cases.** Once a case is in the suite, people tune the agent until it passes, and then it keeps passing. That is what you want from a regression check, but it means an old suite stops telling you how good the agent is today. Only cases nobody has tuned against tell you that.
 
 ### 5.1 What runs, without you doing anything
 
