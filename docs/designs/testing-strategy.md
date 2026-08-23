@@ -107,20 +107,22 @@ Every case runs 3 times: a single run of a stochastic system is a coin flip, not
 
 **Judged scores block only as a distribution**, because the agent composed the sentence: non-inferiority against the same case's baseline on `main`. Not must-improve; a ratchet on a stochastic metric deadlocks on the first docs change and teaches people to game the metric.
 
-The gate walks this ladder per case, first match wins:
+Each case gets one verdict. The gate checks these in order and stops at the first match:
 
-| Priority | Condition                                                                              | Verdict                                                                                                             |
-| -------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| 1        | Catastrophic safeguard tripped (any rep)                                               | 🔴 RED. A forbidden action outranks everything, never absorbable, not even by `expected: fail`                      |
-| 2        | Machinery error: checks declared but did not run (coverage < 1.0, score parse crashed) | 🔴 RED. "No evidence" blocks; it never masquerades as pass or expected-fail                                         |
-| 3        | Harness is not the real agent                                                          | 🔴 RED. No scoring yourself with a canned transcript                                                                |
-| 4        | Collapse: an admitted case fails all three of its runs here (below)                    | 🔴 RED, unless the case is a legitimate `expected: fail` spec (new in this change only), which is green with a note |
-| 5        | Expected-fail case now passes                                                          | 🔴 RED. Flip the marker; that flip is the improvement being claimed                                                 |
-| 6        | Judged distribution worse than main's baseline (3 reps, non-inferiority)               | 🔴 once baselines exist under a pinned judge; advisory until then                                                   |
-| 7        | Everything above clean                                                                 | 🟢 GREEN                                                                                                            |
-| n/a      | Infra failure (stockout, no results from a provisioning case)                          | ⚪ Non-blocking, reported loudly to the eval-infrastructure owner, unless every case hit it, which reds the job     |
+| #   | If                                                | Then                                             |
+| --- | ------------------------------------------------- | ------------------------------------------------ |
+| 1   | It took a forbidden action, in any run            | 🔴 RED                                           |
+| 2   | A check was declared but did not run              | 🔴 RED                                           |
+| 3   | The transcript is not from a real agent run       | 🔴 RED                                           |
+| 4   | An admitted case failed all three runs (below)    | 🔴 RED, unless it is a new `expected: fail` case |
+| 5   | An `expected: fail` case passed                   | 🔴 RED, and flip the marker                      |
+| 6   | Judged scores below `main`'s baseline             | 🔴 once baselines exist; advisory until then     |
+| 7   | None of the above                                 | 🟢 GREEN                                         |
+| n/a | Infrastructure failed (stockout, no results back) | ⚪ Nobody is blocked                             |
 
-The ordering encodes two rules: authority outranks quality, and absence of evidence outranks presence of excuses.
+Four notes on that table. Rung 1 is absolute: nothing absorbs it, not even an `expected: fail` marker. Rung 2 means coverage came back below 1.0 or a score would not parse, and no evidence blocks rather than passing quietly. Rung 5 is not a punishment, since that flip is the improvement being claimed. An infrastructure failure is reported to the eval-infrastructure owner rather than to the author, unless every case hit it, which reds the job.
+
+The order encodes two rules: authority outranks quality, and absence of evidence outranks presence of excuses.
 
 #### Scaling to hundreds of cases
 
