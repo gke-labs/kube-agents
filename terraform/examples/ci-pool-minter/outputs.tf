@@ -21,8 +21,8 @@ output "manual_steps" {
   value       = <<-EOT
     1. Confirm the kube-agents-evals-token-minter App (ID 4675512) is
        installed on ${var.gitops_repo} with contents:write,
-       pull_requests:write and issues:write. It already is for both pool
-       projects; onboarding a THIRD project means adding its repository to
+       pull_requests:write and issues:write. It already is for all three pool
+       projects; onboarding a FOURTH project means adding its repository to
        that installation, and that edit is the security review. This — not
        the minty rule, and not hack/ci-deploy.sh — is what bounds where a run
        can write, because a token the App mints can only ever reach
