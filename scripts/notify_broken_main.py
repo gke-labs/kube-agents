@@ -104,36 +104,6 @@ LABEL = "ci:main-broken"
 LABEL_COLOR = "d73a4a"
 LABEL_DESCRIPTION = "A required check is failing on main"
 
-REQUEST_ATTEMPTS = 3
-REQUEST_RETRY_SECONDS = 5
-# A `Retry-After` GitHub asks for is honoured up to this; beyond it the job would
-# sit burning runner minutes for news that the next run will carry anyway.
-REQUEST_RETRY_CEILING = 60
-
-
-def log(message):
-    print(message, file=sys.stderr, flush=True)
-
-
-def _rate_limited(error):
-    """Whether a 403 is GitHub throttling rather than refusing.
-
-    A secondary rate limit comes back as 403, not 429, and is the one 4xx worth
-    retrying on a write path. It carries `Retry-After`, or an exhausted primary
-    quota; a permissions 403 carries neither, so this does not turn a missing
-    `issues: write` into fifteen seconds of retries.
-    """
-    headers = error.headers or {}
-    return headers.get("Retry-After") is not None or headers.get("x-ratelimit-remaining") == "0"
-
-
-def _retry_delay(error):
-    """`Retry-After` when GitHub names one, capped, else the fixed backoff."""
-    requested = (error.headers or {}).get("Retry-After")
-    if requested and str(requested).strip().isdigit():
-        return min(int(str(requested).strip()), REQUEST_RETRY_CEILING)
-    return REQUEST_RETRY_SECONDS
-
 
 # --------------------------------------------------------------------------- #
 # Deciding whether there is anything to say
