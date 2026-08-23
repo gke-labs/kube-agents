@@ -14,10 +14,16 @@ recovers, which does the same thing more slowly.
 
 import json
 import re
+import sys
 import unittest
 import urllib.error
 import urllib.parse
+from pathlib import Path
 from unittest import mock
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 import notify_broken_main as notifier
 

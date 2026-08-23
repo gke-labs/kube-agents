@@ -71,7 +71,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-API_ROOT = "https://api.github.com"
+from github_api import (
+    API_ROOT,
+    REQUEST_ATTEMPTS,
+    REQUEST_RETRY_CEILING,
+    REQUEST_RETRY_SECONDS,
+    GitHubAPI as BaseGitHubAPI,
+    _rate_limited,
+    _retry_delay,
+    log,
+)
 
 # How a run says "main does not build". `cancelled` and `skipped` are not here:
 # the first is the concurrency group superseding a run, the second a path filter
@@ -374,59 +383,24 @@ def render_comment(notification, repo):
 # --------------------------------------------------------------------------- #
 
 
-class GitHubAPI:
-    def __init__(self, repo, token, root=API_ROOT, opener=urllib.request.urlopen, sleep=time.sleep):
-        self.repo = repo
-        self.token = token
-        self.root = root
-        self.opener = opener
-        self.sleep = sleep
-
-    def request(self, method, path, payload=None, tolerate=()):
-        """One API call, retried on the failures that are worth retrying.
-
-        A dropped write is the failure this whole script exists to prevent -- an
-        issue that never opened, or worse, one that never closed -- so a 5xx, a
-        429, and the 403 form of a secondary rate limit each get three attempts,
-        honouring `Retry-After` when GitHub sends one. A 403 that is really a
-        missing permission is not retried. `tolerate` names status codes the
-        caller has a meaning for; they come back as None instead of raising.
-        """
-        body = None if payload is None else json.dumps(payload).encode()
-        for attempt in range(1, REQUEST_ATTEMPTS + 1):
-            request = urllib.request.Request(
-                f"{self.root}{path}",
-                method=method,
-                data=body,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "kube-agents-notify-broken-main",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-            )
-            try:
-                with self.opener(request) as response:
-                    raw = response.read()
-                return json.loads(raw) if raw else None
-            except urllib.error.HTTPError as error:
-                if error.code in tolerate:
-                    return None
-                retryable = error.code == 429 or 500 <= error.code < 600 or (error.code == 403 and _rate_limited(error))
-                if not retryable or attempt == REQUEST_ATTEMPTS:
-                    raise
-                log(f"{method} {path} returned {error.code}; retrying ({attempt}/{REQUEST_ATTEMPTS})")
-                delay = _retry_delay(error)
-            except urllib.error.URLError as error:
-                if attempt == REQUEST_ATTEMPTS:
-                    raise
-                log(f"{method} {path} unreachable ({error.reason}); retrying ({attempt}/{REQUEST_ATTEMPTS})")
-                delay = REQUEST_RETRY_SECONDS
-            self.sleep(delay)
-
-    def get(self, path):
-        return self.request("GET", path)
+class GitHubAPI(BaseGitHubAPI):
+    def __init__(
+        self,
+        repo,
+        token,
+        root=API_ROOT,
+        user_agent="kube-agents-notify-broken-main",
+        opener=urllib.request.urlopen,
+        sleep=time.sleep,
+    ):
+        super().__init__(
+            repo=repo,
+            token=token,
+            root=root,
+            user_agent=user_agent,
+            opener=opener,
+            sleep=sleep,
+        )
 
     def run(self, run_id):
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}")
