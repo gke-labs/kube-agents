@@ -450,7 +450,7 @@ INVALIDATE_MCP_SCRIPT="/opt/defaults/scripts/invalidate_mcp_cache.py"
 if [ -f "$INVALIDATE_MCP_SCRIPT" ]; then
     PYTHON="python3"
     [ -x "$INSTALL_DIR/.venv/bin/python3" ] && PYTHON="$INSTALL_DIR/.venv/bin/python3"
-    "$PYTHON" "$INVALIDATE_MCP_SCRIPT" "$TARGET_DIR" 2>/dev/null \
+    "$PYTHON" "$INVALIDATE_MCP_SCRIPT" "$TARGET_DIR" \
         || echo "WARN: could not invalidate local MCP schema caches; upgraded tools may not be discovered" >&2
 fi
 

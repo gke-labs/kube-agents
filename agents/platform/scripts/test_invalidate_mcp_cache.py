@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -9,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from invalidate_mcp_cache import (
+    CacheInvalidationError,
     invalidate_all_mcp_caches,
     invalidate_cache_file,
     is_local_mcp_server,
@@ -85,6 +87,13 @@ class InvalidateMcpCacheTest(unittest.TestCase):
             with self.assertRaises(json.JSONDecodeError):
                 invalidate_cache_file(cache_file)
 
+    def test_invalidate_cache_file_non_dict_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "mcp_schema_cache.json"
+            cache_file.write_text("[\"item\"]", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                invalidate_cache_file(cache_file)
+
     def test_invalidate_all_mcp_caches_scans_root_and_profiles(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -130,6 +139,43 @@ class InvalidateMcpCacheTest(unittest.TestCase):
             with open(cluster_cache_file, "r", encoding="utf-8") as f:
                 self.assertEqual({"gke": {"fingerprint": "555"}}, json.load(f))
 
+    def test_invalidate_all_mcp_caches_corrupted_file_deletes_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            # 1. Corrupted root cache
+            root_cache_dir = root / "cache"
+            root_cache_dir.mkdir(parents=True)
+            root_cache_file = root_cache_dir / "mcp_schema_cache.json"
+            root_cache_file.write_text("corrupted-json{", encoding="utf-8")
+
+            # 2. Healthy platform profile cache
+            platform_cache_dir = root / "profiles" / "platform" / "cache"
+            platform_cache_dir.mkdir(parents=True)
+            platform_cache_file = platform_cache_dir / "mcp_schema_cache.json"
+            with open(platform_cache_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "platform_control": {"fingerprint": "333"},
+                        "developer_knowledge": {"fingerprint": "444"},
+                    },
+                    f,
+                )
+
+            err_stream = io.StringIO()
+            with patch("sys.stderr", err_stream):
+                with self.assertRaises(CacheInvalidationError) as ctx:
+                    invalidate_all_mcp_caches(root)
+
+            # Assert root cache was unlinked and stderr logged
+            self.assertFalse(root_cache_file.exists())
+            self.assertIn("unreadable cache", err_stream.getvalue())
+
+            # Assert platform profile cache was still processed despite root cache error
+            self.assertEqual({"platform": ["platform_control"]}, ctx.exception.results)
+            with open(platform_cache_file, "r", encoding="utf-8") as f:
+                self.assertEqual({"developer_knowledge": {"fingerprint": "444"}}, json.load(f))
+
     def test_main_cli(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -144,6 +190,23 @@ class InvalidateMcpCacheTest(unittest.TestCase):
 
             with open(cache_file, "r", encoding="utf-8") as f:
                 self.assertEqual({}, json.load(f))
+
+    def test_main_cli_corrupted_cache_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            cache_dir.mkdir(parents=True)
+            cache_file = cache_dir / "mcp_schema_cache.json"
+            cache_file.write_text("corrupted{", encoding="utf-8")
+
+            err_stream = io.StringIO()
+            with patch("sys.stderr", err_stream):
+                with patch.object(sys, "argv", ["invalidate_mcp_cache.py", str(root)]):
+                    with self.assertRaises(SystemExit) as cm:
+                        main()
+                    self.assertEqual(cm.exception.code, 1)
+
+            self.assertFalse(cache_file.exists())
 
 
 if __name__ == "__main__":

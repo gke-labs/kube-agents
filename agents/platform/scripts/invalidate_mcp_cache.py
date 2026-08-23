@@ -19,6 +19,14 @@ from pathlib import Path
 KNOWN_LOCAL_MCP_SERVERS = frozenset({"platform_control", "router"})
 
 
+class CacheInvalidationError(RuntimeError):
+    """Raised when one or more MCP schema caches could not be invalidated cleanly."""
+
+    def __init__(self, message: str, results: dict[str, list[str]] | None = None):
+        super().__init__(message)
+        self.results = results or {}
+
+
 def is_local_mcp_server(server_name: str, config: dict | None = None) -> bool:
     """Return True if the MCP server is locally hosted rather than a remote proxy."""
     if server_name in KNOWN_LOCAL_MCP_SERVERS:
@@ -65,7 +73,7 @@ def invalidate_cache_file(cache_file: Path, mcp_configs: dict[str, dict] | None 
     with open(cache_file, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
-        return []
+        raise ValueError(f"schema cache {cache_file} root is not a JSON object")
 
     removed: list[str] = []
     for server_name in list(data.keys()):
@@ -89,33 +97,55 @@ def invalidate_cache_file(cache_file: Path, mcp_configs: dict[str, dict] | None 
 def invalidate_all_mcp_caches(target_dir: Path) -> dict[str, list[str]]:
     """Scan root and all profile directories under target_dir and invalidate local MCP caches."""
     results: dict[str, list[str]] = {}
+    failed = False
 
-    # 1. Root / default profile cache
+    targets: list[tuple[str, Path, dict[str, dict]]] = []
     root_cache = target_dir / "cache" / "mcp_schema_cache.json"
-    root_configs = get_profile_mcp_configs(target_dir)
-    removed_root = invalidate_cache_file(root_cache, root_configs)
-    if removed_root:
-        results["default"] = removed_root
+    if root_cache.is_file():
+        targets.append(("default", root_cache, get_profile_mcp_configs(target_dir)))
 
-    # 2. Named profiles under profiles/
     profiles_dir = target_dir / "profiles"
     if profiles_dir.is_dir():
         for p in sorted(profiles_dir.iterdir()):
             if p.is_dir():
                 p_cache = p / "cache" / "mcp_schema_cache.json"
-                p_configs = get_profile_mcp_configs(p)
-                removed_p = invalidate_cache_file(p_cache, p_configs)
-                if removed_p:
-                    results[p.name] = removed_p
+                if p_cache.is_file():
+                    targets.append((p.name, p_cache, get_profile_mcp_configs(p)))
+
+    for profile_name, cache_file, configs in targets:
+        try:
+            removed = invalidate_cache_file(cache_file, configs)
+            if removed:
+                results[profile_name] = removed
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            print(f"unreadable cache {cache_file}: {e}; deleting", file=sys.stderr)
+            try:
+                cache_file.unlink(missing_ok=True)
+            except OSError as unlink_err:
+                print(f"could not delete corrupt cache {cache_file}: {unlink_err}", file=sys.stderr)
+            failed = True
+
+    if failed:
+        raise CacheInvalidationError("failed to invalidate one or more MCP schema caches", results=results)
 
     return results
 
 
-def main():
+def main() -> None:
     target_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(os.environ.get("PLATFORM_AGENT_HOME", "/opt/data"))
-    results = invalidate_all_mcp_caches(target_path)
+    results: dict[str, list[str]] = {}
+    failed = False
+    try:
+        results = invalidate_all_mcp_caches(target_path)
+    except CacheInvalidationError as e:
+        results = e.results
+        failed = True
+
     for profile, servers in results.items():
         print(f"[ENTRYPOINT] Invalidated local MCP schema cache for profile '{profile}': {', '.join(servers)}")
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
