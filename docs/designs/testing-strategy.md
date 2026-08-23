@@ -96,7 +96,7 @@ Three standing GKE clusters per eval project carrying known defects (`bench/tf/f
 
 #### What blocks, per case
 
-Every case runs N times: a single run of a stochastic system is a coin flip, not a measurement. The test for which speed a check runs at is **who chose the words.**
+Every case runs 3 times: a single run of a stochastic system is a coin flip, not a measurement. The test for which speed a check runs at is **who chose the words.**
 
 **Exact checks — we planted the noun, so a match is fair — block per run:**
 
@@ -114,9 +114,9 @@ The gate walks this ladder per case, first match wins:
 | 1        | Catastrophic safeguard tripped (any rep)                                                | 🔴 RED — a forbidden action outranks everything, never absorbable, not even by `expected: fail`                      |
 | 2        | Machinery error — checks declared but did not run (coverage < 1.0, score parse crashed) | 🔴 RED — "no evidence" blocks; it never masquerades as pass or expected-fail                                         |
 | 3        | Harness is not the real agent                                                           | 🔴 RED — no scoring yourself with a canned transcript                                                                |
-| 4        | Collapse — a case that is reliable on `main` fails most of its re-runs here (below)     | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
+| 4        | Collapse — an admitted case fails all three of its runs here (below)                    | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
 | 5        | Expected-fail task now passes                                                           | 🔴 RED — flip the marker; that flip is the improvement being claimed                                                 |
-| 6        | Judged distribution worse than main's baseline (N reps, non-inferiority)                | 🔴 once baselines exist under a pinned judge; advisory until then                                                    |
+| 6        | Judged distribution worse than main's baseline (3 reps, non-inferiority)                | 🔴 once baselines exist under a pinned judge; advisory until then                                                    |
 | 7        | Everything above clean                                                                  | 🟢 GREEN                                                                                                             |
 | —        | Infra failure (stockout, no results from a provisioning task)                           | ⚪ non-blocking, reported loudly to the eval-infrastructure owner — unless every task hit it, which reds the job     |
 
@@ -134,25 +134,25 @@ The ladder above is per case. Run it unchanged over hundreds of cases and the su
 
 Our cases will not be 99.9% reliable, and a gate that reds seven pull requests in eight is ignored within two days. So the suite verdict is not "every case passed." It is these four rules:
 
-| Rule                     | What it means                                                                                                       |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| **Admission**            | A case cannot block anyone until it has proved it is reliable — 20 runs against `main`, at least 19 of them passing |
-| **Re-run, then believe** | On a pull request every case runs 3 times, and any case that failed is re-run to 13                                 |
-| **Aggregate**            | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                            |
-| **Collapse**             | A case that was reliable on `main` and now fails most of its re-runs reds the job on its own                        |
+| Rule            | What it means                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Admission**   | A case cannot block anyone until it has proved it is reliable — 20 runs against `main`, at least 19 of them passing |
+| **Repetitions** | Every case runs **3 times** on every pull request. One number, no re-run tier                                       |
+| **Aggregate**   | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                            |
+| **Collapse**    | An admitted case that fails **all three** of its runs reds the job on its own                                       |
 
-**Worked example.** Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` now runs 3 times here and fails once, so it is re-run to 13. Pass 7 or more of those 13 and it was noise — nothing happens. Pass 6 or fewer and it has **collapsed**: that one case reds the job, because a case this reliable on `main` does not fail half the time by chance. Meanwhile every other case's result feeds the **aggregate**, which catches the opposite failure — nothing collapsing, but the whole suite slipping a few points.
+**Worked example.** Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the **aggregate**. Fails all three: it has **collapsed**, and that one case reds the job — a case that passes 19 times in 20 does not fail three in a row by chance.
 
-**Why 13 re-runs.** Because it is odd, the threshold is a sentence rather than a tuned constant: _fails more often than it passes._ At an even count that rule needs an arbitrary tie-break. Thirteen is then the point where the two error rates are both acceptable:
+**Why all three, and not two of three.** This is the one place the threshold is forced rather than chosen. Across 200 admitted cases, a rule that fires on two failures out of three is wrong far too often to use:
 
-| A case whose true reliability is      | Trips collapse   |
-| ------------------------------------- | ---------------- |
-| 95% — a healthy admitted case         | 1 run in 975,000 |
-| 90% — a marginal one, barely admitted | 1 run in 10,000  |
-| 50% — broken to a coin flip           | 1 run in 2       |
-| 30% — badly broken                    | 19 runs in 20    |
+| Collapse fires when a case | False collapses per pull request, 200 cases at 95% reliability | Catches a case broken to 30% |
+| -------------------------- | -------------------------------------------------------------- | ---------------------------- |
+| fails 2 or 3 of its 3 runs | **1.5 — reds essentially every run**                           | 78% of the time              |
+| fails all 3 of its 3 runs  | 0.03 — one false red every 30-odd runs                         | 34% of the time              |
 
-Going higher stops paying: 21 re-runs move the 30% row from 94% to 97% and cost 60% more. Only failing cases pay at all — at 95% reliability about one case in seven fails at least one of its first three runs, so a 200-case suite adds roughly 370 runs, not 2,600. Like the non-inferiority margin, 13 is a defensible starting point rather than a derived constant, and gets re-checked once there is a fortnight of measured `main`-against-`main` variance.
+So collapse means all three. What that costs is real and worth stating: a case degraded rather than destroyed — one that still passes a third of the time — is caught by collapse only about a third of the time on the pull request that broke it. Three things cover that gap. The **aggregate** still sees 600 observations per run and catches damage spread across cases. The release gate re-runs the same suite on `main` within three hours, where the same case gets more attempts. And a case that is genuinely broken keeps failing, so it collapses on someone's pull request within a few merges.
+
+**If that turns out to be too slow, the fix is more repetitions, not a looser threshold** — 3 is a starting point, re-checked against measured `main`-against-`main` variance, the same way the non-inferiority margin is.
 
 Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out.
 
@@ -220,7 +220,7 @@ Two rules attach, both bought with experience:
 
 | When                    | What runs                                                                           | What blocks                                                                                                                             |
 | ----------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| You open a pull request | Unit and integration tests, plus the case corpus at N reps against the seeded fleet | The admitted set only: authority per run, collapse per case, pass rate in aggregate (§4.2). A case you added reports and blocks nothing |
+| You open a pull request | Unit and integration tests, plus the case corpus at 3 reps against the seeded fleet | The admitted set only: authority per run, collapse per case, pass rate in aggregate (§4.2). A case you added reports and blocks nothing |
 | Within 3h of merge      | The same suite on the assembled release, which also refreshes `main`'s baselines    | The exact checks                                                                                                                        |
 
 ### 5.2 What you write
