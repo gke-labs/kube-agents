@@ -52,9 +52,14 @@ terraform apply -var="project_id=${PROJECT_ID}"
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
   ```
-- **Cloud Build Service Account** (`${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`):
+- **The build identity** — the Compute Engine default service account, `${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`:
   - `roles/artifactregistry.writer` in `${PROJECT_ID}` (to push PR build images).
-  - `roles/artifactregistry.reader` in `kube-agents-prow` (to pull the warm `:latest` cache image).
+  - `roles/artifactregistry.reader` on the `us/kube-agents` repository in `kube-agents-prow` (to pull the warm `:latest` cache image). **Provisioned by [`terraform/examples/ci-pool-registry-access`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/ci-pool-registry-access)**, once per pool project, by someone holding `setIamPolicy` on `kube-agents-prow` — a different right from everything else on this page, all of which is confined to the pool project.
+
+  It is the Compute Engine default service account and **not** `${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`, which this page named until 2026-08-23. `hack/ci-deploy.sh` runs `gcloud builds submit --project="${PROJECT_ID}"` — the _leased_ project, not `kube-agents-prow` — and `deploy/docker/cloudbuild-ci.yaml` declares no `serviceAccount:`, so the build runs as the leased project's Compute Engine default SA. Pulling the cache image is therefore a cross-project read performed by the leased project's identity, which is why that second grant is made on a repository in `kube-agents-prow` and cannot be made anywhere in `${PROJECT_ID}`. The legacy `@cloudbuild` account still appears in the live policy for the first pool project; it is residue, and granting it does nothing, because no build assumes it.
+
+  **What a missing reader grant looks like.** The `warm-cache` step of `cloudbuild-ci.yaml` retries `docker pull` three times, each denied with `Permission 'artifactregistry.repositories.downloadArtifacts' denied`, and then cold-builds all three images because `_REQUIRE_CACHE` defaults to `false` — so the run is far slower and can trip the config's `3600s` ceiling outright, and with `_REQUIRE_CACHE=true` it fails at that step instead. Either way it reads as a flake rather than as a missing grant, because the failure follows the _project_ and not the pull request: a re-run that leases a project which does hold the grant passes unchanged, and nothing is missing from the pool project's own configuration. `kube-agents-evals-3` was registered without it on 2026-08-21 and degraded roughly a third of every presubmit run in the repository.
+
 - **GKE Node Service Account**:
   - `roles/artifactregistry.reader` in `${PROJECT_ID}` to pull operator and agent images.
 

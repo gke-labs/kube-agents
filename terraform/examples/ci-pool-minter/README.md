@@ -10,6 +10,8 @@ This is not an installer. The pool projects already have their `platform-agent-h
 
 Use [`terraform/examples/full-install`](../full-install/README.md) instead for a whole environment; that composition already includes the same module behind `enable_github_minter`.
 
+**This is not the only composition to apply when onboarding a pool project.** [`terraform/examples/ci-pool-registry-access`](../ci-pool-registry-access/README.md) grants the project's build identity read access to the warm build-cache image in `kube-agents-prow`, and is deliberately kept out of this state rather than folded in here. Two reasons, both concrete: it writes to a project this composition has no business touching, so merging them would require every minter apply to carry IAM-admin on the shared cache project; and `project_id` is force-new here, so an apply against the wrong workspace would then revoke a working project's cache access on top of destroying its minter. The onboarding checklist that names both is the [CI pool project prerequisites](../../../docs/site/src/content/docs/deploy/ci-pool-projects.md) page.
+
 ## Why one apply per project
 
 Each pool project gets its **own** private GitOps repository, and the minty rule the chart renders scopes tokens to exactly that one repository, keyed on that project's agent GSA. Two leases therefore cannot reach each other's repository, cannot share a ledger issue, and cannot race on a remediation branch. The resources are per-project (a KMS key ring is not shareable across projects), so the composition is applied once per project with its own state.

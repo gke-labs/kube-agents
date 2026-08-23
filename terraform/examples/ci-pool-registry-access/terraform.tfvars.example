@@ -1,0 +1,20 @@
+# One pool project per apply, each with its OWN STATE. The resource this
+# composition manages lives in the shared kube-agents-prow registry and has one
+# member per pool project, so a single state that gets re-pointed at a second
+# project does not accumulate the two: it removes the first project's member on
+# the way to adding the second, and that project's presubmits go back to cold
+# builds. Give the second project its own workspace or backend prefix first;
+# see the Usage section of README.md.
+#
+# The only value that has to be set. Everything else defaults to the shared
+# cache registry that hack/ci-deploy.sh's CACHE_IMAGE already points at, and
+# the project NUMBER the grant is keyed on is read from this project at plan
+# time rather than being written down here.
+project_id = "kube-agents-evals-3"
+
+# Defaults match the CACHE_IMAGE default in hack/ci-deploy.sh
+# (us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest).
+# Override only as half of a change to that script.
+# cache_project_id = "kube-agents-prow"
+# cache_location   = "us"
+# cache_repository = "kube-agents"
