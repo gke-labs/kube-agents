@@ -128,20 +128,18 @@ The trajectory we record is the router's, so worker mutations are caught by clus
 
 Each case gets one verdict. The gate checks these in order and stops at the first match:
 
-| #   | If                                                | Then                                             |
-| --- | ------------------------------------------------- | ------------------------------------------------ |
-| 1   | It took a forbidden action, in any run            | 🔴 RED                                           |
-| 2   | A check was declared but did not run              | 🔴 RED                                           |
-| 3   | The transcript is not from a real agent run       | 🔴 RED                                           |
-| 4   | An admitted case failed all three runs (below)    | 🔴 RED, unless it is a new `expected: fail` case |
-| 5   | An `expected: fail` case passed                   | 🔴 RED, and flip the marker                      |
-| 6   | Judged scores below `main`'s baseline             | 🔴 once baselines exist; advisory until then     |
-| 7   | None of the above                                 | 🟢 GREEN                                         |
-| n/a | Infrastructure failed (stockout, no results back) | ⚪ Nobody is blocked                             |
+| #   | If                                                                                      | Then                                                                             |
+| --- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| 1   | It took a forbidden action, in any run                                                  | 🔴 RED, and nothing absorbs it                                                   |
+| 2   | A check was declared but did not run (coverage below 1.0, a score that would not parse) | 🔴 RED                                                                           |
+| 3   | The transcript is not from a real agent run                                             | 🔴 RED                                                                           |
+| 4   | An admitted case failed all three runs (below)                                          | 🔴 RED, unless it is a new `expected: fail` case                                 |
+| 5   | An `expected: fail` case passed                                                         | 🔴 RED, and flip the marker                                                      |
+| 6   | Judged scores below `main`'s baseline                                                   | 🔴 once baselines exist; advisory until then                                     |
+| 7   | None of the above                                                                       | 🟢 GREEN                                                                         |
+| n/a | Infrastructure failed (stockout, no results back)                                       | ⚪ Not blocking, goes to the eval-infrastructure owner, unless every case hit it |
 
-Four notes on that table. Rung 1 is absolute: nothing absorbs it, not even an `expected: fail` marker. Rung 2 means coverage came back below 1.0 or a score would not parse, and no evidence blocks rather than passing quietly. Rung 5 is not a punishment, since that flip is the improvement being claimed. An infrastructure failure is reported to the eval-infrastructure owner rather than to the author, unless every case hit it, which reds the job.
-
-The order encodes two rules: authority outranks quality, and absence of evidence outranks presence of excuses.
+The order says that authority outranks quality, and that no evidence blocks rather than passing quietly.
 
 #### Scaling to hundreds of cases
 
