@@ -449,6 +449,38 @@ class ConversationContextTest(_Harness):
         row = self.poll_threads(provider)["conversations"][0]["comments"][0]
         self.assertNotIn("truncated_chars", row)
 
+    def test_a_long_request_is_truncated_and_reports_truncated_chars(self):
+        long_req = "x" * (helper.CONTEXT_MAX_REQUEST_CHARS + 300)
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", f"/agent {long_req}")]}
+        )
+        data = self.poll_threads(provider)
+        req_row = data["requests"][0]
+        self.assertEqual(len(req_row["request"]), helper.CONTEXT_MAX_REQUEST_CHARS)
+        self.assertEqual(req_row["truncated_chars"], 300)
+
+    def test_a_short_request_is_not_marked_truncated(self):
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", "/agent please fix tests")]}
+        )
+        data = self.poll_threads(provider)
+        req_row = data["requests"][0]
+        self.assertEqual(req_row["request"], "please fix tests")
+        self.assertNotIn("truncated_chars", req_row)
+
+    def test_requests_are_capped_to_context_max_requests(self):
+        comments = [
+            make_comment(
+                f"IC_{n:03d}", f"/agent task {n}", created_at=f"2026-08-12T{n // 60:02d}:{n % 60:02d}:00Z"
+            )
+            for n in range(helper.CONTEXT_MAX_REQUESTS + 15)
+        ]
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        data = self.poll_threads(provider)
+        self.assertEqual(len(data["requests"]), helper.CONTEXT_MAX_REQUESTS)
+        self.assertEqual(data["requests"][0]["comment_id"], "IC_000")
+        self.assertEqual(data["requests"][-1]["comment_id"], f"IC_{helper.CONTEXT_MAX_REQUESTS - 1:03d}")
+
     def test_a_long_thread_keeps_the_recent_end_and_counts_what_it_dropped(self):
         comments = [
             make_comment(
