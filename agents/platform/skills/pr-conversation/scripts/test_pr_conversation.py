@@ -476,10 +476,13 @@ class ConversationContextTest(_Harness):
             for n in range(helper.CONTEXT_MAX_REQUESTS + 15)
         ]
         provider = FakeProvider(prs=[make_pr()], comments={12: comments})
-        data = self.poll_threads(provider)
+        err = StringIO()
+        with redirect_stderr(err):
+            data = self.poll_threads(provider)
         self.assertEqual(len(data["requests"]), helper.CONTEXT_MAX_REQUESTS)
         self.assertEqual(data["requests"][0]["comment_id"], "IC_000")
         self.assertEqual(data["requests"][-1]["comment_id"], f"IC_{helper.CONTEXT_MAX_REQUESTS - 1:03d}")
+        self.assertIn("15 request(s) deferred", err.getvalue())
 
     def test_a_long_thread_keeps_the_recent_end_and_counts_what_it_dropped(self):
         comments = [
@@ -562,13 +565,26 @@ def answerable(prs=None, request="/agent bump to 4", **kwargs):
 
 
 class ReplyTest(_Harness):
-    def _reply(self, provider, body="Bumped it to 4.", command="reply"):
+    def _reply(self, provider, body="Bumped it to 4.", command="reply", comment_id="IC_1"):
         path = self.scratch_file("reply.md", body)
         return self.run_helper(
-            [command, "--pr", "12", "--comment-id", "IC_1", "--body-file", path]
+            [command, "--pr", "12", "--comment-id", comment_id, "--body-file", path]
             + (["--no-change"] if command == "reply" else []),
             provider,
         )
+
+    def test_reply_can_answer_a_request_past_the_poll_cap(self):
+        comments = [
+            make_comment(
+                f"IC_{n:03d}", f"/agent task {n}", created_at=f"2026-08-12T{n // 60:02d}:{n % 60:02d}:00Z"
+            )
+            for n in range(helper.CONTEXT_MAX_REQUESTS + 5)
+        ]
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        target_id = f"IC_{helper.CONTEXT_MAX_REQUESTS + 2:03d}"
+        self._reply(provider, comment_id=target_id)
+        self.assertEqual(len(provider.posted), 1)
+        self.assertIn(f"<!-- agent-answered:{target_id} -->", provider.posted[0][1])
 
     def test_the_marker_is_appended_by_the_helper(self):
         """The model cannot forget it, because the model does not write it."""

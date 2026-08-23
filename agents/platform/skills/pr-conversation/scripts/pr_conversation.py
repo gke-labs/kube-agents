@@ -190,8 +190,6 @@ def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
         if truncated:
             row["truncated_chars"] = truncated
         requests.append(row)
-    if len(requests) > CONTEXT_MAX_REQUESTS:
-        requests = requests[:CONTEXT_MAX_REQUESTS]
     return comments, requests
 
 
@@ -333,6 +331,7 @@ def handle_poll(args) -> int:
         found = []
         threads = []
         over_budget = 0
+        deferred_requests = 0
         for repo, pr in prs:
             comments, pr_requests = _requests_on(provider, repo, pr, viewer)
             # Untrusted requests past this pull request's refusal budget are not
@@ -352,6 +351,10 @@ def handle_poll(args) -> int:
                 ]
                 over_budget += len(pr_requests) - len(kept)
                 pr_requests = kept
+            if len(pr_requests) > CONTEXT_MAX_REQUESTS:
+                deferred_count = len(pr_requests) - CONTEXT_MAX_REQUESTS
+                deferred_requests += deferred_count
+                pr_requests = pr_requests[:CONTEXT_MAX_REQUESTS]
             if not pr_requests:
                 # No thread without a request in it: the worker is answering
                 # something, and a transcript of a pull request nobody addressed
@@ -376,6 +379,11 @@ def handle_poll(args) -> int:
         sys.stderr.write(
             f"pr_conversation: {over_budget} untrusted request(s) not offered — "
             "the pull request's refusal budget is spent\n"
+        )
+    if deferred_requests:
+        sys.stderr.write(
+            f"pr_conversation: {deferred_requests} request(s) deferred — "
+            f"poll offers at most {CONTEXT_MAX_REQUESTS} per pull request\n"
         )
 
     if not found:
