@@ -2143,6 +2143,10 @@ def strip_fenced_blocks(text: str) -> str:
     and GitHub both render as literal text inside the enclosing block — reads
     as a closer, the block ends four lines early, and the `/remediate` the
     author put inside it to talk *about* fires as a command.
+
+    Stripped lines are replaced with blank lines rather than deleted, preserving
+    line boundaries so that a code fence interrupts enclosing paragraphs and
+    subsequent commands are not swallowed by upstream paragraph continuation.
     """
     if not text:
         return ""
@@ -2159,11 +2163,13 @@ def strip_fenced_blocks(text: str) -> str:
             ):
                 fence_char = ""
                 fence_len = 0
+            out.append("")
             continue
         match = FENCE_OPEN_RE.match(line)
         if match:
             fence_char = match.group(1)[0]
             fence_len = len(match.group(1))
+            out.append("")
             continue
         out.append(line)
     return "\n".join(out)
@@ -2176,25 +2182,41 @@ def strip_block_quotes(text: str) -> str:
     subsequent non-blank lines that continue the paragraph without a `>` prefix
     are lazy continuation lines that render inside the enclosing block quote.
 
-    Lazy continuation ends when:
-    1. A blank line appears.
+    Lazy continuation applies only to an open paragraph within the block quote.
+    It ends when:
+    1. An empty or blank line appears (unprefixed, or a `>`-only line inside the quote).
     2. A line starts with another block structure (code fence, heading, HR, list item, or new quote).
+    3. A non-paragraph block inside the block quote (such as a fenced code block or list) closes or ends.
     """
     if not text:
         return ""
     out: list[str] = []
-    in_quote = False
+    in_quote_paragraph = False
     for line in text.split("\n"):
         if BLOCKQUOTE_OPEN_RE.match(line):
-            in_quote = True
+            # A line starting with '>' is part of a blockquote and is stripped.
+            # Determine whether this line opens/continues a paragraph or closes/resets it.
+            rest = line.lstrip()[1:]  # content after '>'
+            if not rest.strip():
+                # A blank line inside the quote (e.g. '>' or '> ') terminates
+                # any open paragraph, so following lines cannot lazily continue.
+                in_quote_paragraph = False
+            elif PARAGRAPH_BREAK_RE.match(rest.lstrip()):
+                # A block starter inside the quote (fence, heading, HR, list)
+                # interrupts paragraph continuation.
+                in_quote_paragraph = False
+            else:
+                in_quote_paragraph = True
             continue
+
         if not line.strip():
-            in_quote = False
+            in_quote_paragraph = False
             out.append(line)
             continue
-        if in_quote:
+
+        if in_quote_paragraph:
             if PARAGRAPH_BREAK_RE.match(line):
-                in_quote = False
+                in_quote_paragraph = False
                 out.append(line)
             else:
                 # Lazy continuation line inside the block quote

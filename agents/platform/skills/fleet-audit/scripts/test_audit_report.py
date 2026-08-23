@@ -4165,6 +4165,30 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, ["netpol-missing"])
         self.assertEqual(refusals, [])
 
+    def test_a_command_after_empty_quote_line_fires(self):
+        body = "> The audit flagged netpol-missing.\n>\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_fenced_block_outside_quote_fires(self):
+        body = "> Quoting the report:\n```yaml\nreplicas: 2\n```\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_fenced_block_inside_quote_fires(self):
+        body = "> ```yaml\n> replicas: 2\n> ```\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_inside_fenced_block_inside_quote_never_fires(self):
+        body = "> ```yaml\n> /remediate netpol-missing\n> ```\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -6328,6 +6352,22 @@ class TestBlockQuoteScanning(unittest.TestCase):
 
     def test_a_blank_line_terminates_lazy_continuation(self):
         out = self.strip("> Quote header:\n\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_quote_line_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n>\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_quote_line_with_spaces_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n>   \n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_fence_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n```yaml\nfoo: bar\n```\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_fence_inside_quote_terminates_lazy_continuation(self):
+        out = self.strip("> ```yaml\n> foo: bar\n> ```\n/remediate real")
         self.assertIn("/remediate real", out)
 
     def test_a_heading_terminates_lazy_continuation(self):
