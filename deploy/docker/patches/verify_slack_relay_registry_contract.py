@@ -54,6 +54,8 @@ import os
 import subprocess
 import sys
 
+from typing import Any
+
 # Never dialled: every check here stops short of a request. It only has to look
 # like a configured relay to ``relay_without_token()``.
 RELAY_URL = "http://127.0.0.1:8765"
@@ -140,8 +142,21 @@ UPSTREAM_SIGNATURES = {
     ),
 }
 
+# Default values the relay patches depend on. Keyed by (callable label, parameter name).
+# Only reimplemented methods where a changed upstream default creates silent drift
+# are pinned here; delegating wrappers (PlatformRegistry.register, create_adapter)
+# pass through arguments unchanged and are exempt from default pinning.
+PINNED_DEFAULTS: dict[tuple[str, str], object] = {
+    ("SlackAdapter.connect", "is_reconnect"): False,
+    ("GoogleChatAdapter.connect", "is_reconnect"): False,
+    ("SlackAdapter._download_slack_file", "audio"): False,
+    ("SlackAdapter._download_slack_file", "team_id"): None,
+    ("SlackAdapter._download_slack_file_bytes", "team_id"): None,
+    ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): "",
+}
 
-def upstream_callables() -> dict[str, object]:
+
+def upstream_callables() -> dict[str, Any]:
     """Resolve every pinned callable out of the image's own Hermes tree."""
     from gateway.platform_registry import PlatformRegistry
     from plugins.platforms.google_chat import adapter as google_chat_adapter
@@ -284,6 +299,22 @@ def unwired() -> int:
 
     for label, func in upstream_callables().items():
         check(f"upstream signature: {label}", shape(func), UPSTREAM_SIGNATURES[label])
+
+    for (label, param_name), expected_default in PINNED_DEFAULTS.items():
+        func = upstream_callables()[label]
+        sig = inspect.signature(func)
+        param = sig.parameters.get(param_name)
+        if param is None:
+            fail(
+                f"upstream default: {label}({param_name})",
+                "parameter missing from signature",
+            )
+        else:
+            check(
+                f"upstream default: {label}({param_name})",
+                param.default,
+                expected_default,
+            )
 
     os.environ["SLACK_RELAY_URL"] = RELAY_URL
     # No token anywhere: the credential proxy holds the only one, and that is
