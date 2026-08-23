@@ -1,6 +1,6 @@
 # kube-agents Testing Strategy
 
-> **STATUS — draft.** §1–§3 establish what the product is, why testing it is not like testing ordinary software, and the three questions every test should answer. §4 proposes the four tiers that answer them, and §5 is what that means for someone adding a feature. Unit tests are real; presubmit and the release gate are one test each; nightly does not exist yet.
+> **STATUS — draft.** §1–§3 establish what the product is, why testing it is not like testing ordinary software, and the three questions every test should answer. §4 proposes the tiers that answer them, and §5 is what that means for someone adding a feature. Unit tests are real and the integration tier gates; the seeded fleet is applied and standing; presubmit runs two tasks and still blocks nothing; the release gate is one test. Nightly is **deferred** — §4.4 keeps the design on the record, but nothing is being built there this cycle, and the zero-cost landing tier it was going to provide is now the unadmitted state in §4.2.
 
 ## 1. What we are building
 
@@ -60,7 +60,7 @@ Each tier adds what the one before could not afford.
 
 ```mermaid
 flowchart LR
-    U["<b>Unit</b><br/>every PR<br/>no cluster"] --> I["<b>Integration</b><br/>every PR<br/>real seams, fake agent"] --> P["<b>Presubmit evals</b><br/>every PR<br/>warm-pool fleets"] --> G["<b>Release gate</b><br/>every 3h<br/>built images"] --> N["<b>Nightly</b><br/>nightly<br/>own clusters"]
+    U["<b>Unit</b><br/>every PR<br/>no cluster"] --> I["<b>Integration</b><br/>every PR<br/>real seams, fake agent"] --> P["<b>Presubmit evals</b><br/>every PR<br/>standing seeded fleet"] --> G["<b>Release gate</b><br/>every 3h<br/>built images"] --> N["<b>Nightly</b><br/>deferred<br/>own clusters"]
 ```
 
 ### 4.1 Unit tests — have
@@ -90,7 +90,7 @@ The seam inventory — which boundaries, which fakes, which faults — lives in 
 
 Today a pull request gets its own namespace on a shared GKE cluster, a connectivity check that the runner can reach it, and one devops-bench task: `gpu-stress-test-diagnosis`, whose job goes red below a judged score of 0.7. **That is the whole behavioural presubmit, and it is advisory:** the Prow job is `optional: true` (too slow to gate merges on, per its own config), so nothing behavioural blocks a merge today. One task, one domain, a single LLM judgement against a fixed threshold — which is the part that flakes — and even that judgement only reports.
 
-Expand to **one scenario per domain** — the journeys a customer would notice within a day:
+Expand along two axes. First, **at least one scenario per domain** — the journeys a customer would notice within a day:
 
 | Domain                                                                            | Journey                                          | What must be true                                                                                                                                                                                                                         |
 | --------------------------------------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -109,13 +109,17 @@ Expand to **one scenario per domain** — the journeys a customer would notice w
 
 The last two rows are not domains. They are **failures a domain has to survive.** Refusal runs against all ten, silence against the seven audits that fire on a schedule.
 
+Second, **many cases per journey.** One per domain is a floor, not a ceiling. It establishes that a domain is covered at all (§3), but ten samples cannot characterise a stochastic system, and a customer journey has more than one way to go wrong. Because the fleet is standing and read-only, the expensive part is already paid: the marginal cost of one more case is a model call, not a cluster. A **case** is therefore a question against a named fixture plus what the answer must contain — cheap enough that hundreds are practical, and cheap enough that the author of a behaviour change writes one as a matter of course rather than as a favour (§5). The suite is measured in cases; the domain remains the unit that coverage and regressions are reported against.
+
 #### The seeded fleet
 
 **Run them against a real fleet, not a fresh-per-run one.** These audits need a real fleet to look at, and re-planting defects per run makes the fixture the flakiest part of the test. The fleet is therefore a **golden template**: a Terraform stack of three GKE clusters carrying known defects, three because the drift audit's baseline is the fleet majority and two clusters have no majority.
 
 - Seeded with defects the audits' own SOPs demonstrably flag — an over-permissioned ClusterRoleBinding, a two-replica Deployment with no PDB, a saturated single-zone pool with a live Pending backlog, an idle pool, a control plane derived one minor behind, an authorized-networks outlier. Planting a defect the SOP cannot detect is the reviewable mistake.
 - Because we planted them, we know what a correct audit says, so the assertions that matter can be exact rather than judged.
-- **Isolation comes from a warm pool, not from a read-only rule.** A janitor keeps a pool of pre-provisioned fleet copies in leased projects (Boskos, the mechanism issue 637 introduces); a pull-request run checks out disposable fleets, mutates them freely, and returns them for recycling. Mutation and remediation scenarios are therefore presubmit-eligible; only scenarios that must build a cluster from nothing, or exceed the wall-clock budget, belong to §4.4. The presubmit budget is two hours of wall-clock; compute is deliberately not the constraint.
+- **Isolation comes from the agent being read-only, not from disposable copies.** The agent holds no write path to a cluster: it reports, and it proposes fixes as pull requests against a GitOps repository. So the fleet is a standing stack — `bench/tf/fleet`, applied once per eval project against that project's own state bucket — shared by every pull request that leases the project, and no scenario may mutate it. Read-only is enforced by the credential the run hands out rather than by convention, so a scenario that attempts a write fails loudly instead of quietly spoiling the fixture for everyone else. Remediation scenarios stay presubmit-eligible for the same reason the fleet survives them: a proposed fix lands as a pull request, which is observable without anything on the cluster changing. Drift is corrected by re-applying the stack on a schedule, not by rebuilding per run. The presubmit budget is two hours of wall-clock; compute is deliberately not the constraint.
+- **One trio per project, addressed by role.** The agent is scoped to a single project, so each eval project carries its own trio built from the same module. Scenarios therefore name fixtures by **role** — `hpa-saturated`, `idle-nodepool`, the drift outlier — never by cluster name or project id, so a case written against one project runs unchanged against every other.
+- **Some fixtures are age-gated, and the clock cannot be cheated.** `creationTimestamp` is server-set and immutable. The drift outlier needs D+1, the idle pool D+7, and the unattached disks D+30, because the cost SOP's collector filters server-side. A scenario whose fixture has not aged in is dormant, not failing, and the fleet README carries the timetable.
 
 #### What blocks and what gets recorded
 
@@ -134,14 +138,14 @@ A catastrophic safeguard tripping in **any** repetition blocks outright.
 
 #### The verdict ladder
 
-Per eval task, the gate walks this ladder in order — first match wins. It is the whole section above turned into a decision procedure:
+Per case, the gate walks this ladder in order — first match wins. It is the whole section above turned into a decision procedure:
 
 | Priority | Condition                                                                               | Verdict                                                                                                              |
 | -------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | 1        | Catastrophic safeguard tripped (any rep)                                                | 🔴 RED — a forbidden action outranks everything and is never absorbable, not even by `expected: fail`                |
 | 2        | Machinery error — checks declared but did not run (coverage < 1.0, score parse crashed) | 🔴 RED — "no evidence" blocks; it never masquerades as pass or expected-fail                                         |
 | 3        | Harness is not the real agent                                                           | 🔴 RED — no scoring yourself with a canned transcript                                                                |
-| 4        | Exact checks failed in any rep (correctness below floor)                                | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
+| 4        | Exact checks collapsed — a case admitted at ≥19/20 on `main` passes ≤6 of 13 here       | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
 | 5        | Expected-fail task now passes                                                           | 🔴 RED — with the instruction: flip the marker; that flip is the improvement being claimed                           |
 | 6        | Judged distribution WORSE than main's baseline (N reps, non-inferiority)                | 🔴 once baselines exist under a pinned judge and measurement is trusted; advisory until then                         |
 | 7        | Everything above clean                                                                  | 🟢 GREEN                                                                                                             |
@@ -149,9 +153,28 @@ Per eval task, the gate walks this ladder in order — first match wins. It is t
 
 Two properties the ordering encodes: authority outranks quality (rows 1–3 before 4–6), and absence of evidence outranks presence of excuses — a check that did not run, a harness that is not ours, a provenance that cannot be shown all block before any score is read.
 
+#### From one task to hundreds: admission, and the suite verdict
+
+The ladder is per case. Applied unchanged to a suite of hundreds it would never report green: even at 99% per-case reliability, a 200-case suite comes out fully clean on 13% of runs. A gate that reds seven pull requests in eight teaches the team to ignore it within two days, and that trust does not come back. Two rules keep the ladder usable at scale.
+
+**A case earns the right to block.** A new or edited case has no baseline on the merge target, so it runs, it reports, and it cannot fail anyone. It joins the blocking set only once the screener has run it 20 times against `main` and it has passed at least 19. Its measured reliability is reported on the pull request that added it — which is what makes §5 a development model rather than an obligation: the author finds out their eval is too noisy before it starts randomly reddening other people's work. This also replaces the role §4.4 used to play, of a zero-cost tier where a new eval could land without negotiating a budget.
+
+**The suite verdict has two criteria, not one.** Rungs 1–3 and 5 stay absolute and per case — authority, missing evidence and provenance never average out, and a catastrophic safeguard tripping in any repetition of any case still reds the job outright. What changes is how quality is judged across the admitted set:
+
+- **Aggregate.** The pull request's pass rate across all admitted cases must be non-inferior to `main`'s baseline rate. Hundreds of cases at N repetitions is thousands of observations, so this is where the statistical power is.
+- **Collapse.** Rung 4: any single admitted case that falls from ≥19/20 to ≤6/13 reds the job on its own.
+
+Both are needed. The aggregate catches broad degradation; the collapse test catches a change that destroys exactly one case, which moves a 200-case aggregate by half a point and would otherwise sail through. Per-case significance testing is deliberately **not** used — at 200 cases, a 5% threshold manufactures roughly ten false regressions every run.
+
+Failures are re-run before they are believed: every case runs N=3, and only the cases that failed are re-run to 13. That is what separates "this regressed" from "this flaked" at a cost proportional to the failures rather than the suite.
+
+The non-inferiority margin is set from measurement, not from theory. Run the suite twice against `main`, observe how far the score moves on its own, and set the bar above that observed floor. A margin chosen on paper is either so tight it fires constantly or so loose it never fires, and which one will not be apparent for a month.
+
 The test for which speed a check runs at is **who chose the words**. If we planted the noun, an exact match is fair, so it blocks per run. If the agent composed the sentence, it is judged, so it blocks only as a distribution.
 
-Two prerequisites before scores decide merges, both consequences of taking the gate seriously: the harness, verifiers, and comparator must run pinned from the merge target — a fork pull request must not be able to edit its own scorer — and the judge model is pinned independently of the agent model, because a drifting judge silently moves every baseline.
+Two prerequisites before scores decide merges, both consequences of taking the gate seriously: the harness, verifiers, comparator **and fleet definition** must run pinned from the merge target — a fork pull request must not be able to edit its own scorer, and the fixture it is scored against is part of that scorer — and the judge model is pinned independently of the agent model, because a drifting judge silently moves every baseline.
+
+A baseline is therefore only valid for one combination of fleet definition, harness, verifiers, judge model and agent model. Every stored baseline is keyed on all five, and a key that does not match the run being scored is reported as a stale baseline rather than silently compared against. Baselines do not have to accumulate from organic traffic: the same suite run repeatedly against the merge target backfills them on demand, which is what keeps a change to any of those five from costing weeks of blind gating.
 
 The blocking half works today: it is cluster state, and `verification_spec` already does it — a `safeguard` at `severity: catastrophic` zeroes the run. The recorded half does not, because `ChecklistScore`, `ToolInvocation` and `GroundingAccuracy` are all GEval. But the answer and the trace are already on every result (`res["output"]`, `res["tools"]`, `res["trajectory"]`), and `METRICS` takes plugins through the `devops_bench.metrics` entry point — the same mechanism `bench/pyproject.toml` uses to register our agent. **What is missing is a field in `task.yaml`, not a new engine.**
 
@@ -169,7 +192,9 @@ That one test posts _"what is 2 + 3?"_ to a Google Chat space and asserts the re
 - **Keep the chat test.** The only thing that proves the assembled release can receive a message at all.
 - **The maintainers dashboard.** Not a test. One row per domain per RC, stamped with the commit and the model, written to BigQuery by the pipeline that already authenticates to GCP (`rc-release-pipeline.yml`). Maintainers only, and the only reason a trend exists at all.
 
-### 4.4 The nightly suite — build
+### 4.4 The nightly suite — deferred
+
+> **Deferred, not cancelled.** Nothing in this section is being built this cycle. Two of the three jobs it was carrying have found other homes: the zero-cost landing tier for a new eval is now the unadmitted state in §4.2, and the volume argument is answered by the standing fleet making cases cheap. What remains genuinely nightly-only is the first bullet below — anything that needs a cluster built from nothing. The design is recorded here so that the day that becomes the constraint, it is not re-derived.
 
 **What belongs here.** Three different things, for three different reasons.
 
@@ -190,7 +215,7 @@ Nightly is where a new eval lands. It blocks nothing, so **the cost of admission
 From there an eval can move up:
 
 - **To the release gate**, once it is fast enough and it proves something the release needs.
-- **To presubmit**, only by swapping out its domain's current scenario. The ceiling is one per domain.
+- **To presubmit**, once the screener admits it (§4.2). There is no per-domain ceiling — the constraint on the blocking set is measured reliability, not slots.
 
 The catch is that a tier which blocks nothing is a tier where evals go to be ignored. What stops that is the §3 rule: every domain owns at least one blocking scenario. **A domain whose only coverage is nightly is still reported as uncovered.**
 
@@ -235,11 +260,11 @@ Two rules attach, both bought with experience rather than theory:
 
 ### 5.1 What runs, without you doing anything
 
-| When                    | What runs                                                                                        | What blocks                                                 |
-| ----------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
-| You open a pull request | Unit tests, plus the scenario corpus at N repetitions each on warm-pool fleets                   | Exact checks per run; judged scores as distributions (§4.2) |
-| Within 3h of merge      | The same suite, on the assembled release; the run also refreshes `main`'s baseline distributions | The exact checks                                            |
-| Overnight               | Anything that needs a cluster built, plus the holdout scenarios                                  | Nothing yet                                                 |
+| When                    | What runs                                                                                        | What blocks                                                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| You open a pull request | Unit tests, plus the case corpus at N repetitions each against the standing seeded fleet         | The admitted set only: authority per run, collapse per case, pass rate in aggregate (§4.2). A case you added reports its reliability and blocks nothing |
+| Within 3h of merge      | The same suite, on the assembled release; the run also refreshes `main`'s baseline distributions | The exact checks                                                                                                                                        |
+| Overnight               | Anything that needs a cluster built, plus the holdout scenarios                                  | Nothing yet                                                                                                                                             |
 
 ### 5.2 What you write, and where it goes
 
