@@ -1,6 +1,6 @@
 # kube-agents Testing Strategy
 
-> **STATUS — draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs two eval tasks and blocks nothing; the release gate is one test. Nightly is **deferred** (§4.4). Everything else here is the plan.
+> **STATUS — draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs two cases and blocks nothing; the release gate is one test. Nightly is **deferred** (§4.4). Everything else here is the plan.
 
 ## 1. What we are building
 
@@ -28,7 +28,7 @@ Three questions. Every test answers one.
 2. **Correctness** — there is no single right answer to "audit my fleet," so this is measured over repetitions, not diffed.
 3. **Drift** — prompts and models change silently, and neither shows up as a failing test. Without a recorded baseline, quality decays and a customer notices first.
 
-Those say **what** can go wrong, not **where**. Coverage is counted by **domain** — obtainability, cost, security, upgrades and capacity each own an SOP, a cron stream and their own journeys. A fleet-wide average passes while one domain rots. **Every domain owns at least one blocking scenario and its own line in the release record; a domain with neither is reported uncovered, never passing.**
+Those say **what** can go wrong, not **where**. Coverage is counted by **domain** — obtainability, cost, security, upgrades and capacity each own an SOP, a cron stream and their own journeys. A fleet-wide average passes while one domain rots. **Every domain owns at least one blocking case and its own line in the release record; a domain with neither is reported uncovered, never passing.**
 
 ## 4. The tiers
 
@@ -62,9 +62,9 @@ Budget is minutes, not hours, and anything needing a full install belongs to the
 
 Today a pull request gets a namespace on a shared cluster and one devops-bench task, `gpu-stress-test-diagnosis`, judged against a fixed 0.7. The Prow job is `optional: true`, so **nothing behavioural blocks a merge.**
 
-Expand on two axes.
+Expand on two axes. The unit throughout is the **case**: one question against a named fixture, plus what the answer must contain. There is no second kind of test — a journey is covered by one case or by twenty.
 
-**First, at least one scenario per domain** — the journeys a customer would notice within a day:
+**First, at least one case per domain** — the journeys a customer would notice within a day:
 
 | Domain                                                                            | Journey                                          | What must be true                                                                                                                                                                                                                 |
 | --------------------------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -83,15 +83,15 @@ Expand on two axes.
 
 The last two rows are not domains. They are **failures every domain has to survive** — refusal against all ten, silence against the seven scheduled audits.
 
-**Second, many cases per journey.** One per domain proves a domain is covered at all; it cannot characterise a stochastic system, and a journey has more than one way to go wrong. A **case** is a question against a named fixture plus what the answer must contain. Because the fleet is standing, the expensive part is already paid — one more case costs a model call, not a cluster — so hundreds are practical. Cases are the unit of measurement; the domain stays the unit of coverage and of regression reporting.
+**Second, many cases per journey.** One per domain proves a domain is covered at all; it cannot characterise a stochastic system, and a journey has more than one way to go wrong. Because the fleet is standing, the expensive part is already paid — one more case costs a model call, not a cluster — so hundreds are practical. Cases are the unit of measurement; the domain stays the unit of coverage and of regression reporting.
 
 #### The seeded fleet
 
 Three standing GKE clusters per eval project carrying known defects (`bench/tf/fleet`). Three because the drift audit's baseline is the fleet majority, and two clusters have no majority.
 
 - **The defects are ones the SOPs demonstrably flag** — an over-permissioned ClusterRoleBinding, a two-replica Deployment with no PDB, a saturated single-zone pool with a live Pending backlog, an idle pool, a control plane a minor behind, an authorized-networks outlier. Planting a defect no SOP can detect is the reviewable mistake. Because we planted them, the assertions that matter can be exact rather than judged.
-- **Standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per eval project and shared by every pull request that leases it, and no scenario may mutate it — enforced by the credential the run is handed, not by convention, so an attempted write fails loudly instead of quietly spoiling the fixture. Drift is corrected by re-applying the stack on a schedule. Remediation scenarios stay presubmit-eligible for the same reason the fleet survives them: a proposed fix is a pull request, observable without anything on the cluster changing. The budget is two hours of wall-clock; compute is deliberately not the constraint.
-- **Addressed by role, never by name.** The agent is scoped to one project, so each eval project carries its own trio from the same module. Scenarios name `hpa-saturated`, `idle-nodepool`, the drift outlier — never a cluster name or a project id — so a case written once runs unchanged everywhere.
+- **Standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per eval project and shared by every pull request that leases it, and no case may mutate it — enforced by the credential the run is handed, not by convention, so an attempted write fails loudly instead of quietly spoiling the fixture. Drift is corrected by re-applying the stack on a schedule. Remediation cases stay presubmit-eligible for the same reason the fleet survives them: a proposed fix is a pull request, observable without anything on the cluster changing. The budget is two hours of wall-clock; compute is deliberately not the constraint.
+- **Addressed by role, never by name.** The agent is scoped to one project, so each eval project carries its own trio from the same module. Cases name `hpa-saturated`, `idle-nodepool`, the drift outlier — never a cluster name or a project id — so a case written once runs unchanged everywhere.
 - **Age gates cannot be cheated.** `creationTimestamp` is server-set and immutable, and the cost SOP's collector filters server-side. The drift outlier needs D+1, the idle pool D+7, the unattached disks D+30. A fixture that has not aged in is dormant, not failing; the fleet README carries the timetable.
 
 #### What blocks, per case
@@ -114,11 +114,11 @@ The gate walks this ladder per case, first match wins:
 | 1        | Catastrophic safeguard tripped (any rep)                                                | 🔴 RED — a forbidden action outranks everything, never absorbable, not even by `expected: fail`                      |
 | 2        | Machinery error — checks declared but did not run (coverage < 1.0, score parse crashed) | 🔴 RED — "no evidence" blocks; it never masquerades as pass or expected-fail                                         |
 | 3        | Harness is not the real agent                                                           | 🔴 RED — no scoring yourself with a canned transcript                                                                |
-| 4        | Collapse — an admitted case fails all three of its runs here (below)                    | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
-| 5        | Expected-fail task now passes                                                           | 🔴 RED — flip the marker; that flip is the improvement being claimed                                                 |
+| 4        | Collapse — an admitted case fails all three of its runs here (below)                    | 🔴 RED — unless the case is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
+| 5        | Expected-fail case now passes                                                           | 🔴 RED — flip the marker; that flip is the improvement being claimed                                                 |
 | 6        | Judged distribution worse than main's baseline (3 reps, non-inferiority)                | 🔴 once baselines exist under a pinned judge; advisory until then                                                    |
 | 7        | Everything above clean                                                                  | 🟢 GREEN                                                                                                             |
-| —        | Infra failure (stockout, no results from a provisioning task)                           | ⚪ non-blocking, reported loudly to the eval-infrastructure owner — unless every task hit it, which reds the job     |
+| —        | Infra failure (stockout, no results from a provisioning case)                           | ⚪ non-blocking, reported loudly to the eval-infrastructure owner — unless every case hit it, which reds the job     |
 
 The ordering encodes two rules: authority outranks quality, and absence of evidence outranks presence of excuses.
 
@@ -164,11 +164,11 @@ Proposed: run the presubmit suite again here, against the assembled release. Exa
 
 ### 4.4 Nightly — deferred
 
-> **Deferred, not cancelled.** Nothing here is being built this cycle. Two of its three jobs found other homes: the zero-cost landing tier for a new eval is now the unadmitted state in §4.2, and the volume argument is answered by the standing fleet making cases cheap. The design stays on the record so it is not re-derived later.
+> **Deferred, not cancelled.** Nothing here is being built this cycle. Two of its three jobs found other homes: the zero-cost landing tier for a new case is now the unadmitted state in §4.2, and the volume argument is answered by the standing fleet making cases cheap. The design stays on the record so it is not re-derived later.
 
-What would be nightly-only is anything needing a cluster built from nothing — creation, upgrade from the last validated release, hardware-specific tasks — plus anything too slow for a three-hour cadence. Its own project and concurrency group, so it never queues behind the release pipeline. **Infrastructure failure is not test failure:** retry once, then call it _not run_ and page whoever owns the test infrastructure, not whoever owns the agent. It gates nothing until it has been green for weeks, after which the release gate could require the last nightly.
+What would be nightly-only is anything needing a cluster built from nothing — creation, upgrade from the last validated release, hardware-specific cases — plus anything too slow for a three-hour cadence. Its own project and concurrency group, so it never queues behind the release pipeline. **Infrastructure failure is not test failure:** retry once, then call it _not run_ and page whoever owns the test infrastructure, not whoever owns the agent. It gates nothing until it has been green for weeks, after which the release gate could require the last nightly.
 
-Promotion out of it: to the release gate once it is fast enough, or to presubmit once the screener admits it (§4.2) — there is no per-domain ceiling, because the constraint on the blocking set is measured reliability, not slots. A domain whose only coverage is nightly is still reported uncovered (§3), and a scenario red for a week is fixed or deleted.
+Promotion out of it: to the release gate once it is fast enough, or to presubmit once the screener admits it (§4.2) — there is no per-domain ceiling, because the constraint on the blocking set is measured reliability, not slots. A domain whose only coverage is nightly is still reported uncovered (§3), and a case red for a week is fixed or deleted.
 
 ### 4.5 Which tier answers which question
 
@@ -186,12 +186,12 @@ Authority blocks earliest because it is binary and cannot flake. Drift is the op
 
 ## 5. Eval-driven development
 
-Most changes need no new eval. **A change that alters what the agent says or does ships with the eval that proves it** — the development model, not a courtesy. The eval is the spec: it lands marked expected-fail, the implementation flips it to expected-pass, and it stays as a regression check forever. That flip is a reviewed diff, so "this change improves X" is evidence rather than a sentence in a pull request body.
+Most changes need no new case. **A change that alters what the agent says or does ships with the case that proves it** — the development model, not a courtesy. The case is the spec: it lands marked expected-fail, the implementation flips it to expected-pass, and it stays as a regression check forever. That flip is a reviewed diff, so "this change improves X" is evidence rather than a sentence in a pull request body.
 
 Two rules attach, both bought with experience:
 
-- **The eval is reviewed as hard as the code.** Building the first corpus produced roughly fifty review findings, half of them evals that could not fail (a safeguard naming a tool that does not exist, a defect the audit's own SOP never flags) or could not pass (grading the router's paraphrase instead of the report). An agent implemented against a weak spec produces confident garbage that gates green — the eval is where that failure lives.
-- **A holdout guards against saturation.** A suite grown this way trends monotonically green: its regression value persists, its discrimination decays. New scenarios periodically land un-optimized-against and rotate into the gate.
+- **The case is reviewed as hard as the code.** Building the first corpus produced roughly fifty review findings, half of them cases that could not fail (a safeguard naming a tool that does not exist, a defect the audit's own SOP never flags) or could not pass (grading the router's paraphrase instead of the report). An agent implemented against a weak spec produces confident garbage that gates green — the case is where that failure lives.
+- **A holdout guards against saturation.** A suite grown this way trends monotonically green: its regression value persists, its discrimination decays. New cases periodically land un-optimized-against and rotate into the gate.
 
 ### 5.1 What runs, without you doing anything
 
@@ -202,11 +202,11 @@ Two rules attach, both bought with experience:
 
 ### 5.2 What you write
 
-| If your change                                          | Write                                               | Then                                                                                                                   |
-| ------------------------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| Does not change what the agent says or does             | A unit test                                         | Nothing further — the eval suite still runs, and non-inferiority means noise on an unrelated change must not block you |
-| Changes behaviour in a domain we cover                  | The eval first, expected-fail; your change flips it | It reports on your pull request, and joins the blocking set once admitted (§4.2)                                       |
-| Adds a domain we do not cover                           | A scenario, plus its refusal case (§4.2)            | Same, and until it is admitted the domain still reports uncovered (§3)                                                 |
-| Needs a cluster created, upgraded, or specific hardware | A scenario                                          | Parked until nightly exists (§4.4) — nowhere else can run it                                                           |
+| If your change                                          | Write                                                | Then                                                                                                                   |
+| ------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Does not change what the agent says or does             | A unit test                                          | Nothing further — the eval suite still runs, and non-inferiority means noise on an unrelated change must not block you |
+| Changes behaviour in a domain we cover                  | The case first, expected-fail; your change flips it  | It reports on your pull request, and joins the blocking set once admitted (§4.2)                                       |
+| Adds a domain we do not cover                           | A case for the journey, plus its refusal case (§4.2) | Same, and until it is admitted the domain still reports uncovered (§3)                                                 |
+| Needs a cluster created, upgraded, or specific hardware | A case                                               | Parked until nightly exists (§4.4) — nowhere else can run it                                                           |
 
 **When in doubt, write the case.** It reports before it blocks, so there is no budget to negotiate and nothing it can break.
