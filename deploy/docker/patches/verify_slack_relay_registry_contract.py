@@ -150,9 +150,9 @@ PINNED_DEFAULTS: dict[tuple[str, str], object] = {
     ("SlackAdapter.connect", "is_reconnect"): False,
     ("GoogleChatAdapter.connect", "is_reconnect"): False,
     ("SlackAdapter._download_slack_file", "audio"): False,
-    ("SlackAdapter._download_slack_file", "team_id"): None,
-    ("SlackAdapter._download_slack_file_bytes", "team_id"): None,
-    ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): "",
+    ("SlackAdapter._download_slack_file", "team_id"): "",
+    ("SlackAdapter._download_slack_file_bytes", "team_id"): "",
+    ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): None,
 }
 
 
