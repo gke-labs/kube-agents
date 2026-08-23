@@ -68,10 +68,10 @@ Before pushing, run the checks CI enforces:
 - **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
 
   ```bash
-  make test-integration   # what the Run Integration Seam Tests CI job runs; the Go seam skips cleanly without a toolchain
+  make test-integration   # just this tier, for working on a seam; CI reaches it through `make test-python`
   ```
 
-  Real components wired together with the agent replaced by a fake — no cluster, no model. `tests/integration/README.md` states the tier's contract and why the directory is not yet in `PYTHON_TEST_DIRS`.
+  Real components wired together with the agent replaced by a fake — no cluster, no model. The tier is in `PYTHON_TEST_DIRS`, so `make test-python` runs it and the Run Python Unit Tests job gates on it; the target above is the fast loop for one tier while you work on a seam. Install a Go toolchain first if you want an honest answer — the injector seam compiles the real Go event-watcher client, and without `go` on `PATH` its four tests skip and the run still prints `OK`. `tests/integration/README.md` states the tier's contract.
 
 - **Docs build** (if you touched `docs/site/`):
 

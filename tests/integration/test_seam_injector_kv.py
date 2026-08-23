@@ -8,7 +8,10 @@ is what that gap looks like once it has already bitten. This test compiles and
 runs the real Go client (`injector_integration_test.go`, env-gated in the
 watcher package) against the real server over a real socket.
 
-Skips when no Go toolchain is available; the CI integration job installs one.
+Skips when no Go toolchain is available, which makes a laptop without `go`
+report OK on four tests it never ran -- install one before you believe a green
+run here. CI's `test` and `coverage` jobs both set Go up for exactly that
+reason, since this tier gates from inside `make test-python`.
 """
 
 from __future__ import annotations
