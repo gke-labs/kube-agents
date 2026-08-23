@@ -515,6 +515,60 @@ class TestResolveBaseBranch(WorkspaceTestCase):
         )
         self.assertEqual(head.stdout.strip(), "master")
 
+    def test_a_real_empty_repository_raises_gitops_repo_empty(self):
+        if shutil.which("git") is None:  # pragma: no cover
+            self.skipTest("git is not on PATH")
+
+        def real(cmd, *, cwd=None, check=True):
+            return subprocess.run(
+                cmd, cwd=cwd, check=check, capture_output=True, text=True
+            )
+
+        origin = seed_empty_origin(self.tmp_path, branch="main")
+        with self.assertRaises(gitops_workspace.GitOpsRepoEmpty) as ctx:
+            gitops_workspace.ensure_workspace(
+                "acme/fleet", real, lease=LEASE, root=self.root, remote_url=str(origin), reset=True
+            )
+        self.assertIn("has no commits on any branch", str(ctx.exception))
+
+    def test_ensure_workspace_raises_gitops_repo_empty_on_unborn_remote(self):
+        def runner(cmd, *, cwd=None, check=True):
+            self.calls.append(list(cmd))
+            if cmd[:2] == ["git", "clone"]:
+                (Path(cmd[-1]) / ".git").mkdir(parents=True, exist_ok=True)
+            if cmd[1:2] == ["symbolic-ref"]:
+                return CompletedProcess(cmd, 1, "", "")
+            if cmd[1:3] == ["rev-parse", "--verify"]:
+                return CompletedProcess(cmd, 1, "", "")
+            if cmd[1:3] == ["rev-list", "-n"]:
+                return CompletedProcess(cmd, 0, "", "")
+            return CompletedProcess(cmd, 0, "", "")
+
+        with self.assertRaises(gitops_workspace.GitOpsRepoEmpty) as ctx:
+            gitops_workspace.ensure_workspace(
+                "acme/fleet", runner, lease=LEASE, root=self.root, reset=True
+            )
+        self.assertIn("has no commits on any branch", str(ctx.exception))
+
+    def test_ensure_workspace_raises_runtime_error_when_branch_missing_but_repo_has_commits(self):
+        def runner(cmd, *, cwd=None, check=True):
+            self.calls.append(list(cmd))
+            if cmd[:2] == ["git", "clone"]:
+                (Path(cmd[-1]) / ".git").mkdir(parents=True, exist_ok=True)
+            if cmd[1:2] == ["symbolic-ref"]:
+                return CompletedProcess(cmd, 0, "origin/main\n", "")
+            if cmd[1:3] == ["rev-parse", "--verify"]:
+                return CompletedProcess(cmd, 1, "", "")
+            if cmd[1:3] == ["rev-list", "-n"]:
+                return CompletedProcess(cmd, 0, "abc12345\n", "")
+            return CompletedProcess(cmd, 0, "", "")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            gitops_workspace.ensure_workspace(
+                "acme/fleet", runner, lease=LEASE, root=self.root, reset=True
+            )
+        self.assertIn("has no remote branch origin/main", str(ctx.exception))
+
 
 class TestReaper(WorkspaceTestCase):
     def age(self, path, hours):
@@ -670,6 +724,17 @@ def seed_origin(tmp_path: Path, branch: str = "main") -> Path:
         ["git", "push", "--quiet", "origin", branch],
     ):
         subprocess.run(cmd, cwd=seed, check=True, capture_output=True)
+    return origin
+
+
+def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
+    """A local bare repository with zero commits."""
+    origin = tmp_path / f"empty_origin_{branch}.git"
+    subprocess.run(
+        ["git", "init", "--quiet", "--bare", f"--initial-branch={branch}", str(origin)],
+        check=True,
+        capture_output=True,
+    )
     return origin
 
 
