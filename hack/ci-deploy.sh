@@ -65,9 +65,18 @@ export SLACK_ENABLED="false"
 # docs/site/src/content/docs/deploy/ci-pool-projects.md.
 #
 # One GitOps repo per leasable project, so two concurrent leases can never
-# share a ledger issue or race on a remediation branch. Onboarding a third
+# share a ledger issue or race on a remediation branch. Onboarding a further
 # project (issue #637, Boskos leasing) is one line here plus its row in that
 # same doc — no other edit in this file.
+#
+# A mapping here is a claim that the repo exists and that App 4675512 is
+# installed on it. It is not self-verifying: with the line present and either
+# of those missing, the deploy succeeds and every GitHub-writing scenario
+# fails at `audit_report.py start` with a clone or token error instead of the
+# named, actionable refusal below. Add the row when the repo and the
+# installation are real, not when the project joins the Boskos pool — the two
+# are separate events, and kube-agents-evals-3 is what happens when they are
+# assumed to be one.
 gitops_repo_for_project() {
   case "$1" in
     kube-agents-evals) echo "gke-agentic/kube-agents-evals-infra" ;;
