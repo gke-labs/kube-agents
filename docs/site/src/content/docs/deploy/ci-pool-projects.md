@@ -155,10 +155,10 @@ That provisions the minter GSA, its Workload Identity binding to `kubeagents-sys
 
 Two steps have no Terraform equivalent and must be done by a human with the corresponding rights:
 
-1. **Install the GitHub App on the repository** (org-admin on `gke-agentic`, plus App-manager rights). Grant `contents: write`, `pull_requests: write`, and `issues: write`, on that one repository. **Done for both current pool projects** — see the App below; a third project means adding its repository to the same installation.
+1. **Install the GitHub App on the repository** (org-admin on `gke-agentic`, plus App-manager rights). Grant `contents: write`, `pull_requests: write`, and `issues: write`, on that one repository. **Done for all three current pool projects** — see the App below; a fourth project means adding its repository to the same installation.
 2. **Import the App's private key** into the project's KMS signing key with the Minty CLI. The PEM must never enter Terraform state, so the key is created import-only and empty; the command is in the [composition's README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/ci-pool-minter). Confirm version 1 reaches `ENABLED`. This one is per project — the same PEM, imported into each project's own key.
 
-The pool is served by a single App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on exactly `gke-agentic/kube-agents-evals-infra` and `gke-agentic/kube-agents-evals-2-infra`:
+The pool is served by a single App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on `gke-agentic/kube-agents-evals-infra`, `gke-agentic/kube-agents-evals-2-infra`, and `gke-agentic/kube-agents-evals-3-infra`:
 
 ```bash
 gh api /orgs/gke-agentic/installations \
@@ -184,6 +184,7 @@ Once the GCP project is provisioned with the prerequisites above, register the p
   names:
     - kube-agents-evals
     - kube-agents-evals-2
+    - kube-agents-evals-3
     - <NEW_PROJECT_ID>
 ```
 

@@ -152,7 +152,7 @@ fi
 # deploy failing loudly is the right outcome.
 #
 # The pool's App is kube-agents-evals-token-minter, id 4675512, installed on
-# the two *-infra repos above and nothing else. One App for the whole pool, so
+# the three *-infra repos above and nothing else. One App for the whole pool, so
 # the value is the same in every project's job environment; what is per-project
 # is the KMS key its PEM was imported into. That installation list -- not this
 # script, and not the minty rule the chart renders -- is what bounds where a

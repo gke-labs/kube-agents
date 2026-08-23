@@ -1276,9 +1276,7 @@ class PlatformFrontDoorTest(unittest.TestCase):
                 (profile / "config.yaml").write_text(live, encoding="utf-8")
             venv = root / "install" / ".venv" / "bin"
             venv.mkdir(parents=True)
-            wrapper = venv / "python3"
-            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
-            wrapper.chmod(0o755)
+            (venv / "python3").symlink_to(sys.executable)
 
             script = "set -e\n" + _extract_shell_function("platform_is_front_door") + "\n"
             script += _extract_shell_function("backfill_config_from_template") + "\n" + block
