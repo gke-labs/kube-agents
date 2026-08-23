@@ -606,10 +606,10 @@ Three details are deliberate:
   `handled_node_ids` still reads raw bodies). Feeding the model its own `<!-- agent-answered:… -->`
   syntax invites it to imitate it in prose that `reply` then stamps a second, real marker onto.
 - **Caps report what they dropped** — `omitted_earlier` on the thread transcript (`CONTEXT_MAX_COMMENTS = 40`),
-  `truncated_chars` on the comment body (`CONTEXT_MAX_BODY_CHARS = 4000`) and on the request line
-  (`CONTEXT_MAX_REQUEST_CHARS = 500`), and a stderr notice for requests deferred past `CONTEXT_MAX_REQUESTS = 10`.
-  A silently shortened transcript reads exactly like a complete one, and the worker would answer confidently
-  from a conversation it half saw.
+  `omitted_requests` on the thread (`CONTEXT_MAX_REQUESTS = 10`), `truncated_chars` on the comment body
+  (`CONTEXT_MAX_BODY_CHARS = 4000`) and on the request line (`CONTEXT_MAX_REQUEST_CHARS = 500`), and a stderr
+  notice for requests deferred past `CONTEXT_MAX_REQUESTS = 10`. A silently shortened transcript reads exactly
+  like a complete one, and the worker would answer confidently from a conversation it half saw.
 - **The comment cap drops the oldest**, the opposite of the sweep's oldest-first rule for triggers.
   A trigger queue must not starve its head; a transcript is a story whose recent end explains the
   request being answered now. **The requests themselves are pinned past the cap**, because those two

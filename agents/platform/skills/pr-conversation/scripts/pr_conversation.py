@@ -77,9 +77,10 @@ BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # How much of a thread travels with the requests. All caps are generous enough
 # that no ordinary review conversation meets them, and all report what they
-# dropped — `omitted_earlier` on the thread, `truncated_chars` on the comment /
-# request — because a silently shortened transcript reads as a complete one, and
-# the worker would answer confidently from a conversation it only half saw.
+# dropped — `omitted_earlier` and `omitted_requests` on the thread, `truncated_chars`
+# on the comment / request — because a silently shortened transcript reads as a
+# complete one, and the worker would answer confidently from a conversation it only
+# half saw.
 CONTEXT_MAX_COMMENTS = 40
 CONTEXT_MAX_BODY_CHARS = 4000
 CONTEXT_MAX_REQUEST_CHARS = pr_triggers.MAX_REQUEST_CHARS
@@ -238,7 +239,9 @@ def _context_body(body: str) -> tuple[str, int]:
     return text[:CONTEXT_MAX_BODY_CHARS], len(text) - CONTEXT_MAX_BODY_CHARS
 
 
-def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
+def _conversation(
+    comments, self_login: str, request_ids, all_request_ids=None
+) -> tuple[list, int]:
     """The thread one pull request's requests arrived in, oldest first.
 
     Sorted here as well as in the provider: ordering is part of this payload's
@@ -262,6 +265,7 @@ def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
     """
     ordered = sorted(comments, key=lambda c: (c.created_at, c.node_id))
     wanted = set(request_ids or ())
+    is_req_ids = set(all_request_ids if all_request_ids is not None else wanted)
     recent = ordered[max(0, len(ordered) - CONTEXT_MAX_COMMENTS) :]
     kept_ids = {c.node_id for c in recent} | wanted
     kept = [c for c in ordered if c.node_id in kept_ids]
@@ -276,7 +280,7 @@ def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
             "kind": comment.kind,
             "can_write": comment.can_write,
             "is_self": forge.normalise_login(comment.author) == self_login,
-            "is_request": comment.node_id in request_ids,
+            "is_request": comment.node_id in is_req_ids,
             "body": body,
         }
         if comment.path:
@@ -334,6 +338,7 @@ def handle_poll(args) -> int:
         deferred_requests = 0
         for repo, pr in prs:
             comments, pr_requests = _requests_on(provider, repo, pr, viewer)
+            all_unanswered_ids = {row["comment_id"] for row in pr_requests}
             # Untrusted requests past this pull request's refusal budget are not
             # offered at all. The sweep already stopped refusing them, on
             # purpose, and handing them to the worker is how that bound got
@@ -351,10 +356,25 @@ def handle_poll(args) -> int:
                 ]
                 over_budget += len(pr_requests) - len(kept)
                 pr_requests = kept
-            if len(pr_requests) > CONTEXT_MAX_REQUESTS:
-                deferred_count = len(pr_requests) - CONTEXT_MAX_REQUESTS
+
+            # Prioritize trusted requests over untrusted ones so an untrusted burst
+            # before refusal budget exhaustion cannot starve maintainer requests.
+            trusted_requests = [
+                r for r in pr_requests if r.get("can_write") or not r.get("can_write_known")
+            ]
+            untrusted_requests = [
+                r for r in pr_requests if not r.get("can_write") and r.get("can_write_known")
+            ]
+            ordered_requests = trusted_requests + untrusted_requests
+
+            deferred_count = 0
+            if len(ordered_requests) > CONTEXT_MAX_REQUESTS:
+                deferred_count = len(ordered_requests) - CONTEXT_MAX_REQUESTS
                 deferred_requests += deferred_count
-                pr_requests = pr_requests[:CONTEXT_MAX_REQUESTS]
+                pr_requests = ordered_requests[:CONTEXT_MAX_REQUESTS]
+            else:
+                pr_requests = ordered_requests
+
             if not pr_requests:
                 # No thread without a request in it: the worker is answering
                 # something, and a transcript of a pull request nobody addressed
@@ -362,11 +382,16 @@ def handle_poll(args) -> int:
                 continue
             found.extend(pr_requests)
             rows, omitted_earlier = _conversation(
-                comments, viewer, {row["comment_id"] for row in pr_requests}
+                comments,
+                viewer,
+                request_ids={row["comment_id"] for row in pr_requests},
+                all_request_ids=all_unanswered_ids,
             )
             thread = {"repo": repo, "pr": pr.number, "head_ref": pr.head_ref, "comments": rows}
             if omitted_earlier:
                 thread["omitted_earlier"] = omitted_earlier
+            if deferred_count:
+                thread["omitted_requests"] = deferred_count
             threads.append(thread)
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))

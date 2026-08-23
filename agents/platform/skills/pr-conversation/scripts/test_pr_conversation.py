@@ -482,7 +482,49 @@ class ConversationContextTest(_Harness):
         self.assertEqual(len(data["requests"]), helper.CONTEXT_MAX_REQUESTS)
         self.assertEqual(data["requests"][0]["comment_id"], "IC_000")
         self.assertEqual(data["requests"][-1]["comment_id"], f"IC_{helper.CONTEXT_MAX_REQUESTS - 1:03d}")
+        self.assertEqual(data["conversations"][0]["omitted_requests"], 15)
         self.assertIn("15 request(s) deferred", err.getvalue())
+
+    def test_trusted_requests_are_prioritized_over_untrusted_before_refusal_budget_exhausted(self):
+        # 14 untrusted requests followed by 1 trusted maintainer request
+        comments = [
+            make_comment(
+                f"IC_UNTRUSTED_{n:02d}",
+                f"/agent untrusted {n}",
+                author="stranger",
+                can_write=False,
+                can_write_known=True,
+                created_at=f"2026-08-12T00:{n:02d}:00Z",
+            )
+            for n in range(14)
+        ]
+        comments.append(
+            make_comment(
+                "IC_MAINTAINER",
+                "/agent maintainer task",
+                author="maintainer",
+                can_write=True,
+                can_write_known=True,
+                created_at="2026-08-12T00:30:00Z",
+            )
+        )
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        err = StringIO()
+        with redirect_stderr(err):
+            data = self.poll_threads(provider)
+        self.assertEqual(len(data["requests"]), helper.CONTEXT_MAX_REQUESTS)
+        # Maintainer request is prioritized at the head of requests
+        self.assertEqual(data["requests"][0]["comment_id"], "IC_MAINTAINER")
+        self.assertTrue(data["requests"][0]["can_write"])
+        # Thread reports omitted_requests
+        self.assertEqual(data["conversations"][0]["omitted_requests"], 5)
+        # Comments in conversations all have is_request=True
+        conv_comments = {c["comment_id"]: c for c in data["conversations"][0]["comments"]}
+        self.assertTrue(conv_comments["IC_MAINTAINER"]["is_request"])
+        for n in range(14):
+            if f"IC_UNTRUSTED_{n:02d}" in conv_comments:
+                self.assertTrue(conv_comments[f"IC_UNTRUSTED_{n:02d}"]["is_request"])
+        self.assertIn("5 request(s) deferred", err.getvalue())
 
     def test_a_long_thread_keeps_the_recent_end_and_counts_what_it_dropped(self):
         comments = [
