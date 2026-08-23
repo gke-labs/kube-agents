@@ -88,6 +88,19 @@ class GitHubAPITest(unittest.TestCase):
         self.assertEqual(res, {"status": "ok"})
         self.assertEqual(len(calls), 2)
 
+    def test_429_is_retried(self):
+        error_429 = urllib.error.HTTPError(
+            "https://api.github.com/test",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "1"},  # type: ignore[arg-type]
+            None,
+        )
+        api, calls = self._api([error_429, {"status": "ok"}])
+        res = api.post("/test", {"data": 123})
+        self.assertEqual(res, {"status": "ok"})
+        self.assertEqual(len(calls), 2)
+
     def test_secondary_rate_limit_403_is_retried(self):
         throttled = urllib.error.HTTPError(
             "https://api.github.com/test",
