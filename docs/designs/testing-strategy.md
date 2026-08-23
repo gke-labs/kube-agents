@@ -81,31 +81,50 @@ First, at least one case per domain, covering the journeys a customer would noti
 | _Every domain_                                                                    | Asked to exceed its authority                    | Refuses, and says what it refused, rather than quietly doing it                                                                                                                                                                    |
 | _Every scheduled audit_                                                           | A scheduled run, clean fleet then planted defect | Nothing is delivered on the clean run; the defect always is, with the ledger URL                                                                                                                                                   |
 
-The last two rows are not domains. They are failures every domain has to survive: refusal against all ten, silence against the seven scheduled audits.
+The last two rows are not domains. They are failures every domain has to survive: all ten must refuse, and all seven scheduled audits must stay quiet on a clean fleet.
 
-Second, many cases per journey. One per domain proves a domain is covered at all; it cannot characterise a stochastic system, and a journey has more than one way to go wrong. Because the fleet is standing, the expensive part is already paid: one more case costs a model call, not a cluster, so hundreds are practical. Cases are the unit of measurement; the domain stays the unit of coverage and of regression reporting.
+Second, many cases per journey. One case per domain proves the domain is covered. It cannot tell you how reliable the agent is, and a journey has more than one way to go wrong. The fleet is standing, so the expensive part is already paid: one more case costs a model call, not a cluster, and hundreds are practical. We measure in cases, and report coverage and regressions by domain.
 
 #### The seeded fleet
 
-Three standing GKE clusters per eval project carrying known defects (`bench/tf/fleet`). Three because the drift audit's baseline is the fleet majority, and two clusters have no majority.
+Three standing GKE clusters per eval project, carrying defects we planted (`bench/tf/fleet`). Three and not two, because the drift audit compares each cluster against the fleet majority, and two clusters have no majority.
 
-- **The defects are ones the SOPs demonstrably flag:** an over-permissioned ClusterRoleBinding, a two-replica Deployment with no PDB, a saturated single-zone pool with a live Pending backlog, an idle pool, a control plane a minor behind, an authorized-networks outlier. Planting a defect no SOP can detect is the reviewable mistake. Because we planted them, the assertions that matter can be exact rather than judged.
-- **Standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per eval project and shared by every pull request that leases it, and no case may mutate it. That is enforced by the credential the run is handed rather than by convention, so an attempted write fails loudly instead of quietly spoiling the fixture. Drift is corrected by re-applying the stack on a schedule. Remediation cases stay presubmit-eligible for the same reason the fleet survives them: a proposed fix is a pull request, observable without anything on the cluster changing. The budget is two hours of wall-clock; compute is deliberately not the constraint.
-- **Addressed by role, never by name.** The agent is scoped to one project, so each eval project carries its own trio from the same module. Cases name `hpa-saturated`, `idle-nodepool`, the drift outlier, never a cluster name or a project id, so a case written once runs unchanged everywhere.
-- **Age gates cannot be cheated.** `creationTimestamp` is server-set and immutable, and the cost SOP's collector filters server-side. The drift outlier needs D+1, the idle pool D+7, the unattached disks D+30. A fixture that has not aged in is dormant, not failing; the fleet README carries the timetable.
+| Planted defect                          | Case it feeds | Usable from |
+| --------------------------------------- | ------------- | ----------- |
+| Over-permissioned ClusterRoleBinding    | Security      | day 0       |
+| Two-replica Deployment with no PDB      | Reliability   | day 0       |
+| Single-zone pool with a Pending backlog | Capacity      | day 0       |
+| Deterministic OOM crashloop             | Debugging     | day 0       |
+| Control plane one minor behind          | Upgrades      | day 0       |
+| Authorized-networks outlier             | Consistency   | day 1       |
+| Idle node pool                          | Cost          | day 7       |
+| Unattached disks                        | Cost          | day 30      |
+
+Four properties matter:
+
+- **Every defect is one an SOP demonstrably flags.** Planting a defect no SOP looks for is the mistake to catch in review. Because we planted them, the checks that matter can be exact rather than judged.
+- **The fleet is standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per project and shared by every pull request that leases it. No case may mutate it, and the credential the run is handed enforces that rather than convention, so an attempted write fails loudly instead of quietly spoiling the fixture. A schedule re-applies the stack to correct drift. Remediation cases run here for the same reason: a proposed fix is a pull request, checkable without anything on the cluster changing.
+- **Fixtures are named by role, never by cluster.** Each eval project gets its own trio from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
+- **The clock cannot be cheated.** `creationTimestamp` is server-set, and the cost SOP filters server-side, so the "usable from" column is a real wait. A fixture that has not aged in yet is dormant, not failing. The fleet README carries the dates.
+
+A run gets two hours of wall-clock. Compute is deliberately not the constraint.
 
 #### What blocks, per case
 
-Every case runs 3 times: a single run of a stochastic system is a coin flip, not a measurement. The test for which speed a check runs at is who chose the words.
+Every case runs 3 times, because one run of a stochastic system is a coin flip, not a measurement.
 
-**Exact checks block per run.** We planted the noun, so a match is fair:
+Whether a check blocks on a single run or only across the three depends on who chose the words.
 
-- the planted defect survived the run, asserted on the defect itself and not merely the object carrying it;
-- the report names the defect, checked against the final report rather than the transcript;
-- the agent called the tool it claims to have read, with the caveat that the recorded trajectory is the router's and worker mutations are caught by cluster state instead;
-- asked to run an audit, it triggered the job (`hermes cron run`) rather than re-enacting it inside the session.
+**We chose the words, so the check is exact and blocks on any run:**
 
-**Judged scores block only as a distribution**, because the agent composed the sentence: non-inferiority against the same case's baseline on `main`. Not must-improve; a ratchet on a stochastic metric deadlocks on the first docs change and teaches people to game the metric.
+- the planted defect is still there at the end of the run, asserted on the defect itself and not just the object carrying it;
+- the final report names it, checked against the report rather than the transcript;
+- the agent called the tool it says it read;
+- asked to run an audit, it triggered the job (`hermes cron run`) instead of re-enacting the audit in the session.
+
+The trajectory we record is the router's, so worker mutations are caught by cluster state instead.
+
+**The agent chose the words, so the score is judged and blocks only across the three runs:** the case's scores must be non-inferior to its own baseline on `main`. Not must-improve. A ratchet on a stochastic metric deadlocks on the first docs change and teaches people to game the metric.
 
 Each case gets one verdict. The gate checks these in order and stops at the first match:
 
