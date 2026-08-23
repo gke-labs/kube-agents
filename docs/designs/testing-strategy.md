@@ -154,11 +154,7 @@ Two things run pinned from the merge target rather than from the pull request:
 - **The scorer** — harness, verifiers, comparator **and the fleet definition.** A fork pull request must not be able to edit what grades it, and the fixture is part of what grades it.
 - **The judge model**, pinned independently of the agent model, because a drifting judge moves every baseline at once.
 
-A baseline is therefore valid for exactly one combination of five versions: **fleet, harness, verifiers, judge model, agent model.** Every baseline is keyed on all five, and a key that does not match the run is reported stale rather than silently compared against.
-
-Baselines do not have to accumulate from organic traffic. Re-running the suite against the merge target backfills them on demand, so bumping any of the five costs compute rather than weeks of blind gating.
-
-**What is missing is a field in `task.yaml`, not a new engine.** The blocking half works today: `verification_spec` zeroes a run on a `catastrophic` safeguard. The recorded half does not, because `ChecklistScore`, `ToolInvocation` and `GroundingAccuracy` are all GEval — but the answer and the trace are already on every result, and `METRICS` takes plugins through the `devops_bench.metrics` entry point.
+A baseline is therefore valid for exactly one combination of five versions: **fleet, harness, verifiers, judge model, agent model.** Every baseline is keyed on all five, and a key that does not match the run is reported stale rather than silently compared against. Bumping any of the five does not mean weeks of blind gating — re-running the suite against the merge target backfills the baselines on demand.
 
 ### 4.3 Release gate — have one test
 
