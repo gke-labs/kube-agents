@@ -4201,6 +4201,30 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_lazy_continuation_after_ordered_list_item_starting_above_one_never_fires(self):
+        body = "> Quoting the checklist:\n2. Fix the netpol\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_lazy_continuation_after_quoted_and_unprefixed_continuation_list_never_fires(self):
+        body = "> 1. netpol-missing\n2. rbac-broad\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_lazy_continuation_after_empty_ordered_marker_inside_quote_never_fires(self):
+        body = "> Findings:\n> 2.\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_unprefixed_numbered_list_item_starting_with_one_fires(self):
+        body = "> Quoting context:\n1. Fix the netpol\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
     def test_a_command_after_blank_quote_line_following_quoted_list_item_fires(self):
         body = "> Findings:\n> - netpol-missing\n>\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
@@ -6402,6 +6426,31 @@ class TestBlockQuoteScanning(unittest.TestCase):
         out = self.strip("> Quote header:\n- list item\n/remediate real")
         self.assertIn("- list item", out)
         self.assertIn("/remediate real", out)
+
+    def test_an_ordered_list_item_starting_with_one_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n1. list item\n/remediate real")
+        self.assertIn("1. list item", out)
+        self.assertIn("/remediate real", out)
+
+    def test_an_ordered_list_item_starting_above_one_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Quote header:\n2. list item\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_an_ordered_list_unprefixed_continuation_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> 1. netpol-missing\n2. rbac-broad\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_content_free_ordered_marker_inside_quote_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Findings:\n> 2.\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_an_empty_list_item_without_content_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Quoting context:\n- \n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
 
     def test_a_lazy_continuation_under_quoted_bullet_list_item_is_stripped(self):
         out = self.strip("> Findings:\n> - netpol-missing\n/remediate netpol-missing\n\nreal text")

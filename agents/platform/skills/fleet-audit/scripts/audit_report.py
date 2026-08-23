@@ -444,16 +444,16 @@ FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # A block quote opener (CommonMark §5.1): 0-3 spaces followed by '>'.
 BLOCKQUOTE_OPEN_RE = re.compile(r"^ {0,3}>")
 # Block starters that terminate a paragraph's lazy continuation in a blockquote:
-# Heading (#), thematic break (---, ***, ___), list item (-, *, +, 1.), fence (```, ~~~)
+# Heading (#), thematic break (---, ***, ___), non-blank list item (-, *, +, 1.), fence (```, ~~~)
 PARAGRAPH_BREAK_RE = re.compile(
-    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|(?:[*+-]|\d+[.)])\s|`{3,}|~{3,})"
+    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|(?:[*+-]|1[.)])\s+\S|`{3,}|~{3,})"
 )
 # Block structures inside a block quote that do NOT contain an open paragraph:
-# Heading (#), thematic break (---, ***, ___), fence (```, ~~~), or empty list item.
-# Note: list items with content (e.g. `> - item`) contain open paragraphs and accept
-# CommonMark lazy continuations.
+# Heading (#), thematic break (---, ***, ___), fence (```, ~~~), or empty bullet list item.
+# Note: list items with content (e.g. `> - item`, `> 1. item`) or ordered markers
+# without starting from 1 contain/continue open paragraphs and accept CommonMark lazy continuations.
 NON_PARAGRAPH_BLOCK_RE = re.compile(
-    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|`{3,}|~{3,}|(?:[*+-]|\d+[.)])\s*$)"
+    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|`{3,}|~{3,}|[*+-]\s*$)"
 )
 
 MAX_EXCERPT_LINES = 40
