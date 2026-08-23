@@ -114,7 +114,7 @@ The gate walks this ladder per case, first match wins:
 | 1        | Catastrophic safeguard tripped (any rep)                                                | 🔴 RED — a forbidden action outranks everything, never absorbable, not even by `expected: fail`                      |
 | 2        | Machinery error — checks declared but did not run (coverage < 1.0, score parse crashed) | 🔴 RED — "no evidence" blocks; it never masquerades as pass or expected-fail                                         |
 | 3        | Harness is not the real agent                                                           | 🔴 RED — no scoring yourself with a canned transcript                                                                |
-| 4        | Exact checks collapsed — a case admitted at ≥19/20 on `main` passes ≤6 of 13 here       | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
+| 4        | Collapse — a case that is reliable on `main` fails most of its re-runs here (below)     | 🔴 RED — unless the task is a legitimate `expected: fail` spec (new in this change only), which is green-with-a-note |
 | 5        | Expected-fail task now passes                                                           | 🔴 RED — flip the marker; that flip is the improvement being claimed                                                 |
 | 6        | Judged distribution worse than main's baseline (N reps, non-inferiority)                | 🔴 once baselines exist under a pinned judge; advisory until then                                                    |
 | 7        | Everything above clean                                                                  | 🟢 GREEN                                                                                                             |
@@ -134,12 +134,14 @@ The ladder above is per case. Run it unchanged over hundreds of cases and the su
 
 Our cases will not be 99.9% reliable, and a gate that reds seven pull requests in eight is ignored within two days. So the suite verdict is not "every case passed." It is these four rules:
 
-| Rule                     | What it means                                                                                                                                                |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Admission**            | A new or edited case runs, reports, and fails nobody. It joins the blocking set after the screener runs it 20 times against `main` and it passes at least 19 |
-| **Aggregate**            | Across the admitted cases, the pull request's pass rate must be non-inferior to `main`'s                                                                     |
-| **Collapse**             | Rung 4: one admitted case dropping from ≥19/20 to ≤6 of 13 reds the job by itself                                                                            |
-| **Re-run, then believe** | Every case runs 3 times; only the cases that failed are re-run to 13                                                                                         |
+| Rule                     | What it means                                                                                                       |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| **Admission**            | A case cannot block anyone until it has proved it is reliable — 20 runs against `main`, at least 19 of them passing |
+| **Re-run, then believe** | On a pull request every case runs 3 times, and any case that failed is re-run to 13                                 |
+| **Aggregate**            | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                            |
+| **Collapse**             | A case that was reliable on `main` and now fails most of its re-runs reds the job on its own                        |
+
+**Worked example.** Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` now runs 3 times here and fails once, so it is re-run to 13. Pass 7 or more of those 13 and it was noise — nothing happens. Pass 6 or fewer and it has **collapsed**: that one case reds the job, because a case this reliable on `main` does not fail half the time by chance. Meanwhile every other case's result feeds the **aggregate**, which catches the opposite failure — nothing collapsing, but the whole suite slipping a few points.
 
 Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out.
 
