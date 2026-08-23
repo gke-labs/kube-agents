@@ -143,6 +143,17 @@ Our cases will not be 99.9% reliable, and a gate that reds seven pull requests i
 
 **Worked example.** Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` now runs 3 times here and fails once, so it is re-run to 13. Pass 7 or more of those 13 and it was noise — nothing happens. Pass 6 or fewer and it has **collapsed**: that one case reds the job, because a case this reliable on `main` does not fail half the time by chance. Meanwhile every other case's result feeds the **aggregate**, which catches the opposite failure — nothing collapsing, but the whole suite slipping a few points.
 
+**Why 13 re-runs.** Because it is odd, the threshold is a sentence rather than a tuned constant: _fails more often than it passes._ At an even count that rule needs an arbitrary tie-break. Thirteen is then the point where the two error rates are both acceptable:
+
+| A case whose true reliability is      | Trips collapse   |
+| ------------------------------------- | ---------------- |
+| 95% — a healthy admitted case         | 1 run in 975,000 |
+| 90% — a marginal one, barely admitted | 1 run in 10,000  |
+| 50% — broken to a coin flip           | 1 run in 2       |
+| 30% — badly broken                    | 19 runs in 20    |
+
+Going higher stops paying: 21 re-runs move the 30% row from 94% to 97% and cost 60% more. Only failing cases pay at all — at 95% reliability about one case in seven fails at least one of its first three runs, so a 200-case suite adds roughly 370 runs, not 2,600. Like the non-inferiority margin, 13 is a defensible starting point rather than a derived constant, and gets re-checked once there is a fortnight of measured `main`-against-`main` variance.
+
 Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out.
 
 Three simpler designs were considered and rejected, each for one reason:
