@@ -124,28 +124,47 @@ The ordering encodes two rules: authority outranks quality, and absence of evide
 
 #### Scaling to hundreds of cases
 
-Applied unchanged to hundreds of cases, "everything passes" never reports green: at 99% per-case reliability, a 200-case suite comes out fully clean on 13% of runs. A gate that reds seven pull requests in eight is ignored within two days. Two rules keep it usable.
+The ladder above is per case. Run it unchanged over hundreds of cases and the suite never comes out green:
 
-**A case earns the right to block.** A new or edited case runs, reports, and fails nobody. It joins the blocking set once the screener has run it 20 times against `main` and it passed at least 19. Its measured reliability is reported on the pull request that added it, so the author finds out their eval is too noisy before it starts reddening other people's work.
+| If each case passes | A 200-case suite is fully clean |
+| ------------------- | ------------------------------- |
+| 95% of the time     | 0.003% of runs                  |
+| 99% of the time     | 13% of runs                     |
+| 99.9% of the time   | 82% of runs                     |
 
-**The suite verdict has two criteria, not one.** Rungs 1–3 and 5 stay absolute and per case — authority, missing evidence and provenance never average out. Quality across the admitted set is judged by both of:
+Our cases will not be 99.9% reliable, and a gate that reds seven pull requests in eight is ignored within two days. So the suite verdict is not "every case passed." It is these four rules:
 
-- **Aggregate** — the pull request's pass rate must be non-inferior to `main`'s. Hundreds of cases at N repetitions is thousands of observations, so this is where the statistical power is.
-- **Collapse** — rung 4: any single admitted case falling from ≥19/20 to ≤6/13 reds the job on its own.
+| Rule                     | What it means                                                                                                                                                |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Admission**            | A new or edited case runs, reports, and fails nobody. It joins the blocking set after the screener runs it 20 times against `main` and it passes at least 19 |
+| **Aggregate**            | Across the admitted cases, the pull request's pass rate must be non-inferior to `main`'s                                                                     |
+| **Collapse**             | Rung 4: one admitted case dropping from ≥19/20 to ≤6 of 13 reds the job by itself                                                                            |
+| **Re-run, then believe** | Every case runs 3 times; only the cases that failed are re-run to 13                                                                                         |
 
-Both, because the aggregate misses a change that destroys exactly one case (half a point on a 200-case average) and collapse misses broad drift. Per-case significance testing is deliberately not used: at 200 cases, a 5% threshold manufactures roughly ten false regressions every run.
+Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out.
 
-**Failures are re-run before they are believed.** Every case at N=3, and only the failures re-run to 13 — the cost scales with the failures, not with the suite.
+Three simpler designs were considered and rejected, each for one reason:
 
-**The margin is measured, not chosen.** Run the suite twice against `main`, observe how far the score moves on its own, and set the bar above that. A margin picked on paper either fires constantly or never, and which one will not be apparent for a month.
+- **Aggregate alone** misses a change that destroys exactly one case — half a point on a 200-case average.
+- **Collapse alone** misses broad drift, where nothing collapses but everything slips.
+- **A significance test per case** manufactures roughly ten false regressions every run, at 200 cases and a 5% threshold.
+
+The one number not fixed here is the non-inferiority margin, because it is measured rather than chosen: run the suite twice against `main`, see how far the score moves on its own, and set the bar above that. A margin picked on paper either fires constantly or never fires, and which one it is will not be apparent for a month.
+
+Admission is also what makes §5 a development model rather than an obligation. A case reports its own measured reliability on the pull request that added it, so its author finds out it is too noisy before it starts reddening other people's work.
 
 #### Pinning and baselines
 
-The harness, verifiers, comparator **and fleet definition** run pinned from the merge target — a fork pull request must not edit its own scorer, and the fixture it is scored against is part of that scorer. The judge model is pinned independently of the agent model, because a drifting judge silently moves every baseline.
+Two things run pinned from the merge target rather than from the pull request:
 
-A baseline is therefore valid for exactly one combination of **fleet, harness, verifiers, judge model and agent model.** Every baseline is keyed on all five, and a key that does not match the run is reported as stale rather than silently compared against. Baselines do not have to accumulate from organic traffic: re-running the suite against the merge target backfills them on demand, so bumping any of the five costs compute instead of weeks of blind gating.
+- **The scorer** — harness, verifiers, comparator **and the fleet definition.** A fork pull request must not be able to edit what grades it, and the fixture is part of what grades it.
+- **The judge model**, pinned independently of the agent model, because a drifting judge moves every baseline at once.
 
-**What is missing is a field in `task.yaml`, not a new engine.** The blocking half works today — `verification_spec` zeroes a run on a `catastrophic` safeguard. The recorded half does not, because `ChecklistScore`, `ToolInvocation` and `GroundingAccuracy` are all GEval; but the answer and the trace are already on every result, and `METRICS` takes plugins through the `devops_bench.metrics` entry point.
+A baseline is therefore valid for exactly one combination of five versions: **fleet, harness, verifiers, judge model, agent model.** Every baseline is keyed on all five, and a key that does not match the run is reported stale rather than silently compared against.
+
+Baselines do not have to accumulate from organic traffic. Re-running the suite against the merge target backfills them on demand, so bumping any of the five costs compute rather than weeks of blind gating.
+
+**What is missing is a field in `task.yaml`, not a new engine.** The blocking half works today: `verification_spec` zeroes a run on a `catastrophic` safeguard. The recorded half does not, because `ChecklistScore`, `ToolInvocation` and `GroundingAccuracy` are all GEval — but the answer and the trace are already on every result, and `METRICS` takes plugins through the `devops_bench.metrics` entry point.
 
 ### 4.3 Release gate — have one test
 
