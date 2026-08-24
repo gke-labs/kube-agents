@@ -284,19 +284,52 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 // here would break /sethome exactly the way the read-only mount did.
 //
 // Emitted even when empty: the volume projects this key by name, and a ConfigMap item
-// that names a missing key fails the mount and the pod never starts.
+// that names a missing key fails the mount and the pod never starts. Since API_SERVER_KEY
+// below is unconditional it is no longer ever empty in practice, but the projection still
+// depends on the key existing, not on it having content.
 func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
-	integration := agent.Spec.Integration
-	if integration == nil {
-		return ""
-	}
-
 	// Fixed order, not map iteration: this render feeds the config hash, and a hash that
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
 	add := func(key, value string) {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
+
+	// UNCONDITIONAL, and the only pin here that is not about chat. Every other key below
+	// exists because the agent could otherwise write a competing value into the PVC .env;
+	// this one exists because something already does, on every boot, without being asked.
+	//
+	// Hermes' Docker stage2 hook generates a strong random API_SERVER_KEY into
+	// $HERMES_HOME/.env whenever that file does not already carry one, and
+	// load_hermes_dotenv applies the PVC .env with override=True. So the container env
+	// this render is supposed to agree with was being overwritten before the gateway ever
+	// read it, and the API server ended up authenticating against a 64-character value
+	// that neither the operator, the Secret, the sidecar, nor the process environment had
+	// ever seen. Every authenticated route 401'd — the loopback callers directly, and the
+	// external path through the Service too, because the credential proxy re-signs
+	// upstream with AGENT_API_UPSTREAM_KEY, which is this same sentinel. Issue #786; the
+	// seven consecutive cron relay deliveries that recorded success while being rejected
+	// are the reason it went unnoticed for so long.
+	//
+	// The managed .env is applied LAST of all, after the PVC file, so pinning it here is
+	// what makes one value true everywhere without anyone having to know that .env exists.
+	// It also stops the agent rotating the key out from under its own callers, since
+	// save_env_value refuses to write a key this file holds.
+	//
+	// Deliberately not a per-boot generated secret. The value is worthless — see
+	// loopbackAgentAPIKey — and a generated one would have to be transported to the
+	// sidecar's AGENT_API_UPSTREAM_KEY and to the probe's bearer, reintroducing exactly
+	// the several-parties-must-agree problem this closes.
+	add("API_SERVER_KEY", loopbackAgentAPIKey)
+
+	integration := agent.Spec.Integration
+	if integration == nil {
+		return strings.Join(lines, "\n") + "\n"
+	}
+
+	// The gateway-wide pair below is pinned only when a platform is, so the chat block
+	// records where it started rather than testing `lines` for emptiness.
+	platformStart := len(lines)
 
 	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
 		add("GOOGLE_CHAT_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
@@ -312,8 +345,8 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
 	}
 
-	if len(lines) == 0 {
-		return ""
+	if len(lines) == platformStart {
+		return strings.Join(lines, "\n") + "\n"
 	}
 
 	// The gateway-wide pair, pinned empty/false whenever any platform is pinned above.
@@ -516,6 +549,32 @@ const (
 	// Hermes expects (config.yaml and .env).
 	managedVolumeName = "platform-agent-managed-vol"
 )
+
+// loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
+// it is a MARKER RATHER THAN A SECRET on purpose: the listener binds loopback only
+// (API_SERVER_HOST above), so everything that can reach it is already inside this pod.
+// The credential that actually guards the API from outside is API_SERVER_EXTERNAL_KEY,
+// held by the credential-proxy sidecar alone, which authenticates the caller and then
+// re-signs the request upstream with this value (AGENT_API_UPSTREAM_KEY).
+//
+// It is a named constant because its VALUE is worthless and its AGREEMENT is the whole
+// point. Four places have to say the same thing — the agent container's env, the
+// sidecar's AGENT_API_UPSTREAM_KEY, the sidecar's own copy for the event watcher, and
+// the managed .env pin in renderManagedEnv — and issue #786 is what a fifth party
+// disagreeing costs: Hermes' Docker stage2 hook generates a strong key into
+// $HERMES_HOME/.env when that file does not already carry one, load_hermes_dotenv
+// applies that file with override=True, and the gateway then authenticated against a
+// value invented at boot that no caller in the system knew. Every authenticated route
+// 401'd, in-pod and through the Service, and every caller degraded quietly.
+//
+// The renderManagedEnv pin is what settles it: the managed .env is applied last of all,
+// after the PVC file, so this value wins whatever stage2 wrote. Adding a fifth reader
+// means using this constant, not repeating the literal.
+//
+// Length is load-bearing, minimally: Hermes refuses to bind the API server at all for a
+// key under 16 characters (has_usable_secret(min_length=16), called from
+// gateway/platforms/api_server.py's startup guard). This is 24.
+const loopbackAgentAPIKey = "cluster-internal-trusted"
 
 // profileOverlayKey returns the ConfigMap key carrying the overlay for a profile.
 func profileOverlayKey(profile string) string {
@@ -1617,9 +1676,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 		{
 			// The sidecar authenticates external callers and replaces their bearer
-			// key with this non-secret loopback sentinel.
+			// key with this non-secret loopback sentinel. Setting it here is NOT
+			// sufficient on its own — the PVC .env beats the container env inside
+			// Hermes — which is why renderManagedEnv pins the same value; see
+			// loopbackAgentAPIKey.
 			Name:  "API_SERVER_KEY",
-			Value: "cluster-internal-trusted",
+			Value: loopbackAgentAPIKey,
 		},
 		// API_SERVER_MODEL_NAME belongs here by topic but is appended after the
 		// env merge instead — see buildBaseContainers, and apiServerModelEnvVar
@@ -2268,7 +2330,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+		{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
 		// Read by the k8s-event-watcher this container hosts, via --token-env.
 		// A non-secret loopback sentinel, not a credential; the real secret is
 		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
@@ -2276,7 +2338,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// reserves the name — appending after that call would leave it
 		// protected only by its presence in SensitiveEnvVars, which is
 		// incidental and would not hold for a name not on that list.
-		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
+		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
 	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
 	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {

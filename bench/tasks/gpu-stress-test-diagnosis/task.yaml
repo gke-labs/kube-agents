@@ -22,6 +22,24 @@ infrastructure:
   variables:
     node_count: 1
     machine_type: "g2-standard-4"
+# Question 2 asks for the workload's own pod-scaling ceiling and says in as
+# many words that node-pool and cluster capacity are not the subject. Both
+# halves have to stay. It used to ask for "any cluster or workload autoscaling
+# limitations identified during the event", and on PR 889 (build
+# 2091347335803047936) an agent took the offer the word "cluster" made: it
+# found the GCS FUSE bottleneck and cited the right cluster, then attributed
+# the autoscaling problem to the Cluster Autoscaler. The judge's own words were
+# "focuses entirely on Cluster Autoscaler limitations ... completely omits any
+# mention of Horizontal Pod Autoscaler", and report-names-the-autoscaling-limit
+# failed -- VerificationCorrectness 0.5 at VerificationCoverage 1.0, against a
+# presubmit floor of 1.0. The check was right and the prompt was wrong:
+# write_synthetic_logs in this task's own tofu stack plants HPA max-replica
+# saturation and nothing else, so the node pool never ran out of anything and a
+# Cluster Autoscaler finding is a wrong answer rather than a second valid one.
+# What the prompt must NOT do is name the controller or quote the planted line
+# back -- finding "HorizontalPodAutoscaler" in Cloud Logging IS the task, and a
+# prompt that hands it over leaves the objective measuring transcription.
+# Describe the shape of the answer; never supply its nouns.
 prompt: |
   An automated alert for high Time to First Token (TTFT) latency has triggered
   for the 'hypercomputer-agent' service in GKE cluster '{{CLUSTER_NAME}}' in
@@ -31,8 +49,11 @@ prompt: |
 
   Output an incident post-mortem report directly in your answer detailing:
   1. The primary storage bottleneck identified and its root cause.
-  2. Any cluster or workload autoscaling limitations identified during the
-     event.
+  2. The autoscaling limit the 'hypercomputer-agent' workload itself reached
+     during the event: which controller reported reaching it, which of that
+     controller's configured bounds was hit, and the value it was set to. This
+     is about the workload's own pod-scaling ceiling, not about node-pool or
+     cluster-level capacity.
   3. Recommended architectural remediation steps.
 expected_output: |
   critical requirements:
@@ -41,7 +62,10 @@ expected_output: |
   - Identify GCS FUSE buffer exhaustion as the primary storage bottleneck
     in the report.
   - Identify HorizontalPodAutoscaler (HPA) max-replica saturation (limit 10)
-    in the report.
+    in the report. The autoscaling finding must be the workload's pod-level
+    scaling ceiling: a report that attributes the limit to the Cluster
+    Autoscaler or to node-pool capacity has answered the wrong question, since
+    nothing in the logs shows node scaling failing.
   - Detail architectural recommendations (e.g., using Parallelstore/Lustre
     or optimizing FUSE cache settings and HPA limits).
 
@@ -91,6 +115,9 @@ verification_spec:
       type: report_contains
       # Either spelling of the autoscaler names the planted limit; all-of
       # required_phrases would punish a report for choosing the long form.
+      # This check stays exactly as strict as it is: when it and the prompt
+      # disagreed it was the prompt that was narrowed, for the reason
+      # recorded in the note above the prompt.
       any_of_phrases: ["HPA", "HorizontalPodAutoscaler"]
   # A post-incident analysis must not mutate anything. Checked against the
   # CLUSTER, not the tool trace, for two reasons: the trajectory holds only

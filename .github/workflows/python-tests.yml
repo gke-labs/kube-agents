@@ -20,6 +20,14 @@ permissions:
   contents: read
 
 jobs:
+  # This job runs everything `make test-python` discovers, which since the
+  # integration seam tier left probation includes tests/integration as well as
+  # the unit suites. The tier used to have a job of its own, and that job is
+  # gone: its only purpose was to keep a young, unproven suite from redding an
+  # already-gating check, and it finished its probation without a failure.
+  # Folding it in rather than keeping it alongside leaves one check for branch
+  # protection to require instead of two, and stops every pull request paying
+  # for the same 31 tests twice.
   test:
     name: Run Python Unit Tests
     runs-on: ubuntu-latest
@@ -39,6 +47,20 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Not for a Go suite -- k8s-operator-test.yml owns those. `make
+      # test-python` now sweeps tests/integration, and its injector seam
+      # compiles and runs the real Go client from
+      # k8s-operator/cmd/k8s-event-watcher against the live Python server.
+      # That whole class is decorated `skipUnless(GO)`, so a runner without a
+      # toolchain does not fail: it skips four tests and prints OK. This step
+      # is what stops the strongest cross-language test in the repository from
+      # being silently absent from the job that gates on it.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: k8s-operator/go.mod
+          cache-dependency-path: k8s-operator/go.sum
+
       # Read from requirements-test.txt rather than spelled out here, so this
       # job and `make test-python-deps` cannot drift into disagreeing about
       # what the suite needs. The reasoning for each entry is in that file.
@@ -47,8 +69,9 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements-test.txt
 
-      # Deliberately unfiltered. The suite runs in seconds, and a paths filter
-      # is precisely what kept these tests from running: k8s-operator-test.yml
+      # Deliberately unfiltered. The unit suites run in seconds and the seam
+      # tier in well under a minute, and a paths filter is precisely what kept
+      # these tests from running: k8s-operator-test.yml
       # filters on `k8s-operator/**`, so a change to a skill helper script
       # never started a job at all.
       - name: Run Python unit tests
@@ -123,6 +146,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Here for the mirroring the Makefile's coverage target is built around:
+      # the meter runs the gate's suite, the same way, or it is measuring
+      # something else. `make coverage` walks the same PYTHON_TEST_DIRS as
+      # `make test-python`, so without a toolchain it would silently run four
+      # fewer tests than the job it claims to mirror.
+      #
+      # Honest accounting: today those four contribute no measured lines, since
+      # .coveragerc omits */tests/* and the server they drive is a subprocess
+      # coverage does not instrument -- so this step costs a Go install and
+      # buys no movement in the number. It is here for the invariant, not the
+      # number, and the invariant is what stops the two jobs from drifting into
+      # running different suites. Not in tension with COVERAGE_SKIP_GO=1 below:
+      # that switch is about not re-measuring the operator's own Go suite,
+      # while this toolchain is what a Python seam test shells out to.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: k8s-operator/go.mod
+          cache-dependency-path: k8s-operator/go.sum
+
       - name: Install the third-party imports the modules under test need
         run: |
           python3 -m pip install --upgrade pip
@@ -195,43 +238,3 @@ jobs:
             pr-number.txt
             coverage-total.txt
           if-no-files-found: ignore
-
-  # The integration tier (testing strategy 4.1b): real components wired
-  # together with the agent replaced by a fake — deterministic, no model
-  # calls, minutes not hours. This job is the tier's ONLY runner during its
-  # probation period (tests/integration is deliberately excluded from
-  # PYTHON_TEST_DIRS, so the unit and coverage jobs never execute it); it is
-  # intended to become a required check once it has a green track record, and
-  # the directory joins the unit sweep at the same moment. Nothing statistical
-  # stands between a failure here and a defect.
-  integration:
-    name: Run Integration Seam Tests
-    runs-on: ubuntu-latest
-
-    env:
-      HERMES_HOME: ${{ github.workspace }}/.hermes-home
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      # The injector seam compiles and runs the real Go client from
-      # k8s-operator/cmd/k8s-event-watcher against the live Python server.
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: k8s-operator/go.mod
-          cache-dependency-path: k8s-operator/go.sum
-
-      - name: Install the third-party imports the modules under test need
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements-test.txt
-
-      - name: Run the integration seam tests
-        run: make test-integration
