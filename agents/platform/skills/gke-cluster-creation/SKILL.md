@@ -32,6 +32,16 @@ for all new clusters.
     template or mode, present the available templates (e.g., Autopilot, Standard
     Regional, GPU Inference, AI Hypercompute) and explain key trade-offs (Cost
     vs. Availability, Autopilot vs. Standard node management).
+    3a. **Check quota and live obtainability (GPU/TPU or large-shape
+    designs)**: before recommending capacity, load the
+    [gke-obtainability](../gke-obtainability/SKILL.md) skill and run its
+    Step 4 diagnostics in design-time mode: verify the regional quota for the
+    exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather capacity obtainability
+    advice (`gcloud beta compute advice capacity`) for the requested machine
+    shape and count across the region's zones and across On-Demand, Spot, and
+    Flex provisioning models. Present quota and live obtainability as two
+    separate findings — quota is not proof of obtainable hardware — and never
+    guarantee capacity.
 4.  **Configure networking**: auto-create subnet (default) or bring-your-own.
 5.  **Review golden path settings**: present the default configuration block
     (`gcloud` command or `create_cluster` JSON payload) and confirm with the
