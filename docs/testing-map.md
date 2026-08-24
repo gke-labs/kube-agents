@@ -31,12 +31,12 @@ against the case's `verification_spec`. The subject is the agent — the defect 
 in question is whether the agent finds it. That is why a case needs a `domain:` slug and
 deterministic checks, and why adding one changes what a pull request reports.
 
-A `bench/cuj/` journey is a **live black-box test of an install you already own, and nothing in CI
-runs it**. It plants nothing and provisions nothing. It talks to Kage as a user through the admin
-portal API and scores only evidence the deployed system returned, so the subject is the install: the
-agent is assumed to work, and what is in question is whether this deployment is wired up. It needs a
-real installation to point at, which is exactly why no CI job runs it and why it cannot gate
-anything.
+A `bench/cuj/` journey is a **live black-box test you run by hand against your own install, and it
+is never part of the presubmit**. It plants nothing and provisions nothing. It talks to Kage as a
+user through the admin portal API and scores only evidence the deployed system returned, so the
+subject is the install: the agent is assumed to work, and what is in question is whether this
+deployment is wired up. It needs a real installation to point at, which is why no CI job runs it,
+why adding one changes nothing about what a pull request reports, and why it cannot gate anything.
 
 Rule of thumb: if you would have to break something on purpose for the test to be meaningful, it is
 a `bench/tasks/` case. If you would run it against production to check the deploy landed, it is a
