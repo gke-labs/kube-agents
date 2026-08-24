@@ -30,26 +30,30 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in eight places here, with different runners and different answers to "does this catch a
+Tests live in nine places here, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
 **Decide by asking whether a model call is in the loop.**
 
-- **Yes** — it is an eval, and it belongs in `bench/tasks/<name>/task.yaml` with a `domain:` slug and
-  a `verification_spec`. See [`bench/CUSTOM-TASKS.md`](bench/CUSTOM-TASKS.md).
-- **No** — it is a test. Put it beside the module it covers, or in `tests/integration/` if it spans
-  two components. See [`tests/integration/README.md`](tests/integration/README.md).
-- **Yes, but you want pytest against a deployed install** — that is a journey, and it goes in
-  `bench/cuj/`. See [`bench/cuj/README.md`](bench/cuj/README.md). No CI job runs that suite.
+- **No** — it is a test, and it runs on every pull request. Put it beside the module it covers; in
+  `tests/` when there is nothing to sit beside, as for a shell script or a rendered manifest; or in
+  `tests/integration/` when it spans two components.
+  See [`tests/integration/README.md`](tests/integration/README.md).
+- **Yes, graded against a planted defect** — it is an eval, and it belongs in
+  `bench/tasks/<name>/task.yaml`. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
+  is the contract for what that file must carry; `make bench-case-check` enforces it.
+- **Yes, driving a deployed install end to end** — it is a journey, and it goes in `bench/cuj/`.
+  See [`bench/cuj/README.md`](bench/cuj/README.md). No CI job runs that suite.
+- **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
+  schedule. Adding to it holds up releases rather than pull requests.
 
-Two rules that hold wherever it lands. A `bench/tasks/` case needs a `domain:` slug, because
-coverage is accounted per domain and a case without one counts as coverage of nothing. And a new
-test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makefile` reaches it — a directory the
-globs miss fails nothing, it just sits unexecuted while the suite reports green around it.
+One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
+`Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
+suite reports green around it. Add the glob in the same change.
 
-The eight homes, what runs each, which ones gate a merge, and the traps behind those two rules are
-in [`docs/testing-map.md`](docs/testing-map.md).
+The nine homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+[`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
 
