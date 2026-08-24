@@ -141,6 +141,8 @@ Each case gets one verdict. The gate checks these in order and stops at the firs
 
 The order says that authority outranks quality, and that no evidence blocks rather than passing quietly.
 
+Throughout this document, "blocks" means the presubmit job goes red. Whether a red job stops a merge is a separate question decided Tide-side on labels, and today it does not: the job is `optional: true`.
+
 #### Scaling to hundreds of cases
 
 The ladder above is per case. Run it unchanged over hundreds of cases and the suite never comes out green:
@@ -162,7 +164,9 @@ Our cases will not be 99.9% reliable, and a gate that reds seven pull requests i
 
 A worked example. Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the aggregate. Fails all three: it has collapsed, and that one case reds the job. A case that passes 19 times in 20 does not fail three in a row by chance.
 
-Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out.
+Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out. Admission scopes rung 4 and rung 6 — the quality rungs — and nothing else. An unadmitted case cannot red the job on quality; it can still red it on any of the other four.
+
+Rung 2 is not hypothetical, and it is the reason the ten domain scenarios sit commented out in `TASKS` in `hack/ci-eval-pr.sh` rather than merely reporting. Their `ledger_issue_contains` checks return `status: "error"` without an `issues: read` credential that Prow does not supply, which drops `VerificationCoverage` below the gate's 1.0 floor by design; separately, every `resource_property` safeguard in the corpus reads the ambient kubeconfig, which is not the seeded clusters', so those catastrophic checks error too. A case whose checks cannot run reds the job for every open pull request, admitted or not. That is rung 2 working, not misfiring — but it means "landing a case is free" is only true of its score.
 
 Every number here is a starting point. Three runs, all-three-fail for collapse, 19 of 20 for admission, and the non-inferiority margin are set to be tuned, not defended. The way to tune them is to run the suite twice against `main`, see how much it moves when nothing has changed, and set the bars above that. If a real regression is getting through, add repetitions before loosening a threshold. A looser threshold buys detection with false reds, and a gate that reds pull requests it should not is a gate people learn to ignore.
 
@@ -216,10 +220,10 @@ Two things we learned building the first corpus:
 
 ### 5.1 What runs, without you doing anything
 
-| When                    | What runs                                                                           | What blocks                                                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| You open a pull request | Unit and integration tests, plus the case corpus at 3 reps against the seeded fleet | The admitted set only: authority per run, collapse per case, pass rate in aggregate (§4.2). A case you added reports and blocks nothing |
-| Within 3h of merge      | The same suite on the assembled release, which also refreshes `main`'s baselines    | The exact checks                                                                                                                        |
+| When                    | What runs                                                                           | What blocks                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| You open a pull request | Unit and integration tests, plus the case corpus at 3 reps against the seeded fleet | Rungs 1-3 and 5 on every case, admitted or not: a forbidden action in any run, a check that errored instead of running, a transcript not from a real run. Admission scopes the quality rungs only — collapse per case, pass rate in aggregate (§4.2). A case you added reports its score and blocks nobody on quality; it can still red the job on the absolute rungs |
+| Within 3h of merge      | The same suite on the assembled release, which also refreshes `main`'s baselines    | The exact checks                                                                                                                                                                                                                                                                                                                                                      |
 
 ### 5.2 What you write
 
@@ -230,4 +234,4 @@ Two things we learned building the first corpus:
 | Adds a domain we do not cover                           | A case for the journey, plus its refusal case (§4.2) | Same, and until it is admitted the domain still reports uncovered (§3)                                                |
 | Needs a cluster created, upgraded, or specific hardware | A case                                               | Parked until nightly exists (§4.4); nowhere else can run it                                                           |
 
-When in doubt, write the case. It reports before it blocks, so there is no budget to negotiate and nothing it can break.
+When in doubt, write the case. Its score reports before it blocks, so there is no quality budget to negotiate. That is not a licence to land it unrun: rungs 1-3 and 5 apply to an unadmitted case too, so a case whose checks error rather than run reds the job for everyone until someone deletes it. Run yours before you land it.
