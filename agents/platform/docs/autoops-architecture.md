@@ -98,8 +98,9 @@ flowchart TB
 > On the event-triage path the row is written by the delivery itself: the kanban notifier posts the
 > completed card's report into the thread and keys it to that thread in the same step
 > (`deploy/docker/patches/kanban_notifier.py`). It decides from the report rather than from the card —
-> a `What to do` heading with a lettered option under it — because nothing in the subscription row still
-> says the card came from event triage by the time the notifier reads it.
+> a `What to do` heading with either a lettered option or the `To authorize:` call to action under it —
+> because nothing in the subscription row still says the card came from event triage by the time the
+> notifier reads it.
 
 ## What qualifies as a domain
 
@@ -172,12 +173,12 @@ CREATE TABLE session_metadata (        CREATE TABLE incidents (
 **`session_metadata`** maps a session to its chat thread, so a reply in that thread routes back to the
 same session instead of starting a new one.
 
-**`incidents`** keeps the first triage report per thread — the one carrying the fix options.
+**`incidents`** keeps the first triage report per thread — the one carrying the proposed fix.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
 knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
 a Platform Agent posts into a thread; and the kanban notifier, when it delivers a card whose result carries
-remediation options into one. Only the last of those is on the event-triage path, and it is the only one
+a fix a reply could authorise into one. Only the last of those is on the event-triage path, and it is the only one
 that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
 event-triage card from an ordinary one by the time it runs, so the artifact is the test.
 
@@ -256,6 +257,13 @@ Format the report you pass to `kanban_complete`'s `result` exactly like this —
 - **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix,
   or name one directly with **'apply Option A'** / **'apply Option B'**.
 
+The prompt says separately that with exactly one option the section is unlettered instead — a
+lettered label asks the reader to pick from a list of one — so that `What to do` reads:
+
+## What to do
+- **Proposed fix (<Action Title>):** <1-sentence GitOps fix>
+- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.
+
 **Who acts on this:**
 A human reads your options and the agent that holds the GitOps write path opens the Pull
 Request ... the fix ships as a Pull Request against the GitOps repository, and nothing is
@@ -291,7 +299,9 @@ written to the live cluster directly.
   written" from "the user replied in the wrong thread". The prompt also tells the agent that this
   bullet is the call to action rather than another
   option, because it sits in the same list as Option A and Option B and gets numbered alongside them
-  otherwise.
+  otherwise. The bullet carries a second job on the single-option shape: with no lettered option
+  under the heading, it is what `kanban_notifier.actionable_report` recognises a report by, so
+  reword it and those reports stop earning the row they invite a reply to.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named

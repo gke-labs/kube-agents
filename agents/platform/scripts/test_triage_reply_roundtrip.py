@@ -346,6 +346,19 @@ class TriageReplyRoundTripTest(unittest.TestCase):
                 "## What to do\n\n- **Option A (Right-size the request):** 2Gi.\n"
             )
         )
+        # And the same seam for the shape with no letter in it. One sound fix
+        # is not "Option A", so the template drops the letter -- which is the
+        # evidence the gate used to run on. The call to action is what carries
+        # the coupling now, and it is the reply-carrying half of both shapes.
+        self.assertIn("- **To authorize:** reply **'apply'**", instructions)
+        self.assertTrue(
+            notifier.actionable_report(
+                "## What to do\n\n"
+                "- **Proposed fix (Right-size the request):** 2Gi.\n"
+                "- **To authorize:** reply **'apply'** to open a GitOps Pull "
+                "Request with this fix.\n"
+            )
+        )
 
     def test_the_lookup_the_plugin_makes_is_the_one_the_server_answers(self):
         # Pins the query contract across the seam: parameter names and route.
