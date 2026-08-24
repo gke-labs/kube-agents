@@ -301,7 +301,8 @@ data:
         enabled: false
         extra:
           rich_blocks: true
-  managed.env: ""
+  managed.env: |
+    API_SERVER_KEY=cluster-internal-trusted
   profile-platform.overlay.yaml: |
     memory:
       provider: ""

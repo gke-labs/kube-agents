@@ -12,6 +12,12 @@ subtracts EXCLUDED, and asserts every surviving directory is discovered. From
 here on, skipping a directory means adding a reviewed line to EXCLUDED with a
 reason -- it cannot happen by accident of a glob again.
 
+It owns the opposite direction too, because that one is quieter: an EXCLUDED
+entry naming a directory the globs already reach states a policy that is not in
+force, and the dict stops being a description of what CI does. Promoting a tier
+out of exclusion is two edits in two files, and the checks below fail unless
+both land.
+
 PYTHON_TEST_DIRS is read by invoking make itself on a wrapper makefile, not by
 parsing the Makefile's text: the value that matters is the one make expands,
 and a regex re-implementation would drift from it.
@@ -41,11 +47,9 @@ EXCLUDED = {
     # they open an admin portal and talk to a deployed agent, so they are
     # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
     "bench/cuj": "live manual suite, needs a provisioned install",
-    # Runs in its own CI job (`integration` in python-tests.yml) during its
-    # probation period, so a flake in a young seam test cannot red the
-    # already-gating unit and coverage jobs. Joins the unit sweep when the
-    # job becomes a required check.
-    "tests/integration": "own CI job during probation, make test-integration",
+    # tests/integration left this list when the seam tier came off probation
+    # and joined PYTHON_TEST_DIRS; the contradiction check below now keeps it
+    # out mechanically, so no comment has to.
 }
 
 # Directory names that are never test homes, at any depth. .terraform holds
@@ -118,6 +122,30 @@ class TestEveryTestFileRuns(unittest.TestCase):
             [],
             "\n\nThese EXCLUDED entries match no test_*.py directory any more; "
             "delete them:\n  " + "\n  ".join(stale),
+        )
+
+    def test_no_exclusion_names_a_directory_that_already_runs(self):
+        # The orphan check above only catches one direction: a directory that
+        # runs nowhere. The other direction is quieter and just as bad -- a
+        # directory that PYTHON_TEST_DIRS picks up while EXCLUDED still claims
+        # it is held back, so the reason string in this file describes a policy
+        # that is not in force. Promoting tests/integration out of probation is
+        # exactly that edit, and with only the check above, adding the Makefile
+        # glob and forgetting to delete the entry here passed clean.
+        discovered = discovered_dirs()
+        contradicted = sorted(
+            prefix
+            for prefix in EXCLUDED
+            if any(d == prefix or d.startswith(prefix + "/") for d in discovered)
+        )
+        self.assertEqual(
+            contradicted,
+            [],
+            "\n\nThese EXCLUDED entries name directories PYTHON_TEST_DIRS "
+            "already discovers, so the stated reason is not in force:\n  "
+            + "\n  ".join(contradicted)
+            + "\n\nEither delete the entry, or drop the Makefile wildcard that "
+            "reaches the directory -- the two must tell one story.",
         )
 
     def test_the_wrapper_reads_a_nonempty_list(self):

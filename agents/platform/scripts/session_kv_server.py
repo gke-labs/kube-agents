@@ -78,53 +78,109 @@ LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", 
 # name the variable an operator is being told to set.
 SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 
-# The gateway's own bearer, which is a different value from the sentinel above.
+# The gateway's own bearer. On an operator-managed pod this is the loopback
+# sentinel after all — see _gateway_api_token — but the name is resolved rather
+# than read, because which file answers it is the whole of issue #786.
 GATEWAY_AUTH_ENV = "API_SERVER_KEY"
 
+# Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
+# applies LAST with override=True. The operator mounts it at /etc/hermes and
+# sets HERMES_MANAGED_DIR to the same path explicitly; managed_scope.py's POSIX
+# default is that path too, so the fallback is not a guess.
+#
+# `.strip() or` rather than a plain `get(..., default)`: managed_scope.py treats
+# a set-but-empty value as unset and falls back, and matching that is not
+# pedantry here — `os.path.join("", ".env")` is the RELATIVE path ".env", so the
+# resolver would read whatever .env happens to sit in the server's working
+# directory and hand it back at the highest precedence of all. A stray file in
+# an agent workspace would become the bearer.
+MANAGED_DOTENV_PATH = os.path.join(
+    os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", ".env"
+)
 
-def _gateway_api_token() -> str:
-    """Resolve the bearer the gateway API server will actually accept.
 
-    `os.environ["API_SERVER_KEY"]` is not it, and trusting it is why the relay
-    turn never ran in this deployment. The operator sets that name to the
-    non-secret loopback sentinel `cluster-internal-trusted`
-    (`k8s-operator/internal/controller/platformagent_manifests.go`), on the
-    premise that the listener is loopback-only and the envoy sidecar
-    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes does
-    not honour that premise from this side: it prefers `$HERMES_HOME/.env` over
-    the process environment (`hermes_cli/auth.py` — "Prefer ~/.hermes/.env over
-    os.environ so a deliberate key rotation ... isn't shadowed by a stale shell
-    export"), and its Docker stage2 hook writes a freshly generated strong key
-    into that file whenever it does not already carry one. The sentinel is
-    therefore overridden on every boot, by a value this process never sees, and
-    every loopback caller that trusts the environment gets 401.
+def _dotenv_value(path: str, name: str) -> str:
+    """Return `name`'s value from a dotenv file, or "" if it does not carry one.
 
-    Measured on kage-management 2026-08-18: seven consecutive `github-repo-watcher`
-    relay turns rejected in one pod's first two hours, each degrading to an
-    unrelayed raw report that the scheduler still recorded as delivered. Writing
-    the sentinel into `.env` to force agreement is not an alternative — the API
-    server then declines to bind at all.
-
-    Read per call rather than cached at import: `.env` is rewritten a few seconds
-    *after* this process starts, so an import-time read returns the last boot's
-    key.
+    Deliberately a small hand parser rather than `dotenv.load_dotenv`: this must
+    report what ONE named file says, and load_dotenv mutates `os.environ`, which
+    would make the precedence below unobservable after the first call.
     """
     try:
-        with open(DOTENV_PATH, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
-                name, _, value = line.partition("=")
-                if name.strip() != GATEWAY_AUTH_ENV:
+                key, _, value = line.partition("=")
+                if key.strip() != name:
                     continue
                 value = value.strip().strip('"').strip("'")
                 if value:
                     return value
     except OSError:
-        # No .env, or unreadable: the environment is all there is, and on a
-        # deployment where nothing rewrites the key it is also correct.
+        # Absent or unreadable is an ordinary answer here, not an error: the
+        # managed scope is operator-only, and a plain `docker run` has neither
+        # file.
         pass
+    return ""
+
+
+def _gateway_api_token() -> str:
+    """Resolve the bearer the gateway API server will actually accept.
+
+    KEPT AS A BACKSTOP, no longer load-bearing. The disagreement it was written
+    for is fixed at its source in #786: the operator now pins `API_SERVER_KEY`
+    in the managed `.env` (`renderManagedEnv` in
+    `k8s-operator/internal/controller/platformagent_manifests.go`), which
+    `load_hermes_dotenv` applies LAST with `override=True` — after the PVC file
+    — so `os.environ["API_SERVER_KEY"]` and this function now return the same
+    value on an operator-managed pod, and the fallback below is what runs.
+
+    What went wrong, because the shape recurs. The operator sets that name to
+    the non-secret loopback sentinel `cluster-internal-trusted`, on the premise
+    that the listener is loopback-only and the credential-proxy sidecar
+    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes did
+    not honour that premise from this side: `$HERMES_HOME/.env` is loaded over
+    the process environment, deliberately, so that a key rotation in that file
+    is not shadowed by a stale export — and Hermes' Docker stage2 hook writes a
+    freshly generated strong key into that file whenever it does not already
+    carry one. The sentinel was therefore overridden on every boot by a value
+    nothing else in the system had ever seen, and every caller that trusted the
+    environment got 401.
+
+    Measured on kage-management 2026-08-18: seven consecutive
+    `github-repo-watcher` relay turns rejected in one pod's first two hours,
+    each degrading to an unrelayed raw report that the scheduler still recorded
+    as delivered.
+
+    An earlier note here said that writing the sentinel into `.env` to force
+    agreement was tried and made the API server decline to bind. That was
+    confounded — the pod had lost its credential-proxy sidecar in the same
+    window. Hermes' actual constraint is `has_usable_secret(min_length=16)` in
+    `gateway/platforms/api_server.py`'s startup guard, and the 24-character
+    sentinel clears it. The managed `.env` pin does not touch that file at all
+    in any case; it wins by being applied after it.
+
+    The order below MIRRORS `hermes_cli/env_loader.py`, and reproducing it is
+    the point — a resolver that guesses differently from the server it is
+    guessing about is worse than no resolver, because it fails while looking
+    right. Managed `.env` beats PVC `.env` beats the process environment,
+    because that is the order `load_hermes_dotenv` applies them in, each with
+    `override=True`. Reading the PVC file first — this function's original
+    shape, correct before the pin — would now return stage2's generated key on
+    exactly the pods the pin has already fixed.
+
+    Read per call rather than cached at import: `.env` is rewritten a few
+    seconds *after* this process starts, so an import-time read would return the
+    last boot's key on a deployment that still has the disagreement.
+    """
+    for path in (MANAGED_DOTENV_PATH, DOTENV_PATH):
+        value = _dotenv_value(path, GATEWAY_AUTH_ENV)
+        if value:
+            return value
+    # Neither file says anything: the environment is all there is, and on a
+    # deployment where nothing rewrites the key it is also correct.
     return os.environ.get(GATEWAY_AUTH_ENV, "")
 
 
