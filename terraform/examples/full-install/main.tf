@@ -219,9 +219,16 @@ module "gke_backup_plan" {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id    = var.project_id
-  namespace     = var.namespace
-  project_roles = local.agent_project_roles
+  project_id = var.project_id
+  # Passed rather than left to the module default, so a second install in an
+  # occupied project can be given its own identity. Without this the name is
+  # fixed at kubeagents-platform-gsa for every install in the project, and the
+  # second one's IAM bindings attach to the first one's service account --
+  # making its terraform destroy revoke project roles from a live agent. See
+  # the variable's own description.
+  service_account_id = var.agent_service_account_id
+  namespace          = var.namespace
+  project_roles      = local.agent_project_roles
 
   depends_on = [google_project_service.required]
 }

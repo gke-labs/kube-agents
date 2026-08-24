@@ -90,6 +90,31 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+variable "agent_service_account_id" {
+  description = <<-EOT
+    Account ID of the agent's GCP service account. Change it only to stand up a
+    SECOND install in a project that already has one -- a PR test cluster
+    alongside a live agent, say. Two installs that share this name share the
+    identity: the second apply fails to create the service account because it
+    already exists, and its google_project_iam_member entries resolve to the
+    FIRST install's service account, so tearing the second one down revokes
+    project roles from the agent still running. Give the second install its own
+    name (and its own kms_keyring_name, which collides the same way).
+
+    The default is the only name any single-install project has ever used;
+    leaving it alone keeps existing state unchanged.
+  EOT
+  type        = string
+  default     = "kubeagents-platform-gsa"
+
+  # Mirrors the module's own validation so a bad name fails at plan time here,
+  # naming this variable, rather than inside kube-agents-iam naming its own.
+  validation {
+    condition     = can(regex("^[a-z]([-a-z0-9]{4,28}[a-z0-9])$", var.agent_service_account_id))
+    error_message = "agent_service_account_id must be 6-30 characters, start with a lowercase letter, and contain only lowercase letters, digits, and hyphens."
+  }
+}
+
 variable "permission_set" {
   description = "Which GCP IAM role bundle the agent's service account gets: read-only, gke-admin, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
   type        = string

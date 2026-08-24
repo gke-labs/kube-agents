@@ -200,6 +200,51 @@ equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
 
+### A second install in the same project (`agent_service_account_id`)
+
+Two installs in one GCP project must not share the agent's service account.
+The name is `agent_service_account_id`, default `kubeagents-platform-gsa`, and
+it is a project-wide resource: nothing about it is scoped to the cluster, the
+namespace, or the state file.
+
+Leave it at the default for a second install and Terraform will do two things,
+the second of them destructive:
+
+1. `google_service_account.agent` fails to create — the account already
+   exists. The apply stops there, so nothing downstream of it is created and
+   this failure on its own is harmless.
+2. The harm is in the obvious way past it. `terraform import` on that address
+   is the move a 409 invites, and it is the wrong one here: it adopts the
+   **running** agent's service account into the second install's state. The
+   `google_project_iam_member` entries are keyed on that account's email, so
+   Terraform then believes it owns bindings that belong to a live agent — and
+   `terraform destroy` at teardown revokes them, and deletes the account
+   itself. Nothing warns you; the first install simply starts failing every
+   GCP call.
+
+So the first failure is a wall, not a hazard. Do not climb it by importing.
+
+So give a second install its own identity, and its own key ring — which
+collides in the same way, for the same reason:
+
+```bash
+TF_VAR_agent_service_account_id=kubeagents-pr786-gsa \
+TF_VAR_kms_keyring_name=pr786-keyring \
+  ./terraform/examples/full-install/lifecycle.sh apply
+```
+
+`TF_VAR_` is read only where `terraform.tfvars` is silent, and the generated
+tfvars names neither variable, so the environment wins for both. The chart
+consumes `module.kube_agents_iam.service_account_email`, so the override
+reaches the KSA annotation with nothing further to set.
+
+One thing it does not reach: `githubMinter.allowedServiceAccount`, which the
+chart derives from `platformAgent.harness.projectId` and so still spells the
+default name. If the second install enables the GitHub minter, set that value
+explicitly to match — otherwise the minty rule rejects the very agent it is
+there to serve. Every other consumer of the name reads it from the module's
+output.
+
 ### Backups
 
 `enable_backup_agent` (default `true`) turns on the Backup for GKE addon. It
