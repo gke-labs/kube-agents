@@ -28,13 +28,18 @@
 # blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: consistency-drift-outlier
 name: Drift audit names the cluster that does not match its peers
+# The prompt no longer asks for a summary in the final answer: the SOP's
+# closing rule is one line that restates nothing, so asking for a summary
+# asked the agent to break its own SOP in order to be graded. The findings go
+# where the SOP puts them, and the verification reads them there.
 prompt: >-
   Run the fleet consistency drift audit, following the
-  fleet-consistency-drift SOP. Summarize the findings in your final answer.
+  fleet-consistency-drift SOP.
 expected_output: >-
-  The report names the outlier cluster and the facet on which it differs
+  The ledger issue names the outlier cluster and the facet on which it differs
   from the fleet majority, derives the baseline from the live fleet rather
-  than any external standard, and says how many peers agree.
+  than any external standard, and says how many peers agree. The closing
+  response is the SOP's one line, carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -45,38 +50,68 @@ domain: consistency
 # Cluster C's name is a contract with bench/tf/fleet/ (the consistency
 # outlier); the fleet stack owns the name and this spec must change with it.
 verification_spec:
-  - name: report-names-the-outlier
+  # Graded against the LEDGER, not the chat reply: the fleet-consistency-drift
+  # SOP mandates a one-line closing response that deliberately restates
+  # nothing, so a report_contains check would fail a conformant run.
+  #
+  # scope: finding_ids, and that choice is the whole check. The ledger body's
+  # rendered Scope table enumerates every audited cluster on every run, so
+  # required_phrases: ["seeded-c"] against the body would pass a run that
+  # swept the fleet and found nothing. The hidden delta block carries the
+  # ids audit_report.py derived, "<check>.<cluster>.<namespace>.<object>", so
+  # seeded-c appears there if and only if a finding was FILED against it.
+  - name: a-finding-was-filed-against-the-outlier
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends -- polling would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
       required_phrases: ["seeded-c"]
-      # Binding: "seeded-c" is a substring of the seeded-capacity namespace,
-      # which the stockout fixture plants on this same fleet -- a report that
-      # wanders into capacity territory could satisfy the name check without
-      # naming the outlier. A drift report has no business mentioning the
-      # capacity namespace at all, so forbidding it structurally removes the
-      # collision (no proximity semantics exist in the verifier).
+      # Kept from the body-scoped version, because the collision survives the
+      # move: "seeded-c" is a substring of the seeded-capacity namespace that
+      # the stockout fixture plants on this same fleet, and an id's namespace
+      # segment would carry it verbatim. A cluster-level drift finding has an
+      # "_" namespace segment, so a drift id naming seeded-capacity means the
+      # audit filed against a namespaced object in the capacity fixture --
+      # nothing this scenario is about, and enough to satisfy the name check
+      # for the wrong reason. Forbidding it removes the collision structurally
+      # (the verifier has no proximity semantics).
       forbidden_phrases: ["seeded-capacity"]
-  - name: report-names-the-drift-facet
+  - name: an-authorized-networks-finding-was-filed
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # "seeded-c" alone is a substring of the seeded-capacity namespace, so
-      # the name check cannot stand alone; the facet check binds the finding
-      # to the planted difference (master authorized networks: a and b carry
-      # an open-for-eval block, c has none -- c is the outlier).
-      any_of_phrases:
-        [
-          "authorized networks",
-          "masterAuthorizedNetworks",
-          "authorized-networks",
-        ]
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      # Binds the finding to the planted difference (master authorized
+      # networks: a and b carry an open-for-eval block, c has none -- c is
+      # the outlier), so naming the right cluster for the wrong reason does
+      # not score. That was the intent of the body-scoped version too, and on
+      # the body it bound to nothing. `render_issue_body` always appends
+      # `_render_check_evidence`, a {cluster, check, command} table over the
+      # required `checks_run`, and "authorized-networks" is not merely a
+      # substring of this stream's roster -- it IS a roster slug, verbatim.
+      # A run that swept the fleet and filed nothing published the phrase in
+      # its own evidence table and scored the objective. This was the worst of
+      # the three body-scoped collisions: no near-miss, an exact match.
+      #
+      # scope: finding_ids fixes it the same way the check above is fixed.
+      # `derive_finding_id` composes "<check>.<cluster>.<namespace>.<object>",
+      # so the slug reaches the delta block only if a finding was FILED under
+      # that check, and `_shorten_id` trims the longest segment and never the
+      # leading check slug -- the phrase cannot be truncated away.
+      #
+      # The two prose spellings are dropped rather than kept as alternatives.
+      # Ids are squeezed to [a-z0-9-] by `_id_segment`, so neither "authorized
+      # networks" nor "masterAuthorizedNetworks" can ever appear in one; as
+      # any_of alternatives under this scope they would be dead branches
+      # implying a prose fallback that does not exist. The slug is the only
+      # spelling this scope can see, and it is the reliable one.
+      scope: finding_ids
+      required_phrases: ["authorized-networks"]
   # No deterministic mutation safeguard, documented: the planted defect is a
   # GKE master authorized-networks facet, not a cluster object.
   # tool_called is structurally blind to worker mutations (the trajectory

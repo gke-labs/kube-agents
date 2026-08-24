@@ -47,6 +47,17 @@ _EXPECTED_MAPPING = {
     "kube-agents-evals-3": "gke-agentic/kube-agents-evals-3-infra",
 }
 
+# The fail-closed tests need a project the mapping will never contain, and for
+# a while that was "kube-agents-evals-3" — the obvious next name in the
+# sequence, picked because nothing could plausibly claim it. The pool claimed
+# it: the project was added to Boskos on 2026-08-21 and every presubmit that
+# leased it died on the unmapped-project refusal. Mapping it turned this suite
+# red, which is the test doing its job, but it also showed the fixture was
+# wrong to begin with. A placeholder that is a plausible future value of the
+# thing it stands outside of is a placeholder with an expiry date on it, and
+# the next name in the sequence has the same date on it.
+_NEVER_MAPPED_PROJECT = "not-a-pool-project-fixture"
+
 
 def _resolution_block():
     text = _CI_DEPLOY.read_text(encoding="utf-8")
@@ -112,11 +123,23 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
         repos = list(_EXPECTED_MAPPING.values())
         self.assertEqual(len(repos), len(set(repos)))
 
+    def test_the_fail_closed_fixture_is_not_a_mapped_project(self):
+        """Keeps the fail-closed tests honest about what they prove.
+
+        If the fixture ever becomes a real mapping, `test_unmapped_project_*`
+        starts asserting that a *mapped* project is refused — the opposite of
+        its name. It would fail loudly here rather than quietly inverting its
+        own meaning, which is the failure the kube-agents-evals-3 fixture was
+        one onboarding away from.
+        """
+        self.assertNotIn(_NEVER_MAPPED_PROJECT, _EXPECTED_MAPPING)
+        self.assertNotIn(_NEVER_MAPPED_PROJECT, _resolution_block())
+
     # --- fail-closed ------------------------------------------------------
 
     def test_unmapped_project_fails_the_prow_deploy(self):
         rc, out, err = self._resolve(
-            "kube-agents-evals-4", PULL_NUMBER="123", JOB_NAME="pull-eval"
+            _NEVER_MAPPED_PROJECT, PULL_NUMBER="123", JOB_NAME="pull-eval"
         )
         self.assertNotEqual(rc, 0)
         self.assertNotIn("RESOLVED", out)

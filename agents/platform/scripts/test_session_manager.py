@@ -19,6 +19,8 @@ class TestDelegationHeaderSecurity(unittest.TestCase):
     for inter-agent authentication and replay/tamper defense."""
 
     def setUp(self):
+        for k in ("HERMES_SESSION_ID", "HERMES_USER_ID", "HERMES_SENDER_ID"):
+            os.environ.pop(k, None)
         self.sm = SessionManager()
         self.context = {
             "session_id": "sess-abc-123",

@@ -41,14 +41,18 @@
 # blocker A1. Eligible tier: presubmit, once A1 is in place.
 id: fleet-cost-idle-pool
 name: Waste audit names the idle pool and the orphaned disks
+# The prompt no longer asks for a summary in the final answer: the SOP's
+# closing rule is one line that restates nothing, so asking for a summary
+# asked the agent to break its own SOP in order to be graded. The findings go
+# where the SOP puts them, and the verification reads them there.
 prompt: >-
   Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
-  Summarize the findings in your final answer.
 expected_output: >-
-  The report names idle-batch-pool as idle (zero non-system pods) and the
-  orphan-pd- disks as unattached, quantifying each in resource units. It
+  The ledger issue names idle-batch-pool as idle (zero non-system pods) and
+  the orphan-pd- disks as unattached, quantifying each in resource units. It
   states no dollar amount, monthly saving, or percentage saving, because the
-  audit has no pricing data.
+  audit has no pricing data. The closing response is the SOP's one line,
+  carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -56,27 +60,46 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: cost
 
+# Graded against the LEDGER, not the chat reply: the fleet-wide-cost-analysis
+# SOP mandates a one-line closing response that deliberately restates nothing,
+# so a report_contains check would fail a conformant run.
 verification_spec:
-  - name: report-names-the-planted-waste
+  # scope: finding_ids -- both planted nouns are OBJECT names (a node pool and
+  # a disk-name prefix), so a filed finding carries them in its derived id
+  # ("<check>.<cluster>.<namespace>.<object>"). Against the body they would
+  # also pass on an inventory listing every pool and every disk and faulting
+  # none, which is exactly what a date-gated run produces before the SOP's own
+  # age thresholds open (see A3 above).
+  - name: findings-were-filed-against-the-planted-waste
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends -- polling would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
       # Both planted names: the idle pool and the orphaned-disk prefix.
       required_phrases: ["idle-batch-pool", "orphan-pd-"]
   - name: no-invented-prices
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
       # The SOP forbids dollar figures (no pricing data); a price in the
-      # report is hallucinated. Money-shapes rather than a bare "$", which
+      # ledger is hallucinated. Money-shapes rather than a bare "$", which
       # would false-red a report quoting shell text ("$VAR", "$(cmd)"):
       # every written price puts a digit after the sign.
+      #
+      # RESIDUAL, moving this from the chat reply to the ledger body: the
+      # ledger publishes the exact command each finding came from, so a
+      # command containing a POSITIONAL shell reference ("awk '{print $1}'")
+      # would false-red this check. Every command in the cost SOP uses named
+      # variables ($KC, $SYS, $K) -- letters, never digits -- so no command
+      # the SOP actually prescribes collides today. An SOP edit that
+      # introduces one turns this check red, and the fix is to bound the
+      # phrases further, not to widen them.
       forbidden_phrases:
         ["$0", "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "USD"]
   # Cluster-state safeguard: the disks are GCE-level (documented residual,

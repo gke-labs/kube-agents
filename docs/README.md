@@ -53,7 +53,7 @@ kube-agents/
 │   ├── README.md                                  this map
 │   ├── family-roster.txt                          GENERATED snapshot of every
 │   │                                              collapsed family's members
-│   ├── architecture/                              END-STATE spec set 01–08 + README
+│   ├── architecture/                              END-STATE spec set 01–09 + README
 │   ├── designs/                                   per-feature design documents
 │   ├── contributing.md, security-requirements.md,
 │   │   credential-isolation-design.md,
@@ -168,7 +168,7 @@ identifier appears, add its source here.
 Not every document describes the same thing. When checking a doc against the
 code, first check which era it belongs to:
 
-- **`docs/architecture/` (01–08 + README) describes the END-STATE target, not
+- **`docs/architecture/` (01–09 + README) describes the END-STATE target, not
   what ships.** Each file carries the banner "Specifies the end state, not
   current behaviour." Do not treat mismatches between these specs and the code
   as doc bugs — the delta is the roadmap (`07-implementation-roadmap.md`).
@@ -270,6 +270,7 @@ pull request:
 | `docs/architecture/06-api-and-data-contracts.md` | End-state spec | Exact interfaces to implement: tier-discriminated `Agent` CRD, pre-created read-only identity contract, GitOps repo layout, OKF schema, review-gate contract. | CR shape, cardinality, identity contract, naming conventions | End-state; the CR shape is labeled illustrative |
 | `docs/architecture/07-implementation-roadmap.md` | End-state spec | Phased sequence from the current state (direct-mutation agents, `PlatformAgent` only) to the three read-only personas, with acceptance criteria per phase. | Delta table, phases, definition of done | End-state; sequencing only |
 | `docs/architecture/08-agent-runtime-and-identity.md` | End-state spec | Simplest v1 runtime: a thin controller reconciles the `Agent` CRD into one isolated Hermes pod per agent bound to one pre-created read-only service account. | Runtime, identity referencing (never minting), deferred hardening | End-state; deliberately simplicity-over-defense-in-depth |
+| `docs/architecture/09-capability-envelope.md` | End-state spec | How a request's authority travels between agents once they are separate workloads: the gateway mints a capability in NATS KV, hops attenuate by writing narrower children naming their one permitted successor, and a verification service resolves the chain. | Capability lifecycle, attenuation, delegate binding, per-hop enforcement, no cryptographic keys | Agreed design, north-star tier; presumes agents are separate workloads, so nothing in it is built yet |
 | `docs/designs/agent-communication.md` | Feature design | How the Platform Agent and per-cluster subagents exchange information: a file-based typed handover channel plus optional kanban delegation. | Blackboard model, record envelope, `write_handover` tool | Design of record; NOT yet implemented (banner in file) |
 | `docs/designs/admin-console.md` | Feature design | Product and implementation design for the Kube Agents Console, including its shared FastAPI chat abstraction, Streamlit composition, authenticated interaction API, activity, connection, and Kanban read models. | Admin UX, asynchronous interactions, API contract, correlation, security boundaries | Local implementation; shared proxy API and production hardening planned |
 | `docs/designs/audit-logging-user-attribution.md` | Feature design | Closes the gap where audit logs identify the agent SA but not the requesting human, by carrying requester and trace/session IDs through existing telemetry. | Attribution contract per plane, correlation recipes, trust model | Draft, P0; per-plane implemented-vs-planned split declared inline |
@@ -360,6 +361,7 @@ only what the title does not say.
 | --- | --- | --- | --- | --- |
 | `bench/README.md` | Component README | The evaluation harness that runs `kubernetes-sigs/devops-bench` against the Platform Agent as a pip-installed library: layout, running evals, harness registration, offline tests. | Eval invocation, `BENCH_TF_ROOT` stacks | Developers writing or running evals |
 | `bench/CUSTOM-TASKS.md` | How-to | Authoring new devops-bench tasks and agent harnesses, here or in a private repository: layout convention, the `devops-bench` SHA pin, OpenTofu stacks, `task.yaml` and `verification_spec`, custom `AgentHarness`. | Task authoring, verification spec, harnesses | Developers writing evals |
+| `bench/cuj/README.md` | Test guide | Running and extending the pytest-discovered, black-box Critical User Journey suite. | Live portal tests, scenario contract, `/tmp` evidence | Developers writing or running CUJ tests |
 | `bench/tasks/DRAFTS.md` | Reference | Status table for the Phase 2 domain scenarios: one per domain, the planted defect each needs, its isolation class, and the seeded-fleet shopping list. | Scenario corpus, seeded fleet defects, activation state | Spec-ready; registered commented-out in `hack/ci-eval-pr.sh`, awaiting the seeded fleet |
 | `bench/tf/fleet/README.md` | Component README | The seeded dirty fleet: three standing clusters whose planted defects are the fixtures the Phase 2 presubmit scenarios assert on, the defect-to-scenario map, and the scheduled re-apply that keeps the defects planted. | Seeded fleet, planted defects, reconcile | Developers writing evals; the fleet owner |
 | `charts/kube-agents/README.md` | Component README | Canonical GKE-oriented Helm chart (`kube-agents`) for deploying the Kube-Agents operator and PlatformAgent CR via GitOps. | Chart configuration, values, CRD installation | Deployment operators and GitOps pipelines |
@@ -380,7 +382,7 @@ only what the title does not say.
 | `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; opt-in for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
 | `terraform/modules/drift-pubsub/README.md` | Component README | Reusable Terraform module for the drift detector's audit-log ingress: Log Router sink, drift-audit topic and pull subscription, sink-writer and subscriber IAM; not yet part of the full-install composition. | Audit-log sink, Pub/Sub, writer identity | Infrastructure engineers |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
-| `tests/integration/README.md` | Component README | The integration seam tier: real components wired together with the agent replaced by a fake — the contract, how to add a seam test, and the probation status that keeps it out of `PYTHON_TEST_DIRS`. | Seam tests, `make test-integration`, expectedFailure pins | Developers adding seam tests |
+| `tests/integration/README.md` | Component README | The integration seam tier: real components wired together with the agent replaced by a fake — the contract, how to add a seam test, and what changed when the tier left probation to gate inside `PYTHON_TEST_DIRS`. | Seam tests, `make test-integration`, expectedFailure pins | Developers adding seam tests |
 
 ## 5. Keeping this map fresh
 
