@@ -380,11 +380,6 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 _check_assertions(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
 
-        # The presubmit decides whether a case has a spec by grepping for a
-        # `verification_spec:` line with nothing after it (hack/ci-eval-pr.sh,
-        # task_has_spec). A flow-style spec on one line is a valid, loadable
-        # spec that the gate cannot see, so the case drops back to the
-        # judge-only OutcomeValidity fallback without saying so.
         if fixtures is None and used_types & CLUSTER_READING_TYPES:
             problems.append(
                 "reads live cluster state ("
@@ -395,6 +390,11 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "for a case that plants its own state"
             )
 
+        # The presubmit decides whether a case has a spec by grepping for a
+        # `verification_spec:` line with nothing after it (hack/ci-eval-pr.sh,
+        # task_has_spec). A flow-style spec on one line is a valid, loadable
+        # spec that the gate cannot see, so the case drops back to the
+        # judge-only OutcomeValidity fallback without saying so.
         if not re.search(r"^verification_spec:\s*$", path.read_text(encoding="utf-8"), re.M):
             problems.append(
                 "declares its 'verification_spec:' inline rather than as a "
