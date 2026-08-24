@@ -12,8 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ---
-task_id: "gpu-stress-test-diagnosis"
+# `id:`, not the `task_id:` alias this file used to carry. devops-bench reads
+# `id` first and falls back to `task_id` (tasks/schema.py, Task.from_dict), so
+# the rename changes nothing at runtime and leaves the tree one spelling --
+# see docs/designs/bench-case-format.md.
+id: "gpu-stress-test-diagnosis"
 name: "gpu-stress-test-diagnosis"
+
+# No seeded-fleet dependency: this case brings its own cluster up through the
+# prebuilt/gpu-stress-test stack below and asserts on what it planted there.
+# The empty list is the declaration, not an omission -- see
+# docs/designs/bench-fleet-catalog.md.
+fixtures: []
 infrastructure:
   deployer: "tofu"
   provider: "gcp"
