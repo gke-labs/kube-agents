@@ -127,7 +127,8 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
-	$(wildcard tests/test_*.py)))
+	$(wildcard tests/test_*.py) \
+	$(wildcard tests/memory/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
