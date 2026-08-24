@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, and writes one kubeconfig per role. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own trio, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'.",
+  "cluster_slots": {
+    "a": "Every namespace-level defect, plus the idle and pinned node pools.",
+    "b": "Control plane held one minor behind the REGULAR channel default.",
+    "c": "The consistency outlier: no master authorized networks."
+  },
+  "roles": {
+    "crashloop-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-debug",
+      "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit"
+    },
+    "no-pdb-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-reliability",
+      "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace"
+    },
+    "hpa-saturated": {
+      "cluster_slot": "a",
+      "namespace": "seeded-capacity",
+      "fixture": "inference-server HPA settles above pinned-inference-pool's capped capacity, leaving Pending replicas"
+    },
+    "rbac-overgrant": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount"
+    },
+    "idle-nodepool": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint"
+    },
+    "version-laggard": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "fixture": "control plane one minor behind the REGULAR channel default, held by a NO_MINOR_UPGRADES exclusion"
+    },
+    "drift-outlier": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "fixture": "master authorized networks absent where both cohort peers have it on"
+    }
+  }
+}

@@ -27,11 +27,19 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 
 # Same mechanism, the verifier registry: devops-bench scans this group on the
 # first unresolved verifier lookup, so a task.yaml can name these check types
-# without devops-bench ever importing this package by hand. All three read the
-# per-run transcript stash (kube_agents_bench/transcript.py), which is what
+# without devops-bench ever importing this package by hand. Three of them read
+# the per-run transcript stash (kube_agents_bench/transcript.py), which is what
 # makes report-text, tool-trace and published-artifact checks possible without
-# an upstream change.
+# an upstream change; fleet_resource_property reads cluster state, but the
+# cluster of a seeded-fleet fixture ROLE rather than the ambient one.
+#
+# A key already in the registry when the scan runs is SKIPPED (see
+# devops_bench.core.registry), and upstream registers `resource_property` at
+# import of devops_bench.verification.verifiers -- so this group cannot be used
+# to override an upstream type, only to add one. Hence a distinct name rather
+# than a drop-in replacement.
 [project.entry-points."devops_bench.verifiers"]
+fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
 report_contains = "kube_agents_bench.verifiers:ReportContainsVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
@@ -46,8 +54,9 @@ dev = [
     "pytest>=8.0.0",
     # Test-only, and deliberately not a runtime dependency: the harness never
     # parses a task.yaml itself -- devops-bench does, before this package is
-    # imported. The roster-collision sweep in tests/test_verifiers.py reads
-    # every task spec directly, so the parser rides with the test runner.
+    # imported. The roster-collision sweep in tests/test_verifiers.py and the
+    # fleet catalog-drift sweep in tests/test_fleet_verifier.py both read every
+    # task spec directly, so the parser rides with the test runner.
     # `make test-bench-deps` installs the same thing for CI, which does not
     # use this group; keep the two in step.
     "pyyaml>=6.0",
