@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -23,6 +24,13 @@ from cuj.utils.evidence import EvidenceLog
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 CANONICAL_AGENT_ID = "platform-agent"
+PORTAL_API_TOKEN_ENV = "KUBE_AGENTS_PORTAL_API_TOKEN"
+
+
+def portal_token() -> str:
+    """The per-launch API token shared with the isolated portal process."""
+
+    return os.environ.get(PORTAL_API_TOKEN_ENV, "")
 
 
 def configured_agent_profiles() -> tuple[tuple[str, str], ...]:
@@ -90,7 +98,7 @@ def verify_agent(
 ) -> Path:
     """Require a discovered agent to complete a minimal portal interaction."""
 
-    portal = Portal(endpoint)
+    portal = Portal(endpoint, token=portal_token())
     discovered = portal.get("agents").get("agents", [])
     log.record("prerequisite_agents", discovered)
     if agent_id not in discovered:
@@ -149,6 +157,8 @@ def isolated_portal(output: Path) -> Iterator[str]:
 
     output.mkdir(parents=True, exist_ok=True)
     account = active_gcloud_account()
+    token = secrets.token_urlsafe(32)
+    os.environ[PORTAL_API_TOKEN_ENV] = token
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen()
@@ -158,6 +168,7 @@ def isolated_portal(output: Path) -> Iterator[str]:
         {
             "KUBE_AGENTS_ADMIN_USER": account,
             "KUBE_AGENTS_ADMIN_INTERACTION_STATE": str(output / "portal.db"),
+            PORTAL_API_TOKEN_ENV: token,
         }
     )
     log = (output / "portal.log").open("w", encoding="utf-8")

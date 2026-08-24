@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from cuj.utils.evidence import EvidenceLog
-from cuj.utils.portal import Portal, PortalError
+from cuj.utils.portal import Portal, PortalError, portal_token
 
 if TYPE_CHECKING:
     from cuj.utils.scenario import ScenarioConfig
@@ -33,7 +33,7 @@ class InteractionRunner:
         }
         self.log.record("request", request)
 
-        portal = Portal(self.config.endpoint)
+        portal = Portal(self.config.endpoint, token=portal_token())
         interaction = portal.post("interactions", request)
         self.log.record("interaction", {"poll": 0, "value": interaction})
         interaction_id = str(interaction.get("interactionId") or "")
