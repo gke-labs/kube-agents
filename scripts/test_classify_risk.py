@@ -375,8 +375,8 @@ class PostCheckRunTest(unittest.TestCase):
         # would leave the stale verdict beside the corrected one.
         api = FakeAPI(
             check_runs=[
-                {"id": 5, "app": {"slug": "github-actions"}},
-                {"id": 9, "app": {"slug": "github-actions"}},
+                {"id": 5, "app": {"slug": "github-actions"}, "external_id": "risk-classify"},
+                {"id": 9, "app": {"slug": "github-actions"}, "external_id": "risk-classify"},
             ]
         )
         classify_risk.post_check_run(api, "a" * 40, self._result())
@@ -389,6 +389,39 @@ class PostCheckRunTest(unittest.TestCase):
         api = FakeAPI(check_runs=[{"id": 5, "app": {"slug": "some-other-app"}}])
         classify_risk.post_check_run(api, "a" * 40, self._result())
         self.assertEqual(api.calls[-1][0:2], ("POST", "/repos/gke-labs/kube-agents/check-runs"))
+
+    def test_the_workflow_jobs_own_check_run_is_not_touched(self):
+        # Actions creates a check run for the job itself: same app slug, same
+        # SHA, and -- until the job was renamed -- the same name. Its
+        # external_id carries the runner's job GUID, which is how the script's
+        # runs are told apart. Matching it here would PATCH the job's run and
+        # leave the stale verdict standing (853-F1); the newest-id decoy is the
+        # exact shape of a re-classification, where the current run's job
+        # check run postdates the script's earlier POST.
+        api = FakeAPI(
+            check_runs=[
+                {"id": 5, "app": {"slug": "github-actions"}, "external_id": "risk-classify"},
+                {
+                    "id": 9,
+                    "app": {"slug": "github-actions"},
+                    "external_id": "0198f2f3-ab-job-guid",
+                },
+            ]
+        )
+        classify_risk.post_check_run(api, "a" * 40, self._result())
+        method, path, body = api.calls[-1]
+        self.assertEqual((method, path), ("PATCH", "/repos/gke-labs/kube-agents/check-runs/5"))
+        self.assertEqual(body["external_id"], "risk-classify")
+
+    def test_a_pre_external_id_run_falls_back_to_post(self):
+        # A run this script created before it stamped external_id no longer
+        # matches. One stacked pair on the transition is the accepted cost;
+        # asserting the POST keeps the fallback from silently PATCHing by name.
+        api = FakeAPI(check_runs=[{"id": 5, "app": {"slug": "github-actions"}}])
+        classify_risk.post_check_run(api, "a" * 40, self._result())
+        method, path, body = api.calls[-1]
+        self.assertEqual((method, path), ("POST", "/repos/gke-labs/kube-agents/check-runs"))
+        self.assertEqual(body["external_id"], "risk-classify")
 
 
 class RepositoryRulesTest(unittest.TestCase):
@@ -417,6 +450,20 @@ class RepositoryRulesTest(unittest.TestCase):
         # tree is prose.
         result = self.classify([_file("docs/site/src/components/Hero.astro")])
         self.assertEqual(result["tier"], "medium")
+
+    def test_mdx_in_the_content_tree_is_not_low(self):
+        # MDX accepts imports and JS expressions that execute in the
+        # docs-deploy build -- the build that publishes the install.sh users
+        # pipe to bash -- so it is not prose even inside the content tree
+        # (853-F2).
+        result = self.classify([_file("docs/site/src/content/docs/skills/index.mdx")])
+        self.assertEqual(result["tier"], "medium")
+
+    def test_top_level_content_page_is_still_low(self):
+        # `**/*.md` must match zero intermediate directories, or every page
+        # sitting directly under content/docs silently loses its low path.
+        result = self.classify([_file("docs/site/src/content/docs/contributing.md")])
+        self.assertEqual(result["tier"], "low")
 
     def test_skill_md_is_not_docs(self):
         result = self.classify(

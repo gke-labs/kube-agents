@@ -41,6 +41,12 @@ import yaml
 import request_reviewers as rr
 
 CHECK_NAME = "Risk Classification"
+# Stamped on every check run this script creates, and required of every run it
+# will update. The name cannot be the identity: Actions gives the workflow
+# *job's* check run whatever the job is called, under the same github-actions
+# app slug, on the same head SHA -- and puts the job GUID in its external_id,
+# so this constant can never collide with one.
+CHECK_EXTERNAL_ID = "risk-classify"
 DEFAULT_RULES_PATH = ".github/risk-rules.yml"
 
 TIER_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -380,11 +386,15 @@ def post_check_run(api, head_sha, result):
     SHA; a fresh POST each time would stack runs, leaving the stale verdict
     ("declares low") standing beside the corrected one with nothing marking
     which is current. So the existing run is PATCHed when there is one --
-    filtered to the github-actions app, because a name alone is not an
-    identity and PATCHing another app's run would 403 anyway.
+    filtered to the github-actions app AND this script's external_id. The app
+    slug alone is not enough: the workflow job's own check run is created by
+    the same app on the same SHA, and on a re-classification it is the newest
+    run in the listing, so matching by name-plus-app PATCHes the job's run and
+    leaves the stale verdict standing (853-F1).
     """
     payload = {
         "name": CHECK_NAME,
+        "external_id": CHECK_EXTERNAL_ID,
         "status": "completed",
         "conclusion": "success",
         "output": {"title": check_run_title(result), "summary": check_run_summary(result)},
@@ -394,7 +404,12 @@ def post_check_run(api, head_sha, result):
         f"/repos/{api.repo}/commits/{head_sha}/check-runs"
         f"?check_name={urllib.parse.quote(CHECK_NAME)}"
     )["check_runs"]
-    mine = [run for run in existing if (run.get("app") or {}).get("slug") == "github-actions"]
+    mine = [
+        run
+        for run in existing
+        if (run.get("app") or {}).get("slug") == "github-actions"
+        and run.get("external_id") == CHECK_EXTERNAL_ID
+    ]
 
     if mine:
         newest = max(mine, key=lambda run: run.get("id") or 0)

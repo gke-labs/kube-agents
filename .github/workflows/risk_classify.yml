@@ -35,7 +35,10 @@ concurrency:
 
 jobs:
   classify:
-    name: Risk Classification
+    # Not "Risk Classification": the job's own check run takes this name, and
+    # sharing it with the script's check run put two same-named runs on every
+    # head SHA. The script's run carries the verdict; this one is plumbing.
+    name: classify
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the default branch: the script and its rules

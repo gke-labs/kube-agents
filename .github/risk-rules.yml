@@ -82,8 +82,8 @@ rules:
   - id: docs-site-only
     tier: low
     only_match:
-      - "docs/site/src/content/docs/**"
+      - "docs/site/src/content/docs/**/*.md"
       - "docs/designs/**"
       - "docs/README.md"
       - "README.md"
-    why: "narrative documentation; no runtime or agent-behavior path. Deliberately narrow: INSTALL.md is agent-executable, docs/architecture gates design decisions, and the rest of docs/site (manifests, astro config, components) executes in the docs-deploy build, so only the content tree is prose"
+    why: "narrative documentation; no runtime or agent-behavior path. Deliberately narrow: INSTALL.md is agent-executable, docs/architecture gates design decisions, and the rest of docs/site (manifests, astro config, components) executes in the docs-deploy build. Within the content tree only plain .md is prose -- .mdx accepts imports and JS expressions that run in that same build, so it falls through to medium"
