@@ -61,6 +61,9 @@ jobs:
               # what happens when resolution FAILS, which a green presubmit
               # never exercises, so the guard has to follow the script.
               - "hack/ci-deploy.sh"
+              # tests/test_ci_ledger_token.py does the same to the ledger-token
+              # preflight in this one, and for the same reason.
+              - "hack/ci-eval-pr.sh"
               - ".github/workflows/agent-startup-test.yml"
 
       - name: Set up Python

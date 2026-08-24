@@ -52,9 +52,16 @@ terraform apply -var="project_id=${PROJECT_ID}"
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
   ```
-- **Cloud Build Service Account** (`${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`):
+- **Cloud Build Service Account** (`${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`):
   - `roles/artifactregistry.writer` in `${PROJECT_ID}` (to push PR build images).
   - `roles/artifactregistry.reader` in `kube-agents-prow` (to pull the warm `:latest` cache image).
+
+  `deploy/docker/cloudbuild-ci.yaml` declares no `serviceAccount:` and `hack/ci-deploy.sh` passes no `--service-account`, so builds run as the project's default compute account rather than the legacy `${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`, which none of the three pool projects has. Every build in all three ran as the compute account when this was checked on 2026-08-24. Confirm for a project with:
+
+  ```bash
+  gcloud builds list --limit=1 --project="${PROJECT_ID}" --format='value(serviceAccount)'
+  ```
+
 - **GKE Node Service Account**:
   - `roles/artifactregistry.reader` in `${PROJECT_ID}` to pull operator and agent images.
 
@@ -130,7 +137,7 @@ The repository is kept private: it is throwaway state a bot rewrites on every ru
 > 2. ~~Add it to App `4675512`'s installation.~~ **Done 2026-08-23** — the App resolves to all three pool repositories, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`.
 > 3. **Apply `terraform/examples/ci-pool-minter` for the project, in its own workspace or backend prefix** (see the composition's README — re-using another project's state destroys that project's minter), then import the App PEM into its KMS key with the Minty CLI. **Still outstanding.**
 >
-> Until (3) is done the project has no minter GSA and no signing key. Today that is invisible: `EVAL_GITHUB_APP_ID` is unset, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and `kube-agents-evals-3` deploys and fails at `audit_report.py start` for want of a token — exactly like every other pool project, because the switch is pool-wide (see 5.2).
+> Until (3) is done the project has no minter GSA and no signing key — a state it shares with the other two, neither of which has been through 5.2 either. Today that is invisible: `EVAL_GITHUB_APP_ID` is unset, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and `kube-agents-evals-3` deploys and fails at `audit_report.py start` for want of a token — exactly like every other pool project, because the switch is pool-wide (see 5.2).
 >
 > **The hazard is the day that variable is set.** `hack/ci-deploy.sh` enables the minter whenever `GITOPS_REPO` is non-empty and `EVAL_GITHUB_APP_ID` is set, and this project is now mapped, so a lease of it would render the `github-token-minter` Deployment with `KMS_KEY_NAME` pointing at a key ring that (3) has never created. That pod fails its readiness probe, and the minter Deployment is part of the release `helm upgrade --install --wait --timeout 15m` gates on — so the run dies in the chart-deployment step after a fifteen-minute timeout, while leases of the other two projects pass. `EVAL_GITHUB_APP_ID` is the switch meaning "the manual half is done", and it is only true of the pool when it is true of every project in it: do not set it until (3) has landed here.
 >
@@ -182,9 +189,49 @@ It is a dedicated App rather than the organisation's existing all-repositories m
 
 Only then set `EVAL_GITHUB_APP_ID=4675512` in the Prow job environment. The value is the same for every pool project. `hack/ci-deploy.sh` keeps `githubMinter.enabled=false` until it is set, because the minter Deployment is part of the release `helm --wait` gates on: enabling it before the key import fails every presubmit instead of degrading quietly.
 
+**No pool project has been through this section yet** — verified 2026-08-24, not just `kube-agents-evals-3`. None of the three has a `kubeagents-github-minter-gsa` service account or a `github-token-minter-keyring`; the `platform-agent-keyring` each project does carry holds only the cluster's CMEK key. `EVAL_GITHUB_APP_ID` is correspondingly unset, so the pool is consistent and nothing is failing today, but the GitHub-writing scenarios cannot be activated in any project until the composition is applied and the PEM imported in all three. Check a project with:
+
+```bash
+gcloud iam service-accounts describe \
+  "kubeagents-github-minter-gsa@${PROJECT_ID}.iam.gserviceaccount.com" --project="${PROJECT_ID}"
+gcloud kms keys versions list --key=github-token-minter-key \
+  --keyring=github-token-minter-keyring --location=us-central1 --project="${PROJECT_ID}"
+```
+
 ### 5.3 What actually bounds where a run can write
 
 The GitHub App's installation list, and nothing else. A presubmit runs the pull request's code, so a pull request can in principle edit the resolution table or the minty rule ConfigMap — but it cannot make the App mint a token for a repository the App is not installed on. Keep the installation scoped to the pool's GitOps repositories, and treat any change to that list as the security review.
+
+### 5.4 The runner's read-only ledger token
+
+Sections 5.1–5.3 provision the token the agent writes with. The runner needs a second, unrelated one to read the result back, because the six fleet-audit scenarios grade the ledger issue the run publishes rather than the agent's final message. [Grading a fleet audit](https://github.com/gke-labs/kube-agents/blob/main/bench/CUSTOM-TASKS.md#grading-a-fleet-audit) is canonical for what that credential is, why it is deliberately not the agent's own, and what an absent one does to the score. This section covers only where it comes from and how it reaches the job. `hack/ci-eval-pr.sh` refuses to start without it, once a ledger-reading scenario is uncommented in its `TASKS` array.
+
+Delivery follows `GEMINI_API_KEY`: an environment variable on the Prow job, sourced from a Kubernetes Secret in the Prow build cluster. Secret Manager was the alternative and is a poor fit here — the credential is pool-wide, so a leased project would mean three copies to rotate and a fixed project would mean an IAM grant to the Prow runner for a mechanism Prow already has.
+
+Provision it as a fine-grained personal access token on a machine account:
+
+1. Create the token at **Settings → Developer settings → Personal access tokens → Fine-grained tokens**, resource owner `gke-agentic`, **Only select repositories**: `kube-agents-evals-infra`, `kube-agents-evals-2-infra`, `kube-agents-evals-3-infra`. Repository permissions: **Issues: Read-only** and **Metadata: Read-only**, nothing else. Set the shortest expiry the rotation cadence tolerates.
+2. Store it in the Prow build cluster and reference it from the job. Both the namespace and the job file are whatever the existing `GEMINI_API_KEY` entry already uses — copy that rather than the placeholders here, which are a stock Prow deployment's defaults:
+
+   ```bash
+   kubectl create secret generic kube-agents-bench-github-token \
+     --namespace=test-pods \
+     --from-literal=token='github_pat_...'
+   ```
+
+   ```yaml
+   # the job's presubmit definition in oss-test-infra, beside GEMINI_API_KEY
+   env:
+     - name: BENCH_GITHUB_TOKEN
+       valueFrom:
+         secretKeyRef:
+           name: kube-agents-bench-github-token
+           key: token
+   ```
+
+3. Record the expiry date wherever the pool's other rotations are tracked. An expired token is indistinguishable from a missing one: six `status: "error"` checks and a red presubmit.
+
+Read-only on issues, on three throwaway repositories that exist to be rewritten by a bot, is what makes handing this to a presubmit acceptable — a presubmit runs the pull request's own code, so any credential in its environment is a credential the pull request author holds. Two alternatives were rejected on that ground. Reusing App `4675512`'s private key so the runner could mint its own short-lived token removes the expiry chore, but puts a key that mints `contents: write` and `pull_requests: write` into the same reachable environment; the one-hour lifetime of what it mints is no help when the thing exposed is the minting key. Reaching the agent's token by `kubectl exec` into the pod under test needs no new credential at all and is worse still: it grades the run with the run's own write-scoped credential.
 
 ## 6. Boskos pool registration
 

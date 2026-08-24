@@ -145,14 +145,17 @@ TASKS=(
   # Summarised, so a reader here does not have to guess:
   #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
   #       every fleet-audit stream mints a GitHub token and writes a ledger
-  #       issue. ci-deploy.sh installs the PR's agent on every run but never
-  #       sets platformAgent.integration.github.gitRepo, so SETTINGS.md
-  #       renders `- **Git Repo:** None` (buildSettingsConfigMap substitutes
-  #       the literal when the field is empty) and audit_report.py start has
-  #       nothing to clone. Needs that value passed per leased project (the
-  #       throwaway eval GitOps repos) and the minter scoped to it -- the
-  #       token has exactly one source and no inherited GITHUB_TOKEN is
-  #       honoured, so the value alone only moves the failure to the clone.
+  #       issue. The code half is done: ci-deploy.sh maps the leased project
+  #       to its throwaway GitOps repo and passes it as
+  #       platformAgent.integration.github.gitRepo, so SETTINGS.md no longer
+  #       renders `- **Git Repo:** None` and audit_report.py start has
+  #       something to clone. What remains is provisioning. The minter turns
+  #       on only when EVAL_GITHUB_APP_ID is set, and that variable stays
+  #       unset until all three pool projects have been through section 5.2
+  #       of the CI pool-project doc (minter GSA, KMS key, imported private
+  #       key). None of the three has. Until then githubMinter.enabled=false,
+  #       the token has exactly one source and no inherited GITHUB_TOKEN is
+  #       honoured, so the clone succeeds and the write still fails.
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
   #       (2026-08-28 for the pool, 2026-09-20 for the disks).
   #   A4  cleared in the code, open on one credential. The six audit
@@ -161,10 +164,12 @@ TASKS=(
   #       the GitHub ledger issue the run published and proves it is THIS
   #       run's by the generated-at stamp audit_report.py renders into it.
   #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
-  #       issues:read on the eval GitOps repos, which this script does not
-  #       export and Prow does not supply -- provision it with A1's minter
-  #       work. Until then those checks return status=error, which drops
-  #       VerificationCoverage below the gate's 1.0 floor by design.
+  #       issues:read on the eval GitOps repos, which Prow does not supply
+  #       yet -- provision it per section 5.4 of the CI pool-project doc.
+  #       Until then those checks return status=error, which drops
+  #       VerificationCoverage below the gate's 1.0 floor by design; the
+  #       preflight in 6b refuses the run instead, once one of these lines
+  #       is uncommented.
   #   A5  every resource_property safeguard in the corpus (six scenarios,
   #       cluster-agent-crashloop-debug included) reads the ambient
   #       kubeconfig, and the only get-credentials above is for
@@ -223,6 +228,111 @@ text = open(sys.argv[1]).read()
 print('1' if re.search(r'^verification_spec:\s*\$', text, re.M) else '0')
 " "$1" 2>/dev/null || echo "1"
 }
+
+# 6b. Ledger-token preflight
+# The six fleet-audit scenarios grade the ledger ISSUE the run publishes, not
+# the agent's final message -- their SOPs mandate a one-line close that
+# restates nothing. ledger_issue_contains (bench/kube_agents_bench/
+# verifiers.py) reads that issue over the GitHub API with BENCH_GITHUB_TOKEN,
+# or GITHUB_TOKEN as a fallback, taken from THIS process's environment.
+#
+# Nothing here exports the token, and nothing needs to: `uv run` below
+# inherits this environment, so a value set in the Prow job already reaches
+# the verifier. What is missing without this block is the diagnosis. An absent
+# token makes every one of those checks status=error -- correct, since a check
+# that cannot observe its subject must not read as a pass -- but it surfaces
+# as VerificationCoverage below 1.0 on six tasks at the end of a long run,
+# which reads like six broken scenarios rather than one missing credential.
+#
+# The token is deliberately NOT the agent's. The in-cluster minter issues a
+# write-scoped installation token held by the credential-proxy sidecar in the
+# pod under test; grading an artefact with the credential that produced it
+# buys nothing. The runner's is read-only and separate -- see section 5.4 of
+# docs/site/src/content/docs/deploy/ci-pool-projects.md for how it is
+# provisioned and why a presubmit is allowed to hold it.
+#
+# Scoped to the tasks actually registered above, so the pool owes the
+# credential only once a ledger-reading scenario is uncommented. None is
+# today, which makes this block inert until the moment it is needed.
+#
+# The parse falls back to "0", not "1" -- the opposite of task_has_spec. That
+# one gates, so its unparseable case must fail closed; this one only
+# diagnoses, and a broken parser demanding a credential the registered tasks
+# do not need would red a presubmit to report nothing. Quotes are stripped
+# the way task_deployer strips them, and the key is anchored to the start of
+# a line, so `type: "ledger_issue_contains"` counts and the same string in a
+# prompt or a comment does not. Two known limits, both shared with the
+# sibling parsers and neither worth a YAML dependency here: a line inside a
+# block scalar that itself begins `type: ledger_issue_contains` reads as a
+# declaration, and a flow mapping (`check: {type: ledger_issue_contains}`)
+# does not. The corpus uses neither form.
+task_reads_the_ledger() {
+  python3 -c "
+import re, sys
+text = open(sys.argv[1]).read()
+types = [m.group(1).strip('\'\"') for m in re.finditer(r'^\s*type:\s*(.+?)\s*\$', text, re.M)]
+print('1' if 'ledger_issue_contains' in types else '0')
+" "$1" 2>/dev/null || echo "0"
+}
+
+LEDGER_TASKS=()
+if [ "${#TASKS[@]}" -gt 0 ]; then
+  # Guarded because bash before 4.4 treats "${TASKS[@]}" on an empty array as
+  # an unbound variable under `set -u`. The task loop further down is not
+  # guarded, so an empty matrix still dies there -- but it should die in the
+  # loop that owns the matrix, not in a diagnostic that has no opinion on it.
+  for TASK in "${TASKS[@]}"; do
+    if [ "$(task_reads_the_ledger "${BENCH_DIR}/${TASK}")" = "1" ]; then
+      LEDGER_TASKS+=("$(basename "$(dirname "${TASK}")")")
+    fi
+  done
+fi
+
+# An ambient GITHUB_TOKEN is treated the way ci-deploy.sh treats an ambient
+# EVAL_GITOPS_REPO: honoured on a laptop, refused under Prow. The verifier
+# accepts either name, so a developer who exports only GITHUB_TOKEN should not
+# be blocked -- but in a Prow run that variable is far more likely to be
+# runner pollution than a deliberate choice (tests/testing/common.py strips
+# GITHUB_* for exactly that reason). A token that cannot see a private eval
+# GitOps repository gets 404 on the issue, which the verifier records as a
+# rejected candidate and reports as a plain fail -- so the run reds on
+# VerificationCorrectness rather than on the coverage floor, having first
+# printed a line saying the credential is in play. That is a worse diagnosis
+# than no token at all, which is what this block exists to name.
+if [ -n "${PULL_NUMBER:-}" ] || [ -n "${JOB_NAME:-}" ]; then
+  LEDGER_TOKEN="${BENCH_GITHUB_TOKEN:-}"
+  LEDGER_TOKEN_NAME="BENCH_GITHUB_TOKEN"
+  LEDGER_TOKEN_ADVICE="BENCH_GITHUB_TOKEN (a Prow run does not accept GITHUB_TOKEN)"
+elif [ -n "${BENCH_GITHUB_TOKEN:-}" ]; then
+  LEDGER_TOKEN="${BENCH_GITHUB_TOKEN}"
+  LEDGER_TOKEN_NAME="BENCH_GITHUB_TOKEN"
+  LEDGER_TOKEN_ADVICE="BENCH_GITHUB_TOKEN"
+else
+  LEDGER_TOKEN="${GITHUB_TOKEN:-}"
+  LEDGER_TOKEN_NAME="GITHUB_TOKEN"
+  LEDGER_TOKEN_ADVICE="BENCH_GITHUB_TOKEN, or GITHUB_TOKEN"
+fi
+
+if [ "${#LEDGER_TASKS[@]}" -gt 0 ]; then
+  if [ -n "${LEDGER_TOKEN}" ]; then
+    echo "Ledger token: ${LEDGER_TOKEN_NAME} set; ${#LEDGER_TASKS[@]} task(s) grade the ledger issue."
+  else
+    # The EXIT trap dumps pod descriptions, previous-container logs and the
+    # Cloud Build list. That is the right response to a broken deploy and the
+    # wrong one to a missing environment variable: it buries a one-line
+    # answer under an infrastructure postmortem.
+    trap - EXIT
+    echo "ERROR: these tasks grade the GitHub ledger issue and no read token is set:" >&2
+    printf '         %s\n' "${LEDGER_TASKS[@]}" >&2
+    echo "       Set ${LEDGER_TOKEN_ADVICE} in the runner environment." >&2
+    echo "       Every ledger_issue_contains check would otherwise return status=error," >&2
+    echo "       dropping VerificationCoverage below the gate's 1.0 floor on each task." >&2
+    echo "       It needs issues:read on this project's GitOps repository and nothing" >&2
+    echo "       else; provisioning is section 5.4 of" >&2
+    echo "       docs/site/src/content/docs/deploy/ci-pool-projects.md." >&2
+    exit 1
+  fi
+fi
 
 FAILED_TASKS=()
 INFRA_FAILED_TASKS=()
