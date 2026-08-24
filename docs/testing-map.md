@@ -6,19 +6,41 @@ misplaced test look fine.
 
 ## The nine homes
 
-| What you are testing                                                                       | Where it goes                                                                                    | What runs it                                                                           | On a pull request                                                                                   |
-| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| A Python module's own logic                                                                | beside the module; the exact directory set is the `PYTHON_TEST_DIRS` globs at `Makefile:129-142` | `make test-python`                                                                     | runs, unconditionally                                                                               |
-| A shell script, a rendered manifest, an installer — something with no module to sit beside | `tests/test_*.py`, and `tests/memory/` for the memory provider                                   | `make test-python`, and `agent-startup-test.yml` for the startup subset                | runs, unconditionally                                                                               |
-| Two components across a seam, no model call                                                | `tests/integration/test_seam_*.py`                                                               | `make test-python`                                                                     | runs, unconditionally                                                                               |
-| The bench harness itself — verifiers, parsing                                              | `bench/tests/`                                                                                   | `make test-bench`                                                                      | runs, unconditionally                                                                               |
-| The Go operator                                                                            | `k8s-operator/`                                                                                  | `make -C k8s-operator test`                                                            | paths-filtered: runs only when the change touches `k8s-operator/**` or `agents/platform/scripts/**` |
-| An agent plugin                                                                            | `agentplugins/*/tests/test_*.py`                                                                 | `agentplugins-test.yml`                                                                | paths-filtered: runs only when the change touches `agentplugins/**`                                 |
-| An agent, graded against a planted defect                                                  | `bench/tasks/<name>/task.yaml`                                                                   | `hack/ci-eval-pr.sh`                                                                   | reports; whether it blocks is Prow config this repository cannot read                               |
-| A live journey through a deployed install                                                  | `bench/cuj/test_<NN>_<name>.py`, or `bench/cuj/<area>/` under it                                 | `uv run --project bench pytest -s bench/cuj`                                           | nothing runs it, by design                                                                          |
-| The release gate                                                                           | `tests/e2e/`                                                                                     | `rc-release-pipeline.yml` on a three-hourly schedule, and `e2e-gchat-test.yml` by hand | nothing — it gates releases, not pull requests                                                      |
+| What you are testing                                                                       | Where it goes                                                                                    | What runs it                                                                           | On a pull request                                                                                                 |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| A Python module's own logic                                                                | beside the module; the exact directory set is the `PYTHON_TEST_DIRS` globs at `Makefile:129-142` | `make test-python`                                                                     | runs, unconditionally                                                                                             |
+| A shell script, a rendered manifest, an installer — something with no module to sit beside | `tests/test_*.py`, and `tests/memory/` for the memory provider                                   | `make test-python`, and `agent-startup-test.yml` for the startup subset                | runs, unconditionally                                                                                             |
+| Two components across a seam, no model call                                                | `tests/integration/test_seam_*.py`                                                               | `make test-python`                                                                     | runs, unconditionally                                                                                             |
+| The bench harness itself — verifiers, parsing                                              | `bench/tests/`                                                                                   | `make test-bench`                                                                      | runs, unconditionally                                                                                             |
+| The Go operator                                                                            | `k8s-operator/`                                                                                  | `make -C k8s-operator test`                                                            | paths-filtered: runs only when the change touches `k8s-operator/**` or `agents/platform/scripts/**`               |
+| An agent plugin                                                                            | `agentplugins/*/tests/test_*.py`                                                                 | `agentplugins-test.yml`                                                                | paths-filtered: runs only when the change touches `agentplugins/**`                                               |
+| Whether the agent diagnoses a defect you planted for it                                    | `bench/tasks/<name>/task.yaml`                                                                   | `hack/ci-eval-pr.sh`, as the Prow presubmit                                            | runs as a presubmit and reports on the pull request; whether it blocks is Prow config this repository cannot read |
+| Whether an install you already have still works for a user                                 | `bench/cuj/test_<NN>_<name>.py`, or `bench/cuj/<area>/` under it                                 | `uv run --project bench pytest -s bench/cuj`, by hand                                  | nothing runs it, by design                                                                                        |
+| The release gate                                                                           | `tests/e2e/`                                                                                     | `rc-release-pipeline.yml` on a three-hourly schedule, and `e2e-gchat-test.yml` by hand | nothing — it gates releases, not pull requests                                                                    |
 
-Three of those rows carry a footnote that matters more than the row.
+Four of those rows carry a footnote that matters more than the row.
+
+**`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
+The difference is who supplies the failure and who owns the environment.
+
+A `bench/tasks/` case is an **eval, and it runs in the Prow presubmit**. It plants a defect and the
+run owns the environment the defect sits in: the case's `infrastructure.deployer` decides where,
+with `tofu` provisioning a stack for the run and tearing it down after, and `noop` grading against
+the cluster the deploy already stood up. The agent is pointed at it and its diagnosis is graded
+against the case's `verification_spec`. The subject is the agent — the defect is known, and what is
+in question is whether the agent finds it. That is why a case needs a `domain:` slug and
+deterministic checks, and why adding one changes what a pull request reports.
+
+A `bench/cuj/` journey is a **live black-box test of an install you already own, and nothing in CI
+runs it**. It plants nothing and provisions nothing. It talks to Kage as a user through the admin
+portal API and scores only evidence the deployed system returned, so the subject is the install: the
+agent is assumed to work, and what is in question is whether this deployment is wired up. It needs a
+real installation to point at, which is exactly why no CI job runs it and why it cannot gate
+anything.
+
+Rule of thumb: if you would have to break something on purpose for the test to be meaningful, it is
+a `bench/tasks/` case. If you would run it against production to check the deploy landed, it is a
+`bench/cuj/` journey.
 
 **The two paths-filtered workflows report `success` on a pull request that ran nothing.**
 `k8s-operator-test.yml` and `agentplugins-test.yml` both run `dorny/paths-filter` and then gate

@@ -40,11 +40,14 @@ did not expect, or nowhere at all, and the suite reports green around it.
   `tests/` when there is nothing to sit beside, as for a shell script or a rendered manifest; or in
   `tests/integration/` when it spans two components.
   See [`tests/integration/README.md`](tests/integration/README.md).
-- **Yes, graded against a planted defect** — it is an eval, and it belongs in
-  `bench/tasks/<name>/task.yaml`. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
+- **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
+  `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what
+  every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract for what that file must carry; `make bench-case-check` enforces it.
-- **Yes, driving a deployed install end to end** — it is a journey, and it goes in `bench/cuj/`.
-  See [`bench/cuj/README.md`](bench/cuj/README.md). No CI job runs that suite.
+- **Yes, and it checks an install you already have** — it is a journey, and it goes in `bench/cuj/`.
+  It plants nothing, provisions nothing, and grades the deployment rather than the agent. Nothing in
+  CI runs it, because it needs a real installation to point at.
+  See [`bench/cuj/README.md`](bench/cuj/README.md).
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.
 
