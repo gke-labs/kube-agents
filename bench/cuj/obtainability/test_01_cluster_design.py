@@ -145,10 +145,9 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac02-obtainability-api-invoked",
-        "kube-agents invokes AdviceService.Capacity or "
-        "GeneralCapacityRecommendation for the requested capacity.",
-        "completed evidence names an allowed method and requests 32 A100 GPUs "
-        "in us-central1",
+        "kube-agents invokes AdviceService.Capacity for the requested capacity.",
+        "completed evidence names AdviceService.Capacity and requests 32 A100 "
+        "GPUs in us-central1",
     ),
     AcceptanceCriterion(
         "ac03-available-quantity-analyzed",
@@ -162,8 +161,12 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac05-provisioning-models-analyzed",
-        "kube-agents analyzes On-Demand, Spot, and Flex provisioning signals.",
-        "capacity evidence contains non-empty ON_DEMAND, SPOT, and FLEX signals",
+        "kube-agents analyzes the obtainability signals AdviceService offers "
+        "(Spot and Flex) and advises the user on the trade-offs of all three "
+        "provisioning paths; On-Demand carries no advance obtainability "
+        "signal, so its assessment rests on quota and reservations.",
+        "capacity evidence contains non-empty SPOT and FLEX signals and the "
+        "answer weighs On-Demand, Spot, and Flex",
     ),
     AcceptanceCriterion(
         "ac06-computeclass-generated",
@@ -428,10 +431,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     suite.record(
         "ac02-obtainability-api-invoked",
-        (
-            method.endswith("AdviceService.Capacity")
-            or method.endswith("AdviceService.GeneralCapacityRecommendation")
-        )
+        method.endswith("AdviceService.Capacity")
         and str(capacity_request.get("region") or "").casefold() == "us-central1"
         and "a100"
         in str(capacity_request.get("acceleratorType") or "").casefold()
@@ -456,12 +456,27 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         {"zones": zones, "distinctZones": sorted(distinct_zones)},
         blocked_by=evidence_blocker,
     )
-    required_models = {"ondemand", "spot", "flex"}
+    populated_models = {
+        key
+        for key, value in normalized_models.items()
+        if value not in (None, "", [], {})
+    }
+    advice_models_covered = all(
+        any(key.startswith(model) for key in populated_models)
+        for model in ("spot", "flex")
+    )
+    answer = str(interaction.get("output") or "").casefold()
+    paths_weighed = {
+        "onDemand": any(
+            term in answer for term in ("on-demand", "on demand", "ondemand")
+        ),
+        "spot": "spot" in answer,
+        "flex": "flex" in answer,
+    }
     suite.record(
         "ac05-provisioning-models-analyzed",
-        required_models <= normalized_models.keys()
-        and all(normalized_models[item] not in (None, "", [], {}) for item in required_models),
-        models,
+        advice_models_covered and all(paths_weighed.values()),
+        {"provisioningModels": models, "answerWeighs": paths_weighed},
         blocked_by=evidence_blocker,
     )
     suite.record(
