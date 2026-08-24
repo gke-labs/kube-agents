@@ -58,11 +58,12 @@ eventually resolves it.
 ## Which projects have a fleet
 
 Three projects sit in the Boskos pool: `kube-agents-evals`, `kube-agents-evals-2` and
-`kube-agents-evals-3`. All three carry a fleet, the third applied on 2026-08-24.
-`bench/tf/fleet/README.md` still describes the fleet as one trio across two projects, in
-its opening paragraph and again in its state-bucket list, and needs the third added in
-both places. The first two are the ones the live audit behind this document covered; the
-third's facts here are its apply date and its gate dates, which follow from it.
+`kube-agents-evals-3`. All three carry a fleet, the third applied on 2026-08-24, and each
+keeps its own state bucket. `bench/tf/fleet/README.md` described the fleet as one trio
+across two projects, in its opening paragraph and again in its state-bucket list; this
+change corrects both. The first two are the ones the live audit behind this document
+covered; the third's facts here are its apply date and its gate dates, which follow
+from it.
 
 Boskos leases a project at random, and a fleet-dependent case that lands on a project
 without a fleet does not fail — it errors, which drops `VerificationCoverage` below 1.0
@@ -89,17 +90,21 @@ from voting on the baseline.
 | `rbac-overgrant`   | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
 | `missing-pdb`      | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
 | `oom-crashloop`    | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `pinned-inference` | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants 2                    |
+| `pinned-inference` | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
 | `idle-batch`       | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
 | `orphan-disks`     | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
 | `version-lag`      | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
 | `drift-outlier`    | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
 
-The `inference-server` HPA under `pinned-inference` computes a desired replica count of 2,
-not the 3 the fleet README documents. The fixture still works — desired exceeds the pinned
-maximum of 1, which is the whole claim — but a case must not assert the number 3, and a
-case that asserts a specific figure at all is asserting a load calculation that will move.
-Assert the pin and the unmet demand, not the arithmetic.
+The `inference-server` HPA under `pinned-inference` does not compute a stable desired
+replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
+`kube-agents-evals`, 2 in `kube-agents-evals-2` and 3 in `kube-agents-evals-3` — same
+stack, same manifests, three projects, two different answers. The fixture holds anyway,
+and that is the point: desired exceeds the pinned maximum of 1 in every project, which is
+the whole claim. The number it exceeds it by is a load calculation over live utilisation,
+and it moves. So a case must assert the pin and the unmet demand — `maxReplicas` at 1,
+`desiredReplicas` above it — and never a specific figure, because there is no figure that
+is true everywhere the case might land.
 
 Three of these slugs are corrections to names that circulated before the fleet existed.
 `hpa-saturated` was the working name for what is now `pinned-inference`: the HPA is half

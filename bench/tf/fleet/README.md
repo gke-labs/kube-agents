@@ -1,11 +1,11 @@
 # The seeded dirty fleet
 
-Three small standing GKE clusters, one trio per eval project (`kube-agents-evals` and
-`kube-agents-evals-2` — see State below), whose defects are planted on
-purpose: they are the fixtures the Phase 2 presubmit scenarios assert on. The fleet is
-read-only for evaluations — every open pull request shares it, and no scenario may
-mutate it. Because we planted each defect and chose its name, the scenarios' assertions
-can be exact rather than judged.
+Three small standing GKE clusters, one trio per eval project (`kube-agents-evals`,
+`kube-agents-evals-2` and `kube-agents-evals-3` — see State below), whose defects are
+planted on purpose: they are the fixtures the Phase 2 presubmit scenarios assert on. The
+fleet is read-only for evaluations — every open pull request shares it, and no scenario
+may mutate it. Because we planted each defect and chose its name, the scenarios'
+assertions can be exact rather than judged.
 
 The clusters carry `managed-by=kube-agents-seeded-fleet`, deliberately distinct from
 `managed-by=kube-agents-bench`: the eval orphan sweep in `../modules/cluster/gke`
@@ -17,11 +17,11 @@ State is remote (`backend "gcs"`, partial config), because the operating model i
 re-apply from any checkout — against local state a fresh checkout would plan full
 creates and 409 against the live fleet. The stack applies **once per eval project**,
 and each project keeps its own state: bucket `<project>-tf-state`, prefix
-`seeded-fleet`, always. Both eval projects are live today —
-`gs://kube-agents-evals-tf-state` and `gs://kube-agents-evals-2-tf-state` — and
-project N+1 follows the same convention. The fleet owner creates the bucket once per
-project; switching projects means re-initializing against that project's bucket and
-naming the project on the apply:
+`seeded-fleet`, always. All three eval projects are live today —
+`gs://kube-agents-evals-tf-state`, `gs://kube-agents-evals-2-tf-state` and
+`gs://kube-agents-evals-3-tf-state` — and project N+1 follows the same convention. The
+fleet owner creates the bucket once per project; switching projects means re-initializing
+against that project's bucket and naming the project on the apply:
 
     tofu init -reconfigure \
               -backend-config="bucket=<project>-tf-state" \
