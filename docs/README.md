@@ -382,7 +382,7 @@ only what the title does not say.
 | `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; opt-in for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
 | `terraform/modules/drift-pubsub/README.md` | Component README | Reusable Terraform module for the drift detector's audit-log ingress: Log Router sink, drift-audit topic and pull subscription, sink-writer and subscriber IAM; not yet part of the full-install composition. | Audit-log sink, Pub/Sub, writer identity | Infrastructure engineers |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
-| `tests/integration/README.md` | Component README | The integration seam tier: real components wired together with the agent replaced by a fake — the contract, how to add a seam test, and the probation status that keeps it out of `PYTHON_TEST_DIRS`. | Seam tests, `make test-integration`, expectedFailure pins | Developers adding seam tests |
+| `tests/integration/README.md` | Component README | The integration seam tier: real components wired together with the agent replaced by a fake — the contract, how to add a seam test, and what changed when the tier left probation to gate inside `PYTHON_TEST_DIRS`. | Seam tests, `make test-integration`, expectedFailure pins | Developers adding seam tests |
 
 ## 5. Keeping this map fresh
 

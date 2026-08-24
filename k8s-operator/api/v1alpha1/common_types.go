@@ -66,14 +66,18 @@ type HermesSpec struct {
 	// +optional
 	AgentHome string `json:"agentHome,omitempty"`
 
-	// ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
+	// ApiServerSecretRef references the Secret key holding API_SERVER_EXTERNAL_KEY,
+	// the credential outside callers present to the credential-proxy sidecar. It
+	// does not set API_SERVER_KEY: the value the Hermes API server itself validates
+	// is the non-secret loopback sentinel `cluster-internal-trusted`, a compile-time
+	// constant the sidecar swaps in once it has authenticated the caller.
 	// +optional
 	ApiServerSecretRef *corev1.SecretKeySelector `json:"apiServerSecretRef,omitempty"`
 
 	// SessionKVApiKeySecretRef references the Secret key holding the bearer
 	// token for the pod-local Session KV server on port 8699. Distinct from
-	// ApiServerSecretRef: that path uses the non-secret loopback sentinel
-	// `cluster-internal-trusted`, which would authenticate nothing here.
+	// API_SERVER_KEY, which is that loopback sentinel and would authenticate
+	// nothing here.
 	// +optional
 	SessionKVApiKeySecretRef *corev1.SecretKeySelector `json:"sessionKVApiKeySecretRef,omitempty"`
 

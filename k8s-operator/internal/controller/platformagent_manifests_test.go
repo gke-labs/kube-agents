@@ -2641,15 +2641,43 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		}
 	}
 
-	// A deployment with no chat integration pins nothing, so the render is empty — but
-	// buildConfigMapData still writes the key, and must: the managed volume projects it
-	// by name, and a ConfigMap item naming a missing key fails the mount and the pod
-	// never starts (see renderManagedEnv's doc comment). What is asserted here is the
-	// CONTENT, not the key's presence: an agent with no chat integration has no platform
-	// credential worth freezing, and a pin invented for one would only be a key the agent
-	// is refused permission to set.
-	if got := renderManagedEnv(newTestPlatformAgent()); got != "" {
-		t.Errorf("renderManagedEnv with no integration = %q, want empty", got)
+	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
+	// integration has no platform credential worth freezing, and a pin invented for one
+	// would only be a key the agent is refused permission to set. What survives is the
+	// loopback bearer, which is not conditional on anything; see the next test.
+	bare := renderManagedEnv(newTestPlatformAgent())
+	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"; got != want {
+		t.Errorf("renderManagedEnv with no integration = %q, want %q", got, want)
+	}
+}
+
+// TestManagedEnvPinsTheLoopbackKeyUnconditionally is the regression for issue #786.
+//
+// Hermes' stage2 hook generates a strong random API_SERVER_KEY into $HERMES_HOME/.env on
+// any boot where that file does not already carry one, and load_hermes_dotenv applies the
+// PVC file over the container environment — so the operator setting the env var is not
+// enough, and was not: every authenticated call to the gateway API 401'd against a key
+// nothing else in the system had ever seen. The managed scope is applied LAST with
+// override=True, which is why the pin has to live here and not only in the container env.
+//
+// Unconditional matters as much as present. The failure was found through the Google Chat
+// relay, but it belongs to the API server, which every deployment runs — including the
+// probes on the platform-agent container, which curl that API and so would hold the pod
+// out of Ready forever on an agent with no integration at all.
+func TestManagedEnvPinsTheLoopbackKeyUnconditionally(t *testing.T) {
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"no integration": newTestPlatformAgent(),
+		"chat":           chatAgent(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := renderManagedEnv(agent)
+			want := "API_SERVER_KEY=" + loopbackAgentAPIKey
+			if !slices.Contains(strings.Split(strings.TrimSpace(env), "\n"), want) {
+				t.Errorf("the managed .env does not pin %q, so Hermes' stage2 hook generates its own "+
+					"key into the PVC .env and every authenticated call to the gateway API 401s "+
+					"(issue #786):\n%s", want, env)
+			}
+		})
 	}
 }
 

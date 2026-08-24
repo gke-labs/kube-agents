@@ -1350,5 +1350,97 @@ class PlatformFrontDoorTest(unittest.TestCase):
         self.assertIn("SURVIVED", proc.stdout)
 
 
+class ApiKeyPinCheckTest(unittest.TestCase):
+    """The startup self-check for issue #786.
+
+    The bug it names: Hermes' stage2 hook generates a random API_SERVER_KEY into the PVC
+    `.env` when that file has none, `load_hermes_dotenv` applies that file over the
+    container environment, and so the gateway authenticated against a value invented at
+    boot that nothing else in the pod knew — every authenticated call 401'd, including
+    the container's own startup probe. The operator now pins the key in the managed
+    `.env`, which is applied last; this check is what says so out loud when the pin is
+    missing, because managed scope fails open and the probe alone reports only THAT
+    something is wrong.
+
+    What these hold is the shape of the report, not its wording: warns when the file is
+    absent, warns when it pins a different value, is silent when the two agree, and never
+    ends the boot — a pod that comes up unpinned still answers, and failing the container
+    would trade a degraded API for none.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._FUNC = _extract_shell_function("warn_unless_api_key_is_pinned")
+
+    def _run(self, managed_env, key="cluster-internal-trusted"):
+        """Run the shipped function over a real file; returns the completed process.
+
+        `managed_env` is the file's content, or None for "the mount did not arrive".
+        `set -e` is on, as it is in the entrypoint, so a check that failed the boot on
+        the warning paths would show up here as a non-zero exit.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / ".env"
+            if managed_env is not None:
+                path.write_text(managed_env, encoding="utf-8")
+            return subprocess.run(
+                ["sh", "-c", f'set -e\n{self._FUNC}\nwarn_unless_api_key_is_pinned "{path}" "{key}"\necho SURVIVED\n'],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+    def test_an_agreeing_pin_says_nothing(self):
+        """The steady state is every boot, so it must not warn."""
+        proc = self._run("API_SERVER_KEY=cluster-internal-trusted\nSLACK_ALLOW_ALL_USERS=false\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_a_missing_managed_env_is_named(self):
+        proc = self._run(None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("786", proc.stderr)
+        self.assertIn("NOT pinned", proc.stderr)
+
+    def test_a_pin_that_disagrees_is_named(self):
+        """A stale ConfigMap pinning a key nobody presents.
+
+        Distinct from "no pin at all" in the one way an operator acts on: managed scope is
+        applied last, so HERE the managed file is the winner and the container's env is
+        what loses. Told the PVC won, they would go and read the wrong file.
+        """
+        proc = self._run("API_SERVER_KEY=" + "a1b2" * 16 + "\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("786", proc.stderr)
+        self.assertIn("to a different value", proc.stderr)
+        self.assertNotIn(".env wins", proc.stderr)
+
+    def test_a_managed_env_that_pins_other_keys_is_a_disagreement(self):
+        """A chat-only render is exactly the file this shipped with before the fix.
+
+        Nothing overrides the key, so the winner is the PVC's stage2-generated one — the
+        opposite file from the branch above, and the message has to say so.
+        """
+        proc = self._run("GOOGLE_CHAT_ALLOW_ALL_USERS=false\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("does not pin API_SERVER_KEY", proc.stderr)
+        self.assertIn(".env wins", proc.stderr)
+
+    def test_a_line_that_merely_contains_the_value_is_not_the_pin(self):
+        """`grep -x`, not a substring: a different key holding the same value agrees
+        about nothing, and neither does a commented-out pin."""
+        proc = self._run("# API_SERVER_KEY=cluster-internal-trusted\nOTHER=cluster-internal-trusted\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("does not pin API_SERVER_KEY", proc.stderr)
+
+    def test_it_never_ends_the_boot(self):
+        """Report, never exit — asserted on the warning paths, where it would matter."""
+        for content in (None, "API_SERVER_KEY=something-else\n"):
+            with self.subTest(managed_env=content):
+                proc = self._run(content)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("SURVIVED", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
