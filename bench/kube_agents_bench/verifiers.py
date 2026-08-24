@@ -321,8 +321,26 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
 
 
 def _parse_footer(body: str) -> tuple[str, datetime] | None:
-    """The ledger footer's ``(audit id, generated-at)``, or None when absent."""
-    match = _LEDGER_FOOTER_RE.search(body)
+    """The ledger footer's ``(audit id, generated-at)``, or None when absent.
+
+    The LAST match, not the first. ``render_issue_body`` assembles the body as
+    ``fixed + findings + withheld + evidence + footer``, so every byte the
+    agent authored — finding titles and impacts through ``clip_text``, which
+    redacts credentials and clips length but neither strips backticks nor
+    flattens newlines, and evidence excerpts into a raw fenced block — sits
+    ABOVE the real footer. Taking the first match would let a finding whose
+    impact carries a footer-shaped line supply both halves this check binds
+    to: its own audit id (so the stream check passes) and its own stamp (so
+    the staleness check passes against a ledger left by a previous run). The
+    footer cannot be required to be the body's last non-empty line — the
+    hidden ``audit-findings`` delta block is rendered after it — but nothing
+    the agent writes can ever appear below it, so the final match is the one
+    ``audit_report.py`` wrote. Same reason ``_finding_ids`` reads
+    ``matches[-1]``.
+    """
+    match = None
+    for match in _LEDGER_FOOTER_RE.finditer(body):
+        pass
     if match is None:
         return None
     try:
