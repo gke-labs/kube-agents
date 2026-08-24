@@ -47,6 +47,7 @@ __all__ = [
     "ROLE_PATTERN",
     "FleetRoleUnresolved",
     "available_roles",
+    "confirmed_subjects",
     "kubeconfig_for_role",
     "provisioned_project",
 ]
@@ -67,6 +68,12 @@ _SUFFIX = ".kubeconfig"
 # the fleet, so "role unavailable" is only actionable once it says where the
 # runner looked.
 _CONTEXT_FILE = ".fleet-context"
+
+# Written by hack/fleet-kubeconfigs.sh beside each role's kubeconfig: one
+# canonical subject per line, in the catalog's `<kind>/<name>` or
+# `<kind>?<selector>` form, for every object the runner SAW on that cluster
+# before the agent started.
+_CONFIRMED_SUFFIX = ".confirmed"
 
 
 class FleetRoleUnresolved(LookupError):
@@ -108,6 +115,41 @@ def provisioned_project(directory: str | os.PathLike[str] | None = None) -> str 
         if key.strip() == "project" and value.strip():
             return value.strip()
     return None
+
+
+def confirmed_subjects(
+    role: str, directory: str | os.PathLike[str] | None = None
+) -> frozenset[str]:
+    """Objects the runner SAW on ``role``'s cluster before the agent started.
+
+    This is the only thing that entitles a check to call a later absence a
+    violation. If ``deployment/payments-api`` is in here and is gone at check
+    time, it went missing during the run and the run is answerable for it. If
+    it is not in here, the runner never saw it, so its absence says the fixture
+    was never planted -- an ``error`` about the environment, not a ``fail``
+    charged to the agent.
+
+    Args:
+        role: A fixture role from ``bench/tf/fleet/fixtures.json``.
+        directory: Override for the provisioned directory; defaults to
+            ``$BENCH_FLEET_KUBECONFIG_DIR``.
+
+    Returns:
+        Canonical subject strings (``namespace/seeded-debug``,
+        ``deployment/payments-api``, ``node?cloud.google.com/...``). Empty when
+        the runner never ran, confirmed nothing, or the role declares no
+        probes -- in every one of which cases nothing may be blamed on the run.
+    """
+    if not ROLE_PATTERN.fullmatch(role):
+        return frozenset()
+    root = directory if directory is not None else os.environ.get(FLEET_KUBECONFIG_DIR_ENV)
+    if not root:
+        return frozenset()
+    try:
+        text = (Path(root) / f"{role}{_CONFIRMED_SUFFIX}").read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    return frozenset(line.strip() for line in text.splitlines() if line.strip())
 
 
 def kubeconfig_for_role(role: str, directory: str | os.PathLike[str] | None = None) -> str:

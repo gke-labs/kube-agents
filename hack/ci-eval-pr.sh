@@ -57,11 +57,17 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # are the signal that a pool project still needs bench/tf/fleet applied, and
 # they are wanted BEFORE those tasks start gating PRs, not after. It costs one
 # clusters.list, one get-credentials per seeded cluster, and one namespace read
-# per fixture role -- seconds, against a job measured in tens of minutes.
+# per probe -- seconds, against a job measured in tens of minutes.
+#
+# The `||` catches a REPOSITORY bug only: a missing or malformed
+# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
+# environmental failure -- no fleet in this project, a cluster that will not
+# answer, a fixture that was never planted -- returns 0 with a warning of its
+# own and leaves the affected roles' files absent, which is the whole design.
 STEP_START=$SECONDS
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-write_fleet_kubeconfigs || echo "WARNING: seeded-fleet kubeconfigs unavailable; every fleet fixture check will report status=error" >&2
+write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
 # 3. Agent & Harness Configuration
@@ -203,10 +209,12 @@ TASKS=(
   #       fleet safeguards use `fleet_resource_property` with a
   #       `fixture_role:` instead of reading the ambient kubeconfig (which
   #       is platform-agent-host and carries no seeded namespace). What is
-  #       left is operational, not code: the fleet must be applied in EVERY
-  #       project the Boskos pool can lease (kube-agents-evals-3 has none
-  #       today), each planted defect verified present, and
-  #       FLEET_READONLY_SA exported. The run holds a cluster-admin
+  #       left is operational, not code. The fleet must be applied in EVERY
+  #       project the Boskos pool can lease, with each planted defect
+  #       verified present; that is true of all three as of 2026-08-24 --
+  #       step 2b reports "7 role(s) written ... 0 whose fixtures were not
+  #       present" against each. What is still missing is
+  #       FLEET_READONLY_SA. The run holds a cluster-admin
   #       credential on a fleet every open PR shares until it is --
   #       roles/container.admin via the GKE IAM webhook, with nothing to
   #       narrow in-cluster. bench/tf/fleet/README.md has both.
