@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -127,7 +127,8 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
-	$(wildcard tests/test_*.py)))
+	$(wildcard tests/test_*.py) \
+	$(wildcard tests/memory/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
@@ -298,6 +299,15 @@ test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus p
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
+
+# The integration tier: real components wired together with the agent replaced
+# by a fake -- no model calls, deterministic by construction (strategy 4.1b).
+# Deliberately NOT in PYTHON_TEST_DIRS while the tier is on probation: its own
+# CI job is the single runner, so a flake in a young seam test cannot red the
+# already-gating unit job. It joins the unit sweep when the job becomes a
+# required check; the discovery guard's exclusion entry tells the same story.
+test-integration: ## Run the in-process integration seam tests.
+	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean

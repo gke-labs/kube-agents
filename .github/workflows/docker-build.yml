@@ -1,7 +1,20 @@
 name: Docker Build
 
+# `push: main` as well as the pull request, so that main itself is built.
+# `strict` is off in branch protection, so what a merge is allowed on is a green
+# check from a merge commit that may be hours stale -- if the base moved
+# underneath it, nothing re-runs, and without a push run nothing ever builds the
+# tree that actually landed. That is #812's shape, in Docker rather than Go.
+#
+# This overlaps docker-publish-ghcr.yml, which already builds the `platform` and
+# `credential-proxy` targets on every push here. It is not redundant: the layer
+# budget (#658) and the entrypoint shared-state gate are checked only in this
+# workflow, and those are exactly the two failures that otherwise surface in
+# Cloud Build, on main, after merge. It does add a second image build per merge.
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
 
 # A re-push supersedes this pull request's earlier run instead of stacking a

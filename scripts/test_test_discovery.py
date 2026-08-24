@@ -37,18 +37,15 @@ EXCLUDED = {
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
-    # tests/e2e is deliberately NOT here: its file is gchat_agent_test.py,
-    # which the test_*.py pattern never matches. If a test_*.py ever lands
-    # there, the orphan check below fires and forces this list to say why the
-    # live-cluster suite must not join PYTHON_TEST_DIRS. That is the point.
-    #
-    # Imports kube_agents_memory, which imports hermes-agent's `agent` module
-    # at module scope -- a dependency requirements-test.txt deliberately does
-    # not install ("far too heavy to install for a unit-test run"). Whether to
-    # stub the provider or pay for the dependency is an open decision; until
-    # it is made, the suite cannot load, and this entry is the record that the
-    # omission is known rather than accidental.
-    "tests/memory": "hermes-agent dependency, decision pending",
+    # Live black-box CUJ journeys against a provisioned kube-agents install;
+    # they open an admin portal and talk to a deployed agent, so they are
+    # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
+    "bench/cuj": "live manual suite, needs a provisioned install",
+    # Runs in its own CI job (`integration` in python-tests.yml) during its
+    # probation period, so a flake in a young seam test cannot red the
+    # already-gating unit and coverage jobs. Joins the unit sweep when the
+    # job becomes a required check.
+    "tests/integration": "own CI job during probation, make test-integration",
 }
 
 # Directory names that are never test homes, at any depth. .terraform holds

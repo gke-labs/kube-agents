@@ -42,6 +42,7 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.116,<1",
     "pytest>=8.0.0",
     # Test-only, and deliberately not a runtime dependency: the harness never
     # parses a task.yaml itself -- devops-bench does, before this package is
@@ -50,6 +51,7 @@ dev = [
     # `make test-bench-deps` installs the same thing for CI, which does not
     # use this group; keep the two in step.
     "pyyaml>=6.0",
+    "uvicorn>=0.35,<1",
 ]
 
 # Pin the index explicitly so a machine-wide default (a corporate mirror, an

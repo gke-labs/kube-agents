@@ -195,3 +195,43 @@ jobs:
             pr-number.txt
             coverage-total.txt
           if-no-files-found: ignore
+
+  # The integration tier (testing strategy 4.1b): real components wired
+  # together with the agent replaced by a fake — deterministic, no model
+  # calls, minutes not hours. This job is the tier's ONLY runner during its
+  # probation period (tests/integration is deliberately excluded from
+  # PYTHON_TEST_DIRS, so the unit and coverage jobs never execute it); it is
+  # intended to become a required check once it has a green track record, and
+  # the directory joins the unit sweep at the same moment. Nothing statistical
+  # stands between a failure here and a defect.
+  integration:
+    name: Run Integration Seam Tests
+    runs-on: ubuntu-latest
+
+    env:
+      HERMES_HOME: ${{ github.workspace }}/.hermes-home
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The injector seam compiles and runs the real Go client from
+      # k8s-operator/cmd/k8s-event-watcher against the live Python server.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: k8s-operator/go.mod
+          cache-dependency-path: k8s-operator/go.sum
+
+      - name: Install the third-party imports the modules under test need
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-test.txt
+
+      - name: Run the integration seam tests
+        run: make test-integration

@@ -246,7 +246,13 @@ the requester's own identity (`SubjectAccessReview` for K8s, `testIamPermissions
 Troubleshooter for GCP) and down-scope the agent's effective authority to **agent scope ∩ requester
 permissions** (closing the confused-deputy gap), enforced by an authorization gateway/broker **outside
 the LLM loop** with per-run downscoped tokens. Contract sketch: [06](06-api-and-data-contracts.md)
-§2a. **Not in v1.**
+§2a. **Not in v1.** One half of that mechanism was later measured and does not hold: GCP-layer
+credential attenuation does not reach Kubernetes object authorization, so "down-scope the agent's
+effective authority with per-run tokens" has no GCP mechanism behind it, and
+[09](09-capability-envelope.md) §1 carries the replacement for it. The measurement says nothing
+about the requester-permission _check_ — asking whether a human holds a permission is a query, not
+an attenuation — so `SubjectAccessReview` and `testIamPermissions` stand, and so does the contract
+sketch above. This section stays canonical for the requirement.
 
 ---
 

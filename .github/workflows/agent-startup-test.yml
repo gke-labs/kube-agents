@@ -56,6 +56,11 @@ jobs:
               # Makefile prints; a Makefile-only change must run it or the
               # deploy contract it guards can revert unnoticed.
               - "k8s-operator/Makefile"
+              # tests/test_ci_gitops_repo.py extracts and runs the GitOps
+              # repository resolution out of this script. Its whole subject is
+              # what happens when resolution FAILS, which a green presubmit
+              # never exercises, so the guard has to follow the script.
+              - "hack/ci-deploy.sh"
               - ".github/workflows/agent-startup-test.yml"
 
       - name: Set up Python
