@@ -290,6 +290,30 @@ The three allowlists (`KNOWN_UNREGISTERED`, `KNOWN_NO_DOMAIN`, `KNOWN_JUDGE_ONLY
 work the same way: an entry names a case and carries the reason, and an entry whose case
 no longer exists fails the lint.
 
+### What it does not catch
+
+A green `make bench-case-check` is not a promise that devops-bench will load the case. The
+validator checks the rules above; it does not reimplement the harness's schema, and three
+classes of mistake get through it and fail at spec-load, after a cluster lease is spent:
+
+- **An extra or misspelled key on a verification entry or a check node.** The compound
+  nodes in `devops_bench/verification/spec.py` are `ConfigDict(extra="forbid")`, so
+  `requried_phrases:` is a hard rejection there and merely an unrecognised key here.
+- **A missing required field on a check.** That surfaces as pydantic's `Field required`
+  against the verifier's own model, which this validator does not have.
+- **`critical: yes`.** This one the validator structurally cannot catch, and the reason is
+  worth knowing. It reads cases with PyYAML, which is YAML 1.1 and parses the bare `yes`
+  into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
+  (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
+  `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
+  the validator sees the field, the trap has already been parsed away.
+
+The gap is deliberate rather than pending. `make bench-case-check` depends on PyYAML alone,
+so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what
+makes it cheap enough to run on every edit. Importing devops-bench to close these three
+would trade that for a second copy of a schema that already exists. Note the divergence
+when writing a case; do not add the dependency.
+
 ## Changing the format
 
 Whoever changes the format does the migration. Five people each fixing their own files

@@ -31,6 +31,8 @@ an option. The parse is deliberately narrow -- the TASKS=( ... ) block only --
 and a parse that finds nothing fails loudly rather than passing vacuously.
 """
 
+import contextlib
+import io
 import pathlib
 import re
 import sys
@@ -281,6 +283,51 @@ class TestTheValidatorItself(unittest.TestCase):
         )
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
+
+    def test_main_exits_non_zero_when_a_case_is_rejected(self):
+        # Every other test here reads the problem list that validate_case
+        # returns. None of them runs main(), so none of them would notice if
+        # main() found problems, printed them, and returned 0 anyway --
+        # `make bench-case-check` would go green on a tree it had just
+        # rejected, which is the one failure that makes the whole target
+        # decorative. Assert the exit code, not the report.
+        spec = {
+            "id": "made-up-case",
+            "name": "A case",
+            "domain": "security",
+            "fixtures": ["rbac-overgrant"],
+            "verification_spec": [
+                {
+                    "name": "names-the-thing",
+                    "role": "objective",
+                    "check": {"type": "report_contains", "required_phrases": ["x"]},
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
+            path.parent.mkdir()
+
+            path.write_text(yaml.safe_dump(spec))
+            with contextlib.redirect_stdout(io.StringIO()) as clean:
+                self.assertEqual(
+                    validator.main([str(path)]),
+                    0,
+                    "a case the validator accepts must exit 0",
+                )
+            self.assertIn("OK", clean.getvalue())
+
+            # One rule broken -- an unknown domain -- is enough. Which rule
+            # does not matter; that main() propagates any finding does.
+            path.write_text(yaml.safe_dump({**spec, "domain": "not-a-real-domain"}))
+            with contextlib.redirect_stdout(io.StringIO()) as dirty:
+                self.assertEqual(
+                    validator.main([str(path)]),
+                    1,
+                    "a rejected case must exit non-zero or bench-case-check "
+                    "reports success on a broken tree",
+                )
+            self.assertIn("rejected", dirty.getvalue())
 
 
 class TestTheRulesReject(unittest.TestCase):
