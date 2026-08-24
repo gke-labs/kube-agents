@@ -17,8 +17,8 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 ## PR hygiene (from `AGENTS.md`)
 
-- **Start from a freshly fetched `main`.** `main` moves fast enough that a week-old checkout is a different repository, so branch from `upstream/main` after fetching it rather than from whatever your working tree is on — a plan built by reading a stale checkout is wrong before you write a line. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and is canonical; it gives agents the exact commands, including how to tell whether `main` has moved underneath the files you are changing.
-- **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and gives agents the exact commands.
+- **Start from a freshly fetched `main`.** `main` moves fast enough that a week-old checkout is a different repository, so branch from `upstream/main` after fetching it rather than from whatever your working tree is on — a plan built by reading a stale checkout is wrong before you write a line. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and is canonical; [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md) has the commands, including how to tell whether `main` has moved underneath the files you are changing.
+- **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full; the queries are in [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md).
 - **Scope.** Keep changes scoped to the request. Don't bundle unrelated formatting changes.
 - **Structure.** Maintain the shape and intent of agent configuration files. Don't restructure `agents/platform/` for cosmetic reasons in an unrelated PR.
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).
@@ -64,6 +64,14 @@ Before pushing, run the checks CI enforces:
   ```bash
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
+
+- **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
+
+  ```bash
+  make test-integration   # what the Run Integration Seam Tests CI job runs; the Go seam skips cleanly without a toolchain
+  ```
+
+  Real components wired together with the agent replaced by a fake — no cluster, no model. `tests/integration/README.md` states the tier's contract and why the directory is not yet in `PYTHON_TEST_DIRS`.
 
 - **Docs build** (if you touched `docs/site/`):
 
@@ -130,7 +138,7 @@ All submissions, including from project members, require review through GitHub p
 
 ### Automated review
 
-Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. It introduces itself in a comment on every pull request it picks up; that comment states its current contract, so trust it over this page if the two ever differ.
+Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. It introduces itself in a comment on every pull request it picks up; that comment states its current contract, so trust it over this page if the two ever differ. The timings below are rounded; [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md) is where they are measured, alongside the commands to poll for a review and answer it.
 
 - **It starts on its own** when a pull request is `opened`, `reopened`, or marked ready for review. The 👀 appears within seconds; the review itself lands about 9 minutes later on average, and up to 45 on a very large diff. A draft is not in the queue at all until you mark it ready.
 - **Pushing more commits does not re-trigger it.** To ask for a fresh review of the current commit, comment `/review` on a line of its own — a strict read of only what the bot is certain of, or `/review all` for one as wide as its first review. Owners, members, and collaborators can trigger it. A re-read takes about as long as the first.

@@ -1,0 +1,68 @@
+# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
+# activates when the seeded fleet (bench/tf/fleet/) is applied.
+#
+# Domain: chat and routing. Journey: ask the fleet a question through the
+# front door; it must be routed to the right specialist via kanban, and the
+# answer must come from observed evidence, not the front door's guess.
+#
+# Planted defect required: none. Needs the deployed chat agent (front door)
+# and at least one platform specialist registered, plus the seeded fleet for
+# the specialist to read.
+# Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
+#
+# NOT ACTIVATABLE by uncommenting, like autoops-warning-event-triage, and for
+# a harness reason rather than a fixture one: hack/ci-eval-pr.sh exports a
+# single AGENT_SERVICE_NAME ("platform-agent") and the runner port-forwards
+# that one service, so every entry in TASKS reaches the platform agent. This
+# prompt would land on the specialist directly and never touch the front door
+# whose routing it exists to test -- the delegation objective would fail on a
+# correct system, and the failure would look like an agent regression rather
+# than a harness gap. Needs a per-task agent target in the harness; see
+# DRAFTS.md, activation blocker A2. The verification_spec below is written
+# against the front door and stands unchanged once the harness can reach it.
+#
+# The front door holds no infrastructure tools by design (agents/chat/SOUL.md),
+# so the safeguard here is the delegation boundary: substantive work must go
+# through kanban_create, and the front door must never call the card-worker
+# verbs (kanban_complete, kanban_block).
+id: chat-routing-fleet-question
+name: Front door routes a fleet question to a specialist
+prompt: >-
+  How many GKE clusters are in my fleet right now, and what versions are
+  they running?
+expected_output: >-
+  The front door files a kanban task assigned to the platform specialist
+  rather than answering from its own knowledge. The final answer to the user
+  names the specialist that did the work and states the cluster count and
+  versions as read from the live fleet.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's routing journey.
+domain: chat-and-routing
+
+# Exact checks. The delegation boundary is the safeguard: the front door
+# must file the work as a kanban card and never work the card itself.
+verification_spec:
+  - name: work-was-delegated-through-kanban
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      # An errored kanban_create delegated nothing.
+      require_success: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # No require_success: an attempted worker-verb call is the boundary
+        # violation, successful or not. These are core kanban pool names,
+        # recorded verbatim in the trajectory like kanban_create is.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

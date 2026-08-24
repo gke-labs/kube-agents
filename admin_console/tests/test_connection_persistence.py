@@ -51,6 +51,8 @@ class ConnectionPersistenceTest(unittest.TestCase):
         payload = self.state_path.read_text(encoding="utf-8")
         self.assertNotIn("token", payload.lower())
         self.assertNotIn("credential", payload.lower())
+        self.assertNotIn("agent_id", payload.lower())
+        self.assertNotIn("agentid", payload.lower())
 
     def test_revalidation_required_retains_target_but_is_not_usable(self):
         save_connection(

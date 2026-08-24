@@ -1,0 +1,86 @@
+# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
+# activates when the seeded fleet (bench/tf/fleet/) is applied.
+#
+# Domain: consistency (fleet-consistency-drift SOP). Journey per the
+# strategy table: "Compares against the blueprint, not against its own
+# recollection."
+#
+# CONTRADICTION WITH THE SOP, resolved in the SOP's favour: the SOP states
+# there is no blueprint — "There is no Platform Master Blueprint, no
+# standards document ... If you find yourself wanting an 'expected value'
+# from outside the fleet, you have left this SOP." The baseline is the
+# majority of comparable clusters, derived live. This draft tests what the
+# SOP says; the strategy table's wording needs the fix.
+#
+# Planted defect required: with three comparable clusters on the seeded
+# fleet, one differs on a majority facet — clusters a and b carry a master
+# authorized-networks config and c has none, making c the outlier. NOTE: this scenario is the
+# reason the seeded fleet needs THREE clusters, not two; two clusters have
+# no majority and no outlier.
+# Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
+# the earlier claim that it was is the correction this line carries: step 0 of
+# every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
+# GitHub token and clones the GitOps workspace named by the `Git Repo:` line
+# of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
+# remediation pull requests and closes findings that stopped reproducing.
+# Presubmit-eligible because that write path is pinned per eval project to a
+# throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
+# blocker A1. Eligible tier: presubmit, once A1 is in place.
+id: consistency-drift-outlier
+name: Drift audit names the cluster that does not match its peers
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP. Summarize the findings in your final answer.
+expected_output: >-
+  The report names the outlier cluster and the facet on which it differs
+  from the fleet majority, derives the baseline from the live fleet rather
+  than any external standard, and says how many peers agree.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: consistency
+
+# Cluster C's name is a contract with bench/tf/fleet/ (the consistency
+# outlier); the fleet stack owns the name and this spec must change with it.
+verification_spec:
+  - name: report-names-the-outlier
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-c"]
+      # Binding: "seeded-c" is a substring of the seeded-capacity namespace,
+      # which the stockout fixture plants on this same fleet -- a report that
+      # wanders into capacity territory could satisfy the name check without
+      # naming the outlier. A drift report has no business mentioning the
+      # capacity namespace at all, so forbidding it structurally removes the
+      # collision (no proximity semantics exist in the verifier).
+      forbidden_phrases: ["seeded-capacity"]
+  - name: report-names-the-drift-facet
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # "seeded-c" alone is a substring of the seeded-capacity namespace, so
+      # the name check cannot stand alone; the facet check binds the finding
+      # to the planted difference (master authorized networks: a and b carry
+      # an open-for-eval block, c has none -- c is the outlier).
+      any_of_phrases:
+        [
+          "authorized networks",
+          "masterAuthorizedNetworks",
+          "authorized-networks",
+        ]
+  # No deterministic mutation safeguard, documented: the planted defect is a
+  # GKE master authorized-networks facet, not a cluster object.
+  # tool_called is structurally blind to worker mutations (the trajectory
+  # carries only the delegating turn's calls), so the honest safeguard is
+  # cluster state -- and this scenario's planted defect is not a Kubernetes
+  # object, so there is no resource to assert on. The fleet's scheduled
+  # reconcile owns the defect's integrity; a mutation here surfaces there.

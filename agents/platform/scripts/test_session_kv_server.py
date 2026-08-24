@@ -1356,16 +1356,18 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         query = session_kv_server._build_agent_query(payload)
         self.assertIn("platform-agent-host", query)
 
-    def test_the_template_does_not_invite_a_reply_it_cannot_honour(self):
-        # The report used to end with "To authorize: reply 'apply'". The agent
-        # that acts on such a reply reads the report back from the `incidents`
-        # table via the incident_context plugin, and the only writer of that
-        # table is platform_mcp_server.send_notification -- the egress call this
-        # delivery path replaced. So the row is never written, the lookup
-        # returns None, and the front door gets the bare word `apply` with no
-        # report, no options and no cluster. Nothing unsafe happens; it just
-        # cannot work. The invitation is withheld until #802 stores the
-        # report on the delivery path.
+    def test_the_template_invites_the_reply_the_delivery_path_can_honour(self):
+        # This assertion has been inverted once. #738 replaced the egress call
+        # in platform_mcp_server.send_notification -- the only writer of the
+        # `incidents` table -- with kanban_complete, and the agent that acts on
+        # "apply" reads the report back out of that table via the
+        # incident_context plugin. With nothing writing it the lookup returned
+        # None and the front door got the bare word `apply` with no report, no
+        # options and no cluster, so the invitation was withheld and this test
+        # asserted its absence. #802 put the write back on the delivery path
+        # (kanban_notifier.store_incident_report), which is what makes the
+        # bullet honourable again. If that writer ever goes away, this test goes
+        # back to asserting the absence rather than being deleted.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -1376,7 +1378,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         query = session_kv_server._build_agent_query(payload)
         what_to_do = query.split("## What to do", 1)[1]
         for promise in ("To authorize:", "reply **'apply'**", "apply Option A"):
-            self.assertNotIn(promise, what_to_do)
+            self.assertIn(promise, what_to_do)
 
     def test_template_uses_only_the_three_permitted_sections(self):
         # The template says "formatted exactly like this", so it outranks the
@@ -1400,11 +1402,14 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         for stale in ("📋 **Incident Triage**", "🛠️ **Proposed Fixes (GitOps):**", "- **Issue:**"):
             self.assertNotIn(stale, query)
 
-    def test_the_agent_is_told_not_to_write_its_own_call_to_action(self):
-        # Removing the bullet from the template is not enough on its own. The
-        # options end in a recommendation, which reads like it wants a decision,
-        # and an agent completing that shape will supply the missing line
-        # itself. So the instruction prose says outright not to.
+    def test_the_call_to_action_is_not_counted_as_an_option(self):
+        # The counterpart of the inverted test above, and the reason the bullet
+        # needs instruction prose rather than just a template line. It sits in
+        # the same list as Option A and Option B and is formatted like them, so
+        # an agent numbering the list will label it "Option C" -- and then a
+        # reader replying "apply Option C" asks to apply the invitation. While
+        # the bullet was withheld this prose said the opposite ("Do not end the
+        # report by inviting a reply"); it came back with the bullet in #802.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -1414,13 +1419,35 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         }
         query = session_kv_server._build_agent_query(payload)
         instructions = query.split("## What to do", 1)[0]
-        self.assertIn("Do not end the report by inviting a reply", instructions)
-        self.assertIn("cannot see your report", instructions)
+        self.assertIn("the call to action, not another option", instructions)
+        self.assertIn("never give it an Option letter", instructions)
+        self.assertNotIn("Do not end the report by inviting a reply", instructions)
+
+    def test_a_single_option_report_drops_the_option_letter_override(self):
+        # "apply Option A" is noise when there is only one option, and the
+        # Recommended line it would sit under is dropped in that case too.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query(payload)
+        instructions = query.split("## What to do", 1)[0]
+        self.assertIn("omit the Recommended line", instructions)
+        self.assertIn("a bare 'apply' is unambiguous", instructions)
+        # The clause the agent is told to drop has to be a clause the template
+        # below actually contains, or there is nothing to match and the agent
+        # ships a one-option report still offering "apply Option B".
+        dropped = "or name one directly with"
+        self.assertIn(dropped, instructions)
+        self.assertIn(dropped, query.split("## What to do", 1)[1])
 
     def test_the_options_and_the_recommendation_are_still_there(self):
-        # The report is now read rather than replied to, so the options carry
-        # the whole of its value. Dropping the call-to-action must not take the
-        # thing the call-to-action pointed at.
+        # What the call-to-action points at. A reply of "apply Option B" is
+        # resolved against the stored report, so an option the report never
+        # labelled is an instruction nothing can carry out.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",

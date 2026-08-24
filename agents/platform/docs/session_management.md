@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because it has exactly three callers and all of them share this Pod's network namespace: the event watcher in the credential-proxy container, the Platform MCP server, and the `incident_context` plugin. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because it has exactly four callers and all of them share this Pod's network namespace: the event watcher in the credential-proxy container, the Platform MCP server, the `incident_context` plugin, and the gateway's kanban notifier. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -77,12 +77,11 @@ Behaviour worth knowing before relying on it:
 
 The diagram below details the lifecycles of alert ingestion, session routing, and interactive GitOps fixes:
 
-> **Phase 3 is not reachable from Phase 1 today.** The plugin and both `/v1/incidents` routes work, but
-> the only writer of the `incidents` table they read is `platform_mcp_server.send_notification` — the
-> egress call Phase 1's kanban delivery replaced. So `_lookup` finds nothing, the reply is passed through
-> unrewritten, and the front door gets a bare `apply`. The report template withholds the invitation to
-> reply until that is fixed (issue #802); the phase is drawn because the machinery is still there
-> and a Platform Agent posting a threaded notification still populates it.
+> **What joins Phase 1 to Phase 3 is the `incidents` row**, and the kanban notifier writes it in the
+> same step that posts the report — the only point where the substituted chat address and the card's
+> result are both in hand. Without it `_lookup` finds nothing, the reply passes through unrewritten, and
+> the front door gets a bare `apply`; that was `main` between #738, which replaced the egress call that
+> used to write the row, and #802, which put the write on the delivery path.
 
 ```mermaid
 sequenceDiagram
@@ -115,6 +114,7 @@ sequenceDiagram
     Agent->>Agent: Diagnose (read-only), write the report
     Agent->>Agent: kanban_complete(result=the full report)
     Notifier->>Chat: Post the card's result under the alert's thread
+    Notifier->>Proxy: POST /v1/incidents (key the report to that thread, so a reply can name an option)
 
     Note over K8s, Proxy: Phase 1b: Informational Events Stop Here
     K8s->>Watcher: Normal-type event with a watched Reason (e.g. image-pull BackOff)
@@ -171,10 +171,10 @@ Stores the triage report context for active incident threads:
 
 ```sql
 CREATE TABLE incidents(
-  chat_id TEXT,
-  thread_id TEXT,
+  chat_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
   report TEXT NOT NULL,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (chat_id, thread_id)
 );
 ```
@@ -425,11 +425,18 @@ kubectl -n kubeagents-system logs deployment/platform-agent-gateway -c platform-
 
 ### Check Persisted Incidents
 
-To view currently registered incident triage reports:
+To view currently registered incident triage reports. Through Python rather than
+the `sqlite3` CLI, which the sandbox image does not ship — the interpreter that
+runs the server is the one tool guaranteed to be able to read its database:
 
 ```bash
 kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
-  sqlite3 /var/lib/kube-agents/session/session_kv.db "SELECT chat_id, thread_id, updated_at FROM incidents;"
+  python3 -c "
+import sqlite3
+c = sqlite3.connect('/var/lib/kube-agents/session/session_kv.db')
+for r in c.execute('SELECT chat_id, thread_id, created_at FROM incidents ORDER BY created_at DESC'):
+    print(r)
+"
 ```
 
 ### Verify Inbound Plugin Activity

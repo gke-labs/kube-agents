@@ -95,9 +95,11 @@ flowchart TB
 > still resolves. The Session Manager is ours (`session_kv_server.py`, SQLite-backed); the Agent Gateway
 > is the Hermes REST endpoint it calls to run each turn.
 >
-> **The second turn is not reachable from event triage today.** Nothing on that path writes the
-> `incidents` row the reply depends on — see [Known gaps](#known-gaps) — so the report stops at ①, and
-> the template no longer invites the approval that would start ②.
+> On the event-triage path the row is written by the delivery itself: the kanban notifier posts the
+> completed card's report into the thread and keys it to that thread in the same step
+> (`deploy/docker/patches/kanban_notifier.py`). It decides from the report rather than from the card —
+> a `What to do` heading with a lettered option under it — because nothing in the subscription row still
+> says the card came from event triage by the time the notifier reads it.
 
 ## What qualifies as a domain
 
@@ -170,12 +172,19 @@ CREATE TABLE session_metadata (        CREATE TABLE incidents (
 **`session_metadata`** maps a session to its chat thread, so a reply in that thread routes back to the
 same session instead of starting a new one.
 
-**`incidents`** keeps the first triage report per thread — the one carrying the fix options. Written
-`INSERT OR IGNORE`, so later chatter cannot overwrite the decision record.
+**`incidents`** keeps the first triage report per thread — the one carrying the fix options.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
-knows what Option B was. Its only writer is `send_notification`, so an event triage — which now delivers by
-completing its kanban card instead — leaves no row and no follow-up. Both tables expire on a TTL sweep
+knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
+a Platform Agent posts into a thread; and the kanban notifier, when it delivers a card whose result carries
+remediation options into one. Only the last of those is on the event-triage path, and it is the only one
+that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
+event-triage card from an ordinary one by the time it runs, so the artifact is the test.
+
+The two remote writers go through `POST /v1/incidents`, which is `INSERT OR IGNORE`: later chatter in the
+thread cannot overwrite the decision record. The relay writes in-process (`_store_incident_report`) and
+replaces, so each run of a cron job updates the row for the thread it keeps posting into rather than being
+ignored after the first. Both tables expire on a TTL sweep
 (`SESSION_KV_CLEANUP_TTL_DAYS`, default 14).
 
 **A new domain supplies:** nothing. It inherits sessions and thread routing for free, and follow-up as far
@@ -244,6 +253,8 @@ Format the report you pass to `kanban_complete`'s `result` exactly like this —
 - **Option A (<Action Title>):** <1-sentence GitOps fix>
 - **Option B (<Action Title>):** <1-sentence GitOps fix>
 - ✅ **Recommended: Option <letter>** — <why this is the safer choice>
+- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix,
+  or name one directly with **'apply Option A'** / **'apply Option B'**.
 
 **Who acts on this:**
 A human reads your options and the agent that holds the GitOps write path opens the Pull
@@ -268,12 +279,19 @@ written to the live cluster directly.
   spells that shape out rather than citing the section, because the agent reading it is a Cluster Agent,
   whose persona has no §7.
 - **The approval interaction** — the exact words that turn a suggestion into an authorized action. The
-  template used to end with `To authorize: reply 'apply'`, and that bullet is withheld until something
-  honours it. The agent acting on such a reply reads the report back from `incidents`, whose only writer
-  is `send_notification` — the egress call the card delivery replaced — so the lookup returns nothing and
-  the front door receives a bare `apply` with no report and no options. The prompt now tells the agent
-  not to write a call-to-action of its own either, since a list ending in a recommendation invites one.
-  Restoring it means storing the report on the delivery path first (issue #802).
+  template ends with `To authorize: reply 'apply'`, and the bullet is load-bearing on the row behind it:
+  the agent acting on such a reply reads the report back from `incidents` through the `incident_context`
+  plugin. Between #738 and #802 nothing wrote that row — the card delivery had replaced
+  `send_notification`, the table's only writer — and a reply arrived at the front door as a bare `apply`
+  with no report and no options, so the bullet was withheld. The notifier now writes it as part of the
+  delivery. That write is best-effort by design — an exception on the delivery path would rewind the
+  notifier's cursor and re-post a report the user has already read — so the promise in the bullet is
+  unconditional while the row behind it is not. A delivery that could not store its row logs a warning
+  naming the card and the thread, and that log line is the only thing distinguishing "the row was never
+  written" from "the user replied in the wrong thread". The prompt also tells the agent that this
+  bullet is the call to action rather than another
+  option, because it sits in the same list as Option A and Option B and gets numbered alongside them
+  otherwise.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
@@ -432,11 +450,6 @@ Stated plainly, because they scope the next milestone:
 
 - **The inject envelope is k8s-shaped**, and so is `_build_agent_query()`. The second domain generalizes both.
 - **No incident corpus yet** — the `incidents` table has the data but not the keys, outcomes, or retention.
-- **Event triage stops at the report** (issue #802). Turn ② needs the `incidents` row, and the only
-  writer is `send_notification` — the egress call the kanban card delivery replaced. So a reply of _"apply"_
-  reaches an agent that cannot see the report, and the template withholds the invitation rather than
-  making a promise nothing keeps. The fix is to store the completed report on the delivery path, where the
-  subscription row already holds the chat id, thread id and result together.
 - **No metric or quota tooling** — two of the five cross-domain CUJ rows are blocked on it.
 - **Judgment has no regression harness** — judgment is the differentiator, so it needs an eval suite.
 - **Outbound is chat-only** — the only paths out are the chat thread and the PR link posted into it.

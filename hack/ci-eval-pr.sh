@@ -136,6 +136,54 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
+  # The ten domain scenarios, registered here but commented out. Uncommenting
+  # is the LAST step of activation, not the only one: bench/tasks/DRAFTS.md
+  # carries an activation-blockers section and a per-scenario status column,
+  # and every entry below is blocked on at least one of them today. The
+  # task-registration lint counts a commented entry as registered.
+  #
+  # Summarised, so a reader here does not have to guess:
+  #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
+  #       every fleet-audit stream mints a GitHub token and writes a ledger
+  #       issue. ci-deploy.sh installs the PR's agent on every run but never
+  #       sets platformAgent.integration.github.gitRepo, so SETTINGS.md
+  #       renders `- **Git Repo:** None` (buildSettingsConfigMap substitutes
+  #       the literal when the field is empty) and audit_report.py start has
+  #       nothing to clone. Needs that value passed per leased project (the
+  #       throwaway eval GitOps repos) and the minter scoped to it -- the
+  #       token has exactly one source and no inherited GITHUB_TOKEN is
+  #       honoured, so the value alone only moves the failure to the clone.
+  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
+  #       (2026-08-28 for the pool, 2026-09-20 for the disks).
+  #   A4  the six audit scenarios' objectives read the final message, which
+  #       the SOPs keep to one line -- they need an artifact verifier first.
+  #   A5  every resource_property safeguard in the corpus (six scenarios,
+  #       cluster-agent-crashloop-debug included) reads the ambient
+  #       kubeconfig, and the only get-credentials above is for
+  #       platform-agent-host. The seeded namespaces are on seeded cluster A,
+  #       so those catastrophic safeguards error and red the presubmit for
+  #       every PR in the repo. Needs the runner to fetch the seeded
+  #       clusters' credentials and each check to name one via the
+  #       verifier's `kubeconfig` field.
+  #
+  # Two entries are not activatable by uncommenting at all:
+  #   autoops-warning-event-triage -- its prompt is a meta-note and nothing
+  #     applies its incident workload; it needs a scenario driver, which
+  #     arrives with the AutoOps seam work.
+  #   chat-routing-fleet-question (A2) -- AGENT_SERVICE_NAME above is a single
+  #     global target, so every task here reaches the platform agent. This one
+  #     needs the chat front door, and would fail its delegation objective on
+  #     a correct system until the harness can target an agent per task.
+  # "./tasks/chat-routing-fleet-question/task.yaml"
+  # "./tasks/obtainability-planted-pdb/task.yaml"
+  # "./tasks/stockout-pinned-pool/task.yaml"
+  # "./tasks/fleet-cost-idle-pool/task.yaml"
+  # "./tasks/compliance-rbac-overgrant/task.yaml"
+  # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
+  # "./tasks/consistency-drift-outlier/task.yaml"
+  # "./tasks/rca-remediation-pr/task.yaml"
+  # "./tasks/cluster-agent-crashloop-debug/task.yaml"
+  # "./tasks/autoops-warning-event-triage/task.yaml"
 )
 
 # Floor for VerificationCorrectness on tasks that declare a verification_spec.

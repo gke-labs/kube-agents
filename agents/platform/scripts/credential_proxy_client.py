@@ -59,7 +59,18 @@ def execute(
         with urllib.request.urlopen(request) as response:
             payload = json.load(response)
     except urllib.error.HTTPError as exc:
-        payload = json.load(exc)
+        # The proxy's own errors are JSON, but the error can also come from
+        # whatever sits between shim and proxy — an Envoy restarting mid-request
+        # answers 503 with an HTML body, and a traceback here turns a transient
+        # sidecar blip into a shim crash the agent cannot read.
+        try:
+            payload = json.load(exc)
+        except (ValueError, TypeError):
+            print(
+                f"credential proxy error (HTTP {exc.code}): non-JSON response",
+                file=sys.stderr,
+            )
+            return 1
         if payload.get("code") == "SECURITY_POLICY_BLOCKED":
             print(
                 payload.get("message", "Command blocked for security reasons."),

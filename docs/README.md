@@ -56,7 +56,8 @@ kube-agents/
 │   ├── architecture/                              END-STATE spec set 01–08 + README
 │   ├── designs/                                   per-feature design documents
 │   ├── contributing.md, security-requirements.md,
-│   │   credential-isolation-design.md             standalone docs
+│   │   credential-isolation-design.md,
+│   │   pull-request-workflow.md                   standalone docs
 │   └── site/                                      Astro + Starlight site: README +
 │                                                  the published pages
 ├── examples/                                      gitops-repo template + inference/
@@ -113,6 +114,9 @@ CI enforcement: `make docs-check` runs the same checks as
   not inventory them and the check does not require them — the map and the
   check share one scope. A dot-directory nested inside a documented area
   (`examples/gitops-repo/.github/`) is example content and stays in scope.
+- `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
+  plus `CLAUDE.md` are loaded into every agent session before the first prompt,
+  and their combined size must stay inside the `BUDGET` that file sets.
 
 ### Identifier sources
 
@@ -150,12 +154,14 @@ identifier appears, add its source here.
 | GitOps clone layout (`/opt/data/gitops/...`) and leases | `agents/platform/scripts/gitops_workspace.py` |
 | fleet-audit finding-id pattern and rendering caps | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
 | Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml` |
+| Stock `PlatformAgent.metadata.name` used as the admin-console installation ID | `charts/kube-agents/values.yaml` (`platformAgent.name`) |
 | Terraform module defaults (GSA/KSA/namespace, role set, channel) | `terraform/modules/*/variables.tf` |
 | Memory bank name, scope-tag spelling, and provider name | `agents/chat/plugins/memory/kube_agents_memory/config_schema.py` |
 | Per-profile Hindsight recall settings the agent uses | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, `vars.sh` keys read, which commands count as mutations | `scripts/live_test_lease.py` |
+| Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 
 ## 3. Documentation eras and status
 
@@ -212,9 +218,9 @@ pull request:
 | --- | --- | --- | --- | --- |
 | `README.md` | Project overview | Front door for "The Kubernetes Agentic Harness": Planning Agent + Platform Agent managing GKE via GitOps PRs and ChatOps, with quick-start pointers and an architecture diagram. | Value proposition, components, governance/isolation summary, links to the docs site | Evaluators and adopters; also usable by an agent to start setup |
 | `INSTALL.md` | Install guide | Self-contained, executable installation guide: automated GCP/GKE provisioning, manual Kubernetes deployment, local dev, declarative Terraform+Helm install (pointer to its canonical guide), teardown, troubleshooting. Commands only; explanation lives on the site. | Prerequisites, provisioning stages, integrations, teardown | Written to be runnable end-to-end by a human or an AI agent |
-| `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. | Doc ownership table, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES |
+| `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. States the rules; the commands that carry them out live in `docs/pull-request-workflow.md`. | Doc ownership table, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES; loaded into every session, so `make docs-check-context-budget` caps its size |
 | `CLAUDE.md` | Contributor rules | Imports `AGENTS.md` and adds Claude-specific commit-authorship and PR-disclosure rules. | No co-author trailers; PRs mention Claude assistance | Claude Code sessions |
-| `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, chat, observability, validation | Console users and contributors |
+| `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, LLM gateway, chat, observability, validation | Console users and contributors |
 | `admin_console/CONNECTION_SECURITY.md` | Security reference | Security contract for the local console's persisted connection lease. | Stored metadata, filesystem controls, identity binding, revalidation, trust boundary | Console users and security reviewers |
 
 ### `agents/` — agent blueprints (runtime documents)
@@ -279,6 +285,7 @@ pull request:
 | `docs/designs/semver-deployment-versioning.md` | Feature design | Design rationale for adopting SemVer 2.0.0 across container images, the Helm chart, Terraform modules, release docs, and governance playbooks — decisions, shipped mechanisms, and deliberate exceptions. | OCI Helm charts, Git ref TF modules, version-injection defaults | Implemented; exceptions declared inline |
 | `docs/contributing.md` | Contributor guide | Short entry point: Google CLA and community guidelines, deferring everything else to the site's contributing page and `AGENTS.md`. | CLA, pointers | Human contributors |
 | `docs/credential-isolation-design.md` | Feature design | Design keeping API keys, tokens, and SA credentials out of the agent sandbox container; credentialed operations proxied through an Envoy credential-proxy sidecar. | Pod anatomy, CLI forwarding, guarantee and stated limitation | Canonical design; site `reference/credential-isolation.md` defers here |
+| `docs/pull-request-workflow.md` | Contributor guide | The commands behind `AGENTS.md`'s pull-request rules: the duplicate-work scan, the branch-drift check against `upstream/main`, the local validation checks and the constraint each one exists for, and the `kube-agents-bot` review — how long it takes, how to poll for it, how to reply and resolve. | `gh` and GraphQL recipes, drift `comm` check, prettier/Docker/layer-budget detail, bot timing and failure modes | AI coding agents and human contributors; mechanics only, `AGENTS.md` owns the rules |
 | `docs/security-requirements.md` | Requirements | Provider-neutral security configuration model across three dimensions (permission, interaction, authorization), explicitly distinguishing current behavior from planned capabilities. | Permission sets, credential-isolation requirements, attribution requirements | Referenced by the site's security pages; current-vs-planned marked inline |
 | `docs/site/README.md` | Component README | How to develop the docs site: local preview/build, layout, adding a page, CI build/deploy workflows, publishing from a fork. | `npm run dev`, frontmatter, GitHub Pages base | Site contributors |
 
@@ -353,6 +360,8 @@ only what the title does not say.
 | --- | --- | --- | --- | --- |
 | `bench/README.md` | Component README | The evaluation harness that runs `kubernetes-sigs/devops-bench` against the Platform Agent as a pip-installed library: layout, running evals, harness registration, offline tests. | Eval invocation, `BENCH_TF_ROOT` stacks | Developers writing or running evals |
 | `bench/CUSTOM-TASKS.md` | How-to | Authoring new devops-bench tasks and agent harnesses, here or in a private repository: layout convention, the `devops-bench` SHA pin, OpenTofu stacks, `task.yaml` and `verification_spec`, custom `AgentHarness`. | Task authoring, verification spec, harnesses | Developers writing evals |
+| `bench/tasks/DRAFTS.md` | Reference | Status table for the Phase 2 domain scenarios: one per domain, the planted defect each needs, its isolation class, and the seeded-fleet shopping list. | Scenario corpus, seeded fleet defects, activation state | Spec-ready; registered commented-out in `hack/ci-eval-pr.sh`, awaiting the seeded fleet |
+| `bench/tf/fleet/README.md` | Component README | The seeded dirty fleet: three standing clusters whose planted defects are the fixtures the Phase 2 presubmit scenarios assert on, the defect-to-scenario map, and the scheduled re-apply that keeps the defects planted. | Seeded fleet, planted defects, reconcile | Developers writing evals; the fleet owner |
 | `charts/kube-agents/README.md` | Component README | Canonical GKE-oriented Helm chart (`kube-agents`) for deploying the Kube-Agents operator and PlatformAgent CR via GitOps. | Chart configuration, values, CRD installation | Deployment operators and GitOps pipelines |
 | `k8s-operator/README.md` | Component README | The Go/Kubebuilder operator managing the `PlatformAgent` CRD: prerequisites, pointers to the installer/composition, dev iteration. | CRD lifecycle, dev workflow | Operator developers |
 | `k8s-operator/cmd/k8s-event-watcher/README.md` | Component README | The Go daemon that streams, filters, and deduplicates GKE warning events and forwards unique incidents to trigger autonomous diagnostic sessions. | Event filtering, dedup windows, snapshots | Watcher developers/operators |
@@ -362,6 +371,7 @@ only what the title does not say.
 | `k8s-operator/scripts/dev/README.md` | Component README | The script automating GCP Workload Identity Federation so GitHub Actions can deploy keylessly. | WIF/OIDC CI auth | Repo maintainers |
 | `k8s-operator/testing/staging_workloads/README.md` | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators. | Cluster maps, workload bundle, load shapes | Developers building staging fleets |
 | `scripts/release/README.md` | Component README | Overview of Release Candidate (RC) pipeline scripts: candidate tag creation (Step 1), environment provisioning (Step 2), GKE readiness & E2E test execution (Step 3), and validated tag promotion (Step 4). | Release Candidate scripts, RC automation | CI maintainers and release operators |
+| `terraform/examples/ci-pool-minter/README.md` | Component README | Additive root composition provisioning the GitHub token minter's GCP half in one Prow evaluation-pool project, so its GitOps scenarios can mint a token scoped to that project's repository; documents the App-installation and KMS PEM-import steps Terraform cannot take. | Per-project minter, one repo per lease, manual steps | CI engineers |
 | `terraform/examples/full-install/README.md` | Component README | Single-apply root composition of the modules plus a helm_release of the canonical chart — the install engine `./install.sh` drives via `lifecycle.sh`; covers image-tag overrides, Chat/GitHub integration wiring, teardown order. | Install engine, composed values | Infrastructure engineers |
 | `terraform/modules/gke-cluster/README.md` | Component README | Reusable Terraform module for the GKE cluster hosting Kube-Agents: Autopilot or Standard (`cluster_mode`), existing-cluster mode, optional gVisor pool and CMEK. | Cluster shapes, Workload Identity, CMEK | Infrastructure engineers |
 | `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
@@ -370,6 +380,7 @@ only what the title does not say.
 | `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; opt-in for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
 | `terraform/modules/drift-pubsub/README.md` | Component README | Reusable Terraform module for the drift detector's audit-log ingress: Log Router sink, drift-audit topic and pull subscription, sink-writer and subscriber IAM; not yet part of the full-install composition. | Audit-log sink, Pub/Sub, writer identity | Infrastructure engineers |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |
+| `tests/integration/README.md` | Component README | The integration seam tier: real components wired together with the agent replaced by a fake — the contract, how to add a seam test, and the probation status that keeps it out of `PYTHON_TEST_DIRS`. | Seam tests, `make test-integration`, expectedFailure pins | Developers adding seam tests |
 
 ## 5. Keeping this map fresh
 

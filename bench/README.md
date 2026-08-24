@@ -54,14 +54,21 @@ The matrix terms are:
   Goal, including repair diagnostics.
 
 When a Persona's credential reference resolves to a token, its Agent endpoint
-must use HTTPS. The evaluator rejects redirects instead of forwarding the
-credential; configure the Agent with the final canonical API URL.
+must use HTTPS, except on a loopback host (`127.0.0.1`, `::1`, `localhost`),
+where the token never leaves the machine. The evaluator rejects redirects
+instead of forwarding the credential; configure the Agent with the final
+canonical API URL.
 
-Run the checked-in read-only smoke matrix against a locally running portal:
+Run the checked-in read-only smoke matrix against a locally running portal.
+Every portal `/api/v1` request requires the portal's launch capability, so set
+`KUBE_AGENTS_PORTAL_API_TOKEN` (at least 32 characters) before starting
+`scripts/admin_portal.sh` — otherwise the portal generates a random token the
+evaluator cannot know — and run the matrix with the same value:
 
 ```bash
 cd bench
 KUBE_AGENTS_PORTAL_API_URL=http://127.0.0.1:8501/api/v1 \
+KUBE_AGENTS_PORTAL_API_TOKEN=<the portal's token> \
 EXPECTED_PROJECT=<project> \
 EXPECTED_CLUSTER=<cluster> \
 EXPECTED_LOCATION=<location> \

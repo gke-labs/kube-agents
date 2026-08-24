@@ -149,7 +149,9 @@ already have.
 They cannot go behind the proxy, because the sandbox is not the client — it is
 the server. `session_kv_server.py` runs in the sandbox and binds
 `127.0.0.1:8699`; its callers are the event watcher in the credential sidecar,
-the Platform MCP server, and the `incident_context` plugin. The key exists so
+the Platform MCP server, the `incident_context` plugin, and the gateway's
+kanban notifier, which keys a delivered triage report to the thread it went
+into. The key exists so
 that the server can reject a request that did not come from one of them, which
 means the server has to hold it. The salt is read by the Chat Agent plugins,
 which also run in the sandbox, before any identity is written to disk; hashing

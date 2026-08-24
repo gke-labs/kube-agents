@@ -253,9 +253,14 @@ class IndexRenderingTest(unittest.TestCase):
         self.assertEqual(sqlite_style, iso_style)
 
     def test_an_unlabelled_report_still_gets_a_line(self):
-        """A `send_notification` incident has no relay session to name it."""
+        """A `send_notification` incident has no relay session to name it.
+
+        Neither does one the kanban notifier stored for an event-triage report,
+        which is why the fallback no longer calls the row scheduled.
+        """
         text = ic._index_text([{"thread_id": "T1"}], "hi")
-        self.assertIn("- scheduled report", text)
+        self.assertIn("- report", text)
+        self.assertNotIn("scheduled", text.lower())
 
     def test_a_title_that_repeats_the_job_id_is_not_printed_twice(self):
         text = ic._index_text([{"job_id": "compliance-audit", "title": "compliance-audit"}], "hi")

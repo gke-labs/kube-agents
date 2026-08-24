@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "defaultProvider": "gemini",
+  "gateway": {
+    "deployment": "litellm",
+    "service": "litellm",
+    "configMapBase": "litellm-config",
+    "configVolume": "config-volume",
+    "container": "litellm-container",
+    "servicePort": 80,
+    "containerPort": 8080,
+    "readinessPath": "/health/readiness",
+    "inferencePath": "/v1/chat/completions",
+    "modelAlias": "model-default",
+    "rolloutTimeoutSeconds": 300
+  },
+  "providers": [
+    {
+      "id": "gemini",
+      "label": "Gemini API",
+      "defaultModel": "gemini-3.5-flash",
+      "overlay": "base",
+      "authentication": {
+        "type": "api_key",
+        "environmentVariable": "GEMINI_API_KEY",
+        "secretName": "platform-agent-secrets"
+      }
+    },
+    {
+      "id": "vertex_ai",
+      "label": "Vertex AI",
+      "defaultModel": "gemini-3.5-flash",
+      "overlay": "vertex_ai",
+      "authentication": {
+        "type": "workload_identity"
+      },
+      "workloadIdentity": {
+        "kubernetesServiceAccount": "kubeagents-litellm",
+        "googleServiceAccount": "kubeagents-litellm-gsa",
+        "requiredApi": "aiplatform.googleapis.com",
+        "requiredProjectRole": "roles/aiplatform.user",
+        "workloadIdentityRole": "roles/iam.workloadIdentityUser"
+      },
+      "settings": [
+        {
+          "id": "project_id",
+          "label": "Vertex project",
+          "environmentVariable": "VERTEX_PROJECT_ID",
+          "deploymentEnvironmentVariable": "VERTEXAI_PROJECT"
+        },
+        {
+          "id": "location",
+          "label": "Vertex location",
+          "environmentVariable": "VERTEX_LOCATION",
+          "deploymentEnvironmentVariable": "VERTEXAI_LOCATION"
+        }
+      ]
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic API",
+      "defaultModel": "claude-opus-5",
+      "overlay": "base",
+      "authentication": {
+        "type": "api_key",
+        "environmentVariable": "ANTHROPIC_API_KEY",
+        "secretName": "platform-agent-secrets"
+      }
+    },
+    {
+      "id": "chatgpt",
+      "label": "ChatGPT subscription",
+      "defaultModel": "gpt-5.4",
+      "overlay": "chatgpt",
+      "authentication": {
+        "type": "device_oauth",
+        "tokenDirectory": "/data/litellm/chatgpt"
+      }
+    },
+    {
+      "id": "openai",
+      "label": "OpenAI API",
+      "defaultModel": "gpt-5.4",
+      "overlay": "base",
+      "authentication": {
+        "type": "api_key",
+        "environmentVariable": "OPENAI_API_KEY",
+        "secretName": "platform-agent-secrets"
+      }
+    }
+  ]
+}

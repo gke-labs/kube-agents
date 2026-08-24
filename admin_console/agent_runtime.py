@@ -21,10 +21,17 @@ from admin_console.project_config import (
     is_valid_namespace,
     is_valid_project_id,
 )
+from admin_console.runtime_contract import (
+    CanonicalPlatformAgentMissing,
+    canonical_platform_agent_name,
+    gateway_endpoints,
+    select_canonical_platform_agent,
+)
 from admin_console.telemetry import redact_evidence
 
 _K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _KANBAN_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+GATEWAY_PYTHON = "/opt/hermes/.venv/bin/python3"
 _READ_SCRIPT = r'''
 import json
 import sqlite3
@@ -797,6 +804,7 @@ class AgentRuntimeProvider:
             f"gke_{target.project_id}_{target.location}_{target.cluster_name}"
         )
         self.runner = runner or KubectlRunner(target)
+        self._canonical_agent: str | None = None
 
     def _base(self) -> list[str]:
         return ["--context", self.context, "-n", self.target.namespace]
@@ -835,76 +843,34 @@ class AgentRuntimeProvider:
         return payload
 
     def list_agents(self) -> tuple[str, ...]:
-        """Discover deployed agents from running gateway pods.
+        """Return the one stock PlatformAgent selected for this installation."""
+        return (self.canonical_agent(),)
 
-        History lives in the gateway PVC, so pod discovery is the narrowest
-        relevant source. Current deployments label credential-proxy pods; an
-        older deployment may lack that label, so a bounded PlatformAgent list
-        supplies validated app names for a second pod query.
-        """
-        result = self.runner.run(
-            [
-                *self._base(),
-                "get",
-                "pods",
-                "-l",
-                "kubeagents.x-k8s.io/has-credential-proxy=true",
-                "--field-selector=status.phase=Running",
-                "-o",
-                "json",
-            ],
-            timeout=15,
-        )
-        payload = self._json(result, "Gateway discovery")
-        agents = self._agent_names(payload)
-        if agents:
-            return agents
-
+    def canonical_agent(self) -> str:
+        """Discover and select the stock PlatformAgent, or fail closed."""
+        if self._canonical_agent is not None:
+            return self._canonical_agent
         resources = self.runner.run(
             [*self._base(), "get", "platformagents", "-o", "json"],
             timeout=15,
         )
         resource_payload = self._json(resources, "PlatformAgent discovery")
-        candidates = sorted(
-            {
-                str((item.get("metadata") or {}).get("name") or "")
-                for item in resource_payload.get("items", [])[:50]
-            }
-        )
-        candidates = [name for name in candidates if _K8S_NAME.fullmatch(name)]
-        if not candidates:
-            return ()
-        selector = "app in (" + ",".join(f"{name}-gateway" for name in candidates) + ")"
-        fallback = self.runner.run(
-            [
-                *self._base(),
-                "get",
-                "pods",
-                "-l",
-                selector,
-                "--field-selector=status.phase=Running",
-                "-o",
-                "json",
-            ],
-            timeout=15,
-        )
-        return self._agent_names(self._json(fallback, "Gateway discovery"))
+        try:
+            expected = select_canonical_platform_agent(resource_payload)
+        except CanonicalPlatformAgentMissing as exc:
+            raise AgentRuntimeError(
+                str(exc),
+                f"Install the stock PlatformAgent/{canonical_platform_agent_name()} "
+                "resource or select the cluster containing it.",
+            ) from exc
+        self._canonical_agent = expected
+        return self._canonical_agent
 
-    @staticmethod
-    def _agent_names(payload: dict) -> tuple[str, ...]:
-        agents = set()
-        for item in payload.get("items", []):
-            labels = (item.get("metadata") or {}).get("labels") or {}
-            app = str(labels.get("app") or "")
-            if app.endswith("-gateway"):
-                name = app.removesuffix("-gateway")
-                if _K8S_NAME.fullmatch(name):
-                    agents.add(name)
-        return tuple(sorted(agents))
-
-    def _gateway_pod(self, agent: str) -> str:
-        if not _K8S_NAME.fullmatch(agent):
-            raise ValueError("invalid PlatformAgent name")
+    def gateway_endpoint(self, agent: str) -> tuple[str, str]:
+        """Return one running gateway pod and its live API container name."""
+        canonical = self.canonical_agent()
+        if agent != canonical:
+            raise ValueError(f"agentId must be the canonical PlatformAgent {canonical}")
         result = self.runner.run(
             [
                 *self._base(),
@@ -918,30 +884,35 @@ class AgentRuntimeProvider:
             ],
             timeout=15,
         )
-        payload = self._json(result, "Gateway discovery")
-        pods = sorted(
-            str((item.get("metadata") or {}).get("name") or "")
-            for item in payload.get("items", [])
-            if (item.get("metadata") or {}).get("name")
-        )
-        if not pods:
+        endpoints = gateway_endpoints(self._json(result, "Gateway discovery"))
+        if not endpoints:
             raise AgentRuntimeError(
-                "No running gateway pod was found.",
+                "No running gateway API container was found.",
                 f"Check PlatformAgent {agent} in namespace {self.target.namespace}.",
             )
-        return pods[0]
+        endpoint = endpoints[0]
+        return endpoint.pod, endpoint.container
+
+    def gateway_pod(self, agent: str) -> str:
+        """Return one running gateway pod for a discovered PlatformAgent."""
+        pod, _container = self.gateway_endpoint(agent)
+        return pod
+
+    def _gateway_pod(self, agent: str) -> str:
+        """Compatibility wrapper for the runtime's internal read operations."""
+        return self.gateway_pod(agent)
 
     def _read(self, agent: str, arguments: list[str], *, timeout: int = 25) -> dict:
-        pod = self._gateway_pod(agent)
+        pod, container = self.gateway_endpoint(agent)
         result = self.runner.run(
             [
                 *self._base(),
                 "exec",
                 pod,
                 "-c",
-                "platform-agent",
+                container,
                 "--",
-                "/opt/hermes/.venv/bin/python3",
+                GATEWAY_PYTHON,
                 "-c",
                 _READ_SCRIPT,
                 *arguments,
