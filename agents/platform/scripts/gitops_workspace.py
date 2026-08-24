@@ -515,6 +515,9 @@ def ensure_workspace(
     until the remediation branch stages them, so a `git clean -fd` on the way
     into `finish` deletes every fix the audit just produced and the run reports
     them all as "the file was never written".
+
+    Raises `GitOpsRepoEmpty` if the target repository has zero commits on any
+    branch, preventing dispatch runs from crashing on raw git fatal errors.
     """
     root = Path(root if root is not None else default_root())
     lease = sanitize_lease(lease)
