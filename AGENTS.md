@@ -45,10 +45,12 @@ did not expect, or nowhere at all, and the suite reports green around it.
   every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract for what that file must carry; `make bench-case-check` enforces it.
 - **Yes, and it checks an install you already have** — it is a critical user journey, and it goes in
-  `bench/cuj/`. You run it by hand against your own install. **It is never part of the presubmit**,
-  it cannot gate a pull request, and adding one changes nothing about what CI reports — it needs a
-  real deployment to point at, and CI has none. It plants nothing and provisions nothing, so it
-  grades the deployment rather than the agent. See [`bench/cuj/README.md`](bench/cuj/README.md).
+  `bench/cuj/`. **This tier is for manual testing**: you run it by hand against your own install, to
+  confirm a deploy landed or to work a live bug. It is never part of the presubmit, cannot gate a
+  pull request, and adding one changes nothing about what CI reports — it needs a real deployment to
+  point at, and CI has none. Being manual is the design, not a gap someone will automate later. It
+  plants nothing and provisions nothing, so it grades the deployment rather than the agent.
+  See [`bench/cuj/README.md`](bench/cuj/README.md).
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.
 
