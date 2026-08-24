@@ -669,15 +669,22 @@ _task_after() {
     # reads as "nothing has happened yet" until it times out. The two exec paths are the
     # only ones this watcher has, so leaving this one silent would have fixed the report
     # for `dispatch: api` routes and left `dispatch: kanban` routes lying.
-    local since="$1" out
-    # 2>&1 rather than discarded: on the failure path the command's own message is the
-    # only account of what went wrong, and on the success path anything it wrote to
-    # stderr would have broken the parse regardless — now it says so instead.
+    local since="$1" out err errtext
+    # stderr goes to a file, not into `out`, and is read only on the failure branch.
+    # It cannot be discarded — on that branch the command's own message is the only
+    # account of what went wrong — but it must not be merged into stdout either: `out`
+    # is piped straight into a json.load below, so one benign line from the CLI or from
+    # kubectl would break the parse and report a working board as broken. Unlike
+    # _sessions_json, the program on the other end is not ours to make print elsewhere.
+    err="$(mktemp)"
     if ! out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        env HOME=/tmp hermes kanban ls --json 2>&1)"; then
-        warn_once tasks "could not read the agent's kanban board; treating it as empty — ${out:-no response}"
+        env HOME=/tmp hermes kanban ls --json 2>"$err")"; then
+        errtext="$(head -c 200 "$err")"
+        rm -f "$err"
+        warn_once tasks "could not read the agent's kanban board; treating it as empty — ${errtext:-${out:-no response}}"
         return 0
     fi
+    rm -f "$err"
     printf '%s\n' "$out" | python3 -c "
 import json, sys
 since = float('$since')
