@@ -60,7 +60,7 @@ Budget is minutes, not hours, and anything needing a full install belongs to the
 
 ### 4.2 Presubmit evals: the tier that does the work
 
-Today a pull request gets a namespace on a shared cluster and one devops-bench task, `gpu-stress-test-diagnosis`, judged against a fixed 0.7. The Prow job is `optional: true`, so nothing behavioural blocks a merge.
+Today a pull request gets a namespace on a shared cluster and two devops-bench tasks, `gpu-stress-test-diagnosis` and `agent-kanban-smoke`. Both declare a `verification_spec`, so both take the deterministic path: the gate is `VerificationCatastrophic`, `VerificationCoverage` and `VerificationCorrectness`, not a judged score. The fixed 0.7 in `hack/ci-eval-pr.sh` is the transition fallback for a task carrying no spec, and becomes dead code once every task carries one. The Prow job is `optional: true`, so nothing behavioural blocks a merge.
 
 Expand on two axes. The unit throughout is the **case**: one question against a named fixture, plus what the answer must contain. There is no second kind of test; a journey is covered by one case or by twenty.
 
@@ -103,7 +103,7 @@ Three standing GKE clusters per eval project, carrying defects we planted (`benc
 Four properties matter:
 
 - **Every defect is one an SOP demonstrably flags.** Planting a defect no SOP looks for is the mistake to catch in review. Because we planted them, the checks that matter can be exact rather than judged.
-- **The fleet is standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per project and shared by every pull request that leases it. No case may mutate it, and the credential the run is handed enforces that rather than convention, so an attempted write fails loudly instead of quietly spoiling the fixture. A schedule re-applies the stack to correct drift. Remediation cases run here for the same reason: a proposed fix is a pull request, checkable without anything on the cluster changing.
+- **The fleet is standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per project and shared by every pull request that leases it. No case may mutate it. That is convention today, and nothing enforces it: `bench/tf/fleet` creates exactly one identity, `google_service_account.fleet_nodes`, which is a node-pool identity, and the credential an eval run actually gets (`prowjob-default-sa`) holds `container.admin` on every eval project. A write would succeed and quietly spoil the fixture. A scoped read-only credential that makes an attempted write fail loudly is the intent, and it is unbuilt. Drift is the same story: `bench/tf/fleet/README.md` names a scheduled re-apply as the design, says the workflow does not exist yet, and makes a manual `tofu apply` the reconcile until it does. Remediation cases run here for the same reason: a proposed fix is a pull request, checkable without anything on the cluster changing.
 - **Fixtures are named by role, never by cluster.** Each eval project gets its own trio from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
 - **The clock cannot be cheated.** `creationTimestamp` is server-set, and the cost SOP filters server-side, so the "usable from" column is a real wait. A fixture that has not aged in yet is dormant, not failing. The fleet README carries the dates.
 
