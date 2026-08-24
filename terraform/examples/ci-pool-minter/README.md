@@ -55,7 +55,7 @@ terraform output manual_steps
 
 `terraform plan` before every apply is the check that matters. Onboarding a project that has not been onboarded yet is a create-only plan; **any `destroy` line means the wrong state is loaded** — stop and fix the workspace or the backend prefix rather than confirming.
 
-**Applied so far: `kube-agents-evals` and `kube-agents-evals-2`.** `kube-agents-evals-3` joined the Boskos pool on 2026-08-21 and now has its GitOps repository and its App installation, but this composition has never been applied for it and no PEM has been imported into it — so it is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
+**Applied for all three pool projects as of 2026-08-24** — `kube-agents-evals`, `kube-agents-evals-2` and `kube-agents-evals-3`, each in its own workspace, each with the App PEM imported (`gcloud kms keys versions list --location us-central1 --keyring github-token-minter-keyring --key github-token-minter-key --project <project>` shows one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each). A fourth pool project is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
 
 `location` and `namespace` default to the values `hack/ci-env.sh` uses (`us-central1`, `kubeagents-system`) and should only be overridden if that file changes: the chart derives the KMS key path from `platformAgent.harness.location`, which `hack/ci-deploy.sh` sets from `REGION`.
 

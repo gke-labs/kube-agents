@@ -124,17 +124,13 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 
 The repository is kept private: it is throwaway state a bot rewrites on every run. [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) is the layout an audit expects to find, not a required seed — the current pool repositories carry only a LICENSE and a README, because an audit works against an empty tree and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
 
-> **`kube-agents-evals-3` is mapped but not finished.** The project was added to the Boskos pool on 2026-08-21 with only its GCP half provisioned — it is `ACTIVE` and its `platform-agent-host` cluster is `RUNNING` — but section 5 was skipped, so every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal, taking a share of every open pull request's smoke test with it. Since then:
+> **The pool's three projects are all provisioned, as of 2026-08-24.** `kube-agents-evals-3` was added to the Boskos pool on 2026-08-21 with only its GCP half done, so every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal. That is closed. Verified in all three projects:
 >
-> 1. ~~Create the private `gke-agentic/kube-agents-evals-3-infra`.~~ **Done 2026-08-21.**
-> 2. ~~Add it to App `4675512`'s installation.~~ **Done 2026-08-23** — the App resolves to all three pool repositories, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`.
-> 3. **Apply `terraform/examples/ci-pool-minter` for the project, in its own workspace or backend prefix** (see the composition's README — re-using another project's state destroys that project's minter), then import the App PEM into its KMS key with the Minty CLI. **Still outstanding.**
+> 1. The private GitOps repository exists and is mapped in the table above.
+> 2. App `4675512` resolves to all three pool repositories, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`, `metadata: read`.
+> 3. `terraform/examples/ci-pool-minter` is applied per project: each carries `kubeagents-github-minter-gsa@<project>.iam.gserviceaccount.com` and the key ring `github-token-minter-keyring` with key `github-token-minter-key` in `us-central1`, and the App PEM is imported — `gcloud kms keys versions list` shows exactly one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each.
 >
-> Until (3) is done the project has no minter GSA and no signing key. Today that is invisible: `EVAL_GITHUB_APP_ID` is unset, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and `kube-agents-evals-3` deploys and fails at `audit_report.py start` for want of a token — exactly like every other pool project, because the switch is pool-wide (see 5.2).
->
-> **The hazard is the day that variable is set.** `hack/ci-deploy.sh` enables the minter whenever `GITOPS_REPO` is non-empty and `EVAL_GITHUB_APP_ID` is set, and this project is now mapped, so a lease of it would render the `github-token-minter` Deployment with `KMS_KEY_NAME` pointing at a key ring that (3) has never created. That pod fails its readiness probe, and the minter Deployment is part of the release `helm upgrade --install --wait --timeout 15m` gates on — so the run dies in the chart-deployment step after a fifteen-minute timeout, while leases of the other two projects pass. `EVAL_GITHUB_APP_ID` is the switch meaning "the manual half is done", and it is only true of the pool when it is true of every project in it: do not set it until (3) has landed here.
->
-> Reverting the mapping is not the fix. It restores the immediate, named refusal at `gitops_repo_for_project()` — more legible than a fifteen-minute timeout, and the fast-fail this page exists to preserve — but a lease of the project still fails, so it buys diagnosability, not a working project. The two fixes that end the failure are to finish (3) or to drop the project from the pool.
+> One step remains and it is not in this repository: `EVAL_GITHUB_APP_ID=4675512` is still unset in the Prow job environment, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and an audit stream still fails at `audit_report.py start` for want of a token. Setting it — together with mounting the ledger-read token the bench verifiers need — is [`GoogleCloudPlatform/oss-test-infra#2661`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2661), open and unmerged. Because the switch is pool-wide, it is only safe to set once the manual half is true of every project in the pool, which it now is.
 
 ### 5.1 How CI resolves it
 
@@ -200,9 +196,11 @@ tofu init -reconfigure \
 tofu apply -var="project_id=${PROJECT_ID}"
 ```
 
-The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. `kube-agents-evals` and `kube-agents-evals-2` are applied; `kube-agents-evals-3` is not, which is the same shape of gap as section 5's item (3) — mapped and leasable, but not finished.
+The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. All three pool projects are applied as of 2026-08-24, and `hack/fleet-kubeconfigs.sh` run against each of them confirms all seven fixture roles — `7 role(s) written, 0 on clusters that could not be resolved or reached, 0 whose fixtures were not present`. That command is the check to re-run before believing this paragraph; a project it reports anything else for is a project the stack needs re-applying in.
 
 Nothing outside the fleet's own catalog addresses these clusters by name. `hack/fleet-kubeconfigs.sh` discovers them in the leased project by the labels the stack applies (`environment=seeded`, `managed-by=kube-agents-seeded-fleet`), so a project may use a different `cluster_prefix` or region without any scenario changing.
+
+A half-finished apply is the case to watch for. The stack's Kubernetes provider is configured against a cluster the same stack creates, so an apply that fails after the clusters and before the fixtures leaves a trio that carries the labels, answers every API call, and holds none of the planted objects. The runner therefore reads every object in the role's `probes` list before it publishes that role — the objects themselves, not just their namespaces, since four of the seven roles are cluster-scoped — and a role it cannot confirm reports `status: "error"` naming the role and the project, the same answer as no fleet at all, rather than a check that blames the agent for a fixture nobody planted. `tofu apply` again until it is clean.
 
 ### 6.1 A read-only credential for the checks
 

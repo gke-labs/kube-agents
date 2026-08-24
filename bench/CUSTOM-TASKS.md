@@ -457,12 +457,19 @@ rather than a red presubmit later. The reverse is deliberately not enforced: the
 the fleet, so a role no task has been written against yet is a fixture waiting for a case, not
 drift.
 
-**A role is only published once its fixture has been seen.** Before the agent runs, the runner
-confirms the role's catalog namespace exists on the slot's cluster, and skips the role when it does
-not. A labelled cluster is not the same thing as a planted fixture — an apply that created the
-clusters and stopped before the Kubernetes provider ran leaves a trio that answers every API call
-and holds none of the objects — and this is what lets a namespace that disappears _later_ be read as
-a destroyed fixture rather than an environment that was never ready. Two clusters in one project
+**A role is only published once its fixture has been seen.** Each role in the catalog carries a
+`probes` list — `deployment/payments-api`, `clusterrolebinding/debug-binding`,
+`node?cloud.google.com/gke-nodepool=idle-batch-pool` — and before the agent runs the runner reads
+every one of them on the slot's cluster, skipping the role unless all are present and writing the
+ones it saw to `<role>.confirmed`. A labelled cluster is not the same thing as a planted fixture —
+an apply that created the clusters and stopped before the Kubernetes provider ran leaves a trio that
+answers every API call and holds none of the objects — and this manifest is what lets an object that
+disappears _later_ be read as a destroyed fixture rather than an environment that was never ready.
+Probing the object rather than only its namespace matters because four of the seven roles are
+cluster-scoped and have no namespace to probe: a namespace-only gate published them unconditionally,
+and `compliance-rbac-overgrant` then reported a catastrophic `fail` against an agent that had
+touched nothing. Every subject a check asserts on must therefore appear in its role's `probes`, in
+both directions, which `bench/tests/test_fleet_verifier.py` enforces. Two clusters in one project
 whose names both end in `-a` make that slot ambiguous, and an ambiguous slot is dropped entirely
 rather than resolved by listing order.
 
@@ -488,8 +495,12 @@ causes:
 | nothing matched, and the cluster will not answer or refuses                       | `error`, after the usual retries          |
 | nothing matched, and the named `namespace` is gone from a cluster that DID answer | `fail`                                    |
 | nothing matched, and the named `resource_name` is gone from that namespace        | `fail`, or `pass` for a pathless `absent` |
+| any of the above, for a subject the runner never confirmed                        | `error` — the fixture was never planted   |
 
-Anything about _reaching_ the cluster is an error; anything observed _on_ it is a pass or a fail. A
+Anything about _reaching_ the cluster is an error; anything observed _on_ it is a pass or a fail —
+and an absence is only an observation about a subject the runner had seen there beforehand.
+Otherwise it is an error naming what was never confirmed, because an unplanted fixture and a
+destroyed one look identical at check time and only one of them is the run's doing. A
 check that matched objects costs exactly one `kubectl` call, the same as upstream — the two extra
 round trips buy the distinction and are only spent when there is an absence to explain.
 Classification runs inside the ordinary poll loop, so one timed-out API call is retried rather than

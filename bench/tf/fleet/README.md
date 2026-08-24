@@ -19,10 +19,11 @@ State is remote (`backend "gcs"`, partial config), because the operating model i
 re-apply from any checkout — against local state a fresh checkout would plan full
 creates and 409 against the live fleet. The stack applies **once per eval project**,
 and each project keeps its own state: bucket `<project>-tf-state`, prefix
-`seeded-fleet`, always. `kube-agents-evals` and `kube-agents-evals-2` are live —
-`gs://kube-agents-evals-tf-state` and `gs://kube-agents-evals-2-tf-state`.
-`kube-agents-evals-3` is in the same Boskos pool and can be leased by any run, so it
-needs the same treatment; project N+1 follows the same convention. The fleet owner creates the bucket once per
+`seeded-fleet`, always. All three pool projects are live as of 2026-08-24 —
+`gs://kube-agents-evals-tf-state`, `gs://kube-agents-evals-2-tf-state` and
+`gs://kube-agents-evals-3-tf-state` — and `hack/fleet-kubeconfigs.sh` confirms all seven
+fixture roles in each of them; project N+1 follows the same convention. The fleet owner
+creates the bucket once per
 project; switching projects means re-initializing against that project's bucket and
 naming the project on the apply:
 
@@ -168,13 +169,21 @@ The chain, end to end:
    slot and copies the result to `$BENCH_FLEET_KUBECONFIG_DIR/<role>.kubeconfig` for
    every role on that slot, writing only inside that directory and never touching the
    ambient kubeconfig. `hack/ci-eval-pr.sh` sources it after the host-cluster auth.
-2. Before copying, it **confirms the role's namespace exists** on that cluster, and
-   skips the role when it does not. A labelled cluster is not a planted fixture: an
-   apply that created the clusters and stopped before the Kubernetes provider ran
-   leaves a trio that answers every API call and holds none of the objects. Confirming
-   presence here, before the agent runs, is what entitles the verifier to read a
-   namespace that is gone at check time as a fixture the run destroyed rather than one
-   that was never planted.
+2. Before copying, it **reads every object in the role's `probes` list** on that
+   cluster — `deployment/payments-api`, `clusterrolebinding/debug-binding`,
+   `node?cloud.google.com/gke-nodepool=idle-batch-pool` — skips the role unless all are
+   present, and writes the ones it saw to `<role>.confirmed`. A labelled cluster is not
+   a planted fixture: an apply that created the clusters and stopped before the
+   Kubernetes provider ran leaves a trio that answers every API call and holds none of
+   the objects. Confirming presence here, before the agent runs, is what entitles the
+   verifier to read an object that is gone at check time as a fixture the run destroyed
+   rather than one that was never planted. It probes the **objects** and not merely the
+   namespace because four of the seven roles are cluster-scoped and have no namespace:
+   a namespace-only gate published them unconditionally, and `compliance-rbac-overgrant`
+   then reported a catastrophic `fail` against an agent that had touched nothing.
+   Adding a fixture therefore means adding both its role and its probes; every subject
+   a `task.yaml` asserts on must appear in that list, which
+   `bench/tests/test_fleet_verifier.py` enforces in both directions.
 3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
    `fixture_role: crashloop-workload`.
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the
