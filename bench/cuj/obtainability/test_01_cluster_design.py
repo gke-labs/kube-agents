@@ -29,7 +29,7 @@ cloud.google.com/machine-family values n2, n2d, and c2d with location policy \
 ANY. This is design-only: do not create a cluster, apply a manifest, open a \
 pull request, or mutate cloud or Kubernetes state."""
 
-REQUIRED_SKILLS = {"gke-cluster-creation", "gke-compute-classes"}
+REQUIRED_SKILLS = {"gke-cluster-creation", "gke-compute-classes", "gke-obtainability"}
 FORBIDDEN_OPERATIONS = {
     "create_cluster",
     "delete_cluster",
@@ -86,10 +86,10 @@ MILESTONES = (
     ),
     Milestone(
         "m3-design-skills-loaded",
-        "The Platform Agent must load the cluster-creation and ComputeClass "
-        "skills needed to design a stockout-resilient topology.",
-        "platform task requests and loads gke-cluster-creation and "
-        "gke-compute-classes",
+        "The Platform Agent must load the cluster-creation, ComputeClass, and "
+        "obtainability skills needed to design a stockout-resilient topology.",
+        "platform task requests and loads gke-cluster-creation, "
+        "gke-compute-classes, and gke-obtainability",
         ("m2-platform-task-created",),
     ),
     Milestone(
