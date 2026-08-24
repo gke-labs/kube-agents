@@ -1255,7 +1255,7 @@ class PlatformFrontDoorTest(unittest.TestCase):
         copy would keep passing after the block it stands in for changed. Everything the
         block reads is a variable, so a temp tree and an env is the whole fixture — the
         one exception being `$INSTALL_DIR/.venv/bin/python3`, which the fill arm calls
-        and which is faked here with a symlink to the interpreter running the tests.
+        and which is faked here with a wrapper script executing the interpreter running the tests.
 
         `template` and `live` are YAML text; `live=None` means the file is absent, which
         is the branch under test. Returns (CompletedProcess, live text or None).
@@ -1276,7 +1276,9 @@ class PlatformFrontDoorTest(unittest.TestCase):
                 (profile / "config.yaml").write_text(live, encoding="utf-8")
             venv = root / "install" / ".venv" / "bin"
             venv.mkdir(parents=True)
-            (venv / "python3").symlink_to(sys.executable)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
 
             script = "set -e\n" + _extract_shell_function("platform_is_front_door") + "\n"
             script += _extract_shell_function("backfill_config_from_template") + "\n" + block

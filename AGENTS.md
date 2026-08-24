@@ -17,7 +17,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
     user-facing docs.
-  - `architecture/`: The end-state architecture specification (`01`–`08`). Describes the target, not
+  - `architecture/`: The end-state architecture specification (`01`–`09`). Describes the target, not
     what ships today.
   - `designs/`: Per-feature design documents.
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus the shared installer helpers under `scripts/`.

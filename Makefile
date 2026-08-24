@@ -101,7 +101,7 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # `make test-python-deps`. CI installs the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Twelve globs rather than one because the tests do
+# without editing this file. Thirteen globs rather than one because the tests do
 # not all live under skills -- the admin console, the shared agent scripts,
 # Chat Agent plugins and hooks, image patches, image build and repository
 # tooling in scripts/ each hold their own. scripts/ is here
@@ -138,7 +138,8 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
-	$(wildcard tests/test_*.py)))
+	$(wildcard tests/test_*.py) \
+	$(wildcard tests/memory/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
