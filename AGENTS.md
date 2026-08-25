@@ -43,7 +43,8 @@ did not expect, or nowhere at all, and the suite reports green around it.
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
   `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what
   every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
-  is the contract for what that file must carry; `make bench-case-check` enforces it.
+  is the contract for what that file must carry; `make bench-case-check` checks it locally
+  and `scripts/test_task_registration.py` gates it.
 - **Yes, and it checks an install you already have** — it is a critical user journey, and it goes in
   `bench/cuj/`. **This tier is for manual testing**: you run it by hand against your own install, to
   confirm a deploy landed or to work a live bug. It is never part of the presubmit, cannot gate a

@@ -10,8 +10,14 @@ same failure as a domain nobody covered.
 
 This test owns that difference, and four more like it. The rules and the
 allowlists live in scripts/validate_bench_cases.py, which `make
-bench-case-check` also runs, so the fast local check and this gating lint
-cannot disagree about what a valid case is. A case passes by being named in
+bench-case-check` also runs. Sharing the implementation is only half of what
+it takes for the two to agree: this lint also has to assert on everything that
+module returns rather than on a hand-listed set of substrings, which is what
+TestEveryTaskIsValid's whole-set assertion is for -- see its docstring for the
+rules that leaked through before it existed. `make bench-case-check` is
+invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS
+(Makefile:129) and run by .github/workflows/python-tests.yml, is the whole of
+the enforcement on a pull request. A case passes by being named in
 TASKS (a commented-out entry counts: it is registered, pending activation,
 which is how scenarios wait for the seeded fleet) or by a reviewed entry in
 the validator's KNOWN_UNREGISTERED with the reason. There is deliberately no
@@ -118,8 +124,25 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
 class TestEveryTaskIsValid(unittest.TestCase):
     """The rest of the case contract: docs/designs/bench-case-format.md.
 
-    One assertion per rule rather than one over everything, so a failure names
-    which part of the contract broke instead of dumping every finding at once.
+    Two layers, and they do different jobs.
+    test_no_case_is_rejected_for_any_reason is the gate: it asserts the whole
+    result set is empty, so every rule the validator has reds a pull request,
+    including the ones written after this file was last read. The per-rule
+    assertions under it are the diagnosis: each matches one substring, so a
+    failure names which part of the contract broke instead of dumping every
+    finding at once.
+
+    The per-rule layer was the whole gate for one commit, and it leaked. Every
+    assertion here matches a fixed substring of a problem string, so a problem
+    matching none of them was collected into cls.results and never asserted
+    on: `does not parse to a mapping`, `declares no 'id:'`, `duplicate entry
+    name`, an unknown `severity:` value, `check node has no 'type'
+    discriminator` and eight more were rejected by `make bench-case-check` and
+    would have merged green -- the cluster-lease cost this file exists to
+    remove. A needle list is a hand-maintained second copy of the validator's
+    rule set, and it drifts the first time somebody adds a rule without
+    editing this file. The whole-set assertion cannot drift, so it is the one
+    that gates.
     """
 
     @classmethod
@@ -137,6 +160,25 @@ class TestEveryTaskIsValid(unittest.TestCase):
     def _assert_none(self, needle, guidance):
         found = self._findings(needle)
         self.assertEqual(found, [], "\n\n" + "\n  ".join([guidance, *found]))
+
+    def test_no_case_is_rejected_for_any_reason(self):
+        # The gate. Everything below names one rule; this one covers the set,
+        # so a validator rule with no assertion of its own still fails here.
+        # Keep it even when a per-rule assertion looks like it subsumes a
+        # finding -- the point is the rules nobody has written yet.
+        findings = sorted(
+            f"{name}: {problem}"
+            for name, problems in self.results.items()
+            for problem in problems
+        )
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nThese bench cases break the contract in "
+            "docs/designs/bench-case-format.md. `make bench-case-check` "
+            "prints the same findings against your working tree:\n  "
+            + "\n  ".join(findings),
+        )
 
     def test_no_task_uses_the_deprecated_id_key(self):
         self._assert_none(
@@ -578,6 +620,24 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
                     getattr(validator, name), {"deleted-case": "gone"}, clear=False
                 ):
                     self.assertIn(f"{name}: deleted-case", validator.stale_allowlist_entries())
+
+    def test_the_catch_all_fails_on_a_finding_no_per_rule_needle_matches(self):
+        # TestEveryTaskIsValid.test_no_case_is_rejected_for_any_reason passes
+        # on a clean tree whether or not it asserts anything, exactly like the
+        # stale-allowlist sweep above; this is what proves it does. The planted
+        # finding is deliberately one no per-rule needle in that class matches
+        # -- the shape that was rejected by `make bench-case-check` and merged
+        # green until the catch-all landed.
+        case = TestEveryTaskIsValid("test_no_case_is_rejected_for_any_reason")
+        with unittest.mock.patch.object(
+            TestEveryTaskIsValid,
+            "results",
+            {"some-case": ["check 'x': duplicate entry name"]},
+            create=True,
+        ):
+            with self.assertRaises(AssertionError) as raised:
+                case.test_no_case_is_rejected_for_any_reason()
+        self.assertIn("duplicate entry name", str(raised.exception))
 
     def test_the_sweep_reports_real_cases_not_a_parse_failure(self):
         # validate_all() returns a synthetic "<TASKS array>" row when the parse

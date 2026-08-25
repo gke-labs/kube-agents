@@ -11,8 +11,12 @@ a cluster to find.
 
 This module is both the library the CI lint calls
 (`scripts/test_task_registration.py`) and the CLI `make bench-case-check`
-runs. One implementation, so the fast local check and the gating lint cannot
-drift apart and disagree about what a valid case is.
+runs. One implementation, and the lint asserts that `validate_all()` came back
+empty rather than checking for a hand-listed set of findings, so the fast
+local check and the gating lint cannot drift apart and disagree about what a
+valid case is. A rule added here therefore gates the day it is written, with
+no second edit anywhere. The CLI runs in no workflow; the lint is what reds a
+pull request.
 
 `docs/designs/bench-case-format.md` is the contract these rules enforce, and
 `docs/designs/bench-fleet-catalog.md` the fixture half of it.

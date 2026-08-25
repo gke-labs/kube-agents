@@ -278,8 +278,24 @@ case that declares no `fixtures:` at all, a missing, empty or inline `verificati
 a check that carries no assertion and so can only pass, and a case that is registered
 nowhere. It also applies the entry vocabulary above — role, the severity pairing, the
 rejected `hold` mode, a positive weight — which devops-bench enforces too, at spec-load
-time, after the lease. `scripts/test_task_registration.py` runs the same rules in CI, so
-the fast local check and the gating lint cannot disagree.
+time, after the lease.
+
+`scripts/test_task_registration.py` calls the same module in CI and asserts that it
+returned no findings at all, so the fast local check and the gating lint cannot disagree.
+That whole-set assertion is the load-bearing half, not the shared module. The lint spent
+one commit asserting only on a hand-listed set of substrings, and every rule whose
+wording was not on the list — a missing `id:`, a duplicate verification entry name, an
+unknown `severity:` value, a check node with no `type:`, a file that does not parse to a
+mapping at all, a dozen in total — was rejected by `make bench-case-check` and merged
+green. A list of substrings is a second copy of the rule set; keep the assertion over the
+set.
+
+`make bench-case-check` itself is invoked by no workflow, and that is the intended shape.
+The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` (`Makefile:129`) and
+`.github/workflows/python-tests.yml`, so a separate job running the target would re-derive
+findings CI already has, on a second checkout, for nothing. The target is the pre-push
+copy of the gate rather than the gate; a rule that has to be enforced goes in the
+validator, where both reach it. Nothing should be added to the target alone.
 
 "Carries no assertion" is stricter than "the field is present". `required_phrases: [""]`
 is a populated list, and the empty string is in every text there has ever been, so the

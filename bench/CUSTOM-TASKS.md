@@ -217,7 +217,9 @@ plants its own state. Cases address a fixture by role and never by cluster name 
 id; `docs/designs/bench-fleet-catalog.md` says why and lists the roles.
 
 `make bench-case-check` runs all of these rules in about a second, so a broken task file
-fails before it costs a cluster lease rather than after.
+fails before it costs a cluster lease rather than after. The target runs in no workflow;
+`scripts/test_task_registration.py` calls the same validator on every pull request and
+fails if it reported anything, so a case that passes locally passes there too.
 
 ```yaml
 # tasks/<task-name>/task.yaml
