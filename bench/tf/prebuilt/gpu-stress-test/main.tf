@@ -79,7 +79,16 @@ provider "kind" {}
 # does not exist; both red the task for every PR. Making this stack
 # cluster-free needs an upstream change (an opt-out for get_cluster_info),
 # not a change here.
+#
+# What CAN go away is creating that cluster fresh per run. With
+# reuse_existing_cluster the runner names an existing cluster (a seeded-fleet
+# one), the module below plans nothing, the fixture and the outputs read the
+# subject cluster from the variables, get_cluster_info still hands
+# get-credentials a real cluster, and destroy tears down only the fixture
+# resource. The orphan sweep rides this module and so does not run on reuse
+# runs; orphan GC there belongs to the sweep of the next creating run.
 module "cluster" {
+  count  = var.reuse_existing_cluster ? 0 : 1
   source = "../../modules/cluster"
 
   infra_provider  = var.infra_provider
@@ -91,6 +100,13 @@ module "cluster" {
   kubeconfig_path = var.kubeconfig_path
 }
 
+# The subject cluster of the planted incident: the one the module created, or
+# on a reuse run the existing cluster the variables name.
+locals {
+  task_cluster_name     = coalesce(one(module.cluster[*].cluster_name), var.cluster_name)
+  task_cluster_location = coalesce(one(module.cluster[*].location), var.location)
+}
+
 # The task is a post-incident analysis, so the incident is seeded rather than
 # reproduced: two Cloud Logging entries stand in for the workload that has
 # already stopped. They are what the agent has to find.
@@ -99,8 +115,8 @@ resource "null_resource" "write_synthetic_logs" {
 
   provisioner "local-exec" {
     command = <<EOT
-      gcloud logging write "container" "{\"message\": \"hypercomputer-agent: GCS FUSE buffer exhaustion during checkpoint load\", \"container_name\": \"hypercomputer-agent\"}" --severity=ERROR --project=${var.project_id} --payload-type=json --monitored-resource-type=k8s_container --monitored-resource-labels=project_id=${var.project_id},location=${module.cluster.location},cluster_name=${module.cluster.cluster_name},namespace_name=default,pod_name=hypercomputer-agent-deployment-xyz,container_name=hypercomputer-agent
-      gcloud logging write "container" "{\"message\": \"HorizontalPodAutoscaler: HPA max-replica saturation for deployment/hypercomputer-agent (max: 10)\", \"container_name\": \"hpa-controller\"}" --severity=WARNING --project=${var.project_id} --payload-type=json --monitored-resource-type=k8s_container --monitored-resource-labels=project_id=${var.project_id},location=${module.cluster.location},cluster_name=${module.cluster.cluster_name},namespace_name=default,pod_name=hpa-controller-xyz,container_name=hpa-controller
+      gcloud logging write "container" "{\"message\": \"hypercomputer-agent: GCS FUSE buffer exhaustion during checkpoint load\", \"container_name\": \"hypercomputer-agent\"}" --severity=ERROR --project=${var.project_id} --payload-type=json --monitored-resource-type=k8s_container --monitored-resource-labels=project_id=${var.project_id},location=${local.task_cluster_location},cluster_name=${local.task_cluster_name},namespace_name=default,pod_name=hypercomputer-agent-deployment-xyz,container_name=hypercomputer-agent
+      gcloud logging write "container" "{\"message\": \"HorizontalPodAutoscaler: HPA max-replica saturation for deployment/hypercomputer-agent (max: 10)\", \"container_name\": \"hpa-controller\"}" --severity=WARNING --project=${var.project_id} --payload-type=json --monitored-resource-type=k8s_container --monitored-resource-labels=project_id=${var.project_id},location=${local.task_cluster_location},cluster_name=${local.task_cluster_name},namespace_name=default,pod_name=hpa-controller-xyz,container_name=hpa-controller
 
       # Cloud Logging ingestion is asynchronous: the writes above return
       # before the entries are queryable, and the evaluation starts the
@@ -116,9 +132,13 @@ resource "null_resource" "write_synthetic_logs" {
       # under different logNames, so without this a busy cluster's system
       # entries flood the newest-first --limit window and starve the
       # fixture pair out of it forever -- a healthy apply failing on a
-      # noisy neighbour), the cluster name (unique per run, so a
-      # concurrent run's entries cannot satisfy this one's wait), and the
-      # two seeded message strings themselves.
+      # noisy neighbour), the cluster name, and the two seeded message
+      # strings themselves. On a per-run cluster the name is unique, so a
+      # concurrent run's entries cannot satisfy this one's wait. On a
+      # reuse run every concurrent run shares the seeded cluster's name,
+      # so one run's entries CAN satisfy another's wait -- and that is
+      # benign by construction: the writes are byte-identical, so the
+      # fixture the agent must find exists either way.
       #
       # A failing poll is not a slow poll: gcloud erroring (IAM, API)
       # would otherwise read as "not ingested yet" for the full 120s and
@@ -128,7 +148,7 @@ resource "null_resource" "write_synthetic_logs" {
       elapsed=0
       poll_errs=0
       while :; do
-        if found="$(gcloud logging read "logName=\"projects/${var.project_id}/logs/container\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"${module.cluster.cluster_name}\" AND (jsonPayload.message:\"GCS FUSE buffer exhaustion\" OR jsonPayload.message:\"HPA max-replica saturation\")" --project=${var.project_id} --freshness=10m --limit=10 --format='value(jsonPayload.message)' 2>"$err_file")"; then
+        if found="$(gcloud logging read "logName=\"projects/${var.project_id}/logs/container\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"${local.task_cluster_name}\" AND (jsonPayload.message:\"GCS FUSE buffer exhaustion\" OR jsonPayload.message:\"HPA max-replica saturation\")" --project=${var.project_id} --freshness=10m --limit=10 --format='value(jsonPayload.message)' 2>"$err_file")"; then
           poll_errs=0
         else
           poll_errs=$((poll_errs + 1))
@@ -169,9 +189,9 @@ resource "null_resource" "write_synthetic_logs" {
 }
 
 output "cluster_name" {
-  value = module.cluster.cluster_name
+  value = local.task_cluster_name
 }
 
 output "cluster_location" {
-  value = module.cluster.location
+  value = local.task_cluster_location
 }

@@ -124,6 +124,50 @@ export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
 echo "Task cluster for this run: ${EVAL_CLUSTER_NAME}"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
 
+# 3b. Seeded-cluster reuse: point infra tasks at the standing fleet when the
+# project has one, and only create a per-run cluster when it does not.
+#
+# The gpu-stress-test stack's cluster hosts no workloads at all (its main.tf
+# says why it exists: TFDeployer.get_cluster_info() needs a real cluster to
+# hand get-credentials). The incident it plants is two Cloud Logging entries
+# that merely NAME a cluster -- so when the leased project carries the seeded
+# fleet (bench/tf/fleet), an existing fleet cluster serves as that name and
+# the run pays neither the ~6-minute provision nor the ~8-minute teardown.
+# The discovery filter is the fleet's documented address (both labels from
+# `local.cluster_labels` in bench/tf/fleet/main.tf), the same one
+# hack/fleet-kubeconfigs.sh uses; nothing else may address a seeded cluster.
+#
+# Slot c is preferred deliberately. Slot a carries the planted namespace
+# defects -- including a real, live HPA at max replicas (fixture
+# hpa-saturated) that an agent investigating this task's *synthetic* HPA
+# incident could stumble into and report instead, turning a correct fixture
+# into a wrong answer. Slot b's held-back control plane is upgrade bait of
+# the same kind. Slot c's only defect (no master authorized networks) is
+# invisible to a log-analysis task. The fleet stays read-only throughout:
+# tofu manages only the log-fixture resource on a reuse run, the entries are
+# project-level, and teardown leaves the cluster standing.
+SEEDED_TASK_CLUSTER=""
+SEEDED_TASK_LOCATION=""
+SEEDED_CLUSTERS="$(gcloud container clusters list --project "${PROJECT_ID}" \
+  --filter="resourceLabels.managed-by=kube-agents-seeded-fleet AND resourceLabels.environment=seeded AND status=RUNNING" \
+  --format="value(name,location)" 2>/dev/null | sort || true)"
+if [ -n "${SEEDED_CLUSTERS}" ]; then
+  SEEDED_LINE="$(printf '%s\n' "${SEEDED_CLUSTERS}" | awk '$1 ~ /-c$/ { print; exit }')"
+  [ -n "${SEEDED_LINE}" ] || SEEDED_LINE="$(printf '%s\n' "${SEEDED_CLUSTERS}" | head -n 1)"
+  SEEDED_TASK_CLUSTER="$(printf '%s' "${SEEDED_LINE}" | awk '{ print $1 }')"
+  SEEDED_TASK_LOCATION="$(printf '%s' "${SEEDED_LINE}" | awk '{ print $2 }')"
+fi
+if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${SEEDED_TASK_LOCATION}" ]; then
+  export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+  export CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+  export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}"
+  export GCP_LOCATION="${SEEDED_TASK_LOCATION}"
+  export TF_VAR_reuse_existing_cluster="true"
+  echo "Reusing seeded cluster for infra tasks: ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}); no per-run task cluster will be created"
+else
+  echo "No seeded fleet in ${PROJECT_ID}; infra tasks provision per-run cluster ${EVAL_CLUSTER_NAME}"
+fi
+
 # Stamp the run onto every labelable GCP resource the stacks create, alongside
 # the fixed managed-by label the cluster module applies. These say *which* run
 # left an orphan behind; managed-by is what the sweep matches on. Both are set
