@@ -371,12 +371,13 @@ check to **complete** before assigning anyone from `.github/auto_request_review.
 not going green: the bot never concludes `failure` and keeps `success` for "No findings", so a gate
 on green would assign a reviewer to exactly the pull requests with nothing to look at. Opening a
 pull request still pings nobody. The one completed outcome that assigns no one is
-`Conflicts with the base branch`, where nothing was read at all and the bot re-runs itself on the
-push that resolves it. Two exceptions: a pull request opened by a bot is assigned as soon as the
-check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
-owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
-assign a reviewer immediately — the override for a finding you have answered but disagree with, or
-for a review that never arrived. Nothing here changes who is picked; that is still the config file.
+`Conflicts with the base branch`, where nothing was read at all — merge `main` in and comment
+`/review`, since the push that resolves the conflict starts no review on its own. Two exceptions: a
+pull request opened by a bot is assigned as soon as the check completes, whatever the conclusion,
+because Dependabot cannot re-run `/review` on itself; and an owner, member, or collaborator can
+comment `/request-review` (at the start of the comment) to assign a reviewer immediately — the
+override for a finding you have answered but disagree with, or for a review that never arrived.
+Nothing here changes who is picked; that is still the config file.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
 and **offer to wait for it** instead of reporting the work as finished — unless you opened a draft,

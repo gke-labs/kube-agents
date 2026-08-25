@@ -337,12 +337,14 @@ def ai_review_block_reason(check_run, author_is_bot):
     Two things still hold the gate, and neither is a judgement on the change.
     A check that has not finished has no verdict yet. And a `conflicted` entry
     means the branch does not merge, so nothing was read at all -- there is no
-    review for a reviewer to be reading alongside, and the bot re-runs itself on
-    the push that resolves it.
+    review for a reviewer to be reading alongside. Merging the base branch in
+    does not lift that hold on its own, because a push starts no new review;
+    `/review` on the merged branch is what does.
 
-    A bot author is unchanged: Dependabot cannot read findings and comment
-    `/review`, so its pull requests were already passing on any completed
-    conclusion. `/request-review` remains the override for everything else.
+    A bot author is unchanged, and is checked first so that it stays that way:
+    Dependabot cannot read findings and comment `/review`, so its pull requests
+    pass on any completed conclusion. `/request-review` remains the override for
+    everything else.
     """
     if check_run is None:
         return f"there is no {AI_REVIEW_CHECK_NAME} check run on the head commit"
@@ -350,14 +352,16 @@ def ai_review_block_reason(check_run, author_is_bot):
     if check_run.get("status") != "completed":
         return f"{AI_REVIEW_CHECK_NAME} is {check_run.get('status')}"
 
+    # Before any reading of the conclusion: a bot author passes on *any*
+    # completed one. Nothing below this line is a verdict it could act on.
+    if author_is_bot:
+        return None
+
     conclusion = check_run.get("conclusion")
     if conclusion not in AI_REVIEW_CONCLUSIONS:
         # Not a conclusion this bot writes, so it is not one this gate knows how
         # to read. Holding is the conservative direction: the override exists.
         return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}, which is not a conclusion it publishes"
-
-    if author_is_bot:
-        return None
 
     if check_run.get("external_id") == AI_REVIEW_CONFLICTED_ID:
         return f"{AI_REVIEW_CHECK_NAME} reports the branch does not merge, so nothing was reviewed"

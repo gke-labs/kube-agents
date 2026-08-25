@@ -340,8 +340,9 @@ class AiReviewGateTest(unittest.TestCase):
         )
 
     def test_a_conflicted_branch_holds_the_gate(self):
-        # Read off `external_id`, not the copy: nothing was reviewed, and the
-        # bot re-runs itself on the push that resolves the conflict.
+        # Read off `external_id`, not the copy: nothing was reviewed. The way
+        # out is merging the base branch in and commenting `/review`; the push
+        # itself starts no new review.
         reason = rr.ai_review_block_reason(
             check_run(
                 "neutral",
@@ -376,8 +377,22 @@ class AiReviewGateTest(unittest.TestCase):
             )
         )
 
+    def test_a_conclusion_the_bot_does_not_publish_clears_it_for_a_bot_author(self):
+        # "Any completed conclusion" means any, including the ones the bot does
+        # not write. A `cancelled` or `timed_out` run on a Dependabot pull
+        # request would otherwise strand it: the author cannot type `/review`,
+        # and nothing else would ever ask for a human.
+        for conclusion in ("cancelled", "timed_out", "stale", "skipped", "failure"):
+            with self.subTest(conclusion=conclusion):
+                self.assertIsNone(
+                    rr.ai_review_block_reason(check_run(conclusion), author_is_bot=True)
+                )
+
     def test_a_bot_author_still_needs_the_check_to_have_run(self):
         self.assertIsNotNone(rr.ai_review_block_reason(None, author_is_bot=True))
+        self.assertIsNotNone(
+            rr.ai_review_block_reason(check_run(None, status="in_progress"), author_is_bot=True)
+        )
 
 
 class ResolvePullRequestTest(unittest.TestCase):
