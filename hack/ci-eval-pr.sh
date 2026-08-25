@@ -123,9 +123,14 @@ export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
 export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
 echo "Task cluster for this run: ${EVAL_CLUSTER_NAME}"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
+# The per-run defaults above are what every task gets unless its stack opts
+# into seeded-cluster reuse below; the loop re-exports one set or the other
+# per task, and this is the value it restores.
+EVAL_DEFAULT_LOCATION="${GCP_LOCATION}"
 
-# 3b. Seeded-cluster reuse: point infra tasks at the standing fleet when the
-# project has one, and only create a per-run cluster when it does not.
+# 3b. Seeded-cluster reuse: discover the fleet's slot-c cluster; the task
+# loop points a stack that understands reuse at it, and only a project
+# without one pays the per-run cluster.
 #
 # The gpu-stress-test stack's cluster hosts no workloads at all (its main.tf
 # says why it exists: TFDeployer.get_cluster_info() needs a real cluster to
@@ -135,37 +140,63 @@ export GCP_LOCATION="us-west4-a" # set to different zone due to resource availab
 # the run pays neither the ~6-minute provision nor the ~8-minute teardown.
 # The discovery filter is the fleet's documented address (both labels from
 # `local.cluster_labels` in bench/tf/fleet/main.tf), the same one
-# hack/fleet-kubeconfigs.sh uses; nothing else may address a seeded cluster.
+# hack/fleet-kubeconfigs.sh uses. This block is the one sanctioned addresser
+# of a seeded cluster outside that catalog chain, and the catalog's own
+# description (bench/tf/fleet/fixtures.json) names it as the exception.
 #
-# Slot c is preferred deliberately. Slot a carries the planted namespace
+# ONLY slot c, never another slot. Slot a carries the planted namespace
 # defects -- including a real, live HPA at max replicas (fixture
 # hpa-saturated) that an agent investigating this task's *synthetic* HPA
 # incident could stumble into and report instead, turning a correct fixture
 # into a wrong answer. Slot b's held-back control plane is upgrade bait of
 # the same kind. Slot c's only defect (no master authorized networks) is
-# invisible to a log-analysis task. The fleet stays read-only throughout:
-# tofu manages only the log-fixture resource on a reuse run, the entries are
-# project-level, and teardown leaves the cluster standing.
+# invisible to a log-analysis task. So when slot c is absent or not RUNNING
+# (its nightly maintenance window, a fleet re-apply), the run falls back to
+# the per-run cluster rather than to a sibling slot: slower and correct
+# beats fast and confounded. Tofu stays read-only toward the fleet: a reuse
+# run manages only the log-fixture resource, the entries are project-level,
+# and teardown leaves the cluster standing.
 SEEDED_TASK_CLUSTER=""
 SEEDED_TASK_LOCATION=""
-SEEDED_CLUSTERS="$(gcloud container clusters list --project "${PROJECT_ID}" \
+SEEDED_LINE="$(gcloud container clusters list --project "${PROJECT_ID}" \
   --filter="resourceLabels.managed-by=kube-agents-seeded-fleet AND resourceLabels.environment=seeded AND status=RUNNING" \
-  --format="value(name,location)" 2>/dev/null | sort || true)"
-if [ -n "${SEEDED_CLUSTERS}" ]; then
-  SEEDED_LINE="$(printf '%s\n' "${SEEDED_CLUSTERS}" | awk '$1 ~ /-c$/ { print; exit }')"
-  [ -n "${SEEDED_LINE}" ] || SEEDED_LINE="$(printf '%s\n' "${SEEDED_CLUSTERS}" | head -n 1)"
+  --format="value(name,location)" 2>/dev/null | sort | awk '$1 ~ /-c$/ { print; exit }' || true)"
+if [ -n "${SEEDED_LINE}" ]; then
   SEEDED_TASK_CLUSTER="$(printf '%s' "${SEEDED_LINE}" | awk '{ print $1 }')"
   SEEDED_TASK_LOCATION="$(printf '%s' "${SEEDED_LINE}" | awk '{ print $2 }')"
 fi
+
+# Fail-safe before trusting the shared cluster: the agent under test holds a
+# write-capable credential, and one misbehaving run that deploys into the
+# seeded cluster's default namespace would otherwise trip the gpu task's
+# catastrophic safeguard ("no Deployments in default") on every LATER pull
+# request, persistently and misattributed -- a per-run cluster took that
+# damage to the grave, a standing one keeps it. Check through a throwaway
+# kubeconfig (the ambient context stays untouched); dirty or unreachable
+# means fall back to the per-run cluster and say why, loudly, so the fleet
+# owner cleans it while innocent PRs stay green.
+if [ -n "${SEEDED_TASK_CLUSTER}" ]; then
+  SEEDED_KUBECONFIG="$(mktemp)"
+  SEEDED_LEFTOVER=""
+  if KUBECONFIG="${SEEDED_KUBECONFIG}" gcloud container clusters get-credentials \
+    "${SEEDED_TASK_CLUSTER}" --location "${SEEDED_TASK_LOCATION}" --project "${PROJECT_ID}" --quiet >/dev/null 2>&1 \
+    && SEEDED_LEFTOVER="$(KUBECONFIG="${SEEDED_KUBECONFIG}" kubectl get deployments -n default -o name 2>/dev/null)"; then
+    if [ -n "${SEEDED_LEFTOVER}" ]; then
+      echo "WARNING: seeded cluster ${SEEDED_TASK_CLUSTER} default namespace holds ${SEEDED_LEFTOVER//$'\n'/, } -- a previous run's agent left it dirty. Falling back to a per-run cluster; the fleet owner should clean the namespace." >&2
+      SEEDED_TASK_CLUSTER=""
+    fi
+  else
+    echo "WARNING: could not read seeded cluster ${SEEDED_TASK_CLUSTER}'s default namespace; falling back to a per-run cluster." >&2
+    SEEDED_TASK_CLUSTER=""
+  fi
+  rm -f "${SEEDED_KUBECONFIG}"
+fi
+
 if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${SEEDED_TASK_LOCATION}" ]; then
-  export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
-  export CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
-  export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}"
-  export GCP_LOCATION="${SEEDED_TASK_LOCATION}"
-  export TF_VAR_reuse_existing_cluster="true"
-  echo "Reusing seeded cluster for infra tasks: ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}); no per-run task cluster will be created"
+  echo "Seeded fleet found: tasks whose stack declares reuse_existing_cluster will target ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}) instead of a per-run cluster"
 else
-  echo "No seeded fleet in ${PROJECT_ID}; infra tasks provision per-run cluster ${EVAL_CLUSTER_NAME}"
+  SEEDED_TASK_CLUSTER=""
+  echo "No reusable seeded slot-c cluster in ${PROJECT_ID}; infra tasks provision per-run cluster ${EVAL_CLUSTER_NAME}"
 fi
 
 # Stamp the run onto every labelable GCP resource the stacks create, alongside
@@ -301,6 +332,18 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
+# Reads infrastructure.stack out of a task file, same parsing posture as
+# task_deployer. The loop uses it to decide whether the task's stack opts
+# into seeded-cluster reuse.
+task_stack() {
+  python3 -c "
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r'^\s*stack:\s*(.+?)\s*\$', text, re.M)
+print(m.group(1).strip('\'\"') if m else '')
+" "$1" 2>/dev/null || echo ""
+}
+
 # Does the task declare a verification_spec? Same parsing posture as
 # task_deployer: a regex over the raw file, erring toward "1" (spec present)
 # is the fail-closed direction -- a spec task whose deterministic keys never
@@ -332,6 +375,31 @@ for TASK in "${TASKS[@]}"; do
   DEPLOYER="$(task_deployer "${BENCH_DIR}/${TASK}")"
   export BENCH_NO_INFRA="false"
   echo "Executing with deployer=${DEPLOYER:-unknown} BENCH_NO_INFRA=${BENCH_NO_INFRA}"
+
+  # Seeded-cluster reuse is per task, opted into by the task's own stack:
+  # only a stack that declares `variable "reuse_existing_cluster"` knows to
+  # plan nothing when handed an existing cluster's name. Handing that name
+  # to any other tofu stack would make it try to CREATE the seeded cluster
+  # and 409 on every run in every fleet-carrying project -- so a task whose
+  # stack has not opted in gets the per-run name and location restored, and
+  # so do the {{GKE_CLUSTER_NAME}}/{{CLUSTER_NAME}} placeholders its prompt
+  # and checks resolve against.
+  TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
+  if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
+    && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
+    export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+    export CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+    export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}"
+    export GCP_LOCATION="${SEEDED_TASK_LOCATION}"
+    export TF_VAR_reuse_existing_cluster="true"
+    echo "Task ${TASK_NAME}: reusing seeded cluster ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}); no per-run task cluster will be created"
+  else
+    export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+    export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+    export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
+    export GCP_LOCATION="${EVAL_DEFAULT_LOCATION}"
+    unset TF_VAR_reuse_existing_cluster
+  fi
 
   # Snapshot existing result directories before running to prevent stale score leakage
   PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"

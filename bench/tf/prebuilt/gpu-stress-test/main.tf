@@ -86,7 +86,9 @@ provider "kind" {}
 # subject cluster from the variables, get_cluster_info still hands
 # get-credentials a real cluster, and destroy tears down only the fixture
 # resource. The orphan sweep rides this module and so does not run on reuse
-# runs; orphan GC there belongs to the sweep of the next creating run.
+# runs -- and every pool project carries the fleet, so in CI there is
+# ordinarily no creating run left to ride; gke-labs/kube-agents#950 tracks
+# giving the sweep a home that does not depend on one.
 module "cluster" {
   count  = var.reuse_existing_cluster ? 0 : 1
   source = "../../modules/cluster"
@@ -112,6 +114,16 @@ locals {
 # already stopped. They are what the agent has to find.
 resource "null_resource" "write_synthetic_logs" {
   count = var.infra_provider == "gcp" ? 1 : 0
+
+  # Re-plant when the subject cluster moves. A null_resource re-runs its
+  # provisioner only when a trigger changes; without this, persistent local
+  # state (the intended behaviour for local runs, per hack/ci-eval-pr.sh)
+  # would keep the OLD subject's entries when the fleet arrives in a project
+  # between two runs -- outputs and prompt naming a cluster whose fixture
+  # was never written. Inert in CI, where state starts fresh every run.
+  triggers = {
+    subject_cluster = local.task_cluster_name
+  }
 
   provisioner "local-exec" {
     command = <<EOT
