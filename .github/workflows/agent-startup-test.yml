@@ -51,6 +51,12 @@ jobs:
               # plugin-linking logic, reached from the other direction.
               - "agents/platform/scripts/profile_scaffold.py"
               - "agents/platform/scripts/cluster_agent_profile.py"
+              # The startup path a replicas > 1 Pod takes instead of the
+              # entrypoint: the operator gives the sandbox a `command`, so this
+              # script starts Hermes and owns the umask that keeps the shared
+              # PVC writable from the credential sidecar. test_startup_umask.py
+              # asserts that; it has to run when the file it asserts on changes.
+              - "k8s-operator/internal/controller/leader_elect.py"
               - "tests/test_*.py"
               # tests/test_operator_makefile.py asserts on the recipes this
               # Makefile prints; a Makefile-only change must run it or the

@@ -2069,7 +2069,18 @@ def serve(args: argparse.Namespace) -> None:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         socket_path.unlink(missing_ok=True)
-        server = ThreadingUnixHTTPServer(str(socket_path), CredentialProxyHandler)
+        # Nothing behind this socket authenticates its callers: reaching it is
+        # reaching the credentials, past Envoy and past the whole command policy.
+        # The mount keeps it in this container, and the mode is the second lock —
+        # 0600, so it stays connectable only by this container's own user however
+        # wide the sidecar's umask is set for the shared workspace. Applied as a
+        # umask rather than a chmod after the fact so there is no window in which
+        # the bound socket is more permissive than this.
+        previous_umask = os.umask(0o177)
+        try:
+            server = ThreadingUnixHTTPServer(str(socket_path), CredentialProxyHandler)
+        finally:
+            os.umask(previous_umask)
         LOGGER.info("credential proxy listening on unix socket %s", socket_path)
     else:
         server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)

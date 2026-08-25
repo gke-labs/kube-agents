@@ -841,6 +841,8 @@ spec:
               drop:
                 - ALL
             readOnlyRootFilesystem: true
+            runAsGroup: 10000
+            runAsUser: 10001
           volumeMounts:
             - mountPath: /etc/credential-proxy/policy.json
               name: credential-proxy-policy
@@ -864,12 +866,12 @@ spec:
               name: platform-agent-data-vol
       securityContext:
         fsGroup: 10000
+        runAsGroup: 10000
         runAsNonRoot: true
         runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
-      shareProcessNamespace: true
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:

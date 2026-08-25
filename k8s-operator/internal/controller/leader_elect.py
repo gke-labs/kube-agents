@@ -73,7 +73,16 @@ def release_lease_and_exit(signum, frame):
 
 def main():
     global process, is_shutting_down
-    
+
+    # Every replica > 1 deployment reaches Hermes through this file instead of
+    # agent-entrypoint: the operator sets a container `command`, which overrides
+    # the image ENTRYPOINT, so the umask that script sets never runs here. It has
+    # to be set again, or the sandbox writes 0755 directories on the shared PVC
+    # and the credential sidecar — a different UID in the same group since the
+    # UID split — cannot clone into the GitOps workspace the sandbox just made.
+    # Both ways out of this function start Hermes, so it belongs above both.
+    os.umask(0o002)
+
     if not lease_name or not namespace:
         os.execvp("hermes", HERMES_COMMAND)
         

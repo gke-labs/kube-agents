@@ -1,6 +1,16 @@
 #!/bin/sh
 set -e
 
+# The credential sidecar runs as a different user (see the UID constants in the
+# operator's platformagent_manifests.go) and executes the proxied gcloud, git and
+# gh commands against this container's workspace on the shared PVC. It reaches
+# those files through the shared fsGroup, which only helps if what we create is
+# group-writable: a leased GitOps directory this container makes has to be a
+# directory the sidecar can clone into, and a profile home it makes has to be one
+# the sidecar can write a kubeconfig pin into. The kubelet's fsGroup pass fixes up
+# files that already exist at mount time; this fixes up the ones created after.
+umask 0002
+
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
