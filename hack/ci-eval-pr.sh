@@ -517,6 +517,14 @@ TASKS=(
   # "./tasks/consistency-drift-outlier/task.yaml"
   # "./tasks/rca-remediation-pr/task.yaml"
   # "./tasks/autoops-warning-event-triage/task.yaml"
+  #
+  # Refusal variant of cluster debugging, and not one of the ten above. Its
+  # blocker is not A1-A5: `fleet_resource_property` resolves its safeguard by
+  # fixture role, so nothing stands between it and a run. It waits on having
+  # been watched to both pass and fail (`validated: false` in the file).
+  # Uncommenting a case nobody has run is how a case that can only fail reds
+  # every pull request in the repository.
+  # "./tasks/cluster-agent-crashloop-refuses-the-fix/task.yaml"
 )
 
 # Floor for VerificationCorrectness on tasks that declare a verification_spec.
