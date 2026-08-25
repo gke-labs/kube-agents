@@ -121,7 +121,7 @@ fi
 export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
 export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
 export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
-echo "Task cluster for this run: ${EVAL_CLUSTER_NAME}"
+echo "Per-run task cluster name (used unless a task reuses the seeded fleet, section 3b): ${EVAL_CLUSTER_NAME}"
 export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
 # The per-run defaults above are what every task gets unless its stack opts
 # into seeded-cluster reuse below; the loop re-exports one set or the other
@@ -158,12 +158,17 @@ EVAL_DEFAULT_LOCATION="${GCP_LOCATION}"
 # and teardown leaves the cluster standing.
 SEEDED_TASK_CLUSTER=""
 SEEDED_TASK_LOCATION=""
-SEEDED_LINE="$(gcloud container clusters list --project "${PROJECT_ID}" \
+SEEDED_C_LINES="$(gcloud container clusters list --project "${PROJECT_ID}" \
   --filter="resourceLabels.managed-by=kube-agents-seeded-fleet AND resourceLabels.environment=seeded AND status=RUNNING" \
-  --format="value(name,location)" 2>/dev/null | sort | awk '$1 ~ /-c$/ { print; exit }' || true)"
-if [ -n "${SEEDED_LINE}" ]; then
-  SEEDED_TASK_CLUSTER="$(printf '%s' "${SEEDED_LINE}" | awk '{ print $1 }')"
-  SEEDED_TASK_LOCATION="$(printf '%s' "${SEEDED_LINE}" | awk '{ print $2 }')"
+  --format="value(name,location)" 2>/dev/null | sort | awk '$1 ~ /-c$/' || true)"
+if [ "$(printf '%s\n' "${SEEDED_C_LINES}" | grep -c .)" -gt 1 ]; then
+  # Same rule as hack/fleet-kubeconfigs.sh: two clusters claiming one slot
+  # make it ambiguous, and ambiguity is dropped rather than resolved by
+  # listing order -- the per-run cluster is the unambiguous fallback.
+  echo "WARNING: more than one seeded slot-c cluster in ${PROJECT_ID} (${SEEDED_C_LINES//$'\n'/; }); slot ambiguous, falling back to a per-run cluster." >&2
+elif [ -n "${SEEDED_C_LINES}" ]; then
+  SEEDED_TASK_CLUSTER="$(printf '%s' "${SEEDED_C_LINES}" | awk '{ print $1 }')"
+  SEEDED_TASK_LOCATION="$(printf '%s' "${SEEDED_C_LINES}" | awk '{ print $2 }')"
 fi
 
 # Fail-safe before trusting the shared cluster: the agent under test holds a
@@ -180,7 +185,7 @@ if [ -n "${SEEDED_TASK_CLUSTER}" ]; then
   SEEDED_LEFTOVER=""
   if KUBECONFIG="${SEEDED_KUBECONFIG}" gcloud container clusters get-credentials \
     "${SEEDED_TASK_CLUSTER}" --location "${SEEDED_TASK_LOCATION}" --project "${PROJECT_ID}" --quiet >/dev/null 2>&1 \
-    && SEEDED_LEFTOVER="$(KUBECONFIG="${SEEDED_KUBECONFIG}" kubectl get deployments -n default -o name 2>/dev/null)"; then
+    && SEEDED_LEFTOVER="$(KUBECONFIG="${SEEDED_KUBECONFIG}" kubectl get deployments -n default -o name --request-timeout=30s 2>/dev/null)"; then
     if [ -n "${SEEDED_LEFTOVER}" ]; then
       echo "WARNING: seeded cluster ${SEEDED_TASK_CLUSTER} default namespace holds ${SEEDED_LEFTOVER//$'\n'/, } -- a previous run's agent left it dirty. Falling back to a per-run cluster; the fleet owner should clean the namespace." >&2
       SEEDED_TASK_CLUSTER=""
