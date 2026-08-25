@@ -19,20 +19,36 @@ package controller
 // The credential broker in its own Pod.
 //
 // Everything here is dead code unless spec.security.splitCredentialBrokerPod is
-// true. It is off by default and the default is not a stopgap: the broker runs
-// proxied commands with a working directory the *agent* created on the shared
-// data PVC, and refuses any working directory outside that root
-// (credential_proxy.py, CommandExecutor._execute). Two Pods sharing that
-// filesystem needs ReadWriteMany, which on GKE means Filestore or GCS Fuse
-// rather than the default persistent disk. That is an infrastructure
-// dependency with a bill attached and a breaking change for existing installs,
-// so it is opt-in and the CRD field says so.
+// true, and it stays off by default until the workspace stops being shared.
 //
-// What the split buys, when the storage is there: the agent no longer shares a
-// network namespace with the process holding the cloud credentials, so
-// "reachable on 127.0.0.1" stops being an access-control mechanism. What it
-// costs is that the broker call becomes a network call, which is why it cannot
-// land without the authentication in credential_proxy.py.
+// The reason is the working directory. The broker runs proxied commands in a
+// directory the *agent* created, and refuses any working directory outside that
+// root (credential_proxy.py, CommandExecutor._execute). Two Pods therefore have
+// to see the same files, which is a property of the current directory-sharing
+// design rather than of the split. It is also the security problem: a tree the
+// agent owns is a tree the agent can write .git/config into, which is the class
+// argument-level hardening cannot close by enumeration.
+//
+// The decided answer is content-passing. The broker owns the workspace on a
+// volume of its own, ordinary ReadWriteOnce, and the agent hands it
+// {path, content} pairs and a commit message instead of a directory. That
+// removes the coupling and the .git class together. It is being built as
+// up/11-content-workspace, and the flag stays off until it lands.
+//
+// A ReadWriteMany claim is one way to make two Pods see the same files today,
+// and an operator may choose it. It is not what the product asks for, and it
+// must not become what the product asks for: the managed options bill on
+// provisioned capacity with a floor far above what an agent workspace needs,
+// which is an adoption tax on installs that run in someone else's environment.
+// Co-scheduling the two Pods on one node against a ReadWriteOnce claim is not
+// an answer either — a rolling update deadlocks on the volume, node affinity is
+// only honoured at scheduling time, and the two Pods become one failure domain.
+//
+// What the split buys is that the agent no longer shares a network namespace
+// with the process holding the cloud credentials, so "reachable on 127.0.0.1"
+// stops being an access-control mechanism. What it costs is that the broker
+// call becomes a network call, which is why it cannot land without the
+// authentication in credential_proxy.py.
 
 import (
 	"fmt"

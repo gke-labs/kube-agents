@@ -500,21 +500,30 @@ type SecuritySpec struct {
 	// longer shares a network namespace with the process holding the cloud
 	// credentials.
 	//
-	// REQUIRES ReadWriteMany storage for the agent data volume, and defaults to
-	// false for that reason. The broker runs proxied commands with a working
-	// directory the agent created on the shared data PVC, so both Pods must
-	// mount that PVC read-write at the same path and see the same files there.
-	// The default GKE persistent disk is ReadWriteOnce, which cannot do that
-	// across two Pods on different nodes; the cluster needs Filestore or GCS
-	// Fuse (storage class "standard-rwx" or equivalent) before this is enabled.
+	// LEAVE THIS OFF for now. The broker runs proxied commands in a working
+	// directory the agent created on the shared data volume, so today both Pods
+	// have to mount that claim read-write at the same path and see the same
+	// files. The default GKE persistent disk is ReadWriteOnce and cannot do
+	// that across nodes: the broker Pod stays Pending with a Multi-Attach
+	// error, never becomes a Service endpoint, and every proxied command
+	// reports "credential proxy unavailable: [Errno 111] Connection refused" —
+	// the same symptom an unhealthy sidecar produces.
 	//
-	// Without it the failure is a scheduling one, not a policy one. The broker
-	// Pod cannot attach the volume, stays Pending with a Multi-Attach error,
-	// and never becomes a Service endpoint — so every proxied command reports
-	// "credential proxy unavailable: [Errno 111] Connection refused", the same
-	// symptom an unhealthy sidecar produces. If the scheduler happens to place
-	// both Pods on one node it will instead appear to work, which makes the
-	// misconfiguration intermittent and worth ruling out first.
+	// That coupling is a property of the current directory-sharing design, not
+	// something the split needs, and it is being removed rather than worked
+	// around: the broker will own the workspace on an ordinary ReadWriteOnce
+	// volume of its own and take {path, content} pairs from the agent instead
+	// of a directory. That also closes the wider problem of the agent owning a
+	// tree the broker then runs git in. Until then the split is a mechanism
+	// with no adoptable storage story, which is why it defaults to false.
+	//
+	// A ReadWriteMany claim does satisfy today's design and is a choice
+	// available to you. It is not a requirement of this product and should not
+	// be treated as one — the managed options bill on provisioned capacity with
+	// a floor far above what an agent workspace needs. Co-scheduling both Pods
+	// on one node against a ReadWriteOnce claim is not a workaround: the next
+	// rolling update deadlocks on the volume, node affinity binds only at
+	// scheduling time, and the two Pods become a single failure domain.
 	//
 	// REQUIRES eventWatcher.enabled: false. The k8s-event-watcher is hosted
 	// inside the credential container and posts what it sees to the Session KV

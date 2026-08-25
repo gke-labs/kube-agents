@@ -614,7 +614,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 		return nil
 	}
 
-	r.warnUnlessSharedStorageIsReadWriteMany(ctx, agent)
+	r.warnSplitNeedsSharedFilesystem(ctx, agent)
 
 	// The broker verifies its callers with a TokenReview, which needs one verb
 	// on one virtual resource and grants no read access to anything.
@@ -652,22 +652,34 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 	return nil
 }
 
-// warnUnlessSharedStorageIsReadWriteMany says so, loudly, when the split is
-// enabled on storage that cannot support it.
+// warnSplitNeedsSharedFilesystem says so, loudly, when the split is enabled
+// while the two Pods cannot see the same files.
 //
 // The broker runs proxied commands with a working directory the agent created
-// on this volume. With ReadWriteOnce the two Pods cannot both mount it
-// read-write unless the scheduler happens to place them on one node — and when
-// it does not, the broker Pod stays Pending with a Multi-Attach error and never
-// becomes a Service endpoint, so the agent sees a connection refused on every
-// command. Note that the containment check in the broker is lexical and does
-// not detect this: both Pods are configured with the same workspace root, so
-// the path always looks right; what is missing is the data behind it.
+// on this volume, so today both Pods have to mount it read-write at the same
+// path. A ReadWriteOnce claim cannot do that across nodes: the broker Pod stays
+// Pending with a Multi-Attach error and never becomes a Service endpoint, so
+// the agent sees a connection refused on every command. The containment check
+// in the broker does not catch it either — it is lexical, both Pods are
+// configured with the same workspace root, so the path always looks right and
+// what is missing is the data behind it.
 //
-// This is a log line and not a Degraded status because the access mode of an
-// existing claim cannot be changed in place: an operator who hits it has to
-// provision new storage, and blocking reconcile would not help them do that.
-func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+// The access mode is what this reads, because it is the one signal available.
+// It is not a product requirement, and the fix is not to go and buy a
+// ReadWriteMany volume — that is one way to satisfy today's design and an
+// operator may pick it, but the managed options bill on provisioned capacity
+// with a floor far above what a workspace needs. The supported answer is to
+// leave the split off until the broker owns the workspace on a volume of its
+// own and takes content rather than a directory (up/11-content-workspace),
+// which removes the coupling entirely. Co-scheduling both Pods on one node is
+// not the answer: it deadlocks the next rolling update on the volume and makes
+// the two Pods a single failure domain.
+//
+// A log line rather than a Degraded status, because unlike the event-watcher
+// refusal there is nothing the operator can set to make this correct — the
+// access mode of an existing claim cannot be changed in place, and refusing to
+// reconcile would not help them.
+func (r *PlatformAgentReconciler) warnSplitNeedsSharedFilesystem(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
 	log := logf.FromContext(ctx)
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc); err != nil {
@@ -676,11 +688,14 @@ func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx con
 	if slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany) {
 		return
 	}
-	log.Info("WARNING: splitCredentialBrokerPod is enabled but the agent data volume is not ReadWriteMany; "+
-		"the agent Pod and the broker Pod must both mount it read-write at the same path, and on GKE that means "+
-		"Filestore or GCS Fuse rather than the default persistent disk. Unless the scheduler places both Pods on "+
-		"one node, the broker Pod will stay Pending with a Multi-Attach error and every proxied command will "+
-		"report the credential proxy as unavailable.",
+	log.Info("WARNING: splitCredentialBrokerPod is enabled, and the agent Pod and the broker Pod cannot see the "+
+		"same files: the broker runs proxied commands in a directory the agent created on this claim, and its "+
+		"access mode does not let both Pods mount it read-write at once. The broker Pod will stay Pending with a "+
+		"Multi-Attach error and every proxied command will report the credential proxy as unavailable. Turn the "+
+		"split off. A ReadWriteMany claim also satisfies today's design and is a choice available to you, but it "+
+		"is not what this product asks for; the supported path is to wait for the broker to own the workspace and "+
+		"take content rather than a directory. Do not co-schedule the two Pods to work around this — it deadlocks "+
+		"the next rolling update on the volume.",
 		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
 }
 

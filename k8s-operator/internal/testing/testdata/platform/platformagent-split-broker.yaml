@@ -9,9 +9,10 @@ spec:
   # shape as the tagged fixture, so a diff between the two expected outputs is
   # exactly what the gate changes.
   #
-  # This layout requires ReadWriteMany storage for the agent data volume --
-  # both Pods mount it read-write at the same path -- which is why the gate is
-  # off by default. See the field's documentation in common_types.go.
+  # The gate is off by default because the broker still runs commands in a
+  # directory the agent owns, which couples the two Pods to one filesystem.
+  # That is being removed rather than worked around; see the field's
+  # documentation in common_types.go.
   #
   # eventWatcher.enabled: false is the second half of the only split
   # configuration the operator will render. The watcher is hosted in the

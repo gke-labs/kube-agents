@@ -176,7 +176,8 @@ func assertBrokerHomeIsOffTheSharedWorkspace(t *testing.T, spec corev1.PodSpec, 
 		}
 		if volume.EmptyDir == nil {
 			// A PVC here is the specific regression: it is the one volume kind
-			// the agent Pod also mounts, and on RWX it would be the same bytes.
+			// the agent Pod also mounts, and on a shared filesystem it would be
+			// the same bytes.
 			t.Errorf("volume %s (%s) is no longer a Pod-local emptyDir: %+v", name, role, volume.VolumeSource)
 		}
 		for index := range spec.Containers {
