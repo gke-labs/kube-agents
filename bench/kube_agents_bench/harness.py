@@ -73,11 +73,18 @@ from kube_agents_bench.parsing import (
     reported_statuses,
 )
 
-__all__ = ["KubeAgentsHarness"]
+__all__ = ["INFRA_FAILURE_MARKER", "KubeAgentsHarness"]
 
 _log = logging.getLogger("kube_agents_bench.harness")
 
 SERVICE_API_PORT = 8642
+
+# Prefix on ``AgentResult.errors[0]`` that marks a run as never having reached
+# the agent at all. ``hack/ci-eval-pr.sh`` matches this string in results.json
+# and classifies the task ``RUN_CLASS=INFRA``, so it lands in
+# ``INFRA_FAILED_TASKS`` instead of failing the pull request. The literal is the
+# contract between the two files: change it in both or in neither.
+INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
@@ -296,6 +303,34 @@ def _ensure_port_forward(local_port: int) -> None:
                 _PF_PROCESSES.pop(local_port, None)
             _stop_process(proc)
             raise
+
+
+def _reset_port_forward(local_port: int) -> None:
+    """Tear this process's forward down and stand a fresh one up.
+
+    ``_ensure_port_forward`` returns immediately when ``_port_open`` is true,
+    and an open local listener whose upstream is gone is exactly the state a
+    transport retry has to escape -- ``kubectl port-forward`` keeps accepting
+    on 127.0.0.1 after the pod behind it has been replaced. Probing the port
+    therefore proves nothing; the process has to go first.
+
+    A forward this process did not spawn is left alone (nothing is registered
+    to kill), and the re-establish is then a no-op -- someone else owns the
+    tunnel and terminating it is not ours to do.
+
+    Raises:
+        RuntimeError: The replacement forward could not be established.
+    """
+    with _port_establishment_lock(local_port):
+        with _PF_LOCK:
+            proc = _PF_PROCESSES.pop(local_port, None)
+        if proc is None:
+            _log.info("no port-forward owned on port %d; nothing to tear down", local_port)
+        else:
+            _log.info("tearing down the port-forward on port %d before retrying", local_port)
+            _stop_process(proc)
+    # Outside the lock: _ensure_port_forward takes the same non-reentrant one.
+    _ensure_port_forward(local_port)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -595,8 +630,40 @@ class _TransportError(RuntimeError):
     """A turn that never reached the agent, or came back unreadable.
 
     Distinct from an agent that answered badly: the message is ready for
-    ``AgentResult.errors`` and the caller stops rather than retrying.
+    ``AgentResult.errors``.
+
+    ``retryable`` says whether issuing the same request again could plausibly
+    succeed. It is False by default so a new raise site has to opt in.
     """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# Gateway statuses a proxy in front of the agent emits when the upstream is
+# gone or saturated -- the pod restarted, the tunnel died -- and which clear
+# once it is back. Every other status is an answer about the request itself and
+# repeating the request cannot change it, 500 included: a handler that raised
+# will raise again.
+_RETRYABLE_STATUSES = frozenset({502, 503, 504})
+
+
+def _connection_dropped(exc: BaseException) -> bool:
+    """Whether ``exc`` is a connection lost in flight rather than a timeout.
+
+    A reset or a half-closed keepalive says the socket went away and a fresh
+    one may not; a timeout says the request may still be running on the other
+    end, and re-issuing it would spend the whole HTTP budget a second time for
+    a turn that could yet return. ``URLError`` wraps the real ``OSError`` in
+    ``reason``, so unwrap before testing.
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        exc = reason
+    if isinstance(exc, TimeoutError):
+        return False
+    return isinstance(exc, ConnectionError | http.client.IncompleteRead)
 
 
 def _post_turn(
@@ -619,16 +686,39 @@ def _post_turn(
             session_id = response.headers.get(_SESSION_ID_HEADER, "")
     except urllib.error.HTTPError as exc:
         raise _TransportError(
-            f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}"
+            f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
+            retryable=exc.code in _RETRYABLE_STATUSES,
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
         # Timeouts, resets, a mid-read protocol failure, and a body that is
         # neither UTF-8 nor JSON: transport, not agent, bugs.
-        raise _TransportError(f"{type(exc).__name__}: {exc}") from exc
+        raise _TransportError(
+            f"{type(exc).__name__}: {exc}", retryable=_connection_dropped(exc)
+        ) from exc
 
     if not isinstance(payload, dict):
         raise _TransportError(f"agent endpoint returned non-object JSON: {type(payload).__name__}")
     return parse_response(payload), session_id
+
+
+def _infra_failure(detail: str) -> AgentResult:
+    """A run that never reached the agent, recorded as infrastructure.
+
+    ``output`` is deliberately left empty. ``AgentResult.errored`` copies its
+    message into ``output``, which the eval harness writes to results.json as
+    the "Actual Output" the LLM judge grades -- and on build
+    2092339233527173120 that is how a proxy's HTTP 502 error page came to be
+    graded as the agent's answer to ``gpu-stress-test-diagnosis``
+    ("The Actual Output consists entirely of an HTTP 502 Bad Gateway",
+    OutcomeValidity 0.0). A transport failure has to set a run class, not an
+    output: the marker on ``errors[0]`` is what ``hack/ci-eval-pr.sh`` reads.
+    """
+    return AgentResult(
+        output="",
+        trajectory=[],
+        errors=[f"{INFRA_FAILURE_MARKER}: {detail}"],
+        metadata={"infra_failure": detail},
+    )
 
 
 class KubeAgentsHarness(AgentHarness):
@@ -706,10 +796,44 @@ class KubeAgentsHarness(AgentHarness):
             "input": prompt,
         }
 
-        try:
-            result, session_id = _post_turn(url, body, headers, timeout)
-        except _TransportError as exc:
-            return AgentResult.errored(str(exc))
+        # Same shape as the status-turn retry in _await_delegated_work: count
+        # the transport failures, log each one against the ceiling, and give up
+        # at _MAX_TRANSPORT_FAILURES. What differs is the escape between
+        # attempts -- there is no poll interval to back off over here, and the
+        # 502 this exists for is a live proxy over a dead upstream, so the
+        # tunnel is torn down and respawned rather than merely probed.
+        transport_failures = 0
+        while True:
+            try:
+                result, session_id = _post_turn(url, body, headers, timeout)
+                break
+            except _TransportError as exc:
+                # A 4xx, a 500, or a body that is not JSON says the endpoint
+                # answered; that is the agent's own failure and still belongs
+                # in front of the judge. Only a gateway status or a dropped
+                # connection is worth a second attempt.
+                if not exc.retryable:
+                    return AgentResult.errored(str(exc))
+                transport_failures += 1
+                _log.warning(
+                    "opening turn failed in transport (%d/%d): %s",
+                    transport_failures,
+                    _MAX_TRANSPORT_FAILURES,
+                    exc,
+                )
+                if transport_failures >= _MAX_TRANSPORT_FAILURES:
+                    # Not AgentResult.errored: see _infra_failure. This is the
+                    # run class, not an answer.
+                    return _infra_failure(
+                        f"the opening turn failed in transport {transport_failures} times "
+                        f"running; last failure: {exc}"
+                    )
+                try:
+                    _reset_port_forward(local_port)
+                except RuntimeError as pf_exc:
+                    # Counted, not returned: a forward that will not come back
+                    # is the same outage, and the loop's own ceiling ends it.
+                    _log.warning("port-forward respawn failed before retry: %s", pf_exc)
 
         if delegation_timeout > 0:
             session_id = (
