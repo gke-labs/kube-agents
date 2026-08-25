@@ -46,11 +46,9 @@ did not expect, or nowhere at all, and the suite reports green around it.
   is the contract for what that file must carry; `make bench-case-check` checks it locally
   and `scripts/test_task_registration.py` gates it.
 - **Yes, and it checks an install you already have** — it is a critical user journey, and it goes in
-  `bench/cuj/`. **This tier is for manual testing**: you run it by hand against your own install, to
-  confirm a deploy landed or to work a live bug. It is never part of the presubmit, cannot gate a
-  pull request, and adding one changes nothing about what CI reports — it needs a real deployment to
-  point at, and CI has none. Being manual is the design, not a gap someone will automate later. It
-  plants nothing and provisions nothing, so it grades the deployment rather than the agent.
+  `bench/cuj/`. **This tier is manual by design**, not pending automation: it needs a real
+  deployment to point at and CI has none, so no job runs it and adding one changes nothing about
+  what CI reports. It plants nothing, so it grades the deployment rather than the agent.
   See [`bench/cuj/README.md`](bench/cuj/README.md).
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.

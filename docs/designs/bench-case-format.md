@@ -75,11 +75,16 @@ has watched the case both pass and fail.
 `domain` is a slug from `docs/designs/domains.yaml`. It is how coverage is counted, and
 it is discussed below in its own right.
 
-`fixtures` is a list of fixture role slugs from `docs/designs/fleet-fixtures.yaml` — the
-seeded defects the case depends on. It is documentation the validator enforces: it makes
-a case's fixture dependencies greppable, so the fleet owner replacing a cluster knows
-which cases go quiet. Cases address fixtures by role and never by cluster name or project
-id; `docs/designs/bench-fleet-catalog.md` is the contract for why.
+`fixtures` is a list of fixture role slugs from `bench/tf/fleet/fixtures.json` — the
+seeded defects the case depends on. (`docs/designs/fleet-fixtures.yaml` overlays the
+day-N gates and the project-scoped fixtures on that catalogue, and contributes the roles
+that have no cluster slot; it may not rename one.) It is documentation the validator
+enforces: it makes a case's fixture dependencies greppable, so the fleet owner replacing
+a cluster knows which cases go quiet. The same slugs name a `fleet_resource_property`
+check's `fixture_role:`, and a check naming a role the case does not list is rejected —
+one planted defect, one name, however the case refers to it. Cases address fixtures by
+role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.md` is
+the contract for why.
 
 A case whose spec reads live cluster state must declare it. `fixtures: []` is the
 declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up

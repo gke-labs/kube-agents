@@ -213,10 +213,18 @@ class TestEveryTaskIsValid(unittest.TestCase):
 
     def test_every_named_fixture_role_exists(self):
         self._assert_none(
-            "docs/designs/fleet-fixtures.yaml does not define",
-            "These cases name a seeded-fleet fixture role the catalog does "
-            "not define. Cases address fixtures by role, never by cluster "
+            "neither bench/tf/fleet/fixtures.json",
+            "These cases name a seeded-fleet fixture role no catalogue "
+            "defines. Cases address fixtures by role, never by cluster "
             "name -- see docs/designs/bench-fleet-catalog.md:",
+        )
+
+    def test_every_role_a_check_names_is_declared_by_its_case(self):
+        self._assert_none(
+            "which the case's own 'fixtures:' list does not declare",
+            "A check's `fixture_role:` and the case's `fixtures:` list name "
+            "the same planted defect and must use the same slug -- see "
+            "docs/designs/fleet-fixtures.yaml's header:",
         )
 
     def test_every_task_carries_a_verification_spec(self):
@@ -314,8 +322,22 @@ class TestTheValidatorItself(unittest.TestCase):
         roles = validator.known_fixture_roles()
         self.assertTrue(
             roles,
-            "docs/designs/fleet-fixtures.yaml defines no fixture roles -- "
-            "either the file moved or its shape changed.",
+            "no fixture roles are defined -- either "
+            "bench/tf/fleet/fixtures.json or docs/designs/fleet-fixtures.yaml "
+            "moved, or its shape changed.",
+        )
+
+    def test_the_two_fixture_catalogues_agree(self):
+        # bench/tf/fleet/fixtures.json owns the role vocabulary and
+        # docs/designs/fleet-fixtures.yaml overlays the day-N gates on it. The
+        # two once disagreed on five of eight slugs, which put two names for
+        # one planted defect in the same task.yaml.
+        self.assertEqual(
+            validator.fixture_catalog_disagreements(),
+            [],
+            "\n\ndocs/designs/fleet-fixtures.yaml has drifted from "
+            "bench/tf/fleet/fixtures.json:\n  "
+            + "\n  ".join(validator.fixture_catalog_disagreements()),
         )
 
     def test_a_case_with_no_assertion_is_rejected(self):
@@ -441,7 +463,10 @@ class TestTheRulesReject(unittest.TestCase):
         self._only("is not a slug string", domain=["security", "cost"])
 
     def test_an_unknown_fixture_role_is_rejected(self):
-        self._only("fleet-fixtures.yaml does not define", fixtures=["hpa-saturated"])
+        # Deliberately not a plausible-looking slug: `hpa-saturated` used to
+        # sit here and became a real role the day bench/tf/fleet/fixtures.json
+        # merged, which turned this into a test that asserted nothing.
+        self._only("neither bench/tf/fleet/fixtures.json", fixtures=["no-such-fixture"])
 
     def test_a_fixture_role_that_is_not_a_string_is_rejected(self):
         self._only("is not a slug string", fixtures=[["rbac-overgrant"]])

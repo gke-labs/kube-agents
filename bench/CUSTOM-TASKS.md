@@ -212,8 +212,10 @@ task that deliberately must not run needs a reviewed entry in
 `scripts/validate_bench_cases.py`'s `KNOWN_UNREGISTERED` with the reason.
 
 A task whose verification reads live cluster state also carries `fixtures:`, a list of
-seeded-fleet role slugs from `docs/designs/fleet-fixtures.yaml`, or `fixtures: []` if it
-plants its own state. Cases address a fixture by role and never by cluster name or project
+seeded-fleet role slugs from `bench/tf/fleet/fixtures.json`, or `fixtures: []` if it
+plants its own state. Those are the same slugs a `fleet_resource_property` check's
+`fixture_role:` names, and the validator rejects a case that uses one in a check without
+listing it here. Cases address a fixture by role and never by cluster name or project
 id; `docs/designs/bench-fleet-catalog.md` says why and lists the roles.
 
 `make bench-case-check` runs all of these rules in about a second, so a broken task file

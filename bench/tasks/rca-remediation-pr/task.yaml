@@ -54,10 +54,10 @@ domain: remediation
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in
-# docs/designs/fleet-fixtures.yaml; the rule is
+# bench/tf/fleet/fixtures.json; the rule is
 # docs/designs/bench-fleet-catalog.md.
 fixtures:
-  - oom-crashloop
+  - crashloop-workload
 
 # The PR objective is a report check rather than a tool check, deliberately:
 # submit_suggestion.py runs as a skill script through execute_code, so no

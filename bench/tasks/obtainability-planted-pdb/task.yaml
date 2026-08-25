@@ -57,10 +57,10 @@ domain: reliability
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in
-# docs/designs/fleet-fixtures.yaml; the rule is
+# bench/tf/fleet/fixtures.json; the rule is
 # docs/designs/bench-fleet-catalog.md.
 fixtures:
-  - missing-pdb
+  - no-pdb-workload
 
 # Exact checks: we planted both nouns (the deployment name and the missing
 # object's kind), so requiring them is fair. Graded against the LEDGER, not

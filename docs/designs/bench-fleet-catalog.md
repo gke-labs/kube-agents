@@ -7,14 +7,17 @@ correct audit returns alongside the planted one. This one is the case author's: 
 `task.yaml` refers to a fixture, which fixtures are assertable when, and what happens to a
 case when one is not.
 
-The machine-readable form is `docs/designs/fleet-fixtures.yaml`, which
-`scripts/validate_bench_cases.py` reads. Object names there are copied from
-`bench/tf/fleet/`, which remains the source of truth for all of them.
+**The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
+Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
+against at run time. `docs/designs/fleet-fixtures.yaml` is the machine-readable form of
+the rest of this document — the day-N gates below, and the project-scoped fixtures that
+have no cluster slot — and it may not rename a role: `scripts/validate_bench_cases.py`
+reads both and fails when they disagree about a slug or a slot. Object names in either are
+copied from `bench/tf/fleet/`, which remains the source of truth for all of them.
 
 Everything below was checked against the live fleet in `kube-agents-evals` and
-`kube-agents-evals-2`, and where the audit and the README disagreed the audit won. Three
-such disagreements are recorded in place: the eval-project count under
-[Which projects have a fleet](#which-projects-have-a-fleet), the version pin under
+`kube-agents-evals-2`, and where the audit and the README disagreed the audit won. Two
+such disagreements are recorded in place: the version pin under
 [A finding nobody declared](#a-finding-nobody-declared), and the HPA replica count in the
 role table. Each is a correction the operator document still needs; recorded here so a
 case author is not misled while it waits.
@@ -59,9 +62,9 @@ eventually resolves it.
 
 Three projects sit in the Boskos pool: `kube-agents-evals`, `kube-agents-evals-2` and
 `kube-agents-evals-3`. All three carry a fleet, the third applied on 2026-08-24, and each
-keeps its own state bucket. `bench/tf/fleet/README.md` described the fleet as one trio
-across two projects, in its opening paragraph and again in its state-bucket list; this
-change corrects both. The first two are the ones the live audit behind this document
+keeps its own state bucket. `bench/tf/fleet/README.md` used to describe the fleet as one
+trio across two projects, in its opening paragraph and again in its state-bucket list;
+both now say three. The first two are the ones the live audit behind this document
 covered; the third's facts here are its apply date and its gate dates, which follow
 from it.
 
@@ -85,18 +88,18 @@ outlier. Every cluster is labelled `environment=seeded`, which is what confines 
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
-| Role               | Slot    | Day | What is planted                                                                       |
-| ------------------ | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`   | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `missing-pdb`      | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `oom-crashloop`    | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `pinned-inference` | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-batch`       | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`     | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-lag`      | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`    | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+| Role                 | Slot    | Day | What is planted                                                                       |
+| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
+| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
+| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
+| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
+| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
+| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
+| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
+| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
+| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
 
-The `inference-server` HPA under `pinned-inference` does not compute a stable desired
+The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
 `kube-agents-evals`, 2 in `kube-agents-evals-2` and 3 in `kube-agents-evals-3` — same
 stack, same manifests, three projects, two different answers. The fixture holds anyway,
@@ -106,19 +109,23 @@ and it moves. So a case must assert the pin and the unmet demand — `maxReplica
 `desiredReplicas` above it — and never a specific figure, because there is no figure that
 is true everywhere the case might land.
 
-Three of these slugs are corrections to names that circulated before the fleet existed.
-`hpa-saturated` was the working name for what is now `pinned-inference`: the HPA is half
-of the fixture and the pinned pool is the other half, and the pool is the object the
-capacity audit names. `idle-nodepool` was the working name for `idle-batch` — but
-`idle-nodepool` is the cost SOP's _check_ id, and a role slug that collides with a check
-id makes every conversation ambiguous about whether the subject is the fixture or the
-finding. `drift-outlier` was previously referred to only as "the drift outlier", which is
-not a slug at all.
+Two things about this vocabulary are worth knowing before it confuses someone, because
+neither is going to be obvious from a slug.
 
-Neither is a new coinage. `seeded-role=pinned-inference` is carried by that pool's node
-label and its taint, and `seeded-role=idle-batch` by the idle pool's taint (that pool
-carries no label block), both in `bench/tf/fleet/main.tf` — so the role vocabulary and the
-cluster agree.
+**A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
+`seeded-role=pinned-inference` on the pinned pool's node label and taint, and
+`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
+one thing by the catalogue and another by the Terraform that plants them. They are
+different mechanisms and both are load-bearing: the label and taint are scheduling
+constraints that keep other workloads off those pools, and the role slug is what the
+runner resolves to a kubeconfig. Nothing breaks, but do not read one as the other, and do
+not "fix" either to match without changing the thing that reads it.
+
+**`idle-nodepool` is also the cost SOP's check id.** The role names the planted fixture;
+the check id names the finding an audit returns about it. They are deliberately the same
+word for the same subject, but a sentence with `idle-nodepool` in it is ambiguous about
+which of the two it means, so say "the `idle-nodepool` role" or "the `idle-nodepool`
+check" and never the bare slug.
 
 ## Day 0, 1, 7, 30
 
@@ -127,8 +134,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Five of the eight are assertable on apply day: `rbac-overgrant`, `missing-pdb`,
-`oom-crashloop`, `pinned-inference` and `version-lag`, covering security, reliability,
+Five of the eight are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`crashloop-workload`, `hpa-saturated` and `version-laggard`, covering security, reliability,
 cluster debugging, remediation, capacity and upgrades between them. A corpus that leans on
 these can go green the day the fleet applies.
 
@@ -137,13 +144,13 @@ these can go green the day the fleet applies.
 members — and §2.4's floor, a cohort of fewer than three clusters produces no findings
 ever, would floor it out even if only one cluster were new.
 
-`idle-batch` waits seven, and no agent can satisfy that gate reliably, because the GKE
+`idle-nodepool` waits seven, and no agent can satisfy that gate reliably, because the GKE
 node pool has no creation timestamp to read. The cost SOP's idle-nodepool check refuses
 pools created less than seven days ago, but `gcloud container node-pools describe` returns
 no `createTime` and neither does the REST resource; the only age signal is the boot-disk
 creation time of the pool's current nodes, which a rolling recreation resets while the
 pool object is untouched. So the gate is a judgement the agent makes from a proxy, and a
-node upgrade can silently close it. Treat `idle-batch` as the least dependable fixture in
+node upgrade can silently close it. Treat `idle-nodepool` as the least dependable fixture in
 the catalog, and do not build a blocking objective on the age gate itself.
 
 `orphan-disks` waits thirty, and that one is real: the unattached-disk collector filters
@@ -184,7 +191,7 @@ either.
 
 Until `main.tf` derives the pin from the REGULAR channel's `validVersions` rather than the
 location-wide list, treat the branch (a) critical on slot `b` as expected output. A case
-touching `version-lag` asserts branch (b) specifically and must not assert that the
+touching `version-laggard` asserts branch (b) specifically and must not assert that the
 critical count is one, or that branch (a) is absent.
 
 ## When a fixture goes away
@@ -197,7 +204,7 @@ the recreated disk starts its 30-day clock over. The clusters carry
 `managed-by=kube-agents-bench` which the orphan sweep matches on, but a disk deleted by
 hand is a disk deleted by hand.
 
-A cluster is replaced. That is the documented recovery for `version-lag` when the
+A cluster is replaced. That is the documented recovery for `version-laggard` when the
 maintenance exclusion lapses or the held minor reaches EOL, and it makes the replaced
 cluster new for 24 hours — which takes the drift cohort from three clusters to two and
 drops it under the floor. The drift audit then emits nothing for the whole fleet, so

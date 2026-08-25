@@ -1,14 +1,27 @@
 # The seeded fleet's planted defects, as data, addressed by ROLE.
 #
-# A case names a fixture by the `role` slug below and never by a cluster name
-# or a project id. Each eval project carries its own trio of clusters
-# (`bench/tf/fleet/`, `var.cluster_prefix` defaults to "seeded", so the live
-# names are seeded-a/b/c), and a case written against one project has to run
-# unchanged against the next. The slot letter is the addressable thing; the
-# name is a rendering of it.
+# THE ROLE VOCABULARY IS NOT DEFINED HERE. `bench/tf/fleet/fixtures.json` owns
+# it: it sits beside the Terraform that plants the fixtures, and it is what
+# hack/fleet-kubeconfigs.sh resolves a role against at run time and what a
+# task.yaml check's `fixture_role:` names. Every slug below with a `slot` must
+# appear there with the same slot, and scripts/validate_bench_cases.py fails
+# the build when one does not -- two catalogues of the same fixtures that can
+# disagree about what a role is called are worse than either alone.
+#
+# What this file adds on top of that catalogue is the part fixtures.json does
+# not carry: the day-N availability gate below, and the fixtures that are not
+# on a cluster at all (`orphan-disks` is project-scoped, so it has no cluster
+# slot and no entry in a catalogue keyed by one).
+#
+# A case names a fixture by role and never by a cluster name or a project id.
+# Each eval project carries its own trio of clusters (`bench/tf/fleet/`,
+# `var.cluster_prefix` defaults to "seeded", so the live names are
+# seeded-a/b/c), and a case written against one project has to run unchanged
+# against the next. The slot letter is the addressable thing; the name is a
+# rendering of it.
 #
 # scripts/validate_bench_cases.py reads this file and rejects a task.yaml whose
-# `fixtures:` list names a role that is not here. docs/designs/
+# `fixtures:` list names a role that is in neither catalogue. docs/designs/
 # bench-fleet-catalog.md is the prose contract; bench/tf/fleet/ is the
 # implementation and the source of every object name below.
 #
@@ -43,7 +56,7 @@ fixtures:
       ServiceAccount in seeded-security. Cluster-scoped deliberately: the
       compliance SOP reads clusterrolebindings only.
 
-  - role: missing-pdb
+  - role: no-pdb-workload
     slot: a
     available_from_day: 0
     objects:
@@ -53,7 +66,7 @@ fixtures:
       Two replicas with no PodDisruptionBudget. Two rather than one because the
       reliability SOP flags spec.replicas >= 2 only.
 
-  - role: oom-crashloop
+  - role: crashloop-workload
     slot: a
     available_from_day: 0
     objects:
@@ -61,7 +74,7 @@ fixtures:
     namespace: seeded-debug
     defect: A deterministic OOMKilled crashloop.
 
-  - role: pinned-inference
+  - role: hpa-saturated
     slot: a
     available_from_day: 0
     objects:
@@ -73,11 +86,12 @@ fixtures:
       A single-zone pool whose autoscaler is pinned at min = max = 1, hosting a
       workload whose HPA (min 1, max 10) settles above what the pool can
       schedule, leaving a standing Pending backlog. Node label and taint
-      seeded-role=pinned-inference keep anything else off it. Observed desired
-      replica count is 2, not the 3 bench/tf/fleet/README.md documents; assert
-      the unmet demand, never the number.
+      seeded-role=pinned-inference keep anything else off it -- the taint value
+      is not the role slug, see bench-fleet-catalog.md. The desired replica
+      count is not stable across projects (measured 3/2/3 on 2026-08-24), so
+      assert the pin and the unmet demand and never a number.
 
-  - role: idle-batch
+  - role: idle-nodepool
     slot: a
     available_from_day: 7
     objects:
@@ -100,7 +114,7 @@ fixtures:
       Two unattached 10 GB persistent disks. The cost SOP's unattached-disk
       collector filters server-side on creationTimestamp<-P30D.
 
-  - role: version-lag
+  - role: version-laggard
     slot: b
     available_from_day: 0
     objects:

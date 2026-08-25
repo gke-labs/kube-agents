@@ -30,6 +30,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import sys
@@ -42,6 +43,11 @@ TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
+# The role vocabulary, owned by the catalogue that sits beside the Terraform
+# and is resolved at run time by hack/fleet-kubeconfigs.sh. FIXTURES_FILE adds
+# the day-N gates and the project-scoped fixtures on top of it; it does not get
+# to name a role differently, which fixture_catalog_disagreements() enforces.
+ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
 # Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.
 # Every entry carries its reason; an entry without one should not survive
@@ -95,6 +101,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "resource_property": ("op",),
     "pod_healthy": ("selector",),
     "scaling_complete": ("deployment",),
+    # This repository, seeded-fleet-reading: resource_property addressed by
+    # fixture role rather than by kubeconfig, so `op` carries the assertion
+    # for the same reason. See bench/kube_agents_bench/verifiers.py.
+    "fleet_resource_property": ("op",),
     # This repository, run-reading.
     "report_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
@@ -105,7 +115,17 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
 # something that has to be there, so it says what: either the seeded-fleet
 # roles it depends on, or `fixtures: []` for a case that plants its own state
 # (its own Terraform stack, its own namespace) and depends on no fixture.
-CLUSTER_READING_TYPES = frozenset({"resource_property", "pod_healthy", "scaling_complete"})
+CLUSTER_READING_TYPES = frozenset(
+    {
+        "resource_property",
+        "pod_healthy",
+        "scaling_complete",
+        # The one type that reads the seeded fleet specifically, so the
+        # `fixtures:` it forces is the list its own fixture_role values
+        # resolve against.
+        "fleet_resource_property",
+    }
+)
 
 # Compound nodes assert nothing themselves; their children do.
 COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
@@ -154,10 +174,71 @@ def known_domains() -> set[str]:
     return {d["slug"] for d in data.get("domains") or []}
 
 
-def known_fixture_roles() -> set[str]:
-    """Role slugs defined in docs/designs/fleet-fixtures.yaml."""
+def _catalog_roles() -> dict[str, Any]:
+    """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
+    try:
+        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
+    return data.get("roles") or {}
+
+
+def _overlay_fixtures() -> list[dict[str, Any]]:
+    """Entries in docs/designs/fleet-fixtures.yaml."""
     data = _load_yaml(FIXTURES_FILE) or {}
-    return {f["role"] for f in data.get("fixtures") or []}
+    return [f for f in (data.get("fixtures") or []) if isinstance(f, dict)]
+
+
+def known_fixture_roles() -> set[str]:
+    """Every role slug a task.yaml may name.
+
+    bench/tf/fleet/fixtures.json is the vocabulary; the overlay contributes
+    only the roles that have no cluster slot, which a catalogue keyed by slot
+    cannot hold (orphan-disks is project-scoped). Rejecting a slug is not the
+    place to also complain that the two disagree -- that is a repository-level
+    fault, not a fault of the case that happened to name the role, so it is
+    reported once by fixture_catalog_disagreements() instead of once per case.
+    """
+    roles = set(_catalog_roles())
+    roles |= {f["role"] for f in _overlay_fixtures() if f.get("slot") is None and "role" in f}
+    return roles
+
+
+def fixture_catalog_disagreements() -> list[str]:
+    """Ways docs/designs/fleet-fixtures.yaml can drift from the catalogue.
+
+    Both files describe the same planted defects, so the failure to design
+    against is the two of them calling one fixture by two names -- which is
+    exactly what a task.yaml would then do, naming the overlay's slug in
+    `fixtures:` and the catalogue's in a check's `fixture_role:`, in the same
+    file, for the same object.
+    """
+    catalog = _catalog_roles()
+    problems = []
+    for entry in _overlay_fixtures():
+        role, slot = entry.get("role"), entry.get("slot")
+        if not isinstance(role, str):
+            problems.append(f"fleet-fixtures.yaml: {role!r} is not a role slug")
+        elif slot is None:
+            if role in catalog:
+                problems.append(
+                    f"fleet-fixtures.yaml: {role!r} declares no slot, but "
+                    "bench/tf/fleet/fixtures.json gives it slot "
+                    f"{catalog[role].get('cluster_slot')!r}"
+                )
+        elif role not in catalog:
+            problems.append(
+                f"fleet-fixtures.yaml: {role!r} is on slot {slot!r} but "
+                "bench/tf/fleet/fixtures.json, which owns the role "
+                "vocabulary, does not define it"
+            )
+        elif catalog[role].get("cluster_slot") != slot:
+            problems.append(
+                f"fleet-fixtures.yaml puts {role!r} on slot {slot!r}; "
+                "bench/tf/fleet/fixtures.json puts it on "
+                f"{catalog[role].get('cluster_slot')!r}"
+            )
+    return problems
 
 
 def registered_cases() -> set[str] | None:
@@ -244,6 +325,17 @@ def _check_types(node: Any, found: set[str]) -> None:
         found.add(node_type)
     for child in node.get("checks") or []:
         _check_types(child, found)
+
+
+def _fixture_roles(node: Any, found: set[str]) -> None:
+    """Every `fixture_role:` named anywhere in one check subtree."""
+    if not isinstance(node, dict):
+        return
+    role = node.get("fixture_role")
+    if isinstance(role, str):
+        found.add(role)
+    for child in node.get("checks") or []:
+        _fixture_roles(child, found)
 
 
 def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) -> None:
@@ -343,8 +435,9 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     )
                 elif role not in roles:
                     problems.append(
-                        f"names fixture role {role!r}, which "
-                        "docs/designs/fleet-fixtures.yaml does not define"
+                        f"names fixture role {role!r}, which neither "
+                        "bench/tf/fleet/fixtures.json nor "
+                        "docs/designs/fleet-fixtures.yaml defines"
                     )
 
     # The verification spec.
@@ -364,6 +457,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     else:
         seen: set[str] = set()
         used_types: set[str] = set()
+        used_roles: set[str] = set()
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 problems.append(f"verification_spec[{index}]: entry is not a mapping")
@@ -383,6 +477,22 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             else:
                 _check_assertions(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
+                _fixture_roles(entry["check"], used_roles)
+
+        # The two ways a case names a fixture have to be the same name. A
+        # check's `fixture_role:` is what the runner resolves to a kubeconfig;
+        # `fixtures:` is what a human greps when a cluster is replaced. A case
+        # naming one planted defect `crashloop-workload` in one and something
+        # else in the other reads as depending on two fixtures and is why the
+        # role vocabulary has a single owner -- see fleet-fixtures.yaml's
+        # header and fixture_catalog_disagreements().
+        if isinstance(fixtures, list):
+            undeclared = sorted(used_roles - {f for f in fixtures if isinstance(f, str)})
+            for role in undeclared:
+                problems.append(
+                    f"a check names fixture role {role!r}, which the case's "
+                    "own 'fixtures:' list does not declare"
+                )
 
         if fixtures is None and used_types & CLUSTER_READING_TYPES:
             problems.append(
@@ -490,6 +600,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         results = validate_paths(args.paths) if args.paths else validate_all()
         stale = [] if args.paths else stale_allowlist_entries()
+        # Repository-level, so it runs even when a path subset was named: a
+        # case that names a drifted role is rejected above, but the drift
+        # itself is worth reporting even when no case has hit it yet.
+        drift = fixture_catalog_disagreements()
     except CaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -507,6 +621,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in stale:
         failed += 1
         print(f"stale allowlist entry, delete it: {entry}")
+
+    for entry in drift:
+        failed += 1
+        print(f"fixture catalogue drift: {entry}")
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")
