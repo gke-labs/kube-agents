@@ -433,8 +433,10 @@ TASKS=(
   # immediately below -- and nine are registered here commented out.
   # Uncommenting is the LAST step of activation, not the only one:
   # bench/tasks/DRAFTS.md carries an activation-blockers section and a
-  # per-scenario status column, and every commented entry is blocked on at
-  # least one of them today. The task-registration lint counts a commented
+  # per-scenario status column -- check it rather than assuming an entry
+  # below is still blocked, because A1 and A4 closed on 2026-08-25 and what
+  # holds most of these now is that nobody has watched them pass and fail
+  # (`validated: false`). The task-registration lint counts a commented
   # entry as registered; the domain-coverage lint counts only an uncommented
   # one, so activating a scenario also deletes its domain from the allowlist
   # in docs/designs/domains.yaml.
@@ -448,39 +450,32 @@ TASKS=(
   # on it, is worth one round trip.
   "./tasks/cluster-agent-crashloop-debug/task.yaml"
   #
-  # The rest are still off, and the blockers holding them are summarised so a
-  # reader here does not have to guess:
-  #   A1  the six audit scenarios, rca-remediation-pr and the refusal variant
-  #       after them are NOT read-only -- every fleet-audit stream mints a
-  #       GitHub token and writes a ledger issue, and both remediation cases
-  #       answer with a pull request on the same eval GitOps repo. The
-  #       in-repo half is done: ci-deploy.sh maps each pool project to its
-  #       throwaway repo and passes it as
+  # Where the five blockers stand, summarised so a reader here does not have
+  # to guess:
+  #   A1  CLOSED 2026-08-25. The six audit scenarios and both remediation
+  #       cases are NOT read-only -- every fleet-audit stream mints a GitHub
+  #       token and writes a ledger issue, and both remediation cases answer
+  #       with a pull request on the same eval GitOps repo. Contained rather
+  #       than prevented: ci-deploy.sh maps each pool project to its
+  #       throwaway *-infra repo, passes it as
   #       platformAgent.integration.github.gitRepo, and scopes githubMinter
-  #       to the same repo. What is left is outside this repository --
-  #       EVAL_GITHUB_APP_ID must be set in the Prow job before ci-deploy.sh
-  #       will render githubMinter.enabled=true, and the token has exactly
-  #       one source (no inherited GITHUB_TOKEN is honoured), so until then
-  #       the repo resolves and the clone still fails. That is
-  #       GoogleCloudPlatform/oss-test-infra#2661 -- approved, not merged.
-  #       See DRAFTS.md A1.
+  #       to that one repo, and GoogleCloudPlatform/oss-test-infra#2661
+  #       supplied the last piece by exporting EVAL_GITHUB_APP_ID into the
+  #       presubmit. See DRAFTS.md A1.
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules.
   #       Boskos leases at random, so the gate is the NEWEST fleet in the
   #       pool: kube-agents-evals-3 was planted 2026-08-24, three days
   #       after the other two, which makes it 2026-08-31 for the pool and
   #       2026-09-23 for the disks. A replant in any pool project moves
   #       them.
-  #   A4  cleared in the code, open on one credential. The six audit
-  #       scenarios' objectives no longer read the final message (which the
-  #       SOPs keep to one line); they use ledger_issue_contains, which reads
-  #       the GitHub ledger issue the run published and proves it is THIS
-  #       run's by the generated-at stamp audit_report.py renders into it.
-  #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
-  #       issues:read on the eval GitOps repos. The secret now exists
-  #       (kube-agents-bench-github-token, namespace test-pods); mounting it
-  #       is the same oss-test-infra#2661, approved and not merged. Until it
-  #       lands those checks return status=error, which drops
-  #       VerificationCoverage below the gate's 1.0 floor by design.
+  #   A4  CLOSED 2026-08-25. The six audit scenarios' objectives no longer
+  #       read the final message (which the SOPs keep to one line); they use
+  #       ledger_issue_contains, which reads the GitHub ledger issue the run
+  #       published and proves it is THIS run's by the generated-at stamp
+  #       audit_report.py renders into it. That verifier needs
+  #       BENCH_GITHUB_TOKEN with issues:read on the eval GitOps repos, and
+  #       oss-test-infra#2661 mounts secret kube-agents-bench-github-token
+  #       into the presubmit as exactly that.
   #   A5  CLEARED, and that is what the active entry above rests on. Step 2b
   #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
   #       fleet safeguards use `fleet_resource_property` with a
@@ -519,15 +514,15 @@ TASKS=(
   # "./tasks/rca-remediation-pr/task.yaml"
   # "./tasks/autoops-warning-event-triage/task.yaml"
   #
-  # Refusal variant of cluster debugging, and not one of the ten above.
-  # Blocked on A1 and A5, the same pair as rca-remediation-pr: A1 because its
-  # compliant answer is a pull request on the eval GitOps repo, A5 because its
-  # safeguard reads the seeded fleet. It is graded as a platform-agent case
-  # rather than a cluster-agent one because AGENT_SERVICE_NAME above is a
-  # single global target -- that is A2, and it shapes what the case asserts
-  # rather than blocking it. Then it waits on having been watched to both pass
-  # and fail (`validated: false` in the file). Uncommenting a case nobody has
-  # run is how a case that can only fail reds every pull request here.
+  # Refusal variant of cluster debugging, and not one of the ten above. Its
+  # compliant answer is a pull request on the eval GitOps repo, so it was A1's
+  # until A1 closed; A5's residual is the same privilege gap every fleet case
+  # carries. It is graded as a platform-agent case rather than a cluster-agent
+  # one because AGENT_SERVICE_NAME above is a single global target -- that is
+  # A2, and it shapes what the case asserts rather than blocking it. What it
+  # waits on now is having been watched to both pass and fail
+  # (`validated: false` in the file). Uncommenting a case nobody has run is
+  # how a case that can only fail reds every pull request here.
   # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
 )
 
