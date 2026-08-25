@@ -272,7 +272,7 @@ data "google_container_cluster" "existing" {
     # Terraform run refuses instead.
     postcondition {
       condition     = try(self.datapath_provider, "") == "ADVANCED_DATAPATH" || try(self.network_policy[0].enabled, false) == true
-      error_message = "Cluster '${var.cluster_name}' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy addon), so every NetworkPolicy kube-agents installs would be inert. Enable enforcement first — gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --enable-network-policy — then re-run."
+      error_message = "Cluster '${var.cluster_name}' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy addon), so every NetworkPolicy kube-agents installs would be inert. Run these two commands in this order, then re-run: gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --update-addons=NetworkPolicy=ENABLED, then gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --enable-network-policy. GKE rejects the second until the addon is on, and gcloud rejects both flags in one invocation."
     }
   }
 }

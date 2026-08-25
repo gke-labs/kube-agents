@@ -5,9 +5,12 @@ capacity failure. Each one wedges a real workload on the target cluster and then
 publishes the matching scale-up failure alert, so an investigation starts immediately
 instead of whenever the autoscaler next emits its periodic log.
 
-These are manual tools for demos and for exercising the skill. They are not part of
-CI — `verify.sh` in the parent directory is the automated smoke test, and it checks
-only that an alert reaches the agent.
+They serve two callers. Run by hand they are demo and skill-exercise tools; they are
+also driven by the E2E suite, where `tests/e2e/test_stockout_investigation.py` executes
+`<slug>.sh --teardown` and fails on a non-zero exit. The RC promotion gate runs scenario
+04 and the nightly matrix runs whatever `STOCKOUT_SCENARIOS` selects, so a scenario that
+exits non-zero reds a release gate. `verify.sh` in the parent directory is the narrower
+probe the same suite runs first: it checks only that an alert reaches the agent.
 
 ## Why each scenario deploys a workload
 
@@ -109,6 +112,16 @@ agent ignored it. `MGMT_CONTEXT` defaults to the active kubectl context. Also
 `TARGET_CLUSTER_LOCATION`,
 `MGMT_CONTEXT`, `PROD_CONTEXT`, `AGENT_NAMESPACE`, `WORKLOAD_NAMESPACE`,
 `STOCKOUT_TOPIC`, `GITOPS_REPO`.
+
+`SCENARIO_MACHINES` pins the machine shapes a scenario wedges on, skipping whatever
+discovery it would otherwise do. Only `05-missing-ondemand-floor.sh` reads it today, and
+that scenario is the one prerequisite worth calling out: it locates a shape the region
+offers on demand but not on Spot using `gcloud beta compute advice capacity`, so it
+refuses to start without the `beta` component (`gcloud components install beta`) — in
+preflight, before anything is deployed. Setting `SCENARIO_MACHINES` skips the probe and
+the requirement with it, and `--cleanup` is exempt either way, so a workload left behind
+can still be torn down on a machine without the component. The E2E workflows install
+`beta` already; this bites a hand-run.
 
 ## Adding a scenario
 

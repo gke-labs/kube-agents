@@ -64,7 +64,6 @@ mcp<2
 
 python-dotenv
 pyyaml
-uv
 
 # `make coverage` and the CI coverage job. coverage runs the unittest suite
 # under measurement; diff-cover reads the resulting coverage.xml plus the

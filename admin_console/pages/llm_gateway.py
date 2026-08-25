@@ -14,7 +14,7 @@ import streamlit as st
 from admin_console.clients.portal_api import PortalApiClient, PortalApiError
 from admin_console.connection_gate import require_connection
 from admin_console.connection_session import recover_app_shell
-from admin_console.project_config import DeploymentTarget, region_for_location
+from admin_console.project_config import DeploymentTarget
 from admin_console.ui import render_command_evidence
 
 recover_app_shell()
@@ -226,13 +226,14 @@ with st.form(
             else {}
         )
         for setting in provider.get("settings", []):
-            default = (
-                current_settings.get(setting["id"])
-                or (
-                    target.project_id
-                    if setting["id"] == "project_id"
-                    else region_for_location(target.location)
-                )
+            # The location prefill is "global", not the cluster's region: a
+            # model is only callable from a location that serves it, and the
+            # cluster's often is not one. This field is submitted verbatim, so
+            # a regional prefill would override the same default the gateway
+            # applies -- see DEFAULT_VERTEX_LOCATION in
+            # k8s-operator/scripts/installer_common.sh.
+            default = current_settings.get(setting["id"]) or (
+                target.project_id if setting["id"] == "project_id" else "global"
             )
             settings[setting["id"]] = st.text_input(
                 setting["label"],

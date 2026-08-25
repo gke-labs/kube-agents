@@ -34,9 +34,11 @@ import (
 const (
 	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
 	// collector. It is the last rung of the resolution ladder: the value used when
-	// nothing is configured and no collector is discovered. The same endpoint is used by
-	// the LiteLLM integration, so agent traces and LLM-call telemetry land in the same
-	// place (Cloud Trace/Logging).
+	// nothing is configured and discovery did not establish what the cluster has —
+	// switched off, or no probe completed. A probe that completes and finds nothing
+	// resolves to otlpSourceNone instead, and this value is not used. The same endpoint
+	// is used by the LiteLLM integration, so agent traces and LLM-call telemetry land in
+	// the same place (Cloud Trace/Logging).
 	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
 
 	// otelEndpointEnvVar is the operator-level override, set on the controller-manager
@@ -63,10 +65,10 @@ const (
 	// expired this window is long gone.
 	otelProbeRetryAfter = 30 * time.Second
 
-	// otelRediscoverAfter re-queues an agent that resolved to the bare default. That is
-	// the only outcome that can silently improve on its own, and reconciles are
-	// event-driven, so without a nudge a collector installed later might not be picked up
-	// for hours.
+	// otelRediscoverAfter re-queues an agent that resolved to the bare default or to
+	// otlpSourceNone. Those are the outcomes that can silently improve on their own, and
+	// reconciles are event-driven, so without a nudge a collector installed later might
+	// not be picked up for hours.
 	otelRediscoverAfter = 15 * time.Minute
 
 	// otlpHTTPPort is the conventional OTLP/HTTP receiver port.
@@ -80,7 +82,51 @@ const (
 	otlpSourceOperatorEnv   = "OperatorEnv"
 	otlpSourceDiscovered    = "Discovered"
 	otlpSourceDefault       = "Default"
+
+	// otlpSourceNone is the outcome when discovery completed and this cluster has no
+	// collector. Nothing is configured and there is nowhere to export, so the agent is
+	// wired with no endpoint and OTEL_SDK_DISABLED=true rather than being pointed at a
+	// managed collector that is not installed. Distinct from Default, which still means
+	// "the GKE managed collector" and is what an install gets when discovery is switched
+	// off or could not complete.
+	otlpSourceNone = "None"
 )
+
+// otlpDiscovery is how much a probe — or the cache standing in for one — actually
+// established. The endpoint alone cannot carry this: "" is the answer both when the
+// cluster has no collector and when nothing could be determined, and those two want
+// opposite treatment.
+type otlpDiscovery int
+
+const (
+	// otlpDiscoveryUnknown means a probe was due but established nothing — it could not
+	// complete, and there is no cached answer. The caller falls through to the managed
+	// default unless the agent's own status carries a previous discovery result.
+	otlpDiscoveryUnknown otlpDiscovery = iota
+	// otlpDiscoveryFound means a collector was found; the endpoint is non-empty.
+	otlpDiscoveryFound
+	// otlpDiscoveryNone means a probe completed and this cluster has no collector.
+	otlpDiscoveryNone
+	// otlpDiscoveryOff means nobody looked, because OTEL_COLLECTOR_DISCOVERY is false.
+	//
+	// Distinct from Unknown, which is otherwise the same "no answer", because the two
+	// want opposite treatment of a previously recorded result. An inconclusive probe is
+	// a reason to keep serving what was last established; switching discovery off is an
+	// instruction to stop consulting discovery at all, including its recorded verdict.
+	// Collapsing them makes OTEL_COLLECTOR_DISCOVERY=false a no-op for exactly the agents
+	// that have already resolved to None, which is the population most likely to be
+	// setting it.
+	otlpDiscoveryOff
+)
+
+// discoveryOutcome classifies an endpoint that came from an authoritative probe, where
+// "" is a real answer rather than an absence.
+func discoveryOutcome(endpoint string) otlpDiscovery {
+	if endpoint == "" {
+		return otlpDiscoveryNone
+	}
+	return otlpDiscoveryFound
+}
 
 // collectorCandidate is a Service the probe looks for by name before falling back to
 // label matching.
@@ -241,7 +287,8 @@ func discoverCollectorEndpoint(ctx context.Context, reader client.Reader) (strin
 		return matches[0].endpoint, true
 	}
 
-	log.Info("No in-cluster OpenTelemetry collector found; using the default endpoint", "endpoint", managedOTelEndpoint)
+	log.Info("No in-cluster OpenTelemetry collector found; telemetry export will be disabled for agents " +
+		"that do not configure an endpoint themselves")
 	return "", true
 }
 
@@ -272,16 +319,22 @@ func (r *PlatformAgentReconciler) telemetryReader() client.Reader {
 // operator restart empties the cache, so without it a single API error on the very first
 // probe after a restart resolves to the default, rolls every agent pod onto a collector
 // that may not exist, and rolls them all back when the next probe succeeds.
-func (r *PlatformAgentReconciler) discoveredOTLPEndpoint(ctx context.Context, lastKnown string) string {
+func (r *PlatformAgentReconciler) discoveredOTLPEndpoint(ctx context.Context, lastKnown string) (string, otlpDiscovery) {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(otelDiscoveryEnvVar)), "false") {
-		return ""
+		// Not "this cluster has no collector" — nobody looked. The documented purpose of
+		// switching discovery off is to fall straight through to the managed default, so
+		// this reports Off rather than None; reporting None would disable telemetry on
+		// the strength of a probe that never ran. It is also not Unknown: the caller
+		// replays a recorded None over Unknown, which would leave an agent already at
+		// None stuck there and make this switch a no-op for it.
+		return "", otlpDiscoveryOff
 	}
 
 	r.otelMu.Lock()
 	defer r.otelMu.Unlock()
 
 	if r.otelResolved && time.Since(r.otelResolvedAt) < otelDiscoveryTTL {
-		return r.otelEndpoint
+		return r.otelEndpoint, discoveryOutcome(r.otelEndpoint)
 	}
 
 	// Reaching here means nothing is cached or the TTL expired, so a probe is due —
@@ -289,30 +342,39 @@ func (r *PlatformAgentReconciler) discoveredOTLPEndpoint(ctx context.Context, la
 	// trip this: a success stamps otelResolvedAt too, and the TTL above is far longer
 	// than this floor.
 	if !r.otelProbedAt.IsZero() && time.Since(r.otelProbedAt) < otelProbeRetryAfter {
-		if r.otelEndpoint != "" {
-			return r.otelEndpoint
-		}
-		return lastKnown
+		return r.staleOrLastKnown(lastKnown)
 	}
 	r.otelProbedAt = time.Now()
 
 	endpoint, determined := discoverCollectorEndpoint(ctx, r.telemetryReader())
 	if !determined {
-		// Keep serving the last known good answer rather than flapping to the default.
-		// The in-memory value wins when there is one: it came from a probe, whereas
-		// lastKnown is a per-agent status field. Deliberately neither cached nor
-		// promoted into r.otelEndpoint — the cache is cluster-wide and one agent's
-		// recorded endpoint is not an authoritative answer for the rest of the fleet.
-		if r.otelEndpoint != "" {
-			return r.otelEndpoint
-		}
-		return lastKnown
+		return r.staleOrLastKnown(lastKnown)
 	}
 
 	r.otelEndpoint = endpoint
 	r.otelResolved = true
 	r.otelResolvedAt = time.Now()
-	return endpoint
+	return endpoint, discoveryOutcome(endpoint)
+}
+
+// staleOrLastKnown answers when the current probe told us nothing: from an expired but
+// authoritative cached probe if there is one, else from this agent's own recorded
+// endpoint. The caller holds otelMu.
+//
+// An expired authoritative answer is preferred to falling through to the default even
+// when that answer was "no collector". The alternative flaps: a single API error would
+// switch telemetry back on across the fleet, roll every agent pod, and roll them all
+// back when the next probe succeeds. Nothing here is cached or promoted into
+// r.otelEndpoint — the cache is cluster-wide and one agent's recorded endpoint is not an
+// authoritative answer for the rest of the fleet.
+func (r *PlatformAgentReconciler) staleOrLastKnown(lastKnown string) (string, otlpDiscovery) {
+	if r.otelResolved {
+		return r.otelEndpoint, discoveryOutcome(r.otelEndpoint)
+	}
+	if lastKnown != "" {
+		return lastKnown, otlpDiscoveryFound
+	}
+	return "", otlpDiscoveryUnknown
 }
 
 // resolveOTLPEndpoint decides where this agent's telemetry goes, and reports how.
@@ -323,12 +385,20 @@ func (r *PlatformAgentReconciler) discoveredOTLPEndpoint(ctx context.Context, la
 //	spec.telemetry.otlpEndpoint                       the first-class field
 //	OTEL_COLLECTOR_ENDPOINT on the controller-manager an install-wide default
 //	in-cluster discovery                              a collector we can find
+//	nothing, when discovery says the cluster has none  (otlpSourceNone)
 //	managedOTelEndpoint                               the GKE managed collector
 //
 // The raw env override sits at the top because it already worked that way — mergeEnvVars
 // applies spec.deployment.env after the operator's own values — and demoting it would
 // silently redirect telemetry for anyone already relying on it. Any explicit rung short-
 // circuits discovery, so a configured install makes no extra API calls at all.
+//
+// The last two rungs are one decision, not two: the managed endpoint is the answer only
+// when nobody established that the cluster lacks a collector. Once discovery has probed
+// and come back empty, wiring the managed endpoint anyway is what #831 reported — the
+// exporter then retries a name that never resolves for the life of the pod. An empty
+// endpoint with otlpSourceNone is returned instead, and the manifest layer turns that
+// into OTEL_SDK_DISABLED=true.
 func (r *PlatformAgentReconciler) resolveOTLPEndpoint(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
 	if agent != nil && agent.Spec.Deployment != nil {
 		for _, env := range agent.Spec.Deployment.Env {
@@ -348,16 +418,41 @@ func (r *PlatformAgentReconciler) resolveOTLPEndpoint(ctx context.Context, agent
 		return endpoint, otlpSourceOperatorEnv
 	}
 
-	// Only a previously *discovered* endpoint is offered back as the last known good one.
-	// Status also records endpoints that came from the rungs above, and replaying one of
-	// those here would launder a removed override into a discovery result.
+	// Only a previous answer that came from *discovery* is offered back. Status also
+	// records endpoints that came from the rungs above, and replaying one of those here
+	// would launder a removed override into a discovery result.
+	//
+	// Both discovery outcomes count, not just Discovered. A recorded None is exactly as
+	// authoritative as a recorded endpoint — the same probe produced it — and it is the
+	// only thing that carries "this cluster has no collector" across an operator restart,
+	// which the in-memory cache cannot. Without it, a restart plus one API error resolves
+	// every agent on a collector-less cluster to the managed default, puts
+	// OTEL_EXPORTER_OTLP_ENDPOINT back, rolls every pod, and rolls them all back 30
+	// seconds later when the next probe succeeds.
 	var lastKnown string
-	if agent != nil && agent.Status.Telemetry.OTLPEndpointSource == otlpSourceDiscovered {
-		lastKnown = agent.Status.Telemetry.OTLPEndpoint
+	lastKnownNone := false
+	if agent != nil {
+		switch agent.Status.Telemetry.OTLPEndpointSource {
+		case otlpSourceDiscovered:
+			lastKnown = agent.Status.Telemetry.OTLPEndpoint
+		case otlpSourceNone:
+			lastKnownNone = true
+		}
 	}
 
-	if endpoint := r.discoveredOTLPEndpoint(ctx, lastKnown); endpoint != "" {
+	switch endpoint, outcome := r.discoveredOTLPEndpoint(ctx, lastKnown); outcome {
+	case otlpDiscoveryFound:
 		return endpoint, otlpSourceDiscovered
+	case otlpDiscoveryNone:
+		return "", otlpSourceNone
+	case otlpDiscoveryUnknown:
+		// A probe was due and established nothing. A recorded None stands rather than
+		// flapping to the managed default and rolling the pod. Deliberately not done for
+		// otlpDiscoveryOff: there, the operator has said to stop consulting discovery,
+		// and replaying its recorded verdict would make the switch do nothing.
+		if lastKnownNone {
+			return "", otlpSourceNone
+		}
 	}
 
 	return managedOTelEndpoint, otlpSourceDefault

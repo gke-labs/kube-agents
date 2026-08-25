@@ -19,9 +19,13 @@ locals {
     "gsuiteaddons.googleapis.com",
   ] : []
 
-  use_vertex      = var.model_provider == "vertex_ai"
-  vertex_project  = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
-  vertex_location = var.vertex_location != "" ? var.vertex_location : var.location
+  use_vertex     = var.model_provider == "vertex_ai"
+  vertex_project = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
+  # Not var.location: a model is only callable from a location that serves it,
+  # and the cluster's is often not one — on a zonal cluster it is not even a
+  # valid Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
+  # k8s-operator/scripts/installer_common.sh.
+  vertex_location = var.vertex_location != "" ? var.vertex_location : "global"
   litellm_ksa     = "kubeagents-litellm"
 
   # The minter chart values need the GitOps repository split into owner and

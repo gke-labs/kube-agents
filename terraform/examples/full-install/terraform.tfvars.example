@@ -75,7 +75,10 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # model_default_name = ""
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
-# Both vertex_* variables default to the install's project and cluster location.
+# vertex_project_id defaults to the install's project; vertex_location defaults
+# to "global" rather than the cluster location, because a model is only callable
+# from a location that serves it. Set a region for a data-residency requirement,
+# or for a Model Garden partner model served only from specific regions.
 # model_provider     = "vertex_ai"
 # model_default_name = "gemini-3.5-flash"
 # vertex_project_id  = ""

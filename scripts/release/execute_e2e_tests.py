@@ -3,9 +3,9 @@
 
 Reads the test matrix from tests/e2e/e2e_config.yaml (or $E2E_CONFIG),
 resolves target GCP project, GKE cluster, region, and namespace for each
-environment (e.g. gchat-e2e, cluster-e2e), applies Terraform infrastructure
-at test start if configured (idempotently, preserving the cluster without teardown),
-and executes the specified pytest suites.
+environment (e.g. gchat-e2e, agent-plugin-e2e), and executes the specified
+pytest suites. The cluster is expected to exist already; nothing here
+provisions infrastructure.
 """
 
 import argparse
@@ -207,6 +207,17 @@ def run_environment_tests(
         "AGENT_NAMESPACE": namespace,
         "KUBE_CONTEXT": kube_ctx,
         "REGISTRY": reg,
+        # Name the environment we picked, so conftest's fixtures fall through to this
+        # environment's env_vars rather than e2e_config.yaml's default_environment.
+        # No fixture changes value today -- every key a config lookup would reach is
+        # either exported above or already in os.environ from **custom_env_vars -- with
+        # one exception. e2e-nightly-matrix.yml exports E2E_ENV from a dispatch input
+        # whose choices include "all"; this loop expands that into one child per
+        # environment, but the ambient "all" used to ride through to every one of them,
+        # and conftest matches names exactly, so the lookup found nothing. Naming the
+        # child's own environment also stops being cosmetic the moment a block declares
+        # its own project_id or cluster_name.
+        "E2E_ENV": env_name,
     }
     if "CLOUDSDK_PYTHON" in env_vars:
         del env_vars["CLOUDSDK_PYTHON"]
@@ -231,7 +242,7 @@ def main() -> None:
     parser.add_argument(
         "--env",
         type=str,
-        help="Filter execution to a specific environment name (e.g. gchat-e2e, cluster-e2e)",
+        help="Filter execution to a specific environment name (e.g. gchat-e2e, agent-plugin-e2e)",
     )
 
     args, extra_args = parser.parse_known_args()

@@ -227,7 +227,10 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
         self.assertEqual(
             len(deployments), 1,
             f"expected one Deployment in {self.GOLDEN.name}, found {len(deployments)}")
-        containers = deployments[0]["spec"]["template"]["spec"]["containers"]
+        pod = deployments[0]["spec"]["template"]["spec"]
+        # Both lists: the credential proxy is a native sidecar, so it lives in
+        # initContainers with restartPolicy: Always rather than in containers.
+        containers = pod.get("containers", []) + pod.get("initContainers", [])
         for container in containers:
             if container.get("name") == name:
                 return container

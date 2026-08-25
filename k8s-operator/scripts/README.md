@@ -15,6 +15,7 @@ their own copies:
 | --------------------------------------- | -------------------------------------------------------------------- |
 | `DEFAULT_CLUSTER_NAME`                  | GKE cluster name (`platform-agent-host`)                             |
 | `DEFAULT_REGION`                        | GCP region (`us-central1`)                                           |
+| `DEFAULT_VERTEX_LOCATION`               | Vertex AI serving location (`global`)                                |
 | `DEFAULT_MODEL_PROVIDER`                | Model provider (`gemini`)                                            |
 | `DEFAULT_REGISTRY_PREFIX`               | Container registry prefix                                            |
 | `default_model_for_provider <provider>` | The default model for a provider                                     |

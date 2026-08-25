@@ -139,6 +139,7 @@ def test_stockout_ingress_alert_smoke(
     gcp_project_id: Optional[str],
     gke_cluster_name: Optional[str],
     gcp_region: str,
+    agent_namespace: str,
 ) -> None:
     """Verifies that synthetic autoscaler scale-up error alerts can be published to the PubSub topic."""
     if os.environ.get("SKIP_STOCKOUT") == "1":
@@ -152,7 +153,7 @@ def test_stockout_ingress_alert_smoke(
 
     # Check if the stockout plugin is active in the cluster
     res_plugin = subprocess.run(
-        ["kubectl", "get", "agentplugins", "gkestockoutinvestigator", "-n", "kubeagents-system"],
+        ["kubectl", "get", "agentplugins", "gkestockoutinvestigator", "-n", agent_namespace],
         capture_output=True,
         text=True,
         timeout=5,
@@ -165,6 +166,10 @@ def test_stockout_ingress_alert_smoke(
         "TARGET_CLUSTER_NAME": gke_cluster_name,
         "GCP_PROJECT_ID": gcp_project_id,
         "TARGET_CLUSTER_LOCATION": gcp_region,
+        # verify.sh reads AGENT_NAMESPACE too. Under execute_e2e_tests.py it is already
+        # exported, but a bare `pytest tests/e2e/...` is a documented run mode, and there
+        # the fixture would probe one namespace while verify.sh read another.
+        "AGENT_NAMESPACE": agent_namespace,
     }
 
     proc = subprocess.run([str(verify_script)], capture_output=True, text=True, env=env)
@@ -184,6 +189,7 @@ def test_stockout_scenario(
     gcp_project_id: Optional[str],
     gke_cluster_name: Optional[str],
     gcp_region: str,
+    agent_namespace: str,
     scenario_slug: str,
     rule: str,
     description: str,
@@ -222,6 +228,8 @@ def test_stockout_scenario(
         "TARGET_CLUSTER_NAME": gke_cluster_name,
         "GCP_PROJECT_ID": gcp_project_id,
         "TARGET_CLUSTER_LOCATION": gcp_region,
+        # scenarios/lib/common.sh reads AGENT_NAMESPACE; see the note in the smoke test.
+        "AGENT_NAMESPACE": agent_namespace,
     }
 
     # Watch timeout can be customized via STOCKOUT_WATCH_TIMEOUT (default 360 seconds)
