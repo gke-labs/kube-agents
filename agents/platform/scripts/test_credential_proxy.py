@@ -638,6 +638,39 @@ class GitHardeningTest(unittest.TestCase):
         executor.execute(["git", "status", "--porcelain"], cwd=str(repository))
         self.assertFalse(self.executed(), "core.fsmonitor ran")
 
+    def test_a_pager_in_the_repository_config_does_not_run(self):
+        # `core.pager` is NOT in GIT_FORCED_CONFIG and is not refused in argv.
+        # What closes it is that `_execute` captures output through a pipe, so
+        # git never sees a terminal on stdout and never starts a pager. That is
+        # an implementation detail of the executor rather than a control, which
+        # is exactly why it is pinned here.
+        #
+        # Measured against git 2.55 under the same pinned environment, varying
+        # only the descriptor: with stdout on a pty, a repository-local
+        # `core.pager` executes on `git log`, `git diff`, `git show` and
+        # `git branch` — all read verbs, none of which takes a lease. With
+        # stdout on a pipe none of them runs it, and `--paginate`/`-p` does not
+        # change that.
+        #
+        # So if this test ever fails, the executor has started giving git a
+        # terminal, and a repository-local config value the agent writes is
+        # arbitrary code execution in the credential container again. The fix
+        # then is not to pin `core.pager` — `pager.<cmd>` reaches the same place
+        # with an arbitrary name in the key — it is to keep the pipe.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, f"\n[core]\n\tpager = {self.payload}\n"
+        )
+        for argv in (
+            ["git", "log", "--oneline"],
+            ["git", "branch"],
+            ["git", "--paginate", "log", "--oneline"],
+        ):
+            with self.subTest(argv=argv):
+                executor.execute(argv, cwd=str(repository))
+                self.assertFalse(self.executed(), f"core.pager ran for {argv}")
+
     def dirty_repository(self, executor, name="repo"):
         """A repository with one tracked file and an uncommitted change."""
         repository = self.repository(executor, name)

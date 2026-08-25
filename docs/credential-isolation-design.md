@@ -402,18 +402,54 @@ fetch and push uses an `https` URL built from a fixed prefix.
 the runtime executing inside a directory the sandbox owns.
 
 The pins do not extend to configuration stored in a repository's own
-`.git/config`, which the sandbox authors and which git consults for settings that
-name a program to run. Some such settings can be pinned and are; others take an
-arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`,
-`man.<tool>.cmd`, `browser.<tool>.cmd`, `trailer.<name>.cmd`) and therefore
-cannot be enumerated at all. Where every way of reaching such a key is itself
-nameable, those triggers are refused instead — that is what the `help` and
-`interpret-trailers` subcommand entries and the `--help` and `--trailer` option
-entries above are for. This is weaker than a pin and should be read that way.
-The key stays settable, so the refusals hold only while the set of triggers is
-complete, and completeness is an empirical claim about a program that changes:
-`man.<tool>.cmd` turned out to have two triggers rather than one, and the second
-was found after the first had been closed and documented as closed.
+`.git/config`. That file is inside the shared workspace, so the sandbox can write
+it directly, with no proxied command involved and nothing for the argument-vector
+checks to inspect; the runtime then reads it on the next request. Where every way
+of reaching such a key is itself nameable, those triggers are refused instead —
+that is what the `help` and `interpret-trailers` subcommand entries and the
+`--help` and `--trailer` option entries above are for. This is weaker than a pin
+and should be read that way. The key stays settable, so the refusals hold only
+while the set of triggers is complete, and completeness is an empirical claim
+about a program that changes: `man.<tool>.cmd` turned out to have two triggers
+rather than one, and the second was found after the first had been closed and
+documented as closed.
+
+Measured against git 2.55 under the pinned environment, driving the runtime's own
+executor, these repository-local keys still reach a command:
+
+| Key                      | Reached by                           | Why it is not pinned            |
+| ------------------------ | ------------------------------------ | ------------------------------- |
+| `diff.external`          | `git diff`                           | no value disables it; see above |
+| `diff.<driver>.command`  | `git diff` with `.gitattributes`     | arbitrary name                  |
+| `diff.<driver>.textconv` | `git diff` with `.gitattributes`     | arbitrary name                  |
+| `filter.<name>.clean`    | `git add` with `.gitattributes`      | arbitrary name                  |
+| `filter.<name>.smudge`   | `git checkout` with `.gitattributes` | arbitrary name                  |
+| `alias.<name>`           | `git <name>`                         | arbitrary name                  |
+
+Every trigger in that table is a read verb or a verb the product already issues,
+and none of them takes a lease. Extending the pinned layer does not close any of
+them: five take an arbitrary name inside the key, so there is nothing to
+enumerate, and the sixth has no value that means "off". `.gitattributes` is in
+the workspace too, so the two keys that need it are no harder to reach than the
+rest.
+
+The same measurement found several keys that do **not** reach a command here, and
+each is worth knowing because it is a control rather than an accident, except the
+last: `core.editor` and `sequence.editor` are outranked by `GIT_EDITOR` and
+`GIT_SEQUENCE_EDITOR`; `core.sshCommand` is unreachable while the transport
+allowlist is `https` only; `init.templateDir` installs hooks that the
+`core.hooksPath` pin then ignores; and `core.hooksPath` and `core.fsmonitor` are
+pinned directly.
+
+`core.pager` is the exception, and it is closed by accident. It executes on a
+read verb — `git log`, `git diff`, `git show`, `git branch` — whenever git has a
+terminal on stdout. It does not execute here only because the runtime captures
+output through a pipe, so git never starts a pager; `--paginate` does not change
+that. Nothing declares this, so a change to how the runtime captures output would
+turn a repository-local config value into arbitrary code execution. Pinning
+`core.pager` would not help, because `pager.<command>` reaches the same place with
+an arbitrary name in the key. The pipe is the control, and there is a test that
+fails if it goes away.
 
 That file reaches the credential as well as the program search. A credential
 helper configured there is itself a command, and it runs for any host the
