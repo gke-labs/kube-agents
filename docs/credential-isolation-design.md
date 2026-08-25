@@ -101,9 +101,9 @@ is the sandbox reading the sidecar's process state and private volumes by
 identity; what it does not remove is the sandbox reaching the sidecar through
 bytes the sidecar itself agreed to read. This predates the UID split — before
 it, those bytes were the sandbox's own — so nothing here made it worse, and
-nothing here closes it. The countermeasure is refusing the configuration keys
-that select a program to run, which belongs to the command policy rather than
-to the Pod spec.
+nothing here closes it. What would close it is refusing the configuration keys
+that select a program to run, and that belongs to the command policy rather
+than to the Pod spec.
 
 ## Scope
 
