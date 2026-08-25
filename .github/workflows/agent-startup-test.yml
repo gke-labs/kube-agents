@@ -56,13 +56,18 @@ jobs:
               # Makefile prints; a Makefile-only change must run it or the
               # deploy contract it guards can revert unnoticed.
               - "k8s-operator/Makefile"
+              # tests/test_ci_gitops_repo.py extracts and runs the GitOps
+              # repository resolution out of this script. Its whole subject is
+              # what happens when resolution FAILS, which a green presubmit
+              # never exercises, so the guard has to follow the script.
+              - "hack/ci-deploy.sh"
               - ".github/workflows/agent-startup-test.yml"
 
       - name: Set up Python
         if: steps.filter.outputs.startup == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version-file: ".agent-python-version"
 
       # PyYAML is the only dependency: the tests use stdlib unittest so they run
       # anywhere the agent image does, without adding a test framework to the repo.

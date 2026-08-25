@@ -22,11 +22,29 @@ echo "Target Commit SHA: ${COMMIT_SHA:-(not specified)}"
 echo "Readiness Timeout: ${READINESS_TIMEOUT} (5 minutes)"
 echo "======================================================================"
 
-gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" --project "${PROJECT_ID}" \
-  ${GKE_DNS_ENDPOINT_FLAG}
+unset CLOUDSDK_PYTHON || true
+unset CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE || true
+export CLOUDSDK_PYTHON_SITEPACKAGES="0"
+export PYTHONNOUSERSITE="1"
+export USE_GKE_GCLOUD_AUTH_PLUGIN="True"
+export CLOUDSDK_CONTAINER_USE_APPLICATION_DEFAULT_CREDENTIALS="false"
+gcloud config set container/use_application_default_credentials false --quiet || true
+
+if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${GOOGLE_APPLICATION_CREDENTIALS}" ]; then
+  gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" --quiet || true
+fi
+
+CURRENT_CTX="$(kubectl config current-context 2>/dev/null || echo "")"
+if ! kubectl cluster-info >/dev/null 2>&1 || [[ "${CURRENT_CTX}" != *"${CLUSTER_NAME}"* || "${CURRENT_CTX}" != *"${PROJECT_ID}"* ]]; then
+  echo "Connecting kubectl to target cluster '${CLUSTER_NAME}' in project '${PROJECT_ID}'..."
+  gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
+  # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+  gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" --project "${PROJECT_ID}" \
+    ${GKE_DNS_ENDPOINT_FLAG}
+fi
+
+echo "🔑 Configuring Docker authentication for Artifact Registry (${REGION}-docker.pkg.dev)..."
+gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true
 
 if [ -n "${COMMIT_SHA}" ]; then
   echo "🔍 Verifying platform-agent-gateway deployment container image matches commit ${COMMIT_SHA}..."

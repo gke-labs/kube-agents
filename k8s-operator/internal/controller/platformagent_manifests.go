@@ -60,7 +60,8 @@ const (
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
 	// only kubelet's port-forward can reach.
-	dashboardPort = 9119
+	dashboardPort        = 9119
+	tmpScratchVolumeName = "tmp-scratch"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -289,19 +290,52 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 // here would break /sethome exactly the way the read-only mount did.
 //
 // Emitted even when empty: the volume projects this key by name, and a ConfigMap item
-// that names a missing key fails the mount and the pod never starts.
+// that names a missing key fails the mount and the pod never starts. Since API_SERVER_KEY
+// below is unconditional it is no longer ever empty in practice, but the projection still
+// depends on the key existing, not on it having content.
 func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
-	integration := agent.Spec.Integration
-	if integration == nil {
-		return ""
-	}
-
 	// Fixed order, not map iteration: this render feeds the config hash, and a hash that
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
 	add := func(key, value string) {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
+
+	// UNCONDITIONAL, and the only pin here that is not about chat. Every other key below
+	// exists because the agent could otherwise write a competing value into the PVC .env;
+	// this one exists because something already does, on every boot, without being asked.
+	//
+	// Hermes' Docker stage2 hook generates a strong random API_SERVER_KEY into
+	// $HERMES_HOME/.env whenever that file does not already carry one, and
+	// load_hermes_dotenv applies the PVC .env with override=True. So the container env
+	// this render is supposed to agree with was being overwritten before the gateway ever
+	// read it, and the API server ended up authenticating against a 64-character value
+	// that neither the operator, the Secret, the sidecar, nor the process environment had
+	// ever seen. Every authenticated route 401'd — the loopback callers directly, and the
+	// external path through the Service too, because the credential proxy re-signs
+	// upstream with AGENT_API_UPSTREAM_KEY, which is this same sentinel. Issue #786; the
+	// seven consecutive cron relay deliveries that recorded success while being rejected
+	// are the reason it went unnoticed for so long.
+	//
+	// The managed .env is applied LAST of all, after the PVC file, so pinning it here is
+	// what makes one value true everywhere without anyone having to know that .env exists.
+	// It also stops the agent rotating the key out from under its own callers, since
+	// save_env_value refuses to write a key this file holds.
+	//
+	// Deliberately not a per-boot generated secret. The value is worthless — see
+	// loopbackAgentAPIKey — and a generated one would have to be transported to the
+	// sidecar's AGENT_API_UPSTREAM_KEY and to the probe's bearer, reintroducing exactly
+	// the several-parties-must-agree problem this closes.
+	add("API_SERVER_KEY", loopbackAgentAPIKey)
+
+	integration := agent.Spec.Integration
+	if integration == nil {
+		return strings.Join(lines, "\n") + "\n"
+	}
+
+	// The gateway-wide pair below is pinned only when a platform is, so the chat block
+	// records where it started rather than testing `lines` for emptiness.
+	platformStart := len(lines)
 
 	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
 		add("GOOGLE_CHAT_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
@@ -317,8 +351,8 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
 	}
 
-	if len(lines) == 0 {
-		return ""
+	if len(lines) == platformStart {
+		return strings.Join(lines, "\n") + "\n"
 	}
 
 	// The gateway-wide pair, pinned empty/false whenever any platform is pinned above.
@@ -521,6 +555,32 @@ const (
 	// Hermes expects (config.yaml and .env).
 	managedVolumeName = "platform-agent-managed-vol"
 )
+
+// loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
+// it is a MARKER RATHER THAN A SECRET on purpose: the listener binds loopback only
+// (API_SERVER_HOST above), so everything that can reach it is already inside this pod.
+// The credential that actually guards the API from outside is API_SERVER_EXTERNAL_KEY,
+// held by the credential-proxy sidecar alone, which authenticates the caller and then
+// re-signs the request upstream with this value (AGENT_API_UPSTREAM_KEY).
+//
+// It is a named constant because its VALUE is worthless and its AGREEMENT is the whole
+// point. Four places have to say the same thing — the agent container's env, the
+// sidecar's AGENT_API_UPSTREAM_KEY, the sidecar's own copy for the event watcher, and
+// the managed .env pin in renderManagedEnv — and issue #786 is what a fifth party
+// disagreeing costs: Hermes' Docker stage2 hook generates a strong key into
+// $HERMES_HOME/.env when that file does not already carry one, load_hermes_dotenv
+// applies that file with override=True, and the gateway then authenticated against a
+// value invented at boot that no caller in the system knew. Every authenticated route
+// 401'd, in-pod and through the Service, and every caller degraded quietly.
+//
+// The renderManagedEnv pin is what settles it: the managed .env is applied last of all,
+// after the PVC file, so this value wins whatever stage2 wrote. Adding a fifth reader
+// means using this constant, not repeating the literal.
+//
+// Length is load-bearing, minimally: Hermes refuses to bind the API server at all for a
+// key under 16 characters (has_usable_secret(min_length=16), called from
+// gateway/platforms/api_server.py's startup guard). This is 24.
+const loopbackAgentAPIKey = "cluster-internal-trusted"
 
 // profileOverlayKey returns the ConfigMap key carrying the overlay for a profile.
 func profileOverlayKey(profile string) string {
@@ -1622,9 +1682,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 		{
 			// The sidecar authenticates external callers and replaces their bearer
-			// key with this non-secret loopback sentinel.
+			// key with this non-secret loopback sentinel. Setting it here is NOT
+			// sufficient on its own — the PVC .env beats the container env inside
+			// Hermes — which is why renderManagedEnv pins the same value; see
+			// loopbackAgentAPIKey.
 			Name:  "API_SERVER_KEY",
-			Value: "cluster-internal-trusted",
+			Value: loopbackAgentAPIKey,
 		},
 		// API_SERVER_MODEL_NAME belongs here by topic but is appended after the
 		// env merge instead — see buildBaseContainers, and apiServerModelEnvVar
@@ -1640,7 +1703,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	//
 	//   SESSION_KV_API_KEY  authenticates callers of the Session KV server on
 	//                       127.0.0.1:8699. This container both serves it and
-	//                       calls it (platform_mcp_server, incident_context).
+	//                       calls it (platform_mcp_server, incident_context,
+	//                       and the gateway's kanban notifier).
 	//   SESSION_KV_SALT     the HMAC salt for pseudonymising chat identities.
 	//                       It has to be here because the hashing happens here,
 	//                       at the point the identity is first seen.
@@ -2131,6 +2195,80 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 			MountPath: path.Dir(sessionKVDBPath),
 			SubPath:   "session",
 		},
+		{
+			// The one writable path outside the PVC, and the reason
+			// readOnlyRootFilesystem is survivable here: docker-entrypoint.sh runs
+			// four hermes invocations with HOME=/tmp before the agent starts, and
+			// the image is otherwise root-owned against a runtime UID of 10000.
+			Name:      tmpScratchVolumeName,
+			MountPath: "/tmp",
+		},
+	}
+}
+
+// dropTmpScratchIfClaimed removes the operator's /tmp mount when the CR already mounts
+// something there via storages or extraVolumeMounts.
+//
+// Those are appended to the defaults without deduplication, and the API server rejects a
+// Pod spec with two mounts on one mountPath. So without this the /tmp mount added above
+// would not merely be redundant on such a CR, it would make the Deployment unappliable and
+// stop reconciliation dead — on an upgrade, for a field the user set before /tmp was a
+// path the operator had any opinion about. Mounting scratch space at /tmp is exactly what
+// someone would have done while the root filesystem was still writable and there was no
+// other writable path outside the PVC, which is what makes this worth handling rather than
+// rejecting.
+//
+// The user's mount wins, deliberately: it is the one that predates this, and overriding it
+// would be a silent behaviour change on upgrade. If they mounted something read-only there
+// the agent will fail to start — but it would have failed the same way before this change,
+// since the entrypoint has always needed a writable /tmp.
+//
+// Narrow on purpose: it detects the collision by cleaned mountPath but removes the default
+// by volume name, and only ever for /tmp. The general form — drop every default whose
+// cleaned path a user mount claims — is the same amount of code and would cover the next
+// default the operator adds. It would also silently drop the data PVC mount if a CR set
+// homeDir to a path the defaults use, turning a Deployment the API server rejects outright
+// into an agent that comes up with no persistent home. A rejected Deployment is the better
+// failure of the two, so the generalisation waits for a second path that actually needs it.
+func dropTmpScratchIfClaimed(defaults, userMounts []corev1.VolumeMount) []corev1.VolumeMount {
+	claimed := false
+	for _, m := range userMounts {
+		if path.Clean(m.MountPath) == "/tmp" {
+			claimed = true
+			break
+		}
+	}
+	if !claimed {
+		return defaults
+	}
+	kept := make([]corev1.VolumeMount, 0, len(defaults))
+	for _, m := range defaults {
+		if m.Name != tmpScratchVolumeName {
+			kept = append(kept, m)
+		}
+	}
+	return kept
+}
+
+// hardenedSecurityContext is the container hardening every container the operator builds
+// carries: no privilege escalation, no capabilities, and a root filesystem the process
+// cannot write to.
+//
+// One helper rather than a literal per container, because the alternative has already
+// failed. The same three fields were written out five times, and three of the five had
+// silently drifted to two of them — the read-only root was on the credential sidecar and
+// the cleanup init container and on neither agent container nor the log shipper, which is
+// the gap this function was introduced to close (RUNTIME-007). Nothing failed while that
+// was true. A container added from here on gets the block by construction, and
+// TestEveryContainerHasAHardenedSecurityContext fails if one is built without it.
+//
+// Anything a container needs on top — a different user, a writable path — belongs on that
+// container, not here. This is the floor, not the whole context.
+func hardenedSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(false),
+		ReadOnlyRootFilesystem:   ptr.To(true),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 }
 
@@ -2154,12 +2292,8 @@ func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) c
   /workspace/home/.netrc \
   /workspace/home/.npmrc \
   /workspace/home/.pypirc`},
-		VolumeMounts: []corev1.VolumeMount{{Name: "platform-agent-data-vol", MountPath: "/workspace"}},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(true),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
+		VolumeMounts:    []corev1.VolumeMount{{Name: "platform-agent-data-vol", MountPath: "/workspace"}},
+		SecurityContext: hardenedSecurityContext(),
 		Resources: corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("200m"),
@@ -2296,9 +2430,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
+		SecurityContext: hardenedSecurityContext(),
 	}
 }
 
@@ -2333,7 +2465,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+		{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
 		// Read by the k8s-event-watcher this container hosts, via --token-env.
 		// A non-secret loopback sentinel, not a credential; the real secret is
 		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
@@ -2341,7 +2473,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// reserves the name — appending after that call would leave it
 		// protected only by its presence in SensitiveEnvVars, which is
 		// incidental and would not hold for a name not on that list.
-		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
+		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
 	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
 	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
@@ -2664,13 +2796,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 	resources := resolveResources(agent.Spec.Deployment)
 
-	volumeMounts := buildDefaultVolumeMounts(homeDir)
+	var userVolumeMounts []corev1.VolumeMount
 	if len(storages) > 0 {
-		volumeMounts = append(volumeMounts, buildCustomStorageVolumeMounts(storages)...)
+		userVolumeMounts = append(userVolumeMounts, buildCustomStorageVolumeMounts(storages)...)
 	}
 	if len(extraVolumeMounts) > 0 {
-		volumeMounts = append(volumeMounts, extraVolumeMounts...)
+		userVolumeMounts = append(userVolumeMounts, extraVolumeMounts...)
 	}
+	volumeMounts := append(dropTmpScratchIfClaimed(buildDefaultVolumeMounts(homeDir), userVolumeMounts), userVolumeMounts...)
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
@@ -2784,14 +2917,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:   agentAPIProbe(10, 60),
-			ReadinessProbe: agentAPIProbe(15, 3),
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
+			StartupProbe:    agentAPIProbe(10, 60),
+			ReadinessProbe:  agentAPIProbe(15, 3),
+			SecurityContext: hardenedSecurityContext(),
 		},
 	}
 
@@ -2878,6 +3006,13 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: path.Dir(sessionKVDBPath),
 				SubPath:   "session",
 			},
+			{
+				// Same emptyDir the gateway gets. Sharing it is not a new channel:
+				// these two containers already run the same image against the same
+				// data PVC, so they are one trust domain either way.
+				Name:      tmpScratchVolumeName,
+				MountPath: "/tmp",
+			},
 		}
 
 		// What keeps this container out of the shared tree is AGENT_SHARED_STATE_SETUP
@@ -2906,7 +3041,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 					corev1.ResourceMemory: resource.MustParse("2Gi"),
 				},
 			},
-			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
+			// Through the same guard as the gateway's list above. extraVolumeMounts
+			// reaches both containers, so a CR claiming /tmp collides here too.
+			VolumeMounts: append(dropTmpScratchIfClaimed(dashboardVolumeMounts, extraVolumeMounts), extraVolumeMounts...),
 			// What this buys is not what a probe on a serving container buys. The
 			// Service's :9119 endpoint is unreachable over the pod network either
 			// way (see dashboardPort), so nothing is being kept out of rotation.
@@ -2959,12 +3096,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				TimeoutSeconds:      5,
 				FailureThreshold:    3,
 			},
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
+			SecurityContext: hardenedSecurityContext(),
 		})
 	}
 
@@ -3010,12 +3142,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: "/fluent-bit/state",
 			},
 		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-			},
-		},
+		// Read-only root and no /tmp, the only container here with neither. The config
+		// above buffers in memory (Mem_Buf_Limit, no storage.path), keeps its tail DB on
+		// the fluent-bit-state volume and outputs to stdout, so it writes nothing to the
+		// root filesystem. Handing it the agent's tmp-scratch would only give an
+		// LLM-driven container a path into the log shipper.
+		SecurityContext: hardenedSecurityContext(),
 	})
 
 	// The k8s-event-watcher is not a container of its own. It runs inside
@@ -3105,6 +3237,31 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 						Name: agent.Name + "-settings",
 					},
 					DefaultMode: ptr.To(int32(0644)),
+				},
+			},
+		},
+		{
+			// Bounded, like every other scratch emptyDir here. Without a
+			// sizeLimit a runaway write fills the node's ephemeral storage and the
+			// kubelet evicts whoever it decides is the worst offender, which need
+			// not be this pod. With one, the eviction is this pod, for a stated
+			// reason, at a predictable threshold. Note that it is an eviction
+			// either way: enforcing the limit as an in-container ENOSPC needs the
+			// alpha LocalStorageCapacityIsolationFSQuotaMonitoring gate, which GKE
+			// does not enable. 2Gi matches credential-proxy-tmp, the closest
+			// analogue.
+			//
+			// Declared unconditionally, while dropTmpScratchIfClaimed can remove the
+			// mount from both containers -- so a CR that claims /tmp itself leaves
+			// this volume in the pod with nothing mounting it. That is legal and
+			// inert: the kubelet creates an empty directory and no container sees it.
+			// Making the declaration conditional would mean deciding it here from
+			// state that lives in the mount builders, which buys a tidier pod spec
+			// for a coupling that is easier to get wrong than this is to explain.
+			Name: tmpScratchVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: ptr.To(resource.MustParse("2Gi")),
 				},
 			},
 		},

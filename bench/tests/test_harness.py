@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import time
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
@@ -19,7 +20,7 @@ from typing import Any
 import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
-from kube_agents_bench import harness
+from kube_agents_bench import harness, transcript
 from kube_agents_bench.harness import KubeAgentsHarness
 from kube_agents_bench.parsing import merge_new as _merge_new
 from kube_agents_bench.parsing import parse_response as _parse_response
@@ -2189,3 +2190,32 @@ def test_an_unreachable_pod_does_not_fail_the_run(
 
     assert _RCA_RESULT in result.output
     assert not result.has_errors()
+
+
+def test_run_stamps_the_wall_clock_start_on_the_stash(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """``ledger_issue_contains`` dates a GitHub artifact against this stamp,
+    so it has to bracket the run and be wall clock — a monotonic reading
+    would compare a process-local counter to another machine's timestamp."""
+    before = time.time()
+    KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+    after = time.time()
+
+    snap = transcript.get()
+    assert snap is not None
+    assert before <= snap.started_at <= after
+
+
+def test_an_errored_run_still_stamps_a_start(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """An unstamped stash is status="error" downstream; an agent that blew up
+    must not read as one that never ran."""
+    monkeypatch.setattr(
+        KubeAgentsHarness, "_execute", lambda self, p, w=None: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    result = KubeAgentsHarness().run("prompt")
+
+    assert result.has_errors()
+    assert transcript.get().started_at > 0.0

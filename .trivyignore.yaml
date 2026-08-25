@@ -62,3 +62,15 @@ misconfigurations:
   - id: KSV-0112
     paths:
       - "examples/**"
+  # Ignore GCP-0053 and GCP-0061 on the seeded fleet only: the public control
+  # plane with a 0.0.0.0/0 authorized-networks block (seeded-a/-b) and the
+  # absent block (seeded-c) are deliberately planted eval fixtures -- the
+  # drift scenario's outlier and the declared 2.10 background findings in
+  # bench/tf/fleet/README.md's accepted-background section. Do not "fix"
+  # them; the scenarios assert on them.
+  - id: GCP-0053
+    paths:
+      - "bench/tf/fleet/**"
+  - id: GCP-0061
+    paths:
+      - "bench/tf/fleet/**"

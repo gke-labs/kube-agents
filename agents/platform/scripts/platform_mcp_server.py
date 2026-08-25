@@ -719,8 +719,12 @@ def send_notification(message: str, session_id: str = "") -> str:
                         # Construct explicit target for send_message_tool
                         targets.append(f"{session_platform}:{chat_id}:{thread_id}")
         except Exception as exc:
-            # Fail-open: log error but fall back to broadcast targets
-            print(f"Failed to resolve session metadata for threading: {exc}")
+            # Fail-open: log error but fall back to broadcast targets.
+            # stderr, never a bare print: this server speaks JSON-RPC on
+            # stdout, and one stray line of prose there corrupts the stream
+            # for the MCP client mid-session. Pinned by the stdio seam test
+            # (tests/integration/test_seam_mcp_stdio.py).
+            print(f"Failed to resolve session metadata for threading: {exc}", file=sys.stderr)
 
     if not targets:
         for p in enabled_platforms:

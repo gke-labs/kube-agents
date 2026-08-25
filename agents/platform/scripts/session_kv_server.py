@@ -78,53 +78,109 @@ LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", 
 # name the variable an operator is being told to set.
 SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 
-# The gateway's own bearer, which is a different value from the sentinel above.
+# The gateway's own bearer. On an operator-managed pod this is the loopback
+# sentinel after all — see _gateway_api_token — but the name is resolved rather
+# than read, because which file answers it is the whole of issue #786.
 GATEWAY_AUTH_ENV = "API_SERVER_KEY"
 
+# Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
+# applies LAST with override=True. The operator mounts it at /etc/hermes and
+# sets HERMES_MANAGED_DIR to the same path explicitly; managed_scope.py's POSIX
+# default is that path too, so the fallback is not a guess.
+#
+# `.strip() or` rather than a plain `get(..., default)`: managed_scope.py treats
+# a set-but-empty value as unset and falls back, and matching that is not
+# pedantry here — `os.path.join("", ".env")` is the RELATIVE path ".env", so the
+# resolver would read whatever .env happens to sit in the server's working
+# directory and hand it back at the highest precedence of all. A stray file in
+# an agent workspace would become the bearer.
+MANAGED_DOTENV_PATH = os.path.join(
+    os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", ".env"
+)
 
-def _gateway_api_token() -> str:
-    """Resolve the bearer the gateway API server will actually accept.
 
-    `os.environ["API_SERVER_KEY"]` is not it, and trusting it is why the relay
-    turn never ran in this deployment. The operator sets that name to the
-    non-secret loopback sentinel `cluster-internal-trusted`
-    (`k8s-operator/internal/controller/platformagent_manifests.go`), on the
-    premise that the listener is loopback-only and the envoy sidecar
-    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes does
-    not honour that premise from this side: it prefers `$HERMES_HOME/.env` over
-    the process environment (`hermes_cli/auth.py` — "Prefer ~/.hermes/.env over
-    os.environ so a deliberate key rotation ... isn't shadowed by a stale shell
-    export"), and its Docker stage2 hook writes a freshly generated strong key
-    into that file whenever it does not already carry one. The sentinel is
-    therefore overridden on every boot, by a value this process never sees, and
-    every loopback caller that trusts the environment gets 401.
+def _dotenv_value(path: str, name: str) -> str:
+    """Return `name`'s value from a dotenv file, or "" if it does not carry one.
 
-    Measured on kage-management 2026-08-18: seven consecutive `github-repo-watcher`
-    relay turns rejected in one pod's first two hours, each degrading to an
-    unrelayed raw report that the scheduler still recorded as delivered. Writing
-    the sentinel into `.env` to force agreement is not an alternative — the API
-    server then declines to bind at all.
-
-    Read per call rather than cached at import: `.env` is rewritten a few seconds
-    *after* this process starts, so an import-time read returns the last boot's
-    key.
+    Deliberately a small hand parser rather than `dotenv.load_dotenv`: this must
+    report what ONE named file says, and load_dotenv mutates `os.environ`, which
+    would make the precedence below unobservable after the first call.
     """
     try:
-        with open(DOTENV_PATH, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
-                name, _, value = line.partition("=")
-                if name.strip() != GATEWAY_AUTH_ENV:
+                key, _, value = line.partition("=")
+                if key.strip() != name:
                     continue
                 value = value.strip().strip('"').strip("'")
                 if value:
                     return value
     except OSError:
-        # No .env, or unreadable: the environment is all there is, and on a
-        # deployment where nothing rewrites the key it is also correct.
+        # Absent or unreadable is an ordinary answer here, not an error: the
+        # managed scope is operator-only, and a plain `docker run` has neither
+        # file.
         pass
+    return ""
+
+
+def _gateway_api_token() -> str:
+    """Resolve the bearer the gateway API server will actually accept.
+
+    KEPT AS A BACKSTOP, no longer load-bearing. The disagreement it was written
+    for is fixed at its source in #786: the operator now pins `API_SERVER_KEY`
+    in the managed `.env` (`renderManagedEnv` in
+    `k8s-operator/internal/controller/platformagent_manifests.go`), which
+    `load_hermes_dotenv` applies LAST with `override=True` — after the PVC file
+    — so `os.environ["API_SERVER_KEY"]` and this function now return the same
+    value on an operator-managed pod, and the fallback below is what runs.
+
+    What went wrong, because the shape recurs. The operator sets that name to
+    the non-secret loopback sentinel `cluster-internal-trusted`, on the premise
+    that the listener is loopback-only and the credential-proxy sidecar
+    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes did
+    not honour that premise from this side: `$HERMES_HOME/.env` is loaded over
+    the process environment, deliberately, so that a key rotation in that file
+    is not shadowed by a stale export — and Hermes' Docker stage2 hook writes a
+    freshly generated strong key into that file whenever it does not already
+    carry one. The sentinel was therefore overridden on every boot by a value
+    nothing else in the system had ever seen, and every caller that trusted the
+    environment got 401.
+
+    Measured on kage-management 2026-08-18: seven consecutive
+    `github-repo-watcher` relay turns rejected in one pod's first two hours,
+    each degrading to an unrelayed raw report that the scheduler still recorded
+    as delivered.
+
+    An earlier note here said that writing the sentinel into `.env` to force
+    agreement was tried and made the API server decline to bind. That was
+    confounded — the pod had lost its credential-proxy sidecar in the same
+    window. Hermes' actual constraint is `has_usable_secret(min_length=16)` in
+    `gateway/platforms/api_server.py`'s startup guard, and the 24-character
+    sentinel clears it. The managed `.env` pin does not touch that file at all
+    in any case; it wins by being applied after it.
+
+    The order below MIRRORS `hermes_cli/env_loader.py`, and reproducing it is
+    the point — a resolver that guesses differently from the server it is
+    guessing about is worse than no resolver, because it fails while looking
+    right. Managed `.env` beats PVC `.env` beats the process environment,
+    because that is the order `load_hermes_dotenv` applies them in, each with
+    `override=True`. Reading the PVC file first — this function's original
+    shape, correct before the pin — would now return stage2's generated key on
+    exactly the pods the pin has already fixed.
+
+    Read per call rather than cached at import: `.env` is rewritten a few
+    seconds *after* this process starts, so an import-time read would return the
+    last boot's key on a deployment that still has the disagreement.
+    """
+    for path in (MANAGED_DOTENV_PATH, DOTENV_PATH):
+        value = _dotenv_value(path, GATEWAY_AUTH_ENV)
+        if value:
+            return value
+    # Neither file says anything: the environment is all there is, and on a
+    # deployment where nothing rewrites the key it is also correct.
     return os.environ.get(GATEWAY_AUTH_ENV, "")
 
 
@@ -149,10 +205,10 @@ def verify_api_key(
     """Reject callers that cannot present the pod's session-KV key.
 
     Fails closed when the key is unset. Every caller — the event watcher, the
-    MCP server, the incident_context plugin — gets the value from the same pod
-    secret, so an empty variable means the deployment is misconfigured, and
-    serving chat identifiers to an unauthenticated caller is the worse of the
-    two outcomes.
+    MCP server, the incident_context plugin, the gateway's kanban notifier —
+    gets the value from the same pod secret, so an empty variable means the
+    deployment is misconfigured, and serving chat identifiers to an
+    unauthenticated caller is the worse of the two outcomes.
     """
     expected = _expected_api_key()
     if not expected:
@@ -789,20 +845,26 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     the delegation to that persona is what makes the citation unresolvable for
     the agent being asked to obey it.
 
-    The report used to end by inviting the reader to reply ``apply``, and that
-    invitation is withheld here until something honours it. The agent that acts
-    on such a reply reads the report back from the ``incidents`` table through
-    the ``incident_context`` plugin, and the only writer of that table is
-    ``platform_mcp_server.send_notification`` — the egress call this delivery
-    path replaced. So the row is never written, ``_lookup`` returns ``None``,
-    and the front door receives the bare word ``apply`` with no report, no
-    options and no cluster. Nothing unsafe happens; the front door holds no
-    write path and simply cannot act. It is a promise the system cannot keep,
-    and on ``main`` it was never tested because no report reached a human to
-    reply to. Storing the report on the delivery path is issue #802; the
-    bullet comes back with it. §7 rule 3 — "no offer to help further" — is on the
-    side of the removal, which is why the docstring here used to have to argue
-    the call-to-action past it.
+    The report ends by inviting the reader to reply ``apply``, and something
+    honours it. The agent that acts on such a reply reads the report back from
+    the ``incidents`` table through the ``incident_context`` plugin, and the row
+    that lookup needs is written by the same delivery that posted the report:
+    ``kanban_notifier.store_incident_report`` keys it to the chat thread once
+    the notifier has sent it. That was not true between #738 — which replaced
+    the egress call in ``platform_mcp_server.send_notification``, the table's
+    only writer, with ``kanban_complete`` — and #802, which restored the write
+    on the new path. In that window the invitation was withheld here, because a
+    reply to it reached the front door as the bare word ``apply`` with no
+    report, no options and no cluster. So the bullet is load-bearing on that
+    write: if the row stops being written, take the bullet out again rather
+    than leaving a promise the system cannot keep.
+
+    §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
+    is about closing chatter, the "let me know if you need anything else" that
+    ends a message with nothing in it; rule 1 requires the report to say what
+    the agent wants done. The report asks the reader for exactly one decision,
+    and the ``To authorize:`` bullet is how that decision is expressed. It is
+    the ask, not an offer alongside it.
 
     The report template below is STANDARD markdown, and must stay that way.
     Every chat platform's adapter translates the agent's markdown on the way
@@ -838,13 +900,15 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
-        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
-        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line.\n\n"
+        f"Label them 'Option A', 'Option B', ... in order, and name those same letters in the call-to-action. "
+        f"When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
+        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and end the "
+        f"'To authorize:' bullet after **'apply'**, dropping the \"or name one directly with ...\" clause, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
-        f"**Do not end the report by inviting a reply.** No 'To authorize:', no 'reply apply', no offer to open the Pull Request "
-        f"if the reader asks — a reply to this thread reaches an agent that cannot see your report, so the offer would not be honoured. "
-        f"The Recommended line is the last bullet you write.\n\n"
+        f"The last bullet of the 'What to do' section is the call to action, not another option: keep its 'To authorize:' label, "
+        f"never give it an Option letter, and never count it when you number the options. "
+        f"A reply in this thread reaches an agent that can see your report, so the offer is honoured.\n\n"
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
@@ -854,7 +918,8 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
         f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n"
-        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n\n"
+        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
         f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
         f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
         f"---"
@@ -1733,16 +1798,18 @@ def list_recent_reports(chat_id: str, hours: int = 0, limit: int = 0) -> Dict[st
     in the channel above, unreachable. Naming them is enough for the agent to
     ask which one instead of answering about the wrong one.
 
-    It returns no report text, deliberately. `_store_incident_report` persists
-    the relay's composed output rather than the specialist's finding, so a
-    preview line would carry model-written text into every ordinary message in
+    It returns no report text, deliberately. No writer of this table stores
+    something safe to preview: the relay persists its own composed output, the
+    notifier persists a specialist's report quoting cluster objects, and either
+    would carry model-written or third-party text into every ordinary message in
     the space. `job_id`, `title` and `profile` are fields this server wrote
     itself.
 
     `incidents` is the source of truth for "a report was posted here";
     `session_metadata` only supplies the label. A row written by the
-    `send_notification` path has no relay session and so no job to name, and
-    still belongs in the index.
+    `send_notification` path or by the kanban notifier's triage delivery has no
+    relay session and so no job to name -- `incident_context._index_text`
+    renders it unlabelled -- and still belongs in the index.
     """
     hours = hours or RECENT_REPORTS_WINDOW_HOURS
     limit = limit or RECENT_REPORTS_LIMIT

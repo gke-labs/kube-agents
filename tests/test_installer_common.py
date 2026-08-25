@@ -39,6 +39,23 @@ DATA_MODE_STATE = _state_doc(
 )
 
 
+def _autopilot_describe_stub(version="1.31.5-gke.1023000"):
+    """A `clusters describe` stub for an Autopilot cluster.
+
+    The generator asks twice on this path — autopilot.enabled first, then
+    currentMasterVersion for the gVisor floor — so the stub answers on the
+    --format it is given. An empty `version` stands for a version that
+    could not be read.
+    """
+    return (
+        'case "$*" in\n'
+        f"  *currentMasterVersion*) printf '{version}\\n' ;;\n"
+        "  *) printf 'True\\n' ;;\n"
+        "esac\n"
+        "exit 0"
+    )
+
+
 class InstallerCommonTest(unittest.TestCase):
     def _run(
         self,
@@ -207,6 +224,113 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('cluster_mode               = "standard"', content)
             self.assertIn("create_cluster             = true", content)
+
+    # ── ENABLE_GVISOR splits into a pool and a RuntimeClass by cluster shape ──
+
+    def test_tfvars_gvisor_on_standard_asks_for_pool_and_runtime_class(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = true", content)
+            self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
+        # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
+        # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through
+        # made --gvisor=true unusable there rather than sandboxing the agent.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_gvisor_on_autopilot_below_the_version_floor_aborts(self):
+        # Autopilot's gvisor RuntimeClass has a version floor, and a cluster
+        # under it takes the whole apply before failing on a missing agent
+        # Deployment. Abort while nothing has been applied.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+            describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("1.26.9-gke.9999", proc.stderr)
+        self.assertIn("1.27.4-gke.800", proc.stderr)
+
+    def test_tfvars_gvisor_on_autopilot_warns_when_the_version_is_unreadable(self):
+        # An unparseable version is "unknown", not "too old": say so and carry
+        # on rather than blocking an install on a gcloud output change.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub=_autopilot_describe_stub(""),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not read the GKE version", proc.stderr)
+            self.assertIn('agent_runtime_class        = "gvisor"', dest.read_text())
+
+    def test_tfvars_gvisor_on_standard_does_not_check_the_autopilot_floor(self):
+        # The floor is Autopilot's. On Standard the node pool carries the
+        # RuntimeClass, so an old cluster there must not be rejected by it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub=(
+                    'case "$*" in\n'
+                    "  *currentMasterVersion*) printf '1.24.0-gke.100\\n' ;;\n"
+                    "  *) printf '\\n' ;;\n"
+                    "esac\n"
+                    "exit 0"
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("enable_gvisor_node_pool    = true", dest.read_text())
+
+    def test_tfvars_without_gvisor_sets_neither(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_gke_version_at_least_orders_the_gke_suffix_numerically(self):
+        # gke.800 is older than gke.1500, which a lexical compare gets backwards.
+        cases = {
+            "1.27.4-gke.800 1.27.4-gke.800": "0",
+            "1.27.4-gke.1500 1.27.4-gke.800": "0",
+            "1.30.11-gke.1131000 1.27.4-gke.800": "0",
+            "1.28.1-gke.100 1.27.4-gke.800": "0",
+            "1.27.4-gke.700 1.27.4-gke.800": "1",
+            "1.27.3-gke.1700 1.27.4-gke.800": "1",
+            "1.26.9-gke.9999 1.27.4-gke.800": "1",
+        }
+        for pair, want in cases.items():
+            with self.subTest(pair=pair):
+                proc = self._run(f"gke_version_at_least {pair}; echo \"rc=$?\"")
+                self.assertIn(f"rc={want}", proc.stdout, proc.stderr)
 
     def test_tfvars_refuses_to_guess_on_a_transient_describe_failure(self):
         # Anything other than NOT_FOUND must abort: reading an auth expiry or
