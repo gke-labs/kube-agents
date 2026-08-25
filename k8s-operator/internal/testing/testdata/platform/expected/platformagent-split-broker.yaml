@@ -1052,7 +1052,7 @@ spec:
             - name: EVENT_WATCHER_CLUSTER_NAME
               value: cluster-a
             - name: EVENT_WATCHER_ENABLED
-              value: "true"
+              value: "false"
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: credential-broker

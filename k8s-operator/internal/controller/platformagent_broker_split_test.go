@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -65,6 +67,12 @@ func splitBrokerAgent(split bool) *agentv1alpha1.PlatformAgent {
 	}
 	if split {
 		agent.Spec.Security = &agentv1alpha1.SecuritySpec{SplitCredentialBrokerPod: ptr.To(true)}
+		// The only split configuration the operator will render. The watcher is
+		// hosted in the credential container and posts to the sandbox's
+		// loopback, so the split strands it; validateCredentialBrokerSplit
+		// refuses the combination rather than rendering it. Reconcile-level
+		// tests below would otherwise be testing the refusal by accident.
+		agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)}
 	}
 	return agent
 }
@@ -405,6 +413,113 @@ func TestReconcileRemovesTheBrokerPodWhenTheGateIsOff(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("turning the gate off must remove %T %s, got %v",
 				object, object.GetName(), err)
+		}
+	}
+}
+
+// TestTheSplitIsRefusedWhileTheEventWatcherIsOn covers the combination the
+// operator will not render.
+//
+// The watcher lives in the credential container and delivers over the agent
+// Pod's loopback, so the split takes it away from the only address it can
+// reach. Measured on a cluster: it exits and is retried for the life of the
+// Pod, the container stays Ready, and no cluster event arrives. The default for
+// eventWatcherEnabled is true, so this is what someone enabling the split on a
+// stock CR gets, and it has to be a refusal they can read rather than a silence.
+func TestTheSplitIsRefusedWhileTheEventWatcherIsOn(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		enabled *bool
+		refused bool
+	}{
+		{"absent, so the watcher defaults on", nil, true},
+		{"explicitly on", ptr.To(true), true},
+		{"explicitly off", ptr.To(false), false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			agent := splitBrokerAgent(true)
+			if testCase.enabled == nil {
+				agent.Spec.Harness.EventWatcher = nil
+			} else {
+				agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: testCase.enabled}
+			}
+			reason, msg := validateCredentialBrokerSplit(agent)
+			if testCase.refused {
+				if reason != reasonSplitBrokerStrandsEventWatcher {
+					t.Fatalf("expected %s, got %q", reasonSplitBrokerStrandsEventWatcher, reason)
+				}
+				// The message has to name both fields, because it is the only
+				// thing the operator sees and one of them is the way out.
+				for _, want := range []string{
+					"spec.security.splitCredentialBrokerPod",
+					"spec.harness.eventWatcher.enabled",
+				} {
+					if !strings.Contains(msg, want) {
+						t.Errorf("the refusal must name %s; got %q", want, msg)
+					}
+				}
+			} else if reason != "" {
+				t.Fatalf("expected no refusal, got %s: %s", reason, msg)
+			}
+		})
+	}
+}
+
+// TestTheSidecarLayoutIsNeverRefused: the gate is off by default, so a refusal
+// that fired there would take down every install.
+func TestTheSidecarLayoutIsNeverRefused(t *testing.T) {
+	for _, enabled := range []*bool{nil, ptr.To(true), ptr.To(false)} {
+		agent := splitBrokerAgent(false)
+		if enabled == nil {
+			agent.Spec.Harness.EventWatcher = nil
+		} else {
+			agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: enabled}
+		}
+		if reason, msg := validateCredentialBrokerSplit(agent); reason != "" {
+			t.Errorf("the sidecar layout must never be refused; got %s: %s", reason, msg)
+		}
+	}
+}
+
+// TestReconcileRefusesTheSplitBeforeRenderingAnything is the same rule at the
+// reconcile level. A validator that returned the right string while Reconcile
+// went on to render the broker anyway would be a refusal in name only.
+func TestReconcileRefusesTheSplitBeforeRenderingAnything(t *testing.T) {
+	agent := splitBrokerAgent(true)
+	agent.Spec.Harness.EventWatcher = nil // the stock CR: the watcher is on
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Errorf("expected the refusal to requeue so it clears once the spec is fixed, got %v", result)
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("re-reading the agent failed: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
+	}
+	ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if ready == nil || ready.Reason != reasonSplitBrokerStrandsEventWatcher {
+		t.Errorf("expected Ready=False/%s, got %+v", reasonSplitBrokerStrandsEventWatcher, ready)
+	}
+
+	// Nothing rendered. The refusal is before the workload, so this covers the
+	// agent Deployment as well as the broker's.
+	for _, object := range []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns"}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"}},
+	} {
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(object), object); !errors.IsNotFound(err) {
+			t.Errorf("a refused spec must render no %T %s, got %v", object, object.GetName(), err)
 		}
 	}
 }

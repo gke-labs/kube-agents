@@ -267,6 +267,20 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
+	// 10b. Refuse a broker split that would strand the event watcher.
+	//
+	// Before the workload, deliberately: an operator who asked for the broker to
+	// leave the agent Pod must not get a running agent whose cluster events have
+	// silently stopped. The one refusable configuration is named in
+	// validateCredentialBrokerSplit.
+	if reason, msg := validateCredentialBrokerSplit(instance); reason != "" {
+		log.Info(msg)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone

@@ -9220,6 +9220,17 @@ spec:
                         both Pods on one node it will instead appear to work, which makes the
                         misconfiguration intermittent and worth ruling out first.
 
+                        REQUIRES eventWatcher.enabled: false. The k8s-event-watcher is hosted
+                        inside the credential container and posts what it sees to the Session KV
+                        server the sandbox binds on the agent Pod's loopback, so the split takes
+                        the watcher away from the only address it can deliver to. Asking for both
+                        is refused rather than rendered: the agent goes Degraded with reason
+                        SplitBrokerStrandsEventWatcher and nothing is applied. eventWatcher
+                        defaults to enabled, so this fires on a stock spec, which is the intent —
+                        the split costs you fleet event delivery today and that should be a
+                        decision rather than a discovery. Giving the watcher a home that survives
+                        the split is separate work.
+
                         Two further caveats. The agent Pod and the broker Pod share one
                         ServiceAccount, because the Workload Identity IAM binding names it, so
                         the identity the broker verifies is per-ServiceAccount rather than

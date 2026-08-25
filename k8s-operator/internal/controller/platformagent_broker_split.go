@@ -67,6 +67,54 @@ const (
 	agentCredentialProxyTokenVolume = "agent-credential-proxy-token"
 )
 
+// reasonSplitBrokerStrandsEventWatcher refuses the layout: the k8s-event-watcher
+// is hosted inside the credential container, so splitting the broker takes the
+// watcher with it, away from the loopback it posts on.
+const reasonSplitBrokerStrandsEventWatcher = "SplitBrokerStrandsEventWatcher"
+
+// validateCredentialBrokerSplit returns a Degraded reason and message when
+// spec.security.splitCredentialBrokerPod asks for something the operator cannot
+// honestly render, or "" when it can.
+//
+// There is one such case, and it is the event watcher. start-services.sh runs
+// the watcher inside the credential container, gated by EVENT_WATCHER_ENABLED,
+// and the watcher posts what it sees to the Session KV server the sandbox binds
+// on 127.0.0.1:8699. Both of those are properties of sharing a Pod. Split the
+// broker and the watcher goes with it: no loopback to reach the sandbox on, and
+// no SESSION_KV_API_KEY, which the operator sets only in the sidecar branch
+// because there is no shared loopback for it to authenticate across. Measured on
+// a cluster, the result is the watcher exiting and being retried forever while
+// the container stays Ready and no cluster event reaches the agent.
+//
+// So the two are refused together rather than rendered. Note that
+// eventWatcherEnabled defaults to true, so this fires for anyone who enables the
+// split without also turning the watcher off — which is the intent. The choice
+// between the split and fleet event delivery is the operator's to make with the
+// facts in front of them, not one to discover from a log line weeks later.
+//
+// The alternative was to force EVENT_WATCHER_ENABLED=false under the split. A
+// quietly disabled observability component is worse than a refusal: nothing in
+// the CR or in kubectl describe would say the events had stopped. Giving the
+// watcher a home the split does not strand — a Service in front of the Session
+// KV server, or the watcher moved into the agent Pod — is the real fix and is
+// its own change.
+func validateCredentialBrokerSplit(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if !credentialBrokerIsSplit(agent) {
+		return "", ""
+	}
+	if !eventWatcherEnabled(agent) {
+		return "", ""
+	}
+	return reasonSplitBrokerStrandsEventWatcher, "spec.security.splitCredentialBrokerPod: true requires " +
+		"spec.harness.eventWatcher.enabled: false. The k8s-event-watcher runs inside the credential " +
+		"container and posts to the Session KV server on the agent Pod's loopback, so moving the broker " +
+		"into its own Pod takes the watcher away from the only address it can deliver to — it would exit " +
+		"and be retried for the life of the Pod while the container stayed Ready and no cluster event " +
+		"reached the agent. Set spec.harness.eventWatcher.enabled: false to accept losing cluster event " +
+		"delivery and keep the split, or leave splitCredentialBrokerPod off. Giving the watcher a home " +
+		"that survives the split is follow-up work."
+}
+
 // credentialBrokerIsSplit reports whether the broker runs in its own Pod.
 func credentialBrokerIsSplit(agent *agentv1alpha1.PlatformAgent) bool {
 	return agent.Spec.Security != nil &&
