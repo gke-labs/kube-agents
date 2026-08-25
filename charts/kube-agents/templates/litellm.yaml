@@ -12,10 +12,16 @@
 {{- $vertex := .Values.litellm.vertex | default dict }}
 {{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
 {{- $vertexProject := $vertex.projectId | default .Values.platformAgent.harness.projectId }}
-{{- $vertexLocation := $vertex.location | default .Values.platformAgent.harness.location }}
+{{- /*
+  Not harness.location: a model is only callable from a location that serves it,
+  and the cluster's is often not one -- on a zonal cluster it is not even a valid
+  Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
+  k8s-operator/scripts/installer_common.sh.
+*/}}
+{{- $vertexLocation := $vertex.location | default "global" }}
 {{- if eq $provider "vertex_ai" }}
-{{- if or (empty $vertexProject) (empty $vertexLocation) }}
-{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId and litellm.vertex.location (or platformAgent.harness.projectId/.location): Vertex AI is addressed as projects/<project>/locations/<location> and has no usable default." }}
+{{- if empty $vertexProject }}
+{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId (or platformAgent.harness.projectId): Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
 {{- end }}
 {{- end }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}

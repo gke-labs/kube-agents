@@ -31,11 +31,17 @@
 #   scenario_reasons()   echoes a JSON fragment of rejectedMigs/napFailureReasons
 #                        (optional) — this is what steers the diagnosis
 #   scenario_notes()     echoes free text shown after the run (optional)
+#   scenario_preflight() checks this scenario's own prerequisites (optional) — runs at
+#                        the end of preflight(), so before clear_dedup or any workload
+#                        exists. Put a `die` here rather than in a hook: the hooks above
+#                        first run once the run has already mutated both clusters.
 #
-# Each hook runs in a subshell, and scenario_manifest runs more than once per invocation,
-# so nothing a hook assigns reaches the next one. A hook that resolves something at run
-# time must wrap the resolver in scenario_memo (below) or it will resolve repeatedly, and
-# may not resolve the same way twice.
+# Each of the three output hooks runs in a subshell, and scenario_manifest runs more than
+# once per invocation, so nothing they assign reaches the next one. A hook that resolves
+# something at run time must wrap the resolver in scenario_memo (below) or it will resolve
+# repeatedly, and may not resolve the same way twice. scenario_preflight is the exception:
+# preflight() calls it directly, so what it assigns does persist -- which is why it is the
+# right place for a check whose answer the run depends on.
 
 set -euo pipefail
 
@@ -299,6 +305,12 @@ preflight() {
     gcloud pubsub topics describe "$TOPIC" --project="$PROJECT_ID" >/dev/null 2>&1 \
         || die "Pub/Sub topic ${TOPIC} not found in ${PROJECT_ID}"
     ok "topic ${TOPIC} exists"
+
+    # Last, so a scenario's own prerequisite is reported after the shared ones it
+    # depends on -- and still before clear_dedup wipes the registry.
+    if declare -F scenario_preflight >/dev/null; then
+        scenario_preflight
+    fi
 }
 
 # The adapter dedups on cluster + namespace + controller for 24h. Re-running a

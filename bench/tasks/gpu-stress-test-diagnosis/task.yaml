@@ -19,9 +19,17 @@ infrastructure:
   provider: "gcp"
   stack: "prebuilt/gpu-stress-test"
   teardown: true
+  # The task_id and the stack path are historical names, kept because
+  # hack/ci-eval-pr.sh, testgrid history and docs all reference them. No GPU
+  # is involved: the incident is seeded as Cloud Logging entries by the
+  # stack's write_synthetic_logs, no workload has ever run on this cluster
+  # (see the read-only-in-a-post-incident-task safeguard below), and
+  # "hypercomputer-agent" is a string inside a log line, not a deployment.
+  # Do not move this back to a g2-*/a2-* type: the gke module infers an
+  # accelerator from the machine family alone.
   variables:
     node_count: 1
-    machine_type: "g2-standard-4"
+    machine_type: "e2-standard-4"
 # Question 2 asks for the workload's own pod-scaling ceiling and says in as
 # many words that node-pool and cluster capacity are not the subject. Both
 # halves have to stay. It used to ask for "any cluster or workload autoscaling

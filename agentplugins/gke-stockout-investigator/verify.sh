@@ -21,7 +21,11 @@ if [ -z "$CONTEXT" ]; then
     exit 1
 fi
 
-NAMESPACE="kubeagents-system"
+# AGENT_NAMESPACE is what the scenario harness (scenarios/lib/common.sh) and the E2E
+# suite's fixture both call this, and the suite runs verify.sh in the same breath as its
+# own kubectl probes -- so reading a different variable makes the two disagree on any
+# non-default namespace. Same default either way.
+NAMESPACE="${AGENT_NAMESPACE:-kubeagents-system}"
 CLUSTER_NAME="${TARGET_CLUSTER_NAME:-}"
 if [ -z "$CLUSTER_NAME" ]; then
     echo "Error: set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for,"

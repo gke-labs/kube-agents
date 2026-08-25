@@ -64,12 +64,6 @@ def is_valid_region(value: str) -> bool:
     return bool(REGION_PATTERN.fullmatch(value.strip()))
 
 
-def region_for_location(value: str) -> str:
-    """Return the enclosing region for a valid GCP region or zone."""
-    location = value.strip()
-    return re.sub(r"-[a-z]$", "", location)
-
-
 def is_valid_namespace(value: str) -> bool:
     return bool(NAMESPACE_PATTERN.fullmatch(value.strip()))
 

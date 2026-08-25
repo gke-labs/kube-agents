@@ -154,13 +154,13 @@ variable "model_provider" {
 }
 
 variable "vertex_project_id" {
-  description = "Project serving the Vertex AI models when model_provider = \"vertex\". Empty uses project_id. The gateway's service account is granted roles/aiplatform.user here, which works cross-project."
+  description = "Project serving the Vertex AI models when model_provider = \"vertex_ai\". Empty uses project_id. The gateway's service account is granted roles/aiplatform.user here, which works cross-project."
   type        = string
   default     = ""
 }
 
 variable "vertex_location" {
-  description = "Vertex AI serving location when model_provider = \"vertex\" (e.g. us-east4). Empty uses the cluster location — override when the model is not served in the cluster's region."
+  description = "Vertex AI serving location when model_provider = \"vertex_ai\" (e.g. us-east4). Empty uses \"global\", which serves the first-party Gemini models from wherever has capacity. Set a region when you have a data-residency requirement, or when the model is a Model Garden partner model served only from specific regions."
   type        = string
   default     = ""
 }

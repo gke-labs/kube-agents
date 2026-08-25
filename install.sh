@@ -105,7 +105,8 @@ Flags for AI Agents & Automation:
                                 (default: gemini)
   --model-default-name=NAME     Default model name for the provider
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
-  --vertex-location=REGION      Vertex AI serving location (default: --region)
+  --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
+                                (default: DEFAULT_VERTEX_LOCATION, currently global)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
@@ -946,6 +947,24 @@ ensure_existing_cluster_network_policy() {
     print_success "Existing cluster '$cluster_name' already enforces NetworkPolicy (legacy Calico addon)."
     return 0
   fi
+  # Two calls, in this order. GKE rejects --enable-network-policy with "The
+  # network policy addon must be enabled before updating the nodes" (HTTP 400)
+  # until the Calico addon is on the control plane, and gcloud puts
+  # --update-addons and --enable-network-policy in the same "exactly one of
+  # these must be specified" argparse group, so they cannot be combined into a
+  # single invocation.
+  #
+  # Unconditional, matching Google's documented procedure. Gating it on
+  # addonsConfig.networkPolicyConfig.disabled looks tempting for the re-run
+  # case — the guard above reads networkPolicy.enabled, so a re-run after the
+  # enforcement call failed arrives here with the addon already on — but that
+  # field cannot express it: GKE omits false booleans from addonsConfig, so
+  # "off" prints True and "on" prints nothing, which is also what a failed
+  # describe prints. A gate that skips on empty reintroduces the 400 the
+  # moment describe fails. Re-enabling an already-enabled addon is a no-op.
+  print_info "Enabling the NetworkPolicy addon on existing cluster '$cluster_name'..."
+  gcloud container clusters update "$cluster_name" --location "$region" \
+    --update-addons=NetworkPolicy=ENABLED --project "$project_id" --quiet
   print_info "Enabling NetworkPolicy enforcement on existing cluster '$cluster_name' (node pools may be recreated; this can take several minutes)..."
   gcloud container clusters update "$cluster_name" --location "$region" \
     --enable-network-policy --project "$project_id" --quiet
@@ -1084,7 +1103,7 @@ run_menu_system() {
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
   local vertex_project_id="${VERTEX_PROJECT_ID:-$project_id}"
-  local vertex_location="${VERTEX_LOCATION:-$region}"
+  local vertex_location="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
@@ -1181,6 +1200,12 @@ run_menu_system() {
             prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
             prompt_read "Vertex AI Location" vertex_location "$vertex_location"
             prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "${model_default_name:-$(default_model_for_provider vertex_ai)}"
+            # Same notice main() prints on the first-install path: switching a
+            # running install to Vertex through this panel lands on the global
+            # endpoint too, and must not do so silently.
+            if [ "$vertex_location" = "global" ]; then
+              print_warning "The global endpoint gives no in-region ML processing guarantee. Set a region above if you have a data-residency requirement."
+            fi
             ;;
           3)
             model_provider="openai"
@@ -1569,9 +1594,12 @@ main() {
   fi
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
-  # two are the only credentials it needs and both default to the install target.
+  # two are the only credentials it needs. The project defaults to the install
+  # target; the location does not, because a model is only callable from a
+  # location that serves it and the cluster's region often is not one — see
+  # DEFAULT_VERTEX_LOCATION in k8s-operator/scripts/installer_common.sh.
   local vertex_project_id="${PARAM_VERTEX_PROJECT_ID:-$project_id}"
-  local vertex_location="${PARAM_VERTEX_LOCATION:-$region}"
+  local vertex_location="${PARAM_VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
@@ -1626,6 +1654,19 @@ main() {
     vertex_ai)
       print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-kubeagents-litellm-gsa}@${project_id}.iam.gserviceaccount.com via Workload Identity."
       print_info "Serving ${model_default_name} from projects/${vertex_project_id}/locations/${vertex_location}."
+      # The literal, not $DEFAULT_VERTEX_LOCATION: this warns about a property
+      # of the global endpoint, not about the default being in effect. Tying it
+      # to the constant would fire with false text if the default ever moved to
+      # a region, and stay silent for an explicit --vertex-location=global.
+      #
+      # An `if` rather than `[ ... ] && ...`: the AND-list form returns non-zero
+      # whenever the test fails, which is a live hazard under this file's
+      # `set -Eeuo pipefail` the moment it becomes the last statement in a
+      # function. The `||` idiom used elsewhere in this case block always
+      # returns 0; the `&&` form does not.
+      if [ "$vertex_location" = "global" ]; then
+        print_warning "The global endpoint gives no in-region ML processing guarantee. Pass --vertex-location=<region> if you have a data-residency requirement."
+      fi
       ;;
     openai)
       [ -n "$openai_api_key" ] || print_warning "No OpenAI API key was provided; the agent will require a credential update before model calls can succeed."

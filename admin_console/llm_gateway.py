@@ -22,7 +22,6 @@ from admin_console.project_config import (
     DeploymentTarget,
     is_valid_project_id,
     is_valid_region,
-    region_for_location,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -754,8 +753,10 @@ except urllib.error.HTTPError as error:
             "LITELLM_IMAGE": f"{image['repository']}:{image['tag']}",
             "PROJECT_ID": self.target.project_id,
             "VERTEX_PROJECT_ID": settings.get("project_id", self.target.project_id),
-            "VERTEX_LOCATION": settings.get("location")
-            or region_for_location(self.target.location),
+            # Not the target's region: a model is only callable from a location
+            # that serves it, and the cluster's often is not one. Mirrors
+            # DEFAULT_VERTEX_LOCATION in k8s-operator/scripts/installer_common.sh.
+            "VERTEX_LOCATION": settings.get("location") or "global",
         }
         if provider.workload_identity:
             values["LITELLM_KSA_NAME"] = provider.workload_identity[

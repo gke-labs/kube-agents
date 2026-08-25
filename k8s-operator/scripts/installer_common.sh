@@ -16,6 +16,17 @@
 # one home here so the entry points cannot drift apart.
 DEFAULT_CLUSTER_NAME="platform-agent-host"
 DEFAULT_REGION="us-central1"
+# Vertex serves each model from its own subset of locations, and the cluster's
+# region is usually not one of them -- gemini-3.5-flash, the vertex_ai default,
+# is not served from us-central1 (DEFAULT_REGION), so a region-derived default
+# 404s on a stock install. The global endpoint serves the first-party Gemini
+# models from wherever has capacity, which is the only default that works
+# without knowing the cluster's region. Two reasons to override it: it gives no
+# in-region ML processing guarantee, and a Model Garden partner model (Claude,
+# Llama, Mistral) may be served only from specific regions. Which locations
+# serve which model:
+# https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
+DEFAULT_VERTEX_LOCATION="global"
 DEFAULT_MODEL_PROVIDER="gemini"
 
 # All kube-agents images (k8s-operator, platform-agent, credential-proxy,

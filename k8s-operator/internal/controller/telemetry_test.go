@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -34,7 +35,7 @@ func envMapOf(envs []corev1.EnvVar) map[string]corev1.EnvVar {
 }
 
 func TestOTelTelemetryEnvVars(t *testing.T) {
-	envs := otelTelemetryEnvVars("platform", "my-agent", "my-ns", "")
+	envs := otelTelemetryEnvVars("platform", "my-agent", "my-ns", "", false)
 	m := envMapOf(envs)
 
 	if m["OTEL_SERVICE_NAME"].Value != "my-agent-gateway" {
@@ -56,11 +57,118 @@ func TestOTelTelemetryEnvVars(t *testing.T) {
 // appended and no scheme is rewritten, because the exporter owns the per-signal path.
 func TestOTelTelemetryEnvVarsCustomEndpoint(t *testing.T) {
 	const endpoint = "http://otel-collector.otel-collector.svc.cluster.local:4318"
-	m := envMapOf(otelTelemetryEnvVars("cluster", "my-agent", "my-ns", endpoint))
+	m := envMapOf(otelTelemetryEnvVars("cluster", "my-agent", "my-ns", endpoint, false))
 
 	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != endpoint {
 		t.Errorf("expected endpoint %q, got %q", endpoint, got)
 	}
+}
+
+// TestOTelTelemetryEnvVarsDisabled covers the otlpSourceNone rendering. Both halves
+// matter: no endpoint, because there is no collector to name, and OTEL_SDK_DISABLED,
+// because an absent OTEL_EXPORTER_OTLP_ENDPOINT makes the SDK fall back to
+// http://localhost:4318 and keep exporting at the same interval into a refused connection.
+func TestOTelTelemetryEnvVarsDisabled(t *testing.T) {
+	m := envMapOf(otelTelemetryEnvVars("platform", "my-agent", "my-ns", "", true))
+
+	if _, ok := m["OTEL_EXPORTER_OTLP_ENDPOINT"]; ok {
+		t.Errorf("expected no OTEL_EXPORTER_OTLP_ENDPOINT, got %q", m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value)
+	}
+	if _, ok := m["OTEL_EXPORTER_OTLP_PROTOCOL"]; ok {
+		t.Error("expected no OTEL_EXPORTER_OTLP_PROTOCOL when nothing is exported")
+	}
+	if got := m["OTEL_SDK_DISABLED"].Value; got != "true" {
+		t.Errorf("expected OTEL_SDK_DISABLED=true, got %q", got)
+	}
+	// Identity survives: docker-entrypoint passes OTEL_SERVICE_NAME to otel_config.py.
+	if got := m["OTEL_SERVICE_NAME"].Value; got != "my-agent-gateway" {
+		t.Errorf("expected OTEL_SERVICE_NAME my-agent-gateway, got %q", got)
+	}
+	if m["OTEL_RESOURCE_ATTRIBUTES"].Value == "" {
+		t.Error("expected OTEL_RESOURCE_ATTRIBUTES to be set")
+	}
+}
+
+// TestBuildDeploymentDisabledTelemetryIsOverridable keeps the escape hatch open: an
+// operator who wants an exporter on a cluster the probe found nothing in can still say so,
+// because mergeEnvVars applies spec.deployment.env after the operator's own values.
+func TestBuildDeploymentDisabledTelemetryIsOverridable(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{
+						{Name: "OTEL_SDK_DISABLED", Value: "false"},
+						{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://insisted-on:4318"},
+					},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil,
+		renderOptions{imageVolumeSupported: true, otlpDisabled: true})
+	m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+
+	if got := m["OTEL_SDK_DISABLED"].Value; got != "false" {
+		t.Errorf("expected the operator's OTEL_SDK_DISABLED to be overridable, got %q", got)
+	}
+	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != "http://insisted-on:4318" {
+		t.Errorf("expected the pinned endpoint, got %q", got)
+	}
+}
+
+// TestBuildDeploymentDisabledTelemetry is the manifest-level statement of #831 item 5: the
+// pod that used to be handed a collector that does not exist is now handed nothing.
+func TestBuildDeploymentDisabledTelemetry(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil,
+		renderOptions{imageVolumeSupported: true, otlpDisabled: true})
+	m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+
+	if _, ok := m["OTEL_EXPORTER_OTLP_ENDPOINT"]; ok {
+		t.Errorf("expected no endpoint on a cluster with no collector, got %q", m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value)
+	}
+	if got := m["OTEL_SDK_DISABLED"].Value; got != "true" {
+		t.Errorf("expected OTEL_SDK_DISABLED=true, got %q", got)
+	}
+}
+
+// TestBuildNetworkPolicyOmitsCollectorEgressWhenDisabled: with nothing exporting, the
+// egress rule would open a path to a namespace that does not exist on this cluster.
+func TestBuildNetworkPolicyOmitsCollectorEgressWhenDisabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+
+	enabled := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, managedOTelEndpoint, false)
+	if !hasCollectorEgress(enabled, "gke-managed-otel") {
+		t.Fatal("expected the collector egress rule when telemetry is on")
+	}
+
+	disabled := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", true)
+	if hasCollectorEgress(disabled, "gke-managed-otel") {
+		t.Error("expected no collector egress rule when telemetry is disabled")
+	}
+}
+
+// hasCollectorEgress reports whether np allows egress to ns on an OTLP receiver port.
+func hasCollectorEgress(np *networkingv1.NetworkPolicy, ns string) bool {
+	for _, rule := range np.Spec.Egress {
+		for _, peer := range rule.To {
+			if peer.NamespaceSelector == nil {
+				continue
+			}
+			if peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == ns {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestBuildDeploymentHasOTelEnv verifies the agent container is wired to the managed
