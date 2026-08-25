@@ -1215,6 +1215,31 @@ class ActionableReportTest(unittest.TestCase):
             )
         )
 
+    def test_the_call_to_action_counts_however_it_is_emphasised(self):
+        # The template writes **To authorize:** with the colon inside the
+        # emphasis, but an agent reproducing a **Label:** bullet moves the
+        # marker as readily as not, and italic and __-bold say the same thing.
+        # Matching only the template's spelling fails these silently: the
+        # single-option shape has no lettered option to fall back on, so the
+        # report is delivered, no row is written, and the "apply" it invites
+        # arrives with nothing attached.
+        for label in (
+            "**To authorize:**",
+            "**To authorize**:",
+            "*To authorize*:",
+            "__To authorize__:",
+            "To authorize:",
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(
+                    actionable_report(
+                        "## What to do\n\n"
+                        "- **Proposed fix (Bump the limit):** raise it to 2Gi.\n"
+                        "- %s reply **'apply'** to open a GitOps Pull Request "
+                        "with this fix.\n" % label
+                    )
+                )
+
     def test_an_empty_or_missing_result_is_not_actionable(self):
         for result in (None, "", "   ", 0):
             self.assertFalse(actionable_report(result), result)

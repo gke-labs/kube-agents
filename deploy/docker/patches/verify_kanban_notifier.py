@@ -749,6 +749,20 @@ check(
     "action is the only thing left under the heading to recognise it by",
 )
 check(
+    "however the call to action is emphasised",
+    all(
+        actionable_report(
+            "## What to do\n\n"
+            "- **Proposed fix (Right-size the request):** drop it to 2Gi.\n"
+            "- %s reply **'apply'**.\n" % label
+        )
+        is True
+        for label in ("**To authorize**:", "*To authorize*:", "__To authorize__:")
+    ),
+    "the template puts the colon inside the emphasis, but an agent moves it as "
+    "readily as not; the unlettered shape has no option letter to fall back on",
+)
+check(
     "a status line does not",
     actionable_report("Checked all 14 clusters. No drift found.") is False,
     "it would shadow the next real report in that thread until the TTL expires",

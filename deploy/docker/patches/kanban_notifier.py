@@ -1151,10 +1151,24 @@ _OPTION_RE = re.compile(r"\bOption [A-Z]\b")
 #: ``session_kv_server._triage_task_body``, which owns both shapes. The colon is
 #: load-bearing and the case is not incidental: this has to match a bullet's
 #: label, not the phrase "to authorize the quota increase" in someone's prose,
-#: which is a sentence rather than an offer to act on. Written without the
-#: surrounding ``**`` because what the template pins across the two shapes is
-#: the label rather than its emphasis.
-_AUTHORIZE_RE = re.compile(r"\bTo authorize:")
+#: which is a sentence rather than an offer to act on.
+#:
+#: ``[*_]*`` is what sits between the word and the colon, and it is the whole
+#: reason this pattern is not simply ``To authorize:``. The template emits
+#: ``**To authorize:**``, with the colon inside the emphasis — but a model
+#: reproducing a ``**Label:**`` bullet will as readily close the emphasis first
+#: and write ``**To authorize**:``, and italic and ``__``-bold do the same. Those
+#: are the same bullet, and matching only the template's exact spelling fails
+#: them silently: the single-option shape has no lettered option to fall back on,
+#: so the report is delivered, no ``incidents`` row is written, and the ``apply``
+#: it invites reaches the front door with nothing attached. That is the #802
+#: failure, in the one shape this gate exists to cover.
+#:
+#: The lookbehind does the job ``\b`` would, and is here because ``\b`` cannot:
+#: ``_`` is a word character, so ``\bTo`` finds no boundary in
+#: ``__To authorize__:`` and the ``__``-bold spelling fails on the opening
+#: marker rather than the closing one.
+_AUTHORIZE_RE = re.compile(r"(?<![0-9A-Za-z])To authorize[*_]*:")
 
 
 def actionable_report(result: object) -> bool:
