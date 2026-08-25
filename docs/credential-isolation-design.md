@@ -298,10 +298,18 @@ settings cannot be edited by anything holding the volume:
 - the filesystem monitor, which names a program and is invoked by a read-only
   verb, is disabled;
 - commit and tag signing are disabled, and the signing program is set to a
-  command that fails. Signing runs a program named in configuration, and the
-  trigger is an ordinary `git commit` — like the hooks pin above it, and like
-  the filesystem monitor on a read-only verb, its absence is reachable with no
-  unusual argument at all;
+  command that fails — for every signature format, not just the default one.
+  Signing runs a program named in configuration, and the trigger is an ordinary
+  `git commit`, so like the hooks pin above it its absence is reachable with no
+  unusual argument at all. One pin is not enough here: git supports three
+  signature formats, `gpg.format` is settable from the repository's own
+  configuration, and each format reads its own program key, so pinning only the
+  openpgp one leaves `[gpg] format = ssh` with `gpg.ssh.program` — and
+  `gpg.ssh.defaultKeyCommand`, which needs no signing key configured at all —
+  reaching a command through `git commit -S` and `git tag -s`. All four keys
+  are pinned. The set is closed, which is what separates this from the
+  arbitrary-name keys in the limitation below: three formats, three fixed key
+  names. The `-S`/`-s` flags themselves are not refused, and need not be;
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
@@ -417,21 +425,28 @@ documented as closed.
 Measured against git 2.55 under the pinned environment, driving the runtime's own
 executor, these repository-local keys still reach a command:
 
-| Key                      | Reached by                           | Why it is not pinned            |
-| ------------------------ | ------------------------------------ | ------------------------------- |
-| `diff.external`          | `git diff`                           | no value disables it; see above |
-| `diff.<driver>.command`  | `git diff` with `.gitattributes`     | arbitrary name                  |
-| `diff.<driver>.textconv` | `git diff` with `.gitattributes`     | arbitrary name                  |
-| `filter.<name>.clean`    | `git add` with `.gitattributes`      | arbitrary name                  |
-| `filter.<name>.smudge`   | `git checkout` with `.gitattributes` | arbitrary name                  |
-| `alias.<name>`           | `git <name>`                         | arbitrary name                  |
+| Key                      | Reached by                                            | Lease              | Why it is not pinned            |
+| ------------------------ | ----------------------------------------------------- | ------------------ | ------------------------------- |
+| `diff.external`          | `git diff`                                            | no                 | no value disables it; see above |
+| `diff.<driver>.command`  | `git diff`                                            | no                 | arbitrary name                  |
+| `diff.<driver>.textconv` | `git diff`, `git log -p`, `git blame`, `git show`     | no                 | arbitrary name                  |
+| `filter.<name>.clean`    | `git diff`; also `git add`, `git stash`, `git commit` | no, via `git diff` | arbitrary name                  |
+| `filter.<name>.process`  | `git diff`; also `git add`, `git stash`               | no, via `git diff` | arbitrary name                  |
+| `filter.<name>.smudge`   | `git checkout`                                        | yes                | arbitrary name                  |
+| `merge.<driver>.driver`  | `git merge`, `git cherry-pick`                        | yes                | arbitrary name                  |
+| `alias.<name>`           | `git <name>`                                          | no                 | arbitrary name                  |
 
-Every trigger in that table is a read verb or a verb the product already issues,
-and none of them takes a lease. Extending the pinned layer does not close any of
-them: five take an arbitrary name inside the key, so there is nothing to
-enumerate, and the sixth has no value that means "off". `.gitattributes` is in
-the workspace too, so the two keys that need it are no harder to reach than the
-rest.
+Every key that needs `.gitattributes` is no harder to reach for it, because that
+file is in the workspace as well.
+
+The lease column is measured against the runtime's own check, not assumed. Five
+of the eight are reachable without one, `git diff` being the widest of those
+routes; the three that do need a lease are only bounded by it in the weak sense
+noted above, since the agent creates its own leases. Extending the pinned layer
+does not close any of the eight: seven take an arbitrary name inside the key, so
+there is nothing to enumerate, and the eighth has no value that means "off".
+This is what separates them from the signature-format keys pinned earlier, where
+the set of key names is fixed and finite and pinning therefore works.
 
 The same measurement found several keys that do **not** reach a command here, and
 each is worth knowing because it is a control rather than an accident, except the
@@ -450,6 +465,13 @@ turn a repository-local config value into arbitrary code execution. Pinning
 `core.pager` would not help, because `pager.<command>` reaches the same place with
 an arbitrary name in the key. The pipe is the control, and there is a test that
 fails if it goes away.
+
+`include.path` and `includeIf` are honoured from repository-local configuration,
+so any of the keys above can be pulled in from an absolute path outside the
+workspace rather than written into `.git/config` directly. That widens where the
+value may sit; it adds no capability, and an included setting is still subject to
+the pinned layer — an included `core.hooksPath` loses to the pin exactly as a
+direct one does.
 
 That file reaches the credential as well as the program search. A credential
 helper configured there is itself a command, and it runs for any host the

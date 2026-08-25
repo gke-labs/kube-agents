@@ -1013,6 +1013,31 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
     ("commit.gpgsign", "false"),
     ("tag.gpgSign", "false"),
     ("gpg.program", "false"),
+    # `gpg.program` only covers the openpgp format. `gpg.format` is settable
+    # from the repository's own config, and each format reads its own program
+    # key, so `[gpg] format = ssh` walks straight past the pin above. Measured
+    # against git 2.55 under this environment: with `gpg.format=ssh` and
+    # `gpg.ssh.program=<payload>` set repository-locally, `git commit -S` and
+    # `git tag -s` both execute the payload. `gpg.ssh.defaultKeyCommand` does
+    # the same with no `user.signingkey` at all, and `x509` has its own
+    # `gpg.x509.program`. `-S`/`-s` are not refused in argv and there is no
+    # reason to refuse them, so the pin is the control.
+    #
+    # Unlike the unpinnable keys, this set is closed: git defines exactly three
+    # signature formats and each names its program in a fixed key. Verified
+    # that the pins close all four spellings and that an unsigned
+    # `git commit -m` is untouched. Nothing under `agents/`, `k8s-operator/`
+    # or `scripts/` signs anything.
+    #
+    # The trigger is the `-S`/`-s` flag, and `commit` and `tag` are both
+    # lease-gated -- which is a speed bump rather than a barrier, since the
+    # agent creates its own leases. There is no lease-free read route in:
+    # `log --show-signature`, `show --show-signature`, `verify-commit` and the
+    # `%G?`/`%GS` formats were all tried against a commit carrying a crafted
+    # SSH signature header and none of them ran the configured program.
+    ("gpg.ssh.program", "false"),
+    ("gpg.ssh.defaultKeyCommand", "false"),
+    ("gpg.x509.program", "false"),
     ("help.autocorrect", "0"),
 )
 

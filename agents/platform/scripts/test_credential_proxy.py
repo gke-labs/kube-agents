@@ -659,6 +659,15 @@ class GitHardeningTest(unittest.TestCase):
         # with an arbitrary name in the key — it is to keep the pipe.
         executor = self.executor()
         repository = self.repository(executor)
+        # The fixture has to carry a commit. `self.repository` only runs
+        # `git init`, and `git log` in an empty repository exits 128 with
+        # nothing to page -- so the log subTests below would pass on a pty too,
+        # which is exactly the silent disarming this test exists to prevent.
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "--allow-empty", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
         self.append_repository_config(
             repository, f"\n[core]\n\tpager = {self.payload}\n"
         )
@@ -668,7 +677,10 @@ class GitHardeningTest(unittest.TestCase):
             ["git", "--paginate", "log", "--oneline"],
         ):
             with self.subTest(argv=argv):
-                executor.execute(argv, cwd=str(repository))
+                result = executor.execute(argv, cwd=str(repository))
+                # Assert the command actually ran, so a future fixture change
+                # cannot turn these into vacuous passes.
+                self.assertEqual(0, result.exit_code, result.stderr)
                 self.assertFalse(self.executed(), f"core.pager ran for {argv}")
 
     def dirty_repository(self, executor, name="repo"):
@@ -705,6 +717,11 @@ class GitHardeningTest(unittest.TestCase):
             "commit.gpgsign": "false",
             "tag.gpgSign": "false",
             "gpg.program": "false",
+            # `gpg.program` is the openpgp format's key only; the other two
+            # formats read their own, and `gpg.format` is repository-local.
+            "gpg.ssh.program": "false",
+            "gpg.ssh.defaultKeyCommand": "false",
+            "gpg.x509.program": "false",
             "help.autocorrect": "0",
         }
         for key, value in expected.items():
@@ -799,6 +816,63 @@ class GitHardeningTest(unittest.TestCase):
         self.assertFalse(self.executed(), "gpg.program ran")
         # The positive beside the negative: the commit did not merely fail to
         # sign, it succeeded.
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_signing_cannot_run_a_program_through_a_second_format(self):
+        # `gpg.program` covers the openpgp format only. `gpg.format` is
+        # repository-local too, and each format reads its own program key, so
+        # `[gpg] format = ssh` walks past that pin into `gpg.ssh.program`.
+        # Measured before the pins below existed: `git commit -S` and
+        # `git tag -s` both executed the payload, with a clean argv --
+        # `-S`/`-s` are not refused and should not be.
+        #
+        # `defaultKeyCommand` is the spelling that needs no `user.signingkey`,
+        # and `x509` is the third format. Unlike the arbitrary-name keys in the
+        # design doc's limitation table, this set is closed: three formats,
+        # three fixed key names.
+        executor = self.executor()
+        for label, config, argv in (
+            (
+                "gpg.ssh.program",
+                '\n[gpg]\n\tformat = ssh\n[gpg "ssh"]\n\tprogram = {p}\n'
+                '[user]\n\tsigningkey = "key::ssh-ed25519 AAAA"\n',
+                ["git", "commit", "-S", "--allow-empty", "-m", "audit"],
+            ),
+            (
+                "gpg.ssh.defaultKeyCommand",
+                '\n[gpg]\n\tformat = ssh\n[gpg "ssh"]\n\tdefaultKeyCommand = {p}\n',
+                ["git", "commit", "-S", "--allow-empty", "-m", "audit"],
+            ),
+            (
+                "gpg.x509.program",
+                '\n[gpg]\n\tformat = x509\n[gpg "x509"]\n\tprogram = {p}\n'
+                '[user]\n\tsigningkey = whatever\n',
+                ["git", "commit", "-S", "--allow-empty", "-m", "audit"],
+            ),
+            (
+                "gpg.ssh.program via tag -s",
+                '\n[gpg]\n\tformat = ssh\n[gpg "ssh"]\n\tprogram = {p}\n'
+                '[user]\n\tsigningkey = "key::ssh-ed25519 AAAA"\n',
+                ["git", "tag", "-s", "-m", "release", "v1"],
+            ),
+        ):
+            with self.subTest(key=label):
+                repository = self.repository(executor, name=label.replace(" ", "_"))
+                subprocess.run(
+                    ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                     "commit", "--quiet", "--allow-empty", "-m", "seed"],
+                    cwd=repository, check=True, capture_output=True,
+                )
+                self.append_repository_config(
+                    repository, config.format(p=self.payload)
+                )
+                executor.execute(argv, cwd=str(repository))
+                self.assertFalse(self.executed(), f"{label} ran")
+        # And the unsigned commit the skills actually issue still works.
+        plain = self.repository(executor, name="plain")
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(plain)
+        )
         self.assertEqual(0, result.exit_code, result.stderr)
 
     def test_a_misspelled_subcommand_is_not_autocorrected_past_the_refusal(self):
