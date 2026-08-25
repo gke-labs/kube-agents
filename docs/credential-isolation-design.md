@@ -425,24 +425,26 @@ documented as closed.
 Measured against git 2.55 under the pinned environment, driving the runtime's own
 executor, these repository-local keys still reach a command:
 
-| Key                      | Reached by                                            | Lease              | Why it is not pinned            |
-| ------------------------ | ----------------------------------------------------- | ------------------ | ------------------------------- |
-| `diff.external`          | `git diff`                                            | no                 | no value disables it; see above |
-| `diff.<driver>.command`  | `git diff`                                            | no                 | arbitrary name                  |
-| `diff.<driver>.textconv` | `git diff`, `git log -p`, `git blame`, `git show`     | no                 | arbitrary name                  |
-| `filter.<name>.clean`    | `git diff`; also `git add`, `git stash`, `git commit` | no, via `git diff` | arbitrary name                  |
-| `filter.<name>.process`  | `git diff`; also `git add`, `git stash`               | no, via `git diff` | arbitrary name                  |
-| `filter.<name>.smudge`   | `git checkout`                                        | yes                | arbitrary name                  |
-| `merge.<driver>.driver`  | `git merge`, `git cherry-pick`                        | yes                | arbitrary name                  |
-| `alias.<name>`           | `git <name>`                                          | no                 | arbitrary name                  |
+| Key                      | Reached by                                                          | Lease | Why it is not pinned            |
+| ------------------------ | ------------------------------------------------------------------- | ----- | ------------------------------- |
+| `diff.external`          | `git diff`, `git log --ext-diff`                                    | no    | no value disables it; see above |
+| `diff.<driver>.command`  | `git diff`                                                          | no    | arbitrary name                  |
+| `diff.<driver>.textconv` | `git diff`, `git log -p`, `git blame`, `git show`                   | no    | arbitrary name                  |
+| `filter.<name>.clean`    | `git status`, `git diff`; also `git add`, `git stash`, `git commit` | no    | arbitrary name                  |
+| `filter.<name>.process`  | `git status`, `git diff`; also `git add`, `git stash`               | no    | arbitrary name                  |
+| `filter.<name>.smudge`   | `git checkout`                                                      | yes   | arbitrary name                  |
+| `merge.<driver>.driver`  | `git merge`, `git cherry-pick`, `git rebase`                        | yes   | arbitrary name                  |
+| `alias.<name>`           | `git <name>`                                                        | no    | arbitrary name                  |
 
 Every key that needs `.gitattributes` is no harder to reach for it, because that
-file is in the workspace as well.
+file is in the workspace as well. The two `filter.*` rows need the tracked file
+to be modified as well as the attribute to be set; with both in place a bare
+`git status` runs the configured command.
 
-The lease column is measured against the runtime's own check, not assumed. Five
-of the eight are reachable without one, `git diff` being the widest of those
-routes; the three that do need a lease are only bounded by it in the weak sense
-noted above, since the agent creates its own leases. Extending the pinned layer
+The lease column is measured against the runtime's own check, not assumed. Six of
+the eight are reachable without one, `git status` and `git diff` being the widest
+of those routes; the two that do need a lease are only bounded by it in the weak
+sense noted above, since the agent creates its own leases. Extending the pinned layer
 does not close any of the eight: seven take an arbitrary name inside the key, so
 there is nothing to enumerate, and the eighth has no value that means "off".
 This is what separates them from the signature-format keys pinned earlier, where
