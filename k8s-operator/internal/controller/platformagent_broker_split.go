@@ -53,18 +53,18 @@ const (
 	// minted for and the only audience the broker accepts. A token for any
 	// other audience — including the Kubernetes API's own — is refused, and
 	// this one is useless anywhere but the broker.
-	credentialProxyAudience = "kubeagents-credential-proxy"
+	credentialProxyAudience = "kubeagents-credential-proxy" // #nosec G101 -- Token audience name, not a credential
 
 	// credentialProxyTokenMountPath is where the agent container finds the
 	// token it presents to the broker.
-	credentialProxyTokenMountPath = "/var/run/secrets/kubeagents/credential-proxy"
+	credentialProxyTokenMountPath = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- Mount path, not a credential
 
 	// kubeAPIAccessMountPath is the conventional location of a Pod's
 	// default-audience token and cluster CA. The broker reads both to make the
 	// TokenReview call that verifies the agent's token.
 	kubeAPIAccessMountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 
-	agentCredentialProxyTokenVolume = "agent-credential-proxy-token"
+	agentCredentialProxyTokenVolume = "agent-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
 )
 
 // reasonSplitBrokerStrandsEventWatcher refuses the layout: the k8s-event-watcher
