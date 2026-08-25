@@ -234,13 +234,16 @@ guarantee anywhere: an agent that decides remediation is helpful can delete the 
 every other pull request depends on, and the first evidence will be somebody else's case
 going red.
 
-Making it a guarantee means a second, narrower credential for fleet-dependent runs. Seven
-of the ten drafted cases already need a GitOps-repo write path — the six audit scenarios
-and `rca-remediation-pr` — which is contained by pinning
+Making it a guarantee means a second, narrower credential for fleet-dependent runs. Most
+of the drafted cases already need a GitOps-repo write path — the six audit scenarios and
+both remediation cases — which is contained by pinning
 it to a throwaway repository per eval project rather than by asking the agent not to; the
 cluster credential wants the same treatment. Until then, a case author's assertion that
 their case is read-only is the only control there is.
 
-Asserting read-only from inside a case is `resource_property` against the fixture — "the
+Asserting read-only from inside a case is a state check against the fixture — "the
 planted defect survived the run" — and not `tool_called`, which sees only the delegating
-turn's calls and would be blind to a worker's mutation.
+turn's calls and would be blind to a worker's mutation. On the standing fleet that check
+is `fleet_resource_property`, which resolves the cluster from the fixture role; plain
+`resource_property` reads the ambient kubeconfig and suits only a case whose deployer
+built its own cluster, as `gpu-stress-test-diagnosis` does.

@@ -30,8 +30,8 @@ and `fixtures`. Those are ours. A typo in either cannot fail a run, which is exa
 ## The id key
 
 Use `id:`. It is the field name on the schema, and it is the one every case in the tree
-uses — twelve of the thirteen already did, and the thirteenth was renamed rather than
-grandfathered, on the principle in "Changing the format" below.
+uses — all but one already did, and that one was renamed rather than grandfathered, on
+the principle in "Changing the format" below.
 
 `Task.from_dict` accepts `task_id:` as an alias — it reads `raw.get("id")` first and
 falls back to `raw.get("task_id")` when that is absent

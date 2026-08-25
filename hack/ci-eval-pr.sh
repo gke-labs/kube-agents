@@ -223,7 +223,7 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 #
 # It runs on every presubmit even though every task that consumes it is still
 # commented out of TASKS below, and that is deliberate rather than an oversight.
-# The six fleet tasks cannot be switched on until this step is known to work in
+# The fleet tasks cannot be switched on until this step is known to work in
 # whichever project Boskos leases, and the only way to know that is to run it:
 # its per-project warnings ("carries no clusters labelled environment=seeded")
 # are the signal that a pool project still needs bench/tf/fleet applied, and
@@ -453,18 +453,17 @@ TASKS=(
   #   A1  the six audit scenarios, rca-remediation-pr and the refusal variant
   #       after them are NOT read-only -- every fleet-audit stream mints a
   #       GitHub token and writes a ledger issue, and both remediation cases
-  #       answer with a pull request on the same eval GitOps repo.
-  #       ci-deploy.sh installs the PR's agent on every run but never
-  #       sets platformAgent.integration.github.gitRepo, so SETTINGS.md
-  #       renders `- **Git Repo:** None` (buildSettingsConfigMap substitutes
-  #       the literal when the field is empty) and audit_report.py start has
-  #       nothing to clone. Needs that value passed per leased project (the
-  #       throwaway eval GitOps repos) and the minter scoped to it -- the
-  #       token has exactly one source and no inherited GITHUB_TOKEN is
-  #       honoured, so the value alone only moves the failure to the clone.
-  #       Both repository halves are on main; what is left is the Prow job
-  #       exporting EVAL_GITHUB_APP_ID, which is
+  #       answer with a pull request on the same eval GitOps repo. The
+  #       in-repo half is done: ci-deploy.sh maps each pool project to its
+  #       throwaway repo and passes it as
+  #       platformAgent.integration.github.gitRepo, and scopes githubMinter
+  #       to the same repo. What is left is outside this repository --
+  #       EVAL_GITHUB_APP_ID must be set in the Prow job before ci-deploy.sh
+  #       will render githubMinter.enabled=true, and the token has exactly
+  #       one source (no inherited GITHUB_TOKEN is honoured), so until then
+  #       the repo resolves and the clone still fails. That is
   #       GoogleCloudPlatform/oss-test-infra#2661 -- approved, not merged.
+  #       See DRAFTS.md A1.
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules.
   #       Boskos leases at random, so the gate is the NEWEST fleet in the
   #       pool: kube-agents-evals-3 was planted 2026-08-24, three days
@@ -521,13 +520,15 @@ TASKS=(
   # "./tasks/autoops-warning-event-triage/task.yaml"
   #
   # Refusal variant of cluster debugging, and not one of the ten above.
-  # Blocked on A1 and A5, the same pair as rca-remediation-pr and for the same
-  # reason: AGENT_SERVICE_NAME sends it to the platform agent, whose compliant
-  # answer to "please fix it" is a pull request on the eval GitOps repo. Then
-  # it waits on having been watched to both pass and fail (`validated: false`
-  # in the file). Uncommenting a case nobody has run is how a case that can
-  # only fail reds every pull request in the repository.
-  # "./tasks/cluster-agent-crashloop-refuses-the-fix/task.yaml"
+  # Blocked on A1 and A5, the same pair as rca-remediation-pr: A1 because its
+  # compliant answer is a pull request on the eval GitOps repo, A5 because its
+  # safeguard reads the seeded fleet. It is graded as a platform-agent case
+  # rather than a cluster-agent one because AGENT_SERVICE_NAME above is a
+  # single global target -- that is A2, and it shapes what the case asserts
+  # rather than blocking it. Then it waits on having been watched to both pass
+  # and fail (`validated: false` in the file). Uncommenting a case nobody has
+  # run is how a case that can only fail reds every pull request here.
+  # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
 )
 
 # Floor for VerificationCorrectness on tasks that declare a verification_spec.
