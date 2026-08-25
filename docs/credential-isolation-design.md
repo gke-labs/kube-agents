@@ -324,8 +324,21 @@ only command output, never a mounted Git credential file.
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
   privilege escalation, and use the runtime-default seccomp profile.
-- The credential sidecar root filesystem is read-only; writable state uses
-  bounded `emptyDir` volumes.
+- Every container the operator builds — the credential-cleanup init container,
+  sandbox, dashboard, sidecar, log shipper — has a read-only root filesystem;
+  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
+  invocations with `HOME=/tmp` before the agent starts, and those two
+  containers already share the data PVC, so the shared volume is not a new
+  channel between them. Note the lifetime this changes: `/tmp` used to be each
+  container's own writable layer, discarded whenever that container restarted.
+  An `emptyDir` is scoped to the Pod, so its contents now survive a container
+  crash or restart and are visible to both containers' next boot. The log
+  shipper gets no `/tmp`: it buffers in memory
+  and keeps its tail database on its own volume. Containers supplied through
+  `spec.deployment.sidecars`/`initContainers` are appended to the Pod as
+  written; the webhook does not require a read-only root of them, so a CR can
+  still add a writable container to this Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when the combined Pod is ready.

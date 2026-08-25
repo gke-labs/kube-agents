@@ -1,0 +1,129 @@
+name: Manual E2E Runner
+
+on:
+  #checkov:skip=CKV_GHA_7:Manual E2E test runner requires environment and scenario filter parameters
+  workflow_dispatch:
+    inputs:
+      test_environment:
+        description: "Target test environment (rc-e2e, nightly-e2e, investigations-e2e, audit-e2e, agent-plugin-e2e, gchat-e2e, all)"
+        required: false
+        default: "rc-e2e"
+        type: choice
+        options:
+          - "rc-e2e"
+          - "nightly-e2e"
+          - "investigations-e2e"
+          - "audit-e2e"
+          - "agent-plugin-e2e"
+          - "gchat-e2e"
+          - "all"
+      stockout_scenarios:
+        description: "Stockout scenarios ('04' for fast smoke, 'all' for full matrix)"
+        required: false
+        default: "04"
+        type: string
+      fleet_audit_streams:
+        description: "Fleet audit stream filter ('all', 'stockout-prevention', or specific stream)"
+        required: false
+        default: "all"
+        type: string
+      rebuild_operator:
+        description: "Rebuild operator from source (true / false)"
+        required: false
+        default: "false"
+        type: string
+      test_destructive_crd:
+        description: "Test destructive CRD deletion safeguard (true / false)"
+        required: false
+        default: "false"
+        type: string
+
+concurrency:
+  group: rc-environment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run-e2e:
+    name: Run E2E (${{ inputs.test_environment || 'rc-e2e' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      CLOUDSDK_PYTHON: "/usr/bin/python3"
+      USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: ./scripts/release/install_e2e_deps.sh
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || '' }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT || '' }}
+          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin"
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GCP_REGION || 'us-east4' }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Connect to GKE & Configure Docker
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+        run: |
+          ./scripts/release/wait_for_gke_readiness.sh
+          REGION="${GCP_REGION:-us-east4}"
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true
+
+      - name: Execute E2E Tests
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE || 'kubeagents-system' }}
+          REGISTRY: ${{ vars.REGISTRY || vars.REGISTRY_PREFIX || (vars.GCP_PROJECT_ID && format('{0}-docker.pkg.dev/{1}/kube-agents', vars.GCP_REGION || 'us-east4', vars.GCP_PROJECT_ID)) || '' }}
+          GITHUB_ORG: ${{ vars.GH_ORG || 'test-org-kube-agent' }}
+          GITHUB_REPO: ${{ vars.GH_REPO || 'test-org-kube-agent/agents-repo' }}
+          TEST_ENVIRONMENT: ${{ inputs.test_environment }}
+          STOCKOUT_SCENARIOS: ${{ inputs.stockout_scenarios }}
+          FLEET_AUDIT_STREAMS: ${{ inputs.fleet_audit_streams || 'all' }}
+          REBUILD_OPERATOR: ${{ inputs.rebuild_operator }}
+          TEST_DESTRUCTIVE_CRD: ${{ inputs.test_destructive_crd }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
+          E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
+          E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
+          CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
+        run: |
+          TARGET_ENV="$TEST_ENVIRONMENT"
+          if [ "$TARGET_ENV" = "all" ]; then
+            python3 scripts/release/execute_e2e_tests.py --env all
+          else
+            python3 scripts/release/execute_e2e_tests.py --env "$TARGET_ENV"
+          fi

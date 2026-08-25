@@ -624,6 +624,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
           startupProbe:
             exec:
               command:
@@ -656,6 +657,8 @@ spec:
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
+            - mountPath: /tmp
+              name: tmp-scratch
         - args:
             - hermes
             - dashboard
@@ -700,6 +703,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
@@ -709,6 +713,8 @@ spec:
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
+            - mountPath: /tmp
+              name: tmp-scratch
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
@@ -728,6 +734,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
@@ -935,6 +942,9 @@ spec:
             defaultMode: 420
             name: platformagent-settings
           name: settings-volume
+        - emptyDir:
+            sizeLimit: 2Gi
+          name: tmp-scratch
         - configMap:
             name: platformagent-credential-proxy-policy
           name: credential-proxy-policy
