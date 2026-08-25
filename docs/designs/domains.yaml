@@ -55,16 +55,24 @@ domains:
 
 # Known-uncovered. The two kanban probes cover chat-and-routing, so it is
 # already off the list. Phase 2's exit criterion is an empty list.
+#
+# Reliability, capacity, security, upgrades, consistency and remediation came
+# off on 2026-08-25, when their six scenarios were uncommented in
+# hack/ci-eval-pr.sh's TASKS array. What let them activate was
+# GoogleCloudPlatform/oss-test-infra#2661 merging that day and closing
+# blockers A1 and A4 together: it set EVAL_GITHUB_APP_ID, which is what makes
+# hack/ci-deploy.sh render a real GitOps target and enable the token minter,
+# and it mounted BENCH_GITHUB_TOKEN, which is what ledger_issue_contains reads
+# the published ledger issue with.
 allowlist:
-  - reliability
-  - capacity
+  # A3 (bench/tasks/DRAFTS.md): fleet-cost-idle-pool needs an unattached disk
+  # older than the SOP's literal creationTimestamp<-P30D filter, against a
+  # fleet planted 2026-08-21 -- not before 2026-09-20, and a replant restarts
+  # the clock.
   - cost
-  - security
-  - upgrades
-  - consistency
-  - remediation
   - cluster-debugging
   # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
   # post-incident RCA, and incident-triage means event-fired autoops triage.
-  # Real coverage arrives with the autoops-warning-event-triage scenario.
+  # Real coverage needs autoops-warning-event-triage, which has no scenario
+  # driver to apply its incident workload -- tracked as #954.
   - incident-triage

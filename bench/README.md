@@ -11,13 +11,17 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
-- `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
+- `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. The rest are the Phase 2 domain scenarios; [`tasks/DRAFTS.md`](tasks/DRAFTS.md) is their status page.
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests against a local HTTP stub.
 
 To add a task or plug in a different agent, see
 [CUSTOM-TASKS.md](CUSTOM-TASKS.md).
+
+**Domain coverage.** `docs/designs/domains.yaml` lists ten domains and an `allowlist` of the ones known to be uncovered; `scripts/test_domain_coverage.py` fails the build both for an uncovered domain missing from that list and for a listed domain that is in fact covered, so the list cannot rot in either direction. A domain counts as covered only when a task carries its `domain:` slug **and** a non-empty `verification_spec` **and** is an **uncommented** entry in `hack/ci-eval-pr.sh`'s `TASKS` array — covered means running.
+
+Seven of the ten are covered as of 2026-08-25: `chat-and-routing` by the two kanban probes, and `reliability`, `capacity`, `security`, `upgrades`, `consistency` and `remediation` by the six scenarios activated that day, once blockers A1 and A4 closed. Three remain allowlisted — `cost` (date-gated by the cost SOP's own `creationTimestamp<-P30D` disk filter, not before 2026-09-20), `cluster-debugging` (activating separately, in #939) and `incident-triage` (its scenario has no driver to apply the incident workload; #954). Phase 2's exit criterion is an empty allowlist.
 
 ## Running evals
 
