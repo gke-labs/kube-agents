@@ -67,7 +67,7 @@ Two steps are human-only, and the minter does not work until both are done. `ter
 
 **1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on `gke-agentic`. Grant `contents: write`, `pull_requests: write` and `issues: write` on that repository only.
 
-**This is already done for all three current pool projects.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on `gke-agentic/kube-agents-evals-infra`, `gke-agentic/kube-agents-evals-2-infra`, and `gke-agentic/kube-agents-evals-3-infra`. Verify before an apply:
+**This is already done for every project onboarded so far.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on each project's `gke-agentic/<project>-infra` repository and nothing else. The query below is the list, rather than a copy of it kept here to go stale:
 
 ```bash
 gh api /orgs/gke-agentic/installations \

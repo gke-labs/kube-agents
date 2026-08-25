@@ -166,6 +166,8 @@ identifier appears, add its source here.
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
 | Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |
+| Which CI pool project maps to which GitOps repository | `gitops_repo_for_project()` in `hack/ci-deploy.sh` |
+| Roles the pool verifier accepts as Artifact Registry upload rights, and the API set it requires | `scripts/verify_ci_pool_project.py`, whose `VALID_CMEK_STATES` mirrors `is_valid_cmek_encryption_state()` in `k8s-operator/scripts/installer_common.sh` and whose cluster names mirror `bench/tf/fleet` |
 
 ## 3. Documentation eras and status
 
@@ -334,7 +336,7 @@ only what the title does not say.
 | `deploy/token-minter.md` | Site page | Minty: the in-cluster broker minting short-lived GitHub App installation tokens; no long-lived secret on disk. | Token flow, KMS-held key, setup | Operator-side README: `k8s-operator/config/integrations/github/README.md` |
 | `deploy/telemetry.md` | Site page | Where OTel, Prometheus, and Cloud Logging fit in the shipping deploy, and how to point it at a collector other than the GKE-managed one. | What runs where, OTLP endpoint precedence and discovery, non-GKE clusters | — |
 | `deploy/gitops-argocd.md` | Site page | Standing up ArgoCD and Config Connector as the pull-based reconciler that applies what the agent proposes. | Pull vs push, read-only repo App, fleet auth, prune gates | Reference repo layout: `examples/gitops-repo/README.md` |
-| `deploy/ci-pool-projects.md` | Site page | Prerequisites and setup for GCP projects in the Boskos evaluation pool. | Enabled APIs, host cluster, IAM, AR cleanup policy, Boskos registration | CI engineers |
+| `deploy/ci-pool-projects.md` | Site page | Prerequisites and setup for GCP projects in the Boskos evaluation pool. | Enabled APIs, host cluster, IAM, AR cleanup policy, GitHub App token minter, pre-flight verification, Boskos registration | CI engineers |
 | `operator/index.md` | Site page | Overview of the Kubebuilder controller reconciling `PlatformAgent` CRs and the resources it manages. | Managed resources, webhooks, layout | — |
 | `operator/platformagent-crd.md` | Site page | Reference for the `PlatformAgent` custom resource shape and reconcile behavior. | `spec.harness`/`deployment`/`security`/`integration`, `status` | — |
 | `operator/agentplugin-crd.md` | Site page | Reference for the `AgentPlugin` custom resource shape, OCI image volume mounting, and security allowlisting. | `spec.agentRef`/`image`/`env`/`config`, `status` | — |

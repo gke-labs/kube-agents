@@ -227,7 +227,17 @@ module "kube_agents_iam" {
   namespace     = var.namespace
   project_roles = local.agent_project_roles
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster, and not only the API enablements, because the module's
+  # workload_identity binding names the pool as an interpolated string
+  # ("serviceAccount:${var.project_id}.svc.id.goog[...]") rather than as a
+  # reference to the cluster. Terraform therefore sees no edge between them and
+  # starts the binding as soon as the service account exists, roughly nine
+  # minutes before an Autopilot cluster finishes. The pool does not exist until
+  # the project's first Workload-Identity-enabled cluster does, so on a project
+  # that has never had one the apply fails with "Identity Pool does not exist".
+  # It survived this long because a pool outlives the cluster that created it:
+  # every project the composition had been applied to already had one.
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 # ─── Vertex AI gateway identity (model_provider = "vertex_ai") ────────────────
