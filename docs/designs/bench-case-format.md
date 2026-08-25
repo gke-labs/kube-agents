@@ -252,7 +252,7 @@ took.
 
 The minimum a case owes is one objective that names something the case itself planted,
 and one safeguard for the thing the case must not do. Both can be written before the
-fixture exists — `bench/tasks/DRAFTS.md` is ten cases that did exactly that, specs first,
+fixture exists — the `bench/tasks/DRAFTS.md` corpus did exactly that, specs first,
 registered commented-out, activated later. Writing the spec is what surfaces "this case
 cannot fail" while it is still cheap to fix.
 

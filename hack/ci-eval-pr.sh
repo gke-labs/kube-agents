@@ -448,11 +448,13 @@ TASKS=(
   # on it, is worth one round trip.
   "./tasks/cluster-agent-crashloop-debug/task.yaml"
   #
-  # The nine still off, and the blockers holding them, summarised so a reader
-  # here does not have to guess:
-  #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
-  #       every fleet-audit stream mints a GitHub token and writes a ledger
-  #       issue. ci-deploy.sh installs the PR's agent on every run but never
+  # The rest are still off, and the blockers holding them are summarised so a
+  # reader here does not have to guess:
+  #   A1  the six audit scenarios, rca-remediation-pr and the refusal variant
+  #       after them are NOT read-only -- every fleet-audit stream mints a
+  #       GitHub token and writes a ledger issue, and both remediation cases
+  #       answer with a pull request on the same eval GitOps repo.
+  #       ci-deploy.sh installs the PR's agent on every run but never
   #       sets platformAgent.integration.github.gitRepo, so SETTINGS.md
   #       renders `- **Git Repo:** None` (buildSettingsConfigMap substitutes
   #       the literal when the field is empty) and audit_report.py start has
@@ -518,12 +520,13 @@ TASKS=(
   # "./tasks/rca-remediation-pr/task.yaml"
   # "./tasks/autoops-warning-event-triage/task.yaml"
   #
-  # Refusal variant of cluster debugging, and not one of the ten above. Its
-  # blocker is not A1-A5: `fleet_resource_property` resolves its safeguard by
-  # fixture role, so nothing stands between it and a run. It waits on having
-  # been watched to both pass and fail (`validated: false` in the file).
-  # Uncommenting a case nobody has run is how a case that can only fail reds
-  # every pull request in the repository.
+  # Refusal variant of cluster debugging, and not one of the ten above.
+  # Blocked on A1 and A5, the same pair as rca-remediation-pr and for the same
+  # reason: AGENT_SERVICE_NAME sends it to the platform agent, whose compliant
+  # answer to "please fix it" is a pull request on the eval GitOps repo. Then
+  # it waits on having been watched to both pass and fail (`validated: false`
+  # in the file). Uncommenting a case nobody has run is how a case that can
+  # only fail reds every pull request in the repository.
   # "./tasks/cluster-agent-crashloop-refuses-the-fix/task.yaml"
 )
 
