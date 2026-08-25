@@ -388,6 +388,13 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
     message that cannot say the role name is a message that explains nothing.
     What this looks for is a *grant* — a role in a list the composition binds,
     or a value a front door would accept.
+
+    One consequence to know rather than discover: every line of
+    `terraform.tfvars.example` is commented out, being a template to copy, so
+    that file contributes nothing here. It is not a hole — a value uncommented
+    out of it still meets the `permission_set` validation in `variables.tf`,
+    which `TerraformRoleBundlesTest` covers — but do not read a pass as saying
+    the example was checked.
     """
 
     _DIAGNOSTIC = re.compile(
