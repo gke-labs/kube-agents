@@ -75,7 +75,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee. The one operator-managed exception is `spec.security.splitCredentialBrokerPod: true`, which mounts a projected ServiceAccount token into the sandbox; see the discussion below.
 - Credentialed commands execute in the credential sidecar, not in the agent sandbox.
 - The credential sidecar receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
@@ -85,6 +85,10 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the sidecar for this reason.
 
 The sandbox and credential sidecar must not share a process namespace, and must not run as the same user, while the sidecar holds credentials: either one exposes the sidecar's environment variables through `/proc`. The Pod does neither. `shareProcessNamespace` is unset in every configuration, including the dashboard-enabled one that previously set it, and the sidecar runs as a user of its own. The two containers do still share a Pod, and so a network namespace and one Pod identity; see the limitation in the design.
+
+`spec.security.splitCredentialBrokerPod` removes that last sharing, and is off by default because it requires ReadWriteMany storage for the agent data volume — the broker executes commands in directories the agent creates there, so both Pods must mount the claim read-write at the same path, which a ReadWriteOnce persistent disk cannot do across nodes. Enabling it without that storage fails as a scheduling problem rather than a policy one: the broker Pod cannot attach the volume, never becomes a Service endpoint, and every proxied command reports the credential proxy as unavailable.
+
+When it is on, the broker call is authenticated: the agent presents an audience-bound projected ServiceAccount token and the broker verifies it with a `TokenReview`. Three properties do not follow. The two Pods share one ServiceAccount, because the Workload Identity binding names it, so the verified identity is per-ServiceAccount rather than per-Pod. The token crosses the cluster network in cleartext. And the token is mounted into the sandbox container, so it is short-lived, audience-bound and revocable but not non-exportable — the sandbox holds a credential where previously it held none. A loopback egress forwarder in the agent Pod, mirroring the `agent-api-proxy` container this change already adds, would restore that property and is deferred rather than ruled out.
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 
@@ -109,7 +113,7 @@ The selected configuration is accepted when:
 2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
 3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
 4. operator-managed persisted state is scoped to its `PlatformAgent`;
-5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds in the default sidecar layout. It does **not** hold under `spec.security.splitCredentialBrokerPod: true`, which mounts an audience-bound projected ServiceAccount token into the sandbox container so it can authenticate to the broker across the network — a deliberate trade described in section 6;
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 

@@ -9197,6 +9197,35 @@ spec:
                         ServiceAccountName is the Kubernetes Service Account
                         bound to the Deployment.
                       type: string
+                    splitCredentialBrokerPod:
+                      description: |-
+                        SplitCredentialBrokerPod moves the credential broker out of the agent Pod
+                        into a Deployment and Service of its own, so that a compromised agent no
+                        longer shares a network namespace with the process holding the cloud
+                        credentials.
+
+                        REQUIRES ReadWriteMany storage for the agent data volume, and defaults to
+                        false for that reason. The broker runs proxied commands with a working
+                        directory the agent created on the shared data PVC, so both Pods must
+                        mount that PVC read-write at the same path and see the same files there.
+                        The default GKE persistent disk is ReadWriteOnce, which cannot do that
+                        across two Pods on different nodes; the cluster needs Filestore or GCS
+                        Fuse (storage class "standard-rwx" or equivalent) before this is enabled.
+
+                        Without it the failure is a scheduling one, not a policy one. The broker
+                        Pod cannot attach the volume, stays Pending with a Multi-Attach error,
+                        and never becomes a Service endpoint — so every proxied command reports
+                        "credential proxy unavailable: [Errno 111] Connection refused", the same
+                        symptom an unhealthy sidecar produces. If the scheduler happens to place
+                        both Pods on one node it will instead appear to work, which makes the
+                        misconfiguration intermittent and worth ruling out first.
+
+                        Two further caveats. The agent Pod and the broker Pod share one
+                        ServiceAccount, because the Workload Identity IAM binding names it, so
+                        the identity the broker verifies is per-ServiceAccount rather than
+                        per-Pod. And the bearer token the agent presents crosses the cluster
+                        network in cleartext.
+                      type: boolean
                   type: object
                 telemetry:
                   description: Telemetry configures OpenTelemetry export for this agent.

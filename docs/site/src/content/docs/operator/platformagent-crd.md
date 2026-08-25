@@ -397,6 +397,7 @@ Default image: derived dynamically from the operator's container image at runtim
 
 - `serviceAccountName` — the KSA the pod runs as. `kubeagents-platform-agent` by convention.
 - `serviceAccountAnnotations` — passed through to the KSA. Typically holds `iam.gke.io/gcp-service-account` for Workload Identity binding.
+- `splitCredentialBrokerPod` — default `false`. Renders the credential broker as its own Deployment and Service instead of a sidecar. **Requires ReadWriteMany storage for the agent data volume** — both Pods mount it read-write at the same path, and the default GKE persistent disk cannot do that across nodes. Without it the broker Pod cannot attach the volume and never becomes ready, so every proxied command reports the credential proxy as unavailable. See [Credential isolation § Splitting the broker into its own Pod](/kube-agents/reference/credential-isolation/#splitting-the-broker-into-its-own-pod).
 
 The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by the [`kube-agents-iam` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) with one of these permission sets:
 

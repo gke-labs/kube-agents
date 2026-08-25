@@ -64,6 +64,10 @@ func defaultTestNetpolProfile() netpolProfile {
 	return netpolProfile{DNSClusterIP: defaultDNSClusterIP, MetadataDaemonIP: metadataDaemonIP}
 }
 
+// ssaApplyInterceptor is the shorter name the credential-broker tests use for
+// the fake client's Server-Side Apply support. One aliases the other.
+func ssaApplyInterceptor() interceptor.Funcs { return fakeServerSideApplyInterceptors() }
+
 // fakeServerSideApplyInterceptors returns interceptor.Funcs to handle Server-Side Apply (SSA) in the controller-runtime fake client.
 func fakeServerSideApplyInterceptors() interceptor.Funcs {
 	return interceptor.Funcs{
@@ -281,8 +285,6 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	objects := []client.Object{
 		agent,
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}

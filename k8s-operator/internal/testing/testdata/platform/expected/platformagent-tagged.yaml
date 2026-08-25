@@ -810,11 +810,11 @@ spec:
               value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
-              value: cluster-internal-trusted
-            - name: API_SERVER_KEY
               value: cluster-internal-trusted
             - name: API_SERVER_EXTERNAL_KEY
               valueFrom:

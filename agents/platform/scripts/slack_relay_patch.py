@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from credential_proxy_client import authorization_headers
+
 
 LOGGER = logging.getLogger("slack-relay-patch")
 DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -111,10 +113,13 @@ def install() -> None:
 
     def request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        # The relay shares a listener with the credential broker, so it shares
+        # the broker's authentication. Empty in the sidecar deployment.
+        headers = {"Content-Type": "application/json", **authorization_headers()}
         req = urllib.request.Request(
             relay_url + path,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="GET" if body is None else "POST",
         )
         with urllib.request.urlopen(req, timeout=35) as response:
