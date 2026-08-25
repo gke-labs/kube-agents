@@ -2063,7 +2063,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
-        request_id = str(payload.get("requestId", ""))
+        # Sanitized here rather than at each of the eight log sites below, and
+        # sanitized at all because it is caller-supplied text going into a
+        # line-oriented formatter. A newline in it ends the record and starts a
+        # new one, so an unsanitized requestId lets the caller write a whole
+        # forged entry into the audit trail - including one naming a
+        # ServiceAccount that made no request. It is never echoed back to the
+        # client, so narrowing it costs nothing.
+        request_id = _sanitize_for_logging(str(payload.get("requestId", "")))
         # The principal reaches the decision point, rather than being checked at
         # the door and thrown away. Every policy refusal below is a judgement
         # about *what* was asked. A per-caller model is what would let them
@@ -2078,13 +2085,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # TokenReview, not from the request, and a truncated identity is
             # an audit line that names the wrong ServiceAccount.
             _sanitize_for_logging(principal.describe(), max_length=512),
-            argv[0],
+            # Logged before the allowlist check below, so at this point it is
+            # arbitrary caller text and gets the same treatment as request_id.
+            _sanitize_for_logging(argv[0]),
         )
         if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,
-                argv[0],
+                _sanitize_for_logging(argv[0]),
             )
             self._json(
                 HTTPStatus.FORBIDDEN,
@@ -2117,7 +2126,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         violation = self.executor.git_lease_violation(argv, cwd)
         if violation is not None:
             LOGGER.warning(
-                "git lease refused request_id=%s cwd=%s", request_id, cwd
+                "git lease refused request_id=%s cwd=%s",
+                request_id,
+                _sanitize_for_logging(cwd or "", max_length=256),
             )
             self._json(
                 HTTPStatus.FORBIDDEN,
@@ -2156,7 +2167,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # them from reading as an unexplained proxy outage — the agent can
             # correct the path instead of guessing.
             LOGGER.warning(
-                "command rejected request_id=%s reason=%s", request_id, exc
+                # The message embeds the caller's own cwd or kubeconfig path.
+                "command rejected request_id=%s reason=%s",
+                request_id,
+                _sanitize_for_logging(str(exc), max_length=256),
             )
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return

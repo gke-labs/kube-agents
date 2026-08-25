@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import queue
 import socket
@@ -2162,6 +2163,129 @@ class BackendSocketModeTest(unittest.TestCase):
             self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
             mode = socket_path.stat().st_mode & 0o777
             self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
+
+
+class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
+    """One request must produce one audit record, whatever the caller sends.
+
+    The exec line is the only thing that binds a command to a verified
+    identity, and the root formatter is line-oriented plain text. A newline in
+    any caller-supplied field ends the record and starts another, so an
+    unsanitized `requestId` or `argv[0]` lets the caller write a complete,
+    well-formed second entry naming a ServiceAccount that made no request.
+    Reproduced against a real server before this was fixed.
+    """
+
+    FORGERY = (
+        "x\n2026-01-01 00:00:00,000 INFO credential-proxy exec request_id=y "
+        "principal=system:serviceaccount:kubeagents-system:other executable=kubectl"
+    )
+
+    class _RecordingExecutor:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def git_lease_violation(self, argv, cwd):
+            # Refuse every git command, so the "git lease refused" line -- the
+            # one that logs the caller's cwd -- is actually reached.
+            return "no lease" if argv and argv[0] == "git" else None
+
+        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                duration_ms=0, truncated=False, timed_out=False,
+            )
+
+    def setUp(self):
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
+        ):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.executor = self._RecordingExecutor()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
+
+        self.records = []
+        # Without this the exec line is dropped: LOGGER's own level is NOTSET,
+        # so it inherits root's WARNING under the test runner and the INFO
+        # record the forgery rides on never reaches a handler. A capture that
+        # sees nothing passes every assertion below.
+        level = credential_proxy.LOGGER.level
+        credential_proxy.LOGGER.setLevel(logging.INFO)
+        self.addCleanup(credential_proxy.LOGGER.setLevel, level)
+
+        class Capture(logging.Handler):
+            def emit(inner, record):  # noqa: N805
+                self.records.append(record.getMessage())
+
+        self.capture = Capture()
+        previous = list(credential_proxy.LOGGER.handlers)
+        propagate = credential_proxy.LOGGER.propagate
+        credential_proxy.LOGGER.handlers = [self.capture]
+        credential_proxy.LOGGER.propagate = False
+        self.addCleanup(setattr, credential_proxy.LOGGER, "propagate", propagate)
+        self.addCleanup(setattr, credential_proxy.LOGGER, "handlers", previous)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _post(self, payload):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            exc.read()
+
+    def _assert_single_line_records(self, expected_substring):
+        self.assertTrue(
+            any(expected_substring in message for message in self.records),
+            f"expected a record containing {expected_substring!r}; got {self.records!r}",
+        )
+        for message in self.records:
+            self.assertNotIn(
+                "\n", message,
+                f"a newline in an audit record forges a second entry: {message!r}",
+            )
+
+    def test_a_newline_in_the_request_id_writes_no_second_record(self):
+        self._post({"requestId": self.FORGERY, "argv": ["kubectl", "get", "pods"], "cwd": "/tmp"})
+        self._assert_single_line_records("exec request_id=")
+        self.assertNotIn(
+            "some-other-agent", " ".join(self.records),
+            "the caller must not be able to name a ServiceAccount in the audit trail",
+        )
+
+    def test_a_newline_in_the_executable_writes_no_second_record(self):
+        # argv[0] is logged before the allowlist check, so at that point it is
+        # arbitrary caller text.
+        self._post({"requestId": "ok", "argv": ["ku\nbectl"], "cwd": "/tmp"})
+        self._assert_single_line_records("executable blocked")
+
+    def test_a_newline_in_the_cwd_writes_no_second_record(self):
+        self._post({"requestId": "ok", "argv": ["git", "status"], "cwd": "/tmp/a\nb"})
+        self._assert_single_line_records("git lease refused")
 
 
 class ServiceAccountAuthenticatorTest(unittest.TestCase):
