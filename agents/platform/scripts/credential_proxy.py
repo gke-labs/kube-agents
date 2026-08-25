@@ -1088,6 +1088,16 @@ _GIT_REFUSED_ARGUMENTS = {
     #               needs no lease and no file on the volume: one call, and the
     #               value is attached to the flag rather than separated, which
     #               is why the matcher below has to handle the attached form.
+    #   --trailer   `git commit -m msg --trailer <name>:<value>` runs
+    #               `trailer.<name>.cmd` to compute the value, so the payload
+    #               lands on `commit` — the argv the skills already send, and
+    #               the one the design doc calls reachable with no unusual
+    #               argument at all. The key's arbitrary name puts it out of
+    #               reach of the pins. Measured under the pinned environment
+    #               against git 2.55: `git config trailer.zz.cmd 'id #'` then
+    #               `git commit -m msg --trailer zz:v` writes the credential
+    #               container's `uid=` into the commit message. It has no short
+    #               form on either subcommand that accepts it.
     #
     # `-x` and `-O` are refused wherever they appear, so `git clean -x` and
     # `git cherry-pick -x` are refused too. Neither is in shipped code.
@@ -1095,6 +1105,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "-x": "runs a command the caller names, once per commit",
     "--open-files-in-pager": "runs a command the caller names over the matches",
     "-O": "runs a command the caller names over the matches",
+    "--trailer": "runs a command the caller names to compute a trailer value",
     # Programs git runs on the far side of a transport. Blocked today only by
     # GIT_ALLOW_PROTOCOL refusing `file` — the paired control fires as soon as
     # the allowlist is widened — so these are here to make that widening safe
@@ -1150,7 +1161,7 @@ _GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
 #
 # **This is a denylist over a set that is not closed, and it is the weakest
 # thing in this file.** git keeps a command in configuration for `difftool`,
-# `mergetool`, `web--browse`, `instaweb`, `help -w`, and the `p4`/`svn`
+# `mergetool`, `web--browse`, `instaweb`, `help`, and the `p4`/`svn`
 # bridges, and a new one can arrive in any release. The structurally correct
 # fix is to allowlist the ~20 subcommands the product actually issues and fail
 # closed on the rest, which is a change to the denylist-not-allowlist decision
@@ -1166,9 +1177,35 @@ _GIT_REFUSED_SUBCOMMANDS = {
     "send-email": "runs a command the caller names (`--smtp-server`)",
     "instaweb": "starts a caller-named HTTP daemon",
     "web--browse": "runs a caller-named browser command",
+    # `git help -m <page>` runs `man.<man.viewer>.cmd` through
+    # `execl(SHELL_PATH, "-c", "<cmd> <page>")`, and `git help -w` does the same
+    # through `web.browser` and `browser.<tool>.cmd`. Both keys carry an
+    # arbitrary name, so neither can be pinned in `GIT_FORCED_CONFIG` — the same
+    # shape as `filter.<name>.smudge`. Measured under this file's own pinned
+    # environment against git 2.55: `git config man.viewer evil`, `git config
+    # man.evil.cmd 'id #'`, `git help -m git` prints the credential container's
+    # `uid=`. All three are repository-local `config` writes and a read verb, so
+    # no lease is taken anywhere in the sequence.
+    #
+    # Refusing the verb is what closes it; refusing `web--browse` alone did not,
+    # because `git help -w` reaches that code path internally and the token
+    # never appears in the argv. The cost is that a bare `help` token anywhere
+    # in an argv is refused, including a commit message that is the single word
+    # `help` — the same trade as `foreach` below. `git help` itself is not
+    # something a skill has any reason to run in a container with no pager and
+    # no terminal.
+    "help": "runs a caller-named viewer command (`help -m`, `help -w`)",
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
     "fast-import": "runs caller-supplied stream commands",
+    # `trailer.<name>.cmd` is run to produce a trailer's value, and the key's
+    # arbitrary name puts it out of reach of the pins. `--trailer` below is the
+    # trigger and refusing the flag is what closes the vector; this entry
+    # refuses the subcommand whose whole job is that mechanism, so a future git
+    # that grows a second trigger does not reopen it. Measured: without
+    # `--trailer` the configured command does not run, even when the token is
+    # already present in the input.
+    "interpret-trailers": "applies trailer configuration that can name a command",
     # `git submodule foreach <cmd>` runs <cmd> in each initialised submodule.
     # Demonstrated through the executor at exit 0 with a submodule present.
     # `submodule` itself stays allowed — `submodule update` is a working-tree
@@ -1190,9 +1227,9 @@ def _git_refused_name(argument: str) -> str:
     """The refused option `argument` spells, or `argument` itself.
 
     Three spellings beyond the plain one have to collapse to the same name,
-    because git accepts all of them and a checker that recognises fewer
-    spellings than the executor accepts is a parser differential — D15, and
-    the only kind of bug this project has shipped.
+    because git accepts all of them, and a checker that recognises fewer
+    spellings than the executor accepts is a parser differential — the one
+    kind of bug this policy layer keeps producing.
 
     1. `--flag=value`, handled by splitting on the first `=`.
     2. `-Ovalue` and `-iOvalue`, the attached and clustered short forms,
@@ -1239,14 +1276,14 @@ def git_argument_violation(argv: list[str]) -> str | None:
 
     Matched across the whole argv rather than only the global-option region
     before the subcommand, which is the only place git honours these. That is
-    deliberate and it is the D15 rule: a check that has to agree with git about
-    where the options end is a *guess* about git's parser, and every Critical
-    this project has found was a checker and an executor parsing the same input
+    deliberate: a check that has to agree with git about where the options end
+    is a *guess* about git's parser, and every serious defect found in this
+    policy layer so far was a checker and an executor parsing the same input
     differently. Scanning everything cannot disagree with git about scope.
 
     The cost is refusing a git command with a literal `-c` somewhere in its
-    arguments — a commit message, a pathspec. Nothing shipped does that, and a
-    false refusal is the direction C2 says to fail in.
+    arguments — a commit message, a pathspec. Nothing shipped does that, and
+    refusing something harmless is the direction this is meant to fail in.
     """
     if not argv or Path(argv[0]).name != "git":
         return None
@@ -1351,7 +1388,7 @@ class CommandExecutor:
         # the mount geometry is not on its own a reason to trust this file.
         # Naming the path explicitly means the location stays fixed if the
         # mounts are ever rearranged — the same argument the KUBECTL_KUBERC
-        # line below makes, and the one slice 2b made about the broker's HOME.
+        # line below makes.
         # It is deliberately not /dev/null: `gh auth setup-git` writes the
         # GitHub credential helper into *this* file via `git config --global`,
         # so pointing it at /dev/null does not harden anything, it just severs

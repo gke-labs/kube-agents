@@ -861,6 +861,66 @@ class GitHardeningTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
 
+    def test_the_help_viewer_cannot_run_a_command(self):
+        # `git help -m <page>` runs `man.<man.viewer>.cmd` through
+        # `execl(SHELL_PATH, "-c", ...)`, and `git help -w` does the same
+        # through `web.browser` and `browser.<tool>.cmd`. Both keys carry an
+        # arbitrary name, so neither can be pinned in GIT_FORCED_CONFIG.
+        #
+        # Measured against git 2.55 under this file's own pinned environment:
+        #
+        #   git config man.viewer evil       # repo-local, no lease
+        #   git config man.evil.cmd 'id #'   # repo-local, no lease
+        #   git help -m git                  # -> prints uid=...
+        #
+        # Three ordinary proxied calls, no lease anywhere: `help` is not in
+        # GIT_MUTATING_SUBCOMMANDS and `config` is not a mutating verb either.
+        # Refusing `web--browse` did not close this -- `git help -w` reaches
+        # that code path internally, so the token never appears in the argv.
+        # The verb is what has to be refused.
+        for argv in (
+            ["git", "help", "-m", "git"],
+            ["git", "help", "-w", "git"],
+            ["git", "help", "git"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_a_trailer_command_cannot_run_on_the_commit_path(self):
+        # `trailer.<name>.cmd` produces a trailer's value by running a command,
+        # and the arbitrary name in the key puts it out of reach of the pins.
+        # What makes it worse than the other unpinnable keys is where it lands:
+        # `commit -m`, the argv the skills already send.
+        #
+        # Measured against git 2.55 under the pinned environment:
+        #
+        #   git config trailer.zz.cmd 'id #'        # repo-local, no lease
+        #   git commit -m msg --trailer zz:v        # trailer value is uid=...
+        #
+        # `--trailer` is the trigger: with the token already present in the
+        # input and no flag, the configured command does not run. So refusing
+        # the flag is what closes it, and `interpret-trailers` is refused as
+        # the subcommand whose whole job is this mechanism.
+        for argv in (
+            ["git", "commit", "-m", "chore: x", "--trailer", "zz:v"],
+            ["git", "commit", "-m", "chore: x", "--trailer=zz:v"],
+            # git's subcommand options take unambiguous prefixes.
+            ["git", "commit", "-m", "chore: x", "--trai", "zz:v"],
+            ["git", "interpret-trailers", "--trailer", "zz:v"],
+            ["git", "interpret-trailers", "--parse"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # The neighbouring `--t...` flags the skills do send are not prefixes
+        # of `--trailer` and stay allowed.
+        for argv in (
+            ["git", "push", "--tags", "origin"],
+            ["git", "fetch", "--tags", "origin"],
+            ["git", "log", "--topo-order"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
     def test_writing_the_proxys_own_git_config_is_refused(self):
         # `git config --global alias.zz '!<payload>'` followed by `git zz` was
         # arbitrary code execution: `config` is not a mutating verb, so it

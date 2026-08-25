@@ -336,14 +336,25 @@ it, and repository-local `git config` remains accepted because that is how a
 clone's commit identity is set. Also refused are the subcommands whose function
 is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
 (`--extcmd`), `mergetool`, `filter-branch` (`--tree-filter`), `send-email`
-(`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, the `p4` and `svn`
-bridges, and `submodule foreach`.
+(`--smtp-server`), `instaweb`, `web--browse`, `help`, `fast-import`, the `p4`
+and `svn` bridges, `interpret-trailers`, and `submodule foreach`.
+
+`help` is on that list because `git help -m <page>` executes
+`man.<man.viewer>.cmd` through a shell, and `git help -w` does the same through
+`web.browser` and `browser.<tool>.cmd`. Both keys carry an arbitrary name and so
+cannot be pinned, and the sequence that reaches them is three ordinary requests
+taking no lease: two repository-local `git config` writes and a read verb.
+Refusing `web--browse` alone did not close it — `git help -w` reaches that code
+path internally, so the token never appears in the argument vector.
 
 The same category appears as options on subcommands the product has no reason to
 refuse outright, so those options are refused instead: `--exec` and `-x`, which
 run a caller-named command once per commit during a rebase; `-O` and
 `--open-files-in-pager`, which run one over the matches of a search — reachable
-by a read-only verb, needing neither a lease nor a file on the volume; and
+by a read-only verb, needing neither a lease nor a file on the volume;
+`--trailer`, which runs `trailer.<name>.cmd` to compute a trailer's value and so
+puts a caller-named command on `git commit -m`, the argument vector the skills
+already send; and
 `--upload-pack` and `--receive-pack`, which name a program to run for the remote
 end of a transfer. The last two are unreachable while the transport allowlist
 excludes local paths, and are refused so that widening the allowlist does not
@@ -376,8 +387,13 @@ the runtime executing inside a directory the sandbox owns.
 The pins do not extend to configuration stored in a repository's own
 `.git/config`, which the sandbox authors and which git consults for settings that
 name a program to run. Some such settings can be pinned and are; others take an
-arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`) and
-therefore cannot be enumerated at all.
+arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`,
+`man.<tool>.cmd`, `browser.<tool>.cmd`, `trailer.<name>.cmd`) and therefore
+cannot be enumerated at all. Where such a key has a single reachable trigger,
+the trigger is refused instead — that is what the `help` and `interpret-trailers`
+subcommand entries and the `--trailer` option entry above are for. That works
+only because those triggers are nameable; the key itself stays settable, so a
+future git that grows a second trigger for one of them reopens the path.
 
 That file reaches the credential as well as the program search. A credential
 helper configured there is itself a command, and it runs for any host the
