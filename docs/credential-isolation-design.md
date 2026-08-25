@@ -492,9 +492,56 @@ add another. Allowlisting the subcommands the product issues, and failing closed
 on the rest, is the structurally correct form and is the recommended follow-up.
 
 Reducing both is the motivation for having the runtime receive file content from
-the sandbox rather than operate inside a directory the sandbox controls; until
-that lands, a cloned working tree is sandbox-controlled input and not a trust
-boundary.
+the sandbox rather than operate inside a directory the sandbox controls. The
+mechanism for that is described below; until the skills are moved onto it, a
+cloned working tree is sandbox-controlled input and not a trust boundary.
+
+### Broker-owned working trees
+
+The controls above all work on the argument vector, and every one of them shares
+a premise: the runtime executes inside a directory the sandbox owns. That premise
+is what makes repository-local configuration reachable at all, and it is the
+reason enumeration cannot finish — the dangerous keys carry an arbitrary name
+inside the key, so there is no finite set to deny.
+
+The alternative is to stop passing a directory. The sandbox sends `{path, bytes}`
+pairs, a branch and a message; the runtime writes them into a tree on its own
+volume, commits and pushes; the sandbox never names a path and never sees one
+come back. `CREDENTIAL_PROXY_CONTENT_WORKSPACE` arms it and it is off by default.
+While it is off the `/v1/workspace/*` routes do not exist — they answer 404, which
+is also what an older runtime answers, so a client can detect support by asking.
+
+Four things hold it together, and they are not equally strong:
+
+- **Disjoint roots, checked.** The tree root is under the runtime's own state
+  directory and the check that it does not overlap the shared workspace runs at
+  construction. A mount rearrangement that collapses the two is a runtime that
+  refuses to start rather than one that starts without the property.
+- **One path validator.** The same function decides what a path may name on
+  reads and on writes, refuses rather than normalises, and refuses every spelling
+  of `.git` that a filesystem treats as `.git`. A checker that disagrees with
+  itself about what `manifests/../.git/config` means is the defect class this
+  document keeps describing.
+- **A separate door for the runtime's own git.** Broker-internal git does not go
+  through `/v1/exec`. It accepts a literal allowlist of the subcommands this
+  mechanism issues (`WORKSPACE_GIT_SUBCOMMANDS` in
+  `agents/platform/scripts/content_workspace.py`), refuses `-C`, and is contained
+  to the tree root. Keeping the two apart is what lets the sandbox-facing
+  answer stay "git is not reachable" rather than "git is reachable, narrowly".
+- **Geometry, not checked here.** In the sidecar deployment the tree root is on
+  the runtime's own volume, which the sandbox container does not mount. Nothing in
+  the process can verify that; it is the same argument this document already makes
+  about `$HOME/.gitconfig` and `KUBECTL_KUBERC`, and it is exactly as weak. The
+  structural form of it is the separate broker Pod, where there is no shared mount
+  to name.
+
+Be precise about what arming this does and does not do. It does not change what
+`git` executes: a repository-local `.git/config` planted in the runtime's own tree
+still runs what it names, measured both ways. What changes is who can write that
+file. And `/v1/exec` is unchanged while the flag is on — both mechanisms run side
+by side deliberately, so that landing this does not have to be reverted to fix the
+migration. The finding class above therefore closes for work that goes through the
+content routes and stays open for work that does not, which today is all of it.
 
 ### Agent-supplied kubeconfigs
 
