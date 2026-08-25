@@ -465,13 +465,14 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         any(key.startswith(model) for key in populated_models)
         for model in ("spot", "flex")
     )
-    answer = str(interaction.get("output") or "").casefold()
+    answer = str(interaction.get("output") or "")
+    # Word-bounded so prose like "inflexible" or "spotted" cannot satisfy a
+    # provisioning path; "flex" still matches Flex, Flex-Start, and
+    # flex-start spellings.
     paths_weighed = {
-        "onDemand": any(
-            term in answer for term in ("on-demand", "on demand", "ondemand")
-        ),
-        "spot": "spot" in answer,
-        "flex": "flex" in answer,
+        "onDemand": bool(re.search(r"\bon[- ]?demand\b", answer, re.IGNORECASE)),
+        "spot": bool(re.search(r"\bspot\b", answer, re.IGNORECASE)),
+        "flex": bool(re.search(r"\bflex\b|\bflex[- ]?start\b", answer, re.IGNORECASE)),
     }
     suite.record(
         "ac05-provisioning-models-analyzed",
