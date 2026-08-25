@@ -19,7 +19,7 @@ from admin_console.agent_chat import ChatRunResult, MAX_HISTORY_MESSAGES
 from admin_console.agent_runtime import AgentTaskUpdate, TaskUpdateResult
 from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app
-from admin_console.chat.service import ChatService
+from admin_console.chat.service import FINAL_OUTPUT_LIMIT, ChatService
 from admin_console.chat.models import Interaction, InteractionStatus, TaskProjection
 from admin_console.chat.store import SQLiteInteractionStore
 from admin_console.clients.portal_api import PortalApiClient, PortalApiError
@@ -30,7 +30,15 @@ from admin_console.project_config import (
 )
 
 
-def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
+def task(
+    task_id: str,
+    status: str,
+    *,
+    error: str = "",
+    result: str = "",
+    evidence: tuple[dict, ...] = (),
+    artifacts: tuple[dict, ...] = (),
+) -> AgentTaskUpdate:
     now = datetime.now(UTC)
     return AgentTaskUpdate(
         task_id=task_id,
@@ -41,6 +49,9 @@ def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
         updated_at=now,
         summary="Capacity checked" if status == "done" else "",
         error=error,
+        result=result,
+        evidence=evidence,
+        artifacts=artifacts,
     )
 
 
@@ -231,6 +242,98 @@ class InteractionApiTest(unittest.TestCase):
             ],
         )
         self.assertGreaterEqual(backend.task_reads, 3)
+
+    def test_completed_interaction_output_carries_specialist_reports(self):
+        report = (
+            "Quota is separate from live capacity: 32 A100 GPUs fit the "
+            "regional quota, and Spot obtainability in us-central1-c is 0.9."
+        )
+        backend = ScriptedBackend(
+            task_snapshots=[
+                TaskUpdateResult((task("task-1", "running"),), False),
+                TaskUpdateResult((task("task-1", "done", result=report),), False),
+            ]
+        )
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+
+        result = self.wait_for_terminal(client, interaction_id)
+
+        self.assertEqual(result["status"], "completed")
+        # The user-facing answer is the root acknowledgment plus the report,
+        # not the acknowledgment alone.
+        self.assertTrue(result["output"].startswith("The cluster is healthy."))
+        self.assertIn(report, result["output"])
+        self.assertEqual(result["tasks"][0]["result"], report)
+
+    def test_task_projection_carries_typed_evidence_and_artifacts(self):
+        evidence = (
+            {
+                "type": "advice_service_capacity",
+                "status": "completed",
+                "apiMethod": "compute.beta.AdviceService.Capacity",
+                "request": {"region": "us-central1"},
+                "analysis": {"availableQuantity": 8},
+                "executionRef": "exec-1",
+            },
+        )
+        artifacts = (
+            {
+                "type": "computeclass",
+                "manifest": {"kind": "ComputeClass", "apiVersion": "cloud.google.com/v1"},
+                "pairId": "design-1",
+            },
+        )
+        backend = ScriptedBackend(
+            task_snapshots=[
+                TaskUpdateResult(
+                    (
+                        task(
+                            "task-1",
+                            "done",
+                            evidence=evidence,
+                            artifacts=artifacts,
+                        ),
+                    ),
+                    False,
+                )
+            ]
+        )
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+
+        result = self.wait_for_terminal(client, interaction_id)
+
+        projected = result["tasks"][0]
+        self.assertEqual(projected["evidence"], [dict(evidence[0])])
+        self.assertEqual(projected["artifacts"], [dict(artifacts[0])])
+
+    def test_tasks_without_typed_records_project_empty_lists_not_absence(self):
+        # The CUJ evaluators distinguish "the portal cannot show evidence"
+        # from "evidence was shown and is empty"; the keys must always exist.
+        backend = ScriptedBackend(
+            task_snapshots=[TaskUpdateResult((task("task-1", "done"),), False)]
+        )
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+
+        result = self.wait_for_terminal(client, interaction_id)
+
+        projected = result["tasks"][0]
+        self.assertEqual(projected["evidence"], [])
+        self.assertEqual(projected["artifacts"], [])
+        self.assertEqual(projected["result"], "")
+
+    def test_final_output_is_bounded_with_a_visible_truncation_marker(self):
+        oversized = "capacity report line\n" * 5000
+        composed = ChatService._compose_final_output(
+            "Delegated to the platform agent.",
+            (task("task-1", "done", result=oversized),),
+        )
+        self.assertLessEqual(
+            len(composed), FINAL_OUTPUT_LIMIT + 200, "bound must hold"
+        )
+        self.assertIn("[Truncated:", composed)
 
     def test_interaction_defaults_to_canonical_agent_and_chat_profile(self):
         backend = ScriptedBackend()

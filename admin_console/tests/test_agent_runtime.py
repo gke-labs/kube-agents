@@ -482,6 +482,85 @@ class EmbeddedReadScriptTest(unittest.TestCase):
         self.assertFalse(exact["truncated"])
         self.assertEqual(len(overflow["tasks"]), 100)
         self.assertTrue(overflow["truncated"])
+        # The fixture predates tasks.result and the typed record tables, so
+        # every row must degrade to empty values rather than fail the read.
+        self.assertEqual(exact["tasks"][0]["result"], "")
+        self.assertEqual(exact["tasks"][0]["evidence"], [])
+        self.assertEqual(exact["tasks"][0]["artifacts"], [])
+
+    def test_tasks_carry_result_and_typed_records_when_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with closing(sqlite3.connect(root / "kanban.db")) as connection, connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE tasks (
+                        id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,
+                        session_id TEXT, created_at REAL, started_at REAL,
+                        completed_at REAL, last_heartbeat_at REAL,
+                        last_failure_error TEXT, result TEXT
+                    );
+                    CREATE TABLE task_runs (
+                        id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT
+                    );
+                    CREATE TABLE task_events (
+                        id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at REAL
+                    );
+                    CREATE TABLE task_evidence (
+                        id INTEGER PRIMARY KEY, task_id TEXT, type TEXT,
+                        status TEXT, api_method TEXT, request_json TEXT,
+                        analysis_json TEXT, execution_ref TEXT, created_at REAL
+                    );
+                    CREATE TABLE task_artifacts (
+                        id INTEGER PRIMARY KEY, task_id TEXT, type TEXT,
+                        manifest_json TEXT, pair_id TEXT, created_at REAL
+                    );
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO tasks VALUES ('task-1', 'Design', 'platform', "
+                    "'done', 'portal_session', 1, NULL, 2, NULL, '', "
+                    "'Full capacity design report.')"
+                )
+                connection.execute(
+                    "INSERT INTO task_evidence VALUES (1, 'task-1', "
+                    "'advice_service_capacity', 'completed', "
+                    "'compute.beta.AdviceService.Capacity', "
+                    "'{\"region\": \"us-central1\"}', "
+                    "'{\"availableQuantity\": 8}', 'exec-7', 3)"
+                )
+                connection.execute(
+                    "INSERT INTO task_artifacts VALUES (1, 'task-1', "
+                    "'computeclass', '{\"kind\": \"ComputeClass\"}', 'pair-1', 3)"
+                )
+
+            payload = self._run_script(root, "tasks", "portal_session", "10")
+
+        row = payload["tasks"][0]
+        self.assertEqual(row["result"], "Full capacity design report.")
+        self.assertEqual(
+            row["evidence"],
+            [
+                {
+                    "type": "advice_service_capacity",
+                    "status": "completed",
+                    "apiMethod": "compute.beta.AdviceService.Capacity",
+                    "request": {"region": "us-central1"},
+                    "analysis": {"availableQuantity": 8},
+                    "executionRef": "exec-7",
+                }
+            ],
+        )
+        self.assertEqual(
+            row["artifacts"],
+            [
+                {
+                    "type": "computeclass",
+                    "manifest": {"kind": "ComputeClass"},
+                    "pairId": "pair-1",
+                }
+            ],
+        )
 
     def test_task_detail_returns_newest_runs_and_total_count(self):
         with tempfile.TemporaryDirectory() as directory:

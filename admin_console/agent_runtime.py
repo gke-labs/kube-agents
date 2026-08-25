@@ -225,6 +225,56 @@ def tasks(session_id, limit):
                 (session_id, limit + 1),
             )
         ]
+        for row in rows:
+            # tasks.result predates this reader, but a rebuilt store may lack
+            # it; the typed tables ship with the worker-side recorder patch and
+            # are absent on older images. Missing sources read as empty rather
+            # than failing the whole projection.
+            try:
+                found = connection.execute(
+                    "SELECT result FROM tasks WHERE id = ?", (row["id"],)
+                ).fetchone()
+                row["result"] = (found["result"] if found else None) or ""
+            except sqlite3.OperationalError:
+                row["result"] = ""
+            try:
+                row["evidence"] = [
+                    {
+                        "type": item["type"],
+                        "status": item["status"],
+                        "apiMethod": item["api_method"],
+                        "request": json.loads(item["request_json"] or "{}"),
+                        "analysis": json.loads(item["analysis_json"] or "{}"),
+                        "executionRef": item["execution_ref"],
+                    }
+                    for item in connection.execute(
+                        """
+                        SELECT type, status, api_method, request_json,
+                               analysis_json, execution_ref
+                        FROM task_evidence WHERE task_id = ? ORDER BY id
+                        """,
+                        (row["id"],),
+                    )
+                ]
+            except (sqlite3.OperationalError, ValueError):
+                row["evidence"] = []
+            try:
+                row["artifacts"] = [
+                    {
+                        "type": item["type"],
+                        "manifest": json.loads(item["manifest_json"] or "{}"),
+                        "pairId": item["pair_id"],
+                    }
+                    for item in connection.execute(
+                        """
+                        SELECT type, manifest_json, pair_id
+                        FROM task_artifacts WHERE task_id = ? ORDER BY id
+                        """,
+                        (row["id"],),
+                    )
+                ]
+            except (sqlite3.OperationalError, ValueError):
+                row["artifacts"] = []
     return {"tasks": rows[:limit], "truncated": len(rows) > limit}
 
 
@@ -596,6 +646,9 @@ class AgentTaskUpdate:
     latest_event: str = ""
     latest_event_at: datetime | None = None
     previous_error: str = ""
+    result: str = ""
+    evidence: tuple[dict, ...] = ()
+    artifacts: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -753,6 +806,13 @@ class CronSnapshot:
     jobs_truncated: bool
     executions_truncated: bool
     read_at: datetime
+
+
+def _typed_records(value: object, limit: int = 32) -> tuple[dict, ...]:
+    """Bound the typed evidence and artifact records a task may carry."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, dict))[:limit]
 
 
 def _timestamp(value: object) -> datetime:
@@ -1012,6 +1072,9 @@ class AgentRuntimeProvider:
                 latest_event=str(row.get("latest_event") or ""),
                 latest_event_at=_optional_timestamp(row.get("latest_event_at")),
                 previous_error=redact_evidence(row.get("previous_error") or ""),
+                result=redact_evidence(row.get("result") or ""),
+                evidence=_typed_records(row.get("evidence")),
+                artifacts=_typed_records(row.get("artifacts")),
             )
             for row in payload.get("tasks", [])
         )

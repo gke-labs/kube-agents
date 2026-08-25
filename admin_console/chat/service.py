@@ -25,6 +25,10 @@ from admin_console.telemetry import redact_evidence
 ACTIVE_TASK_STATUSES = {"triage", "todo", "ready", "scheduled", "running", "review"}
 FAILED_TASK_STATUSES = {"blocked", "cancelled", "crashed", "failed"}
 TASK_READ_ERROR_LIMIT = 3
+# Bounds the composed terminal output: the root acknowledgment plus every
+# specialist report. Large enough for a full design report, small enough that
+# one runaway worker cannot balloon the projection every poller receives.
+FINAL_OUTPUT_LIMIT = 65536
 NONTERMINAL_INTERACTION_STATUSES = frozenset(
     {
         InteractionStatus.QUEUED,
@@ -415,6 +419,9 @@ class ChatService:
                         interaction_id,
                         frozenset({InteractionStatus.WAITING_FOR_TASKS}),
                         status=InteractionStatus.COMPLETED,
+                        output=self._compose_final_output(
+                            interaction.output, tasks
+                        ),
                     )
                     if updated is not None:
                         self.store.append_event(interaction_id, "interaction.completed")
@@ -444,9 +451,34 @@ class ChatService:
                 summary=task.summary,
                 error=task.error,
                 run_count=task.run_count,
+                result=task.result,
+                evidence=task.evidence,
+                artifacts=task.artifacts,
             )
             for task in result.tasks
         )
+
+    @staticmethod
+    def _compose_final_output(root_output: str, tasks: tuple[TaskProjection, ...]) -> str:
+        """Fold the specialists' reports into the answer the user receives.
+
+        Workers are required to close their card with a full report in
+        ``result``, and the notifier posts it to the chat thread — but the
+        interaction's terminal ``output`` used to stay frozen at the root
+        run's delegation acknowledgment, so portal callers never saw the
+        answer they asked for.
+        """
+        reports = [task.result.strip() for task in tasks if task.result.strip()]
+        if not reports:
+            return root_output
+        combined = "\n\n".join([root_output.strip(), *reports]).strip()
+        if len(combined) > FINAL_OUTPUT_LIMIT:
+            combined = (
+                combined[:FINAL_OUTPUT_LIMIT]
+                + "\n\n[Truncated: the full report exceeds the portal output "
+                "limit; the complete text is on the task record.]"
+            )
+        return combined
 
     @staticmethod
     def _merge_tool_evidence(

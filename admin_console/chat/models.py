@@ -52,6 +52,9 @@ class TaskProjection:
     summary: str = ""
     error: str = ""
     run_count: int = 0
+    result: str = ""
+    evidence: tuple[dict[str, Any], ...] = ()
+    artifacts: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +65,9 @@ class TaskProjection:
             "summary": self.summary,
             "error": self.error,
             "runCount": self.run_count,
+            "result": self.result,
+            "evidence": [dict(item) for item in self.evidence],
+            "artifacts": [dict(item) for item in self.artifacts],
         }
 
 
