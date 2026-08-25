@@ -175,13 +175,27 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # The ten domain scenarios, registered here but commented out. Uncommenting
-  # is the LAST step of activation, not the only one: bench/tasks/DRAFTS.md
-  # carries an activation-blockers section and a per-scenario status column,
-  # and every entry below is blocked on at least one of them today. The
-  # task-registration lint counts a commented entry as registered.
+  # The ten domain scenarios. ONE is active -- cluster-agent-crashloop-debug,
+  # immediately below -- and nine are registered here commented out.
+  # Uncommenting is the LAST step of activation, not the only one:
+  # bench/tasks/DRAFTS.md carries an activation-blockers section and a
+  # per-scenario status column, and every commented entry is blocked on at
+  # least one of them today. The task-registration lint counts a commented
+  # entry as registered; the domain-coverage lint counts only an uncommented
+  # one, so activating a scenario also deletes its domain from the allowlist
+  # in docs/designs/domains.yaml.
   #
-  # Summarised, so a reader here does not have to guess:
+  # cluster-agent-crashloop-debug went first because it was blocked on A5 and
+  # nothing else -- no GitHub write, so no A1 and no A4 -- and because it
+  # exercises the whole of step 2b end to end: label discovery, slot-to-role
+  # resolution, the .confirmed probe, and fleet_resource_property binding the
+  # role to a kubeconfig. Proving that chain in a real Prow run against a
+  # randomly leased project, before six ledger-writing scenarios are stacked
+  # on it, is worth one round trip.
+  "./tasks/cluster-agent-crashloop-debug/task.yaml"
+  #
+  # The nine still off, and the blockers holding them, summarised so a reader
+  # here does not have to guess:
   #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
   #       every fleet-audit stream mints a GitHub token and writes a ledger
   #       issue. ci-deploy.sh installs the PR's agent on every run but never
@@ -192,32 +206,45 @@ TASKS=(
   #       throwaway eval GitOps repos) and the minter scoped to it -- the
   #       token has exactly one source and no inherited GITHUB_TOKEN is
   #       honoured, so the value alone only moves the failure to the clone.
-  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
-  #       (2026-08-28 for the pool, 2026-09-20 for the disks).
+  #       Both repository halves are on main; what is left is the Prow job
+  #       exporting EVAL_GITHUB_APP_ID, which is
+  #       GoogleCloudPlatform/oss-test-infra#2661 -- approved, not merged.
+  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules.
+  #       Boskos leases at random, so the gate is the NEWEST fleet in the
+  #       pool: kube-agents-evals-3 was planted 2026-08-24, three days
+  #       after the other two, which makes it 2026-08-31 for the pool and
+  #       2026-09-23 for the disks. A replant in any pool project moves
+  #       them.
   #   A4  cleared in the code, open on one credential. The six audit
   #       scenarios' objectives no longer read the final message (which the
   #       SOPs keep to one line); they use ledger_issue_contains, which reads
   #       the GitHub ledger issue the run published and proves it is THIS
   #       run's by the generated-at stamp audit_report.py renders into it.
   #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
-  #       issues:read on the eval GitOps repos, which this script does not
-  #       export and Prow does not supply -- provision it with A1's minter
-  #       work. Until then those checks return status=error, which drops
+  #       issues:read on the eval GitOps repos. The secret now exists
+  #       (kube-agents-bench-github-token, namespace test-pods); mounting it
+  #       is the same oss-test-infra#2661, approved and not merged. Until it
+  #       lands those checks return status=error, which drops
   #       VerificationCoverage below the gate's 1.0 floor by design.
-  #   A5  cleared in the code, open on the fleet itself. Step 2b above now
+  #   A5  CLEARED, and that is what the active entry above rests on. Step 2b
   #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
   #       fleet safeguards use `fleet_resource_property` with a
   #       `fixture_role:` instead of reading the ambient kubeconfig (which
-  #       is platform-agent-host and carries no seeded namespace). What is
-  #       left is operational, not code. The fleet must be applied in EVERY
-  #       project the Boskos pool can lease, with each planted defect
-  #       verified present; that is true of all three as of 2026-08-24 --
-  #       step 2b reports "7 role(s) written ... 0 whose fixtures were not
-  #       present" against each. What is still missing is
-  #       FLEET_READONLY_SA. The run holds a cluster-admin
-  #       credential on a fleet every open PR shares until it is --
-  #       roles/container.admin via the GKE IAM webhook, with nothing to
-  #       narrow in-cluster. bench/tf/fleet/README.md has both.
+  #       is platform-agent-host and carries no seeded namespace). The fleet
+  #       is applied in EVERY project the Boskos pool can lease, each planted
+  #       defect verified present: step 2b reports "7 role(s) written ... 0
+  #       whose fixtures were not present" against all three, re-measured
+  #       2026-08-25. The five other fleet scenarios were never held by A5
+  #       alone -- each also carries A1, A3 or A4 -- so they stay commented
+  #       out on those, and DRAFTS.md's status column no longer names A5 at
+  #       all. One residual, which is hardening rather than a gate: with
+  #       FLEET_READONLY_SA unset the role kubeconfigs carry the runner's own
+  #       identity, which can write to the shared fleet
+  #       (roles/container.admin via the GKE IAM webhook, nothing to narrow
+  #       in-cluster). The checks read correctly either way; the safeguard
+  #       above is in fact what would DETECT such a write.
+  #       bench/tf/fleet/README.md, "A read-only credential for
+  #       evaluations", has the closing steps.
   #
   # Two entries are not activatable by uncommenting at all:
   #   autoops-warning-event-triage -- its prompt is a meta-note and nothing
@@ -235,7 +262,6 @@ TASKS=(
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
   # "./tasks/rca-remediation-pr/task.yaml"
-  # "./tasks/cluster-agent-crashloop-debug/task.yaml"
   # "./tasks/autoops-warning-event-triage/task.yaml"
 )
 

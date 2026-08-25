@@ -20,11 +20,15 @@
 # literal filter `creationTimestamp<-P30D` and flags only at AGE >= 30d;
 # check 3.7 (`idle-nodepool`) will not flag "pools created < 7 days ago".
 # (Check 3.5 is `idle-address` at AGE >= 14d and is unrelated to either.)
-# The fleet in both eval projects was created 2026-08-21, so the idle-pool
-# half of this scenario cannot pass before 2026-08-28 and the orphan-disk
-# half not before 2026-09-20. Turning it on earlier produces a red presubmit
-# that is the SOP behaving correctly.
-# Any replant of the fixtures restarts both clocks. One unsettled detail: the
+# The gate binds to the NEWEST fleet in the Boskos pool, not the oldest:
+# a lease is random, so a run that draws the youngest project is the one
+# that decides. There are three fleets -- kube-agents-evals and -2 planted
+# 2026-08-21, kube-agents-evals-3 on 2026-08-24 -- so the idle-pool half of
+# this scenario cannot pass before 2026-08-31 and the orphan-disk half not
+# before 2026-09-23. Turning it on earlier produces a red presubmit that is
+# the SOP behaving correctly.
+# Any replant of the fixtures, in any pool project, restarts that project's
+# clocks and moves those dates. One unsettled detail: the
 # 3.7 command (`gcloud container node-pools list`) returns no creation field,
 # so pool age is whatever the agent infers -- if it reads node age, the
 # rolling node recreation from a GKE_METADATA or machine-type change resets

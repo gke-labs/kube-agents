@@ -63,7 +63,9 @@ allowlist:
   - upgrades
   - consistency
   - remediation
-  - cluster-debugging
+  # cluster-debugging left this list on 2026-08-25, the first Phase 2 domain
+  # to do so: cluster-agent-crashloop-debug is active in hack/ci-eval-pr.sh's
+  # TASKS array.
   # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
   # post-incident RCA, and incident-triage means event-fired autoops triage.
   # Real coverage arrives with the autoops-warning-event-triage scenario.
