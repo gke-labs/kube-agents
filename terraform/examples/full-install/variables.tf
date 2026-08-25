@@ -97,7 +97,7 @@ variable "permission_set" {
 
   validation {
     condition     = contains(["read-only", "custom"], var.permission_set)
-    error_message = "permission_set must be one of read-only or custom. The gke-admin bundle was removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and its container.clusters.impersonate cannot be scoped by IAM. Name the roles you need in project_roles instead."
+    error_message = "permission_set must be one of read-only or custom. The gke-admin bundle was removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and the container.clusters.impersonate it carries applies to every cluster in the project. Name the roles you need in project_roles instead."
   }
 }
 

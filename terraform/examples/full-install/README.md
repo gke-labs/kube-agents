@@ -190,9 +190,9 @@ vocabulary the installer's `--permission-set` flag uses):
 | `custom`              | whatever `project_roles` lists — setting it is required |
 
 There is no admin bundle. `roles/container.admin` authorizes the agent
-through IAM regardless of its Kubernetes RBAC, and its
-`container.clusters.impersonate` cannot be scoped by IAM, so it is not
-something a one-word setting should hand out; see
+through IAM regardless of its Kubernetes RBAC, and the
+`container.clusters.impersonate` it carries applies to every cluster in the
+project, so it is not something a one-word setting should hand out; see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md).
 Widening access means naming the roles in `project_roles`, where the grant
 is explicit and reviewed.

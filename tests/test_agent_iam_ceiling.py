@@ -3,9 +3,10 @@
 GKE authorizes a request if EITHER IAM or Kubernetes RBAC allows it. The agent's
 Kubernetes RBAC is read-only, but that constrains only one half of the union: a
 GSA holding `roles/container.admin` is authorized by IAM no matter how narrow the
-KSA is. `roles/container.admin` also carries `container.clusters.impersonate`,
-and IAM has no `resourceNames` equivalent, so the grant cannot be scoped to a
-cluster or a principal.
+KSA is. `roles/container.admin` is also the one predefined GKE role carrying
+`container.clusters.impersonate`, and GKE grants IAM roles at the project level,
+so that impersonation reaches every cluster in the project and the grant cannot
+be narrowed to one.
 
 The install used to offer that as one word, `PLATFORM_AGENT_PERMISSION_SET=gke-admin`.
 These tests are what keeps it gone, across the whole of the one install engine:

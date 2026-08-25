@@ -43,12 +43,13 @@ locals {
   # paths hand the agent the same authority. Kubernetes RBAC is read-only
   # alongside it; see the security-and-iam reference.
   #
-  # There is deliberately one bundle and no admin one. GKE authorizes on the
-  # union of IAM and Kubernetes RBAC, so a role like roles/container.admin
-  # authorizes the agent through IAM regardless of how narrow its KSA is, and
-  # its container.clusters.impersonate cannot be scoped by IAM at all. A
-  # deployment that needs broader roles names them in project_roles, which puts
-  # the grant in the caller's Terraform where it is reviewed.
+  # There is deliberately one bundle and no admin one. GKE authorizes an action
+  # if either IAM or Kubernetes RBAC allows it, so a role like
+  # roles/container.admin authorizes the agent through IAM regardless of how
+  # narrow its KSA is, and the container.clusters.impersonate it carries applies
+  # to every cluster in the project. A deployment that needs broader roles names
+  # them in project_roles, which puts the grant in the caller's Terraform where
+  # it is reviewed.
   read_only_roles = [
     "roles/container.clusterViewer",
     "roles/container.viewer",

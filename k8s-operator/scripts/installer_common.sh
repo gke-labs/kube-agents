@@ -59,14 +59,15 @@ is_valid_permission_set() {
 # explanation gets the same one everywhere.
 #
 # `gke-admin` was removed rather than deprecated because it did not merely widen
-# the ceiling, it removed one. GKE authorizes on the UNION of IAM and Kubernetes
-# RBAC, so a GSA holding roles/container.admin is authorized by IAM no matter how
-# narrow the KSA's RBAC is -- and roles/container.admin carries
-# container.clusters.impersonate, which IAM has no resourceNames equivalent for,
-# so granting it is unbounded impersonation of any principal on any cluster in
-# the project. An operator who genuinely needs broad roles uses `custom` and
-# lists them, which makes the grant explicit and reviewable instead of hiding it
-# behind one word.
+# the ceiling, it removed one. GKE authorizes an action if EITHER IAM or
+# Kubernetes RBAC allows it, so a GSA holding roles/container.admin is authorized
+# by IAM no matter how narrow the KSA's RBAC is -- and roles/container.admin is
+# the one predefined GKE role carrying container.clusters.impersonate. GKE grants
+# IAM roles at the project level (a cluster is not a resource an IAM policy can
+# attach to), so that impersonation covers every cluster in the project and the
+# grant cannot be narrowed to one. An operator who genuinely needs broad roles
+# uses `custom` and lists them, which makes the grant explicit and reviewable
+# instead of hiding it behind one word.
 #
 # The removed value is named separately from the generic error so that a cached
 # vars.sh, a GitHub environment variable, or a --permission-set flag written
@@ -75,7 +76,7 @@ is_valid_permission_set() {
 require_supported_permission_set() {
   local value="${1:-}"
   if [ "$value" = "gke-admin" ]; then
-    print_error "The 'gke-admin' permission set has been removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and its container.clusters.impersonate permission cannot be scoped by IAM. Use 'read-only', or 'custom' with an explicit role list if you accept that risk."
+    print_error "The 'gke-admin' permission set has been removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and the container.clusters.impersonate it carries applies to every cluster in the project. Use 'read-only', or 'custom' with an explicit role list if you accept that risk."
     return 1
   fi
   if ! is_valid_permission_set "$value"; then

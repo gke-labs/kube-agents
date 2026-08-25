@@ -76,8 +76,8 @@ The **custom** set binds exactly the roles listed in `PLATFORM_AGENT_CUSTOM_ROLE
 
 There used to be a third set, `gke-admin`, which bound `roles/container.clusterAdmin` and `roles/container.admin`. It was removed rather than deprecated because it did not simply widen the ceiling — it removed one:
 
-- **GKE authorizes on the union of IAM and Kubernetes RBAC.** A GSA holding `roles/container.admin` is authorized by IAM whatever the KSA's RBAC says, so the read-only Kubernetes footprint below stops constraining anything the agent reaches through that identity.
-- **`roles/container.admin` carries `container.clusters.impersonate`, and IAM has no `resourceNames` equivalent for it.** Granting the role therefore grants impersonation of any principal on any cluster in the project, and the grant cannot be scoped down.
+- **GKE authorizes an action if _either_ IAM or Kubernetes RBAC allows it** ([Access control](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control)). A GSA holding `roles/container.admin` is authorized by IAM whatever the KSA's RBAC says, so the read-only Kubernetes footprint below stops constraining anything the agent reaches through that identity.
+- **`roles/container.admin` is the one predefined GKE role that carries `container.clusters.impersonate`** — `roles/container.clusterAdmin` does not. GKE grants IAM roles at the project level; a cluster is not a resource an IAM policy attaches to, so "an IAM role grants privileges across all clusters in the project". The impersonation therefore cannot be narrowed to one cluster.
 
 `custom` remains, so a deployment that genuinely needs broad roles still has a supported path — it just has to name each role, which makes the grant explicit and reviewable. Setting `PLATFORM_AGENT_PERMISSION_SET=gke-admin`, or `permission_set = "gke-admin"` in `terraform.tfvars`, now fails with an error rather than being silently downgraded. Re-running the install does not strip roles it no longer grants, so an existing GSA has to be brought back by hand — see below.
 
