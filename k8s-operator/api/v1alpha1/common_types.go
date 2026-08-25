@@ -570,12 +570,16 @@ type StorageStatus struct {
 // found nothing and fell back to it", so the source is reported alongside it — that
 // distinction is the whole diagnostic question when spans do not arrive.
 type TelemetryStatus struct {
-	// OTLPEndpoint is the collector endpoint written into the agent pod.
+	// OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the
+	// source is None, which is the one case where the pod is given no endpoint at all.
 	// +optional
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
 
 	// OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec,
-	// OperatorEnv, Discovered, or Default.
+	// OperatorEnv, Discovered, Default, or None. None means discovery completed and
+	// this cluster has no collector, so the agent runs with OTEL_SDK_DISABLED=true and
+	// exports nothing; Default still means the GKE managed collector, and is what an
+	// install gets when discovery is switched off or could not complete.
 	// +optional
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }

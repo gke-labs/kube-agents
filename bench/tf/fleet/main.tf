@@ -95,6 +95,53 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
   member  = "serviceAccount:${google_service_account.fleet_nodes.email}"
 }
 
+# ---------------------------------------------------------------------------
+# The evaluation READ credential.
+#
+# Every open pull request's presubmit reads this fleet at the same time, and a
+# check that can write to it spoils a fixture for whoever is running minutes
+# later -- non-deterministically, and in someone else's build. The runner's own
+# identity has to create GKE clusters for the eval tasks, so handing it to the
+# verifiers would be handing them cluster-admin on the shared fleet.
+#
+# roles/container.viewer is the whole grant, verified against the live role
+# rather than assumed: get/list only, no create/update/delete/patch on any
+# Kubernetes object (its one *.create is container.tokenReviews.create, the
+# read-shaped token validation API), and no container.secrets.* at all -- so
+# this account cannot read a Secret on platform-agent-host either. It is
+# project-scoped because IAM is where GKE authorization starts; the fleet
+# stack's kubernetes provider only reaches seeded-a, so an RBAC-level grant
+# could not cover b and c.
+#
+# hack/fleet-kubeconfigs.sh binds it by minting an access token
+# (FLEET_READONLY_SA), which is why the token-creator grant below exists.
+# Impersonation on `gcloud container clusters get-credentials` would NOT do:
+# get-credentials writes an exec entry for gke-gcloud-auth-plugin, and that
+# plugin has no impersonation, so the flag changes who read the cluster
+# metadata and nothing about who kubectl talks to the API server as.
+resource "google_service_account" "fleet_reader" {
+  account_id   = "seeded-fleet-reader"
+  display_name = "Read-only credential for seeded-fleet evaluation checks"
+}
+
+resource "google_project_iam_member" "fleet_reader_container_viewer" {
+  project = var.project_id
+  role    = "roles/container.viewer"
+  member  = "serviceAccount:${google_service_account.fleet_reader.email}"
+}
+
+# Who may mint a token AS the reader. Empty by default: an eval project with no
+# entry here still gets the account, and its runs fall back to the runner's own
+# credential with a loud warning from fleet-kubeconfigs.sh, rather than failing
+# to read the fleet at all. Populate it with the project's Prow runner identity
+# to actually close the write path.
+resource "google_service_account_iam_member" "fleet_reader_token_creators" {
+  for_each           = toset(var.fleet_reader_token_creators)
+  service_account_id = google_service_account.fleet_reader.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = each.value
+}
+
 # seeded-b is held one minor version behind whatever the REGULAR channel
 # currently defaults to, derived live rather than hardcoded so the pin does
 # not rot: each apply re-computes "current default minus one". The cluster

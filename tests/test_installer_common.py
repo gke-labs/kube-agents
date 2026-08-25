@@ -430,6 +430,24 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("API_SERVER_KEY", proc.stderr)
 
+    def test_default_vertex_location_is_global(self):
+        proc = self._run('printf "%s" "$DEFAULT_VERTEX_LOCATION"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "global")
+
+    def test_default_vertex_location_is_a_separate_knob_from_the_region(self):
+        # The whole point of the constant: a Vertex model is only callable from
+        # a location that serves it, and DEFAULT_REGION is not one of those for
+        # the vertex_ai default model. Tying the two together is the bug, so
+        # neither the constant nor its expansion may be derived from the other.
+        proc = self._run(
+            'printf "%s %s" "$DEFAULT_REGION" "$DEFAULT_VERTEX_LOCATION"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        region, vertex_location = proc.stdout.split()
+        self.assertEqual(vertex_location, "global")
+        self.assertNotEqual(region, vertex_location)
+
 
 if __name__ == "__main__":
     unittest.main()

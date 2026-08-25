@@ -1069,6 +1069,101 @@ class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
         self.assertEqual(self._read()["origin"], "k8s-watcher")
 
 
+class TestActivePlatformFallback(unittest.TestCase):
+    """`get_active_platform` when config.yaml does not name a platform.
+
+    Which is every operator-managed pod: `platforms.<p>.enabled` is rendered
+    into the managed scope at /etc/hermes and overlaid inside Hermes' config
+    loader, never written to the CONFIG_PATH file this function opens. So the
+    environment branch is the live selector, and getting it wrong sends every
+    alert to a platform the install does not have. The config branch is still
+    covered below because it answers for a `docker run` off the image and for
+    any install whose writable config was edited to name one -- and because
+    the ordering between the two is what keeps this a fallback.
+    """
+
+    _KEYS = ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN")
+
+    def setUp(self):
+        # patch.dict restores the whole mapping, and addCleanup runs even if a
+        # later line of setUp raises -- a hand-rolled tearDown would not, and
+        # would leave both variables popped for the rest of the discovery run.
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in self._KEYS:
+            os.environ.pop(key, None)
+        # A path that cannot parse, so tests that do not override it land in
+        # the environment branch the way a deployed pod does.
+        self._config = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False)
+        self._config.write("platforms: [this is not a mapping\n")
+        self._config.close()
+        self.addCleanup(os.unlink, self._config.name)
+        config_patch = patch.object(
+            session_kv_server, "CONFIG_PATH", self._config.name)
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
+
+    def _with_config(self, text):
+        """Point CONFIG_PATH at a config with this content, for one test."""
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", delete=False) as handle:
+            handle.write(text)
+            named = handle.name
+        self.addCleanup(os.unlink, named)
+        patcher = patch.object(session_kv_server, "CONFIG_PATH", named)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_relay_url_the_operator_sets_selects_slack(self):
+        # What a Slack-enabled sandbox container actually holds. The value is
+        # the credential proxy's loopback port (credentialProxyPort = 8765 in
+        # platformagent_manifests.go), not the Hermes gateway's 8642.
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        self.assertEqual(session_kv_server.get_active_platform(), "slack")
+
+    def test_the_bot_token_still_selects_slack(self):
+        # Never present in the deployed sandbox -- it is a credential and lives
+        # in the credential-proxy container -- but it is the only signal a bare
+        # `docker run` off the image has, so it stays accepted.
+        os.environ["SLACK_BOT_TOKEN"] = "xoxb-not-a-real-token"
+        self.assertEqual(session_kv_server.get_active_platform(), "slack")
+
+    def test_both_signals_together_still_select_slack(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["SLACK_BOT_TOKEN"] = "xoxb-not-a-real-token"
+        self.assertEqual(session_kv_server.get_active_platform(), "slack")
+
+    def test_an_install_with_neither_falls_back_to_google_chat(self):
+        self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
+
+    def test_an_absent_config_falls_back_rather_than_raising(self):
+        # setUp writes an unparseable file; a missing one takes a different
+        # branch of the same `except` and must not escape to the caller.
+        missing = self._config.name + ".gone"
+        with patch.object(session_kv_server, "CONFIG_PATH", missing):
+            self.assertEqual(
+                session_kv_server.get_active_platform(), "google_chat")
+
+    def test_the_config_decides_when_it_names_a_platform(self):
+        # The environment branch must stay second: a parseable config naming
+        # Slack wins even though no Slack variable is set.
+        self._with_config("platforms:\n  slack:\n    enabled: true\n")
+        self.assertEqual(session_kv_server.get_active_platform(), "slack")
+
+    def test_a_config_naming_google_chat_beats_the_slack_environment(self):
+        # The case the environment branch newly puts at risk. Before this
+        # signal was added the branch was inert on a deployed pod, so nothing
+        # pinned the ordering; now only statement order keeps a config that
+        # names Google Chat from being overridden by a Slack-shaped
+        # environment. A refactor that hoists the environment check above the
+        # config read fails here rather than silently rerouting alerts.
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        self._with_config("platforms:\n  google_chat:\n    enabled: true\n")
+        self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
+
+
 class TestAlertDailyQuota(unittest.TestCase):
     """The per-severity daily ceiling enforced in /sessions/{id}/inject."""
 
@@ -1423,9 +1518,13 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertIn("never give it an Option letter", instructions)
         self.assertNotIn("Do not end the report by inviting a reply", instructions)
 
-    def test_a_single_option_report_drops_the_option_letter_override(self):
-        # "apply Option A" is noise when there is only one option, and the
-        # Recommended line it would sit under is dropped in that case too.
+    def test_a_single_option_report_is_not_lettered(self):
+        # A list of one does not need letters, and a report that opens with
+        # "Option A" and never reaches an Option B reads like a page that
+        # failed to load. The letter goes, and so does everything that only
+        # exists to disambiguate between letters: the Recommended line, and the
+        # "or name one directly with 'apply Option A'" tail of the call to
+        # action.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -1435,14 +1534,23 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         }
         query = session_kv_server._build_agent_query(payload)
         instructions = query.split("## What to do", 1)[0]
-        self.assertIn("omit the Recommended line", instructions)
+        self.assertIn("do not letter it and do not use the word 'Option'", instructions)
+        self.assertIn("**Proposed fix (<Action Title>):**", instructions)
+        self.assertIn("No Recommended line", instructions)
         self.assertIn("a bare 'apply' is unambiguous", instructions)
-        # The clause the agent is told to drop has to be a clause the template
-        # below actually contains, or there is nothing to match and the agent
-        # ships a one-option report still offering "apply Option B".
-        dropped = "or name one directly with"
-        self.assertIn(dropped, instructions)
-        self.assertIn(dropped, query.split("## What to do", 1)[1])
+        # The single-option shape still has to end on the call to action. It is
+        # the reader's only route to a fix, and -- with no lettered option left
+        # under the heading -- the only thing kanban_notifier.actionable_report
+        # can recognise the report by, so a report without it earns no
+        # `incidents` row and the reply it invites arrives bare.
+        single_option = instructions.split("**With exactly one option:**", 1)[1]
+        bullets = [
+            line for line in single_option.splitlines() if line.startswith("- **")
+        ]
+        self.assertEqual(len(bullets), 2, bullets)
+        self.assertTrue(bullets[0].startswith("- **Proposed fix (<Action Title>):**"))
+        self.assertTrue(bullets[1].startswith("- **To authorize:** reply **'apply'**"))
+        self.assertNotIn("Option", "\n".join(bullets))
 
     def test_the_options_and_the_recommendation_are_still_there(self):
         # What the call-to-action points at. A reply of "apply Option B" is

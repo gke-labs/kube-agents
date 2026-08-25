@@ -114,7 +114,7 @@ sequenceDiagram
     Agent->>Agent: Diagnose (read-only), write the report
     Agent->>Agent: kanban_complete(result=the full report)
     Notifier->>Chat: Post the card's result under the alert's thread
-    Notifier->>Proxy: POST /v1/incidents (key the report to that thread, so a reply can name an option)
+    Notifier->>Proxy: POST /v1/incidents (key the report to that thread, so a reply can be resolved against it)
 
     Note over K8s, Proxy: Phase 1b: Informational Events Stop Here
     K8s->>Watcher: Normal-type event with a watched Reason (e.g. image-pull BackOff)

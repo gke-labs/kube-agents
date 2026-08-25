@@ -4,7 +4,7 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 
 ## Prerequisites
 
-- Kubernetes 1.28+ (GKE Autopilot or Standard)
+- Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
 - A Google Service Account (GSA) with a Workload Identity binding to the agent's
   Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
   namespace by default (`platformAgent.security.serviceAccountName`):
@@ -223,8 +223,11 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 Vertex AI has no API key. The gateway calls
 `projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
-(both default to `platformAgent.harness.projectId`/`.location`) as a Google
-Service Account reached through Workload Identity. That GSA, its
+as a Google Service Account reached through Workload Identity. `projectId`
+defaults to `platformAgent.harness.projectId`; `location` defaults to `global`
+rather than the harness location, since a model is only callable from a
+location that serves it. Set a region for a data-residency requirement or a
+Model Garden partner model: [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden). That GSA, its
 `roles/aiplatform.user` grant, and its binding to the gateway's KSA are not
 chart resources — see
 [Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/).
@@ -246,15 +249,18 @@ the annotated KSA.
 
 ### Turning telemetry off
 
-The operator's endpoint ladder always resolves to something — a collector it
-discovers in the cluster, otherwise the GKE Managed OpenTelemetry collector — so
-`telemetry.otlpEndpoint` can move the exporter but cannot switch it off. On a
-cluster running neither (a plain `gke-cluster` module cluster has no
-`gke-managed-otel` namespace) the exporter then retries a hostname that never
-resolves, for the life of the pod.
+A cluster with no collector needs nothing done: when discovery completes and
+finds none — a plain `gke-cluster` module cluster has no `gke-managed-otel`
+namespace — the operator gives the agent no endpoint and sets
+`OTEL_SDK_DISABLED=true` itself. `status.telemetry.otlpEndpointSource` reads
+`None`, and the operator re-probes every 15 minutes, so installing a collector
+later turns export back on without a restart.
 
-`platformAgent.deployment.env` is the off switch. The operator applies it after
-its own container environment, so it wins:
+The manual switch is still there for the cases the operator will not decide:
+discovery switched off with `OTEL_COLLECTOR_DISCOVERY=false`, an endpoint pinned
+through `telemetry.otlpEndpoint`, or a collector that exists but that you do not
+want this agent exporting to. `platformAgent.deployment.env` is applied after the
+operator's own container environment, so it wins either way:
 
 ```yaml
 platformAgent:
@@ -263,6 +269,13 @@ platformAgent:
       - name: OTEL_SDK_DISABLED
         value: "true"
 ```
+
+Setting that value to `"false"` re-enables the SDK on a cluster where discovery
+found nothing, but on its own it does not produce a working exporter: the
+operator emitted no endpoint, so the SDK falls back to `http://localhost:4318`,
+and the NetworkPolicy it renders for a `None` agent carries no collector egress
+rule. Pair it with `telemetry.otlpEndpoint` if you want the export to land
+somewhere.
 
 Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 

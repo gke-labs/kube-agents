@@ -30,6 +30,23 @@ variable "cluster_prefix" {
   default     = "seeded"
 }
 
+variable "fleet_reader_token_creators" {
+  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. This is the eval project's Prow runner identity: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as that identity, so without an entry here the runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). Empty by default so a project can adopt the stack before its runner identity is known."
+  type        = list(string)
+  default     = []
+
+  # A bare email here applies cleanly and grants nothing: the IAM API treats an
+  # unprefixed member as invalid, and the mistake would only surface as the
+  # runner falling back to its own credential on the fleet it is grading.
+  validation {
+    condition = alltrue([
+      for m in var.fleet_reader_token_creators :
+      can(regex("^(serviceAccount|user|group|domain|principal|principalSet):", m))
+    ])
+    error_message = "Each member must carry an IAM type prefix, e.g. serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com."
+  }
+}
+
 variable "exclusion_window_hours" {
   description = "Length in hours of seeded-b's NO_MINOR_UPGRADES maintenance exclusion, re-stamped from now on every apply. The GKE API rejects an endTime past the held minor's end of life (observed live: 'endTime needs to be before minor version 1.34 end of life: (2027-1-25)'), so now + this window must stay inside the EOL -- which no fixed window can do forever. When a reconcile starts failing with that 400, that IS the EOL approaching: shorten this variable to fit, or accept the self-heal and re-lag seeded-b by replacement at EOL (see README). 90 days balances a long protective window against how soon the 400s begin."
   type        = number

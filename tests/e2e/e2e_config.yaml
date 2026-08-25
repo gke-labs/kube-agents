@@ -1,8 +1,8 @@
 # ==============================================================================
 # Declarative E2E Test Suite Matrix & Cluster Configuration
 # ==============================================================================
-# Defines the test matrix: GCP environments, clusters, Terraform modules,
-# and test suites to execute.
+# Defines the test matrix: GCP environments, clusters, and the test suites to
+# execute. Nothing here provisions infrastructure; the cluster must already exist.
 # ==============================================================================
 
 version: "1.0"

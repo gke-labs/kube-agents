@@ -34,8 +34,9 @@ weaker half of all five concerns here:
   read by another — the ``incident_context`` plugin — hours later, so a POST
   that 401s, a ``thread_id`` that never made it into the subscription row, or a
   gate that classifies a real triage report as chatter all leave a delivery that
-  looks perfect and a reply that reaches an agent with no idea what "Option A"
-  was. That is #802.
+  looks perfect and a reply — "apply Option A", or a bare "apply" where the
+  report proposed a single fix — that reaches an agent with no idea what it
+  authorises. That is #802.
 
 So this drives the *patched* runtime rather than reading it: the real
 ``hermes_cli.config.load_config``, the real ``gateway.wake.adapter_supports_push``,
@@ -663,8 +664,9 @@ check(
 # thread; `incident_context` puts it back in front of the agent when someone
 # replies there, looking it up by (chat_id, thread_id). Nothing in the build
 # reads the row back, and nothing in the delivery notices it is missing, so
-# every failure here presents as a user replying "apply Option A" and getting an
-# agent that has never seen an option A. Drive it with urlopen stubbed: there is
+# every failure here presents as a user replying "apply" — with or without an
+# option letter — and getting an agent that has never seen the report they are
+# answering. Drive it with urlopen stubbed: there is
 # no session-KV server inside the build, and what is being verified is the
 # request this code makes, not the server's answer to it.
 print("incident row:")
@@ -735,12 +737,38 @@ TRIAGE = (
 )
 check("a triage report earns a row", actionable_report(TRIAGE) is True)
 check(
+    "so does one proposing a single unlettered fix",
+    actionable_report(
+        "## What to do\n\n"
+        "- **Proposed fix (Right-size the request):** drop it to 2Gi.\n"
+        "- **To authorize:** reply **'apply'** to open a GitOps Pull Request "
+        "with this fix.\n"
+    )
+    is True,
+    "the template drops the letter when there is one fix, so the call to "
+    "action is the only thing left under the heading to recognise it by",
+)
+check(
+    "however the call to action is emphasised",
+    all(
+        actionable_report(
+            "## What to do\n\n"
+            "- **Proposed fix (Right-size the request):** drop it to 2Gi.\n"
+            "- %s reply **'apply'**.\n" % label
+        )
+        is True
+        for label in ("**To authorize**:", "*To authorize*:", "__To authorize__:")
+    ),
+    "the template puts the colon inside the emphasis, but an agent moves it as "
+    "readily as not; the unlettered shape has no option letter to fall back on",
+)
+check(
     "a status line does not",
     actionable_report("Checked all 14 clusters. No drift found.") is False,
     "it would shadow the next real report in that thread until the TTL expires",
 )
 check(
-    "a What-to-do section with no lettered option does not",
+    "a What-to-do section with neither an option nor a call to action does not",
     actionable_report("## What to do\n\n- Restart the pod.\n") is False,
 )
 check(
@@ -750,7 +778,7 @@ check(
         "## What to do\n\n- Escalate to the service owner.\n"
     )
     is False,
-    "the option search starts at the heading, not at the top of the report",
+    "the search starts at the heading, not at the top of the report",
 )
 check(
     "and neither does an empty result",

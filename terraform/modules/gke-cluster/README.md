@@ -4,7 +4,7 @@ Reusable Terraform module for provisioning the GKE cluster that hosts Kube-Agent
 
 - **`cluster_mode = "autopilot"`** (default) — a GKE Autopilot cluster. Autopilot clusters are regional: `location` must be a region (a zone is rejected at plan time).
 - **`cluster_mode = "standard"`** — a GKE Standard cluster: a default node pool of `e2-standard-4` machines (one per zone), Dataplane V2 with FQDN NetworkPolicy, the Filestore CSI and BackupRestore addons, Workload Identity, and CMEK database encryption. `enable_gvisor_node_pool` adds a dedicated GKE Sandbox pool (Standard only — Autopilot ships the `gvisor` RuntimeClass natively).
-- **`create_cluster = false`** — install onto a cluster somebody else made. The module reads the named cluster through a data source and creates no cluster or KMS resources. The cluster must already have Workload Identity enabled.
+- **`create_cluster = false`** — install onto a cluster somebody else made. The module reads the named cluster through a data source and creates no cluster or KMS resources. Two postconditions gate the plan: the cluster must already have Workload Identity enabled, and it must enforce NetworkPolicy — either Dataplane V2 or the legacy Calico addon, which takes two `gcloud container clusters update` calls in order, `--update-addons=NetworkPolicy=ENABLED` and then `--enable-network-policy`. `install.sh` does both for you; a bare Terraform run refuses instead.
 
 The full-install composition passes `kube-agents-host=true` through `resource_labels` so the admin portal can discover the deployed host; standalone callers can use the same input when they install kube-agents on the cluster.
 

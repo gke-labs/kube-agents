@@ -124,17 +124,13 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 
 The repository is kept private: it is throwaway state a bot rewrites on every run. [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) is the layout an audit expects to find, not a required seed — the current pool repositories carry only a LICENSE and a README, because an audit works against an empty tree and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
 
-> **`kube-agents-evals-3` is mapped but not finished.** The project was added to the Boskos pool on 2026-08-21 with only its GCP half provisioned — it is `ACTIVE` and its `platform-agent-host` cluster is `RUNNING` — but section 5 was skipped, so every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal, taking a share of every open pull request's smoke test with it. Since then:
+> **The pool's three projects are all provisioned, as of 2026-08-24.** `kube-agents-evals-3` was added to the Boskos pool on 2026-08-21 with only its GCP half done, so every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal. That is closed. Verified in all three projects:
 >
-> 1. ~~Create the private `gke-agentic/kube-agents-evals-3-infra`.~~ **Done 2026-08-21.**
-> 2. ~~Add it to App `4675512`'s installation.~~ **Done 2026-08-23** — the App resolves to all three pool repositories, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`.
-> 3. **Apply `terraform/examples/ci-pool-minter` for the project, in its own workspace or backend prefix** (see the composition's README — re-using another project's state destroys that project's minter), then import the App PEM into its KMS key with the Minty CLI. **Still outstanding.**
+> 1. The private GitOps repository exists and is mapped in the table above.
+> 2. App `4675512` resolves to all three pool repositories, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`, `metadata: read`.
+> 3. `terraform/examples/ci-pool-minter` is applied per project: each carries `kubeagents-github-minter-gsa@<project>.iam.gserviceaccount.com` and the key ring `github-token-minter-keyring` with key `github-token-minter-key` in `us-central1`, and the App PEM is imported — `gcloud kms keys versions list` shows exactly one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each.
 >
-> Until (3) is done the project has no minter GSA and no signing key. Today that is invisible: `EVAL_GITHUB_APP_ID` is unset, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and `kube-agents-evals-3` deploys and fails at `audit_report.py start` for want of a token — exactly like every other pool project, because the switch is pool-wide (see 5.2).
->
-> **The hazard is the day that variable is set.** `hack/ci-deploy.sh` enables the minter whenever `GITOPS_REPO` is non-empty and `EVAL_GITHUB_APP_ID` is set, and this project is now mapped, so a lease of it would render the `github-token-minter` Deployment with `KMS_KEY_NAME` pointing at a key ring that (3) has never created. That pod fails its readiness probe, and the minter Deployment is part of the release `helm upgrade --install --wait --timeout 15m` gates on — so the run dies in the chart-deployment step after a fifteen-minute timeout, while leases of the other two projects pass. `EVAL_GITHUB_APP_ID` is the switch meaning "the manual half is done", and it is only true of the pool when it is true of every project in it: do not set it until (3) has landed here.
->
-> Reverting the mapping is not the fix. It restores the immediate, named refusal at `gitops_repo_for_project()` — more legible than a fifteen-minute timeout, and the fast-fail this page exists to preserve — but a lease of the project still fails, so it buys diagnosability, not a working project. The two fixes that end the failure are to finish (3) or to drop the project from the pool.
+> One step remains and it is not in this repository: `EVAL_GITHUB_APP_ID=4675512` is still unset in the Prow job environment, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and an audit stream still fails at `audit_report.py start` for want of a token. Setting it — together with mounting the ledger-read token the bench verifiers need — is [`GoogleCloudPlatform/oss-test-infra#2661`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2661), open and unmerged. Because the switch is pool-wide, it is only safe to set once the manual half is true of every project in the pool, which it now is.
 
 ### 5.1 How CI resolves it
 
@@ -186,7 +182,36 @@ Only then set `EVAL_GITHUB_APP_ID=4675512` in the Prow job environment. The valu
 
 The GitHub App's installation list, and nothing else. A presubmit runs the pull request's code, so a pull request can in principle edit the resolution table or the minty rule ConfigMap — but it cannot make the App mint a token for a repository the App is not installed on. Keep the installation scoped to the pool's GitOps repositories, and treat any change to that list as the security review.
 
-## 6. Boskos pool registration
+## 6. The seeded dirty fleet
+
+Six of the evaluation scenarios assert on defects that were planted on purpose — a crashlooping `payments-api`, a workload with no PodDisruptionBudget, an idle node pool, a control plane held a minor behind, a cluster missing master authorized networks. Those fixtures are not provisioned per run. They live on three small standing GKE clusters, `seeded-a`, `seeded-b` and `seeded-c`, and **each pool project needs its own trio**: Boskos leases at random, so a project without them is a project where every fleet check reports `status: "error"` and `VerificationCoverage` drops below 1.0 for that run.
+
+Apply [`bench/tf/fleet`](https://github.com/gke-labs/kube-agents/tree/main/bench/tf/fleet) once per pool project, each with its own remote state:
+
+```bash
+cd bench/tf/fleet
+tofu init -reconfigure \
+          -backend-config="bucket=${PROJECT_ID}-tf-state" \
+          -backend-config="prefix=seeded-fleet"
+tofu apply -var="project_id=${PROJECT_ID}"
+```
+
+The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. All three pool projects are applied as of 2026-08-24, and `hack/fleet-kubeconfigs.sh` run against each of them confirms all seven fixture roles — `7 role(s) written, 0 on clusters that could not be resolved or reached, 0 whose fixtures were not present`. That command is the check to re-run before believing this paragraph; a project it reports anything else for is a project the stack needs re-applying in.
+
+Nothing outside the fleet's own catalog addresses these clusters by name. `hack/fleet-kubeconfigs.sh` discovers them in the leased project by the labels the stack applies (`environment=seeded`, `managed-by=kube-agents-seeded-fleet`), so a project may use a different `cluster_prefix` or region without any scenario changing.
+
+A half-finished apply is the case to watch for. The stack's Kubernetes provider is configured against a cluster the same stack creates, so an apply that fails after the clusters and before the fixtures leaves a trio that carries the labels, answers every API call, and holds none of the planted objects. The runner therefore reads every object in the role's `probes` list before it publishes that role — the objects themselves, not just their namespaces, since four of the seven roles are cluster-scoped — and a role it cannot confirm reports `status: "error"` naming the role and the project, the same answer as no fleet at all, rather than a check that blames the agent for a fixture nobody planted. `tofu apply` again until it is clean.
+
+### 6.1 A read-only credential for the checks
+
+An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. **This is not true today.** The Prow identity holds `roles/container.admin` in every eval project, and there are no in-cluster RoleBindings to narrow — GKE's IAM webhook is the whole authorization path.
+
+The seam exists: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else. To use it, per project:
+
+1. Add the Prow identity to `fleet_reader_token_creators` and re-apply the stack, which binds it `roles/iam.serviceAccountTokenCreator` on that account alone.
+2. Export `FLEET_READONLY_SA=seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` in the Prow job. Unset, `hack/fleet-kubeconfigs.sh` warns on every run and the kubeconfigs carry the runner's own identity.
+
+## 7. Boskos pool registration
 
 Once the GCP project is provisioned with the prerequisites above, register the project ID under the `kube-agents-evals-project` resource type in the Prow Boskos deployment configuration:
 
@@ -202,6 +227,6 @@ Once the GCP project is provisioned with the prerequisites above, register the p
 
 This roster does not live in `oss-test-infra` with the rest of the Prow config — it is in `gke-internal/test-infra`, under `deployments/gke-agentic-tooling-team/boskos`. That split is why registration and onboarding can drift apart: this page is the only thing joining the two repositories, and nothing enforces the order between them.
 
-**Register the project last.** Everything above — the APIs, the cluster, the registry, the GitOps repository, the App installation, the key import, the `gitops_repo_for_project()` row — is a prerequisite of the entry in this list, not a follow-up to it. A project that becomes leasable before it is onboarded takes a share of every presubmit and fails it, which is how `kube-agents-evals-3` broke the smoke test for every open pull request on 2026-08-21.
+**Register the project last.** Everything above — the APIs, the cluster, the registry, the GitOps repository, the App installation, the key import, the `gitops_repo_for_project()` row, the seeded fleet — is a prerequisite of the entry in this list, not a follow-up to it. A project that becomes leasable before it is onboarded takes a share of every presubmit and fails it, which is how `kube-agents-evals-3` broke the smoke test for every open pull request on 2026-08-21.
 
 > **Important:** The Boskos janitor must be disabled for `kube-agents-evals-project` so that the long-lived `platform-agent-host` cluster and pre-warmed state are preserved across leases.

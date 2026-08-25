@@ -9,6 +9,8 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
+- `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
+- `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.

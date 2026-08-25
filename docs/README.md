@@ -161,9 +161,11 @@ identifier appears, add its source here.
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, `vars.sh` keys read, which commands count as mutations | `scripts/live_test_lease.py` |
+| PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
-| Seeded-fleet fixture role slugs, slots, and day-N gates | `docs/designs/fleet-fixtures.yaml`, whose object names come from `bench/tf/fleet/` |
+| Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
+| Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |
 
 ## 3. Documentation eras and status
 
@@ -255,7 +257,7 @@ pull request:
 | `agentplugins/gke-stockout-investigator/README.md` | Component README | What the stockout investigator does, how to install it, and the two behaviours that are not obvious from the chart: alerts become kanban tasks owned by the `platform` profile, and one stockout stays one investigation across autoscaler retries. | Stockout plugin install and behaviour | Operators installing or debugging the plugin |
 | `agentplugins/pubsub-platform/README.md` | Component README | Installing the Pub/Sub ingress adapter, and the route keys that decide whether an alert becomes work at all: filter, threshold, dedup fields and dispatch mode. Defers to the shipped adapter reference for the message flow itself. | Alert ingress configuration | Operators configuring alert routes |
 | `agentplugins/gke-stockout-investigator/files/skills/gke-stockout-investigator/SKILL.md` | Skill bundle | The GKE Stockout Investigator's procedure: judge whether a scale-up failure is real or a stale duplicate, diagnose the capacity shortfall, and propose a GitOps remediation PR. Shipped inside the plugin's OCI image and registered at load time as `gkestockoutinvestigator:gke-stockout-investigator`, so it does not appear in the generated skill catalog. | Stockout diagnosis and remediation | Runtime procedure; travels with the plugin image, not the agent image |
-| `agentplugins/gke-stockout-investigator/scenarios/README.md` | Developer guide | How to trigger a stockout investigation by hand: one script per failure kind, each wedging a real workload and publishing the matching alert. Covers why a workload is needed at all, the dedup/namespace/admission constraints the harness works around, and how to add a scenario. | Manual scenario triggering | Manual demo and skill-exercise tooling; not run by CI (`verify.sh` is the smoke test) |
+| `agentplugins/gke-stockout-investigator/scenarios/README.md` | Developer guide | How to trigger a stockout investigation by hand: one script per failure kind, each wedging a real workload and publishing the matching alert. Covers why a workload is needed at all, the dedup/namespace/admission constraints the harness works around, and how to add a scenario. | Manual scenario triggering | Demo and skill-exercise tooling, also driven by the E2E suite and the RC promotion gate |
 | `agentplugins/pubsub-platform/files/platforms/pubsub/README.md` | Plugin reference | How the Pub/Sub platform adapter routes alert notifications to agent profiles: subscription config, filtering and deduplication, and the `agent_profile` key that sends the resulting work to a specialist. | Pub/Sub alert ingress | Runtime reference; the adapter is a gateway-level singleton on the default profile |
 
 ### `docs/` — architecture, designs, and standalone documents

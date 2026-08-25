@@ -146,31 +146,68 @@ func withCommonLabels(obj metav1.Object, agent *agentv1alpha1.PlatformAgent) {
 // sites keeps this function total, so no caller can emit an empty
 // OTEL_EXPORTER_OTLP_ENDPOINT, and keeps the manifest builders pure — they take no client
 // and cannot discover anything themselves.
-func otelTelemetryEnvVars(agentType, name, namespace, endpoint string) []corev1.EnvVar {
-	if endpoint == "" {
-		endpoint = managedOTelEndpoint
-	}
-	return []corev1.EnvVar{
+//
+// disabled says the controller resolved otlpSourceNone: discovery probed, this cluster
+// has no collector, and nothing configured one. Then no endpoint is emitted at all and
+// the SDK is switched off instead.
+//
+// What this silences is the stock OpenTelemetry SDK's *metric* exporter, which reads
+// OTEL_EXPORTER_OTLP_ENDPOINT directly and is what actually floods the log: on a
+// collector-less cluster it POSTs /v1/metrics to a name that never resolves, once per
+// export interval, for the life of the pod. Omitting the endpoint on its own would not
+// stop it — with the variable unset the SDK falls back to its own default of
+// http://localhost:4318 and trades the DNS failure for a refused connection at the same
+// rate — so the variable has to be set, not merely skipped. OTEL_SDK_DISABLED=true is
+// also already the off switch charts/kube-agents/README.md tells operators to set by hand
+// for exactly this cluster shape; this makes it the default there.
+//
+// It does NOT reach the hermes_otel plugin, which is where agent *spans* go. That
+// plugin does not read OTEL_EXPORTER_OTLP_ENDPOINT at all — its backend is baked into the
+// image and rewritten at start-up by deploy/shared/otel_config.py, which leaves the baked
+// value alone when the endpoint is empty. So on this path the plugin keeps pointing at
+// the managed collector. That is latent rather than noisy (the plugin exports only when
+// there are spans, and it logs no retry storm), but it is not fixed here.
+//
+// It stays overridable: mergeEnvVars applies spec.deployment.env last, so an operator who
+// wants the exporter pointed somewhere regardless can set either variable themselves.
+func otelTelemetryEnvVars(agentType, name, namespace, endpoint string, disabled bool) []corev1.EnvVar {
+	envs := []corev1.EnvVar{
 		{
 			Name:  "OTEL_SERVICE_NAME",
 			Value: name + "-gateway",
 		},
-		{
-			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
-			Value: endpoint,
-		},
-		{
-			Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",
-			Value: "http/protobuf",
-		},
-		{
-			Name: "OTEL_RESOURCE_ATTRIBUTES",
-			Value: fmt.Sprintf(
-				"service.namespace=%s,k8s.namespace.name=%s,kubeagents.agent_type=%s,kubeagents.agent_name=%s",
-				namespace, namespace, agentType, name,
-			),
-		},
 	}
+
+	if disabled {
+		envs = append(envs, corev1.EnvVar{
+			Name:  "OTEL_SDK_DISABLED",
+			Value: "true",
+		})
+	} else {
+		if endpoint == "" {
+			endpoint = managedOTelEndpoint
+		}
+		envs = append(envs,
+			corev1.EnvVar{
+				Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
+				Value: endpoint,
+			},
+			corev1.EnvVar{
+				Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",
+				Value: "http/protobuf",
+			},
+		)
+	}
+
+	// Identity, not export configuration: kept in both cases. OTEL_SERVICE_NAME in
+	// particular is what docker-entrypoint passes to otel_config.py as --service-name.
+	return append(envs, corev1.EnvVar{
+		Name: "OTEL_RESOURCE_ATTRIBUTES",
+		Value: fmt.Sprintf(
+			"service.namespace=%s,k8s.namespace.name=%s,kubeagents.agent_type=%s,kubeagents.agent_name=%s",
+			namespace, namespace, agentType, name,
+		),
+	})
 }
 
 // deriveAgentImageFromOperator derives the platform-agent image from an operator image reference.

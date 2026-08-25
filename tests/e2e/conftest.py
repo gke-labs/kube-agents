@@ -92,7 +92,7 @@ def _get_default_config_env() -> Dict[str, Any]:
 
     defaults = (cfg or {}).get("defaults", {})
     envs = (cfg or {}).get("environments", [])
-    default_env_name = os.environ.get("E2E_ENV") or defaults.get("default_environment", "cluster-e2e")
+    default_env_name = os.environ.get("E2E_ENV") or defaults.get("default_environment", "investigations-e2e")
     default_env = next((e for e in envs if e.get("name") == default_env_name), {})
     return {
         "env_vars": default_env.get("env_vars", {}),
