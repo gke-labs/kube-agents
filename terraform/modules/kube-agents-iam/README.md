@@ -15,11 +15,11 @@ By default the module grants the read-only role set (the composition's
 nothing and manage roles yourself — but note the agent fails every GCP call until an
 equivalent role set exists.
 
-There is no admin preset to mirror: the script's `gke-admin` set was removed (see
+There is no admin preset to mirror: the `gke-admin` bundle was removed (see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),
 and this module has never had one. Passing admin roles through `project_roles` is
-possible and is the module's equivalent of the script's `custom` set — it puts the
-grant in your Terraform, where it is reviewed.
+possible and is the module's equivalent of `permission_set = "custom"` — it puts
+the grant in your Terraform, where it is reviewed.
 
 ## Usage
 

@@ -324,6 +324,40 @@ class TerraformRoleBundlesTest(unittest.TestCase):
             "permission set",
         )
 
+    def test_the_grant_list_does_not_branch_on_the_permission_set_at_all(self):
+        """Defence in depth for a caller that skipped the variable validation.
+
+        `terraform console` does not evaluate variable validations, and a
+        `-var permission_set=...` from a script bypasses the shell gate too.
+        What makes that harmless is structural rather than defensive: with one
+        bundle left, `agent_project_roles` reads `project_roles` or the
+        read-only bundle and never looks at `permission_set`, so no value of it
+        -- removed, misspelled, or invented later -- can select an admin list.
+        Re-introducing the branch is what this catches, and it is the assertion
+        that would have to be deleted to bring the bundle back quietly. The
+        forbidden-role sweep below does not cover it: a branch reintroduced
+        against a benign list passes that one and leaves the shape behind.
+        """
+        start = re.search(r"^[ \t]*agent_project_roles[ \t]*=", self.main, re.M)
+        self.assertIsNotNone(start, "local.agent_project_roles moved or was renamed")
+        # The assignment runs until its brackets balance and the line ends, so
+        # read forward from the `=` rather than to the first newline -- a
+        # parenthesised conditional spans several lines, which is exactly the
+        # shape being looked for.
+        text, depth = "", 0
+        for ch in self.main[start.end() :]:
+            text += ch
+            depth += (ch in "([") - (ch in ")]")
+            if ch == "\n" and depth <= 0:
+                break
+        self.assertTrue(text.strip(), "could not read the agent_project_roles expression")
+        self.assertNotIn(
+            "var.permission_set",
+            text,
+            "the agent's role list branches on permission_set again; a value that "
+            "evades the validation can then choose the branch",
+        )
+
     def test_the_variable_accepts_only_the_two_remaining_sets(self):
         variables = TF_VARIABLES.read_text(encoding="utf-8")
         condition = re.search(

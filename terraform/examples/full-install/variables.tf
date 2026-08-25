@@ -90,6 +90,13 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+# With one bundle left, this no longer selects between bundles: `read-only` takes
+# local.read_only_roles and `custom` requires project_roles, which wins on its own.
+# It stays because it is still load-bearing in two places — installer_common.sh
+# writes it into every generated terraform.tfvars, so removing the variable would
+# fail every installer-driven apply on an unsupported argument, and outputs.tf
+# preconditions on it to catch `custom` with no roles named. It is also the gate
+# that refuses a configuration still asking for the removed admin bundle.
 variable "permission_set" {
   description = "Which GCP IAM role bundle the agent's service account gets: read-only, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
   type        = string
