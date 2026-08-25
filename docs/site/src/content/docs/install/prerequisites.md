@@ -1,29 +1,27 @@
 ---
 title: Prerequisites
-description: What you need in place before running the kube-agents provisioner.
+description: What you need in place before running the kube-agents installer.
 ---
 
 The shipping install path targets GKE. You'll need one working GCP project plus the standard command-line tools, and cert-manager installed on the cluster so the operator's admission webhooks come up cleanly.
 
 ## Local tooling
 
-- **Google Cloud SDK** (`gcloud`) — **576.0.0 or newer**, [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`. Cluster creation enables Managed OpenTelemetry with `--managed-otel-scope`, which reached GA in gcloud 576.0.0 (2026-07-14); on an older SDK the flag exists only on the alpha and beta tracks and cluster creation fails. The installer checks this before it touches any cloud resource — `gcloud components update` if it complains.
-- **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The provisioner points it at the GKE cluster it creates.
+- **Google Cloud SDK** (`gcloud`) — **576.0.0 or newer**, [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`. The installer sets Managed OpenTelemetry with `--managed-otel-scope`, which reached GA in gcloud 576.0.0 (2026-07-14); on an older SDK the flag exists only on the alpha and beta tracks. The installer checks this before it touches any cloud resource — `gcloud components update` if it complains.
+- **Terraform** — the install engine is the [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) composition; `./install.sh` pre-flights `terraform` and offers to install it from HashiCorp's tap (Homebrew) or apt repository.
+- **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The installer points it at the GKE cluster it creates.
 - **Docker or Podman** — required by the operator dev workflow (`make docker-build`) if you rebuild images locally. Not required for a stock install.
-- **Bash 4+** — the provisioning scripts are bash.
-- **`envsubst`** — usually shipped with `gettext`.
-- **`jq`** — [install](https://jqlang.github.io/jq/download/). Stages 03, 09, 10 and 13 read the
-  container-image pins out of `images.json` with it, and each exits at its prerequisite check
-  without it. `./install.sh` pre-flights it and offers to install it; a manual `make gcp-provision`
-  does not, and the failure lands at stage 03 with the cluster already created.
+- **Bash** — the installer scripts are bash (including the `/bin/bash` macOS ships).
+- **`jq`, `gh`, `helm`, `git`** — the rest of the CLI set `./install.sh` pre-flights up front and offers to install when missing.
+- **`envsubst`** — only for the development Kustomize path (`make -C k8s-operator deploy-*`); usually shipped with `gettext`.
 
 ## GCP project
 
 - A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics, KMS keyrings, and IAM service accounts.
 - Billing enabled on that project.
-- The `Editor` or `Owner` role for the user running `./provision.sh` (or a scoped set covering the resources above).
+- The `Editor` or `Owner` role for the user running `./install.sh` (or a scoped set covering the resources above).
 
-The provisioner will enable APIs and create all resources itself; you don't need to pre-provision the cluster.
+The installer will enable APIs and create all resources itself; you don't need to pre-provision the cluster.
 
 **No extra firewall rule is needed on private clusters.** The operator's webhook server listens on
 `10250`, one of the two ports GKE's automatic control-plane-to-node rule already permits — see
@@ -38,11 +36,11 @@ leaves the API server dialing a port nothing is listening on; see
 
 The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+).
 
-**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.21.1 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) The Terraform composition `terraform/examples/full-install` installs the same version as its own `helm_release` — set `enable_cert_manager = false` there if the cluster already has it, because unlike the script it does not detect an existing install and the apply fails on the existing CRDs.
+**You usually do not need to install this yourself.** The Terraform composition `terraform/examples/full-install` installs cert-manager as its own `helm_release`, pinned in its `cert_manager_version` variable, including the leader-election relocation Autopilot needs. On an existing cluster that already runs cert-manager, set `enable_cert_manager = false` — the composition does not detect an existing install and the apply fails on the existing CRDs. `./install.sh` probes for a `cert-manager` Deployment on the existing-cluster path and writes that variable for you. (An existing cert-manager installed under a different namespace or release name is not detected.)
 
 Install it by hand only if you are:
 
-- deploying into an existing cluster without the provisioning scripts or Terraform ([Manual install](/kube-agents/install/manual/)), or
+- deploying into an existing cluster without the installer or Terraform ([Manual install](/kube-agents/install/manual/)), or
 - pinning a specific cert-manager version.
 
 The Helm chart on its own is the one path that never installs cert-manager: a chart that shipped a `Certificate` into a cluster without the CRDs would fail at apply time for everyone. It therefore leaves the operator's admission webhooks off (`operator.webhooks.enabled=false`) until you install cert-manager and turn them on. See the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md).
@@ -85,8 +83,8 @@ On Autopilot you'll additionally need to patch the deployments to append `--lead
 
 ## Chat platform
 
-- **Google Chat** (default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. `provision_05_gcp_gchat.sh` creates the topic and subscription; you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
-- **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Follow the [Hermes Slack setup guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). Slack is configured only if `SLACK_ENABLED=true` when you run the provisioner.
+- **Google Chat** (default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. The composition's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) creates the topic and subscription (`enable_google_chat = true`, or the installer's `--enable-google-chat`); you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
+- **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Follow the [Hermes Slack setup guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). Slack is configured only if you enable it in the installer's chat menu (or set `enable_slack = true` in `terraform.tfvars`).
 
 ## LLM credentials
 
@@ -104,11 +102,11 @@ The declarative workflow needs a GitHub repo to file PRs against.
 
 - A GitHub repo **owned by an organization**. Minty looks the installation up under `/orgs/{org}/`, so a repo owned by a personal account cannot be used — see [token minter](/kube-agents/deploy/token-minter/). A free organization is enough.
 - A GitHub App with `contents:write`, `pull_requests:write`, and `issues:write` permissions, installed on that repo. The App itself may be owned by the organization or by your personal account.
-- The App's private key wrapped in a GCP KMS key — `provision_10_deploy_github_minter.sh` sets up the keyring and key, and you upload the private key material to it.
+- The App's private key wrapped in a GCP KMS key — the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) creates the keyring and an import-only signing key, and `./install.sh` imports the downloaded `.pem` into it via the Minty CLI (a one-shot step, so the key material never enters Terraform state).
 
 See [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) for the full Minty setup.
 
 ## Ready to install
 
-- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — `./provision.sh` end-to-end.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — `./install.sh` end-to-end.
 - [Manual install](/kube-agents/install/manual/) — step-by-step, no wrapper script.

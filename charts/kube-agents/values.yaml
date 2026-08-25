@@ -15,6 +15,38 @@ global:
   # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
   # third-party images under a different path.
   thirdPartyImageRegistry: ""
+  # Secrets holding credentials for a mirror that has to be authenticated to
+  # (Harbor, Artifactory). Leave empty when the nodes can read it themselves —
+  # an Artifact Registry in the same project, or a pull-through cache.
+  #
+  # An entry is either a bare name or the {name: <secret>} map Kubernetes' own
+  # PodSpec uses; both render the same. Anything else fails the render rather
+  # than reaching a pod, because a Secret reference that does not resolve is a
+  # silent fallback to an anonymous pull.
+  #
+  # Referenced, not created: each Secret must already exist in the namespace of
+  # the pod that needs it. That is the release namespace for everything this
+  # chart renders, and the agent's own namespace for a PlatformAgent written
+  # elsewhere against the IMAGE_PULL_SECRETS default below — imagePullSecrets
+  # is a name, not a cross-namespace reference, so a fleet default needs the
+  # Secret in every namespace that runs an agent. Create the namespace and the
+  # Secret before installing, since a pod that cannot pull cannot wait for one
+  # to appear:
+  #
+  #   kubectl create namespace kubeagents-system
+  #   kubectl create secret docker-registry regcred -n kubeagents-system \
+  #     --docker-server=registry.example.com --docker-username=... --docker-password=...
+  #
+  # This reaches every pod of the release AND the agent pods the operator
+  # renders later: it is passed on as IMAGE_PULL_SECRETS on the controller
+  # manager and set on the PlatformAgent CR. A PlatformAgent that sets
+  # spec.deployment.imagePullSecrets itself replaces this rather than adding
+  # to it.
+  #
+  # It does NOT reach the cert-manager release that
+  # terraform/examples/full-install installs alongside — a separate release of
+  # an upstream chart, on the same terms as imageRegistry.
+  imagePullSecrets: []
 
 operator:
   enabled: true
@@ -29,6 +61,12 @@ operator:
     tag: "" # defaults to Chart.appVersion
     pullPolicy: IfNotPresent
   replicaCount: 1
+  podDisruptionBudget:
+    # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
+    # not configurable: minAvailable is the shape that deadlocks node drains,
+    # and the audit SOP this project ships rules it out at every replica count
+    # (obtainability_audit_sop.md 3.3).
+    enabled: true
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -67,9 +105,9 @@ operator:
     # PlatformAgent CR, so on a fresh install the webhooks are registered while
     # the operator is still waiting for a cert cert-manager has not issued yet.
     # Under `Fail` the API server would then reject this chart's own PlatformAgent
-    # CR and the install would deadlock every time. The kustomize path does not
-    # hit this because provision_03 waits for the operator to be Available and a
-    # later step applies the CR.
+    # CR and the install would deadlock every time. The kustomize path did not
+    # hit this because its operator deploy waited for the operator to be
+    # Available before a later step applied the CR.
     #
     # What `Ignore` costs: a PlatformAgent written while the operator is down is
     # admitted without the webhook's defaulting and validation. The CRD's CEL
@@ -126,9 +164,9 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai (chatgpt needs the kustomize overlay and
-  # is rejected). The provider's API key must exist in the credentials Secret —
-  # except vertex_ai, which authenticates with Workload Identity instead.
+  # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
+  # the credentials Secret — except vertex_ai, which authenticates with
+  # Workload Identity instead.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
@@ -144,8 +182,8 @@ litellm:
     projectId: ""
     location: ""
   # Keep in step with the kustomize base
-  # (k8s-operator/config/integrations/litellm/base/deployment.yaml); the
-  # parity check fails the build when they diverge.
+  # (k8s-operator/config/integrations/litellm/base/deployment.yaml), which is
+  # the dev copy of this gateway.
   image:
     repository: ghcr.io/berriai/litellm
     # Keep in step with images.json, which is what `make mirror-images`
@@ -155,6 +193,12 @@ litellm:
     tag: v1.96.2
     pullPolicy: IfNotPresent
   replicaCount: 2
+  podDisruptionBudget:
+    # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
+    # not configurable: minAvailable is the shape that deadlocks node drains,
+    # and the audit SOP this project ships rules it out at every replica count
+    # (obtainability_audit_sop.md 3.3).
+    enabled: true
   resources:
     requests:
       cpu: 100m
@@ -168,6 +212,113 @@ litellm:
   # apply time.
   networkPolicy: true
   podMonitoring: true
+
+# The Hindsight memory store: the API the agents call for long-term memory,
+# the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
+# the database's deliberate lack of a password, and a PodMonitoring. Mirrors
+# k8s-operator/config/integrations/hindsight.
+hindsight:
+  # Tri-state. true/false is an answer; null (the default) follows
+  # platformAgent.harness.memory.provider, so the providers that need the
+  # store (kube_agents_memory, hindsight) get it and everything else — the
+  # default multiuser_memory included — renders nothing. That coupling is the
+  # point: an install cannot select hindsight memory and silently receive no
+  # store to back it.
+  enabled: null
+  api:
+    # Keep in step with images.json (`make mirror-images` copies from it).
+    # Pinned by digest as well as tag; a mirrored install pulls the copy by
+    # tag, because that is what mirror-images pushes.
+    image:
+      repository: ghcr.io/vectorize-io/hindsight-api
+      tag: "0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab"
+      pullPolicy: IfNotPresent
+    # Recall is CPU-bound on the in-process cross-encoder reranker; see the
+    # template before raising these — more CPU has been measured to buy
+    # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
+    resources:
+      requests:
+        cpu: "2"
+        memory: 1Gi
+      limits:
+        cpu: "4"
+        memory: 4Gi
+  postgresql:
+    # Upstream publishes only a floating `latest`; the digest is the real pin.
+    # The images.json entry is named hindsight-postgresql, which is where a
+    # mirror holds the copy.
+    image:
+      repository: docker.io/ankane/pgvector
+      tag: "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    # volumeClaimTemplate size. Immutable once the StatefulSet exists.
+    storage: 8Gi
+  # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
+  networkPolicy: true
+  podMonitoring: true
+  podDisruptionBudget:
+    # Renders maxUnavailable: 1 for both store workloads. Deliberately not
+    # configurable, same rationale as operator.podDisruptionBudget.
+    enabled: true
+
+# The GitHub token minter (minty): mints short-lived GitHub App tokens for
+# the GitOps workflow, called by the credential proxy. This is the Kubernetes
+# half only; the GCP half — the minter GSA, its Workload Identity binding,
+# and the import-only KMS signing key — is terraform/modules/github-minter,
+# and the App's private key must be imported into that key before the
+# Deployment passes its readiness probe.
+githubMinter:
+  enabled: false
+  # GitOps org and repository the minty rule scopes tokens to. Required when
+  # enabled.
+  org: ""
+  repo: ""
+  # GitHub App ID. Set, the chart creates the github-app-credentials Secret;
+  # empty, that Secret must already exist in the release namespace.
+  appId: ""
+  # KSA/GSA pair for Workload Identity; defaults mirror
+  # terraform/modules/kube-agents-iam, so the binding it creates targets the
+  # KSA the chart renders.
+  ksaName: kubeagents-github-minter
+  gsaName: kubeagents-github-minter-gsa
+  # The GSA email allowed to request platform-agent-scope tokens. Empty
+  # derives kubeagents-platform-gsa@<harness.projectId>.iam.gserviceaccount.com.
+  allowedServiceAccount: ""
+  kms:
+    # Defaults mirror terraform/modules/github-minter.
+    keyring: github-token-minter-keyring
+    key: github-token-minter-key
+    # The ENABLED version holding the imported App key. "1" is right unless
+    # the key has been rotated or re-imported.
+    keyVersion: "1"
+    # Empty derives the region from platformAgent.harness.location (zone
+    # suffix stripped) — KMS rings are regional.
+    location: ""
+  # Keep in step with images.json.
+  image:
+    repository: us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server
+    tag: v2.7.1-amd64
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  networkPolicy: true
+  podDisruptionBudget:
+    # Renders maxUnavailable: 1 at any replicaCount. Deliberately not
+    # configurable, same rationale as operator.podDisruptionBudget.
+    enabled: true
 
 # The logging sidecar the operator injects into every agent pod. The chart
 # never renders this container itself — it passes the reference to the
@@ -186,23 +337,20 @@ platformAgent:
     clusterName: ""
     location: ""
     projectId: ""
-    # Hermes runtime knobs, mirroring the HERMES_* variables the provisioning
-    # scripts substitute into platform-agent.yaml.template. `null` omits the
-    # field so the CRD's own default applies — note that the script path
-    # defaults dashboardEnabled to false while the CRD defaults it to true, so
-    # set this explicitly if the two installs must agree.
+    # Hermes runtime knobs. `null` omits the field from the CR so the CRD's
+    # own default applies — dashboardEnabled therefore lands `true` unless an
+    # install pins it, so set it explicitly when it must not float with the
+    # CRD default.
     hermes:
       dashboardEnabled: null
       pluginsDebug: null
       agentHome: "" # CRD default: /opt/data
-    # Agent memory persistence. Defaults match both the CRD and the scripts'
-    # MEMORY_ENABLED / MEMORY_PROVIDER / USER_PROFILE_ENABLED defaults.
+    # Agent memory persistence. `null`/"" omit each field so the CRD's own
+    # defaults apply.
     # Hindsight-backed providers (kube_agents_memory, hindsight) need the
-    # Hindsight API server and Postgres from
-    # k8s-operator/config/integrations/hindsight/, which only
-    # provision_13_deploy_hindsight.sh deploys — this chart does not. Selecting
-    # one here points the agent at a hindsight-api Service that a chart-only
-    # install never created. The default multiuser_memory needs none of that.
+    # Hindsight API server and Postgres, which the chart renders automatically
+    # when one is selected here (see the hindsight block above). The default
+    # multiuser_memory needs none of that.
     memory:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
@@ -211,10 +359,9 @@ platformAgent:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent
       tag: "" # defaults to Chart.appVersion
-      # Always, matching platform-agent.yaml.template — and load-bearing for the
-      # Terraform composition, whose image_tag defaults to "latest": under
-      # IfNotPresent a node with a cached "latest" never picks up a new build.
-      # The parity check compares this against the template.
+      # Always is load-bearing for the Terraform composition, whose image_tag
+      # defaults to "latest": under IfNotPresent a node with a cached "latest"
+      # never picks up a new build.
       #
       # Set IfNotPresent when you pin `tag` to a release: on an immutable tag
       # Always only adds a registry round-trip per pod start, and turns an
@@ -225,9 +372,9 @@ platformAgent:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
       replicas: null
       # RuntimeClass for the agent pod. Set to "gvisor" for GKE Sandbox kernel
-      # isolation — that needs the sandbox node pool
-      # k8s-operator/scripts/provision_02_gvisor_nodepool.sh creates, which has
-      # no Terraform equivalent. Empty omits the field.
+      # isolation — on a Standard cluster that needs the sandbox node pool the
+      # gke-cluster module's enable_gvisor_node_pool creates; Autopilot ships
+      # the RuntimeClass natively. Empty omits the field.
       runtimeClassName: ""
     # Extra environment for the agent container, applied after the operator's own
     # values so it overrides them. The case this exists for is telemetry: the
@@ -271,7 +418,7 @@ platformAgent:
   security:
     # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
     # binding must target this KSA (see the chart README); the default matches
-    # the provisioning scripts (k8s-operator/scripts/common.sh).
+    # PLATFORM_AGENT_KSA_NAME in k8s-operator/scripts/common.sh.
     # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
     # manages the KSA; with no annotations, the operator treats it as
     # user-managed and the CHART creates it instead.
@@ -294,8 +441,8 @@ platformAgent:
     #   SESSION_KV_SALT     HMAC salt for pseudonymising chat identities
     # With create=true they are generated on install and carried forward on
     # upgrade. With create=false (the production path) they come from whatever
-    # created the Secret — provision_07_gcp_k8s_secrets.sh and the
-    # terraform/examples/full-install composition both generate them.
+    # created the Secret — the terraform/examples/full-install composition
+    # generates them.
     # If they are absent the pod still starts, but not everything in it does:
     #   - the in-pod k8s-event-watcher treats an empty SESSION_KV_API_KEY as
     #     fatal and exits on every start, so NO cluster events are watched.
@@ -304,7 +451,7 @@ platformAgent:
     #     losing chat-thread resolution and incident lookup.
     #   - identity hashing falls back to a per-pod random salt with a warning.
     # Upgrading an install that predates these keys is the case that hits this:
-    # add them to the existing Secret (upgrade.sh does it for script installs).
+    # add them to the existing Secret (upgrade.sh backfills them additively).
     create: false
     data: {}
   integration:
@@ -313,8 +460,8 @@ platformAgent:
       # URL). Empty leaves the GitHub integration unconfigured.
       gitRepo: ""
     googleChat:
-      # Requires the Chat Pub/Sub backend (provision_05_gcp_gchat.sh or
-      # terraform/modules/chat-pubsub). projectId is taken from
+      # Requires the Chat Pub/Sub backend (terraform/modules/chat-pubsub).
+      # projectId is taken from
       # platformAgent.harness.projectId.
       enabled: false
       topicName: platform-agent-chat-events

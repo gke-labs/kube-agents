@@ -156,7 +156,7 @@ As a Cluster Agent you operate under a strict **read-only** boundary: **do not a
 
 1. Synthesize the root cause analysis (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_), grounded in the exact diagnostic evidence you collected.
 2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. **Complete the task with the RCA in `result`** — that is the only field the requester receives; the gateway posts it into their chat thread verbatim. `metadata` is for what the Platform Agent parses, not a second home for the finding:
+3. **Complete the task with the RCA in `result`** — that is the only field the requester receives; the gateway posts it into their chat thread verbatim. `metadata` is for what the Platform Agent parses, not a second home for the finding. SOUL.md §6 step 4 has the length budget — aim under 2,000 characters, tightening the prose around the cause, the evidence and the patch rather than dropping any of the three:
 
    ```
    kanban_complete(

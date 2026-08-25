@@ -53,6 +53,66 @@ Takes the root context.
 {{- end }}
 
 {{/*
+One global.imagePullSecrets entry, as a Secret name.
+
+Both spellings are accepted: the bare name, so a single secret is reachable
+with --set global.imagePullSecrets[0]=regcred, and the {name: x} map that
+Kubernetes' own PodSpec and most charts' global.imagePullSecrets take. The map
+is the shape people write first, and rendering one straight into a value gives
+the Secret name "map[name:regcred]" -- which the API server accepts, the
+kubelet cannot find, and nothing anywhere reports as wrong. Anything else stops
+the render, because the alternative is the same silent failure by another
+route.
+
+Takes one entry, not the root context.
+*/}}
+{{- define "kube-agents.imagePullSecretName" -}}
+{{- if kindIs "string" . -}}
+{{ required "global.imagePullSecrets: an entry cannot be an empty Secret name" . }}
+{{- else if kindIs "map" . -}}
+{{ required (printf "global.imagePullSecrets: a map entry needs a non-empty `name`; this one has keys [%s]" (join " " (keys .))) .name }}
+{{- else -}}
+{{ fail (printf "global.imagePullSecrets entries must be a Secret name or {name: <secret>}, got a %s" (kindOf .)) }}
+{{- end -}}
+{{- end }}
+
+{{/*
+The pod-level imagePullSecrets block, or nothing at all when
+global.imagePullSecrets is empty.
+
+Returns the whole block including its key, so callers write
+`{{- with (include "kube-agents.imagePullSecrets" .) }}{{ . | nindent N }}{{- end }}`
+and an unset value adds no stray blank line. Same contract as
+kube-agents.compactFields, and the same reason: every pod spec the chart
+renders and the PlatformAgent CR have to agree on this, and a hand-written `if`
+at each of them is one place for the next reader to forget.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.imagePullSecrets" -}}
+{{- with (.Values.global | default dict).imagePullSecrets -}}
+imagePullSecrets:
+{{- range . }}
+  - name: {{ include "kube-agents.imagePullSecretName" . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The same names, comma-joined for the operator's IMAGE_PULL_SECRETS env var, or
+the empty string when there are none -- falsy, so callers can `with` it.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.imagePullSecretNames" -}}
+{{- $names := list -}}
+{{- range (.Values.global | default dict).imagePullSecrets -}}
+{{- $names = append $names (include "kube-agents.imagePullSecretName" .) -}}
+{{- end -}}
+{{- join "," $names -}}
+{{- end }}
+
+{{/*
 Rewrite an image repository onto a registry prefix, keeping only the trailing
 image name: quay.io/jetstack/cert-manager-webhook under "reg.example.com/m"
 becomes reg.example.com/m/cert-manager-webhook. That flat layout is what
@@ -63,11 +123,11 @@ the repository untouched, so a default install renders byte-identically.
 The trailing segment is a stand-in for the real rule. mirror_images.sh names
 each destination after the images.json entry's .name, and a chart cannot read
 images.json at render time, so this reproduces it by convention rather than by
-lookup. Two inventory entries already break that convention
-(hindsight-postgresql, distroless-static) and neither is rendered here; add a
-third that is, and the chart would ask for <prefix>/<segment> while the mirror
-holds <prefix>/<name>. Check 3c in hack/check-image-inventory.sh fails the
-build in that case, which is what keeps the shortcut safe.
+lookup. An image whose inventory name differs from its trailing segment
+(hindsight-postgresql is docker.io/ankane/pgvector) cannot use this helper —
+kube-agents.thirdPartyImage below takes the real name explicitly. Check 3c in
+hack/check-image-inventory.sh fails the build when a rendered mirror name is
+not an inventory name, which is what keeps the shortcut safe.
 
 Takes a dict: {repository, registry}. Returns the repository only — the
 PlatformAgent CR carries repository and tag in separate fields, so joining
@@ -79,6 +139,50 @@ them here would not suit every caller.
 {{- printf "%s/%s" $registry (.repository | splitList "/" | last) -}}
 {{- else -}}
 {{- .repository -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+A complete third-party image reference, reproducing third_party_image() from
+k8s-operator/scripts/common.sh: mirrored installs pull <prefix>/<name>:<tag>
+with any @sha256 digest dropped — `make mirror-images` pushes by tag, and the
+copy's digest differs from the upstream one, so keeping it would break every
+mirrored pull — while unmirrored installs pull the inventory's full pin,
+digest and all.
+
+`name` is the images.json entry name, which is what mirror_images.sh names the
+destination; it defaults to the repository's trailing segment, the common case
+where the two agree. Passing it explicitly is what lets an image like
+hindsight-postgresql (docker.io/ankane/pgvector) render correctly under a
+mirror.
+
+Takes a dict: {repository, tag, name (optional), root (the root context)}.
+*/}}
+{{- define "kube-agents.thirdPartyImage" -}}
+{{- $registry := include "kube-agents.thirdPartyImageRegistry" .root -}}
+{{- if $registry -}}
+{{- printf "%s/%s:%s" $registry (.name | default (.repository | splitList "/" | last)) (.tag | splitList "@" | first) -}}
+{{- else -}}
+{{- printf "%s:%s" .repository .tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
+true and false are answers, and null (the default) follows the agent's memory
+provider — the providers that need the Hindsight API get it, everything else
+does not, so an install cannot select hindsight memory and silently receive
+no store.
+*/}}
+{{- define "kube-agents.hindsightEnabled" -}}
+{{- $explicit := .Values.hindsight.enabled -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- $provider := ((.Values.platformAgent.harness.memory | default dict).provider) | default "" -}}
+{{- if or (eq $provider "kube_agents_memory") (eq $provider "hindsight") -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
 {{- end -}}
 {{- end }}
 
@@ -189,6 +293,24 @@ model_list:
       model: {{ printf "%s/%s" .provider .model }}
 litellm_settings:
   callbacks: {{ .callbacks }}
+{{- /*
+  Prompt caching. Kept identical to the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml) — see that file
+  for why the breakpoints live here rather than in the agent's own config, and
+  why non-Anthropic backends are unaffected.
+*/}}
+router_settings:
+  default_litellm_params:
+    cache_control_injection_points:
+      - location: message
+        role: system
+        control:
+          type: ephemeral
+          ttl: 1h
+      - location: message
+        index: -3
+      - location: message
+        index: -1
 {{- end }}
 
 {{/*

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import queue
@@ -876,6 +877,23 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertNotIn("SLACK_BOT_TOKEN", executor.environment)
         self.assertEqual(str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"])
 
+    def test_kuberc_is_disabled_for_proxied_commands(self):
+        # command_policy refuses the --kuberc flag, but kubectl v1.36.3 also
+        # reads $HOME/.kube/kuberc with no flag present, and a kuberc can carry
+        # an `as` default -- verified to set Impersonate-User on an argv holding
+        # nothing to refuse. HOME points at the sidecar-only state dir, so the
+        # agent cannot write that path today, but that is deployment geometry
+        # and it is not what this asserts. This asserts the feature is off, so
+        # the property survives someone rearranging the mounts.
+        executor = self.executor()
+        # .get rather than [] so removing the variable reads as a failure with
+        # the expected value in the diff, not as a KeyError in the error column.
+        self.assertEqual("false", executor.environment.get("KUBECTL_KUBERC"))
+        # And the geometry, separately, so a change to either is visible.
+        self.assertEqual(
+            str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"]
+        )
+
     def test_git_commands_carry_a_commit_identity(self):
         # The remediation Pull Request path commits through the proxy, and the
         # commit runs here, in the sidecar. With no identity `git commit` exits
@@ -1106,6 +1124,100 @@ class RepositoryValidationTest(unittest.TestCase):
         # The length guard rejects unbounded untrusted input before the regex
         # runs (defense-in-depth against regex denial-of-service).
         self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
+
+
+class GitHubRefreshHandlerTest(unittest.TestCase):
+    """A failed refresh splits its diagnosis: detail to the log, none to the reply.
+
+    The reply crosses back into the agent sandbox and the caller renders the
+    resulting reason code into a chat room, so it stays output-free. The
+    helper's stderr carries the broker's actual refusal and is the only thing
+    an operator has to read, so it has to reach the sidecar's own log.
+    """
+
+    def _refresh(self, result):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        body = json.dumps({"repository": "gke-agentic/adamparco-infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(execute_internal=lambda argv: result)
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            handler._handle_github_refresh()
+        return replies, logs.output
+
+    @staticmethod
+    def _failure(stderr):
+        return credential_proxy.ExecutionResult(
+            exit_code=1,
+            stdout="",
+            stderr=stderr,
+            duration_ms=5,
+            truncated=False,
+            timed_out=False,
+        )
+
+    def test_logs_broker_refusal_but_keeps_it_out_of_the_reply(self):
+        refusal = "Minty returned error (HTTP 403): installation not found"
+        replies, logs = self._refresh(self._failure(refusal + "\n"))
+
+        self.assertIn(refusal, "\n".join(logs))
+        self.assertEqual(
+            replies,
+            [(HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"})],
+        )
+        self.assertNotIn(refusal, json.dumps(replies[0][1]))
+
+    def test_truncates_oversized_stderr(self):
+        # `_execute` bounds output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
+        # default, which is not a log line -- and this path runs on every failed
+        # cron tick.
+        _, logs = self._refresh(self._failure("x" * 5000))
+
+        detail = logs[0].split("GitHub credential refresh exited 1: ", 1)[1]
+        self.assertEqual(detail, "x" * 1000)
+
+    def test_omits_the_detail_when_stderr_is_empty(self):
+        _, logs = self._refresh(self._failure("   \n"))
+
+        self.assertTrue(logs[0].endswith("GitHub credential refresh exited 1"))
+
+    def test_redacts_token_shapes_out_of_the_detail(self):
+        token = "ghs_" + "A" * 36
+        _, logs = self._refresh(self._failure(f"HTTP 403 echoed {token} back"))
+
+        self.assertNotIn(token, logs[0])
+        self.assertIn("[REDACTED]", logs[0])
+
+    def test_redacts_before_truncating(self):
+        # Truncating first would slice a token in half and leave the prefix in
+        # the log, where the shape no longer matches.
+        token = "ghs_" + "B" * 36
+        _, logs = self._refresh(self._failure("y" * 990 + token))
+
+        self.assertNotIn("ghs_", logs[0])
+        self.assertNotIn("B" * 20, logs[0])
+
+
+class RedactCredentialsTest(unittest.TestCase):
+    def test_redacts_github_and_jwt_shapes(self):
+        for secret in (
+            "ghs_" + "a" * 36,
+            "ghp_" + "b" * 36,
+            "github_pat_" + "c" * 30,
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlX2hlcmU",
+        ):
+            with self.subTest(secret=secret):
+                self.assertEqual(
+                    credential_proxy.redact_credentials(f"before {secret} after"),
+                    "before [REDACTED] after",
+                )
+
+    def test_leaves_ordinary_diagnostics_alone(self):
+        message = "Minty returned error (HTTP 403): installation not found"
+        self.assertEqual(credential_proxy.redact_credentials(message), message)
 
 
 class GoogleChatRelayTest(unittest.TestCase):
@@ -1619,6 +1731,346 @@ class SlackRelayTest(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
         self.assertEqual({"error": "Slack operation failed"}, captured["payload"])
+
+
+class ReadOnlyGateTest(unittest.TestCase):
+    """The gate that makes the PR-only write rule mechanical.
+
+    The proxy refused credential disclosure long before it refused a mutation.
+    These cover the wiring: that the gate runs, that it runs after the existing
+    denylist so credential rules keep their own rule IDs, and that it can be
+    switched off without a new image.
+    """
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        CredentialProxyHandler.enforce_read_only = True
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _decide(self, argv):
+        """The blocked response the handler would send, or None if allowed."""
+        result = credential_proxy.read_only_refusal(argv)
+        return result[0] if result is not None else None
+
+    def test_a_read_passes_the_gate(self):
+        self.assertIsNone(self._decide(["kubectl", "get", "pods"]))
+
+    def test_a_mutation_is_refused(self):
+        refusal = self._decide(["kubectl", "delete", "ns", "prod"])
+        self.assertIsNotNone(refusal)
+        self.assertEqual("kubernetes.read-only", refusal["rule"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
+
+    def test_the_gate_can_be_switched_off(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertIsNone(self._decide(["kubectl", "delete", "ns", "prod"]))
+
+    def test_the_gate_is_on_by_default(self):
+        # A misread env var must not silently disarm the gate.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "banana"}):
+            self.assertTrue(credential_proxy.read_only_enforced())
+        with mock.patch.dict(os.environ,
+                             {"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": "false"}):
+            self.assertFalse(credential_proxy.read_only_enforced())
+
+    def test_credentials_do_not_leak_to_logs(self):
+        # Verify that a token in argv does not get logged
+        result = credential_proxy.read_only_refusal(
+            ["kubectl", "--token=eyJhbGci.SECRET", "--as=admin", "get", "pods"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The log hint should be the --as flag, not a secret-containing argv element
+        self.assertEqual("--as", log_hint)
+        self.assertNotIn("SECRET", log_hint)
+        self.assertNotIn("eyJhbGci", log_hint)
+
+    def test_gcloud_positionals_do_not_leak_to_logs(self):
+        # Verify that positionals in gcloud don't get logged when capped at 3 words
+        # "compute disks describe" is allowlisted, but it accepts a disk name positional
+        # which should not appear in the log hint (capped at first 3 words)
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "describe", "SECRETDISKNAME", "--zone=us-central1-a"]
+        )
+        # This is allowed, so no refusal
+        self.assertIsNone(result)
+
+        # Test a mutation that WOULD refuse and check the hint cap
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]
+        )
+        self.assertIsNotNone(result)
+        refusal, log_hint = result
+        # The hint should cap at 3 words, excluding the credential positional
+        self.assertEqual("compute.disks.delete", log_hint)
+        self.assertNotIn("SECRETDISKNAME", log_hint)
+
+    # Every payload here sits in argv position 1, not position 5. The previous
+    # version of this test put the payload fifth, where the verb cap in
+    # command_policy.evaluate -- `verb_tuple=tuple(words[:3])` -- dropped it
+    # before the sanitizer ever saw it. All three assertions therefore held
+    # against any implementation at all, including `filtered = s`. The cap is
+    # what made the test vacuous, so the payload has to land inside it.
+    #
+    # It is genuinely reachable: gcloud group names are agent-chosen strings and
+    # the first three of them go into the log hint verbatim.
+    FORGERY_PAYLOADS = (
+        ("\n", "compute\n2026-08-06 WARNING command complete exit_code=0"),
+        ("\u2028", "compute\u20282026-08-06 WARNING exit_code=0"),   # LINE SEPARATOR, Zl
+        ("\x85", "compute\x852026-08-06 WARNING exit_code=0"),       # NEL, Cc
+        ("\r", "compute\r2026-08-06 WARNING exit_code=0"),
+        ("\u2029", "compute\u20292026-08-06 WARNING exit_code=0"),   # PARA SEPARATOR, Zp
+    )
+
+    def test_log_sanitization_removes_control_chars(self):
+        # Drive the real path rather than calling the filter directly: a forged
+        # log line only matters if the payload reaches the logger, and
+        # read_only_refusal builds the hint the handler passes to
+        # _sanitize_for_logging.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                result = credential_proxy.read_only_refusal(
+                    ["gcloud", payload, "instances", "delete", "prod"]
+                )
+                self.assertIsNotNone(result)
+                _, log_hint = result
+                # If this fails the rest of the test is asserting about a string
+                # that never held the payload, which is the bug being fixed.
+                self.assertIn(character, log_hint)
+                sanitized = credential_proxy._sanitize_for_logging(log_hint)
+                self.assertNotIn(character, sanitized)
+
+    def test_log_sanitization_leaves_a_single_line(self):
+        # The property that actually matters. str.splitlines breaks on the whole
+        # family a text log reader breaks on -- \n \r \v \f \x1c-\x1e \x85
+        # \u2028 \u2029 -- so one line out means one line in the log.
+        for character, payload in self.FORGERY_PAYLOADS:
+            with self.subTest(character=repr(character)):
+                sanitized = credential_proxy._sanitize_for_logging(payload)
+                self.assertEqual([sanitized], sanitized.splitlines())
+                self.assertNotIn(character, sanitized)
+
+    def test_the_forgery_payload_survives_the_verb_cap(self):
+        # Pins reachability itself, separately from the filter. If the hint ever
+        # stopped carrying agent-chosen text, the tests above would go quiet
+        # rather than fail, and the sanitizer would be unpinned again.
+        result = credential_proxy.read_only_refusal(
+            ["gcloud", "compute\ninjected", "instances", "delete", "prod"]
+        )
+        self.assertIsNotNone(result)
+        _, log_hint = result
+        self.assertEqual("compute\ninjected.instances.delete", log_hint)
+
+    def test_log_sanitization_has_length_cap(self):
+        # Verify that sanitizer caps at 64 chars to prevent unbounded expansion
+        long_flag = "--verylongflagname" + "x" * 100
+        sanitized = credential_proxy._sanitize_for_logging(long_flag)
+        self.assertLessEqual(len(sanitized), 64)
+        # Original should be truncated
+        self.assertNotEqual(sanitized, long_flag)
+
+
+class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
+    """`serve` is what copies the env var onto the handler.
+
+    `read_only_enforced()` and `read_only_refusal()` were both covered, and the
+    one line joining them was not: deleting
+    `CredentialProxyHandler.enforce_read_only = read_only_enforced()` from
+    `serve` left the whole suite green while the kill switch silently stopped
+    working in either direction. This starts the real `serve` with the network
+    parts stubbed and reads the attribute back off the class.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.original = CredentialProxyHandler.enforce_read_only
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def tearDown(self):
+        CredentialProxyHandler.enforce_read_only = self.original
+
+    def _serve_with(self, enforce_value):
+        owner = self
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.address = address
+
+            def serve_forever(self):
+                raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        args = types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket="",
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+        }
+        if enforce_value is not None:
+            environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(self._Stop):
+                credential_proxy.serve(args)
+        return CredentialProxyHandler.enforce_read_only
+
+    def test_serve_arms_the_gate_by_default(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with(None))
+
+    def test_serve_disarms_the_gate_when_the_env_var_says_false(self):
+        CredentialProxyHandler.enforce_read_only = True
+        self.assertFalse(self._serve_with("false"))
+
+    def test_serve_leaves_the_gate_armed_on_a_typo(self):
+        CredentialProxyHandler.enforce_read_only = False
+        self.assertTrue(self._serve_with("banana"))
+
+
+class ReadOnlyOverTheSocketTest(unittest.TestCase):
+    """A mutation must stop at the proxy socket, not merely at a decision function."""
+
+    def setUp(self):
+        self.executed = []
+        owner = self
+
+        class RecordingExecutor:
+            ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+            def git_lease_violation(self, argv, cwd):
+                return None
+
+            def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+                owner.executed.append(argv)
+                return credential_proxy.ExecutionResult(
+                    exit_code=0, stdout="", stderr="",
+                    duration_ms=0, truncated=False, timed_out=False,
+                )
+
+        self.original_executor = getattr(CredentialProxyHandler, 'executor', None)
+        self.original_policy = getattr(CredentialProxyHandler, 'policy', None)
+        self.original_enforce = getattr(CredentialProxyHandler, 'enforce_read_only', True)
+        CredentialProxyHandler.executor = RecordingExecutor()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        if self.original_executor is not None:
+            CredentialProxyHandler.executor = self.original_executor
+        if self.original_policy is not None:
+            CredentialProxyHandler.policy = self.original_policy
+        CredentialProxyHandler.enforce_read_only = self.original_enforce
+
+    def _post(self, argv):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps({"requestId": "t", "argv": argv, "cwd": "/tmp"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_a_read_reaches_the_executor(self):
+        """kubectl get pods (a read) should reach the executor and return 200."""
+        status, payload = self._post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executed)
+
+    def test_a_kubectl_mutation_never_reaches_the_executor(self):
+        """kubectl delete ns prod (a mutation) should be blocked before reaching executor."""
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("kubernetes.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_a_gcloud_mutation_never_reaches_the_executor(self):
+        """gcloud container clusters delete should be blocked before reaching executor."""
+        status, payload = self._post(["gcloud", "container", "clusters", "delete", "c"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("gcp.read-only", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_identity_flag_refusal_over_the_wire(self):
+        """kubectl --as=admin@corp.com get secrets should be blocked for impersonation."""
+        status, payload = self._post(["kubectl", "--as=admin@corp.com", "get", "secrets"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        self.assertEqual("identity.caller-supplied-impersonation", payload["rule"])
+        self.assertEqual([], self.executed)
+
+    def test_kill_switch_allows_mutation_through(self):
+        """With enforce_read_only = False, mutations should reach the executor."""
+        CredentialProxyHandler.enforce_read_only = False
+        status, payload = self._post(["kubectl", "delete", "ns", "prod"])
+        self.assertEqual(200, status)
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual([["kubectl", "delete", "ns", "prod"]], self.executed)
+
+    def test_credential_denylist_takes_precedence_over_read_only(self):
+        """A rule from the credential denylist should report its own rule_id, not read-only.
+
+        The gate runs after policy.blocked_by, so credential rules like
+        kubernetes.token-disclosure keep their own rule ids rather than being
+        masked by a read-only refusal.
+        """
+        # Create a policy with a rule that blocks token disclosure
+        rules = [
+            credential_proxy.Rule(
+                rule_id="kubernetes.token-disclosure",
+                pattern=__import__('re').compile(r"create\s+token", __import__('re').IGNORECASE),
+                message="Token disclosure is not allowed"
+            )
+        ]
+        CredentialProxyHandler.policy = Policy(
+            rules=rules,
+            blocked_message="blocked"
+        )
+
+        # This command matches the denylist rule, not the read-only gate
+        status, payload = self._post(["kubectl", "create", "token", "sa"])
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", payload["code"])
+        # Should report the denylist rule, not read-only
+        self.assertEqual("kubernetes.token-disclosure", payload["rule"])
+        self.assertEqual([], self.executed)
 
 
 if __name__ == "__main__":

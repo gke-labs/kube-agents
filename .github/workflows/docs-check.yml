@@ -6,6 +6,16 @@ on:
   push:
     branches: [main]
 
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -38,3 +48,10 @@ jobs:
       # renamed, or deleted docs that the hand-maintained map missed.
       - name: Documentation map covers every doc
         run: make docs-check-map
+
+      # AGENTS.md and CLAUDE.md are loaded into every agent session before the
+      # first prompt, so their size is a cost paid by every task here. Nothing
+      # about that is visible in a diff, and the file quietly tripled in nine
+      # days before anyone noticed.
+      - name: Agent instruction files fit the context budget
+        run: make docs-check-context-budget

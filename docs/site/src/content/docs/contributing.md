@@ -17,7 +17,8 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 ## PR hygiene (from `AGENTS.md`)
 
-- **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and gives agents the exact commands.
+- **Start from a freshly fetched `main`.** `main` moves fast enough that a week-old checkout is a different repository, so branch from `upstream/main` after fetching it rather than from whatever your working tree is on — a plan built by reading a stale checkout is wrong before you write a line. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and is canonical; [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md) has the commands, including how to tell whether `main` has moved underneath the files you are changing.
+- **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full; the queries are in [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md).
 - **Scope.** Keep changes scoped to the request. Don't bundle unrelated formatting changes.
 - **Structure.** Maintain the shape and intent of agent configuration files. Don't restructure `agents/platform/` for cosmetic reasons in an unrelated PR.
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).
@@ -64,6 +65,14 @@ Before pushing, run the checks CI enforces:
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
 
+- **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
+
+  ```bash
+  make test-integration   # just this tier, for working on a seam; CI reaches it through `make test-python`
+  ```
+
+  Real components wired together with the agent replaced by a fake — no cluster, no model. The tier is in `PYTHON_TEST_DIRS`, so `make test-python` runs it and the Run Python Unit Tests job gates on it; the target above is the fast loop for one tier while you work on a seam. Install a Go toolchain first if you want an honest answer — the injector seam compiles the real Go event-watcher client, and without `go` on `PATH` its four tests skip and the run still prints `OK`. `tests/integration/README.md` states the tier's contract.
+
 - **Docs build** (if you touched `docs/site/`):
 
   ```bash
@@ -88,21 +97,38 @@ What that section should say:
 
 Some changes can't reach a running installation — docs-only edits, CI workflow changes, code paths that need infrastructure you don't have. Write "Not live-tested" and say why. An empty section is not an answer.
 
+If your team shares one installation, take the lease before you mutate it: `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy `.claude/settings.json.example` to `.claude/settings.json` once per checkout, and its `PreToolUse` hook claims the lease on your first mutating command and blocks the command while another agent holds it. Read-only commands are never blocked, and nothing is protected until a checkout has a `vars.sh` or you configure an install. The hook is not committed — it would be branch content Claude Code runs unprompted — and it is Claude Code-specific, so from any other harness, or a plain shell, run `acquire` and `release` yourself:
+
+```bash
+cp .claude/settings.json.example .claude/settings.json   # opt into the hook
+python3 scripts/live_test_lease.py status
+python3 scripts/live_test_lease.py acquire --env my-cluster --pr 123 --note "why"
+python3 scripts/live_test_lease.py release --env my-cluster
+```
+
+`--env` picks the install when more than one resolves, and the commands that act on one require it
+there; `status` reports all of them either way. [`docs/designs/live-test-lease.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/live-test-lease.md) has the details.
+
 ## Self-review
 
-Nobody reads a change as cheaply as the person who wrote it, and right now the first hostile reader of most pull requests here is a reviewer who has never seen the code. So every pull request is reviewed by its author first, and the template's **Self-Review** section says what that pass found.
+Nobody reads a change as cheaply as the person who wrote it, and right now the first hostile reader of most pull requests here is a reviewer who has never seen the code. So every pull request is reviewed by its author first, and the template's **Self-Review** section carries what those passes found — merged into one list, since more than one pass is required.
 
 [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this requirement in full and is canonical; what follows summarises it, so trust it over this page if the two ever differ.
 
 The method is the repository's own review skill, [`.agents/skills/review-adversarial/SKILL.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/skills/review-adversarial/SKILL.md) — run it against your branch diff with whatever agent you use. It works ten angles over the change, then re-derives each candidate from the source as a hostile second reader and throws out what it cannot defend.
 
-Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it.
+Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it. If your harness will not start a subagent without a human's approval, ask for the approval — that setting blocks this step rather than waiving it.
+
+This pass is not the only one [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) requires before a pull request opens: the docs-drift pass runs on every change as well. In Claude Code, `/pr-preflight` covers both — a subagent per pass, one merged list back — and its plumbing lives in [`.agents/skills/review-preflight/SKILL.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/skills/review-preflight/SKILL.md) for any harness without slash commands. Reach for it rather than the session you are already in: coding agents are typically told not to spawn subagents unless asked, and invoking the command is that ask.
 
 What the section should say:
 
 - **What you looked for**, in the skill's terms — which angles you ran, and which you could not.
+- **What kind of context each pass ran in** — a subagent, a fresh session, or the one that wrote the change. A reviewer weighs the rest of the section against that answer.
 - **What it found, and where each finding ended up.** Fixed, naming the commit or hunk; or deliberately not fixed, with a reason. A reason is an argument about this change — the path is unreachable for a stated invariant, the fix belongs to the issue you just filed. "Out of scope" or "will fix later" alone is not.
-- **Nothing you cannot back.** A self-review the diff contradicts is worse than no self-review: it spends the reviewer's trust before they reach the code.
+- **Nothing you cannot back.** A self-review the diff contradicts is worse than no self-review: it spends the reviewer's trust before they reach the code. Fix what the pass confirms and report what it only suspects; a finding it could not pin down is an open question for the section, not a licence to rewrite working code.
+
+Re-running the pass folds into the section rather than stacking a round beneath it. Keep what still holds, re-state what the new commits changed, and drop the superseded round — not a finding's disposition. The same goes for **Live validation**: a reviewer should be able to see at a glance what has been reviewed and exercised against the branch as it stands.
 
 "No findings" is an ordinary outcome on a good change and costs you nothing — provided you also say what you looked for. A pass that names none of its angles is indistinguishable from no pass at all.
 
@@ -112,7 +138,7 @@ All submissions, including from project members, require review through GitHub p
 
 ### Automated review
 
-Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. It introduces itself in a comment on every pull request it picks up; that comment states its current contract, so trust it over this page if the two ever differ.
+Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. It introduces itself in a comment on every pull request it picks up; that comment states its current contract, so trust it over this page if the two ever differ. The timings below are rounded; [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md) is where they are measured, alongside the commands to poll for a review and answer it.
 
 - **It starts on its own** when a pull request is `opened`, `reopened`, or marked ready for review. The 👀 appears within seconds; the review itself lands about 9 minutes later on average, and up to 45 on a very large diff. A draft is not in the queue at all until you mark it ready.
 - **Pushing more commits does not re-trigger it.** To ask for a fresh review of the current commit, comment `/review` on a line of its own — a strict read of only what the bot is certain of, or `/review all` for one as wide as its first review. Owners, members, and collaborators can trigger it. A re-read takes about as long as the first.

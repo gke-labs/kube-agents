@@ -3,6 +3,7 @@ resources:
   - deployment.yaml
   - service-gateway.yaml
   - service.yaml
+  - pdb.yaml
 
 configMapGenerator:
   - name: inference-replay-config

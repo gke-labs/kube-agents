@@ -59,10 +59,10 @@ The base [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kub
 > - **Static Kustomize Deployments**: When deploying with Kustomize, override the API server CIDR by patching the dedicated `platform-agent-apiserver-egress` policy directly.
 
 > [!IMPORTANT]
-> **Workload Identity metadata egress**: The same DNAT applies to the metadata server, on every GKE datapath rather than only Dataplane V2. A pod dials `169.254.169.254:80`, and the node rewrites that to the node-local metadata daemon on TCP `988` before `NetworkPolicy` is evaluated — to `169.254.169.252` on the iptables datapath, and to the hosting node's internal IP on Dataplane V2. A policy that permits only `169.254.169.254/32` therefore drops every Application Default Credentials token fetch, and the symptom is `gcloud` reporting "You do not currently have an active account selected" inside the pod.
+> **Workload Identity metadata egress**: On GKE Dataplane V1 (iptables), the node rewrites `169.254.169.254:80` to the node-local metadata daemon at `169.254.169.252:988` in `nat PREROUTING` before `NetworkPolicy` is evaluated. Dataplane V2 (eBPF) evaluates policy pre-NAT at the socket layer, where the `169.254.169.254/32` rule on ports `80`/`8080` satisfies it directly.
 >
-> - **Operator Deployments**: The operator permits `169.254.169.252/32` and discovers each node's internal IP, refreshing the `/32` set as nodes join and leave. Nothing to configure.
-> - **Static Kustomize Deployments**: [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) ships the `169.254.169.252/32` rule, which covers the iptables datapath. On Dataplane V2 a static manifest cannot know the node addresses: patch the port-`988` rule with one `/32` per node in your overlay, or use the operator.
+> - **Operator Deployments**: The operator generates both rules (`169.254.169.254/32` on ports `80`/`8080` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. Cluster DNS and metadata daemon endpoints are discovered automatically, with escape hatch overrides available via `kubeagents.x-k8s.io/dns-cluster-ip` / `kubeagents.x-k8s.io/metadata-daemon-ip` annotations or `KUBERNETES_DNS_CLUSTER_IP` / `KUBERNETES_METADATA_DAEMON_IP` operator environment variables.
+> - **Static Kustomize Deployments**: [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) ships both rules directly, covering both Dataplane V1 and Dataplane V2 out of the box.
 
 Do **not** edit base manifests directly. If your cluster uses a different service CIDR, is a GKE Dataplane V2 cluster, is managing private-endpoint fleet clusters, or is a GKE Private Cluster with a specific Control Plane VIP range (e.g., `172.16.0.0/28`), override the CIDR cleanly in your deployment overlay using a Kustomize patch in your `kustomization.yaml`:
 
@@ -132,7 +132,7 @@ The `app.kubernetes.io/*` labels follow the project-wide contract that makes the
 The exposed ports:
 
 - `8642` — Hermes API server. Chat integrations and the operator health probes hit this.
-- `9119` — Hermes dashboard. Behind `harness.hermes.dashboardEnabled` in the CR.
+- `9119` — Hermes dashboard. Behind `harness.hermes.dashboardEnabled` in the CR. Nothing answers on the pod network; the listener is loopback-only — see [`PlatformAgent` CRD](/kube-agents/operator/platformagent-crd/#specharness) for how to reach it.
 
 ## Kustomize for operator integrations
 
@@ -141,18 +141,23 @@ The exposed ports:
 - `config/crd/` — the `PlatformAgent` and `AgentPlugin` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
 - `config/webhook/` — admission webhook config (validating + mutating). The Service targets port `10250` on the manager pod for the GKE firewall reason in [Admission webhooks](/kube-agents/operator/#admission-webhooks).
-- `config/manager/` — Deployment for the controller manager.
-- `config/integrations/github/` — Minty deployment.
-- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and `chatgpt` and `vertex_ai` overlays).
-- `config/integrations/inference-replay/` — replay proxy Deployment, Service, and PVC.
-- `config/integrations/hindsight/` — the Chat Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `NetworkPolicy`, and `PodMonitoring`.
+- `config/manager/` — Deployment for the controller manager, plus its `PodDisruptionBudget`.
+- `config/integrations/github/` — Minty deployment and its `PodDisruptionBudget`.
+- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `PodDisruptionBudget`, `NetworkPolicy`, `PodMonitoring`, and a `vertex_ai` overlay).
+- `config/integrations/inference-replay/` — replay proxy Deployment, Service, PVC, and `PodDisruptionBudget`.
+- `config/integrations/hindsight/` — the Planning Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `PodDisruptionBudget`s, `NetworkPolicy`, and `PodMonitoring`.
 
 Each is built and applied on its own; there is no aggregate kustomization over
 `config/integrations/`, because every one of them needs `envsubst` over the built
 output before it can be applied — each carries its image as a `${…}` variable so
 a mirrored install can redirect it, and most need other substitutions besides.
 
-Deploy these via `make deploy-*` from `k8s-operator/`:
+These copies are the **development path**: a stock install gets the same
+components rendered by the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents)
+(via the Terraform engine `./install.sh` drives), while `k8s-operator/config/`
+remains the source of truth for the CRDs and operator RBAC the chart copies
+(`make chart-check` enforces that). Deploy the dev copies via `make deploy-*`
+from `k8s-operator/`:
 
 ```bash
 make deploy                     # operator

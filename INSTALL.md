@@ -7,8 +7,8 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 > commands and nothing else.
 >
 > For the explanatory material — why each component exists, architecture, troubleshooting in depth,
-> and the concept guides — see **<https://gke-labs.github.io/kube-agents/>**. For what each
-> provisioning script does, see
+> and the concept guides — see **<https://gke-labs.github.io/kube-agents/>**. For the shared
+> installer defaults and the `vars.sh` state model, see
 > [`k8s-operator/scripts/README.md`](k8s-operator/scripts/README.md).
 
 ---
@@ -18,8 +18,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 1. [Architecture & Overview](#architecture--overview)
 2. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
 3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
-4. [Method 1: Automated GCP & GKE Provisioning (Recommended)](#method-1-automated-gcp--gke-provisioning-recommended)
-   - [Modular Pipeline Stages](#modular-pipeline-stages)
+4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
 5. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
@@ -29,9 +28,8 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 6. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-7. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
-8. [Teardown & Cleanup](#teardown--cleanup)
-9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+7. [Teardown & Cleanup](#teardown--cleanup)
+8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -45,7 +43,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 
 When prompted for the image/source revision, enter a SemVer release tag or the full 40-character
 commit SHA behind a validated RC tag. The installer rejects mutable refs such as `latest` and `main`
-so the provisioning scripts and container images stay on the same revision. On the one-liner above
+so the install sources and container images stay on the same revision. On the one-liner above
 there is no local checkout yet, so a value is required; running `./install.sh` from a kube-agents
 clone instead offers that clone's `HEAD` as the default — which only works if a container image was
 published for that commit (CI builds one per `main` commit and per release tag).
@@ -56,18 +54,22 @@ _(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.co
 
 - **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
 - **GCP Project & Region Selection**: Auto-detects the active project and prompts for confirmation; you can type a project ID that the discovered list does not show.
-- **Provisioning Sources**: Puts the provisioning scripts on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
+- **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
 - **GKE Cluster Setup**: Provisions the supported GKE Standard topology or connects to an existing cluster.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
-- **Automated Pipeline Execution**: Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision`.
+- **Automated Engine Execution**: Writes `k8s-operator/scripts/vars.sh` (the install's machine-readable record), generates `terraform/examples/full-install/terraform.tfvars` from it, and launches `lifecycle.sh apply` — a single `terraform apply` that provisions every GCP resource and installs the Helm chart, with the Terraform state kept in a versioned GCS bucket (`<project>-kube-agents-tfstate`).
 
-The installer performs no GCP operation of its own — it configures and then delegates to the
-pipeline in [`k8s-operator/scripts/`](k8s-operator/scripts/README.md), which is the canonical
-description of what gets created. It sources `k8s-operator/scripts/common.sh`, so its defaults
-(region, cluster name, model provider, registry prefix) and its accepted values are the ones the
-pipeline uses; see [Shared defaults live in `common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-commonsh).
+The installer's engine is [Method 1](#method-1-the-install-engine--terraform--helm): the
+[`terraform/examples/full-install`](terraform/examples/full-install/README.md) composition, which is
+the canonical description of what gets created. Three things stay outside Terraform, run by the
+installer itself: CMEK database encryption on a **pre-existing** cluster (a `gcloud` pre-step), the
+managed-OTel collection scope (no Terraform field exists), and the GitHub App private-key import
+into KMS (the PEM must not enter Terraform state). The installer sources
+`k8s-operator/scripts/installer_common.sh`, so its defaults (region, cluster name, model provider,
+registry prefix) and its accepted values live in exactly one place; see
+[Shared defaults live in `installer_common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-installer_commonsh).
 
 Two behaviours worth knowing before the first run:
 
@@ -94,7 +96,10 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
   --permission-set="read-only"
 ```
 
-To run pre-flight checks and output configuration state (`vars.sh` and `/tmp/kube-agents-install-report.json`) without creating cloud resources:
+To run pre-flight checks and output configuration state (`vars.sh`, `terraform.tfvars`, and
+`/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
+validates the Terraform configuration, and previews the full resource plan when Application
+Default Credentials are available:
 
 ```bash
 ./install.sh --dry-run --non-interactive \
@@ -118,34 +123,45 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 Before beginning installation, ensure your environment meets the following requirements:
 
-| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                                           |
-| :------------------------------ | :---------------------------------------------- | :------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
-| **Go**                          | `1.26+`                                         | `go version`               | Required for building operator binaries and running tests.                                                            |
-| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                                                  |
-| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                                              |
-| **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                    |
-| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`           | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                 |
-| **Helm**                        | `3.10+`                                         | `helm version`             | Used for installing cluster dependencies like `cert-manager`.                                                         |
-| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by Makefile deployment targets for template substitution.                                                        |
-| **`jq`**                        | `1.6+`                                          | `jq --version`             | Reads `images.json`; provisioning steps 03, 09, and 10 resolve image references and the cert-manager version from it. |
+| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                                 |
+| :------------------------------ | :---------------------------------------------- | :------------------------- | :---------------------------------------------------------------------------------------------------------- |
+| **Go**                          | `1.26+`                                         | `go version`               | Required for building operator binaries and running tests.                                                  |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                                        |
+| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                                    |
+| **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).          |
+| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`           | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.       |
+| **Terraform**                   | `~> 1.5`                                        | `terraform version`        | The install engine. `install.sh` offers to install it (Homebrew tap / HashiCorp apt repo) when missing.     |
+| **Helm**                        | `3.10+`                                         | `helm version`             | `upgrade.sh`'s fast paths and the manual chart install; the engine itself uses the Terraform Helm provider. |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by the kustomize deployment targets (Method 2) for template substitution.                              |
+| **`jq`**                        | `1.6+`                                          | `jq --version`             | Reads `images.json`; the kustomize deploy targets resolve image references from it.                         |
 
 ---
 
-## Method 1: Automated GCP & GKE Provisioning (Recommended)
+## Method 1: The Install Engine — Terraform + Helm
 
-For full end-to-end setups on Google Cloud Platform (GCP) with GKE Standard, Workload Identity, Pub/Sub, LiteLLM, GitHub Token Minter, and Inference Replay Proxy, use the automated provisioning pipeline in `k8s-operator/`.
+This is the engine [Method 0](#method-0-zero-friction-one-liner-installation-fastest) drives, usable
+directly when the install should live in version-controlled IaC (GitOps, CI-driven environments)
+instead of an interview. One `terraform apply` of the
+[`terraform/examples/full-install`](terraform/examples/full-install/README.md) composition
+provisions every GCP resource — the GKE cluster (`cluster_mode = "autopilot"` or `"standard"`, or
+`create_cluster = false` for a cluster somebody else made), the agent's identity and IAM, optionally
+the Google Chat backend, the GitHub minter's KMS resources, and a Backup for GKE plan — and installs
+the [`charts/kube-agents`](charts/kube-agents/README.md) Helm chart on top, which owns every
+Kubernetes resource (operator, PlatformAgent CR, LiteLLM gateway, and the optional Hindsight store
+and GitHub minter workloads).
 
-### Modular Pipeline Stages
-
-The automated installer executes a sequence of numbered, idempotent stages, from GKE cluster
-creation through to the optional inference-replay proxy. Each stage has its own `make` target and can be
-re-run on its own.
-
-- **What each stage does:** [`k8s-operator/scripts/README.md`](k8s-operator/scripts/README.md)
-- **The current target list:** `cd k8s-operator && make help`
-
-Stage 03 installs `cert-manager` automatically if it is not already present, so you do **not** need
-to install it yourself on this path. (You do for [Method 2](#method-2-manual-kubernetes-cluster-deployment).)
+- **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
+- Drive it through [`lifecycle.sh`](terraform/examples/full-install/lifecycle.sh) rather than bare
+  `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete, and `destroy`
+  handles the four teardown asymmetries a bare `terraform destroy` trips over.
+- The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
+  you do **not** need to install it yourself on this path. (You do for
+  [Method 2](#method-2-manual-kubernetes-cluster-deployment).)
+- The manual Chat/Slack registrations in
+  [Step 4 of this method](#step-4-enable-google-chat--slack-integrations-manual-required-steps)
+  apply however the engine is driven.
+- Until the first `X.Y.Z` release tag exists, keep the default `image_tag = "latest"`
+  (see the guide's image-tag note).
 
 ### Step-by-Step Execution
 
@@ -158,50 +174,48 @@ gcloud auth login
 gcloud auth application-default login
 ```
 
-#### Step 2: Execute Provisioning
+#### Step 2: Apply the Composition
 
-Navigate to the `k8s-operator` directory and launch the provisioning pipeline:
+The interactive way is `./install.sh` from the repository root (Method 0), which writes the
+`terraform.tfvars` for you. Hand-driven:
 
 ```bash
-cd k8s-operator
-make gcp-provision
+cd terraform/examples/full-install
+cp terraform.tfvars.example terraform.tfvars   # then edit it
+KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 ```
 
-- On the first run, the script prompts for configuration inputs (GCP Project ID, region, cluster name, model provider, API key, etc.) and saves them locally in `scripts/vars.sh`.
-- Subsequent invocations reuse `scripts/vars.sh` for non-interactive idempotency.
+- `KUBE_AGENTS_STATE_BUCKET=auto` keeps the Terraform state in a versioned GCS bucket
+  (`<project>-kube-agents-tfstate`, prefix `kube-agents/<cluster>`), created on first use. Omit it
+  for local state — fine for a hand-driven evaluation, wrong for anything `uninstall.sh` or
+  `upgrade.sh` should later find. The state contains every secret the install was given; the
+  bucket's IAM is its protection.
+- `install.sh` re-runs are idempotent: it reuses `k8s-operator/scripts/vars.sh` from the first run,
+  regenerates `terraform.tfvars` from it, and `terraform apply` reconciles whatever changed. To
+  change configuration, use `./install.sh --menu` (Save & Apply re-applies through the same
+  engine), edit `vars.sh` and re-run, or edit your hand-written tfvars and re-apply.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
-  only the `kube-agents` images is not enough on its own: `REGISTRY_PREFIX` (or `install.sh`'s
-  `--registry-prefix`) covers the four images this project builds, and cert-manager, LiteLLM,
-  fluent-bit, the GitHub token minter and Hindsight need `THIRD_PARTY_REGISTRY_PREFIX` (or
-  `--third-party-registry-prefix`) as well.
-
-> [!NOTE]
-> Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
+  only the `kube-agents` images is not enough on its own: `image_registry` (or `install.sh`'s
+  `--registry-prefix`) covers the four images this project builds, and LiteLLM, fluent-bit, the
+  GitHub token minter and Hindsight need `third_party_image_registry` (or
+  `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
-  make gcp-provision ARGS="--dry-run"
+  ./install.sh --dry-run -y --project-id=<PROJECT> --image-tag=<TAG>   # validate + terraform plan
+  # or, hand-driven, plain:  terraform plan
   ```
 
 #### Security & CMEK Encryption
 
 The automated installer includes local state hardening and Cloud KMS (CMEK) etcd database encryption:
 
-- **Local State Security**: Configuration state saved in `k8s-operator/scripts/vars.sh` is protected with strict file permissions (`umask 077`, `chmod 600`).
-- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is automatically configured using Cloud KMS (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`).
-- **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before provisioning if deploying to existing unencrypted clusters or testing environments without CMEK:
-  ```bash
-  export ALLOW_UNENCRYPTED_SECRETS=true
-  make gcp-provision
-  ```
+- **Local State Security**: Configuration state saved in `k8s-operator/scripts/vars.sh` — and the `terraform.tfvars` generated from it — is protected with strict file permissions (`umask 077`, `chmod 600`). The Terraform **state** additionally holds every secret in plaintext; it lives in the versioned GCS state bucket, whose IAM is its protection.
+- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is configured automatically using Cloud KMS (`kms_keyring_name` / `kms_key_name`, default `platform-agent-keyring` / `k8s-secret-encryption-key`). On a **pre-existing** cluster Terraform cannot enable it, so `install.sh` does that as a `gcloud` pre-step before the apply.
+- **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before running `install.sh` against an existing unencrypted cluster to skip that CMEK pre-step (testing environments only).
 - **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `vars.sh`. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
-
-> [!TIP]
-> Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
-> `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
-> targets.
 
 #### Private container registry
 
@@ -209,55 +223,35 @@ If your clusters may only pull from an approved registry, copy every image the i
 there first, then export both registry prefixes before provisioning:
 
 ```bash
-# The two targets live in different Makefiles, so each cd is load-bearing:
-# mirror-images is a root-level target, gcp-provision an operator one.
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-
-# Exported before the mirror step so both halves use the same tag.
+# Exported before the mirror step so the mirror and the install use one tag.
 export IMAGE_TAG=v0.1.0
 
-cd "$REPO_ROOT"
 make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 
-export REGISTRY_PREFIX=registry.example.com/kube-agents
-export THIRD_PARTY_REGISTRY_PREFIX=registry.example.com/kube-agents
-
-cd "$REPO_ROOT/k8s-operator"
-make gcp-provision
+./install.sh -y --image-tag=v0.1.0 \
+  --registry-prefix=registry.example.com/kube-agents \
+  --third-party-registry-prefix=registry.example.com/kube-agents
 ```
 
 `make mirror-images` reads `images.json` at the repository root — the inventory of every image
 an install pulls — and copies each one, keeping the trailing image name only.
 
 `IMAGE_TAG` is not optional here. The mirror holds only the tag it was told to copy — `latest`
-if it was told nothing — while `make gcp-provision` asks for whatever `IMAGE_TAG` says, and in
-non-interactive mode it refuses to run without one. Set the two to different values and the four
-first-party images name a reference the mirror was never given: provisioning reports success and
-the pods sit in ImagePullBackOff, after the cluster, node pools, and cert-manager already exist.
-Export it once, as above, so the mirror and the install cannot disagree.
+if it was told nothing — while the install asks for whatever `--image-tag` says. Set the two to
+different values and the four first-party images name a reference the mirror was never given:
+the apply reports success and the pods sit in ImagePullBackOff, after the cluster and
+cert-manager already exist. Export it once, as above, so the mirror and the install cannot
+disagree.
 
-The two prefixes are separate because the images fall into two groups. `REGISTRY_PREFIX`
-replaces `ghcr.io/gke-labs/kube-agents` for the images this project builds — the operator, the
-agent, and the replay proxy. `THIRD_PARTY_REGISTRY_PREFIX` covers the ones it does not: the
-LiteLLM gateway, the fluent-bit sidecar, the GitHub token minter, and cert-manager. **Neither
-implies the other**, so an install that mirrors everything sets both, as above; set only the
-first and the third-party images are still pulled from their upstream registries (the scripts
-warn when they detect that combination). The individual `OPERATOR_IMAGE`, `AGENT_IMAGE`,
-`REPLAY_IMAGE`, `LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE` variables still win over both.
-
-The Helm chart differs here, deliberately: `global.thirdPartyImageRegistry` defaults to
-`global.imageRegistry`, because that value is new and carries no existing meaning to preserve.
-
-`install.sh` takes the same pair as flags — `--registry-prefix=PATH` and
-`--third-party-registry-prefix=PATH` — and writes both into `scripts/vars.sh`, so the one-liner
-install reaches the same place. It does not mirror anything: run `make mirror-images` from a
-checkout first, then point the installer at what it produced.
-
-```bash
-./install.sh -y --image-tag=v0.1.0 \
-  --registry-prefix=registry.example.com/kube-agents \
-  --third-party-registry-prefix=registry.example.com/kube-agents
-```
+The two flags are separate because the images fall into two groups. `--registry-prefix`
+(`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
+builds — the operator, the agent, and the credential proxy. `--third-party-registry-prefix`
+(`third_party_image_registry`) covers the ones it does not: the LiteLLM gateway, the fluent-bit
+sidecar, the GitHub token minter, and Hindsight. **Neither implies the other** on the installer
+flags, so an install that mirrors everything passes both, as above. (The chart's own
+`global.thirdPartyImageRegistry` differs here, deliberately: it defaults to
+`global.imageRegistry`.) cert-manager is a separate Helm release the values never reach — see
+the composition README's mirrored-registry section for its recipe.
 
 See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
 inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
@@ -273,17 +267,9 @@ kubectl get pods -n kubeagents-system
 kubectl get platformagents --all-namespaces
 ```
 
-#### Step 4: ChatGPT OAuth Authentication (If Applicable)
+#### Step 4: Enable Google Chat & Slack Integrations (Manual Required Steps)
 
-If you chose `chatgpt` as your `MODEL_PROVIDER`, follow the printed OAuth Device Flow instructions or check the LiteLLM gateway logs:
-
-```bash
-kubectl logs -n kubeagents-system deployment/litellm -f
-```
-
-#### Step 5: Enable Google Chat & Slack Integrations (Manual Required Steps)
-
-If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED=true`) during provisioning, perform the following required manual steps after `make gcp-provision` completes:
+If you enabled Google Chat or Slack during the install, perform the following required manual steps after the apply completes:
 
 ##### 1. Google Chat Configuration (`GOOGLE_CHAT_ENABLED=true`)
 
@@ -327,7 +313,7 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
      kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
      ```
    - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
-   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Chat Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
+   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
 5. **Set the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - Scheduled audits have nowhere to post until one is set. From the Slack channel you want, run `/sethome` (or `/hermes sethome`). It takes effect immediately and persists across restarts.
 
@@ -346,7 +332,7 @@ If you are installing into an existing Kubernetes or GKE cluster without using t
 
 The Kubernetes Operator requires `cert-manager` (version `1.13.0+`) to generate and rotate admission webhook TLS certificates.
 
-> Only needed on this manual path. [Method 1](#method-1-automated-gcp--gke-provisioning-recommended) installs `cert-manager` for you in stage 03.
+> Only needed on this manual path. [Method 1](#method-1-the-install-engine--terraform--helm) installs `cert-manager` for you.
 
 - **Standard Kubernetes / GKE Standard Cluster (via Helm)**:
 
@@ -446,7 +432,7 @@ kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
   FLUENT_BIT_IMAGE=registry.example.com/kube-agents/fluent-bit:5.1.0
 ```
 
-`provision_03_gcp_gke_operator.sh` and the Helm chart both do this for you when a registry prefix
+The Helm chart does this for you when a registry prefix
 is in effect; the commands above are for a hand-rolled `make deploy`. The credential-proxy
 sidecar needs no variable — the operator derives it from the agent image. See the
 [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all override env
@@ -462,7 +448,7 @@ kubectl rollout status deployment -n kubeagents-system
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
-`GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the provisioning scripts' preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
+`GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the installer's preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
 
 ```bash
 # Deploy LiteLLM Gateway
@@ -523,23 +509,6 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    make dev-rebuild-agent ARGS="platform"
    ```
 
-## Method 4: Declarative IaC Install (Terraform + Helm)
-
-The declarative counterpart of Method 1: a single `terraform apply` provisions the GKE
-Autopilot cluster, the agent's GCP identity (Workload Identity, IAM roles), optionally the
-Google Chat backend and the GitHub minter's KMS resources, and installs the
-[`charts/kube-agents`](charts/kube-agents/README.md) Helm chart on top. Use it when the
-install should live in version-controlled IaC (GitOps, CI-driven environments) instead of
-the interactive pipeline.
-
-- **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
-- Pick **one** path per project — Method 1 and Method 4 create equivalent GCP resources (same IAM, Pub/Sub, and identifiers; the Terraform module provisions an Autopilot cluster where the scripts provision Standard).
-- The manual Chat/Slack registrations in
-  [Step 5 of Method 1](#step-5-enable-google-chat--slack-integrations-manual-required-steps)
-  apply to this method too.
-- Until the first `X.Y.Z` release tag exists, keep the default `image_tag = "latest"`
-  (see the guide's image-tag note).
-
 ## Teardown & Cleanup
 
 To safely remove provisioned resources:
@@ -557,16 +526,23 @@ To remove the resources created for one configured `kube-agents` installation:
 
 ### Automated Cloud Teardown
 
-To clean up all GCP/GKE cluster resources, IAM bindings, secrets, and subscriptions provisioned by `make gcp-provision`:
+`uninstall.sh` above delegates to `lifecycle.sh destroy`, which is also usable directly from a
+checkout:
 
 ```bash
-cd k8s-operator
-make gcp-teardown
+cd terraform/examples/full-install
+KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh destroy
 ```
 
-Teardown mirrors provisioning in reverse, and each step has its own `make gcp-teardown-NN-*` target.
-Run `make help` for the list, and see
-[`k8s-operator/scripts/README.md`](k8s-operator/scripts/README.md) for what each one removes.
+`destroy` handles the four asymmetries a bare `terraform destroy` trips over: it deletes the
+PlatformAgent CR up front (force-clearing a wedged finalizer), purges the backups a BackupPlan
+still owns, clears the cluster's deletion protection, and forgets the undeletable Cloud KMS
+resources from state so their key versions are never scheduled for destruction — the next
+`lifecycle.sh apply` adopts them back automatically.
+
+An install with **no Terraform state** (none in the GCS bucket, none locally) was made by a
+release that predates this engine; `uninstall.sh` says so and stops. Re-run it with
+`--source-ref=<that release>` so the matching teardown runs.
 
 ### Manual Local Uninstall
 

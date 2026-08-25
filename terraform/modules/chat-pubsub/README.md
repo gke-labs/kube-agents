@@ -4,12 +4,12 @@ Reusable Terraform module for provisioning the Google Chat → Pub/Sub inbound r
 
 The Chat API service identity registration is load-bearing: without it, Google Chat silently delivers zero events (no publishes, no errors) and the "Service account email" field on the Chat API configuration page never populates, even though both registrations resolve to the same P4SA.
 
-## Relationship to the provisioning scripts
+## Relationship to the install
 
-This module and `k8s-operator/scripts/provision_05_gcp_gchat.sh` create the **same** topic,
-subscription, service identities, and IAM bindings — use one or the other for a given
-project, never both. The canonical identifiers (topic `platform-agent-chat-events`,
-subscription `platform-agent-chat-events-sub`) live in `k8s-operator/scripts/common.sh`,
+This is the module the full-install composition (and therefore `install.sh` with
+`--enable-google-chat`) uses for the Chat backend. The canonical identifiers (topic
+`platform-agent-chat-events`, subscription `platform-agent-chat-events-sub`) are the
+composition's `chat_topic_name`/`chat_subscription_name` defaults,
 and the module's defaults mirror them.
 
 The module outputs are the values the PlatformAgent CR's `googleChat` integration needs.

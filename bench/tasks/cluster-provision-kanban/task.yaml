@@ -22,3 +22,30 @@ infrastructure:
   stack: prebuilt/kind
   teardown: true
 validated: false
+
+# Slug per docs/designs/domains.yaml (in review): same delegation journey as
+# agent-kanban-smoke, on a freshly provisioned kind cluster.
+domain: chat-and-routing
+
+# The title's cluster half is a {{CLUSTER_NAME}} template in the prompt, so the
+# exact check pins the invariant prefix we chose rather than the rendered name.
+verification_spec:
+  - name: report-states-the-onboard-title
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["onboard cluster"]
+  - name: the-kanban-card-was-actually-filed
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      # An errored kanban_create filed no card, so only successful
+      # calls count toward this objective.
+      require_success: true

@@ -1,9 +1,15 @@
 # check=skip=InvalidDefaultArgInFrom
 #
 # LAYER BUDGET. Docker's overlay2 driver refuses to mount a stack deeper than
-# 128 layers ("max depth exceeded"), and the longest chain in this file --
-# agent-base -> platform -> credential-proxy -- is measured against that ceiling
-# by scripts/check_image_layers.py, which CI runs on every pull request.
+# 128 layers ("max depth exceeded"). The deepest chain that ships --
+# agent-base -> platform -- is measured against that ceiling by
+# scripts/check_image_layers.py, which CI runs on every pull request. That
+# docstring owns the rest of the rationale, including why the gate follows
+# whichever shipping chain is deepest; do not restate it here.
+#
+# entrypoint-gate-test is two instructions deeper still, but it is a build-time
+# assertion that buildx alone ever produces and no daemon ever mounts, so the
+# gate deliberately does not follow it.
 #
 # The ceiling is a property of the classic Docker daemon, not of images: buildx
 # has no such limit, so a build that is over budget passes `docker-build.yml`
@@ -14,7 +20,7 @@
 # third time is a red pull request instead.
 #
 # What this means when editing: every RUN and COPY below is a layer, and the
-# budget is shared by all three stages of that chain. Adding one is fine;
+# budget is shared by both stages of that chain. Adding one is fine;
 # adding a block of them is what to avoid. Where files share a destination they
 # travel in one COPY, and appliers are staged into a directory rather than
 # copied in one at a time -- that is why those instructions look the way they
@@ -77,7 +83,7 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 USER root
 
 # 1. Install all common system utilities and dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-transport-https \
     ca-certificates \
     curl \
@@ -158,9 +164,10 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # a clearer error than that applier's own anchor miss.
 COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
 # Applier and verifier share one COPY into a directory, for the same reason the
-# kanban_notifier pair below does: this stage is the base for `credential-proxy`,
-# which has already hit Docker's layer-depth ceiling once (build f9f1747c,
-# 2026-08-07), so a new build gate does not buy a layer.
+# kanban_notifier pair below does: this stage is the base for `platform`, the
+# chain measured against Docker's layer-depth ceiling, which a build from here
+# broke through once already (f9f1747c, 2026-08-07). A new build gate does not
+# buy a layer.
 COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      deploy/docker/patches/verify_kanban_progress_lines.py \
      deploy/docker/patches/patchlib.py \
@@ -332,6 +339,51 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
 
+# Cron delivery: `deliver: "chat"` hands a job's finished report to the Chat
+# Agent instead of posting it, so the finding lands in a thread that can answer
+# "why does that matter?".
+# Upstream resolves `deliver` to a chat platform and sends. On this install that
+# is where a watchdog's report goes to die: profile_cron_tick.py can only hand a
+# child profile the Slack home channel, so on Google Chat `deliver: "all"`
+# expands to an empty target list and the run records "no delivery target
+# resolved" while posting nowhere. Even where it does post, the report arrives
+# from a process that has exited -- the Chat Agent, which is who the user
+# replies to, never saw it.
+# A delivery MODE rather than a line in every job's prompt, because the prompt
+# only reaches jobs shipped in this image. A job the user asks for at runtime is
+# created through cronjob(action='create') and carries no such contract, which
+# is the case this has to cover: `deliver` is a field every creation path can
+# set, including the model's own tool call.
+# NOT a patch. Upstream already routes `deliver=<name>` through the platform
+# registry, and cron/scheduler.py::_plugin_cron_env_var says in its own words
+# that a plugin setting `cron_deliver_env_var` gets "cron delivery support
+# without editing this module". So this is a bundled platform plugin, dropped
+# into plugins/platforms/ where Hermes auto-registers it: zero lines of the
+# Hermes tree are modified and there is no anchor to go stale.
+# What replaces the patch's build-time failure is verify_chat_relay.py. The
+# plugin depends on a handful of upstream behaviours and every one of them
+# fails QUIETLY -- a watchdog that reports nothing looks exactly like a watchdog
+# with nothing to report -- so the verifier drives the real _deliver_result
+# against a loopback stand-in for the Session KV server and asserts on what
+# crossed the wire. Its own docstring enumerates them.
+# See the module docstring in deploy/docker/plugins/chat/adapter.py.
+#
+# The verifier rides in on the plugin's own COPY and is deleted by the RUN that
+# executes it, rather than being staged into /tmp of its own: one COPY for the
+# four, not two for three and one, because `platform` builds FROM this chain
+# and the budget at the top of this file is the binding constraint. It
+# resolves the plugin through `os.getcwd()`, so /opt/hermes is still the cwd it
+# needs and nothing about the check changes -- only where the file sits for the
+# one layer it exists.
+COPY --chmod=0644 deploy/docker/plugins/chat/plugin.yaml \
+     deploy/docker/plugins/chat/__init__.py \
+     deploy/docker/plugins/chat/adapter.py \
+     deploy/docker/plugins/verify_chat_relay.py \
+     /opt/hermes/plugins/platforms/chat/
+RUN cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 plugins/platforms/chat/verify_chat_relay.py && \
+    rm -f plugins/platforms/chat/verify_chat_relay.py
+
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
 # three edits to the same twenty lines of gateway/kanban_watchers.py. Three
@@ -403,8 +455,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # See the module docstring in deploy/docker/patches/kanban_notifier.py.
 COPY deploy/docker/patches/kanban_notifier.py /opt/hermes/gateway/kanban_notifier.py
 # Applier and verifier share one COPY into a directory: this stage is the base
-# for `credential-proxy`, which has already hit Docker's layer-depth ceiling
-# once (build f9f1747c, 2026-08-07), so patches here do not each buy a layer.
+# for `platform`, whose chain broke through Docker's layer-depth ceiling once
+# already (build f9f1747c, 2026-08-07), so patches here do not each buy a layer.
 COPY deploy/docker/patches/apply_kanban_notifier.py \
      deploy/docker/patches/verify_kanban_notifier.py \
      deploy/docker/patches/patchlib.py \
@@ -502,16 +554,58 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # drives the real patched render_blocks over the reported line and asserts on
 # the elements it returns.
 # See the module docstring in deploy/docker/patches/apply_slack_code_emphasis.py.
+#
+# Google Chat: say the failed-attachment notice in English, and only offer
+# /setup-files where it works. Upstream writes the four user-facing lines of
+# `_post_attachment_fallback` in Spanish, inside an otherwise English adapter,
+# so a user who asked for a report in English gets a Spanish refusal and reads
+# it as the agent having switched language mid-thread. It is not a rare path:
+# native media.upload needs a *per-user* OAuth token, so until each user has run
+# /setup-files in their own DM every attachment lands here, and on the install
+# where this was reported no user had. The second half of the fix is the advice
+# itself: agents/platform/scripts/google_chat_relay_patch.py stubs /setup-files
+# out, and the operator sets GOOGLE_CHAT_RELAY_URL on every install with Google
+# Chat enabled, so on all of them that instruction is a dead end. The notice
+# branches on the _credential_proxy_relay_patched marker that patch leaves on
+# the class, and offers what does work there instead. The direct branch is for
+# an image run outside the operator; it is kept rather than folded away because
+# deleting it hard-codes the instruction off in the one place it works.
+#
+# A grep guard cannot catch this class of bug. The two branches differ only in
+# which strings are appended, so a patch that wired the condition backwards --
+# offering /setup-files precisely where it has been stubbed out -- greps
+# identically to a correct one, and the next reader of the difference is a user
+# following an instruction into a dead end.
+# verify_google_chat_attachment_notice.py therefore builds the real notice from
+# the patched adapter on both branches and asserts on the text.
+#
+# This rides the Slack block's COPY and RUN rather than buying two layers of its
+# own, and it is a different subsystem, which the channel-directory block above
+# treats as grounds for its own pair. The difference is the budget: this stage
+# is the base for `credential-proxy`, the longest chain in the file and the one
+# the layer note at the top of this file is about, so a pair of its own is two
+# layers out of what little that chain has left. Both patches here rewrite an
+# outbound message surface, which is as close to one subject as the grouping
+# gets.
+# See the module docstring in
+# deploy/docker/patches/apply_google_chat_attachment_notice.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
+     deploy/docker/patches/apply_google_chat_attachment_notice.py \
+     deploy/docker/patches/verify_google_chat_attachment_notice.py \
      deploy/docker/patches/patchlib.py \
-     /tmp/slack-code-emphasis/
-RUN /opt/hermes/.venv/bin/python3 /tmp/slack-code-emphasis/apply_slack_code_emphasis.py /opt/hermes && \
+     /tmp/message-surface/
+RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
     ! grep -q "inline code is opaque" /opt/hermes/plugins/platforms/slack/block_kit.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_google_chat_attachment_notice.py /opt/hermes && \
+    grep -qF "kube-agents patch: attachment-fallback notice" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    grep -qF "_credential_proxy_relay_patched" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     cd /opt/hermes && \
-    /opt/hermes/.venv/bin/python3 /tmp/slack-code-emphasis/verify_slack_code_emphasis.py && \
-    rm -rf /tmp/slack-code-emphasis
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
+    rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
 # every lifecycle tool with _check_kanban_mode, which is true for any profile
@@ -589,8 +683,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 # delivery path.
 #
 # Both patches ship in ONE COPY pair + ONE RUN, and the four COPY lines this
-# block used to have are now two: `credential-proxy` builds FROM `platform` and
-# has hit Docker's layer-depth ceiling once already (build f9f1747c,
+# block used to have are now two: this stage is the base for `platform`, whose
+# chain has hit Docker's layer-depth ceiling once already (build f9f1747c,
 # 2026-08-07), so the report-format patch is added at no layer cost rather than
 # buying a block of its own. The guarantees are unchanged -- same appliers, same
 # grep guards, same behavioural verifies.
@@ -875,10 +969,32 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardr
 # to at-most-once if it ever grows a write.
 # See the module docstring in deploy/docker/patches/kanban_notify_delivery.py.
 #
-# All four patches ship in ONE COPY + ONE RUN on purpose. `credential-proxy`
-# builds FROM `platform`, and the block-per-patch layout these would normally get
-# pushed that stage past Docker's layer-depth ceiling ("max depth exceeded" on
-# build f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
+# Hotfix: an event-triage card's subscription was addressed nowhere. A
+# Kubernetes event reaches the agent over the REST API, and api_server.py's
+# session-context chokepoint binds platform="api_server" with the session id as
+# chat_id -- deliberately, as the structural guard against #10760. One layer
+# down, `_maybe_auto_subscribe` copies those values into kanban_notify_subs and
+# writes a well-formed row naming a platform no notifier can deliver to, so the
+# card completes and the root-cause analysis reaches nobody (#630). On the
+# install this was diagnosed against, 14 subscription rows were sitting in that
+# state. The REST bridge already recorded the alert's real chat route under the
+# session id, in session_kv.db's session_metadata, and the
+# session id is the value sitting in the row's chat_id -- so the three
+# destination values are rewritten as the row is written and everything
+# downstream is untouched. Confirmed before the code was written by hand-editing
+# one undelivered card's row to a real address and rewinding its cursor: the
+# report was delivered, and with thread_id set it threaded under the alert it
+# answered. Fails open everywhere -- kanban_tools also runs in CLI workers with
+# no routing database, and a missing, unreadable or malformed one leaves today's
+# behaviour exactly as it is. verify_kanban_event_routing.py drives the real
+# patched create handler with an event session's context and checks every
+# fall-through.
+# See the module docstring in deploy/docker/patches/kanban_event_routing.py.
+#
+# All five patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
+# for `platform`, and the block-per-patch layout these would normally get pushed
+# that chain past Docker's layer-depth ceiling ("max depth exceeded" on build
+# f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
 # same grep guards, same behavioural verifies — only the layer count differs.
 COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/apply_kanban_wake_nudge.py \
@@ -892,12 +1008,16 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_notify_delivery.py \
      deploy/docker/patches/apply_kanban_notify_delivery.py \
      deploy/docker/patches/verify_kanban_notify_delivery.py \
+     deploy/docker/patches/kanban_event_routing.py \
+     deploy/docker/patches/apply_kanban_event_routing.py \
+     deploy/docker/patches/verify_kanban_event_routing.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
     cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
     cp /tmp/latency-patches/kanban_comment_status.py /opt/hermes/tools/kanban_comment_status.py && \
     cp /tmp/latency-patches/kanban_notify_delivery.py /opt/hermes/gateway/kanban_notify_delivery.py && \
+    cp /tmp/latency-patches/kanban_event_routing.py /opt/hermes/tools/kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_nudge.py /opt/hermes && \
     test "$(grep -c '_kanban_record_wake(conn)' /opt/hermes/hermes_cli/kanban_db.py)" = "3" && \
     test "$(grep -c '_wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
@@ -915,11 +1035,15 @@ RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_w
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_comment_status.py /opt/hermes && \
     grep -qF '**_comment_delivery_fields(kb, conn, tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_comment_status import" /opt/hermes/tools/kanban_tools.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_event_routing.py /opt/hermes && \
+    grep -qF 'platform, chat_id, thread_id = _kanban_event_route(' /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_event_routing import" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_comment_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     rm -rf /tmp/latency-patches
 
 
@@ -963,7 +1087,7 @@ COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
-RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
+RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
@@ -990,10 +1114,10 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 # `import run_agent` alone, base image vs this one, both read-only: 3.0s → 1.0s.
 # The bytecode costs ~170MB of image.
 #
-# This must run AFTER every patch this stage applies to /opt/hermes: compileall
-# stamps each .pyc with its source's mtime and size, so bytecode written before a
-# patch would simply be discarded at import and we would be back to compiling on
-# every start. Python that later stages add is not covered here, and the two
+# This must run AFTER everything this stage writes into /opt/hermes — the patches
+# above and the bundled `chat` platform plugin alike: compileall stamps each .pyc
+# with its source's mtime and size, so bytecode written before the write would
+# simply be discarded at import and we would be back to compiling on every start. Python that later stages add is not covered here, and the two
 # cases go different ways. `agents/platform/plugins/` lands in /opt/hermes/plugins
 # in the `platform` stage, which runs a second pass of its own over the same tree
 # — everything compiled here is already up to date and skipped, so that pass costs
@@ -1079,11 +1203,12 @@ RUN rm -f /opt/defaults/config.yaml
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
-COPY agents/chat/scripts/ /opt/defaults/scripts/
-COPY agents/platform/scripts/ /opt/defaults/scripts/
-# One COPY for the three, not three: `credential-proxy` builds FROM this stage and the
-# chain is bounded at 128 layers — see the layer-budget note at the top of the file.
-# They share a destination anyway.
+# One COPY for the two, for the same destination-sharing reason as the three
+# below.
+COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
+# One COPY for the three, not three: this is the chain the layer budget is measured
+# against, and it is bounded at 128 — see the layer-budget note at the top of the
+# file. They share a destination anyway.
 #
 #   profile_overlay.py         merges the operator's per-profile config overlays at
 #                              startup (entrypoint step 2.7). Shipped as a file rather
@@ -1135,9 +1260,20 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # sources are called config.yaml), but the overlay and the merger can share one
 # COPY into the staging directory. Layers are budgeted here — see the note at
 # the top of the file.
+#
+# verify_slack_relay_registry_contract.py rides along in that second COPY, and
+# runs from the same RUN, for the layer budget alone — it has nothing to do
+# with the platform config. It checks the relay patches copied to
+# /opt/defaults/scripts above against the Hermes tree they monkeypatch, which
+# is why it cannot run in CI: this is the `platform` chain that
+# `scripts/check_image_layers.py` measures, and it sits at 114 of the 120 layers
+# that check allows, so a COPY/RUN pair of its own spends a third of what is
+# left. See the
+# module docstring for what a failure here means.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
+     deploy/docker/patches/verify_slack_relay_registry_contract.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
@@ -1149,6 +1285,7 @@ caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {}))
 assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     rm -rf /tmp/platform-config
 
 # Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
@@ -1159,8 +1296,9 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
 # directory records ownership: kube_agents_memory needs the user identity that
 # only chat ingress carries, so it lives with the Chat Agent.
-COPY agents/platform/plugins/ /opt/hermes/plugins/
-COPY agents/chat/plugins/ /opt/hermes/plugins/
+# One COPY for the two: they share a destination, and the chain is bounded at
+# 128 layers — see the layer-budget note at the top of the file.
+COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config
@@ -1231,24 +1369,45 @@ RUN set -eu; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
 
-# --- CREDENTIAL PROXY TARGET ---
-# Only this image contains the real credential-aware CLIs. The platform target
-# above contains wrappers with the same names and cannot execute locally.
-FROM platform AS credential-proxy
+USER 10000:10000
+
+# --- CREDENTIAL PROXY TOOLING ---
+# Everything the sidecar needs that is not agent source: the credential-aware
+# CLIs, the Envoy binary and its config, and the container's entrypoint.
+#
+# FROM agent-base, not FROM platform. Everything the sidecar reads from that
+# chain comes from agent-base itself — the venv at /opt/hermes/.venv, the
+# k8s-event-watcher binary, the hermes user and /opt/defaults — plus
+# /opt/defaults/scripts, which the stage below copies directly. Nothing
+# from the ~20 instructions the `platform` stage spends on SOUL.md, the skill
+# and cluster templates, the plugins and the config merges. Inheriting them
+# bought the sidecar no files it uses and cost it a rebuild whenever any of them
+# changed: `COPY agents/platform/scripts/` sits two thirds of the way down
+# `platform`, so editing one agent Python file invalidated it and every layer
+# after it in BOTH images. The apt/gh install below is the most expensive
+# instruction in the file (~300MB over the network) and it sat under all of that
+# churn. Here it sits under agent-base alone, which changes only when the Hermes
+# pin or the system tooling does.
+#
+# It also stops being true that credential-proxy is the deepest chain shipped.
+# `platform` is, which is the image scripts/check_image_layers.py now measures —
+# see the layer-budget note at the top.
+#
+# Order within this stage is cache order, not reading order: the install is
+# first because it is the most expensive and the least likely to change, and the
+# three COPYs follow in the order they churn. `mkdir -p /etc/envoy` rides along
+# in the install rather than letting the config COPY create that directory,
+# because a `--chmod`ed COPY propagates its file mode to the parents it creates
+# and 0644 on /etc/envoy is not traversable by the runtime uid. Creating it here
+# costs no layer; the `chmod 755 /etc/envoy` this replaces had to run after the
+# COPY, which would have pinned the install above the churn again.
+FROM agent-base AS proxy-tools
 
 USER root
 
-# No `mkdir -p /etc/envoy` ahead of the config COPY: COPY creates the missing
-# parent itself, and the RUN below sets its mode. This stage sits at the end of
-# the longest chain in the file, so an instruction that buys nothing is one the
-# chain cannot afford — see the layer-budget note at the top.
-COPY --from=envoy-bin --chmod=0755 /usr/local/bin/envoy /usr/local/bin/envoy
-COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
-COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
-
 RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    apt-get update && apt-get install -y \
+    apt-get update && apt-get install -y --no-install-recommends \
       git \
       google-cloud-cli \
       google-cloud-cli-gke-gcloud-auth-plugin \
@@ -1258,7 +1417,48 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     dpkg -i /tmp/gh.deb && \
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \
-    chmod 755 /etc/envoy
+    mkdir -p /etc/envoy
+
+COPY --from=envoy-bin --chmod=0755 /usr/local/bin/envoy /usr/local/bin/envoy
+COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
+COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
+
+# --- CREDENTIAL PROXY TARGET ---
+# Only this image contains the real credential-aware CLIs. The platform target
+# contains wrappers with the same names and cannot execute locally.
+#
+# One instruction, and it is the one that churns: an agent source edit now costs
+# the sidecar a single COPY on top of a cached proxy-tools instead of a rebuild
+# of the whole platform chain.
+FROM proxy-tools AS credential-proxy
+
+# The same set the `platform` stage lays down at /opt/defaults/scripts, with the
+# same ownership and mode, so the directory is identical in both images. That
+# used to be structural — the sidecar WAS the platform image — and is now two
+# lists that have to agree, so
+# scripts/test_check_prompt_assets.py::test_the_two_images_fill_opt_defaults_scripts_from_the_same_sources
+# parses both stages and fails if they stop agreeing. Add a source to one list
+# and that test tells you about the other.
+#
+# Only two entries are load-bearing here — start-services.sh runs
+# credential_proxy.py from this path, and that module execs
+# github_token_refresh.py from it and imports gke_endpoint from beside it — but
+# the sidecar has always carried the whole directory and narrowing it is a
+# separate argument from this one.
+#
+# --chmod=0755 reproduces the `find /opt/defaults/scripts -type f -exec chmod
+# 755` the platform stage runs. Only github_token_refresh.py is executed
+# directly and it is already 0755 in git, so this is about the two images
+# agreeing rather than about that one file.
+COPY --chown=hermes:hermes --chmod=0755 \
+     agents/chat/scripts/ \
+     agents/platform/scripts/ \
+     deploy/shared/profile_overlay.py \
+     deploy/shared/profile_plugins.py \
+     deploy/shared/otel_config.py \
+     /opt/defaults/scripts/
+
+USER 10000:10000
 
 
 # --- ENTRYPOINT GATE TEST TARGET ---
@@ -1274,24 +1474,12 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
 # Everything the check needs is already in the `platform` stage above, so this reuses its
 # cache entirely: on a build that has just produced `platform`, the marginal cost is one
 # COPY, one RUN, and a few seconds.
+#
+# Invariant: This stage depends on `platform` ending as non-root (USER 10000:10000) so that
+# entrypoint step 1 (stage2-hook.sh) executes as hermes rather than root.
 FROM platform AS entrypoint-gate-test
 
 COPY --chmod=0755 deploy/shared/entrypoint_gate_check.sh /usr/local/bin/entrypoint-gate-check
 
-# As the runtime UID, not as root, and the difference decides whether this stage tests
-# anything at all. The `platform` stage is still USER root from the base image's setup, but
-# no container ever runs it that way: the operator pins runAsUser/fsGroup 10000 with
-# runAsNonRoot, so every pod executes the entrypoint as hermes.
-#
-# Step 1 of the entrypoint runs upstream's stage2-hook.sh, which branches on exactly this:
-#
-#     as_hermes() { [ "$(id -u)" = 0 ] || { "$@"; return; }; s6-setuidgid hermes "$@"; }
-#
-# As hermes that short-circuits. As root it reaches for s6-setuidgid, which lives in
-# /command and is on no PATH outside s6-overlay's own init — so the hook exits non-zero,
-# the entrypoint's `set -eu` takes the script down at step 1, and all sixteen checks fail
-# having never reached the gate they exist to test. A green build here has to mean the gate
-# is right, not that the image happened to be assembled by the same user that runs it.
-USER 10000
 
 RUN /usr/local/bin/entrypoint-gate-check

@@ -24,7 +24,10 @@ Two communication channels, with different shapes and different reliability requ
 
 **Guiding principles**
 
-1. **No agent-to-agent prompting.** Agents never call each other. They coordinate through shared state (files) and, when delegating, through the kanban board. This avoids the delegation/loop antipatterns.
+1. **No agent-to-agent prompting.** No agent blocks waiting on another. They coordinate through durable state (files) and, when delegating, through the kanban board. This avoids the delegation/loop antipatterns.
+
+   > **Known gap, recorded rather than claimed.** The kanban channel _does_ pass one agent's model output into another's context: a `kanban_create` body becomes the worker's pre-built context (§3.2), and a fan-in card's context carries every parent's structured `metadata`. That is precisely what the **non-authoritative** property in [02](../architecture/02-agent-personas.md) §2.3 exists to control, and nothing in §3 or §5 yet treats a card body as untrusted input to the worker. This channel has **not** been assessed against the four-property test. It should be, before anything else is built on it.
+
 2. **Constrain writes, free reads.** Writers use a schema-enforcing tool; readers use ordinary file tools. LLMs are reliable at reading files and less reliable at bespoke interfaces, so only the _write_ path is a tool.
 3. **Co-located now, migrateable later.** For the MVP all profiles share one pod and one PVC. The design keeps a single seam (the write helper) where a future cross-pod transport would slot in without changing the reader contract.
 

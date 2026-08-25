@@ -30,7 +30,6 @@ docs/site/
 │   ├── content/
 │   │   ├── docs/            # every page in the site
 │   │   └── content.config.ts
-│   ├── plugins/             # remark plugins
 │   └── styles/theme.css     # palette + typography
 └── public/                  # static assets
 ```

@@ -18,16 +18,15 @@ kubectl get all,configmap,pvc,serviceaccount,secret -A \
 
 Every install path sets `name`, `instance`, `part-of`, and `managed-by`:
 
-| Source                                                  | `name`                                              | `instance`                    | `part-of`     | `managed-by`               |
-| ------------------------------------------------------- | --------------------------------------------------- | ----------------------------- | ------------- | -------------------------- |
-| PlatformAgent controller output (per CR)                | `platform-agent`                                    | `<namespace>-<agent name>`    | `kube-agents` | `platformagent-controller` |
-| Operator install (`k8s-operator/config/`)               | `kube-agents-operator`                              | `kube-agents-operator`        | `kube-agents` | `kustomize`                |
-| Helm chart (`charts/kube-agents/`)                      | `kube-agents`, `kube-agents-operator`, or `litellm` | `<release name>`              | `kube-agents` | `Helm`                     |
-| LiteLLM integration                                     | `litellm`                                           | `litellm`                     | `kube-agents` | `kustomize`                |
-| GitHub token minter                                     | `github-token-minter`                               | `github-token-minter`         | `kube-agents` | `kustomize`                |
-| Inference replay                                        | `inference-replay`                                  | `inference-replay`            | `kube-agents` | `kustomize`                |
-| Hindsight memory store                                  | `hindsight`                                         | `hindsight`                   | `kube-agents` | `kustomize`                |
-| Provisioned Secrets (`provision_07_gcp_k8s_secrets.sh`) | `platform-agent`                                    | `${NAMESPACE}-platform-agent` | `kube-agents` | `provisioner`              |
+| Source                                    | `name`                                              | `instance`                 | `part-of`     | `managed-by`               |
+| ----------------------------------------- | --------------------------------------------------- | -------------------------- | ------------- | -------------------------- |
+| PlatformAgent controller output (per CR)  | `platform-agent`                                    | `<namespace>-<agent name>` | `kube-agents` | `platformagent-controller` |
+| Operator install (`k8s-operator/config/`) | `kube-agents-operator`                              | `kube-agents-operator`     | `kube-agents` | `kustomize`                |
+| Helm chart (`charts/kube-agents/`)        | `kube-agents`, `kube-agents-operator`, or `litellm` | `<release name>`           | `kube-agents` | `Helm`                     |
+| LiteLLM integration                       | `litellm`                                           | `litellm`                  | `kube-agents` | `kustomize`                |
+| GitHub token minter                       | `github-token-minter`                               | `github-token-minter`      | `kube-agents` | `kustomize`                |
+| Inference replay                          | `inference-replay`                                  | `inference-replay`         | `kube-agents` | `kustomize`                |
+| Hindsight memory store                    | `hindsight`                                         | `hindsight`                | `kube-agents` | `kustomize`                |
 
 `component` is set by one source only, Hindsight, and everywhere else by nothing: the object's own
 `name` already says what it is, and a second key that has to stay consistent with the first is a key
@@ -42,8 +41,8 @@ database are all built from them. Do not add `component` anywhere else on the st
 is pinned to exactly one application release, so there is a correct value to write. See
 [Release versioning](/kube-agents/deploy/release-versioning/). No other path sets it. The
 controller writes objects whose version is whatever image the CR asked for, and an image reference
-may carry a digest, whose `@` and `:` are not legal in a label value; the kustomizations and the
-provisioner have no build identity to report at all. A `version` label that is present on some of
+may carry a digest, whose `@` and `:` are not legal in a label value; the kustomizations have no
+build identity to report at all. A `version` label that is present on some of
 the footprint and absent from the rest is worse than one that is consistently absent, so select on
 image references, not on this label, when you need to know what is actually running.
 
@@ -54,7 +53,7 @@ to a length that fits a label value, so the joined value is truncated to 63 char
 singleton installs use `instance == name`; there is only one per cluster.
 
 `managed-by` names the thing that writes the object, so you can tell an object the operator
-reconciles from one a human applied with `kustomize` or the provisioner created.
+reconciles from one a human applied with `kustomize` or one Helm rendered.
 
 ## What is not labelled
 

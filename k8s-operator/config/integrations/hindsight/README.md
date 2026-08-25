@@ -11,27 +11,24 @@ README covers only the manifests in this directory.
 ## Install
 
 Nothing here is a manual step. Hindsight is
-[provisioning step 13](../../../scripts/README.md), so a full install
-brings it up along with everything else:
+the chart (`hindsight.*` in `charts/kube-agents/values.yaml`), which renders
+the same store whenever a hindsight-backed memory provider is selected. These
+kustomize copies are the dev path:
 
 ```sh
-make -C k8s-operator gcp-provision-13-hindsight   # or the whole provision.sh run
+make -C k8s-operator deploy-hindsight
 ```
 
-The step deploys the manifests and waits for `hindsight-api` to become ready,
-which takes longer than the rest of the install because the API loads its
-embedding and reranking models at startup.
+`make deploy-hindsight` applies the manifests as-is: no readiness gate — the API
+takes longer than anything else here to come up, because it loads its embedding
+and reranking models at startup — and no provider gate, so it deploys whatever
+you point it at. On the real install path the chart carries both gates: it
+renders this store only when the memory provider is Hindsight-backed
+(`kube_agents_memory` or `hindsight`), and a stock install — the file-based
+`multiuser_memory` default — runs no database. See
+[choosing a provider](../../../../docs/designs/memory.md#choosing-a-provider).
 
-It deploys nothing at all unless the install asked for this store: `MEMORY_PROVIDER`
-must name a Hindsight-backed provider (`kube_agents_memory` or `hindsight`). That
-is the default, so a stock install gets these workloads; it is an install that chose
-the file-based `multiuser_memory`, or no memory at all, that runs no database — see
-[choosing a provider](../../../../docs/designs/memory.md#choosing-a-provider). The
-step exits 0 when it skips, so re-running it after switching the provider is all it
-takes to bring the store up later.
-
-To apply the manifests directly — the same thing the step does, without the
-readiness gate:
+To apply the manifests directly:
 
 ```sh
 cd k8s-operator && make deploy-hindsight
@@ -96,7 +93,7 @@ carries `mode`, `memory_mode` and `recall_budget` and deliberately **no**
 value left there would outrank the operator's silently. Installing into a
 different namespace therefore needs no edit and no image rebuild. The manifests
 are namespace-agnostic for the same reason — every in-cluster address in them is
-a short service name, and the provisioning step applies them with `-n $NAMESPACE`.
+a short service name, and the deploy target applies them with `kubectl apply -n`.
 
 The config file itself is image-owned: the entrypoint force-syncs it onto the
 agent's PVC on every start, so a hand-edit there is overwritten on the next roll.
@@ -109,9 +106,9 @@ retain strategies on the first session that stores anything.
 
 ## Teardown
 
-`teardown_13_deploy_hindsight.sh` removes the workloads and **keeps the volume**.
+`make -C k8s-operator undeploy-hindsight` removes the workloads and **keeps the volume**.
 A StatefulSet's `volumeClaimTemplate` PVC is not owned by these manifests, so
-re-running the provisioning step reattaches it with every memory intact. Discard
+re-deploying reattaches it with every memory intact. Discard
 them explicitly:
 
 ```sh

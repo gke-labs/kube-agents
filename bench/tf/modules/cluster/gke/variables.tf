@@ -81,3 +81,14 @@ variable "gpu_count" {
   default     = 1
 }
 
+variable "orphan_max_age_hours" {
+  description = "Age in hours past which a managed-by=kube-agents-bench cluster is considered orphaned and reaped before this run provisions"
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.orphan_max_age_hours >= 2
+    error_message = "orphan_max_age_hours must be >= 2: the Prow eval job runs up to 85 minutes, and a lower threshold lets the sweep delete a live concurrent run's cluster."
+  }
+}
+

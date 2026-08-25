@@ -436,6 +436,30 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
+		// The probe has to reach the listener over loopback. `hermes dashboard`
+		// binds 127.0.0.1, so the tcpSocket probe this replaces was dialled by
+		// kubelet against the pod IP, refused every time, and left the container
+		// — and therefore the whole pod — permanently NotReady (#822). Asserting
+		// the shape is the only guard available here: nothing in this suite can
+		// open a socket against the real CLI.
+		switch probe := dashboardC.ReadinessProbe; {
+		case probe == nil:
+			t.Errorf("expected a readiness probe on the dashboard container")
+		case probe.TCPSocket != nil:
+			t.Errorf("dashboard readiness probe must not be tcpSocket: kubelet dials the pod IP and the listener is loopback-only")
+		case probe.Exec == nil || len(probe.Exec.Command) == 0:
+			t.Errorf("expected an exec readiness probe on the dashboard container, got %+v", probe.ProbeHandler)
+		default:
+			cmd := strings.Join(probe.Exec.Command, " ")
+			if !strings.Contains(cmd, "http://127.0.0.1:9119/") {
+				t.Errorf("expected the dashboard readiness probe to target http://127.0.0.1:9119/, got %q", cmd)
+			}
+			// --fail would turn an auth-gated or non-2xx root path into an
+			// unready pod; the probe only asserts that something answers.
+			if strings.Contains(cmd, "--fail") {
+				t.Errorf("dashboard readiness probe must not use curl --fail: any HTTP response proves the listener is up, got %q", cmd)
+			}
+		}
 		if len(dashboardC.Env) != 6 {
 			t.Errorf("expected 6 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
@@ -1025,6 +1049,44 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// Widening the allowlist must not have widened it to everything.
 	if _, ok := values["SESSION_KV_DB_PATH"]; ok {
 		t.Errorf("SESSION_KV_DB_PATH must stay operator-owned, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
+	// This is the end-of-day recap's whole configuration surface — the script
+	// reads it from the environment on every run and there is no config file
+	// behind it. Off the allowlist, the SOP's documented override renders,
+	// validates, and silently does nothing, and a fleet whose noisy namespace
+	// is not one of the three shipped exclusions has no supported way to quiet
+	// it.
+	custom := []corev1.EnvVar{
+		{Name: "EOD_EXCLUDE_NAMESPACES", Value: "kube-system,istio-system"},
+		{Name: "GKE_CLUSTER_NAME", Value: "impostor"},
+		{
+			Name: "EOD_EXCLUDE_NAMESPACES",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	if values["EOD_EXCLUDE_NAMESPACES"] != "kube-system,istio-system" {
+		t.Errorf("expected the recap's namespace filter to be overridable, got %q", values["EOD_EXCLUDE_NAMESPACES"])
+	}
+	// The recap resolves its own cluster name; letting the CR relabel every
+	// row would make one cluster's noise read as another's.
+	if _, ok := values["GKE_CLUSTER_NAME"]; ok {
+		t.Errorf("GKE_CLUSTER_NAME must stay operator-owned, got %#v", got)
 	}
 }
 
@@ -2579,15 +2641,43 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		}
 	}
 
-	// A deployment with no chat integration pins nothing, so the render is empty — but
-	// buildConfigMapData still writes the key, and must: the managed volume projects it
-	// by name, and a ConfigMap item naming a missing key fails the mount and the pod
-	// never starts (see renderManagedEnv's doc comment). What is asserted here is the
-	// CONTENT, not the key's presence: an agent with no chat integration has no platform
-	// credential worth freezing, and a pin invented for one would only be a key the agent
-	// is refused permission to set.
-	if got := renderManagedEnv(newTestPlatformAgent()); got != "" {
-		t.Errorf("renderManagedEnv with no integration = %q, want empty", got)
+	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
+	// integration has no platform credential worth freezing, and a pin invented for one
+	// would only be a key the agent is refused permission to set. What survives is the
+	// loopback bearer, which is not conditional on anything; see the next test.
+	bare := renderManagedEnv(newTestPlatformAgent())
+	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"; got != want {
+		t.Errorf("renderManagedEnv with no integration = %q, want %q", got, want)
+	}
+}
+
+// TestManagedEnvPinsTheLoopbackKeyUnconditionally is the regression for issue #786.
+//
+// Hermes' stage2 hook generates a strong random API_SERVER_KEY into $HERMES_HOME/.env on
+// any boot where that file does not already carry one, and load_hermes_dotenv applies the
+// PVC file over the container environment — so the operator setting the env var is not
+// enough, and was not: every authenticated call to the gateway API 401'd against a key
+// nothing else in the system had ever seen. The managed scope is applied LAST with
+// override=True, which is why the pin has to live here and not only in the container env.
+//
+// Unconditional matters as much as present. The failure was found through the Google Chat
+// relay, but it belongs to the API server, which every deployment runs — including the
+// probes on the platform-agent container, which curl that API and so would hold the pod
+// out of Ready forever on an agent with no integration at all.
+func TestManagedEnvPinsTheLoopbackKeyUnconditionally(t *testing.T) {
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"no integration": newTestPlatformAgent(),
+		"chat":           chatAgent(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := renderManagedEnv(agent)
+			want := "API_SERVER_KEY=" + loopbackAgentAPIKey
+			if !slices.Contains(strings.Split(strings.TrimSpace(env), "\n"), want) {
+				t.Errorf("the managed .env does not pin %q, so Hermes' stage2 hook generates its own "+
+					"key into the PVC .env and every authenticated call to the gateway API 401s "+
+					"(issue #786):\n%s", want, env)
+			}
+		})
 	}
 }
 
@@ -4725,5 +4815,116 @@ func TestFrontDoorToolsetsMatchPlatformConfig(t *testing.T) {
 	if got, want := slices.Sorted(slices.Values(frontDoorToolsets)), slices.Sorted(slices.Values(want)); !slices.Equal(got, want) {
 		t.Errorf("frontDoorToolsets differs from platform_toolsets.cli in %s:\n  operator: %v\n  image:    %v",
 			path, got, want)
+	}
+}
+
+// TestImagePullSecretsReachThePodSpec is the end-to-end check for #499: an
+// authenticated private registry is only usable if the pull identity lands on
+// the pod, and the pod is where it has to land — Kubernetes has no
+// per-container pull identity, so one field covers the agent, both
+// operator-injected sidecars, and anything the CR adds beside them.
+func TestImagePullSecretsReachThePodSpec(t *testing.T) {
+	agent := func(secrets ...string) *agentv1alpha1.PlatformAgent {
+		var refs []corev1.LocalObjectReference
+		for _, s := range secrets {
+			refs = append(refs, corev1.LocalObjectReference{Name: s})
+		}
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{ImagePullSecrets: refs},
+				},
+			},
+		}
+	}
+	names := func(refs []corev1.LocalObjectReference) []string {
+		var out []string
+		for _, r := range refs {
+			out = append(out, r.Name)
+		}
+		return out
+	}
+
+	t.Run("from the CR", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		dep := buildDeployment(agent("harbor-pull", "extra-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull", "extra-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("from the operator-wide default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildDeployment(agent(), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"fleet-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v — IMAGE_PULL_SECRETS must reach a CR that names none", got, want)
+		}
+	})
+
+	t.Run("the CR wins over the default", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildDeployment(agent("harbor-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+
+	// The default install must render exactly as it did before this field
+	// existed; an empty slice instead of nil would show up as `imagePullSecrets:
+	// []` on every agent Deployment in the fleet.
+	t.Run("absent when nothing is configured", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		bare := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"}}
+		dep := buildDeployment(bare, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got := dep.Spec.Template.Spec.ImagePullSecrets; got != nil {
+			t.Errorf("Deployment pod spec imagePullSecrets = %v, want nil", got)
+		}
+	})
+
+	// buildStatefulSet shares buildPodTemplateSpec with buildDeployment, and the
+	// RWO storage path is the only way to reach it — an agent with custom RWO
+	// storage must not be the one install that cannot pull from its mirror.
+	t.Run("on the StatefulSet path too", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		sts := buildStatefulSet(agent("harbor-pull"), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+		if got, want := names(sts.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("StatefulSet pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+	})
+}
+
+// The read-only kill switch. Unlike the two above it is not appended by
+// buildCredentialProxySidecar afterwards, so an unreserved name here does not
+// duplicate or lose a race — it is simply accepted, and the proxy reads the
+// user's value. `CREDENTIAL_PROXY_ENFORCE_READ_ONLY: "false"` under
+// spec.deployment.env turned off every refusal in the policy: all commands,
+// all agents, all clusters in the Pod, no expiry, and nothing in the CR that
+// reads like a security change. Whoever can edit the PlatformAgent is often
+// exactly who the policy is meant to constrain, so the switch cannot be theirs.
+//
+// Asserting absence rather than a value is deliberate: the proxy defaults to
+// enforcing when the variable is unset, so dropping the entry is the fix, and
+// an operator-set "true" would be indistinguishable from the merge having
+// silently passed the user's own "true" through.
+func TestDeploymentEnvCannotDisableReadOnlyEnforcement(t *testing.T) {
+	for _, userValue := range []string{"false", "0", "no", "true"} {
+		t.Run(userValue, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_ENFORCE_READ_ONLY", Value: userValue}},
+			}
+
+			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+				if e.Name == "CREDENTIAL_PROXY_ENFORCE_READ_ONLY" {
+					t.Fatalf("spec.deployment.env set the read-only kill switch to %q; it must be dropped as reserved", e.Value)
+				}
+			}
+		})
 	}
 }

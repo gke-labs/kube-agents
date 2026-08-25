@@ -189,6 +189,17 @@ class CronStoreMergeTest(unittest.TestCase):
         merged = self.overlay([job("audit", enabled=False)], [job("audit", enabled=True)])
         self.assertIs(False, merged[0]["enabled"])
 
+    def test_the_image_decides_where_a_report_is_delivered(self):
+        # This is what makes moving the whole roster onto `deliver: "chat"` a
+        # one-field edit rather than a migration script. Every live volume
+        # already carries these jobs at `"all"`, and nothing on the volume can
+        # be reached by hand; the next pod start is what rewrites them. The
+        # default profile is the other way round — `cron_jobs_sync.py` lists
+        # `deliver` in RUNTIME_WINS, because onboarding rewrites it to `origin`
+        # on the delivery job — so this rule holds for named profiles only.
+        merged = self.overlay([job("audit", deliver="chat")], [job("audit", deliver="all")])
+        self.assertEqual("chat", merged[0]["deliver"])
+
     def test_a_job_the_image_does_not_ship_is_kept(self):
         merged = self.overlay([job("audit")], [job("audit"), job("operator-added")])
         self.assertEqual(["audit", "operator-added"], [j["id"] for j in merged])

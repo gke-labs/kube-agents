@@ -51,6 +51,12 @@ cleaned up.
 If the change cannot reach a running installation — docs-only, a CI workflow, a path
 that needs infrastructure you do not have — write "Not live-tested" and say why.
 
+If the install is shared with other agents, take the lease first: see
+docs/designs/live-test-lease.md.
+
+Re-testing after new commits folds into this section rather than stacking a round
+beneath it: keep what still holds, and re-run or flag what the new commits invalidated.
+
 Full contract: AGENTS.md, "Pull Request Hygiene".
 -->
 
@@ -60,14 +66,29 @@ Full contract: AGENTS.md, "Pull Request Hygiene".
 
 <!--
 Required: an empty section is not an answer. You are this change's first hostile
-reader, and this is where you say so. Which pass you ran, what you looked for,
-what it found, and what you did with each finding — fixed, or deliberately not,
-with the reason.
+reader, and this is where you say so. Which passes you ran — adversarial and
+docs-drift, both on every change — what you looked for, what they found, and what
+you did with each finding: fixed, or deliberately not, with the reason. One merged
+list, not a section per pass.
 
 "No findings" is a normal outcome and a complete answer only when you also say
 what you looked for. A reason for not fixing something is an answer when it is an
 argument about this change; "out of scope" and "will fix later" on their own are
 not.
+
+Run the pass in a context that did not write the change — a subagent, or a fresh
+session, handed the diff range and nothing else. `/pr-preflight` spawns one per
+pass. If your harness will not start one without a human's approval, ask for it.
+A session that still holds the reasoning behind the diff re-derives that
+reasoning instead of testing it, so it clears the errors the reasoning caused.
+Name the kind of context each pass ran in.
+
+Fix what the pass confirms and report what it only suspects, and claim no more
+than you did: a Self-Review the diff contradicts is worse than none.
+
+Re-running the pass folds into this section rather than stacking a round beneath
+it: keep what still holds, re-state what the new commits changed, and drop the
+superseded round rather than a finding's disposition.
 
 Full contract: AGENTS.md, "Pull Request Hygiene".
 -->

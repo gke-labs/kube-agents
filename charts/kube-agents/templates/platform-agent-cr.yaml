@@ -41,6 +41,15 @@ spec:
     image: {{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) | quote }}
     tag: {{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion | quote }}
     imagePullPolicy: {{ .Values.platformAgent.deployment.image.pullPolicy }}
+    {{- /*
+      Set on the CR as well as on the operator's IMAGE_PULL_SECRETS default,
+      even though either alone would cover this agent. The CR is the layer a
+      reader looks at when a pull fails, and it is the layer that survives the
+      operator being redeployed by something other than this chart.
+    */}}
+    {{- with (include "kube-agents.imagePullSecrets" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
     {{- $availability := .Values.platformAgent.deployment.availability | default dict }}
     {{- with include "kube-agents.compactFields" (dict
           "replicas" $availability.replicas

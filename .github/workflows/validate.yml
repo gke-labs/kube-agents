@@ -6,6 +6,16 @@ on:
   push:
     branches: [main]
 
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -58,9 +68,6 @@ jobs:
       - name: Check the container-image inventory
         run: make images-check
 
-      - name: Check the install surfaces agree
-        run: make iac-parity-check
-
       - name: Validate Helm Chart
         run: |
           # clusterName/location/projectId are required values with no
@@ -86,8 +93,7 @@ jobs:
           # it exists over `with`, and the one thing here no other check covers.
           # A regression drops an explicit `dashboardEnabled: false` from the CR,
           # the CRD default of `true` applies, and the render stays valid YAML:
-          # lint passes, iac-parity-check passes (it reads values.yaml, not the
-          # render), and the dashboard comes up on an install that asked for it
+          # lint passes, and the dashboard comes up on an install that asked for it
           # off.
           # --show-only isolates the CR: `memory:` also appears in every
           # resources block, and matching one of those would make this pass for
@@ -175,6 +181,175 @@ jobs:
             --set platformAgent.cleanupHook.enabled=false \
             | grep -qF "helm.sh/hook: pre-delete"; then
             echo "cleanup hook rendered while platformAgent.cleanupHook.enabled=false" >&2
+            exit 1
+          fi
+
+          # The Hindsight memory store: absent by default, rendered complete
+          # when the memory provider needs it (the null-follows-provider
+          # tri-state), and forced off by an explicit enabled=false even with
+          # a hindsight provider selected.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            | grep -qF "hindsight"; then
+            echo "hindsight rendered in the default install" >&2
+            exit 1
+          fi
+          hindsight=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set platformAgent.harness.memory.provider=kube_agents_memory \
+            --show-only templates/hindsight.yaml)
+          for expected in \
+            "kind: Deployment" \
+            "kind: StatefulSet" \
+            "kind: NetworkPolicy" \
+            "kind: PodMonitoring" \
+            "name: hindsight-api" \
+            "name: hindsight-postgresql"; do
+            if ! grep -qF "$expected" <<<"$hindsight"; then
+              echo "hindsight render is missing '$expected' with a hindsight memory provider" >&2
+              exit 1
+            fi
+          done
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set platformAgent.harness.memory.provider=hindsight \
+            --set hindsight.enabled=false \
+            | grep -qF "name: hindsight-api"; then
+            echo "hindsight rendered despite hindsight.enabled=false" >&2
+            exit 1
+          fi
+
+          # The GitHub token minter: absent by default; enabled with an appId
+          # it renders all six objects, deriving the regional KMS location
+          # from a zonal cluster location; without an appId the
+          # github-app-credentials Secret is the one object that must not
+          # render (it is expected to pre-exist).
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            | grep -qF "github-token-minter"; then
+            echo "github-token-minter rendered in the default install" >&2
+            exit 1
+          fi
+          MINTER_FLAGS=(
+            --set githubMinter.enabled=true
+            --set githubMinter.org=test-org
+            --set githubMinter.repo=test-repo
+            --set platformAgent.harness.location=us-central1-a
+          )
+          minter=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            "${MINTER_FLAGS[@]}" --set githubMinter.appId=12345 \
+            --show-only templates/github-minter.yaml)
+          for expected in \
+            "kind: Secret" \
+            "name: github-app-credentials" \
+            "kind: ServiceAccount" \
+            "kind: ConfigMap" \
+            "kind: Deployment" \
+            "kind: Service" \
+            "kind: NetworkPolicy" \
+            "name: github-token-minter" \
+            "locations/us-central1/keyRings/github-token-minter-keyring"; do
+            if ! grep -qF "$expected" <<<"$minter"; then
+              echo "minter render is missing '$expected' with githubMinter enabled" >&2
+              exit 1
+            fi
+          done
+          minter_no_app=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            "${MINTER_FLAGS[@]}" --show-only templates/github-minter.yaml)
+          # The Deployment still names the Secret (it must pre-exist), so key
+          # on the object kind: the file renders exactly one Secret, and only
+          # when appId is set.
+          if grep -qF "kind: Secret" <<<"$minter_no_app"; then
+            echo "github-app-credentials Secret rendered without githubMinter.appId" >&2
+            exit 1
+          fi
+          if ! grep -qF "name: github-token-minter" <<<"$minter_no_app"; then
+            echo "minter workload missing when appId is empty (Secret should be the only omission)" >&2
+            exit 1
+          fi
+
+          # global.imagePullSecrets has to reach every pod the chart renders, and
+          # a `with` block omitted from one of them still renders valid YAML —
+          # the install then works everywhere except the pod nobody remembered,
+          # and on the pre-delete cleanup Job that means a failed uninstall.
+          #
+          # So derive the list from the render rather than freeze it here: a
+          # template added later is checked without anyone remembering to add
+          # it, which a hard-coded list is exactly what fails at. --show-only
+          # per template so a hit in one cannot cover for a miss in another.
+          # Still missed: a template that only renders under non-default values.
+          checked=0
+          for tpl in charts/kube-agents/templates/*.yaml; do
+            rel="templates/$(basename "$tpl")"
+            out=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              --set global.imagePullSecrets[0]=regcred --show-only "$rel" 2>/dev/null) || continue
+            grep -qE '^[[:space:]]+containers:' <<<"$out" || continue
+            checked=$((checked + 1))
+            if ! grep -qF 'name: "regcred"' <<<"$out"; then
+              echo "global.imagePullSecrets did not reach the pod spec in $rel" >&2
+              exit 1
+            fi
+          done
+          # Three under these values: the operator, LiteLLM, and the cleanup Job.
+          # A drop means a template stopped rendering and quietly left the loop.
+          if [ "$checked" -lt 3 ]; then
+            echo "expected at least 3 pod-rendering templates, checked $checked" >&2
+            exit 1
+          fi
+          # The PlatformAgent CR carries no pod spec of its own, so the loop
+          # above skips it — and it is what gives the agent pods the operator
+          # renders their pull identity.
+          if ! helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set global.imagePullSecrets[0]=regcred \
+            --show-only templates/platform-agent-cr.yaml | grep -qF 'name: "regcred"'; then
+            echo "global.imagePullSecrets did not reach the PlatformAgent CR" >&2
+            exit 1
+          fi
+          # The {name: x} spelling Kubernetes itself uses has to work too:
+          # rendered as a value it yields the Secret name "map[name:regcred]",
+          # which the API server accepts and the kubelet cannot find.
+          if ! helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set global.imagePullSecrets[0].name=regcred \
+            --show-only templates/platform-agent-cr.yaml | grep -qF 'name: "regcred"'; then
+            echo "the {name: x} form of global.imagePullSecrets did not render" >&2
+            exit 1
+          fi
+          # Any other shape, and a name that is empty either way, stops the
+          # render instead of producing a Secret reference nothing resolves.
+          for bad in 'imagePullSecrets: [{secretName: regcred}]' \
+                     'imagePullSecrets: [""]' \
+                     'imagePullSecrets: [{name: ""}]'; do
+            printf 'global:\n  %s\n' "$bad" > /tmp/bad-pull-secrets.yaml
+            if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              -f /tmp/bad-pull-secrets.yaml > /dev/null 2>&1; then
+              echo "expected 'global.$bad' to fail the render" >&2
+              exit 1
+            fi
+          done
+          # The operator needs it as an env var too, for PlatformAgents this
+          # release did not render.
+          if ! helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set global.imagePullSecrets[0]=regcred \
+            --set global.imagePullSecrets[1]=other \
+            --show-only templates/operator-deployment.yaml \
+            | grep -A1 IMAGE_PULL_SECRETS | grep -qF 'value: "regcred,other"'; then
+            echo "IMAGE_PULL_SECRETS did not follow global.imagePullSecrets" >&2
+            exit 1
+          fi
+          # Unset renders the key nowhere, which is what keeps a default install
+          # byte-identical to one from before this value existed.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            | grep -qE "imagePullSecrets:|IMAGE_PULL_SECRETS"; then
+            echo "imagePullSecrets rendered while global.imagePullSecrets is empty" >&2
+            exit 1
+          fi
+          # The templates the derive-from-the-render loop above cannot see,
+          # because they render only under non-default values: the hindsight
+          # store (two pod specs) and the minter (one).
+          gated=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set global.imagePullSecrets[0]=regcred \
+            --set platformAgent.harness.memory.provider=hindsight \
+            "${MINTER_FLAGS[@]}" --set githubMinter.appId=12345 \
+            --show-only templates/hindsight.yaml \
+            --show-only templates/github-minter.yaml)
+          if [ "$(grep -cF 'name: "regcred"' <<<"$gated")" -ne 3 ]; then
+            echo "global.imagePullSecrets did not reach all 3 hindsight/minter pod specs" >&2
             exit 1
           fi
 

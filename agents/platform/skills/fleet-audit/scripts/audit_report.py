@@ -223,6 +223,17 @@ AUDITS: dict[str, AuditSpec] = {
             "dangling-compute-class",
         ),
     ),
+    "gcp-networking-fabric-audit": AuditSpec(
+        "GCP Networking Fabric & VPC IPAM Audit",
+        "gcp_networking_fabric_sop.md",
+        (
+            "subnet-ip-exhaustion",
+            "cloud-nat-exhaustion",
+            "psc-routing-deadlock",
+            "mtu-packet-fragmentation",
+            "cloud-armor-false-positive",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")

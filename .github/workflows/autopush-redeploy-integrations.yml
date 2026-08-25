@@ -5,13 +5,18 @@ on:
     branches:
       - main
     paths:
+      # The chart templates are what the reusable workflow applies; the
+      # kustomize copies are kept in step with them, so either landing on main
+      # should reconcile the environment.
+      - "charts/kube-agents/templates/litellm.yaml"
+      - "charts/kube-agents/templates/github-minter.yaml"
+      - "charts/kube-agents/templates/_helpers.tpl"
+      - "charts/kube-agents/values.yaml"
       - "k8s-operator/config/integrations/**"
-      - "k8s-operator/scripts/provision_09_deploy_litellm.sh"
-      - "k8s-operator/scripts/provision_10_deploy_github_minter.sh"
-      - "k8s-operator/Makefile"
       # The LiteLLM and token-minter pins live here, not in the manifests that
       # consume them, so a version bump touches only this file.
       - "images.json"
+  #checkov:skip=CKV_GHA_7:Manual dispatch workflow requires boolean input parameters to select integration targets
   workflow_dispatch:
     inputs:
       deploy_litellm:
@@ -23,16 +28,31 @@ on:
         type: boolean
         default: true
 
+# The payload here is a `helm upgrade` on the shared `kube-agents` release.
+# Cancelling one mid-flight strands the release in pending-upgrade and every
+# later deploy fails until someone rolls it back by hand, so a running deploy
+# is never cancelled. A queued one has not reached the cluster and is safe to
+# supersede.
+#
+# Keep this group one component wide. GitHub holds only a single run pending
+# per group, so a group shared with the sibling redeploys would let them evict
+# each other and silently drop a deploy. They contend on the release lock
+# instead, which scripts/helm_upgrade_retry.sh waits out.
 concurrency:
   group: autopush-redeploy-integrations
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   call-deploy:
+    # A fork inherits the push trigger but none of the deploy credentials, so
+    # the job would fail there and mail the fork owner on every sync of main.
+    if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      id-token: write
     # inherit, not an explicit mapping: the called workflow's jobs read
     # GH_APP_ID, an environment secret. A `uses:` job cannot declare an
     # environment, so mapping the secrets here would evaluate them in this job,

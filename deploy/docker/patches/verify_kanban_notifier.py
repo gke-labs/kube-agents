@@ -9,7 +9,7 @@ file), and it additionally covers the clip wiring, which previously had nothing
 behind it but two ``grep -q``\\ s in the Dockerfile.
 
 The applier only proves its two anchors matched, and a matched anchor is the
-weaker half of all four concerns here:
+weaker half of all five concerns here:
 
 * **Clip.** A textual grep proves ``_clip_handoff`` is called; it does not prove
   the name resolves at runtime, and the whole patch exists because a URL arrived
@@ -30,6 +30,12 @@ weaker half of all four concerns here:
   that stopped draining ``sidecar_notes`` — each is a silent no-op producing
   precisely what the unpatched gateway produced, which is the 9m46s of dead wait
   on task ``t_a8f58a2a``.
+* **Record.** Silent in both directions. The row is written by one process and
+  read by another — the ``incident_context`` plugin — hours later, so a POST
+  that 401s, a ``thread_id`` that never made it into the subscription row, or a
+  gate that classifies a real triage report as chatter all leave a delivery that
+  looks perfect and a reply that reaches an agent with no idea what "Option A"
+  was. That is #802.
 
 So this drives the *patched* runtime rather than reading it: the real
 ``hermes_cli.config.load_config``, the real ``gateway.wake.adapter_supports_push``,
@@ -47,6 +53,7 @@ Usage::
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 
@@ -650,6 +657,243 @@ check(
                         kinds={"completed"})) < 600,
     "the wake it replaces cost 32,460 input tokens; this must stay trivial",
 )
+
+# --- 10. The report is keyed to the thread it was posted in -------------------
+# The reply half of the same delivery. The notifier posts the report into a chat
+# thread; `incident_context` puts it back in front of the agent when someone
+# replies there, looking it up by (chat_id, thread_id). Nothing in the build
+# reads the row back, and nothing in the delivery notices it is missing, so
+# every failure here presents as a user replying "apply Option A" and getting an
+# agent that has never seen an option A. Drive it with urlopen stubbed: there is
+# no session-KV server inside the build, and what is being verified is the
+# request this code makes, not the server's answer to it.
+print("incident row:")
+import urllib.request as _urllib_request  # noqa: E402
+
+from gateway.kanban_notifier import (  # noqa: E402
+    SESSION_KV_URL,
+    actionable_report,
+    store_incident_report,
+)
+
+check(
+    "the notifier resolved the incident import",
+    hasattr(watchers, "_kanban_store_incident"),
+    "the trailer import did not execute",
+)
+check(
+    "the incident call was emitted exactly once",
+    NOTIFIER_SOURCE.count("_kanban_store_incident(") == 1,
+)
+check(
+    "it is called with this event and the address the report went to",
+    "_kanban_store_incident(ev, task, sub, posted=send_passive)" in NOTIFIER_SOURCE,
+    "`sub` is the row kanban_event_routing substituted the chat route into, and "
+    "any other source of chat_id is the undeliverable api_server one; `ev` "
+    "rather than d[\"events\"] because this anchor is inside the per-event loop, "
+    "so the delivery\'s kind set would store the row on its `commented` event "
+    "before the `completed` one had sent the report",
+)
+# `_send_res = await _progress_deliver(` is the one place this loop puts text in
+# the thread, for every event kind including the terminal one. Upstream spells
+# it `await adapter.send(`; apply_kanban_progress_lines.py rewrote it earlier in
+# this same build, and the Dockerfile greps for the patched form, so this is a
+# pinned literal rather than a guess about upstream. Checked for presence before
+# it is compared: an anchor that moved makes `find` return -1, and the ordering
+# check alone would report that as "the row is written before the report", which
+# sends the next reader after a bug that is not there.
+_send_at = NOTIFIER_SOURCE.find("_send_res = await _progress_deliver(")
+_store_at = NOTIFIER_SOURCE.find("_kanban_store_incident(")
+check(
+    "the send this ordering is measured against is still there",
+    _send_at >= 0,
+    "kanban_watchers.py no longer sends through _progress_deliver; re-derive "
+    "this anchor before trusting the ordering check below",
+)
+check(
+    "the row is written after the report was sent",
+    0 <= _send_at < _store_at,
+    "a row claiming the reader has a report they were never shown",
+)
+check(
+    "the row is written before this delivery's unsub",
+    0 <= _store_at < NOTIFIER_SOURCE.find("if task_terminal:"),
+    "the subscription carrying chat_id/thread_id is deleted there",
+)
+
+# The gate. POST /v1/incidents is INSERT OR IGNORE and keeps the FIRST report
+# per thread, so a row written for a card that has nothing to apply is not a
+# wasted row — it is the row a later real report cannot replace, for the whole
+# of the table's 14-day TTL.
+TRIAGE = (
+    "## What's wrong\n\nThe `checkout` deployment cannot schedule.\n\n"
+    "## Why\n\nEvery node has 4Gi allocatable and the pod requests 8Gi.\n\n"
+    "## What to do\n\n"
+    "- **Option A (Right-size the request):** drop it to 2Gi.\n"
+    "- **Option B (Add a larger node pool):** create an e2-standard-8 pool.\n"
+    "- ✅ **Recommended: Option A**\n"
+)
+check("a triage report earns a row", actionable_report(TRIAGE) is True)
+check(
+    "a status line does not",
+    actionable_report("Checked all 14 clusters. No drift found.") is False,
+    "it would shadow the next real report in that thread until the TTL expires",
+)
+check(
+    "a What-to-do section with no lettered option does not",
+    actionable_report("## What to do\n\n- Restart the pod.\n") is False,
+)
+check(
+    "nor one whose only lettered option is quoted above the heading",
+    actionable_report(
+        "## Why\n\nThe fix applied as Option A last week has regressed.\n\n"
+        "## What to do\n\n- Escalate to the service owner.\n"
+    )
+    is False,
+    "the option search starts at the heading, not at the top of the report",
+)
+check(
+    "and neither does an empty result",
+    not any(actionable_report(x) for x in (None, "", "   ")),
+)
+
+_posted: list[object] = []
+
+
+class _StubResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _capture(request, timeout=None):
+    _posted.append(request)
+    return _StubResponse()
+
+
+def _raise(request, timeout=None):
+    raise OSError("connection refused")
+
+
+SUB_THREADED = {
+    "task_id": "t_a8f58a2a",
+    "chat_id": "D0BKGRBM6RH",
+    "thread_id": "1786216044.637229",
+}
+
+
+class _Reported:
+    id = "t_a8f58a2a"
+    result = TRIAGE
+
+
+class _UnreadableResult:
+    id = "t_a8f58a2a"
+
+    @property
+    def result(self):
+        raise RuntimeError("task row unreadable")
+
+
+# The build has no SESSION_KV_API_KEY -- it is a per-pod secret the operator
+# injects at deploy time -- and `_post_incident` reads the environment on every
+# call, so an unset key is a request with no `Authorization` header rather than
+# an error. That is the right runtime behaviour (the server 401s, the notifier
+# logs a warning, the delivery survives) and it is exactly the shape the check
+# below is meant to catch, so the value has to be supplied here or the check
+# only ever measures the build sandbox.
+_real_urlopen = _urllib_request.urlopen
+_real_key = os.environ.get("SESSION_KV_API_KEY")
+try:
+    os.environ["SESSION_KV_API_KEY"] = "verify-token"
+    _urllib_request.urlopen = _capture
+    _stored = store_incident_report(Event("completed"), _Reported(), SUB_THREADED)
+    check("a completed triage report is posted", _stored is True)
+    check(
+        "to the session-KV server on loopback",
+        _posted and _posted[0].full_url == f"{SESSION_KV_URL}/v1/incidents",
+        _posted[0].full_url if _posted else "nothing was posted",
+    )
+    check("as a POST", _posted and _posted[0].get_method() == "POST")
+    if _posted:
+        import json as _json  # noqa: E402
+
+        _body = _json.loads(_posted[0].data.decode())
+        check(
+            "keyed on the thread the report was delivered to",
+            _body.get("chat_id") == "D0BKGRBM6RH"
+            and _body.get("thread_id") == "1786216044.637229",
+            f"got {_body.get('chat_id')!r}/{_body.get('thread_id')!r}",
+        )
+        check(
+            "carrying the options the reply will name",
+            "Option B (Add a larger node pool)" in _body.get("report", ""),
+            "a report stored without its options answers nothing",
+        )
+        check(
+            "and no longer than what the reader was shown",
+            len(_body.get("report", "")) <= RESULT_LIMIT,
+        )
+    check(
+        "the request is authenticated",
+        _posted and (_posted[0].get_header("Authorization") or "").startswith("Bearer "),
+        "every /v1/incidents route requires the pod's SESSION_KV_API_KEY; "
+        "without it the POST 401s and this code swallows it as a warning",
+    )
+
+    _posted.clear()
+    check(
+        "a card with nothing to apply posts nothing",
+        store_incident_report(Event("completed"), _ClippedTask(), SUB_THREADED) is False
+        and not _posted,
+    )
+    check(
+        "a non-terminal event posts nothing",
+        store_incident_report(Event("commented"), _Reported(), SUB_THREADED) is False
+        and not _posted,
+    )
+    check(
+        "a wake-only subscription posts nothing",
+        store_incident_report(
+            Event("completed"), _Reported(), SUB_THREADED, posted=False
+        )
+        is False
+        and not _posted,
+        "delivery_mode=\"wake\" puts no message in the thread, so there is no "
+        "delivered report to key to it",
+    )
+    check(
+        "an unthreaded delivery posts nothing",
+        store_incident_report(
+            Event("completed"),
+            _Reported(),
+            {"task_id": "t_a8f58a2a", "chat_id": "D0BKGRBM6RH"},
+        )
+        is False
+        and not _posted,
+        "the by-thread lookup needs both halves; there is no row to write",
+    )
+    check(
+        "a card the store cannot read does not break the delivery",
+        store_incident_report(Event("completed"), _UnreadableResult(), SUB_THREADED) is False
+        and not _posted,
+    )
+
+    _urllib_request.urlopen = _raise
+    check(
+        "a session-KV server that is down does not break the delivery",
+        store_incident_report(Event("completed"), _Reported(), SUB_THREADED) is False,
+        "raising here rewinds the notifier cursor and re-posts a report the "
+        "user has already read",
+    )
+finally:
+    _urllib_request.urlopen = _real_urlopen
+    if _real_key is None:
+        os.environ.pop("SESSION_KV_API_KEY", None)
+    else:
+        os.environ["SESSION_KV_API_KEY"] = _real_key
 
 print()
 if FAILURES:

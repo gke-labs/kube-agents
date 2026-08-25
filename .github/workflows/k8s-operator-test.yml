@@ -1,11 +1,46 @@
 name: Operator Tests
 
+# The two triggers filter in different places, and they have to.
+#
+# On a pull request the filtering is the `Detect changes` step below, because
+# `Run Controller Tests` is a required check: a workflow that `paths:` declines
+# to start posts no check at all, and branch protection waits for it forever.
+# The job therefore always runs and skips its own steps -- which means it
+# reports `success` on a pull request that ran no tests. That is fine there,
+# since the check only has to not block.
+#
+# On a push to main it is not fine. A run that tested nothing and reported
+# success is indistinguishable, in the run list and to anything reading the API,
+# from a run that tested everything and passed. That is how #812 hid: main was
+# red from 277de10, and the commits that followed which touched no Go each posted
+# a green `Operator Tests` without compiling a line of it, so the push history
+# reads red (2654), green (2655), red (2657), red (2658), then four greens before
+# the real fix at 2700. `main-broken-notify.yml` reads that history to decide
+# whether main has recovered, and would have believed every one of those greens.
+#
+# So the push trigger filters with `paths:` instead: a commit that touches
+# nothing here produces no run at all, and an absent run cannot lie. Keep this
+# list and the `operator:` filter below identical.
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+    paths:
+      - "k8s-operator/**"
+      - "agents/platform/scripts/**"
+      - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
+
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

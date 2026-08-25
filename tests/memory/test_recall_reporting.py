@@ -27,6 +27,7 @@ Inside the agent image, Hermes is already importable:
 import json
 import os
 import sys
+import unittest
 from types import SimpleNamespace
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,6 +35,11 @@ _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
 if os.path.isdir(_HERMES):
     sys.path.insert(0, _HERMES)
 sys.path.insert(0, os.path.join(_REPO, "agents", "chat", "plugins", "memory"))
+
+try:
+    from . import _stubs  # noqa: F401
+except (ImportError, ValueError):
+    import _stubs  # type: ignore # noqa: F401
 
 from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
 
@@ -73,97 +79,78 @@ def provider(*, results=None, recall_exc=None, reflect_text="", reflect_exc=None
     return p, calls
 
 
-def test_found_reports_matches_and_the_search():
-    p, calls = provider(results=[SimpleNamespace(text="ADR-2026-081 mandates preemption tolerance.")])
-    r = json.loads(p.handle_tool_call("memory_recall", {"query": "ADR-2026-081"}))
-    assert r["status"] == "found", r
-    assert r["matches"] == 1, r
-    assert "ADR-2026-081 mandates" in r["result"], r
-    assert r["searched"]["tags"] == ["user:alice", SHARED_TAG], r
-    assert r["searched"]["layer"] == ["observation"], r
-    assert calls["recall"]["tags_match"] == "any_strict", calls
+class TestRecallReporting(unittest.TestCase):
+    def test_found_reports_matches_and_the_search(self):
+        p, calls = provider(results=[SimpleNamespace(text="ADR-2026-081 mandates preemption tolerance.")])
+        r = json.loads(p.handle_tool_call("memory_recall", {"query": "ADR-2026-081"}))
+        self.assertEqual(r["status"], "found", r)
+        self.assertEqual(r["matches"], 1, r)
+        self.assertIn("ADR-2026-081 mandates", r["result"], r)
+        self.assertEqual(r["searched"]["tags"], ["user:alice", SHARED_TAG], r)
+        self.assertEqual(r["searched"]["layer"], ["observation"], r)
+        self.assertEqual(calls["recall"]["tags_match"], "any_strict", calls)
 
+    def test_no_match_is_not_nonexistence(self):
+        p, calls = provider(results=[])
+        r = json.loads(p.handle_tool_call("memory_recall", {"query": "ADR-2026-081", "scope": "shared"}))
+        self.assertEqual(r["status"], "no_match", r)
+        self.assertEqual(r["matches"], 0, r)
+        self.assertIn("not the same as the record not existing", r["result"], r)
+        self.assertEqual(r["searched"]["query"], "ADR-2026-081", r)
+        self.assertEqual(r["searched"]["tags"], [SHARED_TAG], r)
+        self.assertEqual(calls["recall"]["tags"], [SHARED_TAG], calls)
 
-def test_no_match_is_not_nonexistence():
-    p, calls = provider(results=[])
-    r = json.loads(p.handle_tool_call("memory_recall", {"query": "ADR-2026-081", "scope": "shared"}))
-    assert r["status"] == "no_match", r
-    assert r["matches"] == 0, r
-    assert "not the same as the record not existing" in r["result"], r
-    # The envelope has to say what was looked in, or the caller cannot tell an
-    # empty scope from an empty store.
-    assert r["searched"]["query"] == "ADR-2026-081", r
-    assert r["searched"]["tags"] == [SHARED_TAG], r
-    assert calls["recall"]["tags"] == [SHARED_TAG], calls
+    def test_unreachable_is_a_distinct_outcome(self):
+        p, _ = provider(recall_exc=RuntimeError("Cannot connect to host hindsight-api:8888"))
+        r = json.loads(p.handle_tool_call("memory_recall", {"query": "ADR-2026-081"}))
+        self.assertEqual(r["status"], "unreachable", r)
+        self.assertIn("error", r, r)
+        self.assertIn("nothing was searched", r["error"], r)
+        self.assertEqual(r["searched"]["bank"], "kube-agents-memory", r)
 
+    def test_scope_still_narrows_the_tag_filter(self):
+        p, calls = provider(results=[SimpleNamespace(text="x")])
+        p.handle_tool_call("memory_recall", {"query": "q", "scope": "personal"})
+        self.assertEqual(calls["recall"]["tags"], ["user:alice"], calls)
 
-def test_unreachable_is_a_distinct_outcome():
-    p, _ = provider(recall_exc=RuntimeError("Cannot connect to host hindsight-api:8888"))
-    r = json.loads(p.handle_tool_call("memory_recall", {"query": "ADR-2026-081"}))
-    assert r["status"] == "unreachable", r
-    assert "error" in r, r
-    assert "nothing was searched" in r["error"], r
-    assert r["searched"]["bank"] == "kube-agents-memory", r
+    def test_reflect_reports_the_same_three_outcomes(self):
+        p, calls = provider(reflect_text="   ")
+        r = json.loads(p.handle_tool_call("memory_reflect", {"query": "who owns etcd"}))
+        self.assertEqual(r["status"], "no_match", r)
+        self.assertEqual(calls["reflect"]["tags"], ["user:alice", SHARED_TAG], calls)
 
+        p, _ = provider(reflect_text="Etcd is owned by the storage team.")
+        r = json.loads(p.handle_tool_call("memory_reflect", {"query": "who owns etcd"}))
+        self.assertTrue(r["status"] == "found" and r["result"].startswith("Etcd"), r)
 
-def test_scope_still_narrows_the_tag_filter():
-    p, calls = provider(results=[SimpleNamespace(text="x")])
-    p.handle_tool_call("memory_recall", {"query": "q", "scope": "personal"})
-    assert calls["recall"]["tags"] == ["user:alice"], calls
-    p.handle_tool_call("memory_recall", {"query": "q", "scope": "both"})
-    assert calls["recall"]["tags"] == ["user:alice", SHARED_TAG], calls
+        p, _ = provider(reflect_exc=RuntimeError("503"))
+        r = json.loads(p.handle_tool_call("memory_reflect", {"query": "q"}))
+        self.assertEqual(r["status"], "unreachable", r)
 
+    def test_the_stock_read_tool_is_no_longer_delegated_to(self):
+        """The stock tool is what conflated the outcomes; nothing may route back.
 
-def test_reflect_reports_the_same_three_outcomes():
-    p, calls = provider(reflect_text="   ")
-    r = json.loads(p.handle_tool_call("memory_reflect", {"query": "who owns etcd"}))
-    assert r["status"] == "no_match", r
-    assert calls["reflect"]["tags"] == ["user:alice", SHARED_TAG], calls
+        Scans every module in the package, not just the entry point — the read path
+        lives in `session.py` and `client.py` since the split.
+        """
+        sources = sorted(f for f in os.listdir(PLUGIN_DIR) if f.endswith(".py"))
+        self.assertGreaterEqual(len(sources), 4, sources)
+        for name in sources:
+            with open(os.path.join(PLUGIN_DIR, name), encoding="utf-8") as f:
+                src = f.read()
+            self.assertNotIn('handle_tool_call("hindsight_', src, f"{name} delegates to the stock tool")
+            for line in src.splitlines():
+                if "No relevant memories found" in line:
+                    # Only survives where it is quoted as the defect being described.
+                    self.assertTrue(line.lstrip().startswith(("#", "tools answer", "string")), (name, line))
 
-    p, _ = provider(reflect_text="Etcd is owned by the storage team.")
-    r = json.loads(p.handle_tool_call("memory_reflect", {"query": "who owns etcd"}))
-    assert r["status"] == "found" and r["result"].startswith("Etcd"), r
-
-    p, _ = provider(reflect_exc=RuntimeError("503"))
-    r = json.loads(p.handle_tool_call("memory_reflect", {"query": "q"}))
-    assert r["status"] == "unreachable", r
-
-
-def test_the_stock_read_tool_is_no_longer_delegated_to():
-    """The stock tool is what conflated the outcomes; nothing may route back.
-
-    Scans every module in the package, not just the entry point — the read path
-    lives in `session.py` and `client.py` since the split.
-    """
-    sources = sorted(f for f in os.listdir(PLUGIN_DIR) if f.endswith(".py"))
-    assert len(sources) >= 4, sources
-    for name in sources:
-        src = open(os.path.join(PLUGIN_DIR, name), encoding="utf-8").read()
-        assert 'handle_tool_call("hindsight_' not in src, f"{name} delegates to the stock tool"
-        for line in src.splitlines():
-            if "No relevant memories found" in line:
-                # Only survives where it is quoted as the defect being described.
-                assert line.lstrip().startswith(("#", "tools answer", "string")), (name, line)
-
-
-def test_the_absence_rule_reaches_the_system_prompt():
-    """The injected block cannot annotate its own silence, so the prompt does."""
-    p, _ = provider()
-    assert "Memory is a search, not an index" in p.system_prompt_block()
-    p._user_tag = ""  # shared-only variant
-    assert "Memory is a search, not an index" in p.system_prompt_block()
+    def test_the_absence_rule_reaches_the_system_prompt(self):
+        """The injected block cannot annotate its own silence, so the prompt does."""
+        p, _ = provider()
+        self.assertIn("Memory is a search, not an index", p.system_prompt_block())
+        p._user_tag = ""  # shared-only variant
+        self.assertIn("Memory is a search, not an index", p.system_prompt_block())
 
 
 if __name__ == "__main__":
-    failed = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_") or not callable(fn):
-            continue
-        try:
-            fn()
-            print(f"ok    {name}")
-        except AssertionError as e:
-            failed += 1
-            print(f"FAIL  {name}: {e}")
-    print("\nall pass" if not failed else f"\n{failed} failed")
-    sys.exit(1 if failed else 0)
+    unittest.main()

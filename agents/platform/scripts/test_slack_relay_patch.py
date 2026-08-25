@@ -84,10 +84,21 @@ def _register_fake_modules() -> None:
         return f"cached_image.{ext}"
 
     class PlatformRegistry:
-        def create_adapter(self, name, config):
+        # Wide for the same reason ``register`` below is: the shim forwards
+        # everything past ``name`` blind, and a fake stuck on today's two-arg
+        # signature would agree with a wrapper stuck on it. The forwarding
+        # itself is exercised in SlackRelayPatchTest.
+        def create_adapter(self, name, *args, **kwargs):
             return None
 
-        def register(self, entry):
+        # Upstream made ``scope`` keyword-only in Hermes v2026.8.13. This
+        # stand-in is what install() captures as the original wherever a test
+        # does not install its own, so it has to accept what the real registry
+        # accepts -- a fake stuck on the old signature agrees with a wrapper
+        # stuck on the old signature, and #718 shipped a gateway with no chat
+        # adapters through exactly that blind spot. The forwarding itself is
+        # exercised through _register in SlackStandaloneRelaySendTest.setUp.
+        def register(self, entry, *, scope=None):
             self.registered = entry
 
     @dataclasses.dataclass
@@ -325,6 +336,45 @@ class SlackRelayPatchTest(unittest.TestCase):
     def _create_adapter(self, token=""):
         config = types.SimpleNamespace(token=token)
         return self.registry_class().create_adapter("slack", config)
+
+    def test_create_adapter_arguments_the_shim_knows_nothing_about_forward(self):
+        """``create_adapter`` is wrapped the same way, so it is pinned too.
+
+        Both wrappers on the registry class add a side effect and delegate.
+        The one that took chat down was ``register``, but nothing about that
+        was specific to it -- upstream is equally free to give
+        ``create_adapter`` an argument this shim has never heard of.
+        """
+        seen = []
+
+        def _create_adapter(_self, name, *args, **kwargs):
+            seen.append((name, args, kwargs))
+            if name != "slack":
+                return None
+            return self.adapter_module.FakeAdapter(args[0])
+
+        self.registry_class.create_adapter = _create_adapter
+        for sentinel in (
+            "_slack_credential_proxy_relay_patched",
+            "_slack_standalone_relay_patched",
+        ):
+            if hasattr(self.registry_class, sentinel):
+                delattr(self.registry_class, sentinel)
+        slack_relay_patch.install()
+
+        config = types.SimpleNamespace(token="xoxb-forwarded")
+        adapter = self.registry_class().create_adapter(
+            "slack", config, scope="/x", not_invented_yet=1
+        )
+
+        self.assertEqual(
+            [("slack", (config,), {"scope": "/x", "not_invented_yet": 1})], seen
+        )
+        # The side effect still happened: patching is keyed on the name, which
+        # is the only argument the shim reads.
+        self.assertTrue(
+            getattr(type(adapter), "_credential_proxy_relay_patched", False)
+        )
 
     def test_bolt_per_request_client_symbol_is_relay_backed(self):
         adapter = self._create_adapter()
@@ -598,8 +648,10 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
 
         self.registered = []
 
-        def _register(_self, entry):
-            self.registered.append(entry)
+        # Upstream's signature, keyword-only ``scope`` included -- see the note
+        # on the module-level fake.
+        def _register(_self, entry, *, scope=None):
+            self.registered.append((entry, scope))
 
         self.registry_class.register = _register
 
@@ -653,7 +705,66 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
         # Tokenless, the probe has to say Slack is reachable — the relay is.
         self.assertTrue(entry.is_connected(types.SimpleNamespace(enabled=True)))
         # The entry still reaches the real registry, unswallowed.
-        self.assertEqual([entry], self.registered)
+        self.assertEqual([(entry, None)], self.registered)
+
+    def test_the_scope_upstream_passes_reaches_upstream(self):
+        """``register_platform`` scopes every registration; forward it verbatim.
+
+        Hermes v2026.8.13 made ``PlatformRegistry.register`` take a
+        keyword-only ``scope`` and had ``PluginContext.register_platform`` pass
+        the profile's Hermes home on every call. The shim is installed on the
+        class, so a signature narrower than upstream's does not fail Slack --
+        it fails Google Chat, Discord and every other platform with it, and the
+        gateway comes up with no chat adapters.
+        """
+        entry = self.entry_class(
+            name="slack", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry.register(entry, scope="/data/profiles/platform")
+
+        self.assertEqual([(entry, "/data/profiles/platform")], self.registered)
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+
+    def test_a_non_slack_entry_registers_with_a_scope_too(self):
+        """The wrapper is on the class: everyone's registration goes through it."""
+        entry = self.entry_class(
+            name="google_chat", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry.register(entry, scope="/data/profiles/platform")
+
+        self.assertEqual([(entry, "/data/profiles/platform")], self.registered)
+        self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
+
+    def test_arguments_the_shim_knows_nothing_about_are_forwarded(self):
+        """Whatever upstream adds next has to pass through untouched.
+
+        The wrapper contributes a side effect and delegates; the signature is
+        upstream's. Pinning ``scope`` by name would leave the shim broken by
+        the argument after it in exactly the same way.
+        """
+        seen = []
+
+        def _register(_self, entry, *args, **kwargs):
+            seen.append((entry, args, kwargs))
+
+        self.registry_class.register = _register
+        for sentinel in (
+            "_slack_credential_proxy_relay_patched",
+            "_slack_standalone_relay_patched",
+        ):
+            if hasattr(self.registry_class, sentinel):
+                delattr(self.registry_class, sentinel)
+        slack_relay_patch.install()
+
+        entry = self.entry_class(
+            name="slack", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry.register(entry, "positional", scope="/x", not_invented_yet=1)
+
+        self.assertEqual(
+            [(entry, ("positional",), {"scope": "/x", "not_invented_yet": 1})], seen
+        )
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
 
     def test_a_non_slack_entry_is_left_alone(self):
         entry = self.entry_class(
@@ -812,12 +923,18 @@ class SlackRegisteredBeforeInstallTest(unittest.TestCase):
     """The ordering the register() wrapper cannot cover.
 
     Every other test here registers Slack *after* install(), so the wrapper
-    fires and the sweep of existing entries is dead code. If the plugin gets
+    fires and the sweep of existing entries is dead code. If the registry gets
     there first the wrapper never sees the entry, and the only thing that
-    patches it is the sweep over the registry's live entries. That sweep reads
-    a private ``_entries``, so it is exactly the part most likely to rot
-    against a base-image bump — and it rots silently, into "cron briefs stopped
-    arriving" with no error anywhere.
+    patches it is the sweep over the registry's live entries.
+
+    In the deployed process that ordering does not arise: ``sitecustomize``
+    hooks the import and calls install() the instant
+    ``gateway.platform_registry`` finishes executing, before anything can
+    register. The sweep is cover for install() ever gaining a caller that
+    runs later, and these tests are what keep it from being quietly wrong in
+    the meantime. It reads two private names, ``_entries`` and
+    ``_scoped_entries``, so it is also the part most likely to rot against a
+    base-image bump — hence the warning tests below.
     """
 
     def setUp(self):
@@ -887,6 +1004,43 @@ class SlackRegisteredBeforeInstallTest(unittest.TestCase):
         self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
         self.assertTrue(entry.is_connected(types.SimpleNamespace(enabled=True)))
 
+    def test_an_entry_pre_registered_into_a_scope_is_still_patched(self):
+        """Since v2026.8.13 the scoped map is where Slack would be.
+
+        ``register_platform`` always passes a scope -- the profile's Hermes
+        home -- and a scoped registration lands in ``_scoped_entries[scope]``,
+        leaving ``_entries`` empty. A sweep that reads only ``_entries`` finds
+        nothing, patches nothing and says nothing, which from here is
+        indistinguishable from a registry that has no Slack in it. Nothing
+        reaches the sweep in the deployed process (see the class docstring);
+        this pins the map it would have to read if anything did.
+        """
+        entry = self.entry_class(
+            name="slack", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry_module.platform_registry = types.SimpleNamespace(
+            _entries={},
+            _scoped_entries={"/data/profiles/platform": {"slack": entry}},
+        )
+
+        slack_relay_patch.install()
+
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+        self.assertTrue(entry.is_connected(types.SimpleNamespace(enabled=True)))
+
+    def test_a_scoped_non_slack_entry_is_left_alone(self):
+        entry = self.entry_class(
+            name="discord", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry_module.platform_registry = types.SimpleNamespace(
+            _entries={},
+            _scoped_entries={"/data/profiles/platform": {"discord": entry}},
+        )
+
+        slack_relay_patch.install()
+
+        self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
+
     def test_a_pre_registered_non_slack_entry_is_left_alone(self):
         entry = self.entry_class(
             name="discord", standalone_sender_fn=self.original_standalone_send
@@ -910,6 +1064,51 @@ class SlackRegisteredBeforeInstallTest(unittest.TestCase):
         self.assertTrue(
             any("not introspectable" in line for line in logs.output), logs.output
         )
+
+    def test_only_one_map_being_readable_still_warns(self):
+        # Half a rename is the case that fails quietly. With `_scoped_entries`
+        # gone the sweep still reads `_entries`, finds it empty and reports
+        # nothing -- and `_entries` is the map a scoped registration never
+        # lands in. Warning on either name going missing costs a line on a
+        # base image that consolidates the two; staying quiet costs Slack.
+        for label, singleton in (
+            ("scoped only", types.SimpleNamespace(_scoped_entries={})),
+            ("global only", types.SimpleNamespace(_entries={})),
+        ):
+            with self.subTest(label):
+                self.registry_module.platform_registry = singleton
+                for sentinel in (
+                    "_slack_credential_proxy_relay_patched",
+                    "_slack_standalone_relay_patched",
+                ):
+                    if hasattr(self.registry_class, sentinel):
+                        delattr(self.registry_class, sentinel)
+
+                with self.assertLogs(
+                    slack_relay_patch.LOGGER, level="WARNING"
+                ) as logs:
+                    slack_relay_patch.install()
+
+                self.assertTrue(
+                    any("not introspectable" in line for line in logs.output),
+                    logs.output,
+                )
+
+    def test_the_readable_map_is_still_swept_when_the_other_is_gone(self):
+        # Warning is not instead of working: whatever survived the rename is
+        # swept anyway, so a half-renamed registry loses the half it lost and
+        # not the half it kept.
+        entry = self.entry_class(
+            name="slack", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry_module.platform_registry = types.SimpleNamespace(
+            _scoped_entries={"/data/profiles/platform": {"slack": entry}}
+        )
+
+        with self.assertLogs(slack_relay_patch.LOGGER, level="WARNING"):
+            slack_relay_patch.install()
+
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
 
     def test_no_registry_yet_is_not_worth_a_warning(self):
         # install() routinely runs before the registry module has a singleton;

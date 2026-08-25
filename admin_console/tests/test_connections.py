@@ -206,7 +206,7 @@ class ConnectionDiagnosticsTest(unittest.TestCase):
     @patch("admin_console.agent_runtime.AgentRuntimeProvider")
     def test_agent_runtime_probe_uses_the_selected_cluster(self, provider_type):
         provider = provider_type.return_value
-        provider.list_agents.return_value = ("test-agent-01",)
+        provider.canonical_agent.return_value = "platform-agent"
         provider.check_connection.return_value = (2, 11)
 
         report = run_connection_checks(
@@ -224,13 +224,13 @@ class ConnectionDiagnosticsTest(unittest.TestCase):
         check = next(item for item in report.checks if item.key == "agent_runtime")
         self.assertEqual(check.status, CheckStatus.PASS)
         self.assertIn("2 profile(s) and 11 session(s)", check.summary)
-        provider.check_connection.assert_called_once_with("test-agent-01")
+        provider.check_connection.assert_called_once_with("platform-agent")
         self.assertTrue(connection_is_ready(report))
 
     @patch("admin_console.agent_runtime.AgentRuntimeProvider")
     def test_telemetry_failure_does_not_lock_runtime_pages(self, provider_type):
         provider = provider_type.return_value
-        provider.list_agents.return_value = ("test-agent-01",)
+        provider.canonical_agent.return_value = "platform-agent"
         provider.check_connection.return_value = (2, 11)
 
         report = run_connection_checks(

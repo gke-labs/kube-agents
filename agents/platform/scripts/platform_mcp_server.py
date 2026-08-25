@@ -21,6 +21,24 @@ from gke_endpoint import dns_endpoint_args
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
+# How long `report_to_chat` waits on /v1/cron-reports. That route relays
+# synchronously — it creates the session, runs a whole Chat Agent turn (its own
+# 300s ceiling) and blocks on `hermes send` before answering — so this has to
+# outlast the work, not just a connect stall. Deliberately the same 360s the
+# delivery plugin uses (`RELAY_TIMEOUT_SECONDS`,
+# deploy/docker/plugins/chat/adapter.py), for the same reason and with the same
+# ordering: the server's verdict must be what the caller records.
+#
+# Timing out first is not a harmless retry. Nothing cancels the server — a sync
+# FastAPI endpoint runs to completion in the threadpool whether or not the
+# client is still connected — so the report is composed, posted and stored
+# regardless, while this tool returns an ERROR the job prompt tells the agent to
+# recover from by returning the report as its final response. On a
+# `deliver: "chat"` job that final response relays a second time and the user
+# reads the same finding twice. The measured relay is ~9s; the old 10s bound
+# left that one second of headroom.
+CRON_REPORT_TIMEOUT_SECONDS = 360.0
+
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")
 
@@ -701,8 +719,12 @@ def send_notification(message: str, session_id: str = "") -> str:
                         # Construct explicit target for send_message_tool
                         targets.append(f"{session_platform}:{chat_id}:{thread_id}")
         except Exception as exc:
-            # Fail-open: log error but fall back to broadcast targets
-            print(f"Failed to resolve session metadata for threading: {exc}")
+            # Fail-open: log error but fall back to broadcast targets.
+            # stderr, never a bare print: this server speaks JSON-RPC on
+            # stdout, and one stray line of prose there corrupts the stream
+            # for the MCP client mid-session. Pinned by the stdio seam test
+            # (tests/integration/test_seam_mcp_stdio.py).
+            print(f"Failed to resolve session metadata for threading: {exc}", file=sys.stderr)
 
     if not targets:
         for p in enabled_platforms:
@@ -743,6 +765,77 @@ def send_notification(message: str, session_id: str = "") -> str:
             print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
 
     return "\n".join(results) if results else "ERROR: No target platform configured."
+
+
+@mcp.tool()
+def report_to_chat(report: str, job_id: str, title: str = "") -> str:
+    """
+    Send a report from a SCHEDULED (cron) job to the user's chat channel mid-run.
+
+    You usually do NOT need this. A job created with deliver='chat' has its final
+    response relayed to the Chat Agent automatically, with nothing to call and
+    nothing to remember. Use this tool only when that is not enough: to report
+    partway through a long run, or to send something other than your final answer.
+
+    Having called it, return exactly `[SILENT]` so the same finding is not also
+    delivered as the run's result. The Chat Agent presents what you pass, so write
+    `report` as the finished message for a human reader, not as notes to yourself.
+
+    Prefer this over send_notification for scheduled work: send_notification posts
+    with no conversational context, so a user replying to it reaches an agent that
+    does not know what they are referring to.
+
+    Args:
+        report: The finished report, in markdown. This is what the user reads.
+        job_id: The id of the cron job producing this report (e.g. 'compliance-audit').
+        title: Optional human-readable job name, used to orient the reader.
+    """
+    import json
+    import urllib.request
+
+    report = (report or "").strip()
+    if not report:
+        return "ERROR: report is empty; nothing to deliver."
+    if not (job_id or "").strip():
+        return "ERROR: job_id is required so replies can be routed back to this job's thread."
+
+    # The profile is the specialist's identity here, and it is not the agent's to
+    # assert: taking it from HERMES_HOME means a scaffolded cluster profile reports
+    # under its own name without the prompt having to carry it. A named profile
+    # lives at <root>/profiles/<name>; anything else is the unprofiled home, where
+    # the directory name ("data") would be a misleading thing to label a report.
+    home = get_hermes_home()
+    profile = home.name if home.parent.name == "profiles" else "platform"
+
+    body = json.dumps(
+        {"job_id": job_id.strip(), "profile": profile, "title": (title or "").strip(), "report": report}
+    ).encode()
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8699/v1/cron-reports",
+            data=body,
+            headers=_session_kv_headers({"Content-Type": "application/json"}),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=CRON_REPORT_TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return f"ERROR: Failed to hand the report to the chat relay: {exc}"
+
+    # The route answers 200 for both a composed delivery and a degraded one, and
+    # says which in `relay`. Reading it here is the difference between the agent
+    # knowing its report went out raw and it believing the Chat Agent framed it.
+    if payload.get("relay") == "degraded":
+        return (
+            f"SUCCESS (degraded): the report was posted to chat (session "
+            f"{payload.get('session_id', '?')}) but the Chat Agent turn failed, so the user "
+            "sees your raw text marked [unrelayed] rather than a composed message. It is "
+            "delivered — do not send it again — and there is nothing for you to retry."
+        )
+    return (
+        f"SUCCESS: Report accepted for delivery to chat (session {payload.get('session_id', '?')}). "
+        "The Chat Agent posts it; do not also call send_notification for this report."
+    )
 
 
 def start_session_kv_server() -> None:

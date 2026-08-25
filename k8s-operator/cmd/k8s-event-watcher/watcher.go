@@ -110,7 +110,7 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 	// runtime.ErrorHandlers rather than replacing it, so klog's
 	// default UnhandledError line still fires alongside ours: the
 	// slice ships with logError already in it and handleError runs
-	// every entry. apimachinery v0.31 has no SetErrorHandlers, and
+	// every entry. apimachinery v0.36 has no SetErrorHandlers, and
 	// assigning the slice directly would drop the rate-limiting
 	// backoff handler that sits beside logError. The default panic
 	// handler still fires for real crashes. Registered once per

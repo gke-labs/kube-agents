@@ -50,6 +50,7 @@ SOP_FILENAMES = {
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
     "ai-security-audit": "ai_security_audit_sop.md",
     "stockout-prevention": "stockout_prevention_sop.md",
+    "gcp-networking-fabric-audit": "gcp_networking_fabric_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
@@ -1610,16 +1611,20 @@ class TestAuditCatalogue(unittest.TestCase):
     def test_every_watchdog_declares_all_delivery(self):
         """A watchdog whose run fails has to be audible.
 
-        `"all"` sends the outcome to the configured target; `"local"` resolves
-        to no target at all (`scheduler.py:_deliver_result`), so a run that
-        failed would be built into a message and then dropped — leaving a
-        watchdog that has stopped working indistinguishable from a fleet with
-        nothing to report.
+        `"all"` sends the outcome to the configured target and `"chat"` hands it
+        to the Chat Agent (`deploy/docker/plugins/chat/adapter.py`); both
+        carry a failure, because the scheduler builds one into a message
+        (`_summarize_cron_failure_for_delivery`) and delivers it on the same leg
+        as a report. `"local"` resolves to no target at all
+        (`scheduler.py:_deliver_result`), so that message would be built and
+        then dropped — leaving a watchdog that has stopped working
+        indistinguishable from a fleet with nothing to report.
 
         The audit's own findings do not travel this leg — Tier 1 is the ledger
         issue — so this is not the route for reports, only for the failure of
         the thing that produces them.
         """
+        audible = {"all", "chat"}
         watchdogs = self.governance_jobs()
         self.assertTrue(
             watchdogs,
@@ -1628,9 +1633,9 @@ class TestAuditCatalogue(unittest.TestCase):
         )
         for job_id, job in sorted(watchdogs.items()):
             with self.subTest(job=job_id):
-                self.assertEqual(
+                self.assertIn(
                     job.get("deliver"),
-                    "all",
+                    audible,
                     f"platform roster[{job_id}] declares "
                     f"deliver={job.get('deliver')!r}; a failed run would then "
                     f"resolve to no delivery target and vanish",
@@ -1674,19 +1679,54 @@ class TestAuditCatalogue(unittest.TestCase):
         The Chat Agent's roster must not carry them at the same time — two
         rosters both firing is the same audit running against itself.
 
-        `github-repo-watcher` rides along in the expected set because it shares
-        the roster, not the argument above: it is a `no_agent` poller that fires
-        no model at all and files a kanban card on the rare tick that finds
-        work. It is named here so that adding a job to this roster stays a
-        deliberate act rather than something a set comparison absorbs quietly.
+        A `no_agent` entry is excluded from the equality rather than added to
+        the expected set: it prompts no model, so none of the above applies to
+        it and it has no stream in `AUDITS` to pair with. It is on this roster
+        for what it reads, not for what it runs — `eod-event-watcher-daily-report`
+        renders the event-watcher recap from this profile's session database.
+        The equality still binds every entry that does prompt a model, which is
+        the case this test exists for.
+
+        Excluded from one equality, pinned by another. `github-repo-watcher`
+        was named in the expected set before this roster carried a second
+        `no_agent` entry, and the reason it was named survives the split:
+        adding a job to this roster must stay a deliberate act rather than
+        something a set comparison absorbs quietly. So the `no_agent` ids are
+        asserted as their own set below.
         """
         live = self.governance_jobs()
+        prompted = {job_id for job_id, job in live.items() if not job.get("no_agent")}
         self.assertEqual(
-            set(audit_report.AUDITS) | {"github-repo-watcher"},
-            set(live),
-            "the platform roster's enabled entries are not the governance set; "
-            "a stream switched off here simply stops running",
+            set(audit_report.AUDITS),
+            prompted,
+            "the platform roster's enabled agent runs are not the governance "
+            "set; a stream switched off here simply stops running",
         )
+        self.assertEqual(
+            {"github-repo-watcher", "eod-event-watcher-daily-report"},
+            set(live) - prompted,
+            "the platform roster's `no_agent` entries are not the expected "
+            "pair; a subprocess job added here fires on every tick without "
+            "any of the review a governance stream gets",
+        )
+        # Resolved to a file, not merely non-empty. Nothing else in the tree
+        # checks a cron `script` against the scripts directory, so a typo in
+        # the name is silent until 21:00, when the tick runs nothing and the
+        # roster looks healthy.
+        scripts_dir = Path(__file__).resolve().parents[4] / "platform" / "scripts"
+        for job_id in sorted(set(live) - prompted):
+            with self.subTest(job=job_id):
+                script = live[job_id].get("script")
+                self.assertTrue(
+                    script,
+                    f"platform roster[{job_id}] is `no_agent` but names no "
+                    f"script, so a tick would run nothing at all",
+                )
+                self.assertTrue(
+                    (scripts_dir / script).is_file(),
+                    f"platform roster[{job_id}] names {script!r}, which is not "
+                    f"in {scripts_dir}",
+                )
 
         chat_roster = (
             Path(__file__).resolve().parents[4]

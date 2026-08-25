@@ -150,10 +150,11 @@ own merge rules, however clean the latest review reads.
 Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" requires before a
 pull request is opened at all:
 
-- **`## Self-Review`** — the disposition list from the author's own `review-adversarial` pass: what
-  they looked for, what it found, and for each finding whether they fixed it or decided not to and
-  why. This is the signal that matters most here, because it is the only one that says somebody
-  already read this diff hostilely.
+- **`## Self-Review`** — the disposition list from the author's own pre-PR passes, merged:
+  `review-adversarial` and `review-docs-drift`, both on every change. What they looked for, what
+  kind of context each pass ran in, what it found, and for each finding whether
+  they fixed it or decided not to and why. This is the signal that matters most here, because it is
+  the only one that says somebody already read this diff hostilely.
 - **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
   exercised. `Not live-tested` with a stated reason is a filled section.
 
@@ -505,6 +506,9 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
 - **Angle J already has an author to filter by**, which the skill cannot assume:
   `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
   review comments on any sibling touching adjacent paths.
+
+- **No green-suite bypass.** Do not skip hunting candidates because CI or unit tests are passing.
+  Work every angle explicitly against the diff as defined in `review-adversarial`.
 
 One thing the skill has no way to know about:
 

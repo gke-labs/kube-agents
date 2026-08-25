@@ -7,9 +7,9 @@ description: Reviews a change adversarially — establishes what it claims to do
 
 Given a diff range, find the defects in it and report only the ones you can defend. This skill is
 the review method itself and holds no plumbing: it is run by an author against their own branch
-before opening a pull request (the `AGENTS.md` requirement), and by a reviewer against a pull
-request already open (`.claude/commands/pr-review-batch.md`, which wraps it in the GitHub-side
-work).
+before opening a pull request (the `AGENTS.md` requirement, wrapped by `review-preflight`), and by a
+reviewer against a pull request already open (`.claude/commands/pr-review-batch.md`, which wraps it
+in the GitHub-side work).
 
 `review-docs-drift` is the companion pass, not part of this one. Angle H stops at the rules the
 diff visibly breaks and leaves the rest of the documentation question to that skill.
@@ -19,15 +19,29 @@ diff visibly breaks and leaves the rest of the documentation question to that sk
 ## 1. Run this in a context that did not write the change
 
 If you are the agent that just produced the diff, **do not run the pass in the conversation that
-produced it**. Spawn a subagent, or start a new session, and hand it the diff range and the
-repository — not your reasoning, not your plan, not the summary you were about to write. A model
-reviewing work it has just justified is the weakest configuration there is: it is poorly calibrated
-about its own output, rates it higher than an outsider would, and the bias is worst on exactly the
-lines it got wrong. It is also more likely to "fix" something correct than to catch something
-broken, which is why step 5 exists and why step 6 will not let you edit on a hunch.
+produced it**. [`review-preflight`](../review-preflight/SKILL.md) is how you get a context that did
+not: it owns the plumbing, down to what to hand the fresh context, what to withhold from it, and
+what to do when your harness will not spawn one for the asking. A model reviewing work it has just justified is the weakest
+configuration there is: it is poorly calibrated about its own output, rates it higher than an
+outsider would, and the bias is worst on exactly the lines it got wrong. It is also more likely to
+"fix" something correct than to catch something broken, which is why step 5 exists and why step 6
+will not let you edit on a hunch.
 
-That is why `.claude/commands/pr-review-batch.md` gives each pull request its own subagent. A
-self-review gets the same treatment for the same reason.
+That is why both wrappers spend a subagent on it —
+[`.claude/commands/pr-review-batch.md`](../../../.claude/commands/pr-review-batch.md) for a pull
+request already open,
+[`.claude/commands/pr-preflight.md`](../../../.claude/commands/pr-preflight.md) for the author's own
+branch.
+
+Without a wrapper, the minimum is: hand the fresh context the repository, the diff range, and this
+file, and withhold your plan, your reasoning, and the intent sentence step 3 asks it to derive for
+itself. The gap between what you meant and what the diff says is the finding you cannot get any
+other way.
+
+Withholding is not enough on its own. Your commit messages are inside the range by construction and
+your plan files are in the checkout you just handed over, so add the instruction that keeps the pass
+out of them: _derive the change's intent from the diff; do not read the branch's commit message
+bodies, plan files, or scratch notes_.
 
 You will be tempted to skip this on a small diff. The cost of a fresh context is one subagent; the
 cost of skipping it is that the pass reports what you already believed.
@@ -76,6 +90,14 @@ makes this line wrong? Inverted or wrong conditions, off-by-one, nil/undefined d
 `await`, unchecked `err`, falsy-zero checks, wrong-variable copy-paste, an error swallowed in a
 catch, unescaped regex metacharacters.
 
+**Audit error handlers and fallback values**: for every `catch`, `except`, `if err != nil`,
+`if ! cmd` (or `$? != 0`), or fallback assignment on a failed resolution, trace the fallback value.
+Does it preserve the invariant downstream code assumes — a normalized 40-character SHA, a validated
+SemVer, an absolute path, a non-nil struct — or does it pass a raw, unvalidated input forward? Check
+if error suppression (`|| true`, `_ = err`, `except: pass`) transforms a failed lookup on a
+malformed input into a benign empty result (`nil`, `""`, `[]`), silently disabling downstream
+collision, uniqueness, or security guards.
+
 **Angle B — removed-behavior auditor.** For every line the diff deletes or replaces, name the
 invariant it enforced, then find where the new code re-establishes it. If you cannot find it,
 that's a candidate: a removed guard, a dropped error path, a narrowed validation, a deleted test
@@ -97,6 +119,12 @@ precondition, a changed return shape, a renamed key a manifest still reads, a ti
 Trace runtime wiring through to the source — which container an env var lands in, which process
 reads a port, which service account a binding actually grants — rather than inferring it from
 names.
+
+**Audit sibling contract symmetry**: when reviewing code in a family of components (reconcilers,
+CLI tools, admission webhooks, API handlers), compare how identical domain inputs (a commit, a
+cluster name, a tag, credentials) are validated and handled across siblings. An unmotivated
+asymmetry — where one component hard-fails on an unresolvable entity while a sibling falls back
+silently — is an immediate candidate.
 
 Then trace the other direction, because a change written by an agent can call things that do not
 exist: for every symbol, method, flag, chart value, CRD field, environment variable, or file path
@@ -147,6 +175,13 @@ Then check that the intent is actually tested: for each behaviour the change cla
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
 regression test, and new error paths nothing exercises, are the usual cases.
+
+**Do not treat green test suites as proof of correctness**: a passing suite proves only that the
+paths it exercises work on the fixtures it supplies. For every validation check, gate, and error
+path, check whether **negative inputs** (unresolvable identifiers, malformed strings, absent fields)
+are tested against the gate, or if the tests only pass valid fixtures through the happy path. Treat
+previously resolved findings in PR history as high-risk areas where adjacent defects and edge cases
+cluster.
 
 For a change that fixes something, naming the test is not enough — **run it against the pre-change
 behaviour and watch it fail.** A test that passes with the fix reverted is testing something else,

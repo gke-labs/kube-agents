@@ -38,25 +38,35 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                          | Type   | Purpose                                                                                                                                                      |
-| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                         |
-| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                         |
-| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                     |
-| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                        |
-| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                          |
-| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                     |
-| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                                                                               |
-| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`. |
-| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.     |
-| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                        |
-| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                      |
-| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
-| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                 |
-| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
-| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
-| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                             |
+| Field                                          | Type   | Purpose                                                                                                                                                                                                             |
+| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                |
+| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                |
+| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                            |
+| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                               |
+| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                 |
+| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                            |
+| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the credential-proxy sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                        |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                            |
+| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                               |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                             |
+| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                  |
+| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                        |
+| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                               |
+| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                    |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                          |
+| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                    |
+
+`dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
+dashboard` binds `127.0.0.1`, so a request arriving over the pod network gets connection refused.
+Reaching it means getting inside the pod's network namespace — `kubectl port-forward svc/<agent>
+9119:9119` on an ordinary node pool, and
+[`scripts/hermes-dashboard-tunnel.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/hermes-dashboard-tunnel.py)
+on a GKE Sandbox (gVisor) one, where port-forward is set up in the host-side netns and cannot see
+the sandbox's listener. That script is canonical on both the access path and why the loopback bind
+is deliberate. The container's readiness probe runs `curl` against loopback for the same reason a
+`tcpSocket` probe cannot work here: kubelet dials the pod IP, and nothing is listening on it.
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
 milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
@@ -88,19 +98,19 @@ Hermes' empty string, which cannot be expressed here: an absent field takes the 
 
 Only a Hindsight-backed provider reaches the specialist profiles, because only that one can be made
 read-only and scoped by tag. Under any other value the specialists get no provider at all and the
-Chat Agent keeps the store to itself.
+Planning Agent keeps the store to itself.
 
 `memoryEnabled` and `userProfileEnabled` are a **different** mechanism — Hermes' built-in
 `MEMORY.md` / `USER.md` files, which have no per-user scoping. Both providers above replace that
 store rather than supplement it, so both run with `memoryEnabled: false`.
 
-The installer's `MEMORY_ENABLED` variable is that same built-in store and nothing more; provisioning
-step 8 copies it into this field unchanged. It is not a master switch — whether the agent remembers
+The installer's `MEMORY_ENABLED` variable is that same built-in store and nothing more; the install
+copies it into this field unchanged. It is not a master switch — whether the agent remembers
 anything is `provider`'s question, and `none` is how that answers no.
 
-The provisioning scripts read only the provider: step 13 deploys Hindsight when `MEMORY_PROVIDER` is
-Hindsight-backed, which is what a stock install gets, and nothing when it is `multiuser_memory` or
-`none`. See
+The install reads only the provider: the chart's `hindsight.*` values deploy the Hindsight store
+when the provider is Hindsight-backed (`--memory=hindsight`), and nothing when it is
+`multiuser_memory` or `none`. See
 [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md).
 
 ### `spec.harness.eventWatcher`
@@ -159,7 +169,7 @@ turns it off.
 
 ### `spec.harness.tuning`
 
-Execution limits per agent persona, where `<persona>` is one of `default` (the Chat Agent front
+Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
@@ -251,7 +261,7 @@ the switch either graduates into a supported block or goes away.
 #### `platformFrontDoor`
 
 Makes the **Platform Agent** the profile the Hermes gateway runs as, so a chat message is handled by
-the agent that has the tools instead of arriving at the Chat Agent, which delegates through the
+the agent that has the tools instead of arriving at the Planning Agent, which delegates through the
 router MCP server and the kanban board.
 
 ```bash
@@ -281,7 +291,7 @@ Three things change while it is on:
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
 keys are unapplied rather than left behind, and the force-sync resumes.
 
-**What it costs.** The Chat Agent's lockdown is the Chat Agent's whole reason for existing: a router
+**What it costs.** The Planning Agent's lockdown is its whole reason for existing: a front door
 with three toolsets, so an inbound message cannot reach the full Platform Agent tool surface before a
 card and a worker turn have framed it. With this on, an inbound message reaches that surface
 directly. The lockdown is deliberately **not** copied onto the platform profile — copying it would
@@ -289,12 +299,12 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 
 **Known limits.**
 
-- One gateway means one profile, so this is not additive. While it is on, the Chat Agent persona sees
+- One gateway means one profile, so this is not additive. While it is on, the Planning Agent persona sees
   no chat at all and the router MCP path is simply unused. Kanban delegation is not: the front door
   keeps `dispatch_in_gateway`, so it can still hand a card to a spawned worker — it just does so as
   the agent that could also have done the work itself.
 - `gateway.multiplex_profiles` is still off, so a `/p/<profile>/` prefix on an API request is
-  ignored. Those requests now land on the Platform Agent rather than the Chat Agent.
+  ignored. Those requests now land on the Platform Agent rather than the Planning Agent.
 - The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
   shows that profile's sessions while the front door is the platform one.
 - **An [`AgentPlugin`](./agentplugin-crd.md) without a `spec.targetProfile` does not follow the
@@ -364,8 +374,12 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
 
 - `image` — container image repository.
-- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's build-injected default version applies instead.
+- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead.
 - `imagePullPolicy` — one of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.
+- `imagePullSecrets` — Secrets in the agent's namespace holding registry credentials, as
+  `- name: <secret>` entries. Referenced, not created: each must exist before the pod is
+  scheduled. Pod-scoped, so it covers the agent, both injected sidecars, anything in
+  `initContainers`/`sidecars`, and the OCI image volumes `AgentPlugin`s mount.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
 - `runtimeClassName` — pod runtime class (e.g. `gvisor`).
 - `env` — additional container environment variables.
@@ -375,18 +389,20 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `podAnnotations` — annotations applied to the generated pod template.
 - `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
 
-Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:<operator release version>` (release builds inject the version; development builds fall back to `latest`), overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)). Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
+Default image: derived dynamically from the operator's container image at runtime via the `OPERATOR_IMAGE` env var on the controller manager (e.g. `ghcr.io/gke-labs/kube-agents/platform-agent:<version>`), overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)), and falling back to `ghcr.io/gke-labs/kube-agents/platform-agent:latest` if neither is set. Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
+
+`imagePullSecrets` has the same operator-wide form, `IMAGE_PULL_SECRETS` on the controller manager, taking comma-separated Secret names. It differs from the image overrides in one way: a CR that sets `imagePullSecrets` **replaces** the operator's list rather than merging with it, so an agent that names its own registry identity is stating it completely. See [Docker images § Registry authentication](/kube-agents/deploy/docker-images/#registry-authentication).
 
 ## `spec.security`
 
 - `serviceAccountName` — the KSA the pod runs as. `kubeagents-platform-agent` by convention.
 - `serviceAccountAnnotations` — passed through to the KSA. Typically holds `iam.gke.io/gcp-service-account` for Workload Identity binding.
 
-The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
+The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by the [`kube-agents-iam` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) with one of these permission sets:
 
 - `read-only` (default)
 - `gke-admin`
-- `custom` (roles supplied via `PLATFORM_AGENT_CUSTOM_ROLES`)
+- `custom` (roles supplied via the installer's `--custom-roles`, the composition's `project_roles`)
 
 ## `spec.telemetry`
 
@@ -398,9 +414,9 @@ Optional, and omitting it is the point: with the field absent the operator disco
 
 Enables external integrations. Only the enabled ones need to be present.
 
-- **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by `provision_05_gcp_gchat.sh`.
-- **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by `provision_06_slack.sh` when `SLACK_ENABLED=true`.
-- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment (up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@...`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand (e.g. `gke-labs/kube-agents`). Rejects URLs containing whitespace, control characters, or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL is encountered during reconciliation, `SETTINGS.md` defaults to `None` and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. Populated by `provision_10_deploy_github_minter.sh`.
+- **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by the installer when Google Chat is enabled.
+- **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by the installer when Slack is enabled.
+- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment (up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@...`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand (e.g. `gke-labs/kube-agents`). Rejects URLs containing whitespace, control characters, or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL is encountered during reconciliation, `SETTINGS.md` defaults to `None` and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. Populated by the installer when a GitOps repository is connected.
 
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.
 
@@ -446,7 +462,7 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 
 ## How config reaches each profile
 
-A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
+A deployment runs several Hermes **profiles** from one pod: `default` (the Planning Agent front door),
 `platform`, and one `cluster-*` profile per managed cluster. The named profiles are each configured
 by an overlay merged into an image-built base at startup. The `default` profile is the exception: it
 takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
@@ -510,6 +526,16 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
+That file also pins one value that is not a credential at all: `API_SERVER_KEY=cluster-internal-trusted`,
+the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
+because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
+file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
+behind `/etc/hermes`. Unpinned, the gateway ends up validating against a value no caller has, and the
+credential proxy, the startup probe and every in-pod loopback call get `401 Invalid gateway API key`
+(issue #786). The container entrypoint warns at boot when this pin and the container env disagree.
+The credential that guards the API from _outside_ is `API_SERVER_EXTERNAL_KEY`, set from
+`hermes.apiServerSecretRef`; the sidecar authenticates the caller against it and swaps in the sentinel.
+
 One consequence is worth knowing before you edit `renderConfigYAML`: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than
 unioning with it — for every profile at once. That is why the render emits no lists at all today,
@@ -570,11 +596,11 @@ one reviewable place.
 
 - On create/update, the controller ensures the Deployment, Service, ServiceAccount, and ConfigMaps match the spec.
 - On delete, it garbage-collects owned resources.
-- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
+- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), requires each `imagePullSecrets` entry to name a Secret, and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
-- `provision_08_deploy_platform_agent.sh` renders and applies the CR; you can also edit it directly with `kubectl edit`.
+- The Helm chart renders and applies the CR (the install engine drives it through `terraform apply`); you can also edit it directly with `kubectl edit`.
 
 ## Where to go next
 
 - [Development](/kube-agents/operator/development/) — build and test the controller locally.
-- [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — how the CR gets applied in a fresh install.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — how the CR gets applied in a fresh install.

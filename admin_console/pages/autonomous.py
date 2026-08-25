@@ -32,7 +32,6 @@ from admin_console.agent_runtime import (
     AgentRuntimeError,
     AgentRuntimeProvider,
 )
-from admin_console.ui import AGENT_SELECTOR_HELP
 
 HISTORY_WINDOWS = {"24h": 1, "7d": 7, "30d": 30}
 INTERVAL_CADENCE = re.compile(r"^every\s+(\d+)m$", re.IGNORECASE)
@@ -395,29 +394,18 @@ target = require_connection()
 provider = AgentRuntimeProvider(target)
 
 try:
-    agents = provider.list_agents()
+    selected_agent = provider.canonical_agent()
 except AgentRuntimeError as exc:
     st.error(str(exc))
     if exc.guidance:
         st.caption(exc.guidance)
     st.stop()
 
-if not agents:
-    st.warning("No running kube-agents gateway was found in this scope.")
-    st.stop()
-
-toolbar = st.columns([2, 1, 1])
-requested_agent = query_value("cron_agent")
-selected_agent = toolbar[0].selectbox(
-    "Agent",
-    agents,
-    index=agents.index(requested_agent) if requested_agent in agents else 0,
-    help=AGENT_SELECTOR_HELP,
-)
-set_query("cron_agent", selected_agent)
+st.query_params.pop("cron_agent", None)
+toolbar = st.columns([1, 1])
 requested_window = query_value("cron_window", "7d")
 window_options = list(HISTORY_WINDOWS)
-selected_window = toolbar[1].selectbox(
+selected_window = toolbar[0].selectbox(
     "History",
     window_options,
     index=(
@@ -427,7 +415,7 @@ selected_window = toolbar[1].selectbox(
     ),
 )
 set_query("cron_window", selected_window)
-if toolbar[2].button(
+if toolbar[1].button(
     "Refresh",
     icon=":material/refresh:",
     width="stretch",

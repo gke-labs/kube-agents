@@ -8,16 +8,17 @@ The plan is only half of the feature: the Backup for GKE **agent** must also be 
 
 > **Cost.** Backup for GKE bills per backed-up pod and per gigabyte of volume snapshot storage. Nothing is charged until a plan exists, which is why both install paths leave it opt-in.
 
-## Relationship to the provisioning scripts
+## Relationship to the install
 
-This module and `k8s-operator/scripts/provision_12_gke_backup_plan.sh` create the **same** BackupPlan — use one or the other for a given cluster, never both. The script does a check-then-create, so it will happily adopt and reconcile a Terraform-managed plan without Terraform noticing.
+This is the module the full-install composition (and therefore `install.sh`, when
+`ENABLE_GKE_BACKUP_PLAN=true`) uses for the scheduled backups.
 
-The defaults mirror the script's: the name `<cluster_name>-backup-plan`, a `0 2 * * *` schedule, 30-day retention, the `kubeagents-system` namespace, secrets and volume data included, and the schedule un-paused.
+The defaults: the name `<cluster_name>-backup-plan`, a `0 2 * * *` schedule, 30-day retention, the `kubeagents-system` namespace, secrets and volume data included, and the schedule un-paused.
 
 ## Teardown is not symmetric
 
-**A BackupPlan cannot be deleted while it still owns backups.** Terraform has no
-equivalent of the purge `k8s-operator/scripts/teardown_12_gke_backup_plan.sh` performs, so
+**A BackupPlan cannot be deleted while it still owns backups.** Terraform cannot
+purge them itself, so
 once any backup has been taken, `terraform destroy` — or flipping
 `enable_gke_backup_plan` back to `false`, or anything else that replaces the plan — fails on
 this resource with the API refusing the delete. The apply stops there, after whatever was
@@ -35,10 +36,9 @@ for backup in $(gcloud beta container backup-restore backups list \
 done
 ```
 
-`teardown_12_gke_backup_plan.sh` does exactly this in batches, waits for the deletions to
-land, and refuses to continue if any survive — read it before doing this by hand on an
-installation whose backups matter. Its `PRESERVE_BACKUPS=true` escape hatch has no
-counterpart here: to keep the backups, remove the module from state
+The full-install composition's `lifecycle.sh destroy` does exactly this purge for you
+(`purge_backups`), permanently — read it before running it on an installation whose
+backups matter. To keep the backups, remove the module from state
 (`terraform state rm module.gke_backup_plan`) rather than destroying it.
 
 ## Usage

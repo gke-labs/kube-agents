@@ -7,6 +7,11 @@ on:
       - "install.sh"
       - "uninstall.sh"
       - "upgrade.sh"
+      # The three scripts source their defaults, validators, and the tfvars
+      # generator from these helpers, so a change there must run this gate too.
+      - "k8s-operator/scripts/installer_common.sh"
+      - "k8s-operator/scripts/min_versions.sh"
+      - "k8s-operator/scripts/gke_dns_endpoint.sh"
       - ".github/workflows/installer-matrix-test.yml"
   push:
     branches: [main]
@@ -14,9 +19,15 @@ on:
 permissions:
   contents: read
 
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
 concurrency:
-  group: installer-matrix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validate-installer:
@@ -58,9 +69,22 @@ jobs:
             "config get-value project") echo "ci-test-project" ;;
             "config get-value compute/region") echo "us-central1" ;;
             "auth print-access-token") echo "test-access-token" ;;
+            # ADC absent on purpose: install.sh's dry-run then skips the
+            # terraform plan preview and stops at validate — both stubbed.
+            "auth application-default print-access-token") exit 1 ;;
             projects\ describe*) echo "123456789012" ;;
             secrets\ versions\ access*) echo "test-model-key" ;;
             config\ set\ project*) ;;
+            # The tfvars generator's liveness probes: no cluster, no state.
+            # The describe stub must fail the way real gcloud does — a
+            # NOT_FOUND on stderr — because the generator only reads that as
+            # "cluster absent" and refuses to guess on any other failure
+            # (guessing is how a transient error plans a live cluster's
+            # replacement).
+            container\ clusters\ describe*) echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND: Not found." >&2; exit 1 ;;
+            # The minter gate's key-version probe: no ENABLED version.
+            kms\ keys\ versions\ list*) exit 0 ;;
+            storage\ cat*) exit 1 ;;
             *) echo "Unexpected gcloud invocation: $*" >&2; exit 1 ;;
           esac
           EOF
@@ -69,6 +93,19 @@ jobs:
             printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER_TEMP/kube-agents-test-bin/$tool"
             chmod +x "$RUNNER_TEMP/kube-agents-test-bin/$tool"
           done
+          # terraform is stubbed like the cloud CLIs: the dry run asserts the
+          # installer's own flow (interview → vars.sh → terraform.tfvars →
+          # validate/plan), not Terraform's. validate.yml runs the real
+          # terraform validate over the composition the generated tfvars feed.
+          cat > "$RUNNER_TEMP/kube-agents-test-bin/terraform" <<'EOF'
+          #!/usr/bin/env bash
+          case "$1" in
+            init|validate|plan) exit 0 ;;
+            version|--version) echo "Terraform v1.15.8" ;;
+            *) echo "Unexpected terraform invocation: $*" >&2; exit 1 ;;
+          esac
+          EOF
+          chmod +x "$RUNNER_TEMP/kube-agents-test-bin/terraform"
 
       # The stub PATH is scoped to the dry-run steps only: exporting it via
       # $GITHUB_PATH would shadow the real kubectl in the Kind validation

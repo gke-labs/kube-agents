@@ -106,7 +106,7 @@ FORMAT_MARKER = "## Report format"
 #: brief. Everything the detector below measures is stated here, so the card,
 #: the schema wording and the delivery log never describe different contracts.
 #: The reverse does not hold: the lead-with-the-answer, `###`, length and link
-#: rules are stated and not measured, because they came from ``SOUL.md`` §7 and
+#: rules are stated and not measured, because they came from ``SOUL.md`` §0/§7 and
 #: this stanza travels *in* the task text, where the persona does not. Measuring
 #: them would mean new defect classes and a louder delivery log for something no
 #: reader has yet called wrong — the WARNING tier stays where the evidence is.

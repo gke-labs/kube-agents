@@ -591,30 +591,17 @@ def run_connection_checks(
                 if cancel_event is not None and cancel_event.is_set():
                     raise ConnectionChecksCancelled()
                 runtime_provider = AgentRuntimeProvider(runtime_target)
-                agents = runtime_provider.list_agents()
-                if not agents:
-                    checks.append(
-                        ConnectionCheck(
-                            "agent_runtime",
-                            "Agent runtime read",
-                            CheckStatus.WARNING,
-                            "No running kube-agents gateway pods were found.",
-                            "Confirm the selected cluster and namespace.",
-                        )
+                agent = runtime_provider.canonical_agent()
+                profile_count, session_count = runtime_provider.check_connection(agent)
+                checks.append(
+                    ConnectionCheck(
+                        "agent_runtime",
+                        "Agent runtime read",
+                        CheckStatus.PASS,
+                        f"Read {profile_count} profile(s) and {session_count} "
+                        f"session(s) from {agent}.",
                     )
-                else:
-                    profile_count, session_count = runtime_provider.check_connection(
-                        agents[0]
-                    )
-                    checks.append(
-                        ConnectionCheck(
-                            "agent_runtime",
-                            "Agent runtime read",
-                            CheckStatus.PASS,
-                            f"Read {profile_count} profile(s) and {session_count} "
-                            f"session(s) from {agents[0]}.",
-                        )
-                    )
+                )
                 if cancel_event is not None and cancel_event.is_set():
                     raise ConnectionChecksCancelled()
             except AgentRuntimeError as exc:

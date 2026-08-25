@@ -1,0 +1,85 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * 1" # Weekly Monday scan
+
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  gosec-scan:
+    name: Go Security Scan (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-operator/go.mod"
+          cache: true
+          cache-dependency-path: "k8s-operator/go.sum"
+      - name: Run gosec
+        working-directory: k8s-operator
+        # G703 (path traversal) and G706 (log injection) arrived in gosec
+        # 2.28.0 and take os.Args and os.Getenv as taint sources. Every flag
+        # the operator and k8s-event-watcher read is rendered by the operator
+        # into their own Deployments, so argv is inside the trust boundary
+        # rather than attacker input, and all 12 findings the pair reports
+        # today trace back to it — one of them, a log.Printf whose only
+        # argument is an int, is the analyzer being imprecise. G304 stays
+        # enabled and still catches a file path that does come from outside.
+        run: go run github.com/securego/gosec/v2/cmd/gosec -exclude=G703,G706 ./...
+
+  trivy-scan:
+    name: Container & Manifest Scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Scan Repository Configs & Manifests
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: "config"
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+          trivyignores: ".trivyignore.yaml"
+
+  semgrep-scan:
+    name: SAST Scan (semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.155.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run semgrep
+        run: semgrep scan --config=.github/semgrep-security-audit.yml --exclude=.github/semgrep-security-audit.yml --severity=ERROR --error
+
+  checkov-scan:
+    name: IaC Security Scan (checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@1246d92f57abae29d5db5f9aeeed2a9813e52d7d # v12.3117.0
+        with:
+          framework: terraform,github_actions
+          output_format: cli
+          config_file: .checkov.yaml

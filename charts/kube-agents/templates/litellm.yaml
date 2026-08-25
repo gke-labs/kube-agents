@@ -1,7 +1,7 @@
 {{- if .Values.litellm.enabled }}
 {{- $provider := .Values.litellm.modelProvider }}
 {{- if eq $provider "chatgpt" }}
-{{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
+{{- fail "litellm.modelProvider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store this chart does not ship. Use 'openai' with an API key, or see examples/litellm-chatgpt-subscription for a hand-applied subscription proxy." }}
 {{- end }}
 {{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
 {{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
@@ -88,6 +88,9 @@ spec:
     spec:
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
+      {{- end }}
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
       {{- end }}
       containers:
         - name: litellm-container
@@ -262,11 +265,10 @@ spec:
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
-    # The node DNATs 169.254.169.254:80 to the metadata daemon on port 988 before
-    # NetworkPolicy is evaluated, so the rule above is not on its own enough to admit a
-    # Workload Identity token fetch. 169.254.169.252 is the rewrite target on the
-    # iptables datapath; Dataplane V2 rewrites to the hosting node's internal IP, so add
-    # one /32 per node there.
+    # GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+    # the node rewrites 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    # is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+    # policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
     - ports:
         - port: 988
           protocol: TCP

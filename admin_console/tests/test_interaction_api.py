@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from admin_console.agent_chat import ChatRunResult, MAX_HISTORY_MESSAGES
 from admin_console.agent_runtime import AgentTaskUpdate, TaskUpdateResult
+from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app
 from admin_console.chat.service import ChatService
 from admin_console.chat.models import Interaction, InteractionStatus, TaskProjection
@@ -68,10 +69,12 @@ class ScriptedBackend:
         self._lock = Lock()
         self.task_reads = 0
         self.prompts: list[str] = []
+        self.run_requests: list[tuple[tuple, dict]] = []
         self.approvals: list[str] = []
         self.approval_resolved = Event()
 
     def run(self, *args, **kwargs) -> ChatRunResult:
+        self.run_requests.append((args, kwargs))
         self.prompts.append(kwargs["prompt"])
         if self.root.status == "waiting_for_approval":
             kwargs["on_update"](self.root)
@@ -172,7 +175,7 @@ def client_for(
         task_timeout=1,
         max_workers=max_workers,
     )
-    return TestClient(create_app(service)), service
+    return TestClient(create_app(service), headers=portal_api_headers()), service
 
 
 class InteractionApiTest(unittest.TestCase):
@@ -228,6 +231,39 @@ class InteractionApiTest(unittest.TestCase):
             ],
         )
         self.assertGreaterEqual(backend.task_reads, 3)
+
+    def test_interaction_defaults_to_canonical_agent_and_chat_profile(self):
+        backend = ScriptedBackend()
+        client, _ = client_for(backend)
+
+        response = client.post(
+            "/api/v1/interactions",
+            json={"input": {"text": "Is the cluster healthy?"}},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        result = self.wait_for_terminal(client, response.json()["interactionId"])
+        self.assertEqual(result["agentId"], "platform-agent")
+        self.assertEqual(result["profile"], "default")
+        arguments, keyword_arguments = backend.run_requests[0]
+        self.assertEqual(arguments[0], "platform-agent")
+        self.assertEqual(keyword_arguments["profile"], "default")
+
+    def test_interaction_rejects_noncanonical_agent_id(self):
+        backend = ScriptedBackend()
+        client, _ = client_for(backend)
+
+        response = client.post(
+            "/api/v1/interactions",
+            json={
+                "agentId": "platform-agent-host",
+                "input": {"text": "Is the cluster healthy?"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("platform-agent-host", response.text)
+        self.assertEqual(backend.run_requests, [])
 
     def test_cancelled_queued_interaction_is_never_started(self):
         backend = BlockingBackend()
@@ -605,7 +641,22 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(client._target, target)
         self.assertEqual(
             constructor.call_args.kwargs["headers"],
-            deployment_target_headers(target),
+            {
+                **deployment_target_headers(target),
+                **portal_api_headers(),
+            },
+        )
+
+    def test_api_rejects_requests_without_the_launch_capability(self):
+        service = ChatService(lambda: ScriptedBackend())
+        client = TestClient(create_app(service))
+
+        response = client.get("/api/v1/agents")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()["detail"]["error"]["code"],
+            "portal_api_unauthorized",
         )
 
     def test_api_rejects_a_stale_tab_target(self):

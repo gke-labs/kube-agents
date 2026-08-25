@@ -53,7 +53,7 @@ import check_docs_map
 REPO = Path(__file__).resolve().parent.parent
 
 # Two rosters, two profiles. Cron ticking is a property of a running gateway
-# and only the `default` (Chat Agent) profile has one, so its roster is the
+# and only the `default` (Planning Agent) profile has one, so its roster is the
 # only store the gateway thread advances — and it carries `profile-cron-tick`,
 # which runs `hermes cron tick` against every named profile with work due. That
 # is what makes the Platform Agent's own roster live, so the governance
@@ -61,17 +61,15 @@ REPO = Path(__file__).resolve().parent.parent
 # files feed the page; a job documented from one roster alone is a job half the
 # fleet cannot find.
 CRON_ROSTERS = (
-    ("Chat Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
+    ("Planning Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
     ("Platform Agent", REPO / "agents/platform/cron/jobs.json"),
 )
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
-SCRIPTS_DIR = REPO / "k8s-operator/scripts"
 IMAGES_JSON = REPO / "images.json"
 
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
-SCRIPTS_PAGE = SCRIPTS_DIR / "README.md"
 IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
 ROSTER_FILE = REPO / "docs/family-roster.txt"
 
@@ -109,6 +107,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-platform-security",
     ],
     "Networking and storage": [
+        "gcp-networking-fabric-audit",
         "gke-networking",
         "gke-service-networking",
         "gke-storage",
@@ -138,6 +137,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Meta": [
         "fleet-audit",
         "github-issue-resolver",
+        "pr-conversation",
     ],
 }
 
@@ -160,6 +160,7 @@ CRON_CADENCE = {
     "11 * * * *": "Hourly at :11",
     "*/10 * * * *": "Every 10 minutes",
     "*/30 * * * *": "Every 30 minutes",
+    "0 21 * * 1-5": "Weekdays 21:00",
     "0 9 * * 0": "Weekly, Sunday 09:00",
     "0 10 * * 0": "Weekly, Sunday 10:00",
     "20 7 * * 1": "Weekly, Monday 07:20",
@@ -310,37 +311,6 @@ def gen_skill_catalog() -> str:
     return "\n".join(out).rstrip()
 
 
-def parse_script_banner(path: Path) -> tuple[str, str]:
-    """Return (title, description) from a script's comment banner."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    title, desc = "", []
-    rules = [i for i, line in enumerate(lines[:24]) if set(line.strip("# ")) == {"="}]
-    if len(rules) >= 2:
-        between = lines[rules[0] + 1 : rules[1]]
-        if between:
-            title = between[0].lstrip("# ").strip()
-            title = re.sub(r"^[^\w]*Step \d+:\s*", "", title).strip()
-    if len(rules) >= 3:
-        for line in lines[rules[1] + 1 : rules[2]]:
-            desc.append(line.lstrip("#").strip())
-    return title, " ".join(d for d in desc if d)
-
-
-def gen_provisioning_steps() -> str:
-    out: list[str] = []
-    for kind, heading in (("provision", "Provisioning"), ("teardown", "Teardown")):
-        out.append(f"### {heading} steps\n")
-        out.append("| # | Script | What it does |")
-        out.append("| :-: | ------ | ------------ |")
-        for path in sorted(SCRIPTS_DIR.glob(f"{kind}_[0-9][0-9]_*.sh")):
-            num = int(re.search(r"_(\d{2})_", path.name).group(1))
-            title, desc = parse_script_banner(path)
-            summary = md_escape(desc or title)
-            out.append(f"| {num} | [`{path.name}`]({path.name}) | **{md_escape(title)}** — {summary} |")
-        out.append("")
-    return "\n".join(out).rstrip()
-
-
 ORIGIN_SECTIONS: list[tuple[str, str, str]] = [
     (
         "first-party",
@@ -447,7 +417,6 @@ ROSTER_HEADER = """
 BLOCKS = {
     "cron-jobs": (CRON_PAGE, gen_cron_jobs),
     "skill-catalog": (SKILLS_PAGE, gen_skill_catalog),
-    "provisioning-steps": (SCRIPTS_PAGE, gen_provisioning_steps),
     "container-images": (IMAGES_PAGE, gen_container_images),
 }
 

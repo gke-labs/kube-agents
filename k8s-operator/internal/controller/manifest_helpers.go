@@ -36,14 +36,15 @@ import (
 )
 
 var (
-	// DefaultPlatformAgentVersion is injected at build time via -ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z"
-	// or defaults to "latest" during local development.
+	// DefaultPlatformAgentVersion is the fallback tag for local development
+	// or environments where OPERATOR_IMAGE is not set (defaults to "latest").
 	DefaultPlatformAgentVersion = "latest"
 )
 
-// fallbackPlatformAgentImage derives its tag from DefaultPlatformAgentVersion
-// at call time (not folded at init), so release builds default to the matching
-// versioned image and tests can pin the derivation by overriding the variable.
+// fallbackPlatformAgentImage returns the default platform-agent image using
+// DefaultPlatformAgentVersion at call time (not folded at init), serving as the
+// static fallback when neither PLATFORM_AGENT_IMAGE nor OPERATOR_IMAGE is configured.
+// Tests can pin the derivation by overriding DefaultPlatformAgentVersion.
 func fallbackPlatformAgentImage() string {
 	return "ghcr.io/gke-labs/kube-agents/platform-agent:" + DefaultPlatformAgentVersion
 }
@@ -55,8 +56,15 @@ const (
 	// private registry. Set on the controller-manager Deployment; a CR's
 	// spec.deployment.image still takes precedence over PLATFORM_AGENT_IMAGE.
 	platformAgentImageEnvVar   = "PLATFORM_AGENT_IMAGE"
-	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE"
+	operatorImageEnvVar        = "OPERATOR_IMAGE"
+	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	fluentBitImageEnvVar       = "FLUENT_BIT_IMAGE"
+
+	// The fleet-wide pull identity for those mirrors, as a comma-separated list
+	// of Secret names in the agent's namespace. Set on the controller-manager
+	// Deployment like the three above; a CR's spec.deployment.imagePullSecrets
+	// replaces it outright.
+	imagePullSecretsEnvVar = "IMAGE_PULL_SECRETS" // #nosec G101 -- Environment variable name, not hardcoded credentials
 
 	defaultSurgePercent = "25%"
 
@@ -165,12 +173,46 @@ func otelTelemetryEnvVars(agentType, name, namespace, endpoint string) []corev1.
 	}
 }
 
+// deriveAgentImageFromOperator derives the platform-agent image from an operator image reference.
+// It maps the operator image to the platform-agent image while preserving the registry prefix
+// and tag. If the operator image is digest-pinned (@sha256:...), the digest cannot name the
+// platform-agent manifest, so it falls back to a tag if present before the digest (e.g. :v1@sha256:...)
+// or :latest.
+// E.g.:
+//   "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0"                -> "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
+//   "ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a" -> "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a"
+//   "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:111111..."    -> "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+//   "mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
+//   "k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
+func deriveAgentImageFromOperator(operatorImage string) string {
+	lastSlash := strings.LastIndex(operatorImage, "/")
+	prefix := ""
+	refPart := operatorImage
+	if lastSlash >= 0 {
+		prefix = operatorImage[:lastSlash+1]
+		refPart = operatorImage[lastSlash+1:]
+	}
+	// Digest pins (@sha256:...) cannot name a different repository manifest.
+	// Strip digest and fall back to tag or :latest.
+	if digestIdx := strings.Index(refPart, "@"); digestIdx >= 0 {
+		refPart = refPart[:digestIdx]
+	}
+	suffix := ":latest"
+	if tagIdx := strings.Index(refPart, ":"); tagIdx >= 0 {
+		suffix = refPart[tagIdx:]
+	}
+	return prefix + appNamePlatformAgent + suffix
+}
+
 // defaultPlatformAgentImage returns the agent image used when a CR omits
-// spec.deployment.image: the PLATFORM_AGENT_IMAGE env var if set, else the
-// public ghcr.io default.
+// spec.deployment.image: the PLATFORM_AGENT_IMAGE env var if set, else derived
+// from OPERATOR_IMAGE if set, else the public ghcr.io default.
 func defaultPlatformAgentImage() string {
 	if img := os.Getenv(platformAgentImageEnvVar); img != "" {
 		return img
+	}
+	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" {
+		return deriveAgentImageFromOperator(opImg)
 	}
 	return fallbackPlatformAgentImage()
 }
@@ -216,6 +258,80 @@ func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage st
 		}
 	}
 	return image
+}
+
+// normalizeImagePullSecrets trims each name, drops the blanks, and collapses
+// repeats, returning nil when nothing survives.
+//
+// Both halves are load-bearing, and nothing below this layer does either. A
+// blank or space-padded name sends the kubelet looking for a Secret that
+// cannot exist; it gives up and pulls anonymously, so the agent lands in
+// ImagePullBackOff against a spec that looks like it configured a pull
+// identity. Core PodSpec validation does not reliably stop that — measured
+// against GKE 1.35.6, `name: ""` is a warning rather than an error and
+// `name: " regcred "` passes clean. A repeat is worse, because it fails
+// somewhere else entirely: PodSpec.imagePullSecrets is a server-side-apply
+// list-map keyed on name, so two identical entries make every apply of the
+// generated Deployment fail with `duplicate entries for key`, several layers
+// from whatever wrote them.
+//
+// Both inputs make these ordinary typos. IMAGE_PULL_SECRETS is hand-written
+// onto a Deployment or joined by a Helm template, where "a,,b" and a trailing
+// comma cost nothing to produce; the CR's list is hand-written YAML that the
+// admission webhook rejects for exactly these two shapes — but the chart
+// leaves that webhook off by default, so this is the layer that has to hold.
+func normalizeImagePullSecrets(refs []corev1.LocalObjectReference) []corev1.LocalObjectReference {
+	var secrets []corev1.LocalObjectReference
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		name := strings.TrimSpace(ref.Name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		secrets = append(secrets, corev1.LocalObjectReference{Name: name})
+	}
+	return secrets
+}
+
+// defaultImagePullSecrets returns the pull identity for agents whose CR omits
+// spec.deployment.imagePullSecrets: the comma-separated IMAGE_PULL_SECRETS env
+// var, or nil.
+func defaultImagePullSecrets() []corev1.LocalObjectReference {
+	raw := os.Getenv(imagePullSecretsEnvVar)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	refs := make([]corev1.LocalObjectReference, 0, len(parts))
+	for _, name := range parts {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return normalizeImagePullSecrets(refs)
+}
+
+// resolveImagePullSecrets picks the pod's pull identity: the CR's list when it
+// has one, otherwise the operator-wide default.
+//
+// Replacement, not merge — the same precedence resolveAgentImage gives
+// spec.deployment.image over PLATFORM_AGENT_IMAGE, and for the same reason. The
+// field is documented that way on DeploymentSpec.ImagePullSecrets.
+//
+// A list that normalizes away to nothing counts as unset and falls through to
+// the default, because a CR carrying only `- name: ""` has not named an
+// identity — it has a typo, and the fleet default is likelier to pull than
+// nothing at all.
+func resolveImagePullSecrets(deployment *agentv1alpha1.DeploymentSpec) []corev1.LocalObjectReference {
+	if deployment != nil {
+		if secrets := normalizeImagePullSecrets(deployment.ImagePullSecrets); len(secrets) > 0 {
+			return secrets
+		}
+	}
+	return defaultImagePullSecrets()
 }
 
 // mergeEnvVars merges custom env vars into defaults. Custom env vars override defaults with the same name.
