@@ -36,6 +36,10 @@ SPOT_CANDIDATES=(h4d-standard-192 h4d-highmem-192)
 _spot_unsupported() {
     # True when the region offers no Spot for this shape at all, as opposed to offering it
     # and being short today. The advisor errors in the first case and scores in the second.
+    if ! gcloud beta --help >/dev/null 2>&1; then
+        echo "Error: gcloud beta component is required for scenario 05 but is not installed." >&2
+        return 1
+    fi
     ! gcloud beta compute advice capacity --project="$PROJECT_ID" --region="$CLUSTER_LOCATION" \
         --provisioning-model=SPOT --size=1 --instance-selection-machine-types="$1" \
         --target-distribution-shape=any-single-zone >/dev/null 2>&1

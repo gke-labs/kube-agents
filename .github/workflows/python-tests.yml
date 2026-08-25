@@ -45,7 +45,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version-file: ".python-version"
 
       # Not for a Go suite -- k8s-operator-test.yml owns those. `make
       # test-python` now sweeps tests/integration, and its injector seam
@@ -92,7 +92,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version-file: ".python-version"
 
       - name: Install bench and its test runner
         run: |
@@ -144,7 +144,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version-file: ".python-version"
 
       # Here for the mirroring the Makefile's coverage target is built around:
       # the meter runs the gate's suite, the same way, or it is measuring

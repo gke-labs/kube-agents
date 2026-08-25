@@ -47,10 +47,10 @@ jobs:
       # deploy to amd64 GKE nodes, and the multi-arch bases otherwise resolve to
       # whatever the runner is (#560). Redundant on today's amd64 runners; load-bearing
       # the day the runner label changes.
-      # load: true, unlike the other builds here, so the layer-budget step below
-      # has an image to inspect. It costs a transfer from the buildx cache into
-      # the daemon; nothing else needs the image, which is why the others do
-      # without.
+      # load: true, so the layer-budget step below has an image to inspect. It costs
+      # a transfer from the buildx cache into the daemon, which is why only this
+      # build and the gate-test build below -- the two whose output a later step
+      # runs or inspects -- pay for it.
       - name: Build Platform Agent
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -89,8 +89,37 @@ jobs:
           target: entrypoint-gate-test
           platforms: linux/amd64
           push: false
+          # load, unlike before: the step below re-runs this stage's check as a
+          # container rather than as a build RUN, and needs the image in the daemon.
+          load: true
+          tags: entrypoint-gate-test:latest
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      # The same check again, against the rootfs the operator actually gives the pod.
+      # The RUN above cannot cover this: a build layer is writable by definition, so it
+      # proves the entrypoint works but says nothing about whether it needs the write.
+      # readOnlyRootFilesystem turns any such write into EROFS at container start, and
+      # the entrypoint runs a script this repo does not own (upstream's stage2-hook.sh),
+      # so "it only writes under $HERMES_HOME and /tmp" has to be tested rather than read
+      # off the source. Cheap, because the image is already in the daemon from the load.
+      #
+      # One --tmpfs stands in for two writable mounts the Deployment provides separately:
+      # the data PVC at $PLATFORM_AGENT_HOME, which the check already relocates under /tmp,
+      # and the tmp-scratch emptyDir. Those have independent budgets in the pod -- a
+      # multi-Gi PVC and a 2Gi emptyDir -- so size=2g is a ceiling on the two combined and
+      # not a model of either. It is there to keep a runaway case from filling the runner,
+      # not to predict which volume a real pod would outgrow; read a failure here as "this
+      # case writes more than we expect", not as "tmp-scratch is too small". exec, because
+      # the check's HA-handoff case runs a wrapper script from the scratch tree and
+      # Docker's default tmpfs is noexec.
+      - name: Verify entrypoint under a read-only root filesystem
+        run: |
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777,size=2g \
+            --entrypoint /usr/local/bin/entrypoint-gate-check \
+            entrypoint-gate-test:latest
 
       # No load: true. This shares only agent-base with the build above, so it is
       # the shorter chain of the two and not the one the budget is measured

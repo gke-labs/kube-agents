@@ -38,11 +38,12 @@ EXCLUDED = {
     # Has its own Makefile target (`make -C k8s-operator test-python`) and its
     # own CI workflow; the root suite does not reach into the operator.
     "k8s-operator": "own suite, k8s-operator-test.yml",
-    # Has its own workflow (agentplugins-test.yml) and its own dependencies.
-    "agentplugins": "own suite, agentplugins-test.yml",
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
+    # Live GKE cluster E2E test suite; pytest-native, requires live cluster, Workload Identity,
+    # and KMS. Runs under `make test-e2e` in e2e-nightly-matrix.yml and e2e-manual-runner.yml.
+    "tests/e2e": "live cluster E2E suite, runs under make test-e2e",
     # Live black-box CUJ journeys against a provisioned kube-agents install;
     # they open an admin portal and talk to a deployed agent, so they are
     # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
@@ -56,7 +57,7 @@ EXCLUDED = {
 # provider and module downloads (an initialized module can carry its own
 # upstream test files), so a worktree where tofu init ever ran would
 # otherwise red this guard on vendored tests.
-IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform"}
+IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform", ".claude"}
 
 
 def discovered_dirs():

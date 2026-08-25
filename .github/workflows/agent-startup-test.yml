@@ -67,7 +67,7 @@ jobs:
         if: steps.filter.outputs.startup == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version-file: ".agent-python-version"
 
       # PyYAML is the only dependency: the tests use stdlib unittest so they run
       # anywhere the agent image does, without adding a test framework to the repo.
