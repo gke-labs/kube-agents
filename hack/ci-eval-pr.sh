@@ -295,6 +295,17 @@ print('1' if re.search(r'^verification_spec:\s*\$', text, re.M) else '0')
 " "$1" 2>/dev/null || echo "1"
 }
 
+# Per-case fixture planting, run inside the loop below rather than beside
+# write_fleet_kubeconfigs at step 2b: 2b is one-shot and case-agnostic, and a
+# plant belongs to exactly one case and must red only that case when it fails.
+# A case carrying bench/tasks/<case>/plant.sh gets it run in the leased project
+# immediately before its own eval; a case without one -- almost all of them --
+# never learns this exists. hack/plant-fixtures.sh holds the convention, the
+# environment a plant receives, the timeout, and why a plant cannot reach the
+# seeded fleet.
+# shellcheck source=hack/plant-fixtures.sh
+source "${SCRIPT_DIR}/plant-fixtures.sh"
+
 FAILED_TASKS=()
 INFRA_FAILED_TASKS=()
 
@@ -314,6 +325,41 @@ for TASK in "${TASKS[@]}"; do
   DEPLOYER="$(task_deployer "${BENCH_DIR}/${TASK}")"
   export BENCH_NO_INFRA="false"
   echo "Executing with deployer=${DEPLOYER:-unknown} BENCH_NO_INFRA=${BENCH_NO_INFRA}"
+
+  # Plant this case's run-time fixtures, if it has any, before its eval.
+  #
+  # Independent of DEPLOYER on purpose. A noop-deployer case on the seeded
+  # fleet plants nothing today and has no other way to; a tofu case gets its
+  # cluster from devops-bench, which has not run yet when this fires, so a
+  # plant here is project-scoped in every case. That is stated in
+  # plant-fixtures.sh rather than enforced here, because the hook has no way to
+  # know what a plant script is reaching for.
+  #
+  # A plant failure BLOCKS, unlike RESOURCE_PREPARATION_FAILED below. That
+  # carve-out is for weather: an OpenTofu stockout says nothing about the pull
+  # request. A plant is a handful of API calls made by a script in this
+  # repository, and when it does not complete, whatever the eval would then
+  # measure is a fiction -- the agent would be investigating an incident that
+  # was never planted, and the deterministic gate would report that as the
+  # agent's failure. Running the eval anyway is the silent-green path; not
+  # running it and saying so is the only honest outcome.
+  #
+  # The path is resolved rather than composed so `dirname` cannot hand the hook
+  # a "bench/./tasks/x" it then reports in an error message. A task path that
+  # does not resolve leaves TASK_DIR empty, the hook finds no plant script and
+  # returns 0, and the run behaves exactly as it did before this existed --
+  # devops-bench is still the thing that reports a missing task file.
+  TASK_DIR="$(cd "$(dirname "${BENCH_DIR}/${TASK}")" 2>/dev/null && pwd)" || TASK_DIR=""
+  if ! plant_task_fixtures "${TASK_DIR}" "${TASK_NAME}"; then
+    TASK_DURATION=$((SECONDS - TASK_START))
+    if [ "${PLANT_STATUS}" = "timeout" ]; then
+      echo "Task ${TASK_NAME} Result: [PLANT_TIMED_OUT] the fixture plant ran out of budget and was killed; the eval was NOT run -- see ${PLANT_LOG} (Duration: ${TASK_DURATION}s)"
+    else
+      echo "Task ${TASK_NAME} Result: [PLANT_FAILED] the fixture plant did not complete (${PLANT_STATUS}); the eval was NOT run -- see ${PLANT_LOG:-the plant error above} (Duration: ${TASK_DURATION}s)"
+    fi
+    FAILED_TASKS+=("${TASK_NAME} (fixture plant ${PLANT_STATUS})")
+    continue
+  fi
 
   # Snapshot existing result directories before running to prevent stale score leakage
   PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"

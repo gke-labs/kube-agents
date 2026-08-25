@@ -268,6 +268,89 @@ Placeholders are substituted in the prompt, the expected output, and the verific
 `{{PROJECT_ID}}`, `{{CLUSTER_NAME}}`, `{{APP_LOCATION}}`, `{{TARGET_DEPLOYMENT_NAME}}`,
 `{{NAMESPACE}}`.
 
+#### Planting a fixture at run time: `plant.sh`
+
+`deployer` decides where a case's cluster comes from, and between the two values there is a gap.
+`tofu` provisions a per-run GKE cluster — the harness calls `get_cluster_info()` for any non-`noop`
+deployer, and the OpenTofu deployer errors without `cluster_name`/`cluster_location` outputs, so
+"OpenTofu but no cluster" is not a reachable state. `noop` skips OpenTofu entirely, which is right
+for a case reading the [standing seeded fleet](#addressing-a-seeded-fleet-fixture-by-role) and
+plants nothing at all.
+
+Some fixtures fall in the gap: they must be created **fresh per run** and they are not clusters.
+Cloud Logging entries are the shape — `gpu-stress-test-diagnosis`'s whole planted incident is two
+`gcloud logging write` calls, the entries expire on a retention window, and no kubectl-shaped fleet
+probe can confirm they are still there, so pre-planting them into a fleet that is never torn down
+would go quietly wrong about a month later and the checks would blame the agent.
+
+Drop an executable **`bench/tasks/<case>/plant.sh`** beside the `task.yaml`. `hack/ci-eval-pr.sh`
+runs it in the leased project immediately before that case's eval, whatever the `deployer` says.
+There is nothing to register: the path is derived from the task's directory, because a second list
+saying which cases plant is a second thing to forget, and forgetting it is the silent failure —
+an eval graded against a fixture nobody created. For the same reason the name is fixed rather than
+declared in `task.yaml`, and the file is run with `bash` rather than by its shebang so a lost
+executable bit cannot turn a plant into a no-op. `bench/tests/test_plant_hook.py` fails the build
+on a task directory holding a `plant.bash` or a `setup.sh`.
+
+**A case with no `plant.sh` is untouched** — one `stat`, no subprocess, no log, no new way to fail.
+
+**A plant that fails reds its case and the eval does not run.** `[PLANT_FAILED]`, or
+`[PLANT_TIMED_OUT]` when it runs past its budget; either way the case is counted against the pull
+request and the last 40 lines of the plant's log are echoed into the job log next to it, with the
+whole log in `$ARTIFACTS/plant_<case>.log`. This is deliberately _not_ the
+`RESOURCE_PREPARATION_FAILED` carve-out, which is non-blocking because an OpenTofu stockout says
+nothing about the pull request: a plant is a handful of API calls made by a script in this
+repository, and when it does not complete, what the eval would measure is a fiction.
+
+**The budget is 300s**, overridable for a local experiment with `BENCH_PLANT_TIMEOUT_SECONDS`. Two
+orders of magnitude above the motivating plant, ~6% of the job's 85 minutes, and deliberately far
+below anything that could provision: a plant wanting longer is infrastructure, and infrastructure
+belongs in a stack the deployer owns and tears down.
+
+**What the script gets.** The job's environment — `PATH`, `HOME`, gcloud's credentials — plus:
+
+| Variable            | Meaning                                                                                       |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| `PROJECT_ID`        | the Boskos-leased project. Scope everything to it; an empty value refuses the plant outright. |
+| `TASK_NAME`         | the case's directory name.                                                                    |
+| `TASK_DIR`          | absolute path to the case's directory, and the working directory.                             |
+| `PLANT_SCRATCH_DIR` | a private writable directory, removed afterwards.                                             |
+| `KUBECONFIG`        | an **empty** file (below).                                                                    |
+
+and minus `BENCH_FLEET_KUBECONFIG_DIR`, `PLATFORM_AGENT_TOKEN`, `JUDGE_API_KEY` and
+`GEMINI_API_KEY`. A plant needs a project and a cloud credential; it has no business holding the
+key that grades the run.
+
+**It must not write to the seeded fleet.** The fleet is standing and never torn down, so one plant
+that mutates a shared cluster poisons every later run in that project — and the run that did it is
+long gone by the time a check notices. `KUBECONFIG` points at an empty file, so `kubectl` in a
+plant reaches no cluster at all, not the fleet and not `platform-agent-host`; the fleet's per-role
+credentials are removed from the environment. That is the enforcement, and it is not complete: the
+runner's identity holds `roles/container.admin` on the project, so a plant could call
+`gcloud container clusters get-credentials` and write itself a credential, and nothing at run time
+can stop it. `kubectl`, `get-credentials` and the fleet's labels are therefore rejected inside a
+`plant.sh` by `bench/tests/test_plant_hook.py`, at review time, with the reason. A case that must
+plant _into_ a cluster needs one of its own — `deployer: tofu` and a stack — and note the hook runs
+before devops-bench, so a per-run cluster does not exist yet. Plant project-scoped things here:
+Cloud Logging, GCS, Pub/Sub, Monitoring.
+
+**Idempotency is the script's job.** Boskos re-leases projects, so a plant runs in projects earlier
+runs already planted, and a retried Prow job replants within minutes. The hook de-duplicates
+nothing and keeps no state. Create-if-absent, tolerate "already exists" on every create, never
+assume a clean project. Append-only sinks are the easy case — a second `gcloud logging write` adds
+a second entry, and a check matching on content rather than count does not care. Anything named and
+singular (a bucket, a topic, a sink) has to be written as create-or-adopt.
+
+```bash
+#!/usr/bin/env bash
+# bench/tasks/<case>/plant.sh
+set -euo pipefail
+
+# Append-only, so re-running against a re-leased project is safe.
+gcloud logging write "container" '{"message": "...", "container_name": "..."}' \
+  --project="${PROJECT_ID}" --severity=ERROR --payload-type=json
+```
+
 ### 4. Write the verification spec
 
 The judge grades prose, which makes it the wrong instrument for "did the deployment actually come

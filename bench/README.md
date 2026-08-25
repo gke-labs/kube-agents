@@ -11,7 +11,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
-- `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
+- `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. A case may also carry a `plant.sh`; see below.
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests against a local HTTP stub.
@@ -104,6 +104,14 @@ module "cluster" {
 ```
 
 The deployer scans `*.tf` in the stack directory only and never descends into modules, so re-declare every variable you want to reach the module in the stack's own `variables.tf` and pass it through. A variable a task's `variables:` block sets but the stack does not declare raises `ConfigError`; one the runner injects is dropped with a log warning.
+
+## How a case gets its environment
+
+Three ways, and a case picks exactly one — or none:
+
+- **`deployer: tofu`** provisions a per-run GKE cluster from the named stack and tears it down. The harness resolves cluster info for any non-`noop` deployer, so this is all-or-nothing: there is no "OpenTofu without a cluster".
+- **`deployer: noop` on the standing seeded fleet** (`tf/fleet/`) reads fixtures planted once, out of band, and provisions nothing per run. Checks address a fixture by ROLE — see [CUSTOM-TASKS.md](CUSTOM-TASKS.md#addressing-a-seeded-fleet-fixture-by-role) and [tf/fleet/README.md](tf/fleet/README.md).
+- **`tasks/<case>/plant.sh`** runs in the Boskos-leased project immediately before that case's eval, whatever its `deployer` says, for fixtures that must be created fresh per run and are not clusters — Cloud Logging entries, GCS objects, Pub/Sub. A case without one is untouched; a plant that fails or runs past its 300-second budget reds that case (`[PLANT_FAILED]` / `[PLANT_TIMED_OUT]`) and its eval does not run. It cannot reach the seeded fleet: `KUBECONFIG` is an empty file and the fleet's credentials are removed from its environment. See [CUSTOM-TASKS.md](CUSTOM-TASKS.md#planting-a-fixture-at-run-time-plantsh) for the environment it receives and the idempotency contract, and `hack/plant-fixtures.sh` for the reasoning.
 
 ## Registration
 
