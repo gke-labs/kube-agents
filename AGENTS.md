@@ -364,13 +364,16 @@ while `/review all` re-reads at the width of the automatic first review and incl
 believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
 outranks both.
 
-**A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
-run alongside its review — `success` when it found nothing, `neutral` when it did — and
-`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
-anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
-clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
-a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
-completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+**A human reviewer is requested once its check has finished.** The bot posts an `AI Review` check
+run alongside its review — `success` when it found nothing, `neutral` when it did, and `neutral`
+again when the review itself broke — and `.github/workflows/auto_request_review.yml` waits for that
+check to **complete** before assigning anyone from `.github/auto_request_review.yml`. Completing,
+not going green: the bot never concludes `failure` and keeps `success` for "No findings", so a gate
+on green would assign a reviewer to exactly the pull requests with nothing to look at. Opening a
+pull request still pings nobody. The one completed outcome that assigns no one is
+`Conflicts with the base branch`, where nothing was read at all and the bot re-runs itself on the
+push that resolves it. Two exceptions: a pull request opened by a bot is assigned as soon as the
+check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
 owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
 assign a reviewer immediately — the override for a finding you have answered but disagree with, or
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.

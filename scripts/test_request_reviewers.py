@@ -311,12 +311,50 @@ class AiReviewGateTest(unittest.TestCase):
     def test_success_clears_the_gate(self):
         self.assertIsNone(rr.ai_review_block_reason(check_run("success"), author_is_bot=False))
 
-    def test_findings_hold_the_gate(self):
-        reason = rr.ai_review_block_reason(
-            check_run("neutral", output={"title": "Found 2 issues"}), author_is_bot=False
+    def test_findings_clear_the_gate(self):
+        # The whole point of the gate. A review that read the change and found
+        # something concludes `neutral`, and that is the pull request a human is
+        # most needed on -- #890 and #921 both sat with no reviewer under the
+        # old `success`-only rule.
+        self.assertIsNone(
+            rr.ai_review_block_reason(
+                check_run("neutral", output={"title": "Found 2 issues"}), author_is_bot=False
+            )
         )
-        self.assertIn("neutral", reason)
-        self.assertIn("Found 2 issues", reason)
+
+    def test_a_broken_review_clears_the_gate(self):
+        # An outage of the bot must not be an outage of reviewer assignment.
+        self.assertIsNone(
+            rr.ai_review_block_reason(
+                check_run("neutral", output={"title": "Review did not complete"}),
+                author_is_bot=False,
+            )
+        )
+
+    def test_a_partial_review_clears_the_gate(self):
+        self.assertIsNone(
+            rr.ai_review_block_reason(
+                check_run("neutral", output={"title": "No findings in the part that was read"}),
+                author_is_bot=False,
+            )
+        )
+
+    def test_a_conflicted_branch_holds_the_gate(self):
+        # Read off `external_id`, not the copy: nothing was reviewed, and the
+        # bot re-runs itself on the push that resolves the conflict.
+        reason = rr.ai_review_block_reason(
+            check_run(
+                "neutral",
+                external_id=rr.AI_REVIEW_CONFLICTED_ID,
+                output={"title": "Conflicts with the base branch"},
+            ),
+            author_is_bot=False,
+        )
+        self.assertIn("does not merge", reason)
+
+    def test_a_conclusion_the_bot_does_not_publish_holds_the_gate(self):
+        reason = rr.ai_review_block_reason(check_run("failure"), author_is_bot=False)
+        self.assertIn("failure", reason)
 
     def test_a_missing_check_run_holds_the_gate(self):
         self.assertIn("no AI Review", rr.ai_review_block_reason(None, author_is_bot=False))
@@ -329,8 +367,14 @@ class AiReviewGateTest(unittest.TestCase):
 
     def test_findings_do_not_hold_the_gate_for_a_bot_author(self):
         # Dependabot cannot read its own findings and comment `/review`, so its
-        # pull requests pass on any completed conclusion.
+        # pull requests pass on any completed conclusion -- including the
+        # conflicted one, which is the only difference left from a human author.
         self.assertIsNone(rr.ai_review_block_reason(check_run("neutral"), author_is_bot=True))
+        self.assertIsNone(
+            rr.ai_review_block_reason(
+                check_run("neutral", external_id=rr.AI_REVIEW_CONFLICTED_ID), author_is_bot=True
+            )
+        )
 
     def test_a_bot_author_still_needs_the_check_to_have_run(self):
         self.assertIsNotNone(rr.ai_review_block_reason(None, author_is_bot=True))

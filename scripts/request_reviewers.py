@@ -6,7 +6,12 @@
 the moment a pull request opened -- minutes before `kube-agents-bot` posted its
 read, and on most pull requests before the author had addressed a single
 finding. The reviewer is now requested from the bot's verdict instead: the
-`AI Review` check run going `success`.
+`AI Review` check run *completing*.
+
+Completing, not going `success`. The bot reserves `success` for "No findings"
+and never concludes `failure` at all, so a review that ran and found something
+concludes `neutral` -- and gating on `success` meant the pull requests with
+something to look at were exactly the ones nobody was ever asked to look at.
 
 That trigger is why this script exists rather than the action. The action reads
 `context.payload.pull_request`, which a `check_run` event does not carry, and
@@ -43,6 +48,19 @@ import yaml
 # any name, and this one decides who gets pinged.
 AI_REVIEW_CHECK_NAME = "AI Review"
 AI_REVIEW_APP_ID = 4437198
+
+# The conclusions the bot actually publishes. `success` is "No findings" and
+# "Not reviewed"; `neutral` is everything else it has to say, including a review
+# that found something. It never publishes `failure` -- deliberately, so that no
+# ruleset can be pointed at this check and turned into a merge gate. Anything
+# outside this set is something the bot did not write, so the gate holds on it.
+AI_REVIEW_CONCLUSIONS = {"success", "neutral"}
+
+# The bot's machine-readable name for "this branch does not merge, so there was
+# no merged result to read". It travels in `external_id` precisely so a reader
+# does not have to match on the copy, and it is the one completed conclusion
+# that is not a review: nothing was read, so there is nothing to hand a person.
+AI_REVIEW_CONFLICTED_ID = "conflicted"
 
 DEFAULT_CONFIG_PATH = ".github/auto_request_review.yml"
 DEFAULT_IGNORED_KEYWORDS = ["DO NOT REVIEW"]
@@ -303,9 +321,28 @@ def latest_ai_review(check_runs):
 def ai_review_block_reason(check_run, author_is_bot):
     """Why the AI review does not clear this pull request, or None.
 
-    A bot cannot read its own findings and comment `/review`, so a pull request
-    Dependabot opened passes on any completed conclusion. A human author has to
-    get it to `success`, or comment `/request-review` to override.
+    The gate is that the review **finished**, not that it liked the change.
+
+    It used to be `conclusion == "success"`, and that read the bot's conclusions
+    as a verdict they were never meant to be. `success` is the bot's word for
+    "No findings"; a review that ran, read the diff and found something
+    concludes `neutral`, and so does one that broke. So the old gate assigned a
+    human to exactly the pull requests with nothing to look at, and to nothing
+    else -- confirmed on #890 and #921, both of which had a completed review
+    with findings and no reviewer until one was assigned by hand. It also made
+    an outage of the bot an outage of reviewer assignment, which is the wrong
+    direction: a pull request the reviewer could not read is one a person is
+    needed on more, not less.
+
+    Two things still hold the gate, and neither is a judgement on the change.
+    A check that has not finished has no verdict yet. And a `conflicted` entry
+    means the branch does not merge, so nothing was read at all -- there is no
+    review for a reviewer to be reading alongside, and the bot re-runs itself on
+    the push that resolves it.
+
+    A bot author is unchanged: Dependabot cannot read findings and comment
+    `/review`, so its pull requests were already passing on any completed
+    conclusion. `/request-review` remains the override for everything else.
     """
     if check_run is None:
         return f"there is no {AI_REVIEW_CHECK_NAME} check run on the head commit"
@@ -314,16 +351,21 @@ def ai_review_block_reason(check_run, author_is_bot):
         return f"{AI_REVIEW_CHECK_NAME} is {check_run.get('status')}"
 
     conclusion = check_run.get("conclusion")
-    if conclusion == "success":
-        return None
+    if conclusion not in AI_REVIEW_CONCLUSIONS:
+        # Not a conclusion this bot writes, so it is not one this gate knows how
+        # to read. Holding is the conservative direction: the override exists.
+        return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}, which is not a conclusion it publishes"
 
     if author_is_bot:
-        log(f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}; the author is a bot, so it cannot re-run /review")
         return None
 
+    if check_run.get("external_id") == AI_REVIEW_CONFLICTED_ID:
+        return f"{AI_REVIEW_CHECK_NAME} reports the branch does not merge, so nothing was reviewed"
+
     title = (check_run.get("output") or {}).get("title")
-    detail = f" ({title})" if title else ""
-    return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
+    if title:
+        log(f"{AI_REVIEW_CHECK_NAME} completed: {title}")
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -471,7 +513,7 @@ def parse_args(argv):
     parser.add_argument(
         "--require-ai-review-pass",
         action="store_true",
-        help="only request a reviewer if the AI Review check passed",
+        help="only request a reviewer once the AI Review check has completed",
     )
     parser.add_argument("--react-to", type=int, help="issue comment id to acknowledge with 👀")
     parser.add_argument("--seed", type=int, help="seed the reviewer sampling, for reproducible runs")

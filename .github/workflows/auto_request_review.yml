@@ -1,9 +1,13 @@
 name: Auto Request Review
 
-# A human reviewer is requested once kube-agents-bot's `AI Review` check goes
-# green -- not when the pull request opens. Before this, the reviewer was pinged
-# minutes ahead of the bot's read and re-read a diff the author was about to
-# change.
+# A human reviewer is requested once kube-agents-bot's `AI Review` check has
+# completed -- not when the pull request opens. Before this, the reviewer was
+# pinged minutes ahead of the bot's read and re-read a diff the author was about
+# to change.
+#
+# Completed, not green. The bot reserves `success` for "No findings", so waiting
+# for green meant a review that found something never assigned anyone. See
+# `scripts/request_reviewers.py`, `ai_review_block_reason`.
 #
 # Neither trigger can be a `pull_request` one. Every pull request here comes
 # from a fork, and on a fork pull request `pull_request` and
@@ -81,7 +85,7 @@ jobs:
       # empty for fork pull requests. The script reads the check run back from
       # the API for the commit and the verdict, then finds the pull request that
       # commit belongs to.
-      - name: Request a reviewer now the AI review has passed
+      - name: Request a reviewer now the AI review has finished
         if: github.event_name == 'check_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
