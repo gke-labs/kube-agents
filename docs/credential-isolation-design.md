@@ -339,22 +339,31 @@ is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
 (`--smtp-server`), `instaweb`, `web--browse`, `help`, `fast-import`, the `p4`
 and `svn` bridges, `interpret-trailers`, and `submodule foreach`.
 
-`help` is on that list because `git help -m <page>` executes
-`man.<man.viewer>.cmd` through a shell, and `git help -w` does the same through
-`web.browser` and `browser.<tool>.cmd`. Both keys carry an arbitrary name and so
-cannot be pinned, and the sequence that reaches them is three ordinary requests
-taking no lease: two repository-local `git config` writes and a read verb.
-Refusing `web--browse` alone did not close it — `git help -w` reaches that code
-path internally, so the token never appears in the argument vector.
+The documentation viewer takes two entries rather than one, because it has two
+triggers. `git help -m <page>` executes `man.<man.viewer>.cmd` through a shell
+and `git help -w` does the same through `web.browser` and `browser.<tool>.cmd`,
+which the `help` subcommand entry covers. But `git <any-verb> --help` is
+dispatched to that same viewer with the verb still in the subcommand slot, so
+`git status --help` reaches it while nothing in the argument vector is `help`.
+The `--help` option is therefore refused as well, and both are needed: refusing
+either alone leaves the other open. The keys carry an arbitrary name and so
+cannot be pinned, and the cheapest sequence that reaches them is three ordinary
+requests taking no lease at all — two repository-local `git config` writes and a
+read verb. `-h` is not refused: git answers it from the subcommand's own option
+table and prints usage without dispatching to a viewer. `web--browse` stays on
+the subcommand list on its own account, because it is directly invocable and
+runs the configured browser command; it never covered the `git help -w` route,
+which reaches that code internally without the token appearing in the argument
+vector.
 
 The same category appears as options on subcommands the product has no reason to
 refuse outright, so those options are refused instead: `--exec` and `-x`, which
 run a caller-named command once per commit during a rebase; `-O` and
 `--open-files-in-pager`, which run one over the matches of a search — reachable
 by a read-only verb, needing neither a lease nor a file on the volume;
-`--trailer`, which runs `trailer.<name>.cmd` to compute a trailer's value and so
-puts a caller-named command on `git commit -m`, the argument vector the skills
-already send; and
+`--help`, described above; `--trailer`, which runs `trailer.<name>.cmd` to
+compute a trailer's value and so puts a caller-named command on `git commit -m`,
+the argument vector the skills already send; and
 `--upload-pack` and `--receive-pack`, which name a program to run for the remote
 end of a transfer. The last two are unreachable while the transport allowlist
 excludes local paths, and are refused so that widening the allowlist does not
@@ -374,8 +383,16 @@ executor accepts is the one defect this codebase keeps producing. Deciding where
 a subcommand's options end, or which prefixes it leaves unambiguous, would mean
 agreeing with git's parser indefinitely; the checker is instead strictly more
 conservative than git. The cost is a refusal the argument's position would
-otherwise excuse — a commit message that is the bare word `foreach`, or
-`git clean -x` — which is the direction this is meant to fail in.
+otherwise excuse — a commit message that is the bare word `foreach` or `help`,
+or `git clean -x` — which is the direction this is meant to fail in.
+
+Matching the subcommand by position instead would remove that last cost, and it
+is deliberately not done. Resolving the subcommand slot means knowing which of
+git's global options take a separated value, and the list is not one this
+runtime can keep complete: `git --attr-source HEAD help -m <page>` runs the
+configured viewer while a position-aware reading of the same argument vector
+sees the subcommand as `HEAD`. Scanning every argument cannot disagree with git
+about where the subcommand is.
 
 Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,
@@ -389,11 +406,14 @@ The pins do not extend to configuration stored in a repository's own
 name a program to run. Some such settings can be pinned and are; others take an
 arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`,
 `man.<tool>.cmd`, `browser.<tool>.cmd`, `trailer.<name>.cmd`) and therefore
-cannot be enumerated at all. Where such a key has a single reachable trigger,
-the trigger is refused instead — that is what the `help` and `interpret-trailers`
-subcommand entries and the `--trailer` option entry above are for. That works
-only because those triggers are nameable; the key itself stays settable, so a
-future git that grows a second trigger for one of them reopens the path.
+cannot be enumerated at all. Where every way of reaching such a key is itself
+nameable, those triggers are refused instead — that is what the `help` and
+`interpret-trailers` subcommand entries and the `--help` and `--trailer` option
+entries above are for. This is weaker than a pin and should be read that way.
+The key stays settable, so the refusals hold only while the set of triggers is
+complete, and completeness is an empirical claim about a program that changes:
+`man.<tool>.cmd` turned out to have two triggers rather than one, and the second
+was found after the first had been closed and documented as closed.
 
 That file reaches the credential as well as the program search. A credential
 helper configured there is itself a command, and it runs for any host the

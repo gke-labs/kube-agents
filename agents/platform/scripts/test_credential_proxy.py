@@ -28,6 +28,7 @@ from credential_proxy import (
     Policy,
     SlackRelay,
     _chat_error_fields,
+    _git_plan,
     _slack_error_detail,
     _slack_error_fields,
     git_argument_violation,
@@ -723,8 +724,8 @@ class GitHardeningTest(unittest.TestCase):
         # variable it exists to guard: rebase refuses an unstaged change before
         # it ever reaches the editor, so "the payload did not run" was true of
         # `error: Please commit or stash them` — a control that is really an
-        # error path, the same failure this slice hit once already. The
-        # assertion on git's own message below is what pins the difference.
+        # error path rather than a control. The assertion on git's own message
+        # below is what pins the difference.
         executor = self.executor()
         repository = self.repository(executor)
         (repository / "manifest.yaml").write_text("replicas: 1\n", encoding="utf-8")
@@ -886,6 +887,73 @@ class GitHardeningTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
 
+    def test_the_help_flag_cannot_run_a_command_on_an_ordinary_verb(self):
+        # `git <verb> --help` is not a usage message. git dispatches it to the
+        # same viewer `git help` uses, so it runs `man.<man.viewer>.cmd`
+        # through a shell with the verb still sitting in the subcommand slot.
+        # Refusing the `help` subcommand does not reach it, and the first cut
+        # of this change shipped that gap.
+        #
+        # Measured against git 2.55 under the pinned environment, with
+        # `man.viewer`/`man.evil.cmd` set repository-locally:
+        #
+        #   git commit --help    -> the configured command runs
+        #   git status --help    -> runs; a read verb, so no lease anywhere
+        #   git version --help   -> runs
+        #
+        # `status` is the cheapest path this file has closed: three ordinary
+        # requests, none of them mutating, and `status` is on the shipped path.
+        for argv in (
+            ["git", "commit", "--help"],
+            ["git", "status", "--help"],
+            ["git", "version", "--help"],
+            ["git", "log", "--help"],
+            ["git", "add", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # `-h` is answered from the subcommand's own option table and prints
+        # usage without dispatching to a viewer -- verified with the payload
+        # configured -- so refusing it would cost a harmless verb for nothing.
+        self.assertIsNone(git_argument_violation(["git", "status", "-h"]))
+        # Adding a long option widens the abbreviation match, so pin the
+        # neighbouring `--h...` flags the skills do send. `git reset --hard
+        # --quiet` is `gitops_workspace.ensure_workspace`'s reset path.
+        for argv in (
+            ["git", "reset", "--hard", "--quiet"],
+            ["git", "ls-remote", "--heads", "origin"],
+            ["git", "diff", "--histogram"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_the_subcommand_match_scans_every_token_on_purpose(self):
+        # `help` is compared against every token rather than against the
+        # subcommand slot, which refuses `git commit -m help`. That is a real
+        # cost and it is deliberate: resolving the slot means agreeing with
+        # git about which global options take a value, and this file does not
+        # know them all. Measured against git 2.55 --
+        #
+        #   git --attr-source HEAD help -m git    -> the payload runs
+        #   _git_plan(...)                        -> reports subcommand 'HEAD'
+        #
+        # -- so a position-aware check allows the very thing this refuses.
+        # Scanning every token cannot disagree with git about where the
+        # subcommand is.
+        self.assertEqual(
+            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "HEAD"
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "HEAD", "help", "-m", "git"])
+        )
+        # The over-refusal that buys it. Only an argument that is exactly the
+        # word collides; a message merely containing it is one token and passes.
+        self.assertIsNotNone(git_argument_violation(["git", "commit", "-m", "help"]))
+        self.assertIsNone(git_argument_violation(["git", "commit", "-m", "help me"]))
+        self.assertIsNone(
+            git_argument_violation(["git", "commit", "-m", "chore: add help text"])
+        )
+
     def test_a_trailer_command_cannot_run_on_the_commit_path(self):
         # `trailer.<name>.cmd` produces a trailer's value by running a command,
         # and the arbitrary name in the key puts it out of reach of the pins.
@@ -984,8 +1052,8 @@ class GitHardeningTest(unittest.TestCase):
         # `fatal: external diff died`. The test that was supposed to cover it
         # asserted only that the payload had not run, which is true of a
         # command that fails before diffing anything — a control that passes
-        # for the wrong reason, and the fourth of those this slice produced.
-        # The pin is gone; this line is what would have caught it.
+        # for the wrong reason. The pin is gone; this line is what would have
+        # caught it.
         executor = self.executor()
         repository = self.dirty_repository(executor)
         for argv in (

@@ -1098,6 +1098,25 @@ _GIT_REFUSED_ARGUMENTS = {
     #               `git commit -m msg --trailer zz:v` writes the credential
     #               container's `uid=` into the commit message. It has no short
     #               form on either subcommand that accepts it.
+    #   --help      `git <any-verb> --help` is not a usage message: it is
+    #               dispatched to the same viewer `git help` uses, so it runs
+    #               `man.<man.viewer>.cmd` through a shell. Refusing the `help`
+    #               subcommand does not touch it, because the verb in argv is
+    #               `status`. Measured under the pinned environment against git
+    #               2.55, with `man.viewer`/`man.evil.cmd` set repository-locally:
+    #               `git commit --help`, `git status --help`, `git version --help`
+    #               and `git log --help` all execute the configured command. The
+    #               `status` spelling is the cheapest path in this file — a read
+    #               verb, so no lease is taken anywhere in the sequence, and
+    #               `status` is squarely on the shipped path.
+    #
+    #               `-h` is NOT refused and must not be: git answers it from the
+    #               subcommand's own option table and prints usage without
+    #               dispatching to a viewer. Verified — `git status -h` prints
+    #               `usage: git status ...` with the payload configured.
+    #               `--help` also takes no abbreviation (`git status --hel` is
+    #               `error: unknown option`), so this one literal entry is the
+    #               whole closure.
     #
     # `-x` and `-O` are refused wherever they appear, so `git clean -x` and
     # `git cherry-pick -x` are refused too. Neither is in shipped code.
@@ -1105,6 +1124,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "-x": "runs a command the caller names, once per commit",
     "--open-files-in-pager": "runs a command the caller names over the matches",
     "-O": "runs a command the caller names over the matches",
+    "--help": "runs the caller-named viewer git help would run",
     "--trailer": "runs a command the caller names to compute a trailer value",
     # Programs git runs on the far side of a transport. Blocked today only by
     # GIT_ALLOW_PROTOCOL refusing `file` — the paired control fires as soon as
@@ -1176,6 +1196,12 @@ _GIT_REFUSED_SUBCOMMANDS = {
     "filter-branch": "runs a command the caller names (`--tree-filter`)",
     "send-email": "runs a command the caller names (`--smtp-server`)",
     "instaweb": "starts a caller-named HTTP daemon",
+    # Directly invocable, and it does run the configured command: with
+    # `browser.evilb.cmd` set repository-locally, both
+    # `git web--browse --browser=evilb <url>` and `git web--browse -b evilb <url>`
+    # execute it. It is NOT here to cover `git help -w`, which reaches this code
+    # path internally without the token ever appearing in argv — that route is
+    # closed by the `help` entry and by `--help` in `_GIT_REFUSED_ARGUMENTS`.
     "web--browse": "runs a caller-named browser command",
     # `git help -m <page>` runs `man.<man.viewer>.cmd` through
     # `execl(SHELL_PATH, "-c", "<cmd> <page>")`, and `git help -w` does the same
@@ -1187,13 +1213,27 @@ _GIT_REFUSED_SUBCOMMANDS = {
     # `uid=`. All three are repository-local `config` writes and a read verb, so
     # no lease is taken anywhere in the sequence.
     #
-    # Refusing the verb is what closes it; refusing `web--browse` alone did not,
-    # because `git help -w` reaches that code path internally and the token
-    # never appears in the argv. The cost is that a bare `help` token anywhere
-    # in an argv is refused, including a commit message that is the single word
-    # `help` — the same trade as `foreach` below. `git help` itself is not
-    # something a skill has any reason to run in a container with no pager and
-    # no terminal.
+    # This entry is half the closure. The other half is `--help` in
+    # `_GIT_REFUSED_ARGUMENTS`, because `git status --help` reaches the same
+    # viewer with `status` in the subcommand slot — refusing this token alone
+    # left that open, and the first cut of this change shipped exactly that gap.
+    #
+    # **The cost is a collision with ordinary text.** `help` is matched against
+    # every token in the argv, so `git commit -m help` and `git checkout -b help`
+    # are refused, with a message that says `git help` is refused. Only an
+    # argument that is *exactly* the word survives the comparison — `git commit
+    # -m "help me"` is one token and passes. Nothing shipped issues a git argv
+    # containing a bare `help` (checked across `agents/`, `k8s-operator/` and
+    # `scripts/`), and the refusal is loud and names the rule.
+    #
+    # Matching the subcommand *slot* instead would remove the collision and was
+    # considered. It is not done, and the reason is measurable: git has
+    # value-taking global options this file does not know about, so resolving
+    # the slot is a guess about git's parser. `git --attr-source HEAD help -m
+    # git` executes the payload, while `_git_plan` reports the subcommand as
+    # `HEAD` — a position-aware check would allow it. Scanning every token
+    # cannot disagree with git about where the subcommand is, and over-refusing
+    # a commit message is the direction this is meant to fail in.
     "help": "runs a caller-named viewer command (`help -m`, `help -w`)",
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
