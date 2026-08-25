@@ -2073,7 +2073,6 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
         self.assertEqual([], self.executed)
 
 
- 
 class BackendSocketModeTest(unittest.TestCase):
     """The backend socket must not inherit a permissive umask.
 
@@ -2157,6 +2156,7 @@ class BackendSocketModeTest(unittest.TestCase):
             self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
             mode = socket_path.stat().st_mode & 0o777
             self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
+
 
 if __name__ == "__main__":
     unittest.main()

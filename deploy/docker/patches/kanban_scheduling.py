@@ -173,12 +173,16 @@ name while every process that made those claims is gone. The new process
 therefore matches ``host_prefix`` against claims made by its *predecessor* and
 runs ``os.kill(pid, 0)`` against PIDs it never issued.
 
-(The pod runs with ``shareProcessNamespace: true``, so the PID *namespace* is the
-pod's and does outlive the container — which is why the replacement dispatcher
-came up as PID 12329 rather than reusing 4. That makes a false *positive* on
-``os.kill(pid, 0)`` less likely than it would be with a fresh namespace, but it
-does not make the adjudication correct: the predecessor's workers are dead, and
-attributing their deaths to the cards is exactly the bug below.)
+(The pod used to run with ``shareProcessNamespace: true``, so the PID *namespace*
+outlived the container — which is why the replacement dispatcher in the incident
+below came up as PID 12329 rather than reusing 4. **That is no longer true.** The
+operator stopped setting the field, because a shared namespace put the credential
+sidecar's ``/proc/<pid>/environ`` inside a directory the sandbox could read; each
+container now gets a PID namespace that is torn down with it. So a restart starts
+counting from 1 again, and a predecessor's recorded PID — 4, in the transcript
+below — is a number the new namespace hands out almost immediately. The
+adjudication was never correct either way; what changed is which way it now goes
+wrong. See ``release_dead_foreign_claims`` for the consequence.)
 
 What that cost us on 2026-08-07
 -------------------------------
@@ -709,6 +713,14 @@ def release_dead_foreign_claims(
     Must be called inside an open write transaction. The ``chargeable`` half of
     the result is what the caller owes to ``charge_reclaimed_cards`` once that
     transaction has closed.
+
+    **A PID collision is more likely than it used to be**, for the reason in the
+    module docstring: the pod no longer shares a process namespace, so a restart
+    hands out PIDs from 1 and a stale claim recording PID 4 will often name a
+    process that is very much alive. ``pid_alive(pid)`` then holds the card
+    rather than reclaiming it, and the TTL is what eventually frees it. That is
+    the fail-safe direction — a card comes back late instead of being taken from
+    something still working on it — but "late" is the TTL, not seconds.
     """
     if process_start is None:
         process_start = process_start_time()

@@ -1260,18 +1260,33 @@ func TestBuildPodTemplateSpecIsolatesTheSidecarUser(t *testing.T) {
 		t.Errorf("expected the shared group %d as both fsGroup and runAsGroup, got %#v", agentFSGroup, podSC)
 	}
 
-	for _, container := range spec.Containers {
+	// Init containers included, and that is the whole point: the credential proxy
+	// is a native sidecar, so it is in InitContainers and a walk of Containers
+	// alone never reaches it. Written that way first, and the sidecar assertion
+	// below was unreachable — deleting RunAsUser from buildCredentialProxySidecar
+	// left this test green.
+	all := append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+	sawProxy := false
+	for _, container := range all {
 		user := podSC.RunAsUser
 		if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
 			user = container.SecurityContext.RunAsUser
 		}
 		isProxy := container.Name == "envoy-credential-proxy"
+		if isProxy {
+			sawProxy = true
+		}
 		if isProxy && *user != credentialProxyUID {
 			t.Errorf("expected the credential sidecar to run as %d, got %d", credentialProxyUID, *user)
 		}
 		if !isProxy && *user != sandboxUID {
 			t.Errorf("expected container %s to run as the sandbox UID %d, got %d", container.Name, sandboxUID, *user)
 		}
+	}
+	// Without this the walk passes vacuously the day the sidecar moves, is
+	// renamed, or stops being built.
+	if !sawProxy {
+		t.Errorf("no envoy-credential-proxy container in the Pod; walked %d containers", len(all))
 	}
 }
 

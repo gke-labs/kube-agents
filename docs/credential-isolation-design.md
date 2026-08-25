@@ -90,6 +90,21 @@ This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
 
+The shared workspace is the other way in, and it is not closed by the UID split
+either. Both containers mount the agent PVC and both write there with
+`umask 0002`, which they must: each has to be able to change what the other
+created. So a file the credential sidecar writes into a clone — a `.git/config`
+in a repository it cloned, say — is group-writable, and the sandbox is in that
+group. Configuration the sandbox edits there is configuration a later proxied
+command reads, and some of it names programs to run. What the UID split removes
+is the sandbox reading the sidecar's process state and private volumes by
+identity; what it does not remove is the sandbox reaching the sidecar through
+bytes the sidecar itself agreed to read. This predates the UID split — before
+it, those bytes were the sandbox's own — so nothing here made it worse, and
+nothing here closes it. The countermeasure is refusing the configuration keys
+that select a program to run, which belongs to the command policy rather than
+to the Pod spec.
+
 ## Scope
 
 ### In scope
