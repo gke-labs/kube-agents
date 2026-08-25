@@ -134,8 +134,9 @@ func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 // 127.0.0.1:8642 with a fixed non-secret sentinel — the agent's API server
 // trusts that sentinel precisely because only the Pod's own loopback can
 // present it. Moving this into the broker Pod would mean publishing 8642 on
-// the cluster network behind a shared fixed string, which is what invariant D4
-// exists to forbid. So the process's two jobs split along the Pod boundary:
+// the cluster network behind a shared fixed string, which is a credential
+// nobody may present from outside the Pod. So the process's two jobs split
+// along the Pod boundary:
 // broker there, front door here. It holds the external API key and no cloud
 // credential at all.
 func buildAgentAPIProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {

@@ -2318,6 +2318,33 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
         self.assertEqual(["forged", "forged"], self.reviews)
 
 
+class PrincipalAuditLineTest(unittest.TestCase):
+    """The audit line has to name the whole ServiceAccount.
+
+    `system:serviceaccount:<ns>:<name>` passes 64 characters at ordinary
+    lengths, and the sanitizer's default cap then removes the tail -- the part
+    that says which ServiceAccount it was. Observed live: the dev install
+    logged `...:kubeagents-platform-agen`.
+    """
+
+    def test_a_65_character_principal_is_not_truncated(self):
+        principal = "system:serviceaccount:kubeagents-system:kubeagents-platform-agent"
+        self.assertEqual(65, len(principal))
+        self.assertEqual(
+            principal,
+            credential_proxy._sanitize_for_logging(principal, max_length=512),
+        )
+
+    def test_the_default_cap_is_unchanged_for_agent_supplied_values(self):
+        self.assertEqual(64, len(credential_proxy._sanitize_for_logging("x" * 200)))
+
+    def test_control_characters_are_still_stripped_at_the_wider_cap(self):
+        self.assertEqual(
+            "systemserviceaccount",
+            credential_proxy._sanitize_for_logging("system\nservice\raccount", max_length=512),
+        )
+
+
 class BuildAuthenticatorTest(unittest.TestCase):
     def test_the_default_is_the_null_authenticator(self):
         with mock.patch.dict(os.environ, {}, clear=True):

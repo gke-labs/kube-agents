@@ -170,21 +170,20 @@ class Principal:
     the agent Pod from another. It answers "which ServiceAccount", not "which
     Pod" and not "on whose behalf".
 
-    ``caller`` is the seam for slice 3, and it is deliberately a field on the
-    object rather than a second parameter threaded through the handler. When
-    the per-caller identity model is settled, the agent obtains a capability
-    token scoped to one session — minted by whatever authority slice 3 lands
-    on, and *attenuating*, so it can never name more authority than the
-    workload token it was exchanged for — and sends it alongside the workload
-    token. This class grows one more verification step that populates
+    ``caller`` is where a per-caller identity would go, and it is deliberately
+    a field on the object rather than a second parameter threaded through the
+    handler. When that model is settled, the agent obtains a capability token
+    scoped to one session — *attenuating*, so it can never name more authority
+    than the workload token it was exchanged for — and sends it alongside the
+    workload token. This class grows one more verification step that populates
     ``caller`` from it, ``authenticate`` keeps its signature, and the policy
     layer downstream reads ``principal.caller`` where it reads
     ``principal.workload`` today. Nothing about the request shape, the
     handler, or the operator's rendering has to change again.
-    ``caller`` stays None until then, and the invariant that matters (A3) is
-    that neither field is ever derived from the request body — from ``argv``,
-    from ``cwd``, from anything a model produced. Both come from a token the
-    API server verified.
+    ``caller`` stays None until then. What must hold in the meantime is that
+    neither field is ever derived from the request body — from ``argv``, from
+    ``cwd``, from anything a model produced. Both come from a token the API
+    server verified.
     """
 
     workload: str
@@ -1878,21 +1877,29 @@ def read_only_enforced() -> bool:
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
 
 
-def _sanitize_for_logging(s: str) -> str:
-    """Strip control characters to prevent log forgery, with 64-char length cap.
+def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
+    """Strip control characters to prevent log forgery, with a length cap.
 
     Removes C0/C1 control characters, line/paragraph separators (Unicode), and
     all characters that could be interpreted as line boundaries by consumers
     (Python splitlines, JS /m, JSON parsers, etc). Also caps length to prevent
     unbounded agent-controlled hint expansion.
+
+    ``max_length`` is raised only for a value the agent does not control. A
+    ServiceAccount username is
+    ``system:serviceaccount:<namespace>:<name>``, which reaches 65 characters
+    at ordinary lengths and truncated at 64 exactly where the discriminating
+    part of the name is -- observed on the dev install, where the principal
+    logged as ``...:kubeagents-platform-agen``. Namespace and name are each
+    bounded at 253 by the API server, so the value cannot grow without bound
+    either way.
     """
     import unicodedata
 
     # Characters in Cc (control), Cf (format), Zl (line sep), Zp (para sep)
     # will forge log lines in text-mode consumers.
     filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))
-    # Cap at 64 chars (no real flag name exceeds this)
-    return filtered[:64]
+    return filtered[:max_length]
 
 
 def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
@@ -1954,9 +1961,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         Binding ``self.principal`` is this method's job rather than each
         route's. The chat relays and the GitHub refresh spend the broker's
         credentials just as ``/v1/exec`` does, so a seam that were populated on
-        only one of them would be a seam slice 3 has to fix before it can use
-        it: whoever adds a per-caller check would find the value present on the
-        route they tested and None on the two they did not.
+        only one of them would be a seam the next change has to fix before it
+        can use it: whoever adds a per-caller check would find the value
+        present on the route they tested and None on the two they did not.
         """
         try:
             self.principal = self.authenticator.authenticate(self.headers)
@@ -2058,16 +2065,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         request_id = str(payload.get("requestId", ""))
         # The principal reaches the decision point, rather than being checked at
-        # the door and thrown away. Every policy refusal below is currently a
-        # judgement about *what* was asked; slice 3's per-caller model is what
-        # lets them become judgements about who asked, and self.principal —
-        # bound for this route and for every other authenticated one by
-        # _authenticated — is the value they will read. Until then it is what
-        # the audit trail records.
+        # the door and thrown away. Every policy refusal below is a judgement
+        # about *what* was asked. A per-caller model is what would let them
+        # become judgements about who asked, and self.principal — bound for
+        # this route and for every other authenticated one by _authenticated —
+        # is the value they would read. Today it is what the audit trail
+        # records and nothing else.
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
             request_id,
-            _sanitize_for_logging(principal.describe()),
+            # 512 rather than the default 64: this value comes from the
+            # TokenReview, not from the request, and a truncated identity is
+            # an audit line that names the wrong ServiceAccount.
+            _sanitize_for_logging(principal.describe(), max_length=512),
             argv[0],
         )
         if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
