@@ -37,10 +37,16 @@ variable "node_count" {
   default     = 1
 }
 
+# General-purpose on purpose. The node runs the GKE system pods and nothing
+# else -- the incident this stack stands up is seeded into Cloud Logging, not
+# scheduled onto the cluster -- so an accelerator machine family bought
+# nothing but cost and a stockout surface. Keep this off the g2-*/a2-*
+# families: the gke submodule infers a GPU from the machine family alone
+# (`local.is_g2`), so putting one back here re-attaches an L4 silently.
 variable "machine_type" {
   type        = string
   description = "VM instance type"
-  default     = "g2-standard-4"
+  default     = "e2-standard-4"
 }
 
 variable "project_id" {
