@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """E2E: the credential boundary between the sandbox and the credential broker.
 
-NEVER EXECUTED. As of the commit that added it, this file has not been run
-against any cluster: it was written on a host with no Linux and no container
-runtime, so its `sh` snippets have never met a real /proc. The verdict logic was
-verified by driving each check with stubbed kubectl output -- every check was
-confirmed to fail on the compromised input it exists for -- but that proves the
-Python, not the shell. Treat the first real run as debugging the test, not as a
-verdict on the code. Delete this paragraph once it has passed against a cluster.
-
 REQUIRES A LIVE CLUSTER. There is no CI job for this file and there cannot be a
 useful one without a running agent Pod: every assertion here is about what the
 kernel shows one container about another, which is precisely the thing a

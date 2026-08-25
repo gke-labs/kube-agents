@@ -267,9 +267,6 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 Asserts, at runtime, the credential boundary between the sandbox and the credential broker. The operator's Go tests assert the _inputs_ — `shareProcessNamespace` left unset, split UIDs, broker-private volumes — and a rendered manifest cannot tell you what the kernel actually shows one container about another. This closes that gap and there is no way to close it without a cluster, so there is no CI job for it.
 
-> [!WARNING]
-> **This file has never been executed.** It was written on a host with no Linux and no container runtime, so its `sh` snippets have never met a real `/proc`. The verdict logic was verified by driving every check with stubbed `kubectl exec` output and confirming each one fails on the compromised input it exists for — but that proves the Python, not the shell. **Treat the first real run as debugging the test, not as a verdict on the code.** Remove this warning once it has passed against a cluster.
-
 Unlike the AgentPlugins suite it is **read-only and safe to run against a cluster you care about**: no image build, no registry, no writes. It runs `id` and reads `/proc` and `/proc/self/mounts`.
 
 ### Prerequisites
