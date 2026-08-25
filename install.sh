@@ -112,7 +112,7 @@ Flags for AI Agents & Automation:
   --anthropic-api-key=KEY       Anthropic API Key
   --gitops-org=ORG              GitHub Org/Username for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: gke-fleet-iac)
-  --permission-set=SET          Agent GCP IAM permission set: read-only | gke-admin | custom
+  --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
@@ -450,8 +450,8 @@ acquire_source_repo() {
 # k8s-operator/scripts/installer_common.sh is the source of truth for install
 # defaults, validation rules, and the terraform.tfvars generator. The installer
 # sources it rather than keeping its own copies, which is how the two drifted
-# apart before (an installer menu defaulting to gke-admin against a read-only
-# default, a us-central1 default against us-east4, a second copy of
+# apart before (an installer menu whose permission-set default disagreed with
+# the provisioner's, a us-central1 default against us-east4, a second copy of
 # derive_kms_location).
 source_provisioning_helpers() {
   local repo_dir="$1"
@@ -1223,13 +1223,11 @@ run_menu_system() {
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
           "read-only — auditing and observability, no GCP write capability (Default)" \
-          "gke-admin — the agent manages GKE lifecycle and node pools directly" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
           1) permission_set="read-only" ;;
-          2) permission_set="gke-admin" ;;
-          3)
+          2)
             permission_set="custom"
             while true; do
               prompt_read "Custom GCP IAM Roles (space- or comma-separated)" custom_roles "$custom_roles"
@@ -1745,10 +1743,11 @@ main() {
   # 9. Agent Permissions & Sandbox Isolation Boundary
   print_step "9. Agent Security & Runtime Isolation Boundary"
   local permission_set="${PARAM_PERMISSION_SET:-read-only}"
-  if ! is_valid_permission_set "$permission_set"; then
-    print_error "Unsupported permission set '$permission_set'. Use read-only, gke-admin, or custom."
-    exit 1
-  fi
+  # require_supported_permission_set (installer_common.sh) is the one home for
+  # the accepted vocabulary and for the explanation the removed admin bundle
+  # gets -- a PLATFORM_AGENT_PERMISSION_SET inherited from a vars.sh or a CI
+  # environment variable written before the removal lands here.
+  require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
   # init_var_platform_agent_permission_set in k8s-operator/scripts/common.sh owns
   # this rule; repeated here only so the run fails at the prompt instead of
@@ -1790,14 +1789,12 @@ main() {
     local perm_choice=""
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
       "read-only — auditing and observability, no GCP write capability (Default)" \
-      "gke-admin — the agent manages GKE lifecycle and node pools directly" \
       "custom — exactly the roles you list, no built-in bundle" \
       perm_choice
 
     case "$perm_choice" in
       1) permission_set="read-only" ;;
-      2) permission_set="gke-admin" ;;
-      3) permission_set="custom" ;;
+      2) permission_set="custom" ;;
     esac
 
     while [ "$permission_set" = "custom" ] && [ -z "$custom_roles" ]; do

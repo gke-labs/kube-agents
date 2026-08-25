@@ -98,9 +98,10 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # slack_home_channel      = "C01234567"
 # slack_home_channel_name = "#kube-agents"
 
-# IAM. "read-only" (default) or "gke-admin" select the bundles
-# the composition grants; "custom" requires project_roles. An explicit
-# project_roles list overrides permission_set either way.
+# IAM. "read-only" (default) selects the bundle the composition grants;
+# "custom" requires project_roles. An explicit project_roles list overrides
+# permission_set either way. There is no admin bundle -- widening access
+# means naming the roles, so that the grant is explicit and reviewed.
 # permission_set = "read-only"
 
 # Optional scheduled backups of the release namespace. Off by default in both

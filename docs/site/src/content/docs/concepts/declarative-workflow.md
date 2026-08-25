@@ -12,7 +12,7 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 - **Human review.** Every infrastructure change gets seen before it hits prod. The PR is the audit trail.
 - **Rollback via revert.** A bad remediation is one revert away from undone.
 - **Compatibility with your existing GitOps.** ArgoCD, Flux, RootSync — whichever reconciler you already run applies the merged change. The agent doesn't compete with your reconciler.
-- **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grant is a leader-election housekeeping Role confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the provisioning-time permission set (`read-only` by default, `gke-admin` as an opt-in). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
+- **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grant is a leader-election housekeeping Role confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the install-time permission set (`read-only` by default; `custom`, where you name every role, is the only way to widen it). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
 
 ## The `submit-suggestion` skill
 

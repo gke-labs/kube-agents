@@ -50,7 +50,39 @@ is_valid_model_provider() {
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
-  [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
+  [[ "${1:-}" =~ ^(read-only|custom)$ ]]
+}
+
+# Accept a permission set, or report why not and return non-zero. Every front
+# door routes its check through here so the three of them cannot drift into
+# accepting different vocabularies -- and so the one value that needs an
+# explanation gets the same one everywhere.
+#
+# `gke-admin` was removed rather than deprecated because it did not merely widen
+# the ceiling, it removed one. GKE authorizes on the UNION of IAM and Kubernetes
+# RBAC, so a GSA holding roles/container.admin is authorized by IAM no matter how
+# narrow the KSA's RBAC is -- and roles/container.admin carries
+# container.clusters.impersonate, which IAM has no resourceNames equivalent for,
+# so granting it is unbounded impersonation of any principal on any cluster in
+# the project. An operator who genuinely needs broad roles uses `custom` and
+# lists them, which makes the grant explicit and reviewable instead of hiding it
+# behind one word.
+#
+# The removed value is named separately from the generic error so that a cached
+# vars.sh, a GitHub environment variable, or a --permission-set flag written
+# before the removal fails with an explanation rather than a bare "invalid".
+# Follows this file's contract: the caller defines print_error.
+require_supported_permission_set() {
+  local value="${1:-}"
+  if [ "$value" = "gke-admin" ]; then
+    print_error "The 'gke-admin' permission set has been removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and its container.clusters.impersonate permission cannot be scoped by IAM. Use 'read-only', or 'custom' with an explicit role list if you accept that risk."
+    return 1
+  fi
+  if ! is_valid_permission_set "$value"; then
+    print_error "Invalid Platform Agent Permission Set '$value'. Must be one of: read-only, custom."
+    return 1
+  fi
+  return 0
 }
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────

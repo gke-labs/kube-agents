@@ -2,6 +2,30 @@
 
 This directory contains executable scripts supporting the Release Candidate (RC) end-to-end automation pipeline.
 
+## Release note: `PLATFORM_AGENT_PERMISSION_SET=gke-admin` now fails the deploy
+
+**Action required before the next RC deploy** for any GitHub environment whose
+`PLATFORM_AGENT_PERMISSION_SET` variable is set to `gke-admin`. That value has been removed and
+`install.sh` now exits non-zero on it, so the deploy hard-fails rather than falling back to a
+default.
+
+**It does not fail before doing damage.** `provision_rc_environment.sh` is `uninstall.sh` followed
+by `install.sh`, and the refusal fires while `install.sh` is collecting configuration — before
+`terraform apply`, but after the teardown has already run. Expect a torn-down RC environment that
+was not rebuilt, not a run that refused to start.
+
+`rc-deploy-environment.yml` forwards `vars.PLATFORM_AGENT_PERMISSION_SET` verbatim to both
+`validate_and_log_deploy_summary.sh` and `provision_rc_environment.sh`, so the summary step logs the
+doomed value and proceeds. The refusal itself is fail-closed by design — `roles/container.admin`
+authorizes the agent through IAM regardless of its Kubernetes RBAC, and its
+`container.clusters.impersonate` permission cannot be scoped by IAM — but nothing warns you ahead of
+the run.
+
+Fix it by editing the environment variable to `read-only`, or to `custom` with
+`PLATFORM_AGENT_CUSTOM_ROLES` naming every role, if you accept that risk explicitly. The reasoning
+is on the site's [Security & IAM](../../docs/site/src/content/docs/reference/security-and-iam.md)
+page under "Why there is no `gke-admin` set".
+
 ## Overview of Scripts
 
 - `common.sh`: Centralized registry/repository helpers (`DEFAULT_REGISTRY_PREFIX`, `DEFAULT_RELEASE_REPO`, `REQUIRED_RELEASE_IMAGES`), commit discovery (`find_latest_built_commit`), validation check (`is_commit_already_validated`), container image promotion (`promote_release_images`), and automated bot tagging (`ensure_git_tag`).

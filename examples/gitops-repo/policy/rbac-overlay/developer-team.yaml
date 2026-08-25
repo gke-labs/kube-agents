@@ -1,6 +1,7 @@
 # Developer-team tier — pre-created read-only identity (06 §2, 03 §4).
 # NAMESPACE-scoped read-only (Role, not ClusterRole). One per team namespace. A ClusterRole labeled
-# tier=developer-team is a wrong-scope grant and is rejected by vap-agent-readonly.
+# tier=developer-team is a wrong-scope grant and is rejected by the `kube-agents-agent-readonly`
+# ValidatingAdmissionPolicy (k8s-operator/config/admission/agent-rbac-policy.yaml).
 apiVersion: v1
 kind: ServiceAccount
 metadata:

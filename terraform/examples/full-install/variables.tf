@@ -91,13 +91,13 @@ variable "namespace" {
 }
 
 variable "permission_set" {
-  description = "Which GCP IAM role bundle the agent's service account gets: read-only, gke-admin, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
+  description = "Which GCP IAM role bundle the agent's service account gets: read-only, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
   type        = string
   default     = "read-only"
 
   validation {
-    condition     = contains(["read-only", "gke-admin", "custom"], var.permission_set)
-    error_message = "permission_set must be one of read-only, gke-admin, or custom."
+    condition     = contains(["read-only", "custom"], var.permission_set)
+    error_message = "permission_set must be one of read-only or custom. The gke-admin bundle was removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and its container.clusters.impersonate cannot be scoped by IAM. Name the roles you need in project_roles instead."
   }
 }
 
