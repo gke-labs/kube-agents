@@ -699,7 +699,7 @@ def build_parser() -> argparse.ArgumentParser:
             claim = cmd.add_mutually_exclusive_group(required=True)
             claim.add_argument(
                 "--verify-commit",
-                default="",
+                default=None,
                 metavar="SHA",
                 help="the commit this reply claims to have made; checked against "
                 "the pull request before anything is posted",

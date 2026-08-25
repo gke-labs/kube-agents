@@ -1087,7 +1087,7 @@ COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
-RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
+RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
@@ -1464,6 +1464,9 @@ USER 10000:10000
 # --- ENTRYPOINT GATE TEST TARGET ---
 # Not shipped, and not a layer of anything that is. Built only by
 # `--target entrypoint-gate-test`, where the RUN either passes or fails the build.
+# `docker-build.yml` then loads the stage and runs the same check a second time as a
+# container under `--read-only`, because a build layer is writable by definition and so
+# the RUN cannot tell you whether the entrypoint needs the write.
 #
 # It exists because the unit tests structurally cannot cover this. They run the entrypoint
 # on a developer host, where every step below the shared-state gate is guarded on

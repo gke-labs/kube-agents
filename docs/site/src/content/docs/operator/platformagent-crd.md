@@ -38,25 +38,25 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                          | Type   | Purpose                                                                                                                                                      |
-| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                         |
-| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                         |
-| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                     |
-| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                        |
-| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                          |
-| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                     |
-| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                                                                               |
-| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`. |
-| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.     |
-| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                        |
-| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                      |
-| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
-| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                 |
-| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
-| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
-| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                             |
+| Field                                          | Type   | Purpose                                                                                                                                                                                                             |
+| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                |
+| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                |
+| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                            |
+| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                               |
+| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                 |
+| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                            |
+| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the credential-proxy sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                        |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                            |
+| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                               |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                             |
+| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                  |
+| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                        |
+| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                               |
+| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                    |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                          |
+| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                    |
 
 `dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
 dashboard` binds `127.0.0.1`, so a request arriving over the pod network gets connection refused.
@@ -525,6 +525,16 @@ merging it into the file at startup left every merged key mutable, so an agent t
 from chat. The platform credentials and endpoints that have no `config.yaml` equivalent are pinned
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
+
+That file also pins one value that is not a credential at all: `API_SERVER_KEY=cluster-internal-trusted`,
+the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
+because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
+file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
+behind `/etc/hermes`. Unpinned, the gateway ends up validating against a value no caller has, and the
+credential proxy, the startup probe and every in-pod loopback call get `401 Invalid gateway API key`
+(issue #786). The container entrypoint warns at boot when this pin and the container env disagree.
+The credential that guards the API from _outside_ is `API_SERVER_EXTERNAL_KEY`, set from
+`hermes.apiServerSecretRef`; the sidecar authenticates the caller against it and swaps in the sentinel.
 
 One consequence is worth knowing before you edit `renderConfigYAML`: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than

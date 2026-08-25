@@ -48,6 +48,11 @@ default, set something distinctly different, then revert and confirm it goes bac
 Say plainly what you could NOT cover and why, and confirm any test artifacts were
 cleaned up.
 
+For a genuinely graphical surface (admin console, docs site, chat), capture and link a
+screenshot with `scripts/pr_evidence_screenshot.sh` — it publishes the image and prints
+Markdown stamped with the commit and capture time. Command output stays as fenced text
+transcripts, not screenshots.
+
 If the change cannot reach a running installation — docs-only, a CI workflow, a path
 that needs infrastructure you do not have — write "Not live-tested" and say why.
 

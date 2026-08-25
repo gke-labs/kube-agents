@@ -10,10 +10,12 @@
 #
 # A task claims a domain with a top-level `domain: <slug>` field in its
 # task.yaml. It counts as covering the domain only when it also carries a
-# non-empty verification_spec.
+# non-empty verification_spec AND is an active (uncommented) entry in
+# hack/ci-eval-pr.sh's TASKS array. Covered means running: a spec-ready task
+# registered commented-out leaves its domain uncovered until it activates.
 #
 # `allowlist` names the domains that are known-uncovered today. Delete entries
-# as Phase 2 lands scenarios; the lint refuses both an uncovered domain that
+# as Phase 2 ACTIVATES scenarios; the lint refuses both an uncovered domain that
 # is not listed (a regression) and a listed domain that is covered (a stale
 # entry hiding progress). The shrinking allowlist is the tier-2 progress
 # metric of the testing implementation plan, as line coverage is the tier-1

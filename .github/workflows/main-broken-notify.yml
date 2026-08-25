@@ -1,0 +1,106 @@
+name: Notify on Broken Main
+
+# Open a `ci:main-broken` issue when a required check fails on main, keep it
+# current while main stays broken, and close it when the check passes again.
+# `scripts/notify_broken_main.py` holds the reasoning and the issue format; this
+# file is the trigger and the guards.
+#
+# No setup: it writes with the workflow's own GITHUB_TOKEN and creates the label
+# the first time it needs one. Issues opened with GITHUB_TOKEN do not trigger
+# further workflows, so this cannot start a loop.
+#
+# `workflows:` matches on the workflow's `name:`, not its filename, and a rename
+# there silently stops this from firing.
+#
+# What may go on the list: a workflow whose green on a push to main is a
+# statement about the tree, not about the push. The script depends on that and
+# cannot check it -- see its docstring. All four below rebuild or re-check
+# everything they cover on every run they start, and `Operator Tests` only
+# starts on a push that touches an operator path.
+#
+# `Prettier Check` is required and deliberately absent. It scopes itself to the
+# files the push changed, so its green says those files are formatted and
+# nothing about the rest of the tree: a bad `docs/a.md` would go red, and the
+# next merge touching only Go would go green and close the issue with an
+# innocent commit named as the fix. Whole-tree prettier is not the fix either --
+# 19 files under `.agents/skills/` have never been formatted, so it would be red
+# from the first run. Prettier is also the check least exposed to the stale-base
+# merge this exists to catch: it reads file contents, which a stale merge base
+# does not change. `cla/google` is an external app with no run to watch.
+#
+# `Validate Repo Structure` runs a second, non-required job (`prompt-assets`)
+# alongside the required `validate`. Watching at run level means its failure
+# also files an issue, which is the more useful behaviour, not an oversight.
+
+on:
+  # zizmor: ignore[dangerous-triggers] - workflow_run is only dangerous when it checks
+  # out the triggering run's code; this checks out the default branch, runs only for
+  # push-to-main runs of this repository, and passes the event nothing but a run id.
+  workflow_run:
+    workflows:
+      - Actionlint
+      - Docker Build
+      - Operator Tests
+      - Validate Repo Structure
+    types: [completed]
+
+# Serialised per watched workflow. Two merges landing together would otherwise
+# both read "was the previous run failing?" against the same history, reach the
+# same answer, and race to open the same issue -- nothing in the API refuses the
+# second one.
+#
+# `cancel-in-progress: false` does not mean nothing is dropped: GitHub holds at
+# most one run pending per group, and a third arrival cancels the one waiting.
+# So a burst of merges loses the notify runs in the middle. That is survivable
+# only because the script reconciles state rather than reporting transitions --
+# it rebuilds the issue body from the run history, and closes an open issue on
+# any green run rather than only on the green that follows a red. A dropped run
+# therefore costs a "Still failing" comment, not a stuck issue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.workflow_id }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Notify on Broken Main
+    # The repository guard is required of any credentialed workflow that starts
+    # on its own (AGENTS.md, Pull Request Hygiene): a fork inherits the trigger
+    # and none of the secrets, so without it every fork sync mails its owner.
+    #
+    # `conclusion` is deliberately not narrowed to failure. A success can be the
+    # recovery that closes a breakage, and the script decides which; what is
+    # filtered here is only the two conclusions that say nothing either way.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the script
+      actions: read # read the triggering run and the workflow's run history
+      issues: write # open, update and close the tracking issue, and its label
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The run id and nothing else. The script reads the conclusion, the
+      # commit and the history back from the API rather than trusting the
+      # event payload for them, so a stale or spoofed field cannot change what
+      # gets filed.
+      - name: Report on the run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: python3 scripts/notify_broken_main.py --run-id "$RUN_ID"

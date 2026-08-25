@@ -150,3 +150,25 @@ def test_append_final_with_no_sections_is_a_no_op():
     base = _base("unchanged")
     _append_final(base, [])
     assert base.metadata["final_message"] == "unchanged"
+
+
+# ------------------------------------------------- the ledger pointer
+
+
+def test_a_delegated_audits_ledger_url_reaches_the_default_scope():
+    """The plumbing ``ledger_issue_contains`` stands on.
+
+    A fleet audit runs in a delegated worker, whose tool calls never enter
+    result.trajectory, and its SOP keeps the router's own closing line to one
+    sentence with no findings in it. What DOES cross back is the worker's card
+    result, which the SOP requires to carry issue_url in full — and that is
+    the only channel by which the verifier can learn WHICH issue to read.
+    """
+    base = _base("Compliance audit complete; details in the ledger.")
+    url = "https://github.com/gke-agentic/kube-agents-evals-infra/issues/42"
+    _append_delivered(
+        base,
+        _observed_with_card_result("t1", f"UPDATED — 1 new finding. Ledger: {url}"),
+        ["t1"],
+    )
+    assert url in base.metadata["final_message"]

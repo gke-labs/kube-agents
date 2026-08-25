@@ -649,14 +649,23 @@ class KubeAgentsHarness(AgentHarness):
         empty) transcript is the truthful input for the verifiers, not the
         previous task's. The clear() up front is the other half of that: see
         the staleness caveat in :mod:`kube_agents_bench.transcript`.
+
+        ``started_at`` is wall clock, taken before the agent is invoked and
+        carried through to the stash: ``ledger_issue_contains`` compares it to
+        the timestamp the audit script rendered into the GitHub ledger issue,
+        which is the only way to tell the artifact THIS run published from the
+        one the previous run left at the same issue number. It must be read
+        here and not at stash time, when the run is already over.
         """
         transcript.clear()
+        started_at = time.time()
         result = super().run(prompt, workspace_path)
         transcript.set(
             result.output,
             result.trajectory,
             prompt=prompt,
             final_message=str(result.metadata.get("final_message") or ""),
+            started_at=started_at,
         )
         return result
 

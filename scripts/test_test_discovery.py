@@ -12,6 +12,12 @@ subtracts EXCLUDED, and asserts every surviving directory is discovered. From
 here on, skipping a directory means adding a reviewed line to EXCLUDED with a
 reason -- it cannot happen by accident of a glob again.
 
+It owns the opposite direction too, because that one is quieter: an EXCLUDED
+entry naming a directory the globs already reach states a policy that is not in
+force, and the dict stops being a description of what CI does. Promoting a tier
+out of exclusion is two edits in two files, and the checks below fail unless
+both land.
+
 PYTHON_TEST_DIRS is read by invoking make itself on a wrapper makefile, not by
 parsing the Makefile's text: the value that matters is the one make expands,
 and a regex re-implementation would drift from it.
@@ -32,30 +38,26 @@ EXCLUDED = {
     # Has its own Makefile target (`make -C k8s-operator test-python`) and its
     # own CI workflow; the root suite does not reach into the operator.
     "k8s-operator": "own suite, k8s-operator-test.yml",
-    # Has its own workflow (agentplugins-test.yml) and its own dependencies.
-    "agentplugins": "own suite, agentplugins-test.yml",
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
-    # tests/e2e is deliberately NOT here: its file is gchat_agent_test.py,
-    # which the test_*.py pattern never matches. If a test_*.py ever lands
-    # there, the orphan check below fires and forces this list to say why the
-    # live-cluster suite must not join PYTHON_TEST_DIRS. That is the point.
-    #
-    # Imports kube_agents_memory, which imports hermes-agent's `agent` module
-    # at module scope -- a dependency requirements-test.txt deliberately does
-    # not install ("far too heavy to install for a unit-test run"). Whether to
-    # stub the provider or pay for the dependency is an open decision; until
-    # it is made, the suite cannot load, and this entry is the record that the
-    # omission is known rather than accidental.
-    "tests/memory": "hermes-agent dependency, decision pending",
+    # Live GKE cluster E2E test suite; pytest-native, requires live cluster, Workload Identity,
+    # and KMS. Runs under `make test-e2e` in e2e-nightly-matrix.yml and e2e-manual-runner.yml.
+    "tests/e2e": "live cluster E2E suite, runs under make test-e2e",
+    # Live black-box CUJ journeys against a provisioned kube-agents install;
+    # they open an admin portal and talk to a deployed agent, so they are
+    # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
+    "bench/cuj": "live manual suite, needs a provisioned install",
+    # tests/integration left this list when the seam tier came off probation
+    # and joined PYTHON_TEST_DIRS; the contradiction check below now keeps it
+    # out mechanically, so no comment has to.
 }
 
 # Directory names that are never test homes, at any depth. .terraform holds
 # provider and module downloads (an initialized module can carry its own
 # upstream test files), so a worktree where tofu init ever ran would
 # otherwise red this guard on vendored tests.
-IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform"}
+IGNORED_NAMES = {".venv", "node_modules", "__pycache__", ".git", ".coverage-data", ".terraform", ".claude"}
 
 
 def discovered_dirs():
@@ -121,6 +123,30 @@ class TestEveryTestFileRuns(unittest.TestCase):
             [],
             "\n\nThese EXCLUDED entries match no test_*.py directory any more; "
             "delete them:\n  " + "\n  ".join(stale),
+        )
+
+    def test_no_exclusion_names_a_directory_that_already_runs(self):
+        # The orphan check above only catches one direction: a directory that
+        # runs nowhere. The other direction is quieter and just as bad -- a
+        # directory that PYTHON_TEST_DIRS picks up while EXCLUDED still claims
+        # it is held back, so the reason string in this file describes a policy
+        # that is not in force. Promoting tests/integration out of probation is
+        # exactly that edit, and with only the check above, adding the Makefile
+        # glob and forgetting to delete the entry here passed clean.
+        discovered = discovered_dirs()
+        contradicted = sorted(
+            prefix
+            for prefix in EXCLUDED
+            if any(d == prefix or d.startswith(prefix + "/") for d in discovered)
+        )
+        self.assertEqual(
+            contradicted,
+            [],
+            "\n\nThese EXCLUDED entries name directories PYTHON_TEST_DIRS "
+            "already discovers, so the stated reason is not in force:\n  "
+            + "\n  ".join(contradicted)
+            + "\n\nEither delete the entry, or drop the Makefile wildcard that "
+            "reaches the directory -- the two must tell one story.",
         )
 
     def test_the_wrapper_reads_a_nonempty_list(self):

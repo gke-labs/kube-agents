@@ -48,3 +48,10 @@ jobs:
       # renamed, or deleted docs that the hand-maintained map missed.
       - name: Documentation map covers every doc
         run: make docs-check-map
+
+      # AGENTS.md and CLAUDE.md are loaded into every agent session before the
+      # first prompt, so their size is a cost paid by every task here. Nothing
+      # about that is visible in a diff, and the file quietly tripled in nine
+      # days before anyone noticed.
+      - name: Agent instruction files fit the context budget
+        run: make docs-check-context-budget

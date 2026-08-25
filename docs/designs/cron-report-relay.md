@@ -108,15 +108,35 @@ So the gateway accepts a value the loopback caller never sees, and the sentinel
 turns rejected inside one pod's first two hours, each one degrading to an
 unrelayed raw report that the scheduler still recorded as delivered.
 
-`_gateway_api_token()` reads `.env` first and falls back to the environment, so a
-deployment where nothing rewrites the key is unaffected. It reads per call rather
-than caching at import, because `.env` is rewritten seconds _after_ this process
-starts. The other direction — writing the sentinel into `.env` so the two agree —
-was tried and is not available: the API server then declines to bind at all.
+`_gateway_api_token()` resolves the name instead of reading it, in
+`load_hermes_dotenv`'s own order: managed `.env`, then `$HERMES_HOME/.env`, then
+the environment. It reads per call rather than caching at import, because `.env`
+is rewritten seconds _after_ this process starts.
 
-This is not specific to the relay. Every in-pod caller that trusts the
-environment has the same 401, `trigger_agent_troubleshooter` included, which is
-why both call sites moved.
+**Fixed at source, 2026-08-19 (issue #786).** The resolver above is now a
+backstop rather than the mechanism. `renderManagedEnv` pins `API_SERVER_KEY` to
+the sentinel in the operator's managed `.env`, unconditionally, and Hermes
+applies the managed scope **last with `override=True`** — after the PVC file it
+was losing to. The PVC file still carries whatever stage2 generated; it simply
+no longer wins. One value is now true in four places: the container env, the
+sidecar's `AGENT_API_UPSTREAM_KEY`, the sidecar's own copy, and the managed pin,
+all from the `loopbackAgentAPIKey` constant.
+
+An earlier version of this section said the other direction — writing the
+sentinel into `.env` so the two agree — was tried and is not available because
+the API server then declines to bind. That observation was confounded: the pod
+had lost its credential-proxy sidecar in the same window. Hermes' actual
+constraint is `has_usable_secret(min_length=16)` in the `api_server.py` startup
+guard, which the 24-character sentinel clears. (The managed pin does not write
+`.env` in any case.)
+
+This was never specific to the relay. Every in-pod caller that trusts the
+environment had the same 401, `trigger_agent_troubleshooter` included, which is
+why both call sites moved — and why the fix belongs in the operator rather than
+in each caller. `docker-entrypoint.sh` now checks the agreement before `exec`
+and names it in the log if it breaks, because the container's startup and
+readiness probes call that same API: a fifth party disagreeing no longer
+degrades quietly, it holds the pod out of Ready.
 
 ## Why context works without an append-only endpoint
 
