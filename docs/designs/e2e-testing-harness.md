@@ -91,6 +91,23 @@ The test runner `scripts/release/execute_e2e_tests.py` reads configuration from 
 | `STOCKOUT_SCENARIOS`  | Comma-separated scenario numbers or `all` | `04`                 |
 | `FLEET_AUDIT_STREAMS` | Specific audit stream names or `all`      | `all`                |
 | `E2E_ENV`             | Target environment selector               | `investigations-e2e` |
+| `GITHUB_ORG`          | Owner used to qualify `GITHUB_REPO`       | Config `env_vars`    |
+| `GITHUB_REPO`         | Repository the GitHub probes target       | Config `env_vars`    |
+
+The last two are read by the fixtures in `tests/e2e/conftest.py` rather than by the
+runner, which forwards the environment to pytest unchanged. `GITHUB_REPO` is required —
+`test_agent_fleet_audit.py` fails rather than skips without it. `GITHUB_ORG` is
+optional, and is only cross-checked against the owner the repository resolves to; where
+it is unset, the fixture takes it from that owner.
+
+The suites' `GITHUB_REPO` resolves to `owner/repo`: `test_agent_fleet_audit.py` asserts
+that shape and `agents/platform/scripts/github_token_refresh.py` refuses anything else.
+A bare repository name is accepted and qualified with `GITHUB_ORG`, because the CI
+variable behind it is bare — `vars.GH_REPO`, which the deploy workflows pass to the
+GitHub Token Minter alongside `vars.GH_ORG` rather than combined with it. That is the
+same spelling with a different meaning: the Token Minter's `GITHUB_REPO`
+([install variables](../site/src/content/docs/deploy/token-minter.md)) is the bare name,
+and only the E2E suites' one is the qualified form.
 
 ### Test Environments
 
@@ -113,3 +130,11 @@ export GCP_PROJECT_ID="my-gcp-project"
 export GKE_CLUSTER_NAME="my-cluster"
 make test-e2e
 ```
+
+The stockout suite waits for its AgentPlugin to reach Ready, for the gateway to finish
+rolling, and for the plugin's `SKILL.md` to be readable inside the surviving pod before
+the first scenario runs. A failure in any of those ends the module naming what was wrong
+rather than letting each scenario spend its watch timeout. The plugin is installed only
+when its custom resource is absent, so the suite needs the permissions that
+[`agentplugins/README.md`](../../agentplugins/README.md#installing) lists only on a
+cluster that has never had it.

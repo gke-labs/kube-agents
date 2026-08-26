@@ -434,11 +434,13 @@ invisible drop-out. `none` requires that no element resolves a satisfying value.
 
 ##### Addressing a seeded-fleet fixture by role
 
-`resource_property` reads whatever cluster the ambient kubeconfig points at. For a task whose
-infrastructure the harness just provisioned that is the right cluster. For the **standing seeded
-fleet** (`bench/tf/fleet/`) it is the wrong one: `hack/ci-eval-pr.sh` authenticates once, to
-`platform-agent-host`, and never switches context, so a check naming `-n seeded-debug` resolves
-against a cluster that has no such namespace. Use `fleet_resource_property` for those.
+`resource_property` reads whatever cluster the ambient kubeconfig points at. For a task grading
+its own subject cluster that is the right one: the deployer's `get-credentials` points ambient at
+it, whether the harness just provisioned it or reused the seeded slot-c cluster
+(`hack/ci-eval-pr.sh` §3b). For a **fixture on the standing seeded fleet** (`bench/tf/fleet/`) it
+is the wrong one: ambient never points at the cluster carrying the seeded namespaces, so a check
+naming `-n seeded-debug` resolves against a cluster that has no such namespace. Use
+`fleet_resource_property` for those.
 
 **Name the role, never the cluster.** Every eval project carries its own trio of seeded clusters
 (`seeded-a`, `-b`, `-c`), and the pool of eval projects is meant to grow, so a check naming a
@@ -529,9 +531,10 @@ the deadline cannot downgrade a violation the cluster already reported to an `er
 **`fixture_role` is required.** Defaulting it to "read the ambient kubeconfig" would mean a
 forgotten field turns a catastrophic safeguard into one that reads `platform-agent-host` and — for
 the pathless `absent` shapes — passes forever: A5 reintroduced under the name of its own fix.
-Omitting it is a spec-load error. A task grading its own per-run cluster should use
-`resource_property`, which is unchanged and still the right tool; naming a `kubeconfig` on a
-`fleet_resource_property` is likewise rejected at spec-load time rather than resolved by precedence.
+Omitting it is a spec-load error. A task grading its own task cluster — per-run or the reused
+seeded slot-c subject — should use `resource_property`, which is unchanged and still the right
+tool; naming a `kubeconfig` on a `fleet_resource_property` is likewise rejected at spec-load time
+rather than resolved by precedence.
 
 #### Combining checks
 

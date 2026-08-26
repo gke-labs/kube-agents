@@ -158,12 +158,64 @@ def fleet_audit_streams() -> str:
     return str(env_vars.get("FLEET_AUDIT_STREAMS") or "all").strip().lower()
 
 
+def _clean(value: Optional[str]) -> Optional[str]:
+    """Trims surrounding whitespace, returning None when no name is left."""
+    text = str(value).strip() if value else ""
+    return text or None
+
+
+def _clean_owner(value: Optional[str]) -> Optional[str]:
+    """_clean for an owner, which carries no slash of its own.
+
+    Kept separate from _clean because stripping slashes off a *repository* would turn a
+    half-written 'owner/' into the bare name 'owner' and hide the missing half.
+    """
+    owner = _clean(value)
+    return _clean(owner.strip("/")) if owner else None
+
+
+def _resolve_github_org() -> Optional[str]:
+    """Resolves the GitHub owner from the environment or e2e_config.yaml.
+
+    Deliberately does not consult GITHUB_REPO, unlike the github_org fixture:
+    _qualify_repo calls this while it is still deciding what github_repo resolves to.
+    """
+    return _clean_owner(os.environ.get("GITHUB_ORG")) or _clean_owner(
+        _get_default_config_env().get("env_vars", {}).get("GITHUB_ORG")
+    )
+
+
+def _qualify_repo(repo: Optional[str]) -> Optional[str]:
+    """Prefixes a bare repository name with the owner.
+
+    GH_REPO is bare by repository convention -- reusable-deploy-integrations.yml passes
+    the org and the repo to the GitHub Token Minter as separate values -- while every
+    consumer of this fixture wants 'owner/repo': test_github_target_repository_configuration
+    asserts the shape, and github_token_refresh.py rejects anything else.
+
+    The owner comes from GITHUB_ORG or, failing that, e2e_config.yaml, which hard-codes
+    it for every e2e environment. So in CI a bare name is always composed, and the
+    owner it gets is that config default whenever nothing more specific is set.
+
+    Only a value with no slash in it is composed. Anything else is returned as the
+    caller gave it, trimmed of surrounding whitespace: 'owner/' and '/repo' stay as they
+    are and fail the caller's structure check naming the value, rather than being
+    reshaped into a repository that parses and does not exist. Whitespace alone
+    resolves to None for the same reason -- 'org/  ' passes both halves of that check.
+    """
+    repo = _clean(repo)
+    if not repo or "/" in repo:
+        return repo
+    org = _resolve_github_org()
+    return f"{org}/{repo}" if org else repo
+
+
 @pytest.fixture(scope="session")
 def github_repo(agent_namespace: str) -> Optional[str]:
     """Resolves the registered GitOps/Audit repository (owner/repo)."""
     val = os.environ.get("GITHUB_REPO") or os.environ.get("GITOPS_REPO")
     if val:
-        return val
+        return _qualify_repo(val)
 
     # Try reading from platform-agent-settings in the cluster
     try:
@@ -178,26 +230,32 @@ def github_repo(agent_namespace: str) -> Optional[str]:
                 if "Git Repo:" in line:
                     repo_cand = line.split("Git Repo:", 1)[1].strip().strip("*` ")
                     if repo_cand and repo_cand.lower() != "none":
-                        return repo_cand
+                        return _qualify_repo(repo_cand)
     except Exception:
         pass
 
     cfg = _get_default_config_env()
     env_vars = cfg.get("env_vars", {})
-    return env_vars.get("GITHUB_REPO") or env_vars.get("GITOPS_REPO")
+    return _qualify_repo(env_vars.get("GITHUB_REPO") or env_vars.get("GITOPS_REPO"))
 
 
 @pytest.fixture(scope="session")
 def github_org(github_repo: Optional[str]) -> Optional[str]:
-    """Resolves the GitHub Organization name."""
-    val = os.environ.get("GITHUB_ORG")
+    """Resolves the GitHub Organization name.
+
+    Every branch is normalised the same way github_repo's owner is, so that
+    GITHUB_ORG=' myorg' and GITHUB_REPO='myorg/repo' agree. Left un-normalised, the
+    two disagree on the whitespace and test_github_target_repository_configuration
+    fails on an owner mismatch instead of on the value that caused it.
+    """
+    val = _clean_owner(os.environ.get("GITHUB_ORG"))
     if val:
         return val
     if github_repo and "/" in github_repo:
-        return github_repo.split("/", 1)[0]
+        return _clean_owner(github_repo.split("/", 1)[0])
     cfg = _get_default_config_env()
     env_vars = cfg.get("env_vars", {})
-    return env_vars.get("GITHUB_ORG")
+    return _clean_owner(env_vars.get("GITHUB_ORG"))
 
 
 @pytest.fixture(scope="session")
