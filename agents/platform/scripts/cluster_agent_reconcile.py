@@ -32,7 +32,8 @@
 # It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
 # profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
 # shared pod-wide, so it operates on every profile regardless of which profile ticks it. It is
-# resilient (always exit 0) and posts a Google Chat summary only when it created or pruned.
+# resilient (always exit 0) and posts a summary to every configured chat platform, only when it
+# created or pruned.
 
 import argparse
 import json
@@ -41,6 +42,7 @@ import subprocess
 import sys
 import urllib.request
 
+from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
@@ -259,14 +261,24 @@ def _format_notification(report: dict) -> str:
 
 
 def _notify(message: str) -> None:
-    """Post a summary to the user's Google Chat home channel (best-effort)."""
-    try:
-        subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
-            capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
-        )
-    except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
-        log(f"Failed to post reconcile notification: {e}")
+    """Post a summary to each configured chat platform's home channel (best-effort).
+
+    The target used to be the literal `google_chat`, which meant a Slack-only
+    install never heard that a Cluster Agent profile had been created or pruned:
+    the send failed on the missing Google Chat home channel and the `except`
+    below turned it into one line of stderr on a run that still exits 0. #989.
+
+    Each platform is sent to independently — a Google Chat outage must not cost
+    Slack the summary, and the reverse.
+    """
+    for platform in enabled_chat_platforms():
+        try:
+            subprocess.run(
+                ["hermes", "send", "--to", platform, message],
+                capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+            )
+        except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
+            log(f"Failed to post reconcile notification to {platform}: {e}")
 
 
 def main() -> None:

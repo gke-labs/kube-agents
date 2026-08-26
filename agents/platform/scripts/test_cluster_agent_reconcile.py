@@ -291,6 +291,41 @@ class NotificationGatingTest(unittest.TestCase):
         notify.assert_not_called()
 
 
+class NotifyTargetTest(unittest.TestCase):
+    """Where _notify sends. Regression cover for #989, where it sent to the
+    literal `google_chat` and a Slack-only install heard nothing at all."""
+
+    def _sends(self, platforms, run=None):
+        """Run _notify with a stubbed resolver; return the `--to` value of each send."""
+        with mock.patch.object(rec, "enabled_chat_platforms", return_value=platforms), \
+             mock.patch.object(rec.subprocess, "run", side_effect=run) as sub:
+            rec._notify("hello")
+        return [call.args[0][3] for call in sub.call_args_list]
+
+    def test_posts_to_every_resolved_platform(self):
+        self.assertEqual(self._sends(["google_chat", "slack"]), ["google_chat", "slack"])
+
+    def test_slack_only_install_gets_the_summary(self):
+        # The reported bug: this used to send to google_chat regardless, and the
+        # failure was swallowed into a log line on a run that still exits 0.
+        self.assertEqual(self._sends(["slack"]), ["slack"])
+
+    def test_one_platform_failing_does_not_cost_the_other_the_summary(self):
+        def run(cmd, **kwargs):
+            if cmd[3] == "google_chat":
+                raise subprocess.CalledProcessError(1, cmd, stderr="no home channel")
+            return mock.DEFAULT
+
+        self.assertEqual(self._sends(["google_chat", "slack"], run=run),
+                         ["google_chat", "slack"])
+
+    def test_the_message_is_the_same_on_every_platform(self):
+        with mock.patch.object(rec, "enabled_chat_platforms", return_value=["google_chat", "slack"]), \
+             mock.patch.object(rec.subprocess, "run") as sub:
+            rec._notify("hello")
+        self.assertEqual({call.args[0][4] for call in sub.call_args_list}, {"hello"})
+
+
 class FormatNotificationTest(unittest.TestCase):
     def test_lists_pruned_and_errors(self):
         msg = rec._format_notification(
