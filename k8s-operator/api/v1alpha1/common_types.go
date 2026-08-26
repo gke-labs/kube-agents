@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -547,6 +548,161 @@ type SecuritySpec struct {
 	// network in cleartext.
 	// +optional
 	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+
+	// EgressPolicy selects the NetworkPolicy the operator renders for the agent
+	// Pod. "None" (the default) renders nothing.
+	//
+	// "Allowlist" renders a default-deny egress policy that permits only the
+	// destinations the agent legitimately needs. Because NetworkPolicy has no
+	// deny rule, a destination is denied by not appearing on the list, and the
+	// link-local metadata server — 169.254.169.254, where anything that can
+	// make an HTTP request can mint the node or Workload Identity service
+	// account's tokens — is one of the destinations left off.
+	//
+	// READ THIS BEFORE YOU BELIEVE THE NAME. On its own this policy does not
+	// deny the agent Pod the metadata server today, because it is not the only
+	// policy selecting that Pod. NetworkPolicies are additive: a Pod may send
+	// whatever the union of every policy selecting it permits, and there is no
+	// way for one policy to subtract from another.
+	//
+	//   - The operator renders <name>-gateway-netpol for the same Pod on every
+	//     reconcile, unconditionally, and it permits 169.254.169.254/32 on TCP
+	//     80 and 8080 and 169.254.169.252/32 on TCP 988 — the pre- and
+	//     post-DNAT forms of a metadata request. It also permits TCP 443 to
+	//     0.0.0.0/0 minus the private ranges, unless the FQDNNetworkPolicy
+	//     annotation is set, so the exfiltration half of this control is
+	//     unioned away as well.
+	//   - A Kustomize install additionally applies platform-agent-core-egress
+	//     (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which
+	//     selects the agent Pod by app.kubernetes.io/name and permits the same
+	//     metadata path. A Helm install does not carry it.
+	//
+	// That overlap is deliberate rather than an oversight: Workload Identity
+	// needs the metadata path, and in the sidecar layout the credential broker
+	// shares the Pod, so <name>-gateway-netpol cannot stop permitting it
+	// without breaking every install. Narrowing it to the broker Pod once the
+	// broker has left is separate work and is not done here. What this field
+	// renders today is the allowlist itself and the object an operator can
+	// audit; treat "the metadata server is denied" as true of this policy in
+	// isolation and not yet of the Pod.
+	//
+	// REQUIRES splitCredentialBrokerPod: true. Containers in one Pod share a
+	// network namespace, and the credential broker reaches the metadata server
+	// on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
+	// cannot deny the metadata server to the agent container while allowing it
+	// to the broker container beside it. Asking for the combination is refused
+	// with Degraded/EgressPolicyRequiresSplitBroker rather than rendered — so
+	// the default install, which has the split off, has none of this.
+	//
+	// Three further conditions the operator cannot check for you.
+	//
+	//   - The policy does nothing at all on a cluster whose CNI does not
+	//     enforce NetworkPolicy (GKE Standard without network policy enabled);
+	//     Autopilot and GKE Dataplane V2 always enforce. An unenforced policy
+	//     is stored and returned by kubectl exactly like an enforced one, so
+	//     there is nothing for the operator to read.
+	//   - Any other policy in the namespace that selects this Pod and permits
+	//     wider egress re-opens what this one closes, as the two above do.
+	//   - NodeLocal DNSCache, if the cluster runs it, may lose DNS entirely.
+	//     It runs hostNetwork, so on Cilium and Dataplane V2 its traffic
+	//     carries a host or remote-node identity, which neither the
+	//     k8s-app: node-local-dns Pod selector nor the 169.254.20.10/32 CIDR
+	//     peer in the rendered DNS rule is guaranteed to match. Both work on
+	//     an iptables dataplane, which is why both are rendered. This is the
+	//     only one of the three that can take the agent down rather than
+	//     quietly weaken it — every allowlisted destination is reached by
+	//     name, so no DNS means no egress at all. Check
+	//     `kubectl -n kube-system get ds node-local-dns` and confirm
+	//     resolution from the agent container after enabling.
+	//
+	// WHAT IT COSTS, and this is not a short list. The allowlist covers DNS,
+	// the credential broker, LiteLLM, the managed OpenTelemetry collector, and
+	// whatever egressAllowlist adds. Everything else the agent container
+	// reaches on its own goes away, on a CNI that enforces:
+	//
+	//   - the "web" toolset (DuckDuckGo) and the "browser" toolset (headless
+	//     Chromium), both of which the platform and cluster-* profiles enable;
+	//   - the MCP servers that call container.googleapis.com and
+	//     developerknowledge.googleapis.com;
+	//   - github.com reached directly from the sandbox;
+	//   - the GKE metadata lookups in cluster_agent_reconcile.py, which fail
+	//     soft — set RECONCILE_PROJECT and RECONCILE_EXCLUDE to restore what
+	//     they were for.
+	//
+	// Those are not accidental casualties. A headless browser with
+	// unrestricted egress is the exfiltration path, so the capabilities this
+	// removes are the same ones that make the control worth having. Restore
+	// individual destinations with egressAllowlist.extraRules — noting that
+	// NetworkPolicy matches addresses, never DNS names, so restoring a hosted
+	// service means naming its address ranges.
+	//
+	// Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
+	// that call the broker, and the broker is on the allowlist.
+	//
+	// TURNING THIS OFF DOES NOT DELETE THE POLICY, and reverting both flags
+	// together will break the agent. An egress policy is a guardrail, and the
+	// operator will not remove a guardrail it may not have created, so setting
+	// this back to "None" leaves <name>-sandbox-metadata-deny in place. That
+	// is fail-closed and harmless on its own — but it is not harmless
+	// alongside splitCredentialBrokerPod: false, because the broker returns to
+	// the Pod the leftover policy selects.
+	//
+	// Revert in three steps, which never leaves a broker inside a policy that
+	// denies it:
+	//
+	//   1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
+	//   2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
+	//      (safe now — with the field off the operator will not re-apply it,
+	//      whereas deleting it while the field is still "Allowlist" only
+	//      earns it back on the next reconcile);
+	//   3. set splitCredentialBrokerPod: false.
+	// +kubebuilder:validation:Enum=None;Allowlist
+	// +optional
+	EgressPolicy string `json:"egressPolicy,omitempty"`
+
+	// EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.
+	// Ignored for any other egressPolicy value.
+	// +optional
+	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+}
+
+// EgressAllowlistSpec supplies the parts of the agent Pod's egress allowlist
+// that the operator cannot derive from the PlatformAgent itself.
+type EgressAllowlistSpec struct {
+	// ControlPlaneCIDRs are the address ranges of the Kubernetes API server,
+	// permitted on port 443.
+	//
+	// Refused, with the same Degraded report extraRules gets, if a range
+	// contains a metadata server address or is broader than /16 (/32 for
+	// IPv6). A GKE control plane is a /28 or a single address, so a wider
+	// range is an internet rule in a field named for the control plane — and
+	// this policy is an exfiltration control as well as a metadata one.
+	//
+	// The operator cannot derive this and NetworkPolicy has no selector for it:
+	// on GKE the control plane is outside the cluster, at a private /28 you
+	// chose at creation time or at a public address, and the in-cluster
+	// "kubernetes" Service is translated to that address before policy is
+	// evaluated. Leaving this empty is allowed and is the stricter choice. It
+	// costs the agent container its API-server connection, which matters at
+	// spec.deployment.replicas above 1, where the container runs
+	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
+	// added that talks to the API. Find the range with
+	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+	// +optional
+	ControlPlaneCIDRs []string `json:"controlPlaneCIDRs,omitempty"`
+
+	// ExtraRules are appended verbatim to the rendered policy, for
+	// destinations a plugin or a custom sidecar needs.
+	//
+	// A rule that would re-permit the metadata server is not rendered — an
+	// escape hatch that can reopen the escape is not one. It is also not
+	// silently skipped: the agent goes Degraded with reason
+	// EgressAllowlistRefused, naming the rule and why, while the policy
+	// without that rule is still rendered and still maintained. A dropped rule
+	// that left the agent Ready would mean an unreachable destination with
+	// nothing in kubectl describe to explain it.
+	// +optional
+	ExtraRules []networkingv1.NetworkPolicyEgressRule `json:"extraRules,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

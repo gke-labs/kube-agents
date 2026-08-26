@@ -1,0 +1,71 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platformagent
+  namespace: kubeagents-system
+spec:
+  # Golden fixture for spec.security.egressPolicy: Allowlist, on top of the
+  # split-broker layout it requires. Everything else is the same shape as
+  # platformagent-split-broker.yaml, so a diff between the two expected
+  # outputs is exactly the rendered NetworkPolicy and nothing else.
+  #
+  # The policy is default-deny egress. The link-local metadata server is
+  # denied by not appearing in the rules -- there is no deny rule in
+  # NetworkPolicy, and the "0.0.0.0/0 with an except clause" form this
+  # repository once shipped is unsound on GKE both ways round. See the
+  # package comment on platformagent_egress_policy.go, which also records
+  # why this policy alone does not deny the Pod the metadata server today:
+  # the gateway policy in the same output still permits it, and policies
+  # selecting one Pod are additive.
+  harness:
+    clusterName: "cluster-a"
+    location: "us-central1-a"
+    projectId: "example-project"
+    eventWatcher:
+      enabled: false
+    hermes:
+      dashboardEnabled: true
+      pluginsDebug: false
+      apiServerSecretRef:
+        name: "platformagent-secrets"
+        key: "api-key"
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9"
+    tag: "latest"
+    imagePullPolicy: "IfNotPresent"
+  security:
+    serviceAccountName: "kubeagents-platform-agent"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com"
+    splitCredentialBrokerPod: true
+    egressPolicy: Allowlist
+    egressAllowlist:
+      # There is no NetworkPolicy peer for "the Kubernetes API server": on GKE
+      # the control plane is not a Pod and not in the cluster. Without this
+      # nothing in the agent Pod can reach the API.
+      controlPlaneCIDRs:
+        - "172.16.0.0/28"
+      extraRules:
+        # An operator restoring one destination the allowlist does not cover --
+        # here GitHub's published range. A rule whose ipBlock contained a
+        # metadata address would be dropped rather than rendered.
+        - to:
+            - ipBlock:
+                cidr: "140.82.112.0/20"
+          ports:
+            - protocol: TCP
+              port: 443
+  integration:
+    googleChat:
+      enabled: true
+      mode: "default"
+      projectId: "kube-agents-gkedemos"
+      topicName: "kubeagents-google-chat-events"
+      subscriptionName: "kubeagents-google-chat-events-sub"
+    slack:
+      enabled: false
+      botToken: ""
+      appToken: ""
+      allowedUsers: []
+      homeChannel: ""
+      homeChannelName: ""
