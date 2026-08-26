@@ -79,7 +79,29 @@ The default **read-only** set swaps the admin roles for viewers:
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
 - `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, `roles/mcp.toolUser` — unchanged.
 
+`roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project. The [scoped service account pool](#the-scoped-service-account-pool) is where a Terraform install can narrow that.
+
 The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
+
+## The scoped service account pool
+
+:::caution[Grants nothing as of 2026-08-12]
+The pool provisions its service accounts, and those accounts hold no IAM grant. Each was scoped by an IAM Condition on the cluster's `resource.name`, and that grants nothing for Kubernetes object operations — measured across four condition spellings, one of which asserted only that the call was a GKE call. Deleting the condition is not the repair: un-conditioned, the same binding is project-wide `roles/container.viewer`, which is the ceiling the pool exists to remove. Both are gone.
+
+So `scoped_clusters` is empty by default and the broker runs on the agent's own identity, as it did before. Authority arrives with per-cluster Kubernetes RBAC, which is a separate change.
+:::
+
+A Terraform install can provision one service account per GKE cluster. The credential broker then mints a short-lived token for the account a request's target cluster maps to, rather than running every request on the agent's own identity.
+
+Set it with the `scoped_clusters` variable, on the [`kube-agents-iam`](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/kube-agents-iam) module or on `terraform/examples/full-install`, which passes it through. A non-empty list provisions the accounts and arms the broker. A cluster that is not in the list is then refused rather than served by a wider credential, so adding a cluster to the fleet without adding it here produces a refusal naming the missing scope.
+
+The narrowing that was to go with it is suspended. The agent's own GSA was to drop `roles/container.viewer` whenever the pool was populated, keeping `roles/container.clusterViewer` — able to enumerate clusters and run `get-credentials`, unable to read anything inside one. The two changes are coupled because neither is safe alone: narrowing the agent while the pool grants nothing breaks every read, and arming the pool while the agent stays wide leaves the ceiling the pool exists to remove. As of 2026-08-12 both are off, and `tests/test_scoped_sa_pool_iam.py` fails on either half.
+
+The module grants the agent `roles/iam.serviceAccountTokenCreator` **on each pool member as a resource**, never at project level. At project level that role would let the agent mint a token for any service account in the project, which would make the pool decorative.
+
+The mapping reaches the broker through `spec.security.scopedServiceAccounts` on the [`PlatformAgent` CR](/kube-agents/operator/platformagent-crd/). The operator renders it into the credential-proxy ConfigMap and sets `CREDENTIAL_PROXY_SCOPED_SA_POOL` on the broker container. That variable is written in both directions, so which credential mode an install is in is readable from the Deployment rather than inferred from what is absent.
+
+**What the pool does not cover.** It scopes what goes _through_ the credential broker. The `gke` MCP server proxies to `container.googleapis.com/mcp` from the agent container on the ambient Workload Identity credential and never reaches the broker, so what bounds that path is the size of the agent's own grant — which is the other half of why `roles/container.viewer` was to come off it.
 
 ## Kubernetes RBAC
 

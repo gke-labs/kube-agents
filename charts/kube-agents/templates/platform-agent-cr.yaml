@@ -91,6 +91,10 @@ spec:
     serviceAccountAnnotations:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+    {{- with .Values.platformAgent.security.scopedServiceAccounts }}
+    scopedServiceAccounts:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
   {{- /*
     `with`, not `if`: an empty value must OMIT the field, not render it as "". Omitting is
     what leaves the operator free to discover a collector; an explicit "" would look like

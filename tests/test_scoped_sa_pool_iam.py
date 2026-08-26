@@ -1,0 +1,355 @@
+"""What the scoped service account pool grants, and what it must not.
+
+The pool exists because impersonation constrains only the RBAC half of GKE's
+IAM-or-RBAC union: an identity holding `roles/container.viewer` reads objects in
+every cluster in the project no matter how narrow its Kubernetes RBAC is. One
+account per cluster was meant to move that read authority off the agent's own
+identity and onto something per-cluster.
+
+As of 2026-08-12 it does not. The IAM Condition each member was scoped by grants
+nothing for Kubernetes object operations, and the un-conditioned binding is
+project-wide `container.viewer`, so both were removed. A member is a principal
+with no authority at all, and the pool is off by default.
+
+That leaves the increment in a state with two halves that must move together,
+which is what most of this file is about. The Terraform is read as text --
+`terraform` is not a dependency of this suite -- but it is read structurally, so
+a grant re-added under any name fails rather than a string sweep passing.
+
+Run:
+  python3 -m unittest discover -s tests -p 'test_scoped_sa_pool_iam.py' -v
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+IAM_MODULE = REPO_ROOT / "terraform" / "modules" / "kube-agents-iam"
+FULL_INSTALL = REPO_ROOT / "terraform" / "examples" / "full-install"
+BROKER_SCRIPTS = REPO_ROOT / "agents" / "platform" / "scripts"
+
+# Roles the agent's own service account may not be granted at project level.
+# The first two are the structural ones -- IAM-side authorization that outranks
+# RBAC, and unscopable impersonation.
+#
+# `roles/iam.serviceAccountTokenCreator` is on this list and is also granted by
+# scoped_pool.tf, and the two are not in tension. At project level it lets the
+# agent mint a token for any service account in the project, which is a general
+# escalation primitive. Bound on a single pool member as a resource, the set of
+# identities the agent can become is exactly the pool. That distinction is the
+# design, and `ScopedPoolCeilingTest` below asserts which form is in force.
+FORBIDDEN_PROJECT_ROLES = {
+    "roles/container.admin",
+    "roles/container.clusterAdmin",
+    "roles/container.developer",
+    "roles/container.hostServiceAgentUser",
+    "roles/monitoring.admin",
+    "roles/logging.admin",
+    "roles/owner",
+    "roles/editor",
+    "roles/iam.serviceAccountTokenCreator",
+}
+
+
+def _hcl_string_list(source: str, name: str) -> list[str]:
+    """The string entries of a named HCL list, in order.
+
+    Deliberately crude -- a regex over the source rather than an HCL parse --
+    but anchored hard enough to fail rather than to quietly return nothing: the
+    block must be found, and it must be non-empty. A test that silently compares
+    two empty lists is the failure this whole file exists to prevent.
+    """
+    block = re.search(
+        rf"^\s*{re.escape(name)}\s*=\s*\[(.*?)^\s*\]",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if block is None:
+        raise AssertionError(f"no list named {name} found; it moved or was renamed")
+    roles = re.findall(r'"([^"]+)"', block.group(1))
+    if not roles:
+        raise AssertionError(f"the list named {name} parsed as empty")
+    return roles
+
+
+def _import_broker_module(name: str):
+    """Import one of the broker's scripts without putting it on sys.path for good."""
+    sys.path.insert(0, str(BROKER_SCRIPTS))
+    try:
+        return __import__(name)
+    finally:
+        sys.path.pop(0)
+
+
+class ModuleAndCompositionAgreeTest(unittest.TestCase):
+    """The two role lists an install can take, compared rather than described.
+
+    `terraform/modules/kube-agents-iam` carries a default read-only set for a
+    caller who names nothing, and `terraform/examples/full-install` resolves
+    `permission_set` into an explicit list before it calls the module. Until now
+    the only thing asserting they matched was a sentence in the module variable's
+    description saying it mirrored the composition. A description does not fail.
+    Somebody widening one path would have left the other alone and nothing would
+    have said so.
+    """
+
+    def test_the_module_default_is_the_compositions_read_only_set(self):
+        module = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        composition = (FULL_INSTALL / "main.tf").read_text(encoding="utf-8")
+        self.assertEqual(
+            _hcl_string_list(composition, "read_only_roles"),
+            _hcl_string_list(module, "agent_read_only_roles"),
+            "the kube-agents-iam module and the full-install composition no longer "
+            "grant the same read-only set; widening one path and not the other is "
+            "how an install ends up with a ceiling nobody chose",
+        )
+
+    def test_the_module_default_grants_no_forbidden_role(self):
+        module = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        self.assertEqual(
+            set(),
+            set(_hcl_string_list(module, "agent_read_only_roles"))
+            & FORBIDDEN_PROJECT_ROLES,
+        )
+
+
+class ScopedPoolCeilingTest(unittest.TestCase):
+    """What the agent's own identity keeps, and what a pool member holds.
+
+    This matters more than an ordinary least-privilege tidy-up because the agent
+    container can reach the metadata server in a default install and mint a token
+    for the agent's identity without going near the broker. Everything the broker
+    enforces is bypassable that way; the size of that role set is not.
+    """
+
+    def _pool_declarations(self) -> str:
+        """scoped_pool.tf with the comments stripped.
+
+        That file explains the removed grant in prose, and a substring match
+        would find its own explanation.
+        """
+        source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
+        return "\n".join(
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def _pool_grants_anything(self) -> bool:
+        """Does a pool member hold any project-level IAM grant of its own?"""
+        return 'resource "google_project_iam_member"' in self._pool_declarations()
+
+    def _agent_is_narrowed(self) -> bool:
+        """Does the module strip container.viewer from the agent's own grant?"""
+        source = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        expression = re.search(
+            r"agent_project_roles\s*=\s*\((.*?)\n  \)", source, re.DOTALL
+        )
+        self.assertIsNotNone(
+            expression, "the computed agent role set moved or was renamed"
+        )
+        body = "\n".join(
+            line
+            for line in expression.group(1).splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        return 'role != "roles/container.viewer"' in body
+
+    def test_the_agent_is_never_narrowed_while_the_pool_grants_nothing(self):
+        """The coupling, as an assertion rather than a comment.
+
+        Two changes ship together or not at all: the pool carrying
+        container.viewer per cluster, and the agent's own identity losing it.
+        Neither is safe alone. Arming the pool while the agent stays wide leaves
+        the ceiling the pool exists to remove. Narrowing the agent while the pool
+        grants nothing is a total outage -- no identity anywhere can read a
+        Kubernetes object, and the runtime flag cannot rescue it, because
+        CREDENTIAL_PROXY_SCOPED_SA_POOL=0 falls back to the very credential that
+        was stripped.
+
+        As of 2026-08-12 both are off: the IAM Condition scoping the pool grants
+        nothing, so the grant and the narrowing were removed together. This test
+        passes in that state and in the fully-restored state, and fails in either
+        half-way house.
+        """
+        if self._agent_is_narrowed():
+            self.assertTrue(
+                self._pool_grants_anything(),
+                "main.tf strips roles/container.viewer from the agent while no "
+                "pool member holds any IAM grant. Nothing can read a Kubernetes "
+                "object, and CREDENTIAL_PROXY_SCOPED_SA_POOL=0 does not help -- "
+                "it falls back to the credential that was just stripped. Restore "
+                "the pool's authority (per-cluster RBAC) in the same change that "
+                "restores the narrowing.",
+            )
+        else:
+            self.assertFalse(
+                self._pool_grants_anything(),
+                "a pool member holds an IAM grant while the agent's own identity "
+                "keeps roles/container.viewer. The ceiling the pool exists to "
+                "remove is still there, and the pool is now a second way to reach "
+                "it. Narrow the agent in the same change.",
+            )
+
+    def test_the_agent_can_still_reach_the_control_plane(self):
+        """Narrowing to nothing would be a different bug.
+
+        `container.clusterViewer` carries container.clusters.get and .list, which
+        is what `gcloud container clusters get-credentials` and the fleet
+        reconcile loop run on. Dropping it would break the broker's own kubeconfig
+        materialisation, and the failure would look like a pool problem rather
+        than a ceiling problem.
+        """
+        source = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        self.assertIn(
+            "roles/container.clusterViewer",
+            _hcl_string_list(source, "agent_read_only_roles"),
+        )
+
+    def test_the_pool_grants_token_creator_per_account_and_never_project_wide(self):
+        """The one line that decides whether the pool is a boundary.
+
+        roles/iam.serviceAccountTokenCreator at project scope would let the agent
+        mint a token for any service account in the project -- a general
+        escalation primitive that makes the per-cluster accounts decorative, since
+        the agent could just become something wider. Bound on each pool member as
+        a resource, the set of identities it can become is exactly the pool.
+
+        Asserted by resource type, because the difference between safe and
+        catastrophic here is `google_service_account_iam_member` versus
+        `google_project_iam_member` and nothing else in the block would look
+        wrong.
+        """
+        source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
+        grants = re.findall(
+            r'resource\s+"(google_\w+_iam_member)"\s+"[^"]*"\s*\{(.*?)\n\}',
+            source,
+            re.DOTALL,
+        )
+        self.assertTrue(grants, "no IAM member resources found in scoped_pool.tf")
+        token_creator = [
+            resource_type
+            for resource_type, body in grants
+            if "roles/iam.serviceAccountTokenCreator" in body
+        ]
+        self.assertEqual(
+            ["google_service_account_iam_member"],
+            token_creator,
+            "the token-creator grant is not bound on the service account as a "
+            "resource; at project scope it lets the agent impersonate anything",
+        )
+
+    def test_no_pool_member_holds_a_project_level_container_grant(self):
+        """The pool members must hold nothing in IAM, and this is why.
+
+        A conditioned `roles/container.viewer` grants nothing for a Kubernetes
+        object operation -- measured 2026-08-12, four condition spellings, all
+        refused, including one asserting only that the call is a GKE call. So the
+        condition cannot come back.
+
+        The un-conditioned form is worse, and that is the case this test really
+        exists for. Someone reading "the condition does nothing" will reach for
+        the obvious repair and delete the condition, leaving every pool member
+        with project-wide `container.viewer` -- the precise ceiling the pool was
+        built to remove, arrived at by way of a fix.
+
+        Either edit fails here. The correct state is no grant: authority comes
+        from per-cluster RBAC, which is a separate change.
+        """
+        body = self._pool_declarations()
+        self.assertNotIn(
+            'resource "google_project_iam_member"',
+            body,
+            "a pool member has been given a project-level IAM grant. Conditioned, "
+            "it grants nothing for object operations; un-conditioned, it grants "
+            "every cluster in the project. Authority for a pool member comes from "
+            "per-cluster RBAC.",
+        )
+        self.assertNotIn(
+            "condition {",
+            body,
+            "an IAM Condition is back in the pool module. Measured 2026-08-12: "
+            "resource attributes are not populated on GKE's object-authorization "
+            "path, so no condition scopes a kubectl read.",
+        )
+
+    def test_the_pool_key_is_the_brokers_key(self):
+        """Terraform and the broker must spell a cluster identically.
+
+        This is what survived the condition's removal. The key is the pool's index
+        -- the broker looks a member up by it and Terraform files a member under
+        it -- so a drift between the two spellings means every request for that
+        cluster is refused. It imports the broker's own function rather than
+        restating the format, because a second copy of the format here would only
+        make the test agree with itself.
+        """
+        scoped_sa_pool = _import_broker_module("scoped_sa_pool")
+
+        source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
+        key_template = re.search(
+            r'for cluster in var\.scoped_clusters :\s*\n\s*"([^"]+)"', source
+        )
+        self.assertIsNotNone(key_template, "the scope key template moved")
+
+        rendered_key = (
+            key_template.group(1)
+            .replace("${cluster.project_id}", "kagents-dev")
+            .replace("${cluster.location}", "us-east4")
+            .replace("${cluster.cluster_name}", "ka-test")
+        )
+        self.assertEqual(
+            scoped_sa_pool.scope_key("kagents-dev", "us-east4", "ka-test"),
+            rendered_key,
+        )
+
+    def test_the_pool_is_disarmed_by_default(self):
+        """Off until a member can actually do something.
+
+        With no IAM grant and no RBAC yet, an armed pool selects a powerless
+        identity for every request and turns every cluster read into a Forbidden.
+        Fail-closed, and a full outage.
+
+        Flip this in the same change that lands per-cluster RBAC, with a test that
+        a real read succeeds through the pool. Not before.
+        """
+        scoped_sa_pool = _import_broker_module("scoped_sa_pool")
+
+        self.assertFalse(
+            scoped_sa_pool.pool_enabled({}),
+            "the pool is armed by default while its members hold no authority",
+        )
+        self.assertTrue(
+            scoped_sa_pool.pool_enabled({scoped_sa_pool.POOL_FLAG_ENV: "1"}),
+            "the pool cannot be turned on explicitly",
+        )
+
+    def test_the_composition_provisions_no_pool_by_default(self):
+        """The other half of the disarm, and the one an install actually hits.
+
+        `pool_enabled` is the broker's default, and the operator overrides it: a
+        PlatformAgent listing scoped accounts renders
+        CREDENTIAL_PROXY_SCOPED_SA_POOL=1. The composition fills that list from
+        `scoped_clusters`, so a default that named the cluster it provisions would
+        arm the pool on every stock install -- past the broker's default entirely,
+        and straight into the outage the test above is written to prevent.
+        """
+        variables = (FULL_INSTALL / "variables.tf").read_text(encoding="utf-8")
+        block = re.search(
+            r'variable "scoped_clusters" \{(.*?)\n\}', variables, re.DOTALL
+        )
+        self.assertIsNotNone(block, "the scoped_clusters variable moved or was renamed")
+        default = re.search(r"^\s*default\s*=\s*(.+)$", block.group(1), re.MULTILINE)
+        self.assertIsNotNone(default, "scoped_clusters declares no default")
+        self.assertEqual(
+            "[]",
+            default.group(1).strip(),
+            "the full-install composition provisions a pool by default. Every "
+            "stock install would then arm the broker onto accounts that hold no "
+            "IAM grant, and every cluster read would be refused.",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

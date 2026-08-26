@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import command_policy
+import scoped_sa_pool
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -1306,11 +1307,23 @@ def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
     return None, directories
 
 
+# Distinguishes "the caller said None" from "the caller said nothing" for
+# `scoped_pool`. None is a real, meaningful value there — it is the ambient
+# credential — so a plain default of None would make an un-parameterised
+# construction silently opt out of the pool, which is the one behaviour this
+# increment cannot afford to reach by omission.
+_FROM_ENVIRONMENT = object()
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
 
     def __init__(
-        self, timeout_seconds: int, max_output_bytes: int, state_dir: str
+        self,
+        timeout_seconds: int,
+        max_output_bytes: int,
+        state_dir: str,
+        scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
@@ -1417,6 +1430,18 @@ class CommandExecutor:
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
+        # Built last: `build_pool` raises on a mapping that is armed and
+        # unusable, and failing here means the container never serves a request
+        # under the ambient credential while an operator believes it is scoped.
+        self.scoped_pool = (
+            scoped_sa_pool.build_pool()
+            if scoped_pool is _FROM_ENVIRONMENT
+            else scoped_pool
+        )
+        if self.scoped_pool is not None:
+            LOGGER.info(
+                "scoped service account pool armed scopes=%d", len(self.scoped_pool.scopes)
+            )
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -1494,7 +1519,32 @@ class CommandExecutor:
         # over it in kubectl, so closing only the environment would leave the
         # flag as an open door.
         command = self._reroute_kubeconfig_flags(command)
-        kubeconfig_path = self._resolve_kubeconfig(kubeconfig) if kubeconfig else None
+        if kubeconfig:
+            kubeconfig_path = self._resolve_kubeconfig(kubeconfig)
+        elif self.scoped_pool is not None and executable == "kubectl":
+            # `KUBECONFIG` is in the base environment, so this branch is not
+            # "no cluster" — it is "the sidecar's default cluster", and it has to
+            # go through selection like any other.
+            #
+            # Only kubectl. gcloud names its target in argv rather than in a
+            # kubeconfig, and deciding scope from argv would put a parser where
+            # the boundary belongs. So gcloud, git and gh keep running as the
+            # agent's own identity, and what bounds them is that identity's
+            # remaining IAM rather than anything decided here.
+            #
+            # Do not read that as "kubectl is the only way to reach a Kubernetes
+            # object." It is not, and the difference matters. The `gke` remote
+            # MCP server in every profile's config.yaml proxies to
+            # container.googleapis.com/mcp from the *agent* container, on the
+            # ambient Workload Identity credential, with no part of this file in
+            # the path. Nothing here scopes it and nothing here can.
+            #
+            # What scopes it is the size of the agent's own grant — which is why
+            # taking roles/container.viewer off that identity is not a tidy-up
+            # alongside this work but the half of it that covers this door.
+            kubeconfig_path = self._default_kubeconfig()
+        else:
+            kubeconfig_path = None
         return self._execute(
             command,
             stdin=stdin,
@@ -1616,7 +1666,87 @@ class CommandExecutor:
         runs under, so it can only name clusters this identity could reach anyway.
         """
         requested = self._workspace_kubeconfig(kubeconfig)
-        return self._ensure_managed_kubeconfig(self._target_of(requested))
+        return self._kubeconfig_for(self._target_of(requested))
+
+    def _kubeconfig_for(self, target: ClusterTarget) -> Path:
+        """Swap the ambient credential for the one that only reads this cluster.
+
+        The managed kubeconfig authenticates with gke-gcloud-auth-plugin, which
+        resolves Application Default Credentials — the agent's own service
+        account, whose IAM reaches every cluster in the project. When the pool is
+        armed that is replaced by a token minted for the account this cluster
+        maps to, and a cluster with no account is refused rather than served by
+        the wide one.
+
+        Selection happens *before* `_ensure_managed_kubeconfig`, and the order is
+        the point. That call runs `gcloud container clusters get-credentials`
+        against the named cluster on the ambient identity; doing it first would
+        mean an unmapped cluster still produced a live call to GKE on the wide
+        credential before the refusal, and would make the refusal depend on that
+        call having succeeded. Refusing first costs nothing and keeps the two
+        independent.
+
+        The scoped file sits beside the managed one in the sidecar-only state
+        dir, and it is rewritten on every call rather than cached: the token
+        behind it rotates, and a file that outlives its token fails as an
+        authentication error somewhere far from here.
+        """
+        if self.scoped_pool is None:
+            return self._ensure_managed_kubeconfig(target)
+        token = self.scoped_pool.token_for(target.project, target.location, target.cluster)
+        managed = self._ensure_managed_kubeconfig(target)
+        scoped = self.kubeconfig_dir / f"{target.context_name}.scoped.yaml"
+        document = scoped_sa_pool.kubeconfig_with_token(
+            managed.read_text(encoding="utf-8"), token
+        )
+        scratch = self.kubeconfig_dir / f".scoped-{uuid.uuid4().hex}.yaml"
+        try:
+            # Created 0600 by the open itself. Writing then chmod-ing would leave
+            # a window in which a bearer token for a cloud identity is readable
+            # at whatever the umask allows.
+            handle = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(document)
+            os.replace(scratch, scoped)
+        finally:
+            scratch.unlink(missing_ok=True)
+        return scoped
+
+    def _ambient_target(self) -> ClusterTarget | None:
+        """The cluster the sidecar's own kubeconfig points at, if any.
+
+        This is the file `bootstrap` asked gcloud to write, so reading it is not
+        the same act as reading one the agent handed over — nothing here is
+        caller-controlled. It matters because `KUBECONFIG` is set in the base
+        environment: a `kubectl` request that names no kubeconfig at all still
+        reaches a cluster, and if the pool did not cover that path it would be
+        the one door left open onto the ambient credential.
+        """
+        try:
+            text = Path(self.environment["KUBECONFIG"]).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return None
+        context = read_current_context(text)
+        return parse_gke_context(context) if context else None
+
+    def _default_kubeconfig(self) -> Path:
+        """The scoped stand-in for the environment's `KUBECONFIG`.
+
+        Refuses when the sidecar's own kubeconfig names no GKE cluster. That is
+        the fail-closed direction and it is deliberate: the alternative is
+        letting the request through on the base environment, which is exactly
+        the ambient credential the pool exists to stop handing out.
+        """
+        target = self._ambient_target()
+        if target is None:
+            raise scoped_sa_pool.PoolRefusal(
+                "the scoped service account pool is armed and this request names no"
+                " cluster; the sidecar's own kubeconfig does not identify a GKE"
+                " cluster either, so there is no scope to select an account for"
+            )
+        return self._kubeconfig_for(target)
 
     def _reroute_kubeconfig_flags(self, command: list[str]) -> list[str]:
         """Point any `--kubeconfig` in argv at the regenerated file.
@@ -2194,6 +2324,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             result = self.executor.execute(
                 argv, stdin=stdin, cwd=cwd, kubeconfig=kubeconfig
             )
+        except scoped_sa_pool.PoolRefusal as exc:
+            # A refusal, not a fault and not a caller error: the request was
+            # well formed and the deployment holds no credential narrow enough
+            # to serve it. Answered with its own rule id so that an operator
+            # reading the logs sees an unprovisioned cluster rather than a
+            # generic policy block, and so that a test can assert on the reason
+            # rather than on a status code every other gate also returns.
+            LOGGER.warning(
+                "scoped service account refused request_id=%s reason=%s", request_id, exc
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "gcp.scoped-sa.unmapped-scope",
+                    "message": str(exc),
+                },
+            )
+            return
         except ValueError as exc:
             # Containment rejections (cwd or kubeconfig outside the workspace)
             # are caller errors, not proxy faults. Returning the reason keeps
