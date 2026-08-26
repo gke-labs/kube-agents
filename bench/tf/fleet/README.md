@@ -20,10 +20,10 @@ State is remote (`backend "gcs"`, partial config), because the operating model i
 re-apply from any checkout — against local state a fresh checkout would plan full
 creates and 409 against the live fleet. The stack applies **once per eval project**,
 and each project keeps its own state: bucket `<project>-tf-state`, prefix
-`seeded-fleet`, always. Every mapped project has the stack applied — the first three as of
-2026-08-24, `kube-agents-evals-4` on 2026-08-25 — and `hack/fleet-kubeconfigs.sh`
-confirms all seven fixture roles in each of the four. Project N+1 follows the same
-convention. The fleet owner creates the bucket once per project; switching projects means
+`seeded-fleet`, always. Whether a given project's apply is complete is not recorded here,
+because a list of project names goes stale silently: `scripts/verify_ci_pool_project.py`
+runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles.
+Project N+1 follows the same convention. The fleet owner creates the bucket once per project; switching projects means
 re-initializing against that project's bucket and naming the project on the apply:
 
     tofu init -reconfigure \

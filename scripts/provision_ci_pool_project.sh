@@ -565,7 +565,12 @@ if [ "${VERIFY_RC}" -eq 0 ]; then
 else
   echo "⚠ ${PROJECT_ID} is provisioned, but verification has not gone green."
   echo "  Nothing failed; one or more items could not be checked. Clear them, then:"
+  # --app-id and --location are spelled out even though the verifier defaults to
+  # these same values: the operator may have passed --app-id or --region to this
+  # script, and a hint that omits them silently verifies a different App or
+  # region than the one just provisioned.
   echo "    python3 scripts/verify_ci_pool_project.py --project-id ${PROJECT_ID} \\"
+  echo "      --app-id ${APP_ID} --location ${REGION} \\"
   echo "      --confirmed-repo-in-app-installation"
   echo "  Boskos registration waits on that exiting 0."
 fi

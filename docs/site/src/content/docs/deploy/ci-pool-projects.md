@@ -144,10 +144,12 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 | `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
 | `kube-agents-evals-3` | `gke-agentic/kube-agents-evals-3-infra` |
 | `kube-agents-evals-4` | `gke-agentic/kube-agents-evals-4-infra` |
+| `kube-agents-evals-5` | `gke-agentic/kube-agents-evals-5-infra` |
+| `kube-agents-evals-6` | `gke-agentic/kube-agents-evals-6-infra` |
 
 The repository is kept private: it is throwaway state a bot rewrites on every run. [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) is the layout an audit expects to find, not a required seed — the current pool repositories carry only a LICENSE and a README, because an audit works against an empty tree and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
 
-> **All four projects are provisioned; three are leasable.** `kube-agents-evals-4` was provisioned on 2026-08-25 by `scripts/provision_ci_pool_project.sh` and verified before registration rather than after — the order this page prescribes. It has no Boskos entry yet, so nothing leases it. Verified in all four:
+> **All five projects are provisioned; three are leasable.** `kube-agents-evals-4` (2026-08-25) and `kube-agents-evals-5` (2026-08-26) were provisioned by `scripts/provision_ci_pool_project.sh` and verified before registration rather than after — the order this page prescribes. Neither has a Boskos entry yet, so nothing leases them. Verified in all five:
 >
 > 1. The private GitOps repository exists and is mapped in the table above.
 > 2. App `4675512` resolves to every pool repository, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`, `metadata: read`.
@@ -225,7 +227,7 @@ tofu init -reconfigure \
 tofu apply -var="project_id=${PROJECT_ID}"
 ```
 
-The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. Every mapped project has the stack applied — the first three as of 2026-08-24, `kube-agents-evals-4` on 2026-08-25 — and `hack/fleet-kubeconfigs.sh` confirms all seven fixture roles in each of the four: `7 role(s) written, 0 on clusters that could not be resolved or reached, 0 whose fixtures were not present`. That command is the check to re-run before believing this paragraph; a project it reports anything else for is a project the stack needs re-applying in. `scripts/verify_ci_pool_project.py` is not a substitute — it matches the three clusters by name and says nothing about their fixtures.
+The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. Confirming the apply is section 7's job: `scripts/verify_ci_pool_project.py` runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles, so there is no separate command to remember here and no dated claim about which projects are planted to go stale. Anything other than `7 role(s) written, 0 on clusters that could not be resolved or reached, 0 whose fixtures were not present` is a project the stack needs re-applying in.
 
 Nothing outside the fleet's own catalog addresses these clusters by name. `hack/fleet-kubeconfigs.sh` discovers them in the leased project by the labels the stack applies (`environment=seeded`, `managed-by=kube-agents-seeded-fleet`), so a project may use a different `cluster_prefix` or region without any scenario changing. The one other sanctioned consumer discovers by the same labels: `hack/ci-eval-pr.sh` §3b reuses the slot-c cluster as the presubmit's log-fixture subject instead of provisioning a per-run cluster, mutating nothing in it — the fleet's catalog (`bench/tf/fleet/fixtures.json`) records the exception.
 
@@ -253,7 +255,9 @@ It exits `0` when everything checked passed, `1` when a prerequisite failed, and
 
 `scripts/provision_ci_pool_project.sh` runs it as its own last step, so a project provisioned by the script has been through this already.
 
-**It is not a complete reading of this page.** `REQUIRED_APIS` in the script is the list it enforces for section 1, the seeded fleet's three clusters and `gs://<project>-tf-state` from section 6 are checked by name, and the section 3 grants it covers are the `kube-agents-prow` reader grants and the host cluster's node account's pull rights on the project's own registry — read off `nodePools[].config.serviceAccount` rather than assumed to be the Compute default — but not the host cluster's location. Read the script's check list rather than assuming a green run means every paragraph above is satisfied.
+One check is not a read-only API call. `Seeded Fleet Fixtures` runs `hack/fleet-kubeconfigs.sh`, which needs `kubectl` and fetches cluster credentials into a temporary directory it removes on the way out. Without `kubectl` on `PATH` that item reports as unverified rather than failing the project.
+
+**It is not a complete reading of this page.** `REQUIRED_APIS` in the script is the list it enforces for section 1, the seeded fleet's three clusters and `gs://<project>-tf-state` from section 6 are checked by name and its planted fixtures by running `hack/fleet-kubeconfigs.sh`, and the section 3 grants it covers are the `kube-agents-prow` reader grants and the host cluster's node account's pull rights on the project's own registry — read off `nodePools[].config.serviceAccount` rather than assumed to be the Compute default — but not the host cluster's location. Read the script's check list rather than assuming a green run means every paragraph above is satisfied.
 
 Two items need something from the operator:
 
@@ -281,3 +285,11 @@ This roster does not live in `oss-test-infra` with the rest of the Prow config �
 **And do not re-run `scripts/provision_ci_pool_project.sh` after it.** Registration is the boundary in both directions. Before it, re-running is free and expected — a first run rarely reaches the end, and every section above is written to be repeatable. After it, the script is the wrong tool: step 2.1 generates a fresh `api_server_key` on each invocation and `terraform/examples/full-install` writes it into the agent's Secret, so a re-run rotates a credential out from under whatever run currently holds the lease, and the agent pod keeps serving the old value until something restarts it. Nothing in the script stops you, and nothing in the failure looks like its cause. Repairing a registered project is a different job from onboarding one, and there is no tooling for it yet.
 
 > **Important:** The Boskos janitor must be disabled for `kube-agents-evals-project` so that the long-lived `platform-agent-host` cluster and pre-warmed state are preserved across leases.
+
+## 9. Raise the presubmit's concurrency
+
+Registration makes a project leasable; it does not make the presubmit use it. The evaluation job's `max_concurrency` in `oss-test-infra` caps how many runs are in flight at once, and the pool size is only a ceiling above it — add five projects without raising that number and the presubmit runs exactly as many evals as it did before, with the new projects idle.
+
+Raise it to the number of leasable projects, not the number provisioned. A slot with no project to lease blocks on Boskos rather than running.
+
+This is the one step in a different repository from section 8's roster: `oss-test-infra` holds the job config, `gke-internal/test-infra` holds the pool. Neither knows about the other, so a change to one is never a prompt to change the other.

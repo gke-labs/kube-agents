@@ -29,6 +29,24 @@ from typing import List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
+_FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+_FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
+
+# The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
+# the only place the counts appear, and the script exits 0 whether it wrote
+# every role file or none -- an absent kubeconfig becomes `status: error` on
+# the checks that needed it rather than killing the job, which is what that
+# script is for -- so the numbers are the whole signal.
+_FLEET_SUMMARY = re.compile(
+    r"Seeded-fleet kubeconfigs: (?P<written>\d+) role\(s\) written to \S+, "
+    r"(?P<unresolved>\d+) on clusters that could not be resolved or reached, "
+    r"(?P<unplanted>\d+) whose fixtures were not present"
+)
+
+# Three get-credentials calls and a kubectl probe per fixture object, against
+# clusters in another project. The 120s ceiling the single gcloud calls use is
+# not enough, and a timeout here reads as a missing fleet.
+FLEET_TIMEOUT_SECONDS = 600
 
 # No gcloud or gh call here should take anywhere near this long. The ceiling
 # exists so a hung call fails the run instead of hanging a CI job forever.
@@ -140,9 +158,13 @@ class CheckResult:
         self.warnings = warnings or []
 
 
-def run_cmd(cmd: List[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> Tuple[int, str, str]:
+def run_cmd(
+    cmd: List[str],
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    env: Optional[dict] = None,
+) -> Tuple[int, str, str]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         # 124 is what GNU timeout(1) reports, so a caller that only looks at the
         # code still sees a failure rather than a success.
@@ -466,7 +488,13 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
 
 
 def check_gke_and_state(project_id: str) -> CheckResult:
-    """Verify the host cluster, its CMEK state, the seeded fleet, and the state bucket."""
+    """Verify the host cluster, its CMEK state, the trio's names, and the state bucket.
+
+    Names and encryption only. Whether the trio holds the planted fixtures is
+    check_seeded_fleet_fixtures() below, and the two are far apart: an apply
+    that created the clusters and died before the Kubernetes provider ran
+    satisfies every assertion here.
+    """
     details = []
     passed = True
 
@@ -509,13 +537,115 @@ def check_gke_and_state(project_id: str) -> CheckResult:
         details.append(f"Missing Terraform state bucket: {state_bucket}")
 
     return CheckResult(
-        "GKE Clusters & Seeded Fleet",
+        "GKE Clusters & Terraform State",
         passed,
         f"All 4 clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
         if passed
-        else "GKE/Fleet resources missing",
+        else "GKE/state resources missing",
         details=details,
     )
+
+
+def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
+    """Run hack/fleet-kubeconfigs.sh against the project and require every role.
+
+    A cluster that exists is not a fixture that was planted, and the gap is not
+    hypothetical: an apply that created the trio and failed before the
+    Kubernetes provider ran leaves three clusters that answer every API call
+    and hold none of the objects. check_gke_and_state() passes that project.
+    Nothing then contradicts it until a lease draws the project, runs a fleet
+    scenario, and every check on it reports `status: error` -- by which point
+    the project is registered and a pull request is wearing the result.
+
+    This is the command the runbook told an operator to run by hand and read
+    the counts off. It writes cluster credentials to a temporary directory,
+    which makes it the one check here that is not a read-only gcloud call; the
+    directory goes away with the run.
+    """
+    name = "Seeded Fleet Fixtures"
+    if not _FLEET_KUBECONFIGS.exists():
+        return CheckResult(name, False, f"Missing {_FLEET_KUBECONFIGS}")
+
+    try:
+        catalog = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+        expected = len(catalog.get("roles") or {})
+    except (OSError, ValueError) as exc:
+        return CheckResult(name, False, f"Could not read {_FLEET_CATALOG}: {exc}")
+    if not expected:
+        return CheckResult(name, False, f"{_FLEET_CATALOG} declares no fixture roles")
+
+    # kubectl is absent from check_toolchain() because every other check here is
+    # gcloud or gh. Without it every probe fails, all seven roles report as
+    # unplanted, and the run states a confident and wrong verdict about a fleet
+    # it never looked at.
+    rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
+    if rc == 127:
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[
+                "kubectl is not on PATH, so the planted fixtures were not checked. "
+                f"Install it and re-run, or run FLEET_PROJECT_ID={project_id} "
+                "hack/fleet-kubeconfigs.sh by hand and read its summary line."
+            ],
+        )
+
+    with tempfile.TemporaryDirectory(prefix="verify-fleet-") as tmp:
+        # A path INSIDE the temporary directory rather than the directory
+        # itself: the script refuses to rm -rf a directory it did not create,
+        # and it creates this one. TemporaryDirectory still takes the
+        # credentials with it on the way out.
+        target = os.path.join(tmp, "kubeconfigs")
+        env = dict(
+            os.environ,
+            FLEET_PROJECT_ID=project_id,
+            BENCH_FLEET_KUBECONFIG_DIR=target,
+        )
+        rc, _, err = run_cmd(
+            ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
+        )
+
+    match = _FLEET_SUMMARY.search(err)
+    if not match:
+        last = (err.strip().splitlines() or ["no output"])[-1]
+        if rc != 0:
+            return CheckResult(
+                name,
+                False,
+                f"hack/fleet-kubeconfigs.sh exited {rc} without reporting",
+                details=[last],
+            )
+        # Exit 0 and no summary means the line moved, not that the fleet is
+        # absent. Saying "no fixtures" here would fail a healthy project on a
+        # change to a string in another file.
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[
+                "hack/fleet-kubeconfigs.sh printed no summary line, so nothing is known "
+                f"about the fixtures in {project_id}. Last line of its output: {last}"
+            ],
+        )
+
+    written = int(match.group("written"))
+    unresolved = int(match.group("unresolved"))
+    unplanted = int(match.group("unplanted"))
+    if written == expected and not unresolved and not unplanted:
+        return CheckResult(name, True, f"All {expected} fixture roles planted and reachable")
+
+    details = [
+        f"{written}/{expected} role(s) written, {unresolved} on clusters that could not be "
+        f"resolved or reached, {unplanted} whose fixtures were not present"
+    ]
+    # The counts say how many; only the warnings say which. Both go in, because
+    # "re-apply the stack" is the wrong advice for a cluster that is there and
+    # unreachable, and the script's own wording is what distinguishes them.
+    details.extend(
+        line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))
+    )
+    return CheckResult(name, False, "Seeded fleet incomplete", details=details)
 
 
 def check_github_repo_and_app(
@@ -938,6 +1068,7 @@ def run_checks(
         checks.append(CheckResult("Artifact Registry Repository", False, "Skipped: could not determine project number"))
 
     checks.append(check_gke_and_state(project_id))
+    checks.append(check_seeded_fleet_fixtures(project_id))
     checks.append(check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
     checks.append(check_token_minter(project_id, app_id, location))
     return checks

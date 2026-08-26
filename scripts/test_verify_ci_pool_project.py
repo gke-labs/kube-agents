@@ -3,6 +3,7 @@
 
 import base64
 import json
+import re
 import subprocess
 import time
 import unittest
@@ -131,6 +132,101 @@ class GkeAndCmekTest(unittest.TestCase):
             result = checker.check_gke_and_state("kube-agents-evals-3")
         self.assertFalse(result.passed)
         self.assertTrue(any("state bucket" in d for d in result.details), result.details)
+
+
+class SeededFleetFixturesTest(unittest.TestCase):
+    """check_seeded_fleet_fixtures shells out to hack/fleet-kubeconfigs.sh.
+
+    Two calls: `kubectl version` to establish the probes can run at all, then
+    the script itself. The script exits 0 whether it wrote every role file or
+    none, so every assertion here is on the summary line it prints to stderr.
+    """
+
+    def _summary(self, written: int, unresolved: int = 0, unplanted: int = 0) -> str:
+        return (
+            f"Seeded-fleet kubeconfigs: {written} role(s) written to /tmp/x, "
+            f"{unresolved} on clusters that could not be resolved or reached, "
+            f"{unplanted} whose fixtures were not present (project kube-agents-evals-5)"
+        )
+
+    def _roles(self) -> int:
+        return len(json.loads(checker._FLEET_CATALOG.read_text(encoding="utf-8"))["roles"])
+
+    def test_every_role_written_passes(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles()))]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([], result.warnings)
+
+    def test_project_is_passed_to_the_script(self):
+        # FLEET_PROJECT_ID is the only thing pointing the script at the project
+        # under test. Without it the script falls back to PROJECT_ID from the
+        # ambient environment and verifies whichever project the operator's
+        # shell happens to name.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles()))]
+            checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        env = run.call_args_list[1].kwargs["env"]
+        self.assertEqual("kube-agents-evals-5", env["FLEET_PROJECT_ID"])
+        self.assertTrue(env["BENCH_FLEET_KUBECONFIG_DIR"].startswith("/"))
+
+    def test_unplanted_fixture_fails_and_names_the_role(self):
+        # The clusters are up and labelled; the objects were never created.
+        # This is the state check_gke_and_state passes and this check exists for.
+        stderr = "\n".join([
+            "WARNING: deployment/payments-api absent from b.kubeconfig in "
+            "kube-agents-evals-5, so fixture role 'crashloop-workload' was never planted.",
+            self._summary(self._roles() - 1, unplanted=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("crashloop-workload" in d for d in result.details), result.details)
+
+    def test_unresolved_cluster_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(0, unresolved=self._roles()))]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed)
+
+    def test_missing_kubectl_is_unverified_not_failed(self):
+        # 127 is "could not look", and reporting it as an absent fleet would
+        # block a project that is fine on a missing binary.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [(127, "", "not found")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed)
+        self.assertTrue(any("kubectl" in w for w in result.warnings), result.warnings)
+        self.assertEqual(1, run.call_count)
+
+    def test_missing_summary_on_exit_zero_is_unverified(self):
+        # The wording lives in another file. If it moves, this check must stop
+        # answering rather than start failing healthy projects.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", "something else entirely")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed)
+        self.assertTrue(result.warnings)
+
+    def test_script_error_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (1, "", "ERROR: fleet fixture catalog not found")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed)
+
+    def test_summary_regex_matches_the_line_the_script_prints(self):
+        # The counts are parsed out of prose in a file this test does not run.
+        # Asserting against a hand-written copy of that prose only proves the
+        # regex matches itself, so take the format string from the script.
+        text = checker._FLEET_KUBECONFIGS.read_text(encoding="utf-8")
+        line = next(
+            l for l in text.splitlines() if "Seeded-fleet kubeconfigs:" in l and "echo" in l
+        )
+        rendered = re.sub(r"\$\{[^}]+\}", "7", line.split('"', 1)[1].rsplit('"', 1)[0])
+        match = checker._FLEET_SUMMARY.search(rendered)
+        self.assertIsNotNone(match, rendered)
 
 
 class ArtifactRegistryTest(unittest.TestCase):
