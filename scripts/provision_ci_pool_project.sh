@@ -412,11 +412,12 @@ fi
 
 # The Workload Identity binding that used to sit here is gone for the same
 # reason the GSA creation above is: module.kube_agents_iam already declares it,
-# with this exact member. Terraform builds the cluster and the binding in one
-# apply, so the ${PROJECT_ID}.svc.id.goog pool -- which GCP creates implicitly
-# with the project's first Workload-Identity-enabled cluster -- exists by the
-# time it is referenced. Doing it here as well was a no-op on a good run and a
-# hard "Identity Pool does not exist" on a project with no cluster yet.
+# with this exact member, and depends_on there orders it after the cluster --
+# which is what makes the ${PROJECT_ID}.svc.id.goog pool exist by the time the
+# binding runs. GCP creates that pool implicitly with the project's first
+# Workload-Identity-enabled cluster; without that edge the binding fires minutes
+# early and the apply fails with "Identity Pool does not exist" on any project
+# that has never had one.
 
 # ─── Step 3: GitHub Token Minter GCP Resources ────────────────────────────────
 echo -e "\n==> [Step 3/5] Provisioning GitHub Token Minter Resources with remote state..."
