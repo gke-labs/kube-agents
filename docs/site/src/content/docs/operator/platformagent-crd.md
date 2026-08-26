@@ -64,8 +64,10 @@ Reaching it means getting inside the pod's network namespace — `kubectl port-f
 9119:9119` on an ordinary node pool, and
 [`scripts/hermes-dashboard-tunnel.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/hermes-dashboard-tunnel.py)
 on a GKE Sandbox (gVisor) one, where port-forward is set up in the host-side netns and cannot see
-the sandbox's listener. That script is canonical on both the access path and why the loopback bind
-is deliberate. The container's readiness probe runs `curl` against loopback for the same reason a
+the sandbox's listener. That script is canonical on the dashboard's access path and on why the
+loopback bind is deliberate; the exec relay it uses to get inside the sandbox lives in
+[`scripts/exec_tunnel.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/exec_tunnel.py),
+shared with the E2E suite, which reaches the agent API the same way and for the same reason. The container's readiness probe runs `curl` against loopback for the same reason a
 `tcpSocket` probe cannot work here: kubelet dials the pod IP, and nothing is listening on it.
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the

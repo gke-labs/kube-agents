@@ -19,12 +19,14 @@ engine it does not carry.
 """
 
 import pathlib
+import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _UNINSTALL_SH = _REPO_ROOT / "uninstall.sh"
@@ -32,12 +34,26 @@ _INSTALLER_COMMON = _REPO_ROOT / "k8s-operator" / "scripts" / "installer_common.
 
 
 class ResolveStateLocationTest(unittest.TestCase):
-    def _run(self, remote_state_exists, env=None, compose_files=()):
+    # What a real `gcloud storage cat` says for each case. The probe reads the
+    # message, not just the exit code, so a stub that only exits 1 would assert
+    # nothing about the distinction the function exists to draw.
+    PROBE_ABSENT = (
+        "ERROR: (gcloud.storage.cat) The following URLs matched no objects or files: "
+        "gs://test-project-kube-agents-tfstate/kube-agents/test-cluster/default.tfstate"
+    )
+    PROBE_DENIED = (
+        "ERROR: (gcloud.storage.cat) HTTPError 403: caller does not have "
+        "storage.objects.get access to the Google Cloud Storage object."
+    )
+
+    def _run(self, remote_state_exists, env=None, compose_files=(), probe_stderr=None):
         """Run resolve_state_location against a stub gcloud and a temp compose dir.
 
-        `remote_state_exists` drives the stub's `storage cat` exit code —
-        uninstall.sh probes only existence, never content. `compose_files`
-        are created empty in the temp composition directory.
+        `remote_state_exists` drives the stub's `storage cat` exit code.
+        `probe_stderr` is what the stub writes to stderr when it fails,
+        defaulting to a genuine not-found; pass PROBE_DENIED for the case where
+        the object may well exist and the caller simply cannot read it.
+        `compose_files` are created empty in the temp composition directory.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -46,11 +62,13 @@ class ResolveStateLocationTest(unittest.TestCase):
             compose_dir.mkdir()
             for name in compose_files:
                 (compose_dir / name).touch()
+            failure_message = self.PROBE_ABSENT if probe_stderr is None else probe_stderr
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
-                f'  *"storage cat"*) exit {0 if remote_state_exists else 1} ;;\n'
+                f'  *"storage cat"*)\n'
+                f"      {'exit 0' if remote_state_exists else f'echo {shlex.quote(failure_message)} >&2; exit 1'} ;;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -67,6 +85,12 @@ echo "rc=$rc bucket=${{KUBE_AGENTS_STATE_BUCKET:-<unset>}}"
                     "PROJECT_ID": "test-project",
                     "CLUSTER_NAME": "test-cluster",
                     "REGION": "us-central1",
+                    # Neutralised, not inherited: get_isolated_test_env strips
+                    # only GITHUB_*/RUNNER_*/CI/GH_TOKEN, and a maintainer with
+                    # this exported reaches the explicitly-named-bucket branch
+                    # in four of these cases. `env` still overrides it, which is
+                    # how the two tests that want a bucket set one.
+                    "KUBE_AGENTS_STATE_BUCKET": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -114,13 +138,176 @@ echo "rc=$rc bucket=${{KUBE_AGENTS_STATE_BUCKET:-<unset>}}"
         )
         self.assertIn("rc=0 bucket=<unset>", proc.stdout, proc.stderr)
 
+    def test_an_unreadable_probe_is_not_reported_as_nothing_to_tear_down(self):
+        # The failure this guards is specific: the RC pipeline's WIF principal
+        # loses storage.objects.get, the probe fails, and a bare exit-code test
+        # calls that "clean project" — so provision_rc_environment.sh takes the
+        # benign arm, raises no annotation, ignores RC_TEARDOWN_STRICT, and
+        # installs over the live cluster. Anything that is not a clean absent
+        # must be a failure.
+        proc = self._run(remote_state_exists=False, probe_stderr=self.PROBE_DENIED)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not read the Terraform state", proc.stdout)
+        self.assertNotIn("rc=3", proc.stdout)
+
+    def test_an_unreadable_probe_outranks_local_state(self):
+        # Falling through to the local-state branch on a permission error is
+        # the same mistake one level down: it would pick up an unrelated
+        # checkout's state and destroy against it.
+        proc = self._run(
+            remote_state_exists=False,
+            probe_stderr=self.PROBE_DENIED,
+            compose_files=("terraform.tfstate",),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Could not read the Terraform state", proc.stdout)
+
     def test_no_state_anywhere_refuses_and_names_source_ref(self):
         # Also the transient-failure case: a gcloud that cannot read the
         # object is indistinguishable from no state, and the safe answer to
         # both is a refusal that names the recovery path, never a destroy.
+        #
+        # rc=3, not 1: this is the one non-zero exit that is not a failure, and
+        # an automated caller (scripts/release/provision_rc_environment.sh) has
+        # to tell "nothing was installed" from "the teardown broke".
         proc = self._run(remote_state_exists=False)
-        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("rc=3", proc.stdout, proc.stderr)
         self.assertIn("--source-ref", proc.stdout)
+
+
+class DiagnosticsTest(unittest.TestCase):
+    """The two ways this teardown used to fail without saying anything."""
+
+    def test_the_process_lock_does_not_silence_stderr(self):
+        # `exec 200>"$LOCK_FILE" 2>/dev/null` applied BOTH redirections to the
+        # shell permanently, so every later error message — this script's abort
+        # banner, lifecycle.sh's, terraform's — went to /dev/null. The release
+        # pipeline's teardown failed that way on every run, exiting non-zero
+        # with an empty stderr. A stub flock is on PATH because the lock block
+        # is skipped entirely where flock is absent (macOS), which would make
+        # this pass without exercising anything.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            flock = bin_dir / "flock"
+            flock.write_text("#!/usr/bin/env bash\nexit 0\n")
+            flock.chmod(flock.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"
+echo "stderr-survived-the-lock" >&2
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertIn("stderr-survived-the-lock", proc.stderr, proc.stdout)
+
+    def test_a_child_exiting_3_does_not_leak_the_reserved_code(self):
+        # on_error exits with the FAILING COMMAND's status, so without
+        # normalisation any child that exits 3 — a gcloud wrapper, a nested
+        # script under lifecycle.sh — would speak the "nothing to tear down"
+        # contract and tell provision_rc_environment.sh to install over a live
+        # environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"
+bash -c "exit 3"
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        # The banner proves on_error actually ran and normalised. Without it
+        # this passes vacuously whenever /tmp/kube-agents-uninstall.lock is
+        # held: the lock branch also exits 1, having asserted nothing.
+        self.assertIn("Teardown error encountered", proc.stderr)
+        self.assertIn("exit code 1", proc.stderr)
+
+    def _scratch_repo(self, tmp):
+        """A minimal kube-agents tree for whole-script runs.
+
+        Running against the real checkout is not hermetic: compose_dir is
+        derived from the script's own directory, and a checkout that has driven
+        a real install carries a gitignored
+        terraform/examples/full-install/backend_override.tf, which sends
+        resolve_state_location down the local-state branch. Green in CI, red on
+        a maintainer's machine.
+        """
+        root = pathlib.Path(tmp) / "repo"
+        (root / "terraform" / "examples" / "full-install").mkdir(parents=True)
+        (root / "k8s-operator" / "scripts").mkdir(parents=True)
+        # Only its existence is tested before the exits under test.
+        (root / "terraform" / "examples" / "full-install" / "lifecycle.sh").touch()
+        shutil.copy(_UNINSTALL_SH, root / "uninstall.sh")
+        shutil.copy(_INSTALLER_COMMON, root / "k8s-operator" / "scripts" / "installer_common.sh")
+        return root
+
+    def _run_whole_script(self, tmp, gcloud_body):
+        bin_dir = create_minimal_tools_bin(tmp)
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(gcloud_body)
+        gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+        root = self._scratch_repo(tmp)
+        return subprocess.run(
+            ["bash", str(root / "uninstall.sh"), "--non-interactive", "-y",
+             "--project-id=p1", "--cluster-name=c1", "--region=r1"],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                # get_isolated_test_env strips only GITHUB_*/RUNNER_*/CI/GH_TOKEN,
+                # so a maintainer's exported bucket would otherwise reach the
+                # explicitly-named-bucket branch and change the answer.
+                overrides={"PATH": str(bin_dir), "KUBE_AGENTS_STATE_BUCKET": ""},
+            ),
+            cwd=str(tmp),
+        )
+
+    def test_no_state_and_no_terraform_still_exits_3(self):
+        # The state probe runs before the terraform gate, so "there is nothing
+        # here" outranks "your machine is missing the engine". Getting this
+        # backwards made exit 3 unreachable on exactly the runner the RC
+        # pipeline uses, which has no terraform.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run_whole_script(
+                tmp,
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *\"storage cat\"*) echo {shlex.quote(ResolveStateLocationTest.PROBE_ABSENT)} >&2; exit 1 ;;\n"
+                '  *"clusters describe"*) echo "NOT_FOUND" >&2; exit 1 ;;\n'
+                "esac\n"
+                "exit 0\n",
+            )
+            self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+            self.assertIn("No Terraform state found", proc.stdout)
+            self.assertNotIn("terraform is not installed", proc.stdout)
+
+    def test_a_missing_terraform_is_refused_by_name(self):
+        # terraform is the teardown engine; without it lifecycle.sh dies on a
+        # bare "terraform: command not found" from inside a subshell. PATH is
+        # restricted to a minimal tool set so the assertion does not depend on
+        # whether the runner happens to ship terraform. The gcloud stub reports
+        # live state, because with none the run exits 3 above this gate — which
+        # is the point of the test above.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run_whole_script(
+                tmp,
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"storage cat"*) echo "{}"; exit 0 ;;\n'
+                "esac\n"
+                "exit 0\n",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("terraform is not installed", proc.stdout)
 
 
 class SourceRefDispatchTest(unittest.TestCase):

@@ -204,7 +204,7 @@ class InstallerCommonTest(unittest.TestCase):
             # Exists but not in state (the stub serves no state object).
             self.assertIn("create_cluster             = false", content)
 
-    def test_tfvars_standard_cluster_and_fresh_create_stay_standard(self):
+    def test_tfvars_standard_cluster_and_unasked_fresh_create_stay_standard(self):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             # An existing Standard cluster: describe succeeds, empty output.
@@ -215,7 +215,8 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('cluster_mode               = "standard"', dest.read_text())
-            # No cluster at all: the script-parity create.
+            # No cluster at all and no CLUSTER_MODE: the installer's default
+            # shape, unchanged by --cluster-mode existing.
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k"},
@@ -224,6 +225,56 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('cluster_mode               = "standard"', content)
             self.assertIn("create_cluster             = true", content)
+
+    def test_tfvars_fresh_create_honours_cluster_mode(self):
+        # --cluster-mode reaches the generator through vars.sh. The probe found
+        # nothing, so the interview's choice is the only shape on offer.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopilot"},
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('cluster_mode               = "autopilot"', content)
+            self.assertIn("create_cluster             = true", content)
+
+    def test_tfvars_fresh_create_rejects_an_unknown_cluster_mode(self):
+        # vars.sh is hand-editable, and an unknown shape reaching Terraform
+        # fails at validate with the whole interview already paid for.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopiloot"},
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("autopiloot", proc.stderr)
+
+    def test_tfvars_live_cluster_outranks_a_conflicting_cluster_mode(self):
+        # The teardown path: uninstall.sh and upgrade.sh regenerate through
+        # this generator from vars.sh alone and have no flag to correct a wrong
+        # CLUSTER_MODE with. A persisted value that disagrees with the live
+        # cluster must lose in BOTH directions — either way round, the losing
+        # answer takes the cluster's count to 0 and turns the next apply into a
+        # replacement.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            # Live Autopilot, vars.sh says standard.
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "standard"},
+                describe_stub="printf 'True\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('cluster_mode               = "autopilot"', dest.read_text())
+            # Live Standard, vars.sh says autopilot.
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopilot"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('cluster_mode               = "standard"', dest.read_text())
 
     # ── ENABLE_GVISOR splits into a pool and a RuntimeClass by cluster shape ──
 
@@ -252,6 +303,27 @@ class InstallerCommonTest(unittest.TestCase):
                 describe_stub=_autopilot_describe_stub(),
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_gvisor_on_a_fresh_autopilot_create_skips_the_version_probe(self):
+        # There is no cluster to describe yet, so the floor check would only
+        # ever produce its "could not read the version" warning. A cluster
+        # created now comes up on its release channel's current version.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "ENABLE_GVISOR": "true",
+                    "CLUSTER_MODE": "autopilot",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("Could not read the GKE version", proc.stderr)
             content = dest.read_text()
             self.assertIn("enable_gvisor_node_pool    = false", content)
             self.assertIn('agent_runtime_class        = "gvisor"', content)
