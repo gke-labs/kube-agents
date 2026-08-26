@@ -457,16 +457,26 @@ class ContentWorkspaceStore:
         # from the caller: a caller-supplied URL is `url.<host>.insteadOf` by
         # another route, and the whole point of this module is that the agent
         # does not choose where the credentials go.
-        self._git(tree, ["clone", "--quiet", url, str(tree / "repo")])
-        workspace = Workspace(
-            handle=handle,
-            repo=repo,
-            tree=tree / "repo",
-            base="",
-            base_sha="",
-        )
-        workspace.base = base or self._default_branch(workspace)
-        workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
+        # Everything from here to the registration is undone on failure. The
+        # directory is created before the clone that fills it, so a clone that
+        # cannot authenticate leaves a tree with no handle pointing at it —
+        # unreachable by `close` and therefore permanent for the life of the
+        # container. Observed against a real install: a private repository with
+        # no credential available left one directory per attempt.
+        try:
+            self._git(tree, ["clone", "--quiet", url, str(tree / "repo")])
+            workspace = Workspace(
+                handle=handle,
+                repo=repo,
+                tree=tree / "repo",
+                base="",
+                base_sha="",
+            )
+            workspace.base = base or self._default_branch(workspace)
+            workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
+        except BaseException:
+            _remove_tree(tree)
+            raise
         self._workspaces[handle] = workspace
         return workspace
 

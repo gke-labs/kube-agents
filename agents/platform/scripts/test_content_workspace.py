@@ -417,6 +417,30 @@ class StoreTest(unittest.TestCase):
         prefixes = {handle[:8] for handle in handles}
         self.assertEqual(16, len(prefixes), "handles must not share a prefix")
 
+    def test_a_clone_that_fails_leaves_no_tree_behind(self):
+        """A tree with no handle is a tree `close` can never reach.
+
+        `open` makes the directory before the clone that fills it, so a clone
+        that cannot authenticate would otherwise leave one directory per attempt
+        on the broker's volume, permanent for the life of the container.
+        Measured against a real install before it was fixed: a private
+        repository with no credential available left exactly that.
+        """
+        runner = RecordingRunner({"clone": FakeResult(128, "", "could not read Username")})
+        store = self.store(runner)
+        with self.assertRaises(content_workspace.GitFailed):
+            store.open("acme/fleet")
+        self.assertEqual(
+            [], list(store.tree_root.iterdir()), "a failed open must leave nothing"
+        )
+        self.assertEqual({}, store._workspaces)
+
+        # Paired ordinary use: a clone that succeeds keeps its tree, and the
+        # handle the store minted reaches it.
+        store = self.store()
+        workspace = store.open("acme/fleet")
+        self.assertEqual([workspace.handle], [p.name for p in store.tree_root.iterdir()])
+
     def test_an_unknown_or_malformed_handle_is_refused(self):
         store = self.store()
         for handle in ("", "../../etc", "z" * 32, None, 42, "0" * 32):
