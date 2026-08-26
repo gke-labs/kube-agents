@@ -49,7 +49,7 @@ Preflight authorization requires an integration-specific implementation. Kuberne
 - Any configured approval requirement is enforced in addition to authorization.
 - Audit records distinguish reads from mutations.
 
-The current provisioner supports read-only, GKE administrator, and custom Google Cloud permission sets. Kubernetes target-resource inspection is read-only; the agent also has narrowly scoped write permissions for its own leader election. Provider-neutral permission profiles, mutation classification in audit records, and per-action approval policy remain deployment-specific.
+The install supports a read-only and a custom Google Cloud permission set; the GKE-administrator set was removed because an IAM grant of `roles/container.admin` authorizes the agent independently of its Kubernetes RBAC. Kubernetes target-resource inspection is read-only; the agent also has narrowly scoped write permissions for its own leader election. Provider-neutral permission profiles, mutation classification in audit records, and per-action approval policy remain deployment-specific.
 
 ### 4. Interaction and Shared State
 
