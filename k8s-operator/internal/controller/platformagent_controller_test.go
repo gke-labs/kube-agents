@@ -287,7 +287,7 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
 	// The metadata-deny NetworkPolicy is a guardrail this controller does not
-	// create. Invariant C5 forbids deleting it, so it belongs on the survivor
+	// create, so deleting it is out of bounds and it belongs on the survivor
 	// side of this test, not the deleted side. Owned here on purpose: an owner
 	// reference is the one thing that would have made deleting it defensible,
 	// and it must survive even so.
@@ -308,7 +308,7 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	}
 	surviving := &networkingv1.NetworkPolicy{}
 	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(guardrail), surviving); err != nil {
-		t.Errorf("the metadata-deny NetworkPolicy is a guardrail the controller does not create; it must survive reconcile (invariant C5), got %v", err)
+		t.Errorf("the metadata-deny NetworkPolicy is a guardrail the controller does not create; it must survive a reconcile, got %v", err)
 	}
 }
 
@@ -379,7 +379,7 @@ func TestReconcileDoesNotDeleteTheMetadataDenyGuardrail(t *testing.T) {
 			}
 
 			if err := cl.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
-				t.Fatalf("Reconcile deleted the metadata-deny NetworkPolicy; invariant C5 forbids a controller deleting a guardrail it did not create: %v", err)
+				t.Fatalf("Reconcile deleted the metadata-deny NetworkPolicy; a controller must not delete a guardrail it did not create: %v", err)
 			}
 
 			// The status is the half the hot loop took away: the reconcile

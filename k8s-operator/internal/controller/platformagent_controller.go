@@ -606,9 +606,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 // It also deliberately does NOT touch the <name>-sandbox-metadata-deny
 // NetworkPolicy. That object is a guardrail, not a workload: it denies the
 // sandbox egress to the link-local metadata server. Deleting it removed a
-// control this controller no longer creates, which is exactly what invariant
-// C5 forbids — "no controller may delete, weaken, or fail to reconcile a
-// guardrail it did not create". A cluster operator who applies that policy by
+// control this controller no longer creates, and the rule this controller keeps
+// is that it does not delete, weaken, or stop reconciling a guardrail it did
+// not create. A cluster operator who applies that policy by
 // hand, or a future release that renders it again, has to be able to rely on
 // it surviving a reconcile. A stale NetworkPolicy fails closed; a stale
 // Deployment does not, which is why the two are treated differently here.
@@ -860,8 +860,8 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 //
 // It applies the policy when spec.security.egressPolicy asks for it, and
 // otherwise does nothing at all — note that "nothing at all" includes not
-// deleting. An egress policy is a guardrail and invariant C5 forbids this
-// controller removing one it did not create, which is the mistake that left
+// deleting. An egress policy is a guardrail, and this controller does not
+// remove one it did not create, which is the mistake that left
 // <name>-sandbox-metadata-deny deleted on every reconcile; see
 // deleteLegacyCredentialIsolationResources. A cluster operator who applies
 // their own policy under this name, or who turns the field off after the

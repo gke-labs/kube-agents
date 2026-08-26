@@ -620,14 +620,16 @@ type SecuritySpec struct {
 	// whatever egressAllowlist adds. Everything else the agent container
 	// reaches on its own goes away, on a CNI that enforces:
 	//
-	//   - the "web" toolset (DuckDuckGo) and the "browser" toolset (headless
-	//     Chromium), both of which the platform and cluster-* profiles enable;
-	//   - the MCP servers that call container.googleapis.com and
-	//     developerknowledge.googleapis.com;
-	//   - github.com reached directly from the sandbox;
-	//   - the GKE metadata lookups in cluster_agent_reconcile.py, which fail
-	//     soft — set RECONCILE_PROJECT and RECONCILE_EXCLUDE to restore what
-	//     they were for.
+	//   - DuckDuckGo web search, which the shared default config turns on for
+	//     every profile, and the "browser" toolset, which only the Chat Agent
+	//     disables;
+	//   - the gke and developer_knowledge MCP servers, which proxy
+	//     container.googleapis.com and developerknowledge.googleapis.com;
+	//   - github.com reached directly from the sandbox, though not the gh and
+	//     git wrappers, which go through the broker;
+	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
+	//     script's project id. It fails soft after a five-second timeout and
+	//     falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
 	//
 	// Those are not accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this

@@ -198,10 +198,10 @@ Two things to verify on the cluster, neither of which the operator can check for
 
 On a cluster that enforces, the allowlist covers DNS, the broker, LiteLLM and the OTel collector. Everything the agent container reaches on its own goes away:
 
-- the `web` toolset (DuckDuckGo) and the `browser` toolset (headless Chromium), both enabled on the `platform` and `cluster-*` profiles;
-- the MCP servers that call `container.googleapis.com` and `developerknowledge.googleapis.com`;
-- `github.com` reached directly from the sandbox;
-- the GKE metadata lookups in the hourly cluster-agent reconcile. Those fail soft — the code catches the error and falls back — but the management cluster stops being excluded from profile creation. Set `RECONCILE_PROJECT` and `RECONCILE_EXCLUDE` to restore what they were for.
+- DuckDuckGo web search, which `deploy/shared/defaults/config.yaml` turns on for every profile (`web.backend: ddgs`), and the `browser` toolset, which only the Chat Agent disables;
+- the `gke` and `developer_knowledge` MCP servers, which proxy `container.googleapis.com` and `developerknowledge.googleapis.com`;
+- `github.com` reached directly from the sandbox — not the `gh` and `git` wrappers, which go through the broker;
+- the metadata lookup in `cluster_agent_reconcile.py`, which is how that script finds its project id. It fails soft after a five-second timeout and falls back to `gcloud config get-value project`, a broker call that is on the allowlist, so the cost is the timeout on each tick. Setting `RECONCILE_PROJECT` skips it.
 
 Credentialed `gcloud`, `kubectl`, `gh` and `git` are unaffected: they are wrappers that call the broker, and the broker is on the list.
 

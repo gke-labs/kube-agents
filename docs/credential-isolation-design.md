@@ -470,9 +470,9 @@ under `splitCredentialBrokerPod: true`, and it owns them in both directions —
 applied while the flag is on, deleted when it goes off.
 
 The `<agent>-sandbox-metadata-deny` NetworkPolicy is left alone for a different
-reason. It is a guardrail rather than a workload, and invariant C5 forbids this
-controller deleting a guardrail it did not create, so a cluster operator who
-applies that policy by hand can rely on it surviving a reconcile. A stale
+reason. It is a guardrail rather than a workload, and this controller does not
+delete a guardrail it did not create, so a cluster operator who applies that
+policy by hand can rely on it surviving a reconcile. A stale
 NetworkPolicy fails closed; a stale Deployment does not. Leaving it on the list
 was also a live bug: nothing owns a hand-applied copy, so the ownership check
 above refused it and failed every reconcile before `updateStatusReady`, which

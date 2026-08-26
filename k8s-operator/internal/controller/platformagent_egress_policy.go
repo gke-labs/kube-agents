@@ -61,8 +61,8 @@ package controller
 //   - It requires spec.security.splitCredentialBrokerPod. The broker mints the
 //     cloud token from the metadata server — that is its function — and a
 //     Pod-level policy cannot tell two containers in one network namespace
-//     apart. reconcileAgentEgressPolicy refuses to render in the sidecar
-//     layout and reports Degraded.
+//     apart. validateEgressPolicy refuses the reconcile in the sidecar layout
+//     and reports Degraded, and nothing is rendered.
 //   - It does nothing whatsoever on a cluster whose CNI does not enforce
 //     NetworkPolicy. The operator cannot detect that: an unenforced policy is
 //     accepted by the API server, stored, and returned by kubectl get exactly
@@ -99,8 +99,8 @@ const (
 	egressPolicyAllowlist = "Allowlist"
 
 	// agentEgressPolicyNameSuffix keeps the name the previous two-pod layout
-	// used, and that invariant C5 and deleteLegacyCredentialIsolationResources
-	// both name. Rendering under a new name would leave any hand-applied copy
+	// used, and that deleteLegacyCredentialIsolationResources still names.
+	// Rendering under a new name would leave any hand-applied copy
 	// of the old one in place beside this one, and since policies are additive
 	// the more permissive of the two would win.
 	agentEgressPolicyNameSuffix = "-sandbox-metadata-deny"
