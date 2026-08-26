@@ -777,17 +777,95 @@ class TokenMinterTest(unittest.TestCase):
         self._run(key=_ok(self._key(algorithm="RSA_SIGN_PSS_2048_SHA256")))
         self.probe_mock.assert_not_called()
 
-    def test_probe_uses_the_highest_enabled_version_not_a_hardcoded_one(self):
-        # token-minter.md offers rotation as "import a new key version"; pinning
-        # version 1 would fail a correctly rotated project.
-        self._run(versions=_ok(self._versions(ids=(2,))))
-        self.assertEqual(self.probe_mock.call_args.args[2], "2")
+    def test_probe_uses_the_version_the_chart_pins_not_the_highest(self):
+        # The pool deploys through helm and the chart pins
+        # githubMinter.kms.keyVersion, so probing the highest ENABLED version
+        # would verify a key no lease ever loads.
+        self._run(versions=_ok(self._versions(ids=(1, 2))))
+        self.assertEqual(self.probe_mock.call_args.args[2], "1")
+
+    def test_rotation_that_disables_the_pinned_version_fails(self):
+        # import v2, disable v1 -- the rotation token-minter.md describes. The
+        # old highest-ENABLED probe greened here while every lease deployed a
+        # minter pinned to the disabled v1.
+        versions = json.dumps([
+            {"name": "projects/p/.../cryptoKeyVersions/1", "state": "DISABLED"},
+            {"name": "projects/p/.../cryptoKeyVersions/2", "state": "ENABLED"},
+        ])
+        result = self._run(versions=_ok(versions))
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("cryptoKeyVersion 1" in d and "DISABLED" in d for d in result.details), result.details
+        )
+        self.probe_mock.assert_not_called()
+
+    def test_pinned_version_that_does_not_exist_fails(self):
+        result = self._run(versions=_ok(self._versions(ids=(2,))))
+        self.assertFalse(result.passed)
+        self.assertTrue(any("does not exist" in d for d in result.details), result.details)
+        self.probe_mock.assert_not_called()
 
     def test_several_enabled_versions_warn_but_pass(self):
         result = self._run(versions=_ok(self._versions(ids=(1, 2))))
         self.assertTrue(result.passed, result.details)
         self.assertTrue(any("ENABLED versions" in w for w in result.warnings), result.warnings)
+        self.assertEqual(self.probe_mock.call_args.args[2], "1")
+
+    def test_unreadable_chart_pin_warns_and_falls_back(self):
+        with mock.patch.object(
+            checker, "_chart_pinned_key_version", return_value=(None, "missing values.yaml")
+        ):
+            result = self._run(versions=_ok(self._versions(ids=(1, 2))))
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("unconfirmed" in w for w in result.warnings), result.warnings)
         self.assertEqual(self.probe_mock.call_args.args[2], "2")
+
+    def test_message_names_the_version_it_verified(self):
+        self.assertIn("v1", self._run().message)
+
+
+class ChartKeyVersionPinTest(unittest.TestCase):
+    """The pin is only authoritative if it is read correctly and not overridden."""
+
+    def _values(self, text):
+        fake = mock.Mock()
+        fake.exists.return_value = True
+        fake.read_text.return_value = text
+        return mock.patch.object(checker, "_CHART_VALUES", fake)
+
+    def test_reads_the_pin_out_of_the_real_chart(self):
+        version, detail = checker._chart_pinned_key_version()
+        self.assertEqual(detail, "")
+        self.assertTrue(version and version.isdigit(), f"unreadable pin {version!r}: {detail}")
+
+    def test_ci_deploy_does_not_override_the_pin(self):
+        # The chart's value is what the pool signs with only because nothing
+        # overrides it at deploy time. An override added to GITHUB_MINTER_ARGS
+        # later would make this whole check verify the wrong version again, so
+        # it fails here rather than in a fifteen-minute helm timeout.
+        self.assertNotIn("kms.keyVersion", checker._CI_DEPLOY.read_text(encoding="utf-8"))
+
+    def test_a_pin_outside_the_githubminter_block_is_not_read(self):
+        with self._values('other:\n  kms:\n    keyVersion: "9"\ngithubMinter:\n  kms:\n    keyVersion: "3"\n'):
+            self.assertEqual(checker._chart_pinned_key_version()[0], "3")
+
+    def test_unquoted_pin_is_read(self):
+        with self._values("githubMinter:\n  kms:\n    keyVersion: 4\n"):
+            self.assertEqual(checker._chart_pinned_key_version()[0], "4")
+
+    def test_missing_values_file_is_reported_not_raised(self):
+        fake = mock.Mock()
+        fake.exists.return_value = False
+        with mock.patch.object(checker, "_CHART_VALUES", fake):
+            version, detail = checker._chart_pinned_key_version()
+        self.assertIsNone(version)
+        self.assertIn("missing", detail)
+
+    def test_absent_pin_is_reported_not_guessed(self):
+        with self._values("githubMinter:\n  kms:\n    key: github-token-minter-key\n"):
+            version, detail = checker._chart_pinned_key_version()
+        self.assertIsNone(version)
+        self.assertIn("keyVersion", detail)
 
 
 class _Response:
@@ -1043,6 +1121,141 @@ class ToolchainTest(unittest.TestCase):
         self.assertEqual(status, checker.EXIT_UNVERIFIED)
         out = "\n".join(str(c.args[0]) for c in p.call_args_list if c.args)
         self.assertIn("Nothing was checked", out)
+
+
+_REMOTES = (
+    "origin\tgit@github.com:lapis2002/kube-agents.git (fetch)\n"
+    "origin\tgit@github.com:lapis2002/kube-agents.git (push)\n"
+    "gke-labs\tgit@github.com:gke-labs/kube-agents.git (fetch)\n"
+    "gke-labs\tgit@github.com:gke-labs/kube-agents.git (push)\n"
+    "upstream\tgit@github.com:gke-labs/devops-bench.git (fetch)\n"
+    "upstream\tgit@github.com:gke-labs/devops-bench.git (push)\n"
+)
+
+
+def _ci_deploy_text(*projects):
+    rows = "".join(f'    {p}) echo "gke-agentic/{p}-infra" ;;\n' for p in projects)
+    return 'gitops_repo_for_project() {\n  case "$1" in\n' + rows + "    *) return 1 ;;\n  esac\n}\n"
+
+
+def _local_ci_deploy(text):
+    fake = mock.Mock()
+    fake.exists.return_value = True
+    fake.read_text.return_value = text
+    return mock.patch.object(checker, "_CI_DEPLOY", fake)
+
+
+def _git(remotes=_REMOTES, remotes_rc=0, show=None, show_rc=0, show_err="fatal: bad object",
+         log="2026-08-19", log_rc=0):
+    def responder(cmd, *_a, **_kw):
+        if cmd[3] == "remote":
+            return (remotes_rc, remotes if remotes_rc == 0 else "", "" if remotes_rc == 0 else "not a git repo")
+        if cmd[3] == "show":
+            return (show_rc, show or "", "" if show_rc == 0 else show_err)
+        if cmd[3] == "log":
+            return (log_rc, log + "\n" if log_rc == 0 else "", "" if log_rc == 0 else "fatal: bad revision")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    return mock.patch.object(checker, "run_cmd", side_effect=responder)
+
+
+class CodebaseMappingTest(unittest.TestCase):
+    """The row a presubmit reads is main's, not this checkout's."""
+
+    def test_row_on_upstream_main_passes_clean(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), \
+             _git(show=_ci_deploy_text("kube-agents-evals-6")):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertTrue(r.passed)
+        self.assertEqual(r.warnings, [])
+        self.assertIn("gke-labs/main", r.message)
+
+    def test_row_only_in_this_checkout_is_unverified_not_green(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), \
+             _git(show=_ci_deploy_text("kube-agents-evals-3")):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertTrue(r.passed)
+        self.assertEqual(len(r.warnings), 1)
+        self.assertIn("not yet on gke-labs/main", r.message)
+        self.assertIn("before registering", r.warnings[0])
+        self.assertIn("git fetch gke-labs main", r.warnings[0])
+
+    def test_row_only_in_this_checkout_withholds_the_safe_to_register_verdict(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), \
+             _git(show=_ci_deploy_text("kube-agents-evals-3")):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        with mock.patch("builtins.print") as p:
+            status = checker.report("kube-agents-evals-6", [r])
+        out = "\n".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        self.assertEqual(status, checker.EXIT_UNVERIFIED)
+        self.assertNotIn("ALL CHECKS PASSED", out)
+
+    def test_row_absent_locally_still_fails_without_consulting_git(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-3")), \
+             mock.patch.object(checker, "run_cmd") as run:
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertFalse(r.passed)
+        run.assert_not_called()
+
+    def test_no_remote_for_the_merge_target_is_unverified(self):
+        only_fork = "origin\tgit@github.com:lapis2002/kube-agents.git (fetch)\n"
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), _git(remotes=only_fork):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertTrue(r.passed)
+        self.assertIn("no git remote points at gke-labs/kube-agents", r.warnings[0])
+
+    def test_unreadable_main_is_unverified_rather_than_absent(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), \
+             _git(show_rc=128, show_err="fatal: invalid object name 'gke-labs/main'"):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertTrue(r.passed)
+        self.assertIn("could not read gke-labs/main:hack/ci-deploy.sh", r.warnings[0])
+        self.assertNotIn("not yet on", r.message)
+
+    def test_remote_is_resolved_by_url_not_by_name(self):
+        # `origin` is the contributor's fork and `upstream` is a different
+        # repository; neither name identifies the merge target.
+        with _git():
+            self.assertEqual(checker._upstream_remote(), "gke-labs")
+
+    def test_remote_resolution_accepts_the_https_url_form(self):
+        https = "fleet\thttps://github.com/gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=https):
+            self.assertEqual(checker._upstream_remote(), "fleet")
+
+    def test_no_git_at_all_is_unverified(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), _git(remotes_rc=127):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertTrue(r.passed)
+        self.assertIn("no git remote points at", r.warnings[0])
+
+    def test_snapshot_predating_the_function_is_unverified_not_absent(self):
+        # `git show <remote>/main` reads the last fetch, and a fetch older than
+        # 2026-08-21 returns a ci-deploy.sh with no gitops_repo_for_project()
+        # in it at all. Every project reads as unmapped there, including ones
+        # mapped for months -- so the copy cannot answer, and saying "not yet
+        # on main" about it is a claim this check has not earned.
+        before_the_function = 'deploy_agent() {\n  echo "no mapping here"\n}\n'
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals")), \
+             _git(show=before_the_function):
+            r = checker.check_codebase_mapping("kube-agents-evals")
+        self.assertTrue(r.passed)
+        self.assertEqual(len(r.warnings), 1)
+        self.assertNotIn("not yet on", r.message)
+        self.assertIn("no gitops_repo_for_project()", r.warnings[0])
+
+    def test_not_yet_on_main_dates_the_snapshot_it_read(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), \
+             _git(show=_ci_deploy_text("kube-agents-evals-3"), log="2026-08-19"):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertIn("gke-labs/main is dated 2026-08-19", r.warnings[0])
+
+    def test_undatable_snapshot_still_reports_the_row_as_missing(self):
+        with _local_ci_deploy(_ci_deploy_text("kube-agents-evals-6")), \
+             _git(show=_ci_deploy_text("kube-agents-evals-3"), log_rc=128):
+            r = checker.check_codebase_mapping("kube-agents-evals-6")
+        self.assertNotIn("dated", r.warnings[0])
+        self.assertIn("not yet on gke-labs/main", r.message)
 
 
 class RunChecksTest(unittest.TestCase):

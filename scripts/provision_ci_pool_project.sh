@@ -129,7 +129,7 @@ echo -e "\n==> [Step 0/5] Checking preconditions..."
 # the reason at the top of Step 0: without it, a missing `tofu` surfaces as
 # "command not found" at Step 2.2, twelve minutes and two applies in.
 MISSING_TOOLS=()
-for tool in gcloud gh python3 terraform tofu; do
+for tool in gcloud gh git go jq python3 terraform tofu; do
   command -v "${tool}" >/dev/null 2>&1 || MISSING_TOOLS+=("${tool}")
 done
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
@@ -137,7 +137,7 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
   echo "       This script needs terraform and tofu both; see the comment above." >&2
   exit 1
 fi
-echo "✓ Toolchain present (gcloud, gh, python3, terraform, tofu)"
+echo "✓ Toolchain present (gcloud, gh, git, go, jq, python3, terraform, tofu)"
 
 # The project must exist and bill. `gcloud services enable` against an unbilled
 # project fails with a message that does not obviously say "billing", so the

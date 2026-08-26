@@ -28,7 +28,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parent.parent
+_UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
+_CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
 _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
@@ -192,20 +194,122 @@ def _load_json(out: str):
         return json.loads(first)
 
 
+def _mapping_function_body(text: str) -> Optional[str]:
+    """The body of gitops_repo_for_project() in this ci-deploy.sh text, or None.
+
+    None separates "this is not a file I can read a mapping out of" from "the
+    mapping is here and this project is not in it". A row search alone cannot
+    tell them apart, and they mean opposite things: the function itself only
+    landed on main on 2026-08-21, so any copy older than that answers "no row"
+    for every project, including ones mapped since.
+    """
+    m = re.search(r"gitops_repo_for_project\(\)\s*\{(.*?)\n\}", text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _mapping_row_present(text: str, project_id: str) -> bool:
+    """Does this ci-deploy.sh text carry the project's gitops_repo_for_project() row?"""
+    body = _mapping_function_body(text)
+    if body is None:
+        return False
+    expected_repo = f"gke-agentic/{project_id}-infra"
+    pattern = rf"{re.escape(project_id)}\)\s*echo\s*[\"']?{re.escape(expected_repo)}[\"']?"
+    return re.search(pattern, body) is not None
+
+
+def _upstream_remote() -> Optional[str]:
+    """Name the git remote that points at gke-labs/kube-agents, or None.
+
+    Resolved by URL rather than by convention, because neither conventional
+    name is reliable here. This repository's own rules send contributors'
+    branches to a fork, so `origin` is usually the fork; and `upstream` is
+    taken by an unrelated repository on at least one maintainer's checkout.
+    A hardcoded remote name would read some other repository's main and
+    report the answer with the same confidence as a correct one.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(_ROOT), "remote", "-v"])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] != "(fetch)":
+            continue
+        url = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+        if url.endswith(_UPSTREAM_SLUG):
+            return parts[0]
+    return None
+
+
+def _ref_committed_at(remote: str) -> str:
+    """When the commit behind <remote>/main was authored, as " (fetched at ...)".
+
+    Empty when git will not say. This is the age of the local snapshot, not of
+    main: `git show <remote>/main` reads whatever the last fetch left behind,
+    and a verdict about main drawn from a week-old snapshot is worth exactly
+    as much as the snapshot. Printing the date lets the operator judge that
+    without knowing how the check works.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(_ROOT), "log", "-1", "--format=%cs", f"{remote}/main"])
+    return f" (this checkout's {remote}/main is dated {out.strip()})" if rc == 0 and out.strip() else ""
+
+
+def _mapping_on_upstream_main(project_id: str) -> Tuple[str, Optional[str], str]:
+    """Look for the mapping row on the merge target's ci-deploy.sh.
+
+    Returns (status, remote, detail); status is "present", "absent", or
+    "unknown" when this checkout cannot see the merge target at all.
+    """
+    remote = _upstream_remote()
+    if remote is None:
+        return "unknown", None, f"no git remote points at {_UPSTREAM_SLUG}"
+    ref = f"{remote}/main:hack/ci-deploy.sh"
+    rc, out, err = run_cmd(["git", "-C", str(_ROOT), "show", ref])
+    if rc != 0:
+        first = err.strip().splitlines()[0] if err.strip() else "git show failed"
+        return "unknown", remote, f"could not read {ref} ({first})"
+    if _mapping_function_body(out) is None:
+        return (
+            "unknown",
+            remote,
+            f"{ref} has no gitops_repo_for_project() to read{_ref_committed_at(remote)}, so "
+            "no project reads as mapped there -- the function landed on main on 2026-08-21",
+        )
+    return ("present" if _mapping_row_present(out, project_id) else "absent"), remote, ""
+
+
 def check_codebase_mapping(project_id: str) -> CheckResult:
-    """Verify the hack/ci-deploy.sh mapping row for this project."""
+    """Verify the hack/ci-deploy.sh mapping row for this project.
+
+    Read twice, from two different files. The local tree is the one the
+    operator is editing; the merge target's is the one that actually runs,
+    because Prow builds an eval run from main plus that run's own pull
+    request rather than from this branch. A row that exists only here is the
+    evals-3 outage with the safety catch removed: the verdict line says the
+    project is safe to register, it is registered, and the next presubmit to
+    lease it stops at gitops_repo_for_project()'s refusal -- taking a share
+    of every open pull request's smoke test with it.
+
+    Missing from main is reported unverified rather than failed. The row is
+    written and about to land, so this is a "not yet" for a human to time,
+    not a misconfiguration; the run's own banner already tells the operator
+    to confirm each unverified item before registering anything.
+
+    "Not yet on main" is only ever claimed about a copy of ci-deploy.sh this
+    check could actually read a mapping out of, and the message carries the
+    date of the snapshot it read. `git show <remote>/main` returns the last
+    fetch, not main, so the alternative is a check that reports every project
+    unmapped whenever a checkout has sat for a while -- which is the warning
+    an operator learns to wave off, and then waves off the real one too.
+    """
     if not _CI_DEPLOY.exists():
         return CheckResult("Codebase GitOps Mapping", False, f"Missing {_CI_DEPLOY}")
 
     text = _CI_DEPLOY.read_text(encoding="utf-8")
-    m = re.search(r"gitops_repo_for_project\(\)\s*\{(.*?)\n\}", text, re.DOTALL)
-    if not m:
+    if _mapping_function_body(text) is None:
         return CheckResult("Codebase GitOps Mapping", False, "Could not find gitops_repo_for_project() in hack/ci-deploy.sh")
 
-    func_body = m.group(1)
     expected_repo = f"gke-agentic/{project_id}-infra"
-    pattern = rf"{re.escape(project_id)}\)\s*echo\s*[\"']?{re.escape(expected_repo)}[\"']?"
-    if not re.search(pattern, func_body):
+    if not _mapping_row_present(text, project_id):
         return CheckResult(
             "Codebase GitOps Mapping",
             False,
@@ -213,7 +317,37 @@ def check_codebase_mapping(project_id: str) -> CheckResult:
             details=[f"Expected: {project_id}) echo \"{expected_repo}\" ;;"],
         )
 
-    return CheckResult("Codebase GitOps Mapping", True, f"Mapped to {expected_repo}")
+    status, remote, detail = _mapping_on_upstream_main(project_id)
+    if status == "present":
+        return CheckResult(
+            "Codebase GitOps Mapping",
+            True,
+            f"Mapped to {expected_repo} in this checkout and on {remote}/main",
+        )
+    if status == "unknown":
+        return CheckResult(
+            "Codebase GitOps Mapping",
+            True,
+            f"Mapped to {expected_repo} in this checkout; could not read the mapping on {_UPSTREAM_SLUG} main",
+            warnings=[
+                f"Could not check whether {project_id} is mapped on {_UPSTREAM_SLUG} main: {detail}. "
+                "A presubmit runs main's hack/ci-deploy.sh, not this checkout's -- confirm the row is on "
+                f"main before registering {project_id}.",
+            ],
+        )
+    fetch_hint = f"git fetch {remote} main" if remote else "git fetch"
+    return CheckResult(
+        "Codebase GitOps Mapping",
+        True,
+        f"Mapped to {expected_repo} in this checkout, not yet on {remote}/main",
+        warnings=[
+            f"{project_id} is mapped here but not on {_UPSTREAM_SLUG} main{_ref_committed_at(remote)}. A "
+            "presubmit that leases it runs main's hack/ci-deploy.sh and stops at "
+            "gitops_repo_for_project()'s refusal, failing that run. Land the mapping on main before "
+            f"registering {project_id} in Boskos. If it landed since this checkout last fetched, run "
+            f"`{fetch_hint}` and re-run.",
+        ],
+    )
 
 
 def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]:
@@ -871,6 +1005,30 @@ def _probe_github_app_identity(
     return "ok", f"signature accepted by GitHub as App {app_id} ({body.get('slug') or body.get('name')})"
 
 
+def _chart_pinned_key_version() -> Tuple[Optional[str], str]:
+    """Read githubMinter.kms.keyVersion out of the chart's values.yaml.
+
+    Returns (version, detail); version is None when it cannot be read, and
+    detail then says why. Parsed with a regex rather than a YAML library
+    because this script is deliberately dependency-free -- it is the first
+    thing an operator runs on a fresh machine, and a missing import here
+    would read as an unprovisioned project.
+    """
+    if not _CHART_VALUES.exists():
+        return None, f"missing {_CHART_VALUES}"
+    text = _CHART_VALUES.read_text(encoding="utf-8")
+    block = re.search(r"^githubMinter:\n(?:(?:[ \t].*)?\n)*", text, re.MULTILINE)
+    if not block:
+        return None, "no githubMinter block in the chart values"
+    kms = re.search(r"^  kms:\n(?:(?:    .*)?\n)*", block.group(0), re.MULTILINE)
+    if not kms:
+        return None, "no githubMinter.kms block in the chart values"
+    m = re.search(r"^    keyVersion:\s*[\"']?([^\"'\s#]+)", kms.group(0), re.MULTILINE)
+    if not m:
+        return None, "no githubMinter.kms.keyVersion in the chart values"
+    return m.group(1), ""
+
+
 def check_token_minter(
     project_id: str, app_id: int = DEFAULT_GITHUB_APP_ID, location: str = "us-central1"
 ) -> CheckResult:
@@ -881,7 +1039,18 @@ def check_token_minter(
     key = KMS_KEY
     keyring = KMS_KEYRING
     enabled_versions: List[str] = []
+    version_states: dict = {}
     algorithm_ok = False
+
+    # Which version matters is the chart's business, not KMS's. The pool
+    # deploys through helm: charts/kube-agents/templates/github-minter.yaml
+    # renders cryptoKeyVersions/{{ $m.kms.keyVersion }}, values.yaml pins it,
+    # and hack/ci-deploy.sh's GITHUB_MINTER_ARGS never overrides it -- so the
+    # minter every lease runs signs with that one version and no other. (The
+    # k8s-operator path differs: provision_10_deploy_github_minter.sh resolves
+    # the active version at deploy time, which is where "Minty picks it up"
+    # after a rotation is true. It is not true here.)
+    pinned_version, pin_detail = _chart_pinned_key_version()
 
     rc, out, err = run_cmd([
         "gcloud", "kms", "keys", "versions", "list",
@@ -900,25 +1069,22 @@ def check_token_minter(
             # The key existing only proves Terraform ran; the composition creates
             # it import-only and empty. An ENABLED version is what proves the PEM
             # was imported, which is the condition EVAL_GITHUB_APP_ID asserts.
-            #
-            # Which version is not pinned here. token-minter.md offers rotation
-            # as "import a new key version to KMS; Minty picks it up", so after a
-            # rotation version 1 is disabled and the live key is 2 -- hardcoding
-            # 1 would fail a correctly rotated project and point the operator at
-            # the PEM instead of at the rotation.
             for v in versions:
+                name = v.get("name", "").rsplit("/", 1)[-1]
+                version_states[name] = v.get("state")
                 if v.get("state") == "ENABLED":
-                    enabled_versions.append(v.get("name", "").rsplit("/", 1)[-1])
+                    enabled_versions.append(name)
             if not enabled_versions:
                 passed = False
                 details.append(f"KMS key {key} has no ENABLED version (PEM import pending via minty)")
             elif len(enabled_versions) > 1:
-                # Not a failure: both versions verify. But Minty signs with the
-                # one the chart names, so a stale version left enabled after a
-                # rotation is a key that still works and should not.
+                # Not a failure: every one of them verifies. But only the version
+                # the chart names is ever loaded, so the rest are keys that still
+                # open the door and no longer need to.
+                pin_note = f"only {pinned_version} is deployed" if pinned_version else "only the chart's pinned version is deployed"
                 warnings.append(
                     f"KMS key {key} has {len(enabled_versions)} ENABLED versions "
-                    f"({', '.join(sorted(enabled_versions))}); disable the superseded one"
+                    f"({', '.join(sorted(enabled_versions))}); {pin_note}, so disable the others"
                 )
         except Exception as exc:
             passed = False
@@ -1017,14 +1183,46 @@ def check_token_minter(
             passed = False
             details.append(f"Failed parsing Minter GSA policy: {exc}")
 
+    # The version the chart deploys is the one that has to work, so it is the
+    # one probed. Checking the highest ENABLED version instead is the failure
+    # this replaced: rotate as token-minter.md describes -- import v2, disable
+    # v1 -- and that probe greens on v2 while every lease deploys a minter
+    # pinned to the disabled v1, whose readiness probe never succeeds and
+    # whose helm --wait kills the run at fifteen minutes without naming a key.
+    probe_version: Optional[str] = None
+    if pinned_version is None:
+        if enabled_versions:
+            probe_version = sorted(enabled_versions, key=lambda v: int(v) if v.isdigit() else 0)[-1]
+        warnings.append(
+            f"Could not read githubMinter.kms.keyVersion from the chart ({pin_detail}), so the version this "
+            f"project's minter will sign with is unconfirmed; probed version {probe_version or 'none'} instead. "
+            "Confirm the chart's pin names an ENABLED version before registering."
+        )
+    elif not version_states:
+        pass  # The versions list already failed; a second message restates it.
+    elif pinned_version not in version_states:
+        passed = False
+        details.append(
+            f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, which does not exist "
+            f"(present: {', '.join(sorted(version_states)) or 'none'}). Every lease would deploy a minter "
+            "that cannot sign."
+        )
+    elif version_states[pinned_version] != "ENABLED":
+        passed = False
+        details.append(
+            f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, whose state is "
+            f"{version_states[pinned_version]}. Every lease would deploy a minter that cannot sign, and "
+            "helm --wait would kill the run at its fifteen-minute timeout without naming the key."
+        )
+    else:
+        probe_version = pinned_version
+
     # Last, and only once the key is known to exist, hold enabled material, and
     # carry the right algorithm -- a probe against a key already known to be
     # wrong costs a network round trip to restate what was just reported.
     probe = ""
-    if enabled_versions and algorithm_ok:
-        status, message = _probe_github_app_identity(
-            project_id, location, sorted(enabled_versions, key=lambda v: int(v) if v.isdigit() else 0)[-1], app_id
-        )
+    if probe_version and algorithm_ok:
+        status, message = _probe_github_app_identity(project_id, location, probe_version, app_id)
         if status == "failed":
             passed = False
             details.append(message)
@@ -1033,10 +1231,12 @@ def check_token_minter(
         else:
             probe = f", {message}"
 
+    signing_version = f" v{probe_version}" if probe_version else ""
     message = (
         "Token minter not provisioned / PEM key missing or wrong"
         if not passed
-        else f"Import-only signing key ENABLED, minter GSA can sign and be impersonated{probe}"
+        else f"Import-only signing key{signing_version} (the version the chart deploys) ENABLED, "
+        f"minter GSA can sign and be impersonated{probe}"
     )
 
     return CheckResult(

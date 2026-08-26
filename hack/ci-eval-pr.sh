@@ -493,8 +493,8 @@ TASKS=(
   #       is platform-agent-host and carries no seeded namespace). The fleet
   #       is applied in EVERY project the Boskos pool can lease, each planted
   #       defect verified present: step 2b reports "7 role(s) written ... 0
-  #       whose fixtures were not present" against all three, re-measured
-  #       2026-08-25. The five other fleet scenarios were never held by A5
+  #       whose fixtures were not present" against every leasable project,
+  #       re-measured 2026-08-25. The five other fleet scenarios were never held by A5
   #       alone -- each also carries A1, A3 or A4 -- so they stay commented
   #       out on those, and DRAFTS.md's status column no longer names A5 at
   #       all. One residual, which is hardening rather than a gate: with

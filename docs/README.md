@@ -169,7 +169,7 @@ identifier appears, add its source here.
 | Credential-proxy refusal rule ids, refused flags, forced git config | `agents/platform/scripts/credential_proxy.py` |
 | Command-policy allowlisted verbs and denied `kubectl`/`gcloud` flags | `agents/platform/scripts/command_policy.py` |
 | Which CI pool project maps to which GitOps repository | `gitops_repo_for_project()` in `hack/ci-deploy.sh` |
-| Roles the pool verifier accepts as Artifact Registry upload rights, and the API set it requires | `scripts/verify_ci_pool_project.py`, whose `VALID_CMEK_STATES` mirrors `is_valid_cmek_encryption_state()` in `k8s-operator/scripts/installer_common.sh` and whose cluster names mirror `bench/tf/fleet` and whose fixture check parses the summary line `hack/fleet-kubeconfigs.sh` prints |
+| Roles the pool verifier accepts as Artifact Registry upload rights, and the API set it requires | `scripts/verify_ci_pool_project.py`, whose `VALID_CMEK_STATES` mirrors `is_valid_cmek_encryption_state()` in `k8s-operator/scripts/installer_common.sh` and whose cluster names mirror `bench/tf/fleet` and whose fixture check parses the summary line `hack/fleet-kubeconfigs.sh` prints, whose signing probe reads `githubMinter.kms.keyVersion` from `charts/kube-agents/values.yaml`, and whose mapping check reads `hack/ci-deploy.sh` from `gke-labs/main` as well as the local tree |
 
 ## 3. Documentation eras and status
 
