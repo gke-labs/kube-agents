@@ -663,6 +663,74 @@ class RealGitTest(unittest.TestCase):
         self.assertTrue(self.commit(changes)["committed"])
         self.assertEqual(b"a", (self.tree / "manifests" / "a.yaml").read_bytes())
 
+    def seed_a_symlink_into_the_base(self, name, target):
+        """Commit a symlink onto the base branch and refresh the workspace.
+
+        Committed, not merely written. `commit` does `checkout --force` and
+        `clean -fdxq` before it applies anything, so a symlink only written
+        into the working tree is gone by the time the write loop runs and the
+        test would pass for the wrong reason -- the same fixture trap as
+        attributes that have to live in the merge base.
+        """
+        seed = self.base / "seed"
+        real_git_runner(["git", "rm", "-r", "--cached", "-q", "--ignore-unmatch", name], seed)
+        path = seed / name
+        if path.is_dir() and not path.is_symlink():
+            for child in sorted(path.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            path.rmdir()
+        path.symlink_to(target)
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "symlink"], seed)
+        real_git_runner(["git", "push", "origin", "main"], seed)
+        real_git_runner(["git", "fetch", "--quiet", "origin"], self.tree)
+        real_git_runner(["git", "checkout", "--force", "-B", "main", "origin/main"], self.tree)
+        # The fixture is only worth anything if git really restored a symlink.
+        self.assertTrue(
+            (self.tree / name).is_symlink(), "fixture did not produce a symlink"
+        )
+
+    def test_a_commit_refuses_to_write_through_a_symlink_in_the_base(self):
+        """The symlink check, reached the way a request reaches it.
+
+        The unit tests above call `_no_symlink_on_the_way` directly, which
+        proves the function and not the wiring. Bypassing the call at both of
+        its sites left every one of those tests green, so this one goes through
+        `store.commit` instead.
+        """
+        outside = self.base / "outside"
+        outside.mkdir()
+        self.seed_a_symlink_into_the_base("manifests", outside)
+
+        with self.assertRaises(PathRefused):
+            self.commit([Change(repo_relative("manifests/pwned.yaml"), b"kind: Pwned\n")])
+        self.assertFalse(
+            (outside / "pwned.yaml").exists(), "the write escaped through the link"
+        )
+
+        # Paired ordinary use: a path that does not cross the link still commits.
+        self.assertTrue(
+            self.commit([Change(repo_relative("charts/values.yaml"), b"replicas: 1\n")])[
+                "committed"
+            ]
+        )
+
+    def test_a_read_refuses_to_follow_a_symlink_in_the_base(self):
+        """Same wiring question on the read path, which has its own call site."""
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "secret.yaml").write_text("kind: Secret\n")
+        self.seed_a_symlink_into_the_base("manifests", outside)
+
+        with self.assertRaises(PathRefused):
+            self.store.read(self.workspace.handle, "manifests/secret.yaml")
+
+        # Paired: an ordinary tracked file still reads.
+        (self.tree / "plain.yaml").write_bytes(b"kind: ConfigMap\n")
+        self.assertEqual(
+            b"kind: ConfigMap\n", self.store.read(self.workspace.handle, "plain.yaml")
+        )
+
     def test_a_commit_cannot_write_the_repository_configuration(self):
         """Repo-local config as code execution, refused where it can be."""
         # Distinctive enough that finding it proves the payload landed. A single
