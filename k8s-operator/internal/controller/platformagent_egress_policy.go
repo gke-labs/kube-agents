@@ -202,9 +202,9 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*network
 	// DNS. Everything else in this list is reached by name, so without this
 	// rule the allowlist is equivalent to a total egress block. kube-dns is the
 	// CoreDNS Service in kube-system; node-local-dns is the NodeLocal DNSCache
-	// DaemonSet, which also answers on a link-local address of its own. Mirrors
-	// charts/kube-agents/templates/litellm.yaml, the repository's only other
-	// worked NetworkPolicy.
+	// DaemonSet, which also answers on a link-local address of its own. The
+	// same two peers appear in charts/kube-agents/templates/litellm.yaml and in
+	// deploy/kustomize/platform/networkpolicy-core-egress.yaml.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{udpPort(53), tcpPort(53)},
 		To: []networkingv1.NetworkPolicyPeer{

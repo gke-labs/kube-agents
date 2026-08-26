@@ -9432,32 +9432,49 @@ spec:
                         make an HTTP request can mint the node or Workload Identity service
                         account's tokens — is one of the destinations left off.
 
-                        READ THIS BEFORE YOU BELIEVE THE NAME. On its own this policy does not
-                        deny the agent Pod the metadata server today, because it is not the only
-                        policy selecting that Pod. NetworkPolicies are additive: a Pod may send
-                        whatever the union of every policy selecting it permits, and there is no
-                        way for one policy to subtract from another.
+                        READ THIS BEFORE YOU BELIEVE THE NAME. THIS FIELD BLOCKS NOTHING TODAY.
+                        Not the metadata server, not anything else. Setting it to Allowlist can
+                        only widen what the agent Pod may send, never narrow it.
 
-                          - The operator renders <name>-gateway-netpol for the same Pod on every
-                            reconcile, unconditionally, and it permits 169.254.169.254/32 on TCP
-                            80 and 8080 and 169.254.169.252/32 on TCP 988 — the pre- and
-                            post-DNAT forms of a metadata request. It also permits TCP 443 to
-                            0.0.0.0/0 minus the private ranges, unless the FQDNNetworkPolicy
-                            annotation is set, so the exfiltration half of this control is
-                            unioned away as well.
-                          - A Kustomize install additionally applies platform-agent-core-egress
-                            (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which
-                            selects the agent Pod by app.kubernetes.io/name and permits the same
-                            metadata path. A Helm install does not carry it.
+                        That is not a bug in the rules below; it is what NetworkPolicy does.
+                        Policies selecting one Pod are unioned — the Pod may send whatever any of
+                        them permits — and the API has no deny rule, so an added policy is a
+                        monotone operation. It cannot subtract. The agent Pod is already selected
+                        for egress by <name>-gateway-netpol, which the operator renders on every
+                        reconcile whether this field is set or not, so turning this on leaves the
+                        Pod's permitted egress a strict superset of what it was. In the default
+                        shape the only destination it adds is the credential broker on TCP 8765.
+                        Anything egressAllowlist names is added on top of that.
 
-                        That overlap is deliberate rather than an oversight: Workload Identity
+                        What the gateway policy already permits, and therefore what this cannot
+                        take away:
+
+                          - 169.254.169.254/32 on TCP 80 and 8080, and 169.254.169.252/32 on TCP
+                            988 — the pre- and post-DNAT forms of a metadata request. So the
+                            metadata path stays open.
+                          - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
+                            FQDNNetworkPolicy annotation is set. So every HTTPS destination on
+                            the public internet stays open, and with it the exfiltration half of
+                            what this control is meant to be.
+
+                        A Kustomize install additionally applies platform-agent-core-egress
+                        (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which selects
+                        the agent Pod by app.kubernetes.io/name and permits the same metadata
+                        path. A Helm install does not carry it, and it changes nothing either
+                        way: the gateway policy alone is enough to make the point above.
+
+                        The overlap is deliberate rather than an oversight. Workload Identity
                         needs the metadata path, and in the sidecar layout the credential broker
                         shares the Pod, so <name>-gateway-netpol cannot stop permitting it
                         without breaking every install. Narrowing it to the broker Pod once the
-                        broker has left is separate work and is not done here. What this field
-                        renders today is the allowlist itself and the object an operator can
-                        audit; treat "the metadata server is denied" as true of this policy in
-                        isolation and not yet of the Pod.
+                        broker has left is the work that turns this field into a control.
+
+                        So what is this for today? Two things, and they are worth having, but
+                        neither is enforcement. It renders an auditable statement of the
+                        destinations the agent is supposed to need, in an object an operator can
+                        diff and a reviewer can read. And it establishes the field, the refusal
+                        rules and the reconcile behaviour, so that narrowing the gateway policy
+                        later is a change to one policy rather than a new feature.
 
                         REQUIRES splitCredentialBrokerPod: true. Containers in one Pod share a
                         network namespace, and the credential broker reaches the metadata server
@@ -9488,10 +9505,16 @@ spec:
                             `kubectl -n kube-system get ds node-local-dns` and confirm
                             resolution from the agent container after enabling.
 
-                        WHAT IT COSTS, and this is not a short list. The allowlist covers DNS,
-                        the credential broker, LiteLLM, the managed OpenTelemetry collector, and
-                        whatever egressAllowlist adds. Everything else the agent container
-                        reaches on its own goes away, on a CNI that enforces:
+                        WHAT IT WILL COST, once the gateway policy is narrowed and this field
+                        starts blocking things. None of the following happens today, for the
+                        reason above: every destination on this list is one <name>-gateway-netpol
+                        still permits to the same Pod. Read it as the bill that falls due, not as
+                        the current behaviour — and do not schedule a capability review for a
+                        change that will not alter anything yet.
+
+                        The allowlist covers DNS, the credential broker, LiteLLM, the managed
+                        OpenTelemetry collector, and whatever egressAllowlist adds. Everything
+                        else the agent container reaches on its own would go away:
 
                           - DuckDuckGo web search, which the shared default config turns on for
                             every profile, and the "browser" toolset, which only the Chat Agent
@@ -9504,9 +9527,9 @@ spec:
                             script's project id. It fails soft after a five-second timeout and
                             falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
 
-                        Those are not accidental casualties. A headless browser with
+                        Those would not be accidental casualties. A headless browser with
                         unrestricted egress is the exfiltration path, so the capabilities this
-                        removes are the same ones that make the control worth having. Restore
+                        would remove are the same ones that make the control worth having. Restore
                         individual destinations with egressAllowlist.extraRules — noting that
                         NetworkPolicy matches addresses, never DNS names, so restoring a hosted
                         service means naming its address ranges.

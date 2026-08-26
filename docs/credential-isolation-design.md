@@ -113,11 +113,14 @@ default install runs on. `spec.security.splitCredentialBrokerPod` moves the
 broker into a Pod of its own, and `spec.security.egressPolicy: Allowlist` then
 renders a default-deny egress NetworkPolicy on the agent Pod that leaves the
 metadata server off its allowlist. Both default to false, and the second is
-refused outright without the first. Two things that policy does not do on its
-own: it does nothing at all on a cluster whose CNI does not enforce
-NetworkPolicy, and it is unioned with the `<agent>-gateway-netpol` this same
-operator renders, which does permit the metadata path — so the agent Pod can
-still reach the metadata server today even with the flag on. See
+refused outright without the first. Neither closes the path yet. Adding a
+NetworkPolicy is monotone — policies selecting one Pod are unioned and the API
+has no deny rule — and the agent Pod is already selected for egress by the
+`<agent>-gateway-netpol` this same operator renders, which permits the metadata
+path. So enabling the allowlist widens what the Pod may send and narrows
+nothing; it is an auditable object rather than a control until that gateway
+policy is narrowed to the broker Pod. It would in any case do nothing on a
+cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 ## Scope

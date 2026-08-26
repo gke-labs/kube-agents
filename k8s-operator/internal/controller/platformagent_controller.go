@@ -301,23 +301,22 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// in validateEgressPolicy.
 	if reason, msg := validateEgressPolicy(instance); reason != "" {
 		log.Info(msg)
-		// A refusal must not also suspend the guardrail it is refusing over.
-		// Returning here skips step 11b, so for an already-running agent a bad
-		// extraRules entry would stop the NetworkPolicy being reconciled at
-		// all — delete it and nothing puts it back, and the agent runs
-		// unprotected with a Degraded status that reads like it is protected.
-		// That is precisely the "continuous, not one-time" property this
-		// change exists to establish, so the two are separated: refuse the
-		// spec, keep the guardrail.
+		// Returning here withholds the workload, the Service, the
+		// PodDisruptionBudget, the legacy cleanup and updateStatusReady. What
+		// it must not withhold is a guardrail, and the agent Pod has two:
+		// <name>-gateway-netpol, which is reconciled below in the normal path
+		// and so is reconciled here as well, and <name>-sandbox-metadata-deny,
+		// which step 11b renders.
 		//
-		// EgressPolicyRequiresSplitBroker is the exception and must stay one.
-		// There the objection is to rendering the policy at all — it would
-		// take the metadata server away from the credential broker sharing the
-		// Pod — so rendering it "anyway" is the outage the refusal prevents.
-		if refusalStillRendersTheGuardrail(reason) {
-			if err := r.reconcileAgentEgressPolicy(ctx, instance); err != nil {
-				return ctrl.Result{}, err
-			}
+		// Both have to survive a refusal for the same reason. An operator
+		// triaging an EgressAllowlistRefused who deletes them gets neither back
+		// until the spec is fixed, and with nothing selecting the agent Pod
+		// NetworkPolicy permits all egress — so the outcome is wide-open egress
+		// behind a Degraded status that names only the allowlist. The gateway
+		// policy is unconditional because it has nothing to do with either
+		// refusal; it is the Pod's baseline and it predates this field.
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
+			return ctrl.Result{}, err
 		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -854,6 +853,33 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 			"(kubernetes/kubernetes#68078). Split the range around it instead."
 	}
 	return "", ""
+}
+
+// reconcileAgentNetworkGuardrails keeps the agent Pod's NetworkPolicies
+// maintained on a reconcile that is about to bail out over its egress spec.
+//
+// A refusal withholds the workload. It must not also withhold a guardrail,
+// because a guardrail that stops being reconciled is a guardrail an operator
+// can delete permanently — and deleting every policy that selects the agent
+// Pod does not leave it restricted, it leaves NetworkPolicy permitting all
+// egress. That the CR reads Degraded at the time makes it worse rather than
+// better: the status names one bad CIDR while the Pod's egress is wide open.
+//
+// <name>-gateway-netpol is reconciled whatever the refusal was. It is the
+// Pod's baseline policy, it predates spec.security.egressPolicy, and neither
+// refusal is an objection to it. <name>-sandbox-metadata-deny is reconciled
+// only when refusalStillRendersTheGuardrail says so — see validateEgressPolicy
+// for why EgressPolicyRequiresSplitBroker is the case where rendering it is
+// itself the harm.
+func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason string) error {
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
+	if err := r.reconcileNetworkPolicy(ctx, agent, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
+		return err
+	}
+	if !refusalStillRendersTheGuardrail(reason) {
+		return nil
+	}
+	return r.reconcileAgentEgressPolicy(ctx, agent)
 }
 
 // reconcileAgentEgressPolicy renders the agent Pod's default-deny egress policy.

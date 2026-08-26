@@ -144,18 +144,24 @@ Against the credential requirements this mechanism is short-lived, audience-boun
 
 `spec.security.egressPolicy: Allowlist` renders one NetworkPolicy on the agent Pod: default-deny egress, with rules for DNS, the credential broker, LiteLLM, the managed OpenTelemetry collector, and whatever `spec.security.egressAllowlist` adds. The metadata server is denied by not appearing on that list.
 
-### The name overstates what you get today
+### This blocks nothing today
 
-Read this before you turn it on. NetworkPolicies selecting the same Pod are additive — a Pod may send whatever the union of them permits, and the API has no deny rule — so this policy cannot subtract anything another policy allows. Two other policies allow the metadata path to this same Pod:
+**Turning this on does not take any egress away from the agent Pod. It cannot.** Adding a NetworkPolicy is a monotone operation: policies selecting one Pod are unioned, the Pod may send whatever any of them permits, and the API has no deny rule at all. The agent Pod is already selected for egress by `<name>-gateway-netpol`, which the operator renders on every reconcile whether or not you set this field, so with the flag on the Pod's permitted egress is a strict _superset_ of what it was with the flag off. In the default shape the one destination it adds is the credential broker on TCP 8765.
 
-- `<name>-gateway-netpol`, which the operator renders on every reconcile whether or not you set this field. It permits `169.254.169.254/32` on TCP 80 and 8080, `169.254.169.252/32` on TCP 988, and TCP 443 to `0.0.0.0/0` minus the private ranges unless FQDNNetworkPolicy is enabled.
-- `platform-agent-core-egress` from [`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform), which selects the agent Pod by `app.kubernetes.io/name` and permits the same metadata path. Kustomize installs have it; Helm installs do not.
+That holds in every install shape, on every CNI, enforcing or not. It is a property of the API, not of a particular cluster.
 
-So with the flag on, the agent Pod can still reach `169.254.169.254`. The overlap is deliberate rather than an accident: Workload Identity needs that path, and in the sidecar layout the broker is in the Pod that needs it, so the gateway policy cannot stop permitting it without breaking every install. Scoping it to the broker Pod once the broker has left is separate work and is not done here.
+What `<name>-gateway-netpol` already permits, and this therefore cannot remove:
 
-What you get today is the allowlist itself: a default-deny egress object on the agent Pod that closes everything the gateway policy does not separately open, and an auditable statement of which destinations the agent is supposed to need. Treat "the metadata server is denied" as true of this policy and not yet of the Pod.
+- `169.254.169.254/32` on TCP 80 and 8080, and `169.254.169.252/32` on TCP 988 — the pre- and post-DNAT forms of a metadata request. The metadata path stays open.
+- TCP 443 to `0.0.0.0/0` minus the private ranges, unless FQDNNetworkPolicy is enabled. Every HTTPS destination on the public internet stays open, and with it the exfiltration half of what this is meant to be.
 
-The complementary control is removing the `iam.gke.io/gcp-service-account` annotation from the agent Pod's ServiceAccount once the broker has one of its own — deny the route versus remove the identity. That one does not depend on the CNI at all. It is separate work and is not in this change.
+`platform-agent-core-egress` from [`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) permits the same metadata path and selects the agent Pod by `app.kubernetes.io/name`. Kustomize installs have it; Helm installs do not. It changes nothing either way — the gateway policy alone settles the point.
+
+The overlap is deliberate rather than an accident. Workload Identity needs that path, and in the sidecar layout the broker is in the Pod that needs it, so the gateway policy cannot stop permitting it without breaking every install. Narrowing it to the broker Pod, once the broker has left, is the work that turns this field into a control.
+
+**So what is it for today?** Two things, neither of them enforcement. It renders an auditable statement of the destinations the agent is supposed to need, as an object you can diff and a reviewer can read. And it settles the field, the refusal rules and the reconcile behaviour now, so that narrowing the gateway policy later is a one-policy change rather than a new feature. If you were planning a capability-impact review before enabling this, you do not need one yet; [what it will cost](#what-it-will-cost-once-it-does-block-something) says when you will.
+
+The complementary control is removing the `iam.gke.io/gcp-service-account` annotation from the agent Pod's ServiceAccount once the broker has one of its own — deny the route versus remove the identity. That one does not depend on the CNI at all, and unlike this it would take something away immediately. It is separate work and is not in this change.
 
 ### The other conditions, plainly
 
@@ -164,7 +170,7 @@ Only the first is enforced by the operator.
 1. **`splitCredentialBrokerPod` must be `true`, and it defaults to `false`.** This is why the two features are one story. A NetworkPolicy selects Pods, never containers, and the broker reaches the metadata server on purpose. With the broker still a sidecar, the same policy governs both containers, so restricting the sandbox restricts the broker and every proxied command fails. **Asking for `egressPolicy: Allowlist` without the split is refused**, not quietly downgraded: the agent goes `Degraded` with reason `EgressPolicyRequiresSplitBroker`, no policy object is written, and reconciliation stops before the workload.
 2. **The cluster CNI must enforce NetworkPolicy, and the operator cannot tell whether it does.** An unenforced policy is accepted, stored, and returned by `kubectl get` exactly like an enforced one; there is no field, condition or event to read. GKE Autopilot and GKE Dataplane V2 always enforce. A GKE Standard cluster created without network policy gets a no-op.
 3. **No other policy may widen it**, which is the point above and also applies to anything an administrator adds later. Nothing detects that.
-4. **The allowlist has to stay complete**, and it deliberately is not — see [What it breaks](#what-it-breaks-which-is-not-a-short-list). Every gap is pressure toward a broader rule.
+4. **The allowlist has to stay complete**, and it deliberately is not — see [what it will cost](#what-it-will-cost-once-it-does-block-something). Every gap is pressure toward a broader rule.
 
 ### What a refusal does, and does not do
 
@@ -194,18 +200,20 @@ Two things to verify on the cluster, neither of which the operator can check for
 - **Does the CNI enforce NetworkPolicy?** `gcloud container clusters describe CLUSTER --format='value(networkPolicy.enabled,networkConfig.datapathProvider)'`. Autopilot and Dataplane V2 always do. A GKE Standard cluster created without network policy gets a policy object that enforces nothing.
 - **Does the cluster run NodeLocal DNSCache, and does DNS still resolve after enabling?** This one can take the agent down. NodeLocal DNSCache runs with `hostNetwork`, so on Cilium and Dataplane V2 its traffic carries a host or remote-node identity — and neither the `k8s-app: node-local-dns` Pod selector nor the `169.254.20.10/32` CIDR peer in the rendered rule is guaranteed to match that, because CIDR peers do not select node identities unless `policy-cidr-match-mode` includes `nodes`, which is off by default. Both peers work on an iptables dataplane, which is why both are rendered. If neither matches, DNS is blocked outright and every destination in the allowlist becomes unreachable, because they are all reached by name. Check with `kubectl -n kube-system get ds node-local-dns` first, and after enabling confirm resolution from the agent container before trusting the policy.
 
-### What it breaks, which is not a short list
+### What it will cost, once it does block something
 
-On a cluster that enforces, the allowlist covers DNS, the broker, LiteLLM and the OTel collector. Everything the agent container reaches on its own goes away:
+**None of this happens today.** Every destination below is one `<name>-gateway-netpol` still permits to the same Pod, so on a current install you can enable the flag and observe no behaviour change in either direction. This is the bill that falls due once the gateway policy is narrowed, and it is here so that the narrowing is not a surprise.
+
+At that point the allowlist covers DNS, the broker, LiteLLM and the OTel collector, and everything the agent container reaches on its own would go away:
 
 - DuckDuckGo web search, which `deploy/shared/defaults/config.yaml` turns on for every profile (`web.backend: ddgs`), and the `browser` toolset, which only the Chat Agent disables;
 - the `gke` and `developer_knowledge` MCP servers, which proxy `container.googleapis.com` and `developerknowledge.googleapis.com`;
 - `github.com` reached directly from the sandbox — not the `gh` and `git` wrappers, which go through the broker;
 - the metadata lookup in `cluster_agent_reconcile.py`, which is how that script finds its project id. It fails soft after a five-second timeout and falls back to `gcloud config get-value project`, a broker call that is on the allowlist, so the cost is the timeout on each tick. Setting `RECONCILE_PROJECT` skips it.
 
-Credentialed `gcloud`, `kubectl`, `gh` and `git` are unaffected: they are wrappers that call the broker, and the broker is on the list.
+Credentialed `gcloud`, `kubectl`, `gh` and `git` would be unaffected either way: they are wrappers that call the broker, and the broker is on the list.
 
-None of that is accidental. A headless browser with unrestricted egress is the exfiltration path, so the capabilities this removes are the same ones that make the control worth having. Weigh it as a trade rather than a regression.
+None of that would be accidental. A headless browser with unrestricted egress is the exfiltration path, so the capabilities this would remove are the same ones that make the control worth having. Weigh it as a trade rather than a regression, when it arrives.
 
 ### Restoring a destination
 

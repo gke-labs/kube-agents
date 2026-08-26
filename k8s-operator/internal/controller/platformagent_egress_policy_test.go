@@ -176,7 +176,7 @@ func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
 		if permits(policy, address) {
 			t.Errorf("the rendered egress policy permits the metadata server at %s; "+
 				"anything that can make an HTTP request there can mint the Workload Identity token "+
-				"and bypass the credential broker entirely (invariant C1)", address)
+				"and bypass the credential broker entirely", address)
 		}
 	}
 }
@@ -270,9 +270,11 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 // TestTheControlPlaneRuleIsAbsentUntilAskedFor pins the deliberate under-allow.
 // NetworkPolicy has no peer for "the Kubernetes API server" and the operator
 // cannot derive its address, so the choice was between omitting the rule and
-// inventing a range. Omitting it costs the event-watcher its connection; that
-// cost is documented on the CRD field and must not be quietly paid off with a
-// guess.
+// inventing a range. Omitting it costs the agent container its API-server
+// connection, which matters above one replica where it runs leader_elect.py;
+// that cost is documented on the CRD field and must not be quietly paid off
+// with a guess. (Not the event watcher — the split this policy requires
+// already refuses to render while the watcher is enabled.)
 func TestTheControlPlaneRuleIsAbsentUntilAskedFor(t *testing.T) {
 	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent())
 	if permits(policy, "172.16.0.2") {
@@ -804,5 +806,200 @@ func TestReconcileRendersNoPolicyWhenNotAskedFor(t *testing.T) {
 		&networkingv1.NetworkPolicy{})
 	if err == nil {
 		t.Error("a policy was rendered for an agent that did not ask for one")
+	}
+}
+
+// TestARefusalDoesNotSuspendTheGatewayNetworkPolicy covers the sibling of the
+// hazard refusalStillRendersTheGuardrail was written for.
+//
+// The agent Pod has two NetworkPolicies: <name>-sandbox-metadata-deny, which
+// this change adds, and <name>-gateway-netpol, which the operator has always
+// rendered. Refusing the egress spec returns before the step that reconciles
+// the second one, so an operator triaging the refusal could delete both and
+// get neither back. That is not a Pod left restricted — with nothing selecting
+// it, NetworkPolicy permits all egress — so the failure is wide-open egress
+// behind a Degraded status that names one bad CIDR.
+//
+// Checked under both refusal reasons. The gateway policy is not what either
+// refusal objects to, so both must keep it maintained.
+func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*agentv1alpha1.PlatformAgent)
+		reason  string
+		guarded bool // whether the egress guardrail is rendered too
+	}{
+		{
+			name:    "EgressAllowlistRefused",
+			reason:  reasonEgressAllowlistRefused,
+			guarded: true,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			},
+		},
+		{
+			name:   "EgressPolicyRequiresSplitBroker",
+			reason: reasonEgressPolicyRequiresSplitBroker,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.SplitCredentialBrokerPod = nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(tc.mutate)
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
+			// The refusal is what makes this test mean anything: without it the
+			// gateway policy would be reconciled by the ordinary path below.
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			var gotReason string
+			for _, condition := range stored.Status.Conditions {
+				if condition.Type == "Ready" {
+					gotReason = condition.Reason
+				}
+			}
+			if gotReason != tc.reason {
+				t.Fatalf("the spec was not refused, so this test proves nothing; got reason %q", gotReason)
+			}
+
+			gateway := types.NamespacedName{Name: agent.Name + "-gateway-netpol", Namespace: agent.Namespace}
+			if err := cl.Get(ctx, gateway, &networkingv1.NetworkPolicy{}); err != nil {
+				t.Fatalf("the refusal withheld the agent Pod's gateway NetworkPolicy: %v", err)
+			}
+
+			// And it must keep being maintained, not merely have been written
+			// once before the spec went bad.
+			if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: gateway.Name, Namespace: gateway.Namespace},
+			}); err != nil {
+				t.Fatalf("failed to delete the gateway policy for the restore check: %v", err)
+			}
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("second Reconcile failed: %v", err)
+			}
+			if err := cl.Get(ctx, gateway, &networkingv1.NetworkPolicy{}); err != nil {
+				t.Fatalf("while the spec was refused the gateway NetworkPolicy stopped being reconciled, so "+
+					"deleting it stuck; with nothing selecting the agent Pod its egress is unrestricted: %v", err)
+			}
+
+			egress := types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}
+			err := cl.Get(ctx, egress, &networkingv1.NetworkPolicy{})
+			if tc.guarded && err != nil {
+				t.Errorf("the egress guardrail was withheld by a refusal about one destination: %v", err)
+			}
+			if !tc.guarded && err == nil {
+				t.Error("the split-broker refusal rendered the egress policy, which is the outage it exists to prevent")
+			}
+		})
+	}
+}
+
+// TestTheFlagAddedToARunningAgentIsHandledBothWays covers the case the
+// reference page describes in prose and no other test reaches: the field is
+// set on an agent that is already running, rather than being present when the
+// agent is first created.
+//
+// It is the more dangerous shape of both outcomes. Refused, the existing Pods
+// keep running with metadata access rather than being taken down, which is
+// deliberate but is not what an operator reading "refused" expects. Accepted,
+// the guardrail has to appear against a workload that already exists.
+func TestTheFlagAddedToARunningAgentIsHandledBothWays(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		split    *bool
+		rendered bool
+	}{
+		{name: "accepted with the split already on", split: ptr.To(true), rendered: true},
+		{name: "refused in the sidecar layout", split: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			// The agent starts without the field, which is how every existing
+			// install starts.
+			agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressPolicy = ""
+				a.Spec.Security.SplitCredentialBrokerPod = tc.split
+			})
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("first Reconcile failed: %v", err)
+			}
+			workload := types.NamespacedName{Name: agent.Name + "-gateway", Namespace: agent.Namespace}
+			if err := cl.Get(ctx, workload, &appsv1.Deployment{}); err != nil {
+				t.Fatalf("the agent was not running before the field was set, so this test proves nothing: %v", err)
+			}
+			egress := types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}
+			if err := cl.Get(ctx, egress, &networkingv1.NetworkPolicy{}); err == nil {
+				t.Fatal("a policy existed before the field was set")
+			}
+
+			// Now an operator sets the field on the running agent.
+			live := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			live.Spec.Security.EgressPolicy = egressPolicyAllowlist
+			if err := cl.Update(ctx, live); err != nil {
+				t.Fatalf("failed to set the field: %v", err)
+			}
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("second Reconcile failed: %v", err)
+			}
+
+			rendered := &networkingv1.NetworkPolicy{}
+			err := cl.Get(ctx, egress, rendered)
+			if tc.rendered {
+				if err != nil {
+					t.Fatalf("setting the field on a running agent did not render the guardrail: %v", err)
+				}
+				assertClosed(t, rendered, live, "added-to-running-agent")
+				return
+			}
+
+			if err == nil {
+				t.Error("the field was refused but a policy was written anyway")
+			}
+			// The refusal does not take the workload down, and the reference
+			// page says so. Pin it, because "refused" reads like "stopped" and
+			// the running Pods still reach the metadata server.
+			if err := cl.Get(ctx, workload, &appsv1.Deployment{}); err != nil {
+				t.Errorf("the refusal deleted the running workload; it withholds reconciliation, "+
+					"it does not tear the agent down: %v", err)
+			}
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			if stored.Status.Phase != "Degraded" {
+				t.Errorf("the refusal must be visible in status, got phase %q", stored.Status.Phase)
+			}
+		})
 	}
 }
