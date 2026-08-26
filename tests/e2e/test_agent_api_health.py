@@ -13,11 +13,10 @@ def test_platform_agent_api_health_ping(
     platform_agent_api_key: Optional[str],
 ) -> None:
     """Verifies that the deployed Platform Agent REST API is reachable, authenticated, and responsive."""
-    if not port_forward_agent:
-        pytest.fail("Cannot reach Platform Agent REST API on cluster: background port-forward could not connect to agent pod/gateway.")
-    if not platform_agent_api_key:
-        pytest.fail("Platform Agent API key (API_SERVER_KEY) not found in platform-agent-secrets or environment.")
-
+    # No guard on the fixtures here on purpose. port_forward_agent fails during
+    # setup, naming the transport it used and what the far end said, so a guard
+    # in the test body could only restate that less precisely — the message this
+    # one used to carry named a port-forward the suite no longer uses.
     url = f"{port_forward_agent}/v1/responses"
     payload = json.dumps({
         "model": "model-default",

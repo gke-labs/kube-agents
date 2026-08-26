@@ -102,6 +102,23 @@ jobs:
           go-version-file: "k8s-operator/go.mod"
           cache-dependency-path: "k8s-operator/go.sum"
 
+      # The teardown half of the step below needs this. install.sh auto-installs
+      # terraform, but only once it is already running — uninstall.sh installs
+      # nothing and refuses without it, so before this step existed the RC
+      # teardown failed on every run and the pipeline reinstalled over the
+      # surviving environment.
+      #
+      # terraform_wrapper: false is load-bearing. The wrapper replaces terraform
+      # with a script that re-prints stdout and stderr for its outputs, and
+      # lifecycle.sh reads terraform's stdout directly — `terraform console` for
+      # resolved variables and `terraform state list` for what exists. Left on,
+      # those captures pick up the wrapper's copy as well as the real output.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
       - name: Provision Environment in GCP
         env:
           CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
@@ -121,4 +138,18 @@ jobs:
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+          # Unset (the default) reports a failed teardown as an annotation and
+          # a job-summary entry and provisions on top of whatever survived;
+          # truthy makes it a hard stop. Which of those is right depends on
+          # whether a candidate validated against stale state or a blocked
+          # release is the worse outcome that week, so it is a variable rather
+          # than a constant here.
+          #
+          # Set it on the `rc` environment, alongside GCP_PROJECT_ID and the
+          # rest — this job's `environment: rc` is where every other value it
+          # reads comes from, and the repository level holds none of them.
+          # `vars` resolves environment over repository over organization, so a
+          # repository-level one works too and is the easier of the two to set
+          # by accident and then not find again.
+          RC_TEARDOWN_STRICT: ${{ vars.RC_TEARDOWN_STRICT }}
         run: ./scripts/release/provision_rc_environment.sh

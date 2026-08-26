@@ -21,18 +21,42 @@ C_RED="\033[1;31m"
 C_BOLD="\033[1m"
 C_RESET="\033[0m"
 # Process Lock File & Error Trap Handling
+#
+# The 2>/dev/null probes whether the lock file can be opened; it must NOT ride
+# on the `exec`. `exec` with no command applies its redirections to the shell
+# PERMANENTLY, so `exec 200>"$LOCK_FILE" 2>/dev/null` sent every later error
+# message — this script's abort banner, lifecycle.sh's, terraform's — to
+# /dev/null for the rest of the run. The release pipeline's teardown failed
+# that way on every scheduled run for weeks: uninstall.sh exited non-zero with
+# nothing on stderr to say why. Same shape as install.sh's lock, deliberately.
 LOCK_FILE="/tmp/kube-agents-uninstall.lock"
-if command -v flock >/dev/null 2>&1 && exec 200>"$LOCK_FILE" 2>/dev/null; then
+if command -v flock >/dev/null 2>&1 && ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
   if ! flock -n 200 2>/dev/null; then
     echo -e "  \033[93m⚠ Another instance of kube-agents uninstaller is currently running. Exiting.\033[0m" >&2
     exit 1
   fi
 fi
 
+# The one non-zero exit that is not a failure: the target holds no Terraform
+# state anywhere, so this engine has nothing to tear down. Expected against a
+# clean project, and the case an automated caller must be able to tell apart
+# from a teardown that tried and failed — scripts/release/
+# provision_rc_environment.sh branches on exactly this. Defined above on_error
+# because on_error reads it.
+EXIT_NOTHING_TO_TEAR_DOWN=3
+
 on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
+  # Reserve the code. on_error exits with the FAILING COMMAND's status, so any
+  # child that happens to exit 3 — a gcloud wrapper, a nested script under
+  # lifecycle.sh — would otherwise speak this script's "nothing to tear down"
+  # contract and tell an automated caller to install over a live environment.
+  # Anything that reaches this trap is a failure by definition.
+  if [ "$exit_code" = "$EXIT_NOTHING_TO_TEAR_DOWN" ]; then
+    exit_code=1
+  fi
   echo -e "\n\033[91m\033[1m✗ Teardown error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_report "FAILED" "true" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   exit "$exit_code"
@@ -52,6 +76,14 @@ cleanup() {
     rm -rf -- "$TEMP_REPO_DIR"
   fi
 }
+# Known gap in the exit-code contract above, left in place deliberately. On
+# bash 3.2 a `set -u` abort reports $?=0 to this trap and does not fire the ERR
+# trap, so such a crash would exit 0. It cannot be rescued from here — the
+# status is already lost by the time the trap runs, and returning non-zero from
+# an EXIT trap does not change the shell's status (measured). The alternative,
+# a sentinel set true before each of the four deliberate exits, turns a
+# successful teardown red the first time someone adds a fifth and forgets. No
+# reachable unbound variable exists today; a new one would be the real bug.
 trap cleanup EXIT
 
 print_banner() {
@@ -113,6 +145,18 @@ Examples:
 
   # Automated teardown for a known project and cluster
   ./uninstall.sh --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+
+Exit codes:
+  0  Teardown completed (or --dry-run finished, or you declined the
+     confirmation).
+  3  Nothing to tear down: no Terraform state for this cluster in GCS or
+     locally. Either nothing is installed here, or the install predates the
+     Terraform engine — see --source-ref. Not a failure.
+  1  Anything else — the teardown could not start, or started and did not
+     finish.
+
+  --source-ref hands over to the pinned release's own uninstall.sh wholesale,
+  so from then on the exit code is that release's, not this contract.
 EOF
   exit 0
 }
@@ -172,15 +216,39 @@ persist_state_var() {
 #
 # Needs installer_common.sh sourced (tf_state_bucket/tf_state_prefix) and the
 # target coordinates exported. Unit-tested in tests/test_uninstall_script.py;
-# keep the branch order — remote state wins, an explicitly named bucket with
-# no state is an error, local state is honoured only when nothing is remote,
-# and no state anywhere refuses rather than guesses.
+# keep the branch order — remote state wins, a probe that could not read wins
+# over every "absent" branch below it, an explicitly named bucket with no state
+# is an error, local state is honoured only when nothing is remote, and no
+# state anywhere refuses rather than guesses.
 resolve_state_location() {
   local compose_dir="$1"
-  if gcloud storage cat "gs://$(tf_state_bucket)/$(tf_state_prefix)/default.tfstate" >/dev/null 2>&1; then
+  local state_object probe_err="" probe_rc=0
+  state_object="gs://$(tf_state_bucket)/$(tf_state_prefix)/default.tfstate"
+
+  # The probe's stderr is kept, not discarded, because "the object is not
+  # there" and "I could not look" are different answers and only the first one
+  # means there is nothing to tear down. A bare `>/dev/null 2>&1` collapses 404,
+  # 403, expired credentials, a network timeout and a missing gcloud into one
+  # bit — and with exit 3 wired to "clean project", the 403 case would tell
+  # scripts/release/provision_rc_environment.sh to install over a live cluster.
+  #
+  # `trap - ERR` inside the substitution: under bash 3.2 the inherited ERR trap
+  # fires in this subshell even though the failure is the tested condition. The
+  # rc is captured on the assignment rather than declared with `local`, which
+  # would report `local`'s own status instead of the substitution's.
+  probe_err="$(trap - ERR; gcloud storage cat "$state_object" 2>&1 >/dev/null)" || probe_rc=$?
+
+  if [ "$probe_rc" -eq 0 ]; then
     # Remote state where the installer keeps it (or where the caller pointed
     # us): pin the backend for lifecycle.sh.
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
+  elif ! printf '%s' "$probe_err" | grep -qiE 'matched no objects|not found|404|does not exist'; then
+    # Anything that is not a clean "absent" — refuse rather than report an
+    # empty target. Reaching the local-state branches below on a permission
+    # error would be the same mistake one level down.
+    print_error "Could not read the Terraform state at ${state_object}: ${probe_err:-unknown gcloud failure}"
+    print_info "That is not the same as 'nothing is installed here', so this is a failure rather than an empty target. Fix the access or transport error and re-run."
+    return 1
   elif [ -n "${KUBE_AGENTS_STATE_BUCKET:-}" ]; then
     # The caller named a bucket and it holds no state for this cluster:
     # error out rather than fall back to guessing.
@@ -194,7 +262,7 @@ resolve_state_location() {
   else
     print_error "No Terraform state found for '${CLUSTER_NAME}' (gs://$(tf_state_bucket)/$(tf_state_prefix)) and none locally."
     print_info "If this install was made by a pre-Terraform release, re-run with --source-ref=<that release> so its own teardown runs."
-    return 1
+    return "$EXIT_NOTHING_TO_TEAR_DOWN"
   fi
 }
 
@@ -287,6 +355,52 @@ main() {
     exit 0
   fi
 
+  # Coordinates are settled, so publish them: tf_state_bucket, tf_state_prefix
+  # and write_tfvars_from_state all read the environment rather than arguments.
+  export PROJECT_ID="$target_project"
+  export CLUSTER_NAME="$target_cluster"
+  export REGION="$target_region"
+  export NO_CONFIRM="1"
+
+  # The engine is `lifecycle.sh destroy` against the install's Terraform state
+  # in GCS (derived from the coordinates, so a fresh clone finds it). With no
+  # state anywhere there is either nothing installed here or an install that
+  # predates the Terraform engine — this uninstaller cannot take the second
+  # apart, but the release that installed it can, which is what --source-ref
+  # pins.
+  local compose_dir="${repo_dir}/terraform/examples/full-install"
+  export KUBE_AGENTS_STATE_PREFIX
+  KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+
+  # Deciding there is nothing to tear down costs one `gcloud storage cat` and
+  # two file tests, and it runs BEFORE the terraform gate below on purpose: a
+  # target with no state needs no teardown and therefore no teardown engine, so
+  # gating on terraform first would answer "your machine is missing a tool" to
+  # a question that is really "there is nothing here". That ordering is what
+  # makes exit 3 reachable on a clean project without terraform installed.
+  #
+  # `|| exit $?` rather than `|| exit 1`: the no-state-anywhere branch returns
+  # EXIT_NOTHING_TO_TEAR_DOWN, and flattening it to 1 is what left a caller
+  # unable to tell "nothing was installed" from "the teardown broke".
+  resolve_state_location "$compose_dir" || exit $?
+
+  # terraform is the teardown engine, not an optional extra: lifecycle.sh's
+  # first act is `terraform init`. Checked before the confirmation prompt and
+  # before anything is destroyed, because the alternative is a bare "terraform:
+  # command not found" from three subshells down. install.sh auto-installs the
+  # binary and this script deliberately does not, so a CI job that only ever
+  # runs install.sh has terraform, while the same job's teardown, running
+  # first, has none. Three things deliberately run before this and the reasons
+  # are with them: the --source-ref hand-over, the --dry-run preview, and the
+  # state probe. The cost of not being first is that the engine-fetch branch
+  # may already have cloned into a temp dir — a side effect, if a self-cleaning
+  # one — before this refuses.
+  if ! command -v terraform >/dev/null 2>&1; then
+    print_error "terraform is not installed, and it is the teardown engine — nothing can be destroyed without it."
+    print_info "Install it (https://developer.hashicorp.com/terraform/install) and re-run. install.sh auto-installs terraform; this script does not."
+    exit 1
+  fi
+
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     echo -e "\n${C_RED}${C_BOLD}⚠️  WARNING: This will PERMANENTLY DELETE all kube-agents infrastructure in GCP project '${target_project}'!${C_RESET}"
     local confirm_choice=""
@@ -319,21 +433,6 @@ main() {
       persist_state_var "$state_file" REGION "$target_region"
     fi
   fi
-
-  export PROJECT_ID="$target_project"
-  export CLUSTER_NAME="$target_cluster"
-  export REGION="$target_region"
-  export NO_CONFIRM="1"
-
-  # The engine is `lifecycle.sh destroy` against the install's Terraform state
-  # in GCS (derived from the coordinates, so a fresh clone finds it). An
-  # install with no state anywhere predates the Terraform engine — this
-  # uninstaller cannot take it apart, but the release that installed it
-  # can, which is exactly what --source-ref pins.
-  local compose_dir="${repo_dir}/terraform/examples/full-install"
-  export KUBE_AGENTS_STATE_PREFIX
-  KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
-  resolve_state_location "$compose_dir" || exit 1
 
   # terraform destroy still evaluates the configuration, so required variables
   # must be present even from a fresh clone; the placeholder key feeds nothing
