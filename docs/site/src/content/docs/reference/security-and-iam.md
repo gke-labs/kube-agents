@@ -88,7 +88,7 @@ The **custom** set binds exactly the roles listed in `--custom-roles` (space- or
 :::caution[Grants nothing as of 2026-08-12]
 The pool provisions its service accounts, and those accounts hold no IAM grant. Each was scoped by an IAM Condition on the cluster's `resource.name`, and that grants nothing for Kubernetes object operations — measured across four condition spellings, one of which asserted only that the call was a GKE call. Deleting the condition is not the repair: un-conditioned, the same binding is project-wide `roles/container.viewer`, which is the ceiling the pool exists to remove. Both are gone.
 
-So `scoped_clusters` is empty by default and the broker runs on the agent's own identity, as it did before. Authority arrives with per-cluster Kubernetes RBAC, which is a separate change.
+So the pool is empty by default and the broker runs on the agent's own identity, as it did before. There are two ways to arm it and both should stay off: `scoped_clusters` on the Terraform side, and `platformAgent.security.scopedServiceAccounts` in the chart, which is what an install that writes the `PlatformAgent` CR by hand would set. Authority arrives with per-cluster Kubernetes RBAC, which is a separate change.
 :::
 
 A Terraform install can provision one service account per GKE cluster. The credential broker then mints a short-lived token for the account a request's target cluster maps to, rather than running every request on the agent's own identity.

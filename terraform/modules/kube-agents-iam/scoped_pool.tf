@@ -130,10 +130,15 @@ resource "google_service_account_iam_member" "scoped_token_creator" {
   # `tests/test_scoped_sa_pool_iam.py` lists this role as forbidden for the
   # agent's project-level set, and that test must keep passing alongside this
   # binding. The two are not in tension: the role is dangerous at project scope
-  # and bounded at resource scope, and that distinction is the whole design. A
-  # text sweep for forbidden roles that does not make the distinction will flag
-  # this line; it needs the same by-name exemption the installer's refusal text
-  # already gets, not a change here.
+  # and bounded at resource scope, and that distinction is the whole design.
+  #
+  # A text sweep for forbidden roles that does not make the distinction will
+  # flag the `role` line below. The resolution is to suppress inside a
+  # `resource "google_service_account_iam_member"` block and nowhere else --
+  # scope-aware, so a project-scoped reintroduction is still caught. Do not
+  # resolve it by dropping the role from the forbidden set, and do not remove
+  # the grant: impersonated_credentials needs tokenCreator on the target, so
+  # without it the pool cannot mint at all.
   service_account_id = google_service_account.scoped[each.key].name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:${google_service_account.agent.email}"

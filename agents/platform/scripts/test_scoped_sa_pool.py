@@ -96,6 +96,27 @@ class ScopeKeyTest(unittest.TestCase):
     # Assert the behaviour, never the artifact. This one asserted neither -- it
     # asserted two artifacts matched each other.
 
+    def test_a_trailing_newline_cannot_pass_for_a_name_component(self):
+        """`$` is not `\\Z`, and the difference reaches a log line and a filename.
+
+        Python's `$` matches immediately before a trailing newline, so
+        `re.match(r"^[a-z0-9-]*$", "cluster\\n")` succeeds. The component goes
+        into the scope key, the scope key goes into the refusal message, and the
+        refusal message goes into a WARNING -- one agent-written newline in a
+        kubeconfig's `current-context` splits that into two log records. The
+        same component also becomes part of a filename in the sidecar state dir.
+
+        Separate from the test below, which covers separators and quotes: those
+        were always refused. This one was not.
+        """
+        for value in ("cluster\n", "cluster\r\n", "cluster\r", "\ncluster"):
+            for position in range(3):
+                components = ["project", "location", "cluster"]
+                components[position] = value
+                with self.subTest(value=value, position=position):
+                    with self.assertRaises(ValueError):
+                        scope_key(*components)
+
     def test_a_component_that_could_change_the_key_is_refused(self):
         """Anything that could smuggle a separator or close the CEL string."""
         for project, location, cluster in (
@@ -135,13 +156,27 @@ class ScopeKeyTest(unittest.TestCase):
             "",
             "a b",
             'a"b',
+            # The newline cases are here as well as in their own test above,
+            # because the two patterns have to agree about them too -- fixing
+            # `$` to `\\Z` in one file and not the other is the drift this
+            # whole test exists for.
+            "abc\n",
+            "\nabc",
+            "abc\r\n",
         ]
         for candidate in candidates:
             with self.subTest(candidate=candidate):
                 self.assertEqual(
+                    bool(credential_proxy._GKE_CONTEXT_COMPONENT.fullmatch(candidate)),
+                    bool(scoped_sa_pool._COMPONENT.fullmatch(candidate)),
+                    f"the broker and the pool disagree about {candidate!r}",
+                )
+                # Also compared under `.match`, because that is how the pool
+                # calls it and an anchor fixed only in one place shows up here.
+                self.assertEqual(
                     bool(credential_proxy._GKE_CONTEXT_COMPONENT.match(candidate)),
                     bool(scoped_sa_pool._COMPONENT.match(candidate)),
-                    f"the broker and the pool disagree about {candidate!r}",
+                    f"the broker and the pool disagree about {candidate!r} under match()",
                 )
 
 

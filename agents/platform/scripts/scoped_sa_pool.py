@@ -33,10 +33,20 @@ identity it selects, which is why `pool_enabled` defaults off.
 Three properties are the point of the module, and each one is here rather than
 at the call site so that removing it is a visible diff:
 
-* **The scope is a resolved cluster, never a field in the request.** `select`
-  takes a triple the broker derived; there is no code path from JSON to a
-  service-account email. A payload that names an account is data the broker
-  never reads.
+* **No field of the request names an account.** `select` takes a triple, and
+  the only way to reach it is through a kubeconfig's `current-context`, which
+  the broker parses into a cluster itself. A payload naming a service account,
+  a scope or an email is data the broker never reads.
+
+  What that does *not* say is that the input is out of the agent's hands. The
+  agent writes the kubeconfig in the shared workspace, and `current-context` is
+  the selector; it can also re-point the sidecar's own default with an allowed
+  `get-credentials`. So the agent chooses **which cluster** it is asking about.
+  What it cannot do is choose the account, because the mapping is a file it
+  cannot write, and asking about a cluster with no entry is a refusal rather
+  than a wider credential. The token and the API server address both come from
+  the same resolved cluster, so naming a different one buys a credential scoped
+  to that different one.
 * **A scope with no member is refused.** There is no widest-member fallback and
   no ambient fallback, because a fallback to the credential this pool exists to
   stop using is invisible in every log line that matters.
@@ -90,7 +100,12 @@ MAX_POOL_BYTES = 1 << 20
 # and a test asserts the two agree on every component it can construct, so a
 # drift between them fails rather than silently admitting a key the other half
 # would reject.
-_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+#
+# `\Z` rather than `$`, for the reason spelled out beside the broker's copy:
+# `$` matches before a trailing newline, so `$` plus `re.match` admits
+# "cluster\n" -- which then goes into the scope key, and the scope key goes
+# into a log line.
+_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 
 # `<id>@<project>.iam.gserviceaccount.com`.
 #
@@ -179,7 +194,7 @@ def scope_key(project: str, location: str, cluster: str) -> str:
     nothing (or, in the Terraform half, an expression that means something else).
     """
     for name, value in (("project", project), ("location", location), ("cluster", cluster)):
-        if not isinstance(value, str) or not _COMPONENT.match(value):
+        if not isinstance(value, str) or not _COMPONENT.fullmatch(value):
             raise ValueError(f"{name} is not a GKE name component: {value!r}")
     return f"projects/{project}/locations/{location}/clusters/{cluster}"
 
@@ -350,10 +365,15 @@ class ScopedServiceAccountPool:
         """The account for one cluster, or a refusal.
 
         The arguments are three validated strings, not a request and not a
-        mapping. The property is expressed in the signature: there is nothing
-        to pass here that a caller could have authored, because a caller
-        supplies a kubeconfig naming a cluster and the broker turns that into a
-        cluster triple of its own before anything reaches this method.
+        mapping, and that is the property the signature carries: no field of a
+        request reaches this method, because the broker resolves a cluster of
+        its own before it calls.
+
+        The cluster itself is agent-influenced -- it comes from the
+        `current-context` of a kubeconfig in the shared workspace -- and the
+        module docstring says why that is not the same as choosing an account.
+        Read this as "the account is not selectable", not as "the input is
+        trusted".
         """
         key = scope_key(project, location, cluster)
         member = self._members.get(key)

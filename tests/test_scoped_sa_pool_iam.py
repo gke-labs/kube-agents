@@ -76,6 +76,47 @@ def _hcl_string_list(source: str, name: str) -> list[str]:
     return roles
 
 
+def _hcl_variable_default_list(source: str, variable: str) -> list[str]:
+    """The `default = [...]` of a named HCL variable block.
+
+    Separate from `_hcl_string_list` because a variable block contains several
+    `= [` assignments (validations, nested types) and the one that matters is
+    the default. Anchored on the block first, then on `default` inside it.
+    """
+    block = re.search(
+        rf'^variable\s+"{re.escape(variable)}"\s*\{{(.*?)^\}}',
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if block is None:
+        raise AssertionError(f"no variable named {variable}; it moved or was renamed")
+    return _hcl_string_list(block.group(1), "default")
+
+
+def _agent_project_roles_expression(module_main: str) -> str:
+    """The right-hand side of `local.agent_project_roles`, comments stripped.
+
+    Read to its balanced end rather than to the first newline, because the
+    restored form of this local is a multi-line parenthesised conditional --
+    which is exactly the shape that has to be readable here.
+    """
+    start = re.search(r"^\s*agent_project_roles\s*=", module_main, re.MULTILINE)
+    if start is None:
+        raise AssertionError("local.agent_project_roles moved or was renamed")
+    text, depth = "", 0
+    for char in module_main[start.end() :]:
+        text += char
+        depth += (char in "([") - (char in ")]")
+        if char == "\n" and depth <= 0:
+            break
+    body = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    if not body.strip():
+        raise AssertionError("could not read the agent_project_roles expression")
+    return body
+
+
 def _import_broker_module(name: str):
     """Import one of the broker's scripts without putting it on sys.path for good."""
     sys.path.insert(0, str(BROKER_SCRIPTS))
@@ -95,24 +136,54 @@ class ModuleAndCompositionAgreeTest(unittest.TestCase):
     description saying it mirrored the composition. A description does not fail.
     Somebody widening one path would have left the other alone and nothing would
     have said so.
+
+    Both sides are read where the value is *bound*, not where it is described.
+    An earlier version of this file compared a `local` in the module's main.tf
+    that nothing referenced -- the variable is `nullable = false` with a default,
+    so the local's fallback arm was unreachable -- and adding
+    roles/container.admin to the list that actually granted left the suite green.
+    `effective_module_roles` below is the list `google_project_iam_member` binds.
     """
 
-    def test_the_module_default_is_the_compositions_read_only_set(self):
+    def test_the_module_binds_the_list_the_variable_carries(self):
+        """The anchor for everything else in this class.
+
+        Both tests below read `variable "project_roles"`. They are only about the
+        agent's ceiling if that variable is what the module grants from, so this
+        checks the wiring rather than assuming it: `local.agent_project_roles`
+        resolves to the variable, and `for_each` resolves to the local.
+        """
         module = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        expression = _agent_project_roles_expression(module)
+        self.assertIn(
+            "var.project_roles",
+            expression,
+            "local.agent_project_roles no longer reads var.project_roles, so the "
+            "list this file checks is not the list the module grants",
+        )
+        self.assertIn(
+            "for_each = toset(local.agent_project_roles)",
+            module,
+            "google_project_iam_member.agent_roles no longer binds "
+            "local.agent_project_roles",
+        )
+
+    def test_the_module_default_is_the_compositions_read_only_set(self):
+        module_vars = (IAM_MODULE / "variables.tf").read_text(encoding="utf-8")
         composition = (FULL_INSTALL / "main.tf").read_text(encoding="utf-8")
         self.assertEqual(
             _hcl_string_list(composition, "read_only_roles"),
-            _hcl_string_list(module, "agent_read_only_roles"),
+            _hcl_variable_default_list(module_vars, "project_roles"),
             "the kube-agents-iam module and the full-install composition no longer "
             "grant the same read-only set; widening one path and not the other is "
             "how an install ends up with a ceiling nobody chose",
         )
 
     def test_the_module_default_grants_no_forbidden_role(self):
-        module = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        module_vars = (IAM_MODULE / "variables.tf").read_text(encoding="utf-8")
         self.assertEqual(
             set(),
-            set(_hcl_string_list(module, "agent_read_only_roles"))
+            set(_hcl_variable_default_list(module_vars, "project_roles"))
             & FORBIDDEN_PROJECT_ROLES,
         )
 
@@ -142,20 +213,33 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         return 'resource "google_project_iam_member"' in self._pool_declarations()
 
     def _agent_is_narrowed(self) -> bool:
-        """Does the module strip container.viewer from the agent's own grant?"""
-        source = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
-        expression = re.search(
-            r"agent_project_roles\s*=\s*\((.*?)\n  \)", source, re.DOTALL
+        """Has roles/container.viewer come off the set the module actually binds?
+
+        Answered from the resulting role set, not from one spelling of how it
+        got that way. The first version of this asked whether main.tf contained
+        the literal `role != "roles/container.viewer"` filter, which is only the
+        spelling the suspended coupling happens to use. Deleting the role from
+        the variable's default reaches the identical state -- agent narrowed,
+        pool granting nothing, no identity able to read a Kubernetes object --
+        and the substring check called it not-narrowed and passed.
+
+        So: take the list the module binds and apply the filter if it is there.
+        Either route to an absent container.viewer reads as narrowed.
+        """
+        module_vars = (IAM_MODULE / "variables.tf").read_text(encoding="utf-8")
+        module_main = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+
+        granted = _hcl_variable_default_list(module_vars, "project_roles")
+        expression = _agent_project_roles_expression(module_main)
+        self.assertIn(
+            "var.project_roles",
+            expression,
+            "local.agent_project_roles no longer reads var.project_roles, so this "
+            "test is no longer looking at the roles the module grants",
         )
-        self.assertIsNotNone(
-            expression, "the computed agent role set moved or was renamed"
-        )
-        body = "\n".join(
-            line
-            for line in expression.group(1).splitlines()
-            if not line.lstrip().startswith("#")
-        )
-        return 'role != "roles/container.viewer"' in body
+        if 'role != "roles/container.viewer"' in expression:
+            granted = [role for role in granted if role != "roles/container.viewer"]
+        return "roles/container.viewer" not in granted
 
     def test_the_agent_is_never_narrowed_while_the_pool_grants_nothing(self):
         """The coupling, as an assertion rather than a comment.
@@ -202,10 +286,10 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         materialisation, and the failure would look like a pool problem rather
         than a ceiling problem.
         """
-        source = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        module_vars = (IAM_MODULE / "variables.tf").read_text(encoding="utf-8")
         self.assertIn(
             "roles/container.clusterViewer",
-            _hcl_string_list(source, "agent_read_only_roles"),
+            _hcl_variable_default_list(module_vars, "project_roles"),
         )
 
     def test_the_pool_grants_token_creator_per_account_and_never_project_wide(self):
@@ -331,23 +415,87 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         `pool_enabled` is the broker's default, and the operator overrides it: a
         PlatformAgent listing scoped accounts renders
         CREDENTIAL_PROXY_SCOPED_SA_POOL=1. The composition fills that list from
-        `scoped_clusters`, so a default that named the cluster it provisions would
-        arm the pool on every stock install -- past the broker's default entirely,
-        and straight into the outage the test above is written to prevent.
+        `scoped_clusters`, so a default that named the cluster it provisions arms
+        the pool on every stock apply -- past the broker's default entirely, and
+        straight into the outage the guard test above exists to prevent.
+
+        The defect has two halves and an earlier version of this test pinned one.
+        Asserting `default = []` leaves the other open: a coalescing local
+        substitutes a cluster when the variable is empty, the variable's own
+        spelling never changes, and every stock apply is armed again.
+
+        So this traces the value instead of reading the declaration. There are
+        exactly two paths out of `scoped_clusters` -- into the module, which
+        provisions the accounts, and into the chart values, which arm the broker
+        -- and both are pinned to expressions that are empty when the variable
+        is. Nothing between them is left free to substitute.
         """
         variables = (FULL_INSTALL / "variables.tf").read_text(encoding="utf-8")
+        main = (FULL_INSTALL / "main.tf").read_text(encoding="utf-8")
+
+        # 1. The variable is empty, and cannot be null -- so there is nothing
+        #    for a `!= null` coalesce to catch either.
         block = re.search(
             r'variable "scoped_clusters" \{(.*?)\n\}', variables, re.DOTALL
         )
         self.assertIsNotNone(block, "the scoped_clusters variable moved or was renamed")
         default = re.search(r"^\s*default\s*=\s*(.+)$", block.group(1), re.MULTILINE)
         self.assertIsNotNone(default, "scoped_clusters declares no default")
+        self.assertEqual("[]", default.group(1).strip())
+        self.assertIsNotNone(
+            re.search(r"^\s*nullable\s*=\s*false\s*$", block.group(1), re.MULTILINE),
+            "scoped_clusters is nullable, so null is a third state this test does "
+            "not cover and a coalesce can act on",
+        )
+
+        # 2. First path: nothing sits between the variable and the module that
+        #    provisions the accounts.
+        module_block = re.search(
+            r'module "kube_agents_iam" \{(.*?)\n\}', main, re.DOTALL
+        )
+        self.assertIsNotNone(module_block, "the kube_agents_iam module call moved")
+        argument = re.search(
+            r"^\s*scoped_clusters\s*=\s*(.+?)\s*$", module_block.group(1), re.MULTILINE
+        )
+        self.assertIsNotNone(
+            argument, "the composition no longer passes scoped_clusters to the module"
+        )
         self.assertEqual(
-            "[]",
-            default.group(1).strip(),
-            "the full-install composition provisions a pool by default. Every "
-            "stock install would then arm the broker onto accounts that hold no "
-            "IAM grant, and every cluster read would be refused.",
+            "var.scoped_clusters",
+            argument.group(1),
+            "something transforms scoped_clusters between the variable and the "
+            "module. Whatever it substitutes when the variable is empty is what "
+            "every stock apply provisions a pool from.",
+        )
+
+        # 3. Second path: the chart values, which are what actually arm the
+        #    broker. Keyed off the module's output, so an empty variable gives an
+        #    empty map gives an empty CR list -- and the rejoin table is iterated
+        #    from the variable rather than from anything substituted for it.
+        helm_value = re.search(
+            r"scopedServiceAccounts\s*=\s*\[(.*?)\n(\s*)\]", main, re.DOTALL
+        )
+        self.assertIsNotNone(
+            helm_value, "the chart values no longer carry scopedServiceAccounts"
+        )
+        self.assertIn(
+            "module.kube_agents_iam.scoped_service_accounts",
+            helm_value.group(1),
+            "the CR's scopedServiceAccounts list is built from something other "
+            "than the module's output, so it can be non-empty while the pool is "
+            "not provisioned -- which arms the broker onto accounts that do not "
+            "exist",
+        )
+        entries = re.search(
+            r"^\s*scoped_pool_entries\s*=\s*\{\s*\n\s*for \w+ in (\S+)\s*:",
+            main,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(entries, "local.scoped_pool_entries moved or was renamed")
+        self.assertEqual(
+            "var.scoped_clusters",
+            entries.group(1),
+            "the rejoin table is built from something other than the variable",
         )
 
 

@@ -29,7 +29,11 @@ spec:
       # Default: false
       # +optional
       pluginsDebug: false
-      # ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
+      # ApiServerSecretRef references a Secret holding API_SERVER_EXTERNAL_KEY, the
+      # credential outside callers present to the credential-proxy sidecar. It does
+      # NOT set API_SERVER_KEY: the value the Hermes API server itself validates is
+      # the non-secret loopback sentinel the operator pins, and pointing this at a
+      # Secret does not replace it.
       # +optional
       apiServerSecretRef:
         name: "platformagent-secrets"

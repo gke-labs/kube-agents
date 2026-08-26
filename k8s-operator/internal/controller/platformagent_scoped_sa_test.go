@@ -18,6 +18,10 @@ package controller
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -229,6 +233,128 @@ func TestAPluginCannotDisableTheScopedServiceAccountPool(t *testing.T) {
 		if count != 1 || value != want {
 			t.Errorf("%s = %q (x%d), want exactly one %q", name, value, count, want)
 		}
+	}
+}
+
+// TestTheFlagTheKeyAndTheMountAgreeOnEveryShape is the invariant the two tests
+// above only spot-check at their own end of it.
+//
+// Three things have to move together on every render: the ConfigMap carries the
+// key, the broker container is told to read that path, and something mounts the
+// key there. Any two out of three is a broker that will not start, and the
+// failure is a crashloop several layers from the CR field that caused it — the
+// SubPath names a key the ConfigMap does not have, so the kubelet cannot
+// populate the volume; or the flag is armed and `build_pool` finds no file.
+//
+// Written as a sweep over the shapes rather than as another single case,
+// because what went wrong here once already was a builder that got two of the
+// three right. Mutating any one of the three leaves the goldens and the
+// per-property tests above green in at least one direction.
+// TestARepeatedClusterIsRejectedAtAdmission pins the marker, not the prose.
+//
+// The broker refuses to start on a mapping that resolves one cluster to two
+// accounts, which is the right call -- resolving it by last-wins would make the
+// account a request gets depend on the order the operator happened to type. But
+// refusing at startup means the operator sees a crashloop, several layers away
+// from the copy-pasted CR entry that caused it, and the CR itself applied
+// cleanly.
+//
+// `x-kubernetes-list-type: map` on the cluster tuple moves that to `kubectl
+// apply`. Asserted against the generated CRD rather than against the Go marker
+// comment, because the marker is only worth anything once controller-gen has
+// turned it into schema -- a typo'd marker is a comment.
+func TestARepeatedClusterIsRejectedAtAdmission(t *testing.T) {
+	crd, err := os.ReadFile(filepath.Join(
+		"..", "..", "config", "crd", "bases", "kubeagents.x-k8s.io_platformagents.yaml",
+	))
+	if err != nil {
+		t.Fatalf("reading the generated CRD: %v", err)
+	}
+
+	// The field appears once per served version; every one of them has to carry
+	// the keys, so the count is checked rather than the first hit.
+	blocks := regexp.MustCompile(
+		`(?s)scopedServiceAccounts:.*?\n(\s+)x-kubernetes-list-type: (\w+)`,
+	).FindAllStringSubmatch(string(crd), -1)
+	if len(blocks) == 0 {
+		t.Fatal("scopedServiceAccounts carries no x-kubernetes-list-type; a repeated " +
+			"cluster is admitted and the broker crashloops on it")
+	}
+	for _, block := range blocks {
+		if block[2] != "map" {
+			t.Errorf("x-kubernetes-list-type is %q, want \"map\"", block[2])
+		}
+	}
+
+	for _, key := range []string{"projectId", "location", "clusterName"} {
+		if !regexp.MustCompile(
+			`(?s)scopedServiceAccounts:.*?x-kubernetes-list-map-keys:(.*?)x-kubernetes-list-type`,
+		).MatchString(string(crd)) {
+			t.Fatal("scopedServiceAccounts declares no list-map keys")
+		}
+		keys := regexp.MustCompile(
+			`(?s)scopedServiceAccounts:.*?x-kubernetes-list-map-keys:(.*?)x-kubernetes-list-type`,
+		).FindStringSubmatch(string(crd))[1]
+		if !strings.Contains(keys, "- "+key) {
+			t.Errorf("%s is not a list-map key, so two entries differing only in it "+
+				"are admitted as distinct and the broker sees a duplicate scope", key)
+		}
+	}
+
+	// serviceAccountEmail must NOT be a key: keyed on it too, one cluster
+	// pointed at two accounts is a legal list again, which is the case the
+	// broker refuses.
+	keys := regexp.MustCompile(
+		`(?s)scopedServiceAccounts:.*?x-kubernetes-list-map-keys:(.*?)x-kubernetes-list-type`,
+	).FindStringSubmatch(string(crd))[1]
+	if strings.Contains(keys, "- serviceAccountEmail") {
+		t.Error("serviceAccountEmail is a list-map key, so one cluster may still " +
+			"appear twice with different accounts")
+	}
+}
+
+func TestTheFlagTheKeyAndTheMountAgreeOnEveryShape(t *testing.T) {
+	shapes := map[string]*agentv1alpha1.PlatformAgent{
+		"no accounts":   scopedAgent(),
+		"one account":   scopedAgent(account("proj", "us-central1", "cluster", "ka-cluster-1a2b3c4d@proj.iam.gserviceaccount.com")),
+		"two accounts":  scopedAgent(account("proj", "us-central1", "a", "ka-a-11111111@proj.iam.gserviceaccount.com"), account("other", "europe-west1", "b", "ka-b-22222222@other.iam.gserviceaccount.com")),
+		"cross-project": scopedAgent(account("other", "europe-west1", "b", "ka-b-22222222@other.iam.gserviceaccount.com")),
+		"plugin override": func() *agentv1alpha1.PlatformAgent {
+			agent := scopedAgent(account("proj", "us-central1", "cluster", "ka-cluster-1a2b3c4d@proj.iam.gserviceaccount.com"))
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+				{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"},
+			}}
+			return agent
+		}(),
+	}
+	for name, agent := range shapes {
+		t.Run(name, func(t *testing.T) {
+			_, keyPresent := buildCredentialProxyPolicyConfigMap(agent).Data[scopedSAPoolKey]
+
+			flagValue, flagCount := envValueCount(buildCredentialProxyEnv(agent), "CREDENTIAL_PROXY_SCOPED_SA_POOL")
+			if flagCount != 1 {
+				t.Fatalf("CREDENTIAL_PROXY_SCOPED_SA_POOL appears %d times, want exactly 1", flagCount)
+			}
+			armed := flagValue == "1"
+
+			mounted := false
+			for _, mount := range buildCredentialProxySidecar(agent, "/opt/data").VolumeMounts {
+				if mount.SubPath == scopedSAPoolKey {
+					mounted = true
+				}
+			}
+
+			if armed != keyPresent {
+				t.Errorf("flag armed=%v but the ConfigMap key present=%v; armed with no "+
+					"mapping is a broker that refuses to start, and a mapping with the "+
+					"flag off is a file nothing reads", armed, keyPresent)
+			}
+			if mounted != keyPresent {
+				t.Errorf("SubPath mount present=%v but the ConfigMap key present=%v; a "+
+					"SubPath naming a key the ConfigMap does not carry stops the "+
+					"container starting", mounted, keyPresent)
+			}
+		})
 	}
 }
 

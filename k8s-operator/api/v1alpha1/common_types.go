@@ -522,6 +522,20 @@ type SecuritySpec struct {
 	// every cluster — and renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the
 	// mode a deployment is in can be read off the Deployment rather than
 	// inferred from what is absent.
+	//
+	// Keyed on the cluster tuple by the API server, so a repeated cluster is
+	// rejected at admission. Without that a copy-pasted entry whose clusterName
+	// was never changed is admitted, reconciles, changes the ConfigMap hash and
+	// rolls the broker — which then refuses to start, because the broker will
+	// not resolve one cluster to two accounts by taking whichever came last.
+	// The failure is a crashloop with the cause several layers away, so it is
+	// worth catching in `kubectl apply`. Terraform's scoped_clusters already
+	// validates the same thing on its own path.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
 	// +optional
 	ScopedServiceAccounts []ScopedServiceAccount `json:"scopedServiceAccounts,omitempty"`
 
@@ -588,9 +602,12 @@ type SecuritySpec struct {
 // files the account under. Keying on the cluster name alone would let a second
 // project reusing a name be served by the first project's account.
 //
-// The patterns are GKE's own name rules, and they are enforced here rather than
-// only in the broker because a separator or a quote in one of them would
-// produce a key that silently matches nothing.
+// The patterns are the broker's own component regexes, which is the property
+// that matters: they are narrower than GKE's naming rules in places, and being
+// identical to what the broker will accept is what stops the API server
+// admitting an entry the broker then refuses. They are enforced here as well as
+// there because a separator or a quote in one of them would produce a key that
+// silently matches nothing.
 type ScopedServiceAccount struct {
 	// ProjectID is the project the cluster lives in, which need not be the
 	// project the agent runs in.

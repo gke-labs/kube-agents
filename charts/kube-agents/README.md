@@ -334,6 +334,18 @@ Two knobs need context beyond the chart:
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
 
+### Scoped service accounts
+
+`platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
+may read to the Google service account that reads it. Empty is the default and
+should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
+non-empty list arms the credential broker onto identities that can read nothing
+and every cluster read is refused. The
+`terraform/examples/full-install` composition fills it in from its
+`scoped_service_accounts` output when `scoped_clusters` is set. See the site's
+[security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
+for what the pool does and does not bound.
+
 ### ServiceAccount ownership
 
 Exactly one owner creates the agent's KSA, depending on

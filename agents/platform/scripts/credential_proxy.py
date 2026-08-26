@@ -1140,7 +1140,12 @@ class ExecutionResult:
 # denylist over a format that keeps growing, and racy besides, since the file can
 # be rewritten between the check and the open — the proxy reads exactly one
 # string out of it and regenerates the rest. See CommandExecutor._resolve_kubeconfig.
-_GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
+# `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
+# scope key in a log line and a filename in the sidecar state dir. `fullmatch`
+# at the call site says the same thing twice on purpose: whichever a later
+# reader changes, the other still holds.
+_GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 
 # Enough for any real kubeconfig; the point is that this file is attacker-chosen
 # and gets read into memory before anything is known about it.
@@ -1170,13 +1175,17 @@ def parse_gke_context(context: str) -> ClusterTarget | None:
     contain one, so a 4-way split is unambiguous.
 
     Each component is held to the GKE naming rules, which is also what keeps the
-    value safe to use in a filename — no separators, no dots, no traversal.
+    value safe to use in a filename — no separators, no dots, no traversal, and
+    no newline, which `$` would have let through and `context_name` would then
+    have carried into a path and a log record.
     """
     parts = context.split("_", 3)
     if len(parts) != 4 or parts[0] != "gke":
         return None
     project, location, cluster = parts[1], parts[2], parts[3]
-    if not all(_GKE_CONTEXT_COMPONENT.match(part) for part in (project, location, cluster)):
+    if not all(
+        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (project, location, cluster)
+    ):
         return None
     return ClusterTarget(project=project, location=location, cluster=cluster)
 
@@ -1518,9 +1527,21 @@ class CommandExecutor:
         # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
         # over it in kubectl, so closing only the environment would leave the
         # flag as an open door.
-        command = self._reroute_kubeconfig_flags(command)
+        command, flag_kubeconfig = self._reroute_kubeconfig_flags(command)
         if kubeconfig:
             kubeconfig_path = self._resolve_kubeconfig(kubeconfig)
+        elif flag_kubeconfig is not None:
+            # argv already names a cluster and the reroute above has already put
+            # it through selection. Falling into the branch below would select a
+            # *second* cluster -- the sidecar's own -- for a request that never
+            # asked for it. With the ambient cluster unmapped that is a refusal
+            # of a request pinned to a cluster the pool covers; with it mapped it
+            # is a second token minted and thrown away. Neither is a control.
+            #
+            # The environment follows the flag when the pool is armed so the two
+            # cannot disagree, and is left alone otherwise, which is what the
+            # flag path did before the pool existed.
+            kubeconfig_path = flag_kubeconfig if self.scoped_pool is not None else None
         elif self.scoped_pool is not None and executable == "kubectl":
             # `KUBECONFIG` is in the base environment, so this branch is not
             # "no cluster" — it is "the sidecar's default cluster", and it has to
@@ -1748,27 +1769,37 @@ class CommandExecutor:
             )
         return self._kubeconfig_for(target)
 
-    def _reroute_kubeconfig_flags(self, command: list[str]) -> list[str]:
+    def _reroute_kubeconfig_flags(
+        self, command: list[str]
+    ) -> tuple[list[str], Path | None]:
         """Point any `--kubeconfig` in argv at the regenerated file.
 
         kubectl prefers this flag over the environment, and it reaches the
         sidecar untouched — the policy engine matches on argv but has no rule for
         it, and the workspace PVC is mounted here. Left alone it would be the
         simplest way around everything `_resolve_kubeconfig` does.
+
+        Returns the rewritten argv and the path the flag ends up naming, or None
+        when there was no flag. The caller needs to know: resolving the flag has
+        already put its cluster through pool selection, and selecting a *second*
+        cluster for the same request is not a second control, it is a bug. The
+        last flag wins, the way kubectl reads them.
         """
         rewritten = list(command)
+        resolved_path: Path | None = None
         index = 1
         while index < len(rewritten):
             argument = rewritten[index]
             if argument == "--kubeconfig" and index + 1 < len(rewritten):
-                rewritten[index + 1] = str(self._resolve_kubeconfig(rewritten[index + 1]))
+                resolved_path = self._resolve_kubeconfig(rewritten[index + 1])
+                rewritten[index + 1] = str(resolved_path)
                 index += 2
                 continue
             if argument.startswith("--kubeconfig="):
-                resolved = self._resolve_kubeconfig(argument.split("=", 1)[1])
-                rewritten[index] = f"--kubeconfig={resolved}"
+                resolved_path = self._resolve_kubeconfig(argument.split("=", 1)[1])
+                rewritten[index] = f"--kubeconfig={resolved_path}"
             index += 1
-        return rewritten
+        return rewritten, resolved_path
 
     def _target_of(self, requested: Path) -> ClusterTarget:
         """Read the wanted cluster out of the caller's kubeconfig."""
@@ -2332,7 +2363,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # generic policy block, and so that a test can assert on the reason
             # rather than on a status code every other gate also returns.
             LOGGER.warning(
-                "scoped service account refused request_id=%s reason=%s", request_id, exc
+                # The message embeds the scope key, which is built from the
+                # `current-context` of a kubeconfig the agent wrote. Same
+                # reasoning as the ValueError handler below: an unsanitised
+                # value here forges log records.
+                "scoped service account refused request_id=%s reason=%s",
+                request_id,
+                _sanitize_for_logging(str(exc), max_length=256),
             )
             self._json(
                 HTTPStatus.FORBIDDEN,

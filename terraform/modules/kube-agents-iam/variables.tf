@@ -34,13 +34,15 @@ variable "ksa_name" {
 
 variable "project_roles" {
   description = <<-EOT
-    Project-level IAM roles granted to the agent's service account. Leave unset
-    (or pass null, which lets a root module expose a passthrough variable) to
-    take the module's default read-only set; set [] to grant nothing and manage
-    roles elsewhere. The full-install composition resolves permission_set into
-    an explicit list before it calls this module, so on that path this variable
-    is always named. See the security-and-iam reference for what each role is
-    for.
+    Project-level IAM roles granted to the agent's service account, and the only
+    list the module binds -- `local.agent_project_roles` in main.tf reads this
+    and nothing else. The default below mirrors `read_only_roles` in
+    terraform/examples/full-install/main.tf, and
+    tests/test_scoped_sa_pool_iam.py compares the two, so the mirror is checked
+    rather than merely intended. Set [] to grant nothing and manage roles
+    elsewhere. The full-install composition resolves permission_set into an
+    explicit list before it calls this module, so on that path this variable is
+    always named. See the security-and-iam reference for what each role is for.
 
     The default was going to depend on scoped_clusters: with a pool the
     per-cluster accounts would carry roles/container.viewer and the agent would

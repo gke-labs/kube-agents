@@ -11,26 +11,25 @@ resource "google_service_account_iam_member" "workload_identity" {
 }
 
 locals {
-  # Mirrors `read_only_roles` in terraform/examples/full-install/main.tf, which
-  # is what the composition passes in as project_roles. Two copies because the
-  # module has to have a default a caller who names nothing still gets, and the
-  # composition has to resolve permission_set before it calls the module.
-  # `tests/test_scoped_sa_pool_iam.py` compares the two lists, so the mirror is
-  # checked rather than merely intended.
-  agent_read_only_roles = [
-    "roles/container.clusterViewer",
-    "roles/container.viewer",
-    "roles/compute.viewer",
-    "roles/monitoring.viewer",
-    "roles/logging.viewer",
-    "roles/iam.serviceAccountUser",
-    "roles/iam.securityReviewer",
-    "roles/mcp.toolUser",
-  ]
-
-  # roles/container.viewer is what lets an identity read Kubernetes objects in
-  # every cluster in the project. Once the pool carries it per-cluster, the
-  # agent's own identity keeps only container.clusterViewer, which reaches the
+  # The list that actually reaches google_project_iam_member.agent_roles.
+  #
+  # There is deliberately only one, and it is `var.project_roles`. An earlier
+  # draft kept a second copy here as the module's "real" default; because the
+  # variable is nullable = false with a default of its own, `var.project_roles`
+  # is never null and that copy was unreachable -- a role list a reader would
+  # take for the granted set while nothing bound it.
+  #
+  # This local exists as the seam the scoped_clusters coupling goes back into.
+  # It was going to read:
+  #
+  #   length(var.scoped_clusters) > 0
+  #   ? [for role in var.project_roles : role if role != "roles/container.viewer"]
+  #   : var.project_roles
+  #
+  # so populating scoped_clusters stripped container.viewer from the agent and
+  # relied on the pool to carry it per cluster. roles/container.viewer is what
+  # lets an identity read Kubernetes objects in every cluster in the project;
+  # without it the agent keeps roles/container.clusterViewer, which reaches the
   # Container API control plane -- listing clusters, `get-credentials` -- and
   # nothing inside a cluster.
   #
@@ -39,16 +38,9 @@ locals {
   # for this identity whenever it likes, entirely outside the broker. Shrinking
   # what that token is worth is the only control that survives the bypass.
   #
-  # SUSPENDED 2026-08-12. This read:
-  #
-  #   length(var.scoped_clusters) > 0
-  #   ? [for role in local.agent_read_only_roles : role if role != "roles/container.viewer"]
-  #   : local.agent_read_only_roles
-  #
-  # so populating scoped_clusters stripped container.viewer from the agent and
-  # relied on the pool to carry it per cluster. The pool carries nothing now:
-  # the IAM Condition scoping its members grants nothing for Kubernetes object
-  # operations, so the grant was removed outright. See scoped_pool.tf.
+  # SUSPENDED 2026-08-12. The pool carries nothing now: the IAM Condition
+  # scoping its members grants nothing for Kubernetes object operations, so the
+  # grant was removed outright. See scoped_pool.tf.
   #
   # Left as it was, this is a total outage rather than a narrowing -- the agent
   # cannot read objects and no pool member can either. The runtime flag does not
@@ -59,9 +51,7 @@ locals {
   # strongest reason to want it back. Restore it in the same change that lands
   # per-cluster RBAC, gated on the pool granting something, with a test that a
   # read still succeeds afterwards.
-  agent_project_roles = (
-    var.project_roles != null ? var.project_roles : local.agent_read_only_roles
-  )
+  agent_project_roles = var.project_roles
 }
 
 resource "google_project_iam_member" "agent_roles" {
