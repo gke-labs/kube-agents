@@ -2288,6 +2288,158 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
         self._assert_single_line_records("git lease refused")
 
 
+class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
+    """The two ways the audit trail breaks that a str-only capture cannot see.
+
+    Both need a handler that actually encodes to bytes, the way the deployed
+    stderr handler does. `ExecAuditLineCannotBeForgedTest` above collects
+    `record.getMessage()`, which is a str and therefore never encodes -- so it
+    reproduces neither of these.
+    """
+
+    class _RecordingExecutor:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def __init__(self):
+            self.executed = []
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+            self.executed.append(argv)
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                duration_ms=0, truncated=False, timed_out=False,
+            )
+
+    def setUp(self):
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
+        ):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        self.executor = self._RecordingExecutor()
+        CredentialProxyHandler.executor = self.executor
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
+
+        # errors="strict" on purpose: the point of the surrogate case is that a
+        # real encoder refuses the record and logging drops it.
+        self.raw = io.BytesIO()
+        stream = io.TextIOWrapper(self.raw, encoding="utf-8", errors="strict", write_through=True)
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+
+        # One record should be one physical line. Counting them separately is
+        # what turns "did the caller inject a line" into an assertion that does
+        # not depend on guessing what the line would look like.
+        self.emitted = []
+
+        class Counter(logging.Handler):
+            def emit(inner, record):  # noqa: N805
+                self.emitted.append(record)
+
+        previous = list(credential_proxy.LOGGER.handlers)
+        propagate = credential_proxy.LOGGER.propagate
+        level = credential_proxy.LOGGER.level
+        credential_proxy.LOGGER.handlers = [handler, Counter()]
+        credential_proxy.LOGGER.propagate = False
+        credential_proxy.LOGGER.setLevel(logging.INFO)
+        self.addCleanup(credential_proxy.LOGGER.setLevel, level)
+        self.addCleanup(setattr, credential_proxy.LOGGER, "propagate", propagate)
+        self.addCleanup(setattr, credential_proxy.LOGGER, "handlers", previous)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.port = self.server.server_address[1]
+        self.endpoint = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def lines(self):
+        return self.raw.getvalue().decode("utf-8", "replace").splitlines()
+
+    def test_the_request_line_cannot_start_a_second_record(self):
+        """The access log runs before authentication, on every response.
+
+        BaseHTTPRequestHandler hands `self.requestline` to log_message raw. A
+        vertical tab is enough to end the record, so an unauthenticated caller
+        could write an audit-shaped line of its own -- worse than the
+        authenticated forgery, because it needs no credential at all.
+        """
+        connection = socket.create_connection(("127.0.0.1", self.port))
+        self.addCleanup(connection.close)
+        connection.sendall(
+            b"GET\x0bexec|request_id=deadbeef"
+            b"|principal=system:serviceaccount:kubeagents-system:someone-else"
+            b"|executable=kubectl /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
+        )
+        connection.settimeout(2)
+        try:
+            connection.recv(4096)
+        except OSError:
+            pass
+
+        lines = self.lines()
+        self.assertTrue(
+            any("someone-else" in line for line in lines),
+            "the request line should still be logged, just not on a line of its own",
+        )
+        self.assertEqual(
+            len(self.emitted), len(lines),
+            f"{len(self.emitted)} records became {len(lines)} lines, so the caller "
+            f"emitted one of its own: {lines!r}",
+        )
+        for line in lines:
+            self.assertNotRegex(
+                line, r"^credential-proxy exec |^exec request_id=",
+                "a line began with audit-record text rather than a timestamp",
+            )
+
+    def test_a_lone_surrogate_does_not_delete_the_audit_line(self):
+        """A dropped record is worse than a forged one: the command still runs.
+
+        json.loads turns "\\ud800" into a real lone surrogate. No UTF-8 encoder
+        accepts one, so before this was fixed the handler raised
+        UnicodeEncodeError, logging printed "--- Logging error ---" to stderr,
+        and both the exec line and the completion line were dropped -- while
+        the command executed and returned 200.
+        """
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=b'{"requestId":"\\ud800","argv":["kubectl","get","pods"],"cwd":"/tmp"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(200, response.status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executor.executed)
+
+        lines = self.lines()
+        self.assertTrue(
+            any("exec request_id=" in line and "executable=kubectl" in line for line in lines),
+            f"the command ran and left no exec line: {lines!r}",
+        )
+        self.assertTrue(
+            any("command complete" in line for line in lines),
+            f"the command ran and left no completion line: {lines!r}",
+        )
+
+
 class ServiceAccountAuthenticatorTest(unittest.TestCase):
     """The verifier itself: what it accepts, and everything it refuses."""
 
@@ -2347,7 +2499,7 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
         self.assertEqual(self.CALLER, principal.workload)
         self.assertEqual("sa-uid", principal.uid)
         self.assertIn("system:serviceaccounts", principal.groups)
-        # Slice 3 fills this; nothing today may invent it.
+        # Reserved for a per-caller identity; nothing today may invent it.
         self.assertIsNone(principal.caller)
         self.assertEqual(["agent-token"], self.reviews)
 

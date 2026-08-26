@@ -514,7 +514,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         return value.replace("\r", "").replace("\n", "")
 
     def log_message(self, message: str, *args: Any) -> None:
-        LOGGER.info("agent-api " + message, *args)
+        # BaseHTTPRequestHandler hands the raw request line through here, so
+        # every argument is caller text and it is logged before any
+        # authentication runs. See CredentialProxyHandler.log_message.
+        LOGGER.info("agent-api " + message, *_sanitized_log_args(args))
 
 
 class GoogleChatRelay:
@@ -1896,10 +1899,35 @@ def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
     """
     import unicodedata
 
-    # Characters in Cc (control), Cf (format), Zl (line sep), Zp (para sep)
-    # will forge log lines in text-mode consumers.
-    filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))
+    # Cc (control), Cf (format), Zl (line sep) and Zp (para sep) forge log
+    # lines in text-mode consumers.
+    #
+    # Cs is here for the opposite reason: a lone surrogate does not forge a
+    # record, it deletes one. json.loads turns "\\ud800" into a real lone
+    # surrogate, which no UTF-8 encoder will accept, so the handler raises
+    # UnicodeEncodeError, logging prints "--- Logging error ---" to stderr and
+    # drops the record - while the request it was supposed to describe carries
+    # on and succeeds. An authenticated caller could execute a command and
+    # leave no exec line behind. Verified against a byte-encoding handler; a
+    # StringIO one does not reproduce it, which is why the unit tests below
+    # write through a real UTF-8 encoder.
+    filtered = ''.join(
+        c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')
+    )
     return filtered[:max_length]
+
+
+def _sanitized_log_args(args: tuple[Any, ...], max_length: int = 512) -> tuple[Any, ...]:
+    """Sanitize the string arguments of a log record, leaving the rest alone.
+
+    For the BaseHTTPRequestHandler log hooks, where the format string is the
+    stdlib's and every argument is caller-controlled. Non-strings (status
+    codes, sizes) are passed through so the format specifiers still match.
+    """
+    return tuple(
+        _sanitize_for_logging(arg, max_length=max_length) if isinstance(arg, str) else arg
+        for arg in args
+    )
 
 
 def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
@@ -2070,6 +2098,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # forged entry into the audit trail - including one naming a
         # ServiceAccount that made no request. It is never echoed back to the
         # client, so narrowing it costs nothing.
+        #
+        # This is one route into the log, not all of them. The access line goes
+        # through log_message above, which had the same defect from an
+        # unauthenticated caller; both are fixed, and any new log site taking
+        # caller text needs the same treatment.
         request_id = _sanitize_for_logging(str(payload.get("requestId", "")))
         # The principal reaches the decision point, rather than being checked at
         # the door and thrown away. Every policy refusal below is a judgement
@@ -2385,7 +2418,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
     def log_message(self, message: str, *args: Any) -> None:
-        LOGGER.info("http " + message, *args)
+        # BaseHTTPRequestHandler.log_request passes self.requestline through
+        # here verbatim, and this runs on every response - including the 401 an
+        # unauthenticated caller gets. A vertical tab in the request line is
+        # enough to end the record and start another, so an unauthenticated
+        # caller could write a whole audit-shaped line of its own. The request
+        # line's own tokenizer stops at whitespace, which limits the shape of
+        # the forgery and does not prevent it.
+        LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")

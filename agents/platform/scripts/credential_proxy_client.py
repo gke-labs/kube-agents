@@ -50,10 +50,24 @@ class _BrokerHTTPHandler(urllib.request.HTTPHandler):
         return self.do_open(BrokerConnection, req)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect out of the broker.
+
+    urllib re-sends the Authorization header across a cross-host redirect, so
+    a 302 in a broker response would hand the projected token to wherever the
+    Location points. Only reachable by something that already controls the
+    broker's responses, but the header is the one thing worth not leaking on
+    the way out.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
 # A private opener rather than urllib.request.install_opener: this module is
 # imported by github_token_refresh and the two relay patches, and a global
 # opener would strip the total timeouts their own urlopen calls rely on.
-_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler)
+_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
 
 
 def open_broker_request(request: urllib.request.Request):

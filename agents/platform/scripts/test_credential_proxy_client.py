@@ -212,6 +212,23 @@ class TestConnectTimeout(unittest.TestCase):
             "a long-running proxied command must not be cut off by a client timeout",
         )
 
+    def test_the_opener_does_not_follow_a_redirect(self):
+        # urllib re-sends Authorization across a cross-host redirect, so a 302
+        # from a compromised broker would hand the projected token to whatever
+        # the Location names.
+        handlers = [
+            handler
+            for handler in credential_proxy_client._BROKER_OPENER.handlers
+            if isinstance(handler, credential_proxy_client._NoRedirect)
+        ]
+        self.assertEqual(1, len(handlers))
+        self.assertIsNone(
+            handlers[0].redirect_request(
+                None, None, 302, "Found", {}, "http://elsewhere.invalid/"
+            ),
+            "a redirect out of the broker must not be followed",
+        )
+
     def test_the_opener_uses_that_connection(self):
         # Building the opener with the wrong handler would silently restore the
         # stdlib connection and its unbounded connect.
