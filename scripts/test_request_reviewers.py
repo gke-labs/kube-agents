@@ -311,12 +311,46 @@ class AiReviewGateTest(unittest.TestCase):
     def test_success_clears_the_gate(self):
         self.assertIsNone(rr.ai_review_block_reason(check_run("success"), author_is_bot=False))
 
-    def test_findings_hold_the_gate(self):
-        reason = rr.ai_review_block_reason(
-            check_run("neutral", output={"title": "Found 2 issues"}), author_is_bot=False
+    def test_findings_clear_the_gate(self):
+        # The bot concludes `neutral` titled "Found 1 issue" when the review ran
+        # and found something (#890). That used to hold the reviewer back in the
+        # case a reviewer matters most.
+        self.assertIsNone(
+            rr.ai_review_block_reason(
+                check_run("neutral", output={"title": "Found 2 issues"}), author_is_bot=False
+            )
         )
-        self.assertIn("neutral", reason)
+
+    def test_a_review_that_never_ran_clears_the_gate(self):
+        # The same `neutral`, for the opposite reason: the bot's credential is
+        # expired (gke-labs/kube-agents-bot#18) and nobody read the diff at all.
+        self.assertIsNone(
+            rr.ai_review_block_reason(
+                check_run("neutral", output={"title": "Review did not complete"}),
+                author_is_bot=False,
+            )
+        )
+
+    def test_a_failure_still_holds_the_gate(self):
+        # `neutral` is not "any completed conclusion". A review that ran and
+        # failed is still a reason to keep a human out of it.
+        reason = rr.ai_review_block_reason(
+            check_run("failure", output={"title": "Found 2 issues"}), author_is_bot=False
+        )
+        self.assertIn("failure", reason)
         self.assertIn("Found 2 issues", reason)
+
+    def test_the_other_unhappy_conclusions_still_hold_the_gate(self):
+        for conclusion in ("cancelled", "timed_out", "action_required", "skipped", "stale"):
+            with self.subTest(conclusion=conclusion):
+                reason = rr.ai_review_block_reason(check_run(conclusion), author_is_bot=False)
+                self.assertIsNotNone(reason)
+                self.assertIn(conclusion, reason)
+
+    def test_the_passing_set_is_exactly_success_and_neutral(self):
+        # Guards the widening this change is one step short of: a later "just
+        # let completed through" would make every case above pass silently.
+        self.assertEqual(rr.AI_REVIEW_PASSING_CONCLUSIONS, frozenset({"success", "neutral"}))
 
     def test_a_missing_check_run_holds_the_gate(self):
         self.assertIn("no AI Review", rr.ai_review_block_reason(None, author_is_bot=False))
@@ -329,11 +363,22 @@ class AiReviewGateTest(unittest.TestCase):
 
     def test_findings_do_not_hold_the_gate_for_a_bot_author(self):
         # Dependabot cannot read its own findings and comment `/review`, so its
-        # pull requests pass on any completed conclusion.
-        self.assertIsNone(rr.ai_review_block_reason(check_run("neutral"), author_is_bot=True))
+        # pull requests pass on any completed conclusion -- including the ones
+        # widening the passing set above deliberately did not cover. `neutral`
+        # is not in this list any more: it clears for everyone now, so it would
+        # no longer reach the bot branch at all.
+        for conclusion in ("failure", "cancelled", "timed_out", "action_required"):
+            with self.subTest(conclusion=conclusion):
+                self.assertIsNone(
+                    rr.ai_review_block_reason(check_run(conclusion), author_is_bot=True)
+                )
 
     def test_a_bot_author_still_needs_the_check_to_have_run(self):
         self.assertIsNotNone(rr.ai_review_block_reason(None, author_is_bot=True))
+
+    def test_a_bot_author_still_waits_for_a_check_in_progress(self):
+        reason = rr.ai_review_block_reason(check_run(None, status="in_progress"), author_is_bot=True)
+        self.assertIn("in_progress", reason)
 
 
 class ResolvePullRequestTest(unittest.TestCase):

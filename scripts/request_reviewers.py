@@ -6,7 +6,8 @@
 the moment a pull request opened -- minutes before `kube-agents-bot` posted its
 read, and on most pull requests before the author had addressed a single
 finding. The reviewer is now requested from the bot's verdict instead: the
-`AI Review` check run going `success`.
+`AI Review` check run completing on a conclusion that is not a failure -- see
+`ai_review_block_reason` for which those are and why.
 
 That trigger is why this script exists rather than the action. The action reads
 `context.payload.pull_request`, which a `check_run` event does not carry, and
@@ -43,6 +44,12 @@ import yaml
 # any name, and this one decides who gets pinged.
 AI_REVIEW_CHECK_NAME = "AI Review"
 AI_REVIEW_APP_ID = 4437198
+
+# Check run conclusions that let a human reviewer be requested. Everything else
+# GitHub can conclude with -- `failure`, `cancelled`, `timed_out`,
+# `action_required`, `skipped`, `stale` -- still holds the gate. See
+# `ai_review_block_reason` for why `neutral` is in here and `failure` is not.
+AI_REVIEW_PASSING_CONCLUSIONS = frozenset({"success", "neutral"})
 
 DEFAULT_CONFIG_PATH = ".github/auto_request_review.yml"
 DEFAULT_IGNORED_KEYWORDS = ["DO NOT REVIEW"]
@@ -305,7 +312,25 @@ def ai_review_block_reason(check_run, author_is_bot):
 
     A bot cannot read its own findings and comment `/review`, so a pull request
     Dependabot opened passes on any completed conclusion. A human author has to
-    get it to `success`, or comment `/request-review` to override.
+    get it to `success` or `neutral`, or comment `/request-review` to override.
+
+    `neutral` clears the gate because both of the things it means want a human:
+
+      - The review ran and found something. The bot concludes `neutral` with a
+        title like "Found 1 issue" (#890), which held the reviewer back in
+        exactly the case a reviewer matters most.
+      - The review did not run. Since 2026-08-24 a broken credential has the bot
+        concluding `neutral` titled "Review did not complete"
+        (gke-labs/kube-agents-bot#18), so nobody has read the diff at all.
+
+    The crash case riding along on the same conclusion is deliberate, but it is
+    the weaker half of the justification: assigning a reviewer is the right
+    outcome there, and it is only reached by not being able to tell the two
+    apart. Revisit it if the bot ever gains a way to say "I am broken"
+    distinctly -- the thread on gke-labs/kube-agents-bot#18 sketches a
+    `CHECK_ID_BROKEN` sentinel in `external_id`, which is empty on these check
+    runs today. `failure` and the rest below still block; this is deliberately
+    not "any completed conclusion".
     """
     if check_run is None:
         return f"there is no {AI_REVIEW_CHECK_NAME} check run on the head commit"
@@ -314,7 +339,7 @@ def ai_review_block_reason(check_run, author_is_bot):
         return f"{AI_REVIEW_CHECK_NAME} is {check_run.get('status')}"
 
     conclusion = check_run.get("conclusion")
-    if conclusion == "success":
+    if conclusion in AI_REVIEW_PASSING_CONCLUSIONS:
         return None
 
     if author_is_bot:
@@ -323,7 +348,10 @@ def ai_review_block_reason(check_run, author_is_bot):
 
     title = (check_run.get("output") or {}).get("title")
     detail = f" ({title})" if title else ""
-    return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
+    return (
+        f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, "
+        f"not one of {', '.join(sorted(AI_REVIEW_PASSING_CONCLUSIONS))}"
+    )
 
 
 # --------------------------------------------------------------------------- #

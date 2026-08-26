@@ -1,17 +1,28 @@
 name: Auto Request Review
 
-# A human reviewer is requested once kube-agents-bot's `AI Review` check goes
-# green -- not when the pull request opens. Before this, the reviewer was pinged
-# minutes ahead of the bot's read and re-read a diff the author was about to
-# change.
+# A human reviewer is requested once kube-agents-bot's `AI Review` check has
+# completed on something other than a failure -- not when the pull request
+# opens. Before this, the reviewer was pinged minutes ahead of the bot's read
+# and re-read a diff the author was about to change. Which conclusions clear the
+# gate is `ai_review_block_reason` in scripts/request_reviewers.py, not here.
 #
-# Neither trigger can be a `pull_request` one. Every pull request here comes
+# No trigger here can be a `pull_request` one. Every pull request here comes
 # from a fork, and on a fork pull request `pull_request` and
 # `pull_request_review` hand the workflow a read-only `GITHUB_TOKEN` that
 # `permissions:` cannot raise, so it could not request a reviewer at all.
-# `check_run` and `issue_comment` run in the base repository's context with a
-# writable token, and `check_run` does not fire for check suites Actions itself
-# created, so there is no recursion to guard against.
+# `check_run`, `issue_comment` and `pull_request_target` all run in the base
+# repository's context with a writable token, and `check_run` does not fire for
+# check suites Actions itself created, so there is no recursion to guard
+# against.
+#
+# That reasoning picks the triggers but does not make one of them enough.
+# `check_run` fires once, and the answer the gate gives at that moment can be
+# "not yet" for a reason that later stops being true. A pull request opened as a
+# draft -- the normal flow here -- has its `AI Review` complete while
+# `skip_reason` is still correctly returning "the pull request is a draft", and
+# nothing fires again when it is marked ready, so it never gets a reviewer at
+# all. `pull_request_target: [ready_for_review]` re-runs the same gate at the
+# one moment draft-ness stops being a reason to skip.
 on:
   check_run:
     types: [completed]
@@ -20,6 +31,13 @@ on:
   # pull-request code is fetched or executed and no other secret is exposed
   issue_comment:
     types: [created]
+  # zizmor: ignore[dangerous-triggers] - a draft marked ready is the second entry point that
+  # has to work on a fork PR, and pull_request_target is the only trigger for it that keeps a
+  # write token; the checkout is the base repository's branch and never the pull request head,
+  # so no fork-authored code is fetched or executed, every event field reaches the step through
+  # `env:` rather than shell interpolation, and no other secret is exposed
+  pull_request_target:
+    types: [ready_for_review]
 
 permissions: {}
 
@@ -32,10 +50,27 @@ permissions: {}
 # the commit alone they queue behind each other, and GitHub keeps only one run
 # pending per group -- so the `AI Review` run, the only one that does anything,
 # can be cancelled before it starts by the next check to finish.
+#
+# A `pull_request_target` payload carries neither `check_run` nor `issue`, so
+# before the third fallback below *both* halves of the key fell through: the
+# name to the `'request-review'` literal, and the commit to
+# `github.event.issue.number`, which is empty on this event. Every
+# `ready_for_review` in the repository would have landed in the one group
+# `Auto Request Review-request-review-`, and since GitHub keeps only one run
+# pending per group, two pull requests marked ready close together would have
+# lost one of them before it started -- the same silent drop this trigger
+# exists to fix. `github.event.pull_request.number` is only set on the
+# `pull_request_target` event, so adding it last leaves the other two keys
+# byte-identical to what they were.
+#
+# `ready_for_review` and `/request-review` on the *same* pull request do share a
+# group, and should: both ask "has this pull request got a reviewer yet?", which
+# is exactly the pair the queueing above exists to serialise.
 concurrency:
   group: >-
     ${{ github.workflow }}-${{ github.event.check_run.name || 'request-review' }}-${{
-    github.event.check_run.head_sha || github.event.issue.number }}
+    github.event.check_run.head_sha || github.event.issue.number ||
+    github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
@@ -45,12 +80,16 @@ jobs:
       contents: read # check out the default branch: the script and its config
       pull-requests: write # request the reviewer
       issues: write # 👀 on the /request-review comment that asked for it
-    # Two entry points, and nothing else gets a runner:
+    # Three entry points, and nothing else gets a runner:
     #   - the bot's own `AI Review` check finishing (app id 4437198 -- the name
     #     alone is not an identity, any App can post a check run called
     #     anything);
     #   - `/request-review` from someone with write access, the override for a
-    #     finding the author has pushed back on, or a bot that never reported.
+    #     finding the author has pushed back on, or a bot that never reported;
+    #   - a draft marked ready, the one event that retracts a `skip_reason`
+    #     nothing else would retry. The `types:` filter already narrows this to
+    #     `ready_for_review`; `draft == false` is asserted anyway so a future
+    #     added type cannot quietly widen the entry point.
     if: >-
       (github.event_name == 'check_run' &&
         github.event.check_run.name == 'AI Review' &&
@@ -58,11 +97,20 @@ jobs:
       (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
         startsWith(github.event.comment.body, '/request-review') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_target' &&
+        github.event.action == 'ready_for_review' &&
+        github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     steps:
       # The default branch, never the pull request head: this job holds a
-      # writable token and must not run code from a fork.
+      # writable token and must not run code from a fork. No `ref:` is what
+      # keeps that true on all three triggers -- `check_run` and `issue_comment`
+      # resolve `github.ref` to the default branch, and `pull_request_target`
+      # resolves it to the pull request's *base* branch, which lives in this
+      # repository and is only writable by people who already have write access.
+      # `pull_request_target` never checks out the fork's head unless you ask it
+      # to by name, and nothing here does.
       - name: Checkout the default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,6 +138,23 @@ jobs:
           CHECK_RUN_ID: ${{ github.event.check_run.id }}
         run: |
           python3 scripts/request_reviewers.py --check-run-id "$CHECK_RUN_ID" --require-ai-review-pass
+
+      # The draft-to-ready retry. `--require-ai-review-pass` is kept
+      # deliberately: this is not a bypass, it re-evaluates the same gate at the
+      # one moment draft-ness stops being a reason to skip. No check run id,
+      # because this event has none -- given `--pr` the script reads the head
+      # commit's `AI Review` back from the API itself.
+      #
+      # `PR_NUMBER` reaches the script through `env:`, never interpolated into
+      # the `run:` body: on a `pull_request_target` every event field is
+      # attacker-controlled input.
+      - name: Request a reviewer now the draft is ready for review
+        if: github.event_name == 'pull_request_target'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 scripts/request_reviewers.py --pr "$PR_NUMBER" --require-ai-review-pass
 
       # No `--require-ai-review-pass`: bypassing the gate is what the command is
       # for. The `if:` above already checked who is asking.
