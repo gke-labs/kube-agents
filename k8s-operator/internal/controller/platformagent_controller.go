@@ -266,7 +266,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
+	otlpDisabled := otlpSource == otlpSourceNone
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -279,7 +280,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	// Reconcile NetworkPolicy
-	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
@@ -299,12 +300,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// Falling through to the bare default is the one telemetry outcome that can improve
-	// without anything else changing — someone installs a collector and nothing about
-	// this agent is touched. Reconciles are event-driven and can be quiet for hours, so
-	// nudge the probe rather than wait for an unrelated event. Every other source is
-	// explicit or already found something, and needs no polling.
-	if otlpSource == otlpSourceDefault {
+	// Default and None are the telemetry outcomes that can improve without anything else
+	// changing — someone installs a collector and nothing about this agent is touched.
+	// Reconciles are event-driven and can be quiet for hours, so nudge the probe rather
+	// than wait for an unrelated event. Every other source is explicit or already found
+	// something, and needs no polling. None especially: it is the outcome that leaves the
+	// agent exporting nowhere, so it is the one an operator most wants picked up promptly
+	// once they install a collector.
+	if otlpSource == otlpSourceDefault || otlpSource == otlpSourceNone {
 		return ctrl.Result{RequeueAfter: otelRediscoverAfter}, nil
 	}
 	return ctrl.Result{}, nil
@@ -477,11 +480,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
-	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint}
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -607,7 +610,7 @@ func (r *PlatformAgentReconciler) clearForeignPDBBudgetField(ctx context.Context
 	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string) error {
+func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
 	profile := r.resolveNetpolProfile(ctx, agent)
 
 	var apiTargets []string
@@ -721,7 +724,7 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 	}
 
 	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
-	netpol := buildNetworkPolicy(agent, apiTargets, profile, fqdnEnabled, otlpEndpoint)
+	netpol := buildNetworkPolicy(agent, apiTargets, profile, fqdnEnabled, otlpEndpoint, otlpDisabled)
 	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
 	}

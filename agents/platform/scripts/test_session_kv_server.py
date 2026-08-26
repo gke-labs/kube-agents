@@ -1518,9 +1518,13 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertIn("never give it an Option letter", instructions)
         self.assertNotIn("Do not end the report by inviting a reply", instructions)
 
-    def test_a_single_option_report_drops_the_option_letter_override(self):
-        # "apply Option A" is noise when there is only one option, and the
-        # Recommended line it would sit under is dropped in that case too.
+    def test_a_single_option_report_is_not_lettered(self):
+        # A list of one does not need letters, and a report that opens with
+        # "Option A" and never reaches an Option B reads like a page that
+        # failed to load. The letter goes, and so does everything that only
+        # exists to disambiguate between letters: the Recommended line, and the
+        # "or name one directly with 'apply Option A'" tail of the call to
+        # action.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -1530,14 +1534,23 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         }
         query = session_kv_server._build_agent_query(payload)
         instructions = query.split("## What to do", 1)[0]
-        self.assertIn("omit the Recommended line", instructions)
+        self.assertIn("do not letter it and do not use the word 'Option'", instructions)
+        self.assertIn("**Proposed fix (<Action Title>):**", instructions)
+        self.assertIn("No Recommended line", instructions)
         self.assertIn("a bare 'apply' is unambiguous", instructions)
-        # The clause the agent is told to drop has to be a clause the template
-        # below actually contains, or there is nothing to match and the agent
-        # ships a one-option report still offering "apply Option B".
-        dropped = "or name one directly with"
-        self.assertIn(dropped, instructions)
-        self.assertIn(dropped, query.split("## What to do", 1)[1])
+        # The single-option shape still has to end on the call to action. It is
+        # the reader's only route to a fix, and -- with no lettered option left
+        # under the heading -- the only thing kanban_notifier.actionable_report
+        # can recognise the report by, so a report without it earns no
+        # `incidents` row and the reply it invites arrives bare.
+        single_option = instructions.split("**With exactly one option:**", 1)[1]
+        bullets = [
+            line for line in single_option.splitlines() if line.startswith("- **")
+        ]
+        self.assertEqual(len(bullets), 2, bullets)
+        self.assertTrue(bullets[0].startswith("- **Proposed fix (<Action Title>):**"))
+        self.assertTrue(bullets[1].startswith("- **To authorize:** reply **'apply'**"))
+        self.assertNotIn("Option", "\n".join(bullets))
 
     def test_the_options_and_the_recommendation_are_still_there(self):
         # What the call-to-action points at. A reply of "apply Option B" is

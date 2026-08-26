@@ -900,6 +900,19 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     write: if the row stops being written, take the bullet out again rather
     than leaving a promise the system cannot keep.
 
+    A report with one option is not lettered. "Option A" standing alone asks
+    the reader to pick from a list of one, so that shape labels the bullet
+    **Proposed fix** and stops the call to action at ``apply``. What the letter
+    was also doing is evidence: ``kanban_notifier.actionable_report`` decided
+    which completions earn an ``incidents`` row by looking for ``Option <A-Z>``
+    under ``What to do``, and an unlettered report would have earned none — the
+    bare-``apply`` failure below, reintroduced with nothing red. It now takes
+    the ``To authorize:`` bullet as that evidence, which is the one line both
+    shapes carry. So the label in this template and the pattern in that gate are
+    one decision in two files: change the words here and the gate stops
+    recognising the report. ``test_triage_reply_roundtrip.py`` is the test that
+    holds both halves in scope.
+
     §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
     is about closing chatter, the "let me know if you need anything else" that
     ends a message with nothing in it; rule 1 requires the report to say what
@@ -940,13 +953,16 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"one line to the person waiting for the diagnosis.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
-        f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
-        f"Label them 'Option A', 'Option B', ... in order, and name those same letters in the call-to-action. "
-        f"When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
-        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and end the "
-        f"'To authorize:' bullet after **'apply'**, dropping the \"or name one directly with ...\" clause, since a bare 'apply' is unambiguous.\n\n"
-        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose. "
-        f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
+        f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"
+        f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters in the call-to-action, and mark exactly one of them "
+        f"'✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). "
+        f"The template below shows that shape; repeat its Option line once for each further option you propose.\n\n"
+        f"**With exactly one option:** do not letter it and do not use the word 'Option' — a lettered label asks the reader to pick from a list of one. "
+        f"The 'What to do' section is then these two bullets and nothing else, replacing the ones in the template below:\n"
+        f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action — a bare 'apply' is unambiguous when there is one fix.\n\n"
+        f"Every <...> above and in the template below is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"The last bullet of the 'What to do' section is the call to action, not another option: keep its 'To authorize:' label, "
         f"never give it an Option letter, and never count it when you number the options. "
         f"A reply in this thread reaches an agent that can see your report, so the offer is honoured.\n\n"

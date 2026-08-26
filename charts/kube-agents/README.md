@@ -249,15 +249,18 @@ the annotated KSA.
 
 ### Turning telemetry off
 
-The operator's endpoint ladder always resolves to something — a collector it
-discovers in the cluster, otherwise the GKE Managed OpenTelemetry collector — so
-`telemetry.otlpEndpoint` can move the exporter but cannot switch it off. On a
-cluster running neither (a plain `gke-cluster` module cluster has no
-`gke-managed-otel` namespace) the exporter then retries a hostname that never
-resolves, for the life of the pod.
+A cluster with no collector needs nothing done: when discovery completes and
+finds none — a plain `gke-cluster` module cluster has no `gke-managed-otel`
+namespace — the operator gives the agent no endpoint and sets
+`OTEL_SDK_DISABLED=true` itself. `status.telemetry.otlpEndpointSource` reads
+`None`, and the operator re-probes every 15 minutes, so installing a collector
+later turns export back on without a restart.
 
-`platformAgent.deployment.env` is the off switch. The operator applies it after
-its own container environment, so it wins:
+The manual switch is still there for the cases the operator will not decide:
+discovery switched off with `OTEL_COLLECTOR_DISCOVERY=false`, an endpoint pinned
+through `telemetry.otlpEndpoint`, or a collector that exists but that you do not
+want this agent exporting to. `platformAgent.deployment.env` is applied after the
+operator's own container environment, so it wins either way:
 
 ```yaml
 platformAgent:
@@ -266,6 +269,13 @@ platformAgent:
       - name: OTEL_SDK_DISABLED
         value: "true"
 ```
+
+Setting that value to `"false"` re-enables the SDK on a cluster where discovery
+found nothing, but on its own it does not produce a working exporter: the
+operator emitted no endpoint, so the SDK falls back to `http://localhost:4318`,
+and the NetworkPolicy it renders for a `None` agent carries no collector egress
+rule. Pair it with `telemetry.otlpEndpoint` if you want the export to land
+somewhere.
 
 Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 

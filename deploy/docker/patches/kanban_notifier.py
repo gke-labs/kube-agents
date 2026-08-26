@@ -32,7 +32,9 @@ The concerns, in the order the notifier reaches them:
    spending a turn to find out.
 5. **Store** the report the user just read: :func:`store_incident_report` puts
    it in the ``incidents`` table, keyed on the thread it was posted in, so a
-   reply of ``apply Option A`` reaches an agent that can see what Option A was.
+   reply of ``apply Option A`` reaches an agent that can see what Option A was
+   — or, where the report proposed a single unlettered fix, so that a bare
+   ``apply`` reaches one that can see which fix it authorises.
 
 Step 3 is only defensible because steps 1 and 2 happened, which is the clearest
 argument for keeping them together: ``kanban.wake_on_events`` may drop
@@ -1085,10 +1087,19 @@ def note_suppressed_completion(
 #
 # Which cards get a row
 # ---------------------
-# Only the ones carrying something to act on: a ``What to do`` section and at
-# least one lettered ``Option``. That is not a proxy for "was this event
-# triage" — it is the question itself. The row exists so ``apply Option A`` can
-# be resolved, and a card whose result is a one-line status has no Option A.
+# Only the ones carrying something to act on: a ``What to do`` section holding
+# either a lettered ``Option`` or the ``To authorize:`` call to action. That is
+# not a proxy for "was this event triage" — it is the question itself. The row
+# exists so ``apply Option A`` can be resolved, and a card whose result is a
+# one-line status has neither an Option A nor anything to authorize.
+#
+# Two patterns rather than one because the template asks for two shapes. A
+# report proposing a single fix does not letter it — a lone "Option A" reads as
+# a list of one — so it carries no lettered option at all, and gating on the
+# letter alone would deny a row to exactly the reports whose reply is the
+# simplest, a bare ``apply``. The ``To authorize:`` bullet is the line both
+# shapes end on, and it is the one this row serves: it is the sentence that
+# invites the reply the row exists to resolve.
 #
 # Card metadata cannot answer it. By the time the notifier sees the
 # subscription, ``kanban_event_routing`` has rewritten the row to look exactly
@@ -1135,17 +1146,42 @@ _WHAT_TO_DO_RE = re.compile(r"^ {0,3}#{1,6} +what to do\b", re.IGNORECASE | re.M
 #: order", and a lowercase "option a" in prose is a sentence, not a label.
 _OPTION_RE = re.compile(r"\bOption [A-Z]\b")
 
+#: The call to action. The template's single-option shape has no lettered option
+#: to match, and this bullet is what it ends on instead — see
+#: ``session_kv_server._triage_task_body``, which owns both shapes. The colon is
+#: load-bearing and the case is not incidental: this has to match a bullet's
+#: label, not the phrase "to authorize the quota increase" in someone's prose,
+#: which is a sentence rather than an offer to act on.
+#:
+#: ``[*_]*`` is what sits between the word and the colon, and it is the whole
+#: reason this pattern is not simply ``To authorize:``. The template emits
+#: ``**To authorize:**``, with the colon inside the emphasis — but a model
+#: reproducing a ``**Label:**`` bullet will as readily close the emphasis first
+#: and write ``**To authorize**:``, and italic and ``__``-bold do the same. Those
+#: are the same bullet, and matching only the template's exact spelling fails
+#: them silently: the single-option shape has no lettered option to fall back on,
+#: so the report is delivered, no ``incidents`` row is written, and the ``apply``
+#: it invites reaches the front door with nothing attached. That is the #802
+#: failure, in the one shape this gate exists to cover.
+#:
+#: The lookbehind does the job ``\b`` would, and is here because ``\b`` cannot:
+#: ``_`` is a word character, so ``\bTo`` finds no boundary in
+#: ``__To authorize__:`` and the ``__``-bold spelling fails on the opening
+#: marker rather than the closing one.
+_AUTHORIZE_RE = re.compile(r"(?<![0-9A-Za-z])To authorize[*_]*:")
+
 
 def actionable_report(result: object) -> bool:
     """Whether ``result`` is a report a reply could ask to act on.
 
     True only when both halves of the triage template's ``What to do`` section
-    are present: the heading, and at least one lettered option under it. Either
-    alone is not enough — a heading with no options offers nothing to apply, and
-    the word "Option" in a paragraph is not a label.
+    are present: the heading, and under it either a lettered option or the
+    ``To authorize:`` call to action. Either half alone is not enough — a
+    heading with neither offers nothing to apply, and the word "Option" in a
+    paragraph is not a label.
 
-    "Under it" is literal: the option search starts at the end of the heading
-    match, not at the top of the report. A ``What to do`` section holding only
+    "Under it" is literal: the search starts at the end of the heading match,
+    not at the top of the report. A ``What to do`` section holding only
     unlettered bullets, in a report whose ``Why`` quotes "Option A" from an
     earlier one, offers nothing to apply — and a row stored for it would hold
     the thread's one ``INSERT OR IGNORE`` slot against the report that does.
@@ -1158,7 +1194,10 @@ def actionable_report(result: object) -> bool:
     heading = _WHAT_TO_DO_RE.search(body)
     if not heading:
         return False
-    return bool(_OPTION_RE.search(body, heading.end()))
+    return bool(
+        _OPTION_RE.search(body, heading.end())
+        or _AUTHORIZE_RE.search(body, heading.end())
+    )
 
 
 def _incident_address(sub: object) -> Tuple[str, str]:
@@ -1250,17 +1289,17 @@ def store_incident_report(
             # The common case — every status line, every "no drift found". Not
             # a warning: this is what most cards look like.
             logger.debug(
-                "kanban notifier: card %s completed with no options to act on; "
-                "no incident row stored",
+                "kanban notifier: card %s completed with nothing for a reply to "
+                "act on; no incident row stored",
                 card,
             )
             return False
         chat_id, thread_id = _incident_address(sub)
         if not (chat_id and thread_id):
             logger.warning(
-                "kanban notifier: card %s delivered a report with remediation "
-                "options to chat %s thread %s, which is not a thread — a reply "
-                "naming an option will reach an agent that cannot see the report",
+                "kanban notifier: card %s delivered a report inviting a reply "
+                "to chat %s thread %s, which is not a thread — that reply will "
+                "reach an agent that cannot see the report",
                 card,
                 chat_id or "<no chat>",
                 thread_id or "<no thread>",

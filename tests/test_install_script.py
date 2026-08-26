@@ -23,6 +23,12 @@ from tests.testing.common import (
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
+_INSTALLER_COMMON = _REPO_ROOT / "k8s-operator" / "scripts" / "installer_common.sh"
+
+# install.sh sources the shared helpers from the acquired workspace partway
+# through main(), so a validator that leans on one is unreachable from a bare
+# KUBE_AGENTS_SOURCE_ONLY source. Prepend this to reach it.
+_SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -89,6 +95,101 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"MODE={MOCK_GOOGLE_CHAT_MODE}", proc.stdout)
+
+    def test_parse_args_cluster_mode(self):
+        """Verifies parse_args captures --cluster-mode."""
+        cmd = 'parse_args --cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODE=autopilot", proc.stdout)
+
+    def test_cluster_mode_defaults_to_unset(self):
+        """An unpassed --cluster-mode leaves the interview free to ask."""
+        proc = self._run_install_func('echo "MODE=[$PARAM_CLUSTER_MODE]"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MODE=[]", proc.stdout)
+
+    def test_require_creatable_cluster_mode_accepts_both_shapes(self):
+        for mode in ("autopilot", "standard"):
+            with self.subTest(mode=mode):
+                proc = self._run_install_func(
+                    f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode "{mode}" us-central1'
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_require_creatable_cluster_mode_rejects_an_unknown_shape(self):
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode autopiloot us-central1'
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        # install.sh's print_error writes to stdout.
+        self.assertIn("autopiloot", proc.stdout)
+
+    def test_require_creatable_cluster_mode_rejects_a_zone_for_autopilot(self):
+        """Autopilot clusters are regional; the module rejects a zone at plan
+        time, which is after the whole interview has been paid for."""
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode autopilot us-central1-a'
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("us-central1-a", proc.stdout)
+        # Standard clusters are zonal-capable, so the same location is fine.
+        proc = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}require_creatable_cluster_mode standard us-central1-a'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _run_persist(self, requested, effective, starting_line):
+        """persist_effective_cluster_mode against a throwaway vars.sh."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vars_file = pathlib.Path(tmp) / "vars.sh"
+            vars_file.write_text(starting_line)
+            call = (
+                f'{_SOURCE_INSTALLER_COMMON}'
+                f'VARS_FILE="{vars_file}"; TFVARS_CLUSTER_MODE="{effective}"; '
+                f'persist_effective_cluster_mode "{requested}"'
+            )
+            proc = self._run_install_func(call)
+            return proc, vars_file.read_text()
+
+    def test_persist_effective_cluster_mode_records_the_probed_shape(self):
+        """vars.sh must record what the install HAS, not what was asked for.
+
+        The generator's probe overrules --cluster-mode on any cluster that
+        already exists. Leaving the request on disk is how the value that
+        rebuilds a deleted cluster — and that uninstall.sh and upgrade.sh
+        regenerate from — comes to name the wrong shape.
+        """
+        for requested, effective in (
+            ("autopilot", "standard"),
+            ("standard", "autopilot"),
+        ):
+            with self.subTest(requested=requested, effective=effective):
+                proc, content = self._run_persist(
+                    requested, effective, f"export CLUSTER_MODE={requested}\n"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout)
+                self.assertIn(f"export CLUSTER_MODE={effective}", content)
+                self.assertNotIn(f"export CLUSTER_MODE={requested}", content)
+
+    def test_persist_effective_cluster_mode_leaves_an_agreeing_file_alone(self):
+        proc, content = self._run_persist(
+            "autopilot", "autopilot", "export CLUSTER_MODE=autopilot\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(content, "export CLUSTER_MODE=autopilot\n")
+
+    def test_persist_effective_cluster_mode_without_a_generator_answer(self):
+        """No TFVARS_CLUSTER_MODE means the generator never ran; do not guess."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vars_file = pathlib.Path(tmp) / "vars.sh"
+            vars_file.write_text("export CLUSTER_MODE=autopilot\n")
+            proc = self._run_install_func(
+                f'{_SOURCE_INSTALLER_COMMON}VARS_FILE="{vars_file}"; '
+                'persist_effective_cluster_mode standard'
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout)
+            self.assertEqual(vars_file.read_text(), "export CLUSTER_MODE=autopilot\n")
 
     def test_parse_args_enable_google_chat(self):
         """Verifies parse_args captures --enable-google-chat."""

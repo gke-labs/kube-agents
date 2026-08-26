@@ -59,6 +59,12 @@ PARAM_DRY_RUN="${DRY_RUN:-false}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
 PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
+# Only consulted when this run creates the cluster. Against one that already
+# exists the tfvars generator's live probe decides the shape; see
+# write_tfvars_from_state in k8s-operator/scripts/installer_common.sh. Empty
+# means "not chosen yet" — the interview asks, and settles on standard when
+# there is nobody to ask.
+PARAM_CLUSTER_MODE="${CLUSTER_MODE:-}"
 # Left empty on purpose: resolved from installer_common.sh's DEFAULT_* once
 # the installer helpers are sourced, so no default is spelled twice.
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
@@ -101,6 +107,10 @@ Flags for AI Agents & Automation:
                                 DEFAULT_REGION, currently us-central1)
   --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
+  --cluster-mode=MODE           Shape of a cluster this run creates: autopilot | standard
+                                (default: standard). Autopilot clusters are regional, so
+                                --region must be a region. Ignored when installing onto a
+                                cluster that already exists — its live shape wins.
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
                                 (default: gemini)
   --model-default-name=NAME     Default model name for the provider
@@ -163,6 +173,7 @@ parse_args() {
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
@@ -281,6 +292,56 @@ validate_immutable_ref() {
     print_error "Image/source ref must be a full 40-character commit SHA or a pure numeric SemVer release tag (X.Y.Z, e.g. 0.1.0)."
     return 1
   fi
+}
+
+# A cluster shape this install can create in this location. is_valid_cluster_mode
+# comes from installer_common.sh, so this runs after the workspace step.
+#
+# The region rule is the gke-cluster module's Autopilot precondition, checked
+# here as well because reaching it costs the whole interview first: a location
+# that only turns out to be wrong at terraform validate has already collected
+# every API key and integration answer.
+require_creatable_cluster_mode() {
+  local mode="${1:-}" location="${2:-}"
+  if ! is_valid_cluster_mode "$mode"; then
+    print_error "--cluster-mode must be either autopilot or standard (got '${mode}')."
+    exit 1
+  fi
+  if [ "$mode" = "autopilot" ] && [[ ! "$location" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]; then
+    print_error "GKE Autopilot clusters are regional: --region must be a region such as us-central1, not '${location}'."
+    exit 1
+  fi
+}
+
+# vars.sh must record the shape the install HAS, not the one the interview
+# asked for. The two differ whenever a cluster already existed: the tfvars
+# generator probed its live shape and the request had no say. Leaving the
+# request on disk is how the value that later rebuilds a deleted cluster —
+# and that uninstall.sh and upgrade.sh regenerate from, with no flag to
+# correct it — ends up naming the wrong shape.
+#
+# Runs after write_tfvars_from_state, which is what sets TFVARS_CLUSTER_MODE;
+# save_var rewrites the one key rather than the file, so the line the state
+# step already wrote is replaced rather than duplicated.
+persist_effective_cluster_mode() {
+  local requested="${1:-}" effective="${TFVARS_CLUSTER_MODE:-}"
+  [ -n "$effective" ] || return 0
+  [ "$effective" != "$requested" ] || return 0
+  print_info "Cluster '${CLUSTER_NAME:-}' is GKE $(cluster_mode_label "$effective"), not $(cluster_mode_label "$requested"); recording its live shape in vars.sh."
+  # DRY_RUN=0 pins save_var's dry-run guard, which tests a variable install.sh
+  # never sets (it has PARAM_DRY_RUN, spelled "true", so `DRY_RUN=1` here is a
+  # REAL install whose write save_var would skip, and `DRY_RUN=true` is an
+  # integer-comparison error). Every other vars.sh key goes through
+  # write_state_var, which has no guard; this one is written on the same terms.
+  DRY_RUN=0 save_var CLUSTER_MODE "$effective"
+}
+
+# How GKE writes the shape. bash 3.2, still macOS's /bin/bash, has no ${var^}.
+cluster_mode_label() {
+  case "${1:-}" in
+    autopilot) echo "Autopilot" ;;
+    *) echo "Standard" ;;
+  esac
 }
 
 # The image tag doubles as the source ref that verify_local_source_ref checks the
@@ -797,6 +858,7 @@ write_json_report() {
   "project_id": "$(json_escape "${project_id:-}")",
   "project_number": "$(json_escape "${project_number:-}")",
   "cluster_name": "$(json_escape "${cluster_name:-}")",
+  "cluster_mode": "$(json_escape "${TFVARS_CLUSTER_MODE:-${cluster_mode:-}}")",
   "region": "$(json_escape "${region:-}")",
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
@@ -1439,6 +1501,11 @@ main() {
     prompt_read "Target GCP Region" region "${active_region:-$DEFAULT_REGION}"
   fi
 
+  # Checked here as well as after the menu below so a bad --cluster-mode fails
+  # before the rest of the interview, not after it.
+  local cluster_mode="${PARAM_CLUSTER_MODE:-}"
+  [ -z "$cluster_mode" ] || require_creatable_cluster_mode "$cluster_mode" "$region"
+
   # 5. GKE Cluster Selection & Provisioning Strategy
   print_step "5. GKE Cluster Topology & Capacity Setup"
   local cluster_choice=""
@@ -1456,10 +1523,16 @@ main() {
   fi
 
   local cluster_name="${PARAM_CLUSTER_NAME:-}"
+  # Set on the branches where the user has demonstrably asked for a cluster
+  # that does not exist yet, which is the only case --cluster-mode decides.
+  # Picking one out of the discovered list, or naming one with --cluster-name,
+  # does not qualify: the generator probes those and the live shape wins.
+  local ask_cluster_shape="false"
   if [ "$cluster_choice" = "1" ]; then
     if [ -z "$cluster_name" ]; then
       prompt_read "New GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
     fi
+    ask_cluster_shape="true"
   else
     if [ -n "$PARAM_CLUSTER_NAME" ]; then
       cluster_name="$PARAM_CLUSTER_NAME"
@@ -1490,12 +1563,44 @@ main() {
           print_success "Using discovered cluster location: ${C_BOLD}${region}${C_RESET}"
         else
           prompt_read "Existing GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
+          # A name the project's own cluster list did not offer, so it very
+          # likely does not exist and this run creates it.
+          ask_cluster_shape="true"
         fi
       else
         print_warning "No existing GKE clusters found in project '$project_id'."
         prompt_read "Existing GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
+        # Nothing to adopt in this project, so whatever is named here is about
+        # to be created.
+        ask_cluster_shape="true"
       fi
     fi
+  fi
+  # Only when --cluster-mode said nothing: a flag the caller passed is an
+  # answer already, and re-asking would let a mis-keyed menu choice override
+  # it. Standard leads because it is the installer's default and the shape
+  # every install has been getting.
+  if [ -z "$cluster_mode" ] && [ "$ask_cluster_shape" = "true" ] &&
+    [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local mode_choice=""
+    prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
+      "Standard — you size and pay for the node pool; carries the GKE Sandbox pool for --gvisor (Default)" \
+      "Autopilot — Google manages the nodes and you pay per Pod; regional only" \
+      mode_choice
+    case "$mode_choice" in
+      1) cluster_mode="standard" ;;
+      2) cluster_mode="autopilot" ;;
+    esac
+  fi
+  # Nothing asked, nothing passed: the shape every install has been getting.
+  cluster_mode="${cluster_mode:-standard}"
+  # Only where a cluster is about to be created. Adopting a discovered cluster
+  # replaced $region with that cluster's own location, which may be a zone —
+  # and failing an adoption over a location the installer chose itself, for a
+  # shape the generator is about to overrule anyway, blames the wrong input.
+  # The flag/region pair the caller did supply was already checked above.
+  if [ "$ask_cluster_shape" = "true" ]; then
+    require_creatable_cluster_mode "$cluster_mode" "$region"
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
@@ -1915,6 +2020,7 @@ main() {
   write_state_var "$vars_file" PROJECT_ID "$project_id"
   write_state_var "$vars_file" PROJECT_NUMBER "$project_number"
   write_state_var "$vars_file" CLUSTER_NAME "$cluster_name"
+  write_state_var "$vars_file" CLUSTER_MODE "$cluster_mode"
   write_state_var "$vars_file" REGION "$region"
   write_state_var "$vars_file" KMS_LOCATION "$(derive_kms_location "$region")"
   write_state_var "$vars_file" ENABLE_GVISOR "$enable_gvisor"
@@ -1989,6 +2095,7 @@ main() {
   local tfvars_file
   tfvars_file="$(tf_compose_dir "$repo_dir")/terraform.tfvars"
   write_tfvars_from_state "$tfvars_file" "$image_tag"
+  persist_effective_cluster_mode "$cluster_mode"
   print_success "Terraform input saved to: $tfvars_file"
 
   # Pre-Flight Summary & Final Confirmation Checkpoint
@@ -1997,7 +2104,9 @@ main() {
   draw_separator
   echo -e "${C_RESET}${C_BOLD}Please review your selections before provisioning begins:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Target Project:${C_RESET} ${C_BOLD}${project_id}${C_RESET} (Project Number: ${project_number:-unknown})"
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE Standard)"
+  # The generator's answer, not the interview's: on an existing cluster it
+  # probed the live shape and the flag had no say.
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
@@ -2160,7 +2269,7 @@ main() {
 
   echo -e "${C_BOLD}Component Status Summary:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Project:${C_RESET} ${project_id} (Project Number: ${project_number})"
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region})"
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-${cluster_mode:-standard}}"))"
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"

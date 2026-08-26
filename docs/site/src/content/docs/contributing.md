@@ -29,7 +29,8 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 ## Local validation
 
-Before pushing, run the checks CI enforces:
+Before pushing, run the checks CI enforces. This section is about running the tests; for deciding
+where a new one belongs, `docs/testing-map.md` maps the nine test homes to their runners.
 
 - **Prettier** on changed Markdown and YAML (what the `Prettier Check` CI job enforces — it checks changed `.md`/`.yaml`/`.yml` files):
 

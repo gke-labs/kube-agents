@@ -193,8 +193,10 @@ A task gives the agent a prompt, describes the infrastructure to stand up, says 
 answer reads like, and — where the answer is objectively checkable — asserts it against the live
 cluster.
 
-A task that covers one of the ten testing domains also carries a top-level
-`domain: <slug>` field naming it. The slugs live in `docs/designs/domains.yaml`, and
+Every task in this repository carries a top-level `domain: <slug>` field, and a task that
+covers no row gets a reviewed `KNOWN_NO_DOMAIN` entry instead of an absent field —
+`docs/designs/bench-case-format.md` is the contract, and this section is the how-to.
+The slugs live in `docs/designs/domains.yaml`, and
 `scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
 slug AND a non-empty `verification_spec` AND is an active (uncommented) entry in
 `hack/ci-eval-pr.sh`'s `TASKS` array — covered means running, so a spec-ready task
@@ -206,14 +208,27 @@ A new task must also be registered: the presubmit runs only what the `TASKS` arr
 `hack/ci-eval-pr.sh` names, and `scripts/test_task_registration.py` fails the build for a
 task that appears nowhere. A commented-out `TASKS` entry counts as registered, pending
 activation — that is how scenarios wait for infrastructure that does not exist yet — and a
-task that deliberately must not run needs a reviewed entry in that lint's
-`KNOWN_UNREGISTERED` with the reason.
+task that deliberately must not run needs a reviewed entry in
+`scripts/validate_bench_cases.py`'s `KNOWN_UNREGISTERED` with the reason.
+
+A task whose verification reads live cluster state also carries `fixtures:`, a list of
+seeded-fleet role slugs from `bench/tf/fleet/fixtures.json`, or `fixtures: []` if it
+plants its own state. Those are the same slugs a `fleet_resource_property` check's
+`fixture_role:` names, and the validator rejects a case that uses one in a check without
+listing it here. Cases address a fixture by role and never by cluster name or project
+id; `docs/designs/bench-fleet-catalog.md` says why and lists the roles.
+
+`make bench-case-check` runs all of these rules in about a second, so a broken task file
+fails before it costs a cluster lease rather than after. The target runs in no workflow;
+`scripts/test_task_registration.py` calls the same validator on every pull request and
+fails if it reported anything, so a case that passes locally passes there too.
 
 ```yaml
 # tasks/<task-name>/task.yaml
 id: my-provisioned-task
 name: Human-readable name
-domain: capacity # optional; required to count for domain coverage
+domain: capacity # required; a slug from docs/designs/domains.yaml
+fixtures: [] # required when the spec reads cluster state; seeded-fleet roles, or [] for none
 prompt: >-
   The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.
   <what the agent should do>
@@ -227,8 +242,9 @@ infrastructure:
   variables: # optional; passed as -var flags
     node_count: 1
 
-# Optional. Deterministic assertions run against the live cluster once the
-# agent finishes.
+# Required, and as a block rather than inline: the presubmit greps for a bare
+# `verification_spec:` line to tell a spec-carrying task from a judge-only one.
+# Deterministic assertions run against the live cluster once the agent finishes.
 verification_spec:
   - name: workload-running # objectives: what the agent had to achieve
     role: objective
@@ -262,7 +278,9 @@ Things the loader will hold you to:
 
 - **`provider` is not guessed** — see [Choose the provider at run time](#2-make-the-stack-provider-neutral).
 - **`validated: false` is the default,** which keeps an unvetted task off the leaderboard.
-- **`id` also accepts `task_id`,** and `prompt` also accepts `goal` or `input`, for older specs.
+- **`id` also accepts `task_id`,** and `prompt` also accepts `goal` or `input`, for older
+  specs. Those aliases are upstream compatibility for other people's corpora: a task in
+  this repository uses `id` and `prompt`, and the validator rejects `task_id`.
 
 Placeholders are substituted in the prompt, the expected output, and the verification spec:
 `{{PROJECT_ID}}`, `{{CLUSTER_NAME}}`, `{{APP_LOCATION}}`, `{{TARGET_DEPLOYMENT_NAME}}`,

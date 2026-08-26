@@ -1,0 +1,141 @@
+# The seeded fleet's planted defects, as data, addressed by ROLE.
+#
+# THE ROLE VOCABULARY IS NOT DEFINED HERE. `bench/tf/fleet/fixtures.json` owns
+# it: it sits beside the Terraform that plants the fixtures, and it is what
+# hack/fleet-kubeconfigs.sh resolves a role against at run time and what a
+# task.yaml check's `fixture_role:` names. Every slug below with a `slot` must
+# appear there with the same slot, and scripts/validate_bench_cases.py fails
+# the build when one does not -- two catalogues of the same fixtures that can
+# disagree about what a role is called are worse than either alone.
+#
+# What this file adds on top of that catalogue is the part fixtures.json does
+# not carry: the day-N availability gate below, and the fixtures that are not
+# on a cluster at all (`orphan-disks` is project-scoped, so it has no cluster
+# slot and no entry in a catalogue keyed by one).
+#
+# A case names a fixture by role and never by a cluster name or a project id.
+# Each eval project carries its own trio of clusters (`bench/tf/fleet/`,
+# `var.cluster_prefix` defaults to "seeded", so the live names are
+# seeded-a/b/c), and a case written against one project has to run unchanged
+# against the next. The slot letter is the addressable thing; the name is a
+# rendering of it.
+#
+# scripts/validate_bench_cases.py reads this file and rejects a task.yaml whose
+# `fixtures:` list names a role that is in neither catalogue. docs/designs/
+# bench-fleet-catalog.md is the prose contract; bench/tf/fleet/ is the
+# implementation and the source of every object name below.
+#
+# `available_from_day` is days after the stack is applied, and it is the SOP's
+# own age gate rather than a provisioning delay: recreating a fixture restarts
+# its clock, because creationTimestamp is server-set and immutable. The clock
+# runs per project, so a fleet-wide assertion holds only from the most recently
+# applied project's date.
+
+# The three cluster slots. `slot` is what a case addresses; `suffix` is what
+# the Terraform appends to var.cluster_prefix to render the live name.
+slots:
+  - slot: a
+    suffix: a
+    carries: The four seeded workload namespaces and the two defect node pools
+  - slot: b
+    suffix: b
+    carries: The held-back control plane, and no workloads
+  - slot: c
+    suffix: c
+    carries: The configuration outlier, and no workloads
+
+fixtures:
+  - role: rbac-overgrant
+    slot: a
+    available_from_day: 0
+    objects:
+      - clusterrolebinding/debug-binding
+    namespace: seeded-security
+    defect: >-
+      Cluster-scoped ClusterRoleBinding granting cluster-admin to the default
+      ServiceAccount in seeded-security. Cluster-scoped deliberately: the
+      compliance SOP reads clusterrolebindings only.
+
+  - role: no-pdb-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/checkout-gateway
+    namespace: seeded-reliability
+    defect: >-
+      Two replicas with no PodDisruptionBudget. Two rather than one because the
+      reliability SOP flags spec.replicas >= 2 only.
+
+  - role: crashloop-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/payments-api
+    namespace: seeded-debug
+    defect: A deterministic OOMKilled crashloop.
+
+  - role: hpa-saturated
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/pinned-inference-pool
+      - deployment/inference-server
+      - horizontalpodautoscaler/inference-server
+    namespace: seeded-capacity
+    defect: >-
+      A single-zone pool whose autoscaler is pinned at min = max = 1, hosting a
+      workload whose HPA (min 1, max 10) settles above what the pool can
+      schedule, leaving a standing Pending backlog. Node label and taint
+      seeded-role=pinned-inference keep anything else off it -- the taint value
+      is not the role slug, see bench-fleet-catalog.md. The desired replica
+      count is not stable across projects (measured 3/2/3 on 2026-08-24), so
+      assert the pin and the unmet demand and never a number.
+
+  - role: idle-nodepool
+    slot: a
+    available_from_day: 7
+    objects:
+      - nodepool/idle-batch-pool
+    defect: >-
+      A node pool with zero non-system pods, held that way by the
+      seeded-role=idle-batch NoSchedule taint. The cost SOP's idle-nodepool
+      check refuses pools created less than 7 days ago, and the GKE node pool
+      resource exposes no creation timestamp at all, so pool age is inferred
+      from node boot-disk time and a rolling node recreation resets the gate.
+      The least dependable fixture here.
+
+  - role: orphan-disks
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 30
+    objects:
+      - disk/orphan-pd-1
+      - disk/orphan-pd-2
+    defect: >-
+      Two unattached 10 GB persistent disks. The cost SOP's unattached-disk
+      collector filters server-side on creationTimestamp<-P30D.
+
+  - role: version-laggard
+    slot: b
+    available_from_day: 0
+    objects:
+      - cluster/self
+    defect: >-
+      Control plane held one minor behind the REGULAR channel default, and
+      enrolled in REGULAR, which is what makes the lag visible to the upgrade
+      SOP's master-behind check at all. Held between reconciles by a
+      NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from the
+      location-wide valid_master_versions rather than the channel's own list,
+      so the held version is absent from REGULAR and upgrade check 3.1 branch
+      (a) fires at critical too -- an undeclared finding, see
+      docs/designs/bench-fleet-catalog.md.
+
+  - role: drift-outlier
+    slot: c
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Master authorized networks absent, where slots a and b carry an
+      open-for-eval block. The drift SOP excludes a cluster whose createTime is
+      under 24 hours old from every cohort, and its cohort floor of three
+      clusters means a replaced cluster silences the audit fleet-wide for a day.

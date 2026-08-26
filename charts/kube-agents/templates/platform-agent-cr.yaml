@@ -61,8 +61,10 @@ spec:
       The operator applies spec.deployment.env AFTER its own container env, so
       anything set here wins. That is the only way to reach settings the operator
       computes rather than exposes — OTEL_SDK_DISABLED being the one that matters
-      in practice, since the telemetry ladder always resolves to some endpoint and
-      a cluster with no collector otherwise retries a dead one forever.
+      in practice. The operator now sets it itself when discovery establishes the
+      cluster has no collector, so this is for the cases it will not decide:
+      discovery switched off, a pinned endpoint, or a collector you would rather
+      this agent did not export to.
     */}}
     {{- with .Values.platformAgent.deployment.env }}
     env:

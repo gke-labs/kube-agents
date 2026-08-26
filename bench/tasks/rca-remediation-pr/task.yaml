@@ -51,6 +51,14 @@ validated: false
 # fix landing as a pull request, nothing applied directly.
 domain: remediation
 
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster: each eval project carries its own trio and this case has to run
+# unchanged against all of them. Roles are defined in
+# bench/tf/fleet/fixtures.json; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - crashloop-workload
+
 # The PR objective is a report check rather than a tool check, deliberately:
 # submit_suggestion.py runs as a skill script through execute_code, so no
 # distinct tool name reaches the trajectory. What the skill's SKILL.md

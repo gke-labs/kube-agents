@@ -690,7 +690,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	if netpol.Name != "test-agent-gateway-netpol" {
 		t.Errorf("expected Name 'test-agent-gateway-netpol', got %s", netpol.Name)
 	}
@@ -798,7 +798,7 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	if len(netpol.Spec.Ingress) != 1 {
 		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
 	}
@@ -818,7 +818,7 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
 	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
 	// 2. GCP WI / Metadata server (80, 8080)
@@ -848,13 +848,13 @@ func TestBuildNetworkPolicy_CustomAPIHost(t *testing.T) {
 		},
 	}
 
-	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
+	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
 	ruleIPv4 := findAPIServerEgressRule(netpolIPv4)
 	if ruleIPv4 == nil || len(ruleIPv4.To) == 0 || ruleIPv4.To[0].IPBlock == nil || ruleIPv4.To[0].IPBlock.CIDR != "10.0.0.5/32" {
 		t.Errorf("expected IPv4 CIDR '10.0.0.5/32', got %v", ruleIPv4)
 	}
 
-	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, defaultTestNetpolProfile(), false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, defaultTestNetpolProfile(), false, "", false)
 	ruleIPv6 := findAPIServerEgressRule(netpolIPv6)
 	if ruleIPv6 == nil || len(ruleIPv6.To) == 0 || ruleIPv6.To[0].IPBlock == nil || ruleIPv6.To[0].IPBlock.CIDR != "fd00::1/128" {
 		t.Errorf("expected IPv6 CIDR 'fd00::1/128', got %v", ruleIPv6)
@@ -928,7 +928,7 @@ func TestBuildNetworkPolicy_InvalidAPIHost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			netpol := buildNetworkPolicy(agent, tt.apiHosts, defaultTestNetpolProfile(), false, "")
+			netpol := buildNetworkPolicy(agent, tt.apiHosts, defaultTestNetpolProfile(), false, "", false)
 			rule := findAPIServerEgressRule(netpol)
 			if rule == nil {
 				t.Fatalf("API server egress rule (port 6443) not found in netpol")
@@ -954,8 +954,8 @@ func TestBuildNetworkPolicy_Idempotent(t *testing.T) {
 		},
 	}
 
-	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
-	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
+	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
+	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
 	if !reflect.DeepEqual(np1.Spec, np2.Spec) {
 		t.Errorf("buildNetworkPolicy is not idempotent: consecutive calls produced different specs")
 	}
@@ -968,7 +968,7 @@ func TestBuildNetworkPolicy_ExternalHTTPSExceptList(t *testing.T) {
 			Namespace: "test-ns",
 		},
 	}
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
 	var httpsRule *networkingv1.NetworkPolicyEgressRule
 	for i := range netpol.Spec.Egress {
@@ -1034,7 +1034,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 1. IPv4 dynamic DNS clusterIP
-	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "34.118.224.10", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "34.118.224.10", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleGKE := findDNSEgressRule(netpolGKE)
 	if dnsRuleGKE == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolGKE")
@@ -1051,7 +1051,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 2. IPv6 dynamic DNS clusterIP
-	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "2001:db8::10", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "2001:db8::10", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleIPv6 := findDNSEgressRule(netpolIPv6)
 	if dnsRuleIPv6 == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolIPv6")
@@ -1068,7 +1068,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 3. Fallback when invalid or empty
-	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "invalid-ip", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "invalid-ip", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleFallback := findDNSEgressRule(netpolFallback)
 	if dnsRuleFallback == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolFallback")
@@ -1093,7 +1093,7 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
 	// The pre-NAT targets belong on 80 and 8080.
 	got80 := egressCIDRsForPort(netpol, 80)
@@ -2338,7 +2338,7 @@ func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -2662,7 +2662,7 @@ func TestReconcileNetworkPolicy_DynamicDiscovery(t *testing.T) {
 		APIServerCIDROverride: "198.51.100.0/24,203.0.113.1/32",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2755,7 +2755,7 @@ func TestReconcileNetworkPolicy_CustomEgressCIDRsAnnotation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2820,7 +2820,7 @@ func TestReconcileNetworkPolicy_RejectOverlyBroadCIDR(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2873,7 +2873,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2951,7 +2951,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 
 	// 3. Verify disabling annotation deletes FQDNNetworkPolicy
 	delete(agent.Annotations, AnnotationEnableFQDNNetworkPolicy)
-	err = r.reconcileNetworkPolicy(ctx, agent, "")
+	err = r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy after disabling FQDN failed: %v", err)
 	}
@@ -2997,7 +2997,7 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3061,7 +3061,7 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3111,7 +3111,7 @@ func TestReconcileNetworkPolicy_TruncateMaxCIDRs(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3164,7 +3164,7 @@ func TestReconcileNetworkPolicy_PrivateIPOverlap(t *testing.T) {
 		APIServerIP: "172.16.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 

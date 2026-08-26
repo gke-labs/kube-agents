@@ -221,7 +221,17 @@ command.
 
 Only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy also rejects
 known credential-disclosure, credential-replacement, and self-modification
-operations. Pipelines and redirections are interpreted by the sandbox shell
+operations, and the GitHub **write** path: merging a pull request
+(`github.merge`), approving a review (`github.assent`), mutating through the
+REST API (`github.api-mutation`), triggering workflows or releases
+(`github.pipeline-trigger`), and repository administration — secrets,
+variables, and repository deletion, archiving or editing
+(`github.repo-administration`). Rulesets are not in that last list because
+`gh ruleset` cannot change one: it has only `check`, `list` and `view`.
+Reshaping a ruleset goes through `gh api`, so `github.api-mutation` is the
+rule that refuses it and the id an operator will see.
+Those five exist because the agent is the proposer: the review gate is only a
+gate if the thing that opens a pull request cannot also merge it. Pipelines and redirections are interpreted by the sandbox shell
 around an individual wrapper invocation, so they cannot execute inside the
 credential sidecar. Requests that cannot be represented safely fail closed,
 including:
@@ -235,9 +245,30 @@ including:
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
 
-The current deny policy applies regular expressions to a shell-escaped rendering
-of the argument vector and permits flags before or between subcommands. This is
-an interim policy mechanism, not a general shell parser. If the policy grows
+The current deny policy applies regular expressions to a normalised rendering of
+the argument vector and permits flags before or between subcommands. Three
+normalisations, and all of them matter for predicting what a rule will match:
+
+- **Free-text flag values are dropped**, so prose the agent wrote is not searched
+  as though it were a command path. Without this a pull request body containing
+  the word "merge" tripped `github.merge`, which refused the product's own
+  GitOps suggestions. The flag names remain, since a rule may key on one.
+- **Attached shorthand values are split**, so `-XPUT` reads as `-X PUT`. gh,
+  kubectl and gcloud are all Cobra/pflag, which accepts a shorthand's value with
+  no separator, and a rule written for the separated spelling would otherwise
+  miss it.
+- **A shorthand buried in a cluster keeps its dash**, so `-iX PUT` reads as
+  `-i -X PUT`. pflag also accepts a boolean shorthand and a value-taking one in
+  the same token, and splitting only the first one off left the `-X` a rule
+  matches on as a bare letter — enough for `gh api -iX PUT …/merge` and
+  `gh auth status -at` to get through. Only the shorthands a shipped rule keys
+  on are re-dashed, and the walk stops at the first non-letter, since
+  everything from there is somebody's value rather than another flag.
+
+A value that looks like a flag is never dropped: the free-text set is applied
+without knowing the subcommand, and a name on it is not always value-taking.
+
+This is an interim policy mechanism, not a general shell parser. If the policy grows
 beyond these narrowly defined commands, it should use tool-specific argument
 parsers over the structured argument vector.
 

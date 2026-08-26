@@ -1155,16 +1155,34 @@ class ActionableReportTest(unittest.TestCase):
         self.assertFalse(actionable_report(STATUS_ONLY_RESULT))
 
     def test_a_single_option_report_is_actionable(self):
-        # The template drops the Recommended line when there is only one sound
-        # fix. "apply Option A" still means something, so the row is still owed.
+        # The shape with no letter in it at all. One sound fix is not "Option
+        # A" — the template drops the letter and the Recommended line with it,
+        # leaving the call to action as the only thing under the heading. The
+        # reply it invites is a bare "apply", which is exactly the reply that
+        # needs the row: nothing in the words themselves says which report.
         self.assertTrue(
             actionable_report(
-                "## What to do\n\n- **Option A (Bump the limit):** raise it to 2Gi.\n"
+                "## What to do\n\n"
+                "- **Proposed fix (Bump the limit):** raise it to 2Gi.\n"
+                "- **To authorize:** reply **'apply'** to open a GitOps Pull "
+                "Request with this fix.\n"
             )
         )
 
     def test_the_heading_alone_is_not_enough(self):
         self.assertFalse(actionable_report("## What to do\n\n- Restart the pod.\n"))
+
+    def test_a_call_to_action_above_the_heading_does_not_count(self):
+        # The unlettered half of the "under it is literal" rule below. A card
+        # quoting an older report's call to action in its prose has nothing of
+        # its own to apply, and would take the thread's one INSERT OR IGNORE
+        # slot from the report that has.
+        self.assertFalse(
+            actionable_report(
+                "## Why\n\nThe **To authorize:** bullet went unanswered.\n\n"
+                "## What to do\n\n- Escalate to the service owner.\n"
+            )
+        )
 
     def test_an_option_named_above_the_heading_does_not_count(self):
         # A report whose "What to do" holds only unlettered bullets, but which
@@ -1183,6 +1201,44 @@ class ActionableReportTest(unittest.TestCase):
         self.assertFalse(
             actionable_report("There is no good option here; escalate to the owner.")
         )
+
+    def test_authorize_in_prose_is_not_a_call_to_action(self):
+        # The counterpart for the unlettered shape. "to authorize" turns up in
+        # ordinary remediation prose, and a card that merely mentions it offers
+        # a reply nothing to act on — but would still take the thread's one
+        # INSERT OR IGNORE slot from the triage report that follows. The colon
+        # is what separates the template's bullet label from the preposition.
+        self.assertFalse(
+            actionable_report(
+                "## What to do\n\n"
+                "- Escalate to the service owner to authorize the quota increase.\n"
+            )
+        )
+
+    def test_the_call_to_action_counts_however_it_is_emphasised(self):
+        # The template writes **To authorize:** with the colon inside the
+        # emphasis, but an agent reproducing a **Label:** bullet moves the
+        # marker as readily as not, and italic and __-bold say the same thing.
+        # Matching only the template's spelling fails these silently: the
+        # single-option shape has no lettered option to fall back on, so the
+        # report is delivered, no row is written, and the "apply" it invites
+        # arrives with nothing attached.
+        for label in (
+            "**To authorize:**",
+            "**To authorize**:",
+            "*To authorize*:",
+            "__To authorize__:",
+            "To authorize:",
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(
+                    actionable_report(
+                        "## What to do\n\n"
+                        "- **Proposed fix (Bump the limit):** raise it to 2Gi.\n"
+                        "- %s reply **'apply'** to open a GitOps Pull Request "
+                        "with this fix.\n" % label
+                    )
+                )
 
     def test_an_empty_or_missing_result_is_not_actionable(self):
         for result in (None, "", "   ", 0):

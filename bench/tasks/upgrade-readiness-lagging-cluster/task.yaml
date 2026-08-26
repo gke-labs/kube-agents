@@ -46,6 +46,14 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster: each eval project carries its own trio and this case has to run
+# unchanged against all of them. Roles are defined in
+# bench/tf/fleet/fixtures.json; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - version-laggard
+
 # The lagging cluster's name is a contract with bench/tf/fleet/ (cluster B
 # is the one held behind its channel); the fleet stack owns the name and this
 # spec must change with it.

@@ -13,15 +13,187 @@
 
 set -euo pipefail
 
+# ─── Step timing profiler ────────────────────────────────────────────────────
+# Contiguous named spans: each profile_begin closes the previous span and opens
+# the next, so the report's percentages always sum to 100% of the wall clock
+# between script start and the report. python3 is already a hard dependency of
+# the gate below, so it is what supplies millisecond epochs.
+PROFILE_ROWS=()
+PROFILE_CURRENT=""
+_now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+PROFILE_T0="$(_now_ms)"
+PROFILE_LAST="${PROFILE_T0}"
+
+profile_begin() {
+  local now
+  now="$(_now_ms)"
+  if [ -n "${PROFILE_CURRENT}" ]; then
+    PROFILE_ROWS+=("${PROFILE_CURRENT}|$((PROFILE_LAST - PROFILE_T0))|$((now - PROFILE_LAST))")
+  fi
+  PROFILE_CURRENT="$1"
+  PROFILE_LAST="${now}"
+  echo "--- [PROFILE $(date -u +'%Y-%m-%dT%H:%M:%SZ')] step: $1 ---"
+}
+
+profile_report() {
+  local exit_code="$1" now
+  now="$(_now_ms)"
+  if [ -n "${PROFILE_CURRENT}" ]; then
+    PROFILE_ROWS+=("${PROFILE_CURRENT}|$((PROFILE_LAST - PROFILE_T0))|$((now - PROFILE_LAST))")
+    PROFILE_CURRENT=""
+  fi
+  PROFILE_DATA="$(printf '%s\n' ${PROFILE_ROWS[@]+"${PROFILE_ROWS[@]}"})" \
+  PROFILE_EXIT_CODE="${exit_code}" python3 <<'PY' || true
+import os
+
+rows = []
+for line in os.environ.get("PROFILE_DATA", "").splitlines():
+    if not line.strip():
+        continue
+    name, start_ms, dur_ms = line.rsplit("|", 2)
+    rows.append((name, int(start_ms), int(dur_ms)))
+total = sum(d for _, _, d in rows)
+print(f"\n=== Step timing profile (exit code {os.environ['PROFILE_EXIT_CODE']}) ===")
+if not rows or total <= 0:
+    print("no profiled spans recorded")
+else:
+    # Largest-remainder rounding in tenths of a percent, so the printed
+    # column sums to exactly 100.0 instead of drifting with row count.
+    tenths, rems = [], []
+    for _, _, d in rows:
+        q, r = divmod(d * 1000, total)
+        tenths.append(q)
+        rems.append(r)
+    for i in sorted(range(len(rows)), key=lambda i: rems[i], reverse=True)[: 1000 - sum(tenths)]:
+        tenths[i] += 1
+    print(f"{'start(s)':>10} {'dur(s)':>10} {'%':>7}  step")
+    for (name, start_ms, dur_ms), t in zip(rows, tenths):
+        print(f"{start_ms / 1000:10.1f} {dur_ms / 1000:10.1f} {t / 10:6.1f}%  {name}")
+    print(f"{'':>10} {total / 1000:10.1f} {'100.0':>6}%  TOTAL")
+PY
+}
+
+# Prefix every line flowing through with "[TS <epoch.ms>]". devops-bench's own
+# logger is never configured by its CLI (NullHandler swallows the INFO phase
+# lines), so the wrapper stamps wall-clock time onto the subprocess's output
+# itself and the phase analyzer below keys on content markers instead.
+_ts_lines() {
+  python3 -u -c 'import sys, time
+for line in iter(sys.stdin.readline, ""):
+    sys.stdout.write("[TS %.3f] " % time.time() + line)
+    sys.stdout.flush()'
+}
+
+# Per-task deep dive: split one devops-bench invocation into phases using the
+# [TS ...] stamps and the phase-boundary text the run actually prints (tofu
+# apply/destroy, the first DeepEval judge banner), plus the agent latency the
+# results.json record carries. Informational — the top-level profile table is
+# the one whose steps sum to 100% of the script's span; this table sums to
+# 100% of the single task's devops-bench run.
+analyze_eval_phases() {
+  EVAL_PHASE_LOG="$1" EVAL_PHASE_START_MS="$2" EVAL_PHASE_END_MS="$3" \
+  EVAL_PHASE_TASK="$4" EVAL_PHASE_RESULT="${5:-}" python3 <<'PY' || true
+import json
+import os
+import re
+
+log = os.environ["EVAL_PHASE_LOG"]
+start = int(os.environ["EVAL_PHASE_START_MS"]) / 1000.0
+end = int(os.environ["EVAL_PHASE_END_MS"]) / 1000.0
+task = os.environ["EVAL_PHASE_TASK"]
+result = os.environ.get("EVAL_PHASE_RESULT", "")
+
+latency = None
+if result and os.path.exists(result):
+    try:
+        data = json.load(open(result))
+        rec = data[0] if isinstance(data, list) else data
+        latency = float(rec.get("latency") or 0) or None
+    except Exception:
+        pass
+
+# Ordered phase-opening markers; a match is only accepted at or after the
+# last matched position, so a stray earlier occurrence cannot reorder phases.
+# Markers absent from a run (noop deployer, crash) collapse their phase into
+# the neighbour's.
+MARKERS = [
+    ("Initializing the backend", "provision (tofu init + apply)"),
+    ("Apply complete!", "scenario setup + agent execution"),
+    (": Destroying...", "teardown (tofu destroy)"),
+    ("You're running DeepEval", "scoring (LLM judge) + persist"),
+]
+ts_re = re.compile(r"^\[TS (\d+(?:\.\d+)?)\] (.*)$")
+found = []
+idx = 0
+try:
+    with open(log, errors="replace") as fh:
+        for line in fh:
+            if idx >= len(MARKERS):
+                break
+            m = ts_re.match(line)
+            if not m:
+                continue
+            t, content = float(m.group(1)), m.group(2)
+            for j in range(idx, len(MARKERS)):
+                if MARKERS[j][0] in content:
+                    found.append((MARKERS[j][1], min(max(t, start), end)))
+                    idx = j + 1
+                    break
+except OSError as exc:
+    print(f"    phase breakdown unavailable: {exc}")
+    raise SystemExit(0)
+
+# The agent's own span is recorded, not logged: results.json carries its
+# latency. With infrastructure, anchor it forward from "Apply complete!" and
+# split what follows into the drain; without (noop deployer), work backward
+# from where scoring begins — the agent runs immediately before it.
+labels = [label for label, _ in found]
+if latency:
+    if "scenario setup + agent execution" in labels:
+        i = labels.index("scenario setup + agent execution")
+        nxt = found[i + 1][1] if i + 1 < len(found) else end
+        cut = min(found[i][1] + latency, nxt)
+        if cut < nxt:
+            found.insert(i + 1, ("post-agent drain (verify/metrics, record)", cut))
+    elif "scoring (LLM judge) + persist" in labels:
+        i = labels.index("scoring (LLM judge) + persist")
+        found.insert(i, ("agent execution", max(found[i][1] - latency, start)))
+
+print(f"    ── devops-bench phase breakdown for {task} ──")
+if not found:
+    print("    no phase markers found in the log; cannot split the run")
+else:
+    bounds = [("harness startup (uv sync, imports, task load)", start)] + found + [("(end)", end)]
+    total = max(end - start, 1e-9)
+    for (label, t0), (_, t1) in zip(bounds, bounds[1:]):
+        d = max(t1 - t0, 0.0)
+        print(f"    {d:9.1f}s {100 * d / total:6.1f}%  {label}")
+    print(f"    {total:9.1f}s  100.0%  total devops-bench run")
+    if latency:
+        print(f"    (agent latency from results.json: {latency:.1f}s)")
+PY
+}
+
 # 1. Target Cluster Context
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
-trap dump_prow_artifacts_on_failure EXIT
+
+# Print the profile on every exit — success, gate failure, or a set -e death —
+# then hand the original exit code to the artifact dumper ci-env.sh provides.
+profile_and_dump_on_exit() {
+  local exit_code=$?
+  profile_report "${exit_code}"
+  (exit "${exit_code}")
+  dump_prow_artifacts_on_failure
+}
+trap profile_and_dump_on_exit EXIT
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
+profile_begin "cluster-auth: gcloud get-credentials"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
 gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
@@ -64,6 +236,7 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # environmental failure -- no fleet in this project, a cluster that will not
 # answer, a fixture that was never planted -- returns 0 with a warning of its
 # own and leaves the affected roles' files absent, which is the whole design.
+profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
@@ -71,6 +244,7 @@ write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output dir
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
 # 3. Agent & Harness Configuration
+profile_begin "config: env, platform-agent token fetch, prereqs"
 # Configures devops-bench runner to target deployed platform-agent service
 export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
@@ -255,13 +429,27 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 TASKS=(
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # The ten domain scenarios, registered here but commented out. Uncommenting
-  # is the LAST step of activation, not the only one: bench/tasks/DRAFTS.md
-  # carries an activation-blockers section and a per-scenario status column,
-  # and every entry below is blocked on at least one of them today. The
-  # task-registration lint counts a commented entry as registered.
+  # The ten domain scenarios. ONE is active -- cluster-agent-crashloop-debug,
+  # immediately below -- and nine are registered here commented out.
+  # Uncommenting is the LAST step of activation, not the only one:
+  # bench/tasks/DRAFTS.md carries an activation-blockers section and a
+  # per-scenario status column, and every commented entry is blocked on at
+  # least one of them today. The task-registration lint counts a commented
+  # entry as registered; the domain-coverage lint counts only an uncommented
+  # one, so activating a scenario also deletes its domain from the allowlist
+  # in docs/designs/domains.yaml.
   #
-  # Summarised, so a reader here does not have to guess:
+  # cluster-agent-crashloop-debug went first because it was blocked on A5 and
+  # nothing else -- no GitHub write, so no A1 and no A4 -- and because it
+  # exercises the whole of step 2b end to end: label discovery, slot-to-role
+  # resolution, the .confirmed probe, and fleet_resource_property binding the
+  # role to a kubeconfig. Proving that chain in a real Prow run against a
+  # randomly leased project, before six ledger-writing scenarios are stacked
+  # on it, is worth one round trip.
+  "./tasks/cluster-agent-crashloop-debug/task.yaml"
+  #
+  # The nine still off, and the blockers holding them, summarised so a reader
+  # here does not have to guess:
   #   A1  the six audit scenarios and rca-remediation-pr are NOT read-only --
   #       every fleet-audit stream mints a GitHub token and writes a ledger
   #       issue. ci-deploy.sh installs the PR's agent on every run but never
@@ -272,32 +460,45 @@ TASKS=(
   #       throwaway eval GitOps repos) and the minter scoped to it -- the
   #       token has exactly one source and no inherited GITHUB_TOKEN is
   #       honoured, so the value alone only moves the failure to the clone.
-  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
-  #       (2026-08-28 for the pool, 2026-09-20 for the disks).
+  #       Both repository halves are on main; what is left is the Prow job
+  #       exporting EVAL_GITHUB_APP_ID, which is
+  #       GoogleCloudPlatform/oss-test-infra#2661 -- approved, not merged.
+  #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules.
+  #       Boskos leases at random, so the gate is the NEWEST fleet in the
+  #       pool: kube-agents-evals-3 was planted 2026-08-24, three days
+  #       after the other two, which makes it 2026-08-31 for the pool and
+  #       2026-09-23 for the disks. A replant in any pool project moves
+  #       them.
   #   A4  cleared in the code, open on one credential. The six audit
   #       scenarios' objectives no longer read the final message (which the
   #       SOPs keep to one line); they use ledger_issue_contains, which reads
   #       the GitHub ledger issue the run published and proves it is THIS
   #       run's by the generated-at stamp audit_report.py renders into it.
   #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
-  #       issues:read on the eval GitOps repos, which this script does not
-  #       export and Prow does not supply -- provision it with A1's minter
-  #       work. Until then those checks return status=error, which drops
+  #       issues:read on the eval GitOps repos. The secret now exists
+  #       (kube-agents-bench-github-token, namespace test-pods); mounting it
+  #       is the same oss-test-infra#2661, approved and not merged. Until it
+  #       lands those checks return status=error, which drops
   #       VerificationCoverage below the gate's 1.0 floor by design.
-  #   A5  cleared in the code, open on the fleet itself. Step 2b above now
+  #   A5  CLEARED, and that is what the active entry above rests on. Step 2b
   #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
   #       fleet safeguards use `fleet_resource_property` with a
   #       `fixture_role:` instead of reading the ambient kubeconfig (which
-  #       is platform-agent-host and carries no seeded namespace). What is
-  #       left is operational, not code. The fleet must be applied in EVERY
-  #       project the Boskos pool can lease, with each planted defect
-  #       verified present; that is true of all three as of 2026-08-24 --
-  #       step 2b reports "7 role(s) written ... 0 whose fixtures were not
-  #       present" against each. What is still missing is
-  #       FLEET_READONLY_SA. The run holds a cluster-admin
-  #       credential on a fleet every open PR shares until it is --
-  #       roles/container.admin via the GKE IAM webhook, with nothing to
-  #       narrow in-cluster. bench/tf/fleet/README.md has both.
+  #       is platform-agent-host and carries no seeded namespace). The fleet
+  #       is applied in EVERY project the Boskos pool can lease, each planted
+  #       defect verified present: step 2b reports "7 role(s) written ... 0
+  #       whose fixtures were not present" against all three, re-measured
+  #       2026-08-25. The five other fleet scenarios were never held by A5
+  #       alone -- each also carries A1, A3 or A4 -- so they stay commented
+  #       out on those, and DRAFTS.md's status column no longer names A5 at
+  #       all. One residual, which is hardening rather than a gate: with
+  #       FLEET_READONLY_SA unset the role kubeconfigs carry the runner's own
+  #       identity, which can write to the shared fleet
+  #       (roles/container.admin via the GKE IAM webhook, nothing to narrow
+  #       in-cluster). The checks read correctly either way; the safeguard
+  #       above is in fact what would DETECT such a write.
+  #       bench/tf/fleet/README.md, "A read-only credential for
+  #       evaluations", has the closing steps.
   #
   # Two entries are not activatable by uncommenting at all:
   #   autoops-warning-event-triage -- its prompt is a meta-note and nothing
@@ -315,7 +516,6 @@ TASKS=(
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
   # "./tasks/rca-remediation-pr/task.yaml"
-  # "./tasks/cluster-agent-crashloop-debug/task.yaml"
   # "./tasks/autoops-warning-event-triage/task.yaml"
 )
 
@@ -366,6 +566,7 @@ INFRA_FAILED_TASKS=()
 
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
+  profile_begin "task ${TASK_NAME}: devops-bench run"
   TASK_START=$SECONDS
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) <<<"
 
@@ -410,7 +611,11 @@ for TASK in "${TASKS[@]}"; do
   PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
   EVAL_LOG="/tmp/eval_${TASK_NAME}.log"
 
-  (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | tee "${EVAL_LOG}") || true
+  RUN_START_MS="$(_now_ms)"
+  (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | _ts_lines | tee "${EVAL_LOG}") || true
+  RUN_END_MS="$(_now_ms)"
+
+  profile_begin "task ${TASK_NAME}: classify + gate"
 
   # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS task run.
   # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
@@ -418,6 +623,8 @@ for TASK in "${TASKS[@]}"; do
   NEW_RUN_DIR="$(comm -13 <(echo "${PRE_RUNS}") <(echo "${POST_RUNS}") | head -n 1)"
   LATEST_RESULT=""
   [ -n "${NEW_RUN_DIR}" ] && LATEST_RESULT="${NEW_RUN_DIR}/results.json"
+
+  analyze_eval_phases "${EVAL_LOG}" "${RUN_START_MS}" "${RUN_END_MS}" "${TASK_NAME}" "${LATEST_RESULT}"
 
   # Classify the run. Three outcomes, because they route differently:
   #   INFRA  -- devops-bench died before evaluating anything, on a task that
@@ -586,6 +793,7 @@ else:
   fi
 done
 
+profile_begin "final gate + summary"
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if [ "${#INFRA_FAILED_TASKS[@]}" -gt 0 ]; then
   echo "⚠️ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Infrastructure failed for tasks (not counted against the PR): ${INFRA_FAILED_TASKS[*]}"
