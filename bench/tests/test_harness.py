@@ -8,6 +8,7 @@ path the eval harness consumes.
 
 from __future__ import annotations
 
+import http.client
 import json
 import subprocess
 import sys
@@ -176,6 +177,15 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         self.server.last_request = json.loads(self.rfile.read(length))
         self.server.requests.append(self.server.last_request)
         self.server.last_auth = self.headers.get("Authorization")
+        if len(self.server.requests) in self.server.drop_on:
+            # Kill the socket before any status line goes out: the client
+            # sees the connection die in flight, not an HTTP answer.
+            self.close_connection = True
+            try:
+                self.wfile.close()
+            finally:
+                self.connection.close()
+            return
         if self.path != "/v1/responses":
             self.send_error(404)
             return
@@ -240,6 +250,9 @@ class _StubAgentServer(ThreadingHTTPServer):
     # 1-based request ordinals that fail; every other request serves normally.
     # Models a dropped keepalive rather than a dead endpoint.
     fail_on: frozenset[int] = frozenset()
+    # 1-based request ordinals whose socket is closed before any response
+    # bytes: a connection lost in flight, as distinct from a gateway status.
+    drop_on: frozenset[int] = frozenset()
     # Status the ``fail_on`` ordinals answer with. 503 by default so the
     # dropped-keepalive tests read as they did before 502 became interesting.
     fail_on_status: int = 503
@@ -1247,6 +1260,77 @@ def test_a_timeout_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapped = urllib.error.URLError(ConnectionResetError(104, "reset by peer"))
     assert harness._connection_dropped(wrapped) is True
     assert harness._connection_dropped(urllib.error.URLError(TimeoutError())) is False
+    # The other half of the isinstance: a body cut off mid-read.
+    assert harness._connection_dropped(http.client.IncompleteRead(b"partial")) is True
+
+
+def test_a_connection_dropped_in_flight_is_retried(
+    stub_agent: _StubAgentServer, recorded_pf_resets: list[int]
+) -> None:
+    """The socket dies before a status line; the retry gets the answer.
+
+    The gateway-status tests exercise ``retryable`` through the HTTPError arm
+    of ``_post_turn``; this one exercises the OSError arm, where the verdict
+    comes from ``_connection_dropped`` on the unwrapped exception.
+    """
+    stub_agent.drop_on = frozenset({1})
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert len(stub_agent.requests) == 2
+    assert recorded_pf_resets == [stub_agent.server_address[1]]
+
+
+def test_a_failed_respawn_is_absorbed_and_the_ceiling_still_ends_the_run(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunnel that will not come back is the same outage, not a crash.
+
+    ``_reset_port_forward`` raises when the replacement forward cannot be
+    established -- a cluster that is fully down. If that escaped ``run()``,
+    the harness would die with no record at all and the task would land in
+    BROKEN (or worse, kill the eval loop) instead of INFRA: exactly the
+    un-graded death the retry exists to prevent.
+    """
+    respawn_attempts: list[int] = []
+
+    def _failing_reset(port: int) -> None:
+        respawn_attempts.append(port)
+        raise RuntimeError("port-forward did not become ready")
+
+    monkeypatch.setattr(harness, "_reset_port_forward", _failing_reset)
+    stub_agent.fail_with = 502
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+    # The failed respawns did not shortcut the ceiling: every attempt ran.
+    assert len(stub_agent.requests) == harness._MAX_TRANSPORT_FAILURES
+    assert len(respawn_attempts) == harness._MAX_TRANSPORT_FAILURES - 1
+
+
+def test_an_unowned_tunnel_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No registered process for the port: nothing killed, re-establish still runs.
+
+    The docstring's contract: a forward this process did not spawn is not ours
+    to terminate. The reset then degrades to the probe -- which no-ops on the
+    open listener -- so the retry loop spins to its ceiling and the run ends
+    INFRA rather than the harness reaching into someone else's tunnel.
+    """
+    stopped: list[object] = []
+    established: list[int] = []
+    monkeypatch.setattr(harness, "_stop_process", stopped.append)
+    monkeypatch.setattr(harness, "_ensure_port_forward", established.append)
+    assert 4243 not in harness._PF_PROCESSES
+
+    harness._reset_port_forward(4243)
+
+    assert stopped == []
+    assert established == [4243]
 
 
 def test_the_tunnel_is_torn_down_rather_than_probed(monkeypatch: pytest.MonkeyPatch) -> None:
