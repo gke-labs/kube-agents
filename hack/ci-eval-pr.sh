@@ -460,15 +460,19 @@ TASKS=(
   #       throwaway eval GitOps repos) and the minter scoped to it -- the
   #       token has exactly one source and no inherited GITHUB_TOKEN is
   #       honoured, so the value alone only moves the failure to the clone.
-  #       Both repository halves are on main; what is left is the Prow job
-  #       exporting EVAL_GITHUB_APP_ID, which is
-  #       GoogleCloudPlatform/oss-test-infra#2661 -- approved, not merged.
+  #       Both repository halves are on main, and the Prow job has exported
+  #       EVAL_GITHUB_APP_ID pool-wide since 2026-08-25
+  #       (GoogleCloudPlatform/oss-test-infra#2661, merged).
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules.
   #       Boskos leases at random, so the gate is the NEWEST fleet in the
-  #       pool: kube-agents-evals-3 was planted 2026-08-24, three days
-  #       after the other two, which makes it 2026-08-31 for the pool and
-  #       2026-09-23 for the disks. A replant in any pool project moves
-  #       them.
+  #       pool, and onboarding a project plants one -- so REGISTERING a
+  #       freshly-provisioned project moves the gate out. Today the newest
+  #       leasable fleet is kube-agents-evals-3's, planted 2026-08-24:
+  #       2026-08-31 for the pool and 2026-09-23 for the disks.
+  #       kube-agents-evals-4, -5 and -6 were provisioned 2026-08-25/26 and
+  #       are not registered yet; registering them moves the gate to
+  #       2026-09-02 and 2026-09-25. A replant in any pool project moves
+  #       them again.
   #   A4  cleared in the code, open on one credential. The six audit
   #       scenarios' objectives no longer read the final message (which the
   #       SOPs keep to one line); they use ledger_issue_contains, which reads
@@ -477,9 +481,11 @@ TASKS=(
   #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
   #       issues:read on the eval GitOps repos. The secret now exists
   #       (kube-agents-bench-github-token, namespace test-pods); mounting it
-  #       is the same oss-test-infra#2661, approved and not merged. Until it
-  #       lands those checks return status=error, which drops
-  #       VerificationCoverage below the gate's 1.0 floor by design.
+  #       was the same oss-test-infra#2661, now merged. What is unconfirmed
+  #       is the token's scope -- these checks need issues:read on the eval
+  #       GitOps repos, and until that is verified they may still return
+  #       status=error, which drops VerificationCoverage below the gate's
+  #       1.0 floor by design.
   #   A5  CLEARED, and that is what the active entry above rests on. Step 2b
   #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
   #       fleet safeguards use `fleet_resource_property` with a
@@ -487,8 +493,8 @@ TASKS=(
   #       is platform-agent-host and carries no seeded namespace). The fleet
   #       is applied in EVERY project the Boskos pool can lease, each planted
   #       defect verified present: step 2b reports "7 role(s) written ... 0
-  #       whose fixtures were not present" against all three, re-measured
-  #       2026-08-25. The five other fleet scenarios were never held by A5
+  #       whose fixtures were not present" against every leasable project,
+  #       re-measured 2026-08-25. The five other fleet scenarios were never held by A5
   #       alone -- each also carries A1, A3 or A4 -- so they stay commented
   #       out on those, and DRAFTS.md's status column no longer names A5 at
   #       all. One residual, which is hardening rather than a gate: with
