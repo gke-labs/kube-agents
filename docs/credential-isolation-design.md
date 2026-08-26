@@ -79,6 +79,14 @@ The last of those four is given up under
 ServiceAccount token in the sandbox deliberately; the other three hold in both
 layouts.
 
+The shared agent volume is outside all four, and it is the live gap in both
+layouts. A repository's own `.git/config` is read by every `git` invocation, so
+a `core.fsmonitor` entry the sandbox writes under the workspace root runs in the
+credential holder on the next `git status` — with no lease taken and no
+mutating verb, which is why neither the workspace-lease floor nor the
+argument-level deny policy reaches it. Closing it means the broker owning its
+workspace rather than operating in the agent's.
+
 `spec.deployment.env` is applied to the credential sidecar because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
 four OpenTelemetry settings and the three `ALERT_DAILY_LIMIT_*` alert ceilings —

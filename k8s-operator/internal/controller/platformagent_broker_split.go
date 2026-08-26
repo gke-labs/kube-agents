@@ -29,11 +29,11 @@ package controller
 // agent owns is a tree the agent can write .git/config into, which is the class
 // argument-level hardening cannot close by enumeration.
 //
-// The decided answer is content-passing. The broker owns the workspace on a
+// The decided answer is content-passing: the broker owns the workspace on a
 // volume of its own, ordinary ReadWriteOnce, and the agent hands it
 // {path, content} pairs and a commit message instead of a directory. That
-// removes the coupling and the .git class together. It is being built as
-// up/11-content-workspace, and the flag stays off until it lands.
+// removes the coupling and the .git class together. It is being built
+// separately, and this flag stays off until it lands.
 //
 // A ReadWriteMany claim is one way to make two Pods see the same files today,
 // and an operator may choose it. It is not what the product asks for, and it
@@ -145,14 +145,20 @@ func credentialBrokerName(agent *agentv1alpha1.PlatformAgent) string {
 
 // agentServiceAccountName is the ServiceAccount both Pods run as.
 //
-// They share one deliberately, and this is the weakest joint in the split. The
-// Workload Identity IAM binding in terraform names this ServiceAccount, so
-// giving the agent one of its own would take the broker's cloud credentials
-// away with it. The consequence is that the identity the broker verifies is
-// "a Pod running as this ServiceAccount", not "the agent Pod" — good enough to
-// exclude everything else in the cluster, not good enough to distinguish the
-// two halves of this agent. Separating them is an infrastructure change, not a
-// manifest change.
+// They share one, and this is the weakest joint in the split: the identity the
+// broker verifies is "a Pod running as this ServiceAccount", not "the agent
+// Pod". Good enough to exclude everything else in the cluster, not good enough
+// to tell the two halves of this agent apart.
+//
+// It shares one because both Pods are rendered from this one name and nothing
+// here mints a second. Not because splitting them is impossible: the Workload
+// Identity IAM binding names this ServiceAccount, so the way to split it is to
+// leave the bound name with the *broker* — which is what actually needs the
+// cloud credential once it is split out — and give the agent a new one of its
+// own. That buys per-Pod attribution and takes the cloud credential away from
+// the sandbox's identity at the same time. It also moves which identity holds
+// the cloud credential, which is a bigger decision than a manifest change and
+// belongs with the per-cluster service-account work rather than here.
 func agentServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		return agent.Spec.Security.ServiceAccountName
@@ -223,7 +229,7 @@ func buildAgentAPIProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Cont
 		Env: []corev1.EnvVar{
 			{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"},
 			{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-			{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+			{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
 			{Name: "PYTHONPATH", Value: "/opt/defaults/scripts"},
 			{Name: "HOME", Value: "/tmp"},
 			{
@@ -371,6 +377,15 @@ func buildCredentialBrokerService(agent *agentv1alpha1.PlatformAgent) *corev1.Se
 // "is this token valid, and for whom", which is the whole of what the broker
 // needs. Deliberately not system:auth-delegator, which also carries
 // SubjectAccessReview.
+//
+// The cost, named rather than hidden: the binding names the ServiceAccount the
+// agent Pod also runs as, so with the split on the sandbox can validate any
+// bearer token it gets hold of. It has no use for that. Narrowing it means
+// giving the two Pods separate ServiceAccounts — see agentServiceAccountName —
+// which is why this is a cost of enabling the flag rather than something the
+// flag can fix on its own. It is applied only under the split and deleted when
+// the split goes off (reconcileCredentialBroker), so an install with the flag
+// off never has it.
 func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},

@@ -93,7 +93,7 @@ func volumeNamed(volumes []corev1.Volume, name string) *corev1.Volume {
 // assertBrokerHomeIsOffTheSharedWorkspace is the whole point of this file, run
 // against both layouts.
 //
-// Slice 2a closed `--kuberc` in the command policy and then found that kubectl
+// The command policy closed `--kuberc`, and it then turned out that kubectl
 // honours $HOME/.kube/kuberc with no flag present. That default path is closed
 // by `KUBECTL_KUBERC=false` in the executor environment (asserted in
 // test_credential_proxy.py) and, underneath it, by the broker's HOME living on

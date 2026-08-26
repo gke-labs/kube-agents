@@ -281,15 +281,22 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
+	// 10c. Reconcile the credential broker's own Pod, if it has one.
+	//
+	// Before the agent's workload, not after. On the reconcile that first turns
+	// the split on, the agent Deployment is re-rendered pointing at the broker
+	// Service; creating that Service afterwards leaves the restarted agent
+	// failing every proxied command with a connection refused until the next
+	// pass. The other direction is safe either way, because turning the split
+	// off deletes a broker the re-rendered agent has already stopped using.
+	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 11b. Reconcile the credential broker's own Pod, if it has one.
-	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -670,8 +677,8 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 // operator may pick it, but the managed options bill on provisioned capacity
 // with a floor far above what a workspace needs. The supported answer is to
 // leave the split off until the broker owns the workspace on a volume of its
-// own and takes content rather than a directory (up/11-content-workspace),
-// which removes the coupling entirely. Co-scheduling both Pods on one node is
+// own and takes content rather than a directory, a separate change that
+// removes the coupling entirely. Co-scheduling both Pods on one node is
 // not the answer: it deadlocks the next rolling update on the volume and makes
 // the two Pods a single failure domain.
 //

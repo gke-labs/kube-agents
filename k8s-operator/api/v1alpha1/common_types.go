@@ -530,7 +530,11 @@ type SecuritySpec struct {
 	// server the sandbox binds on the agent Pod's loopback, so the split takes
 	// the watcher away from the only address it can deliver to. Asking for both
 	// is refused rather than rendered: the agent goes Degraded with reason
-	// SplitBrokerStrandsEventWatcher and nothing is applied. eventWatcher
+	// SplitBrokerStrandsEventWatcher and no workload is applied. The refusal
+	// sits after the ServiceAccount, RBAC, PVCs and ConfigMaps, so those are
+	// reconciled either way; and on an agent that is already running with the
+	// split, it leaves the running Pods alone rather than taking them down.
+	// eventWatcher
 	// defaults to enabled, so this fires on a stock spec, which is the intent —
 	// the split costs you fleet event delivery today and that should be a
 	// decision rather than a discovery. Giving the watcher a home that survives

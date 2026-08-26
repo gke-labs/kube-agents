@@ -187,10 +187,13 @@ func TestTheGateOnMovesTheBrokerOffTheAgentPod(t *testing.T) {
 	if !hasVolume(pod.Spec.Volumes, agentCredentialProxyTokenVolume) {
 		t.Error("the agent Pod must project the broker token")
 	}
-	// The event-watcher container still mounts these, and it did not move.
+	// The event watcher is a process inside the credential container rather
+	// than a container of its own, so it leaves the agent Pod with the broker
+	// and these two go with it. Leaving them behind declared two volumes that
+	// nothing in this Pod mounts.
 	for _, name := range []string{"event-watcher-kubeconfig", "event-watcher-ksa-token"} {
-		if !hasVolume(pod.Spec.Volumes, name) {
-			t.Errorf("the agent Pod still needs the %s volume for its event watcher", name)
+		if hasVolume(pod.Spec.Volumes, name) {
+			t.Errorf("volume %s went to the broker Pod with the watcher; nothing here mounts it", name)
 		}
 	}
 	// The broker's own volumes went with the broker.
@@ -413,6 +416,31 @@ func TestReconcileRemovesTheBrokerPodWhenTheGateIsOff(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("turning the gate off must remove %T %s, got %v",
 				object, object.GetName(), err)
+		}
+	}
+}
+
+// TestTheSplitAgentPodDeclaresNoVolumeItDoesNotMount catches the class the
+// event-watcher volumes fell into: the broker's volume list was pruned by hand
+// for the split branch, and two entries survived that nothing in the agent Pod
+// mounts any more, because the container that used them left with the broker.
+func TestTheSplitAgentPodDeclaresNoVolumeItDoesNotMount(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		spec := buildPodTemplateSpec(
+			splitBrokerAgent(split), "c", "f", "s", "p", nil,
+			renderOptions{imageVolumeSupported: true},
+		).Spec
+
+		mounted := map[string]bool{}
+		for _, container := range append(append([]corev1.Container{}, spec.Containers...), spec.InitContainers...) {
+			for _, mount := range container.VolumeMounts {
+				mounted[mount.Name] = true
+			}
+		}
+		for _, volume := range spec.Volumes {
+			if !mounted[volume.Name] {
+				t.Errorf("split=%v: volume %q is declared and never mounted", split, volume.Name)
+			}
 		}
 	}
 }

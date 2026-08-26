@@ -2049,14 +2049,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
 	if credentialBrokerIsSplit(agent) {
-		// The broker's own volumes go with the broker. What the agent Pod still
-		// needs from that set is the event-watcher pair, which belongs to the
-		// event-watcher container and never did belong to the broker.
-		volumes = append(volumes,
-			buildEventWatcherKubeconfigVolume(),
-			buildEventWatcherTokenVolume(),
-			buildAgentCredentialProxyTokenVolume(),
-		)
+		// The broker's volumes all go with the broker, including the
+		// event-watcher pair: the watcher is hosted inside the credential
+		// container, so it leaves the agent Pod too and nothing here mounts
+		// either volume. What stays is the token the agent presents to the
+		// broker across the network.
+		volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	} else {
 		volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
 	}
