@@ -100,7 +100,14 @@ tmp=$(mktemp)
   echo '# `no matches for kind`. Rendering nothing there is the only behaviour that keeps the chart'
   echo '# installable across the range it claims. It is a condition on this one template, not a'
   echo '# second delivery path.'
-  cat "$VAP_SRC"
+  # One substitution, and only this one: the chart runs the controller as
+  # <release>-operator-sa in the release namespace, while the source file names
+  # the kustomize path's kubeagents-controller. The policy's operator exemption
+  # has to name the identity that will actually reconcile, so the chart's copy
+  # gets the rendered form. tests/test_admission_policy_shipped.py applies the
+  # same substitution before comparing the two, so a second one appearing here
+  # fails that comparison rather than passing unnoticed.
+  sed "s|'system:serviceaccount:kubeagents-system:kube-agents-operator-sa'|'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'|" "$VAP_SRC"
   echo '{{- end }}'
 } >"$tmp"
 

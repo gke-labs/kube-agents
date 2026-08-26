@@ -66,6 +66,19 @@ EXPECTED_OBJECTS = {
 }
 
 
+# The one difference the chart's copy is allowed to have from the source, and
+# why: the two install paths run the controller under different
+# ServiceAccounts, and the policy's operator exemption has to name the one that
+# will actually reconcile. hack/sync-chart-manifests.sh applies exactly this
+# rewrite. Spelled out here rather than pattern-matched so that a second
+# substitution appearing in the generator fails the drift comparison instead of
+# being absorbed by a looser rule.
+CONTROLLER_USER_SRC = "'system:serviceaccount:kubeagents-system:kube-agents-operator-sa'"
+CONTROLLER_USER_CHART = (
+    "'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'"
+)
+
+
 def load_source_objects() -> list[dict]:
     return [d for d in yaml.safe_load_all(POLICY_SRC.read_text(encoding="utf-8")) if d]
 
@@ -86,6 +99,10 @@ def load_chart_objects() -> list[dict]:
             "this test's stripping is invalid, so re-read it before trusting it"
         )
     body = "\n".join(lines[1:-1])
+    # Undo the generator's one substitution before parsing, so what is compared
+    # against the source is like for like and any *other* templating still trips
+    # the check below.
+    body = body.replace(CONTROLLER_USER_CHART, CONTROLLER_USER_SRC)
     if "{{" in body:
         raise AssertionError(f"unexpected Go templating inside the generated body: {body[:200]}")
     return [d for d in yaml.safe_load_all(body) if d]
@@ -203,6 +220,29 @@ class ChartCopyHasNotDriftedTest(unittest.TestCase):
     def test_the_chart_and_the_source_hold_the_same_objects(self):
         self.assertEqual(load_source_objects(), load_chart_objects())
 
+    def test_the_chart_copy_names_the_identity_that_release_reconciles_as(self):
+        """The exemption is useless if it names the wrong ServiceAccount.
+
+        The chart runs the controller as `<release>-operator-sa` in the release
+        namespace; the source file names the kustomize path's
+        `kubeagents-controller`. A chart copied verbatim would exempt an
+        identity that does not exist on a chart install, and every reconcile
+        would be evaluated against the rule the exemption exists to skip.
+        """
+        raw = CHART_TEMPLATE.read_text(encoding="utf-8")
+        self.assertIn(
+            CONTROLLER_USER_CHART,
+            raw,
+            "the chart's admission policy does not name the release's own operator "
+            "ServiceAccount, so the operator exemption cannot match on a chart install",
+        )
+        self.assertNotIn(
+            CONTROLLER_USER_SRC,
+            raw,
+            "the chart still carries the source file's literal ServiceAccount name; "
+            "the sync substitution did not run",
+        )
+
     def test_the_sync_script_knows_about_the_template(self):
         """Otherwise `make chart-sync` silently stops regenerating it."""
         script = SYNC_SCRIPT.read_text(encoding="utf-8")
@@ -221,6 +261,15 @@ class PolicyContentTest(unittest.TestCase):
     compiles every expression when the policy object is admitted -- so a
     `kubectl apply --dry-run=server` of the source file is the check that
     covers syntax, and enforcement on a live cluster covers the rest.
+
+    Worth stating because it has already cost one round: the failure mode a
+    reader most expects these to guard -- an exemption that lets a denied
+    object through -- is precisely the one they cannot see. Nothing here
+    evaluates a matchCondition against an object, so the first version of the
+    operator exemption, which any manifest could satisfy by setting a label,
+    was green in this suite while being a complete bypass of the policy it
+    sat in. Treat "the assertions pass" as "the text still says what it said",
+    and get the semantics from the live run.
     """
 
     def setUp(self):
@@ -263,6 +312,32 @@ class PolicyContentTest(unittest.TestCase):
         )
         self.assertIn("secrets", expressions)
 
+    def test_the_operator_exemption_keys_on_the_authenticated_user(self):
+        """A label exemption is a hole, not an exemption.
+
+        matchConditions are ANDed and a false one drops the object from the
+        policy entirely, so any exemption an author can satisfy from inside the
+        manifest is a bypass of the whole rule rather than a carve-out from it.
+        The first version of this exemption keyed on a label the controller
+        stamps; setting that label on a hand-written ClusterRoleBinding to
+        `developer-team-agent` walked straight past the denial. `request.userInfo`
+        is filled in by the API server from the authenticated request, so no
+        object can carry it.
+        """
+        conditions = self.by_name["kube-agents-agent-binding-scope"]["spec"]["matchConditions"]
+        joined = " ".join(c["expression"] for c in conditions)
+        self.assertIn(
+            "request.userInfo.username",
+            joined,
+            "the operator exemption no longer keys on the authenticated user",
+        )
+        self.assertNotIn(
+            "metadata.labels",
+            joined,
+            "the binding-scope policy reads a label again; anything the manifest can "
+            "carry is a bypass of the policy, not an exemption from it",
+        )
+
     def test_the_operator_own_bindings_are_exempt_from_the_binding_scope_policy(self):
         """The policy asserted an invariant the controller violates by construction.
 
@@ -278,13 +353,18 @@ class PolicyContentTest(unittest.TestCase):
         """
         conditions = self.by_name["kube-agents-agent-binding-scope"]["spec"]["matchConditions"]
         joined = " ".join(c["expression"] for c in conditions)
-        self.assertIn(
-            "platformagent-controller",
-            joined,
-            "the binding-scope policy no longer exempts operator-managed bindings, so a "
-            "reconcile can be denied by the policy the same install ships",
-        )
-        self.assertIn("app.kubernetes.io/managed-by", joined)
+        for username in [
+            "system:serviceaccount:kubeagents-system:kubeagents-controller",
+            "system:serviceaccount:kubeagents-system:kube-agents-operator-sa",
+        ]:
+            with self.subTest(username=username):
+                self.assertIn(
+                    username,
+                    joined,
+                    "the binding-scope policy no longer exempts this install path's "
+                    "controller, so a reconcile can be denied by the policy the same "
+                    "install ships",
+                )
 
     def test_the_binding_scope_policy_selects_on_the_subject_not_a_label(self):
         """The one selector an author cannot drop from the manifest.

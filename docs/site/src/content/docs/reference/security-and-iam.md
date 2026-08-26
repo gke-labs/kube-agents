@@ -70,6 +70,10 @@ The default **read-only** set binds viewer roles only:
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
+The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
+
+If that list names a role like `roles/container.admin`, the installer says so at the point of choice — it is the authority the removed bundle granted, reached the long way round — and continues. It is your call to make, not the installer's.
+
 ### Why there is no `gke-admin` set
 
 There used to be a third set, `gke-admin`, which bound `roles/container.clusterAdmin` and `roles/container.admin`. It was removed rather than deprecated because it did not simply widen the ceiling — it removed one:
@@ -78,8 +82,6 @@ There used to be a third set, `gke-admin`, which bound `roles/container.clusterA
 - **`roles/container.admin` is the one predefined GKE role that carries `container.clusters.impersonate`** — `roles/container.clusterAdmin` does not. GKE grants IAM roles at the project level; a cluster is not a resource an IAM policy attaches to, so "an IAM role grants privileges across all clusters in the project". The impersonation therefore cannot be narrowed to one cluster.
 
 `custom` remains, so a deployment that genuinely needs broad roles still has a supported path — it just has to name each role, which makes the grant explicit and reviewable. Setting `PLATFORM_AGENT_PERMISSION_SET=gke-admin`, or `permission_set = "gke-admin"` in `terraform.tfvars`, now fails with an error rather than being silently downgraded. Re-running the install does not strip roles it no longer grants, so an existing GSA has to be brought back by hand — see below.
-
-The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
 
 ## Kubernetes RBAC
 
@@ -126,7 +128,7 @@ They need Kubernetes 1.30 or later, where the policy API reached `v1`. The chart
 What they do **not** cover, stated plainly because a backstop misread as complete is worse than none:
 
 - **They cannot check the role a binding points at.** CEL in a `ValidatingAdmissionPolicy` sees only the object being admitted, so an unlabelled write `Role` bound to an agent ServiceAccount is admitted. Closing that needs a cross-object webhook, which is not built.
-- **The content policy is label-selected.** `kube-agents-agent-readonly` only looks at objects carrying `kube-agents/tier`. A hand-written manifest that omits the label is not examined at all; pull-request review is what catches that. The binding-scope policy is not evadable this way — it keys on the ServiceAccount being privileged, which the binding cannot omit.
+- **The content policy is label-selected.** `kube-agents-agent-readonly` only looks at objects carrying `kube-agents/tier`. A hand-written manifest that omits the label is not examined at all; pull-request review is what catches that. The binding-scope policy is not evadable that way: it keys on the ServiceAccount being privileged, which the binding cannot omit. Nor by _adding_ something — its one exemption, for the operator's own reconcile, matches on `request.userInfo.username`, which the API server fills in from the authenticated request and no manifest can carry. That distinction is load-bearing rather than pedantic: `matchConditions` are ANDed, so a false one drops the object from the policy altogether, and an exemption an author could satisfy from inside the manifest would be a bypass of the whole rule rather than a carve-out from it.
 - **Policy 2 denies exactly one ServiceAccount name.** A cluster-scoped binding to any other agent ServiceAccount is admitted. Combined with the label point above, this means an unlabelled `ClusterRole` granting `*` on `*`, bound to the agent's own ServiceAccount, is admitted by both policies on a default install. Pull-request review on the GitOps repository is the control for that, which is what the [branch-protection guidance](https://github.com/gke-labs/kube-agents/blob/main/examples/gitops-repo/.github/branch-protection.md) shipped with the example overlay is for.
 - **Policy 2 only examines `kind: ServiceAccount` subjects.** A binding whose subject is a `kind: Group` — `system:serviceaccounts:team-x`, say — is not selected. The subject is unforgeable for the kinds the policy looks at; choosing a different kind steps outside them.
 - **They govern agent RBAC, not the operator's own.** The controller's ClusterRole below is unlabelled and out of scope by design.

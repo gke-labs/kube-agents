@@ -1234,6 +1234,7 @@ run_menu_system() {
               [ -n "$custom_roles" ] && break
               print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
             done
+            warn_on_overreaching_custom_roles "$custom_roles"
             ;;
         esac
         ;;
@@ -1743,15 +1744,24 @@ main() {
   # 9. Agent Permissions & Sandbox Isolation Boundary
   print_step "9. Agent Security & Runtime Isolation Boundary"
   local permission_set="${PARAM_PERMISSION_SET:-read-only}"
+  # Normalise and keep the normalised value, the way common.sh does. The gate
+  # below normalises its own argument so that every spelling reaches the right
+  # message, but it cannot fix the caller's variable -- and everything
+  # downstream compares against the lowercase literal: the custom-roles check
+  # and the over-reach warning just below, write_state_var's PLATFORM_AGENT_*
+  # pair, and terraform's case-sensitive contains() on permission_set. Passing
+  # `Custom` through raw would clear the gate and then miss all four.
+  permission_set=$(printf '%s' "$permission_set" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   # require_supported_permission_set (installer_common.sh) is the one home for
   # the accepted vocabulary and for the explanation the removed admin bundle
   # gets -- a PLATFORM_AGENT_PERMISSION_SET inherited from a vars.sh or a CI
   # environment variable written before the removal lands here.
   require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
-  # init_var_platform_agent_permission_set in k8s-operator/scripts/common.sh owns
-  # this rule; repeated here only so the run fails at the prompt instead of
-  # partway through the apply.
+  # This rule is also written in init_var_platform_agent_permission_set
+  # (k8s-operator/scripts/common.sh), which has no caller left in the repository
+  # -- the numbered provision scripts that used to invoke it went with #797. So
+  # this is the only place it runs, not a duplicate of somewhere it also runs.
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
@@ -1808,6 +1818,12 @@ main() {
         print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
       fi
     done
+    # Repeated rather than moved: the call above runs on the --custom-roles flag
+    # path, which is decided before this prompt exists. An operator who runs
+    # ./install.sh and types the roles in reaches only this one.
+    if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
+      warn_on_overreaching_custom_roles "$custom_roles"
+    fi
 
     local gvisor_choice=""
     prompt_menu "Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?" \

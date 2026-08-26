@@ -336,6 +336,57 @@ class InstallerFrontDoorTest(unittest.TestCase):
             "install.sh still names the removed `gke-admin` permission set",
         )
 
+    def test_the_installer_normalises_before_it_branches_on_the_value(self):
+        """The gate normalising its own argument is not enough for the caller.
+
+        `require_supported_permission_set` lowercases what it is handed so that
+        every spelling reaches the right message, but it cannot fix the
+        variable in the caller. Everything downstream of the call in install.sh
+        compares against the lowercase literal -- the custom-roles requirement,
+        the over-reach warning, the two `write_state_var` lines, and (through
+        the generated tfvars) terraform's case-sensitive `contains()` on
+        permission_set. So a `--permission-set=Custom` that cleared the gate
+        and stayed `Custom` would miss all of them and fail much later, in the
+        apply, with an error about a different value entirely. The fix is one
+        line and this is what holds it there.
+        """
+        source = INSTALL_SH.read_text(encoding="utf-8")
+        assignment = re.search(
+            r'^\s*local permission_set="\$\{PARAM_PERMISSION_SET:-read-only\}"$',
+            source,
+            re.M,
+        )
+        self.assertIsNotNone(assignment, "the permission_set assignment moved or was renamed")
+        gate = source.index('require_supported_permission_set "$permission_set"')
+        between = source[assignment.end() : gate]
+        normalisation = [
+            line.strip()
+            for line in between.splitlines()
+            if line.strip().startswith("permission_set=")
+        ]
+        self.assertEqual(
+            1,
+            len(normalisation),
+            "install.sh does not reassign permission_set between reading the flag and "
+            "validating it, so a mixed-case value clears the gate and then misses every "
+            "comparison after it",
+        )
+
+        # Executed, not just matched: a line that reassigns the variable without
+        # actually lowercasing it would satisfy the check above.
+        probe = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'permission_set="$1"\n{normalisation[0]}\nprintf "%s" "$permission_set"',
+                "_",
+                "  CuStOm  ",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual("custom", probe.stdout, probe.stdout + probe.stderr)
+
     def test_the_installer_routes_its_check_through_the_shared_gate(self):
         """Not a duplicate of the shell test above: this is the wiring.
 

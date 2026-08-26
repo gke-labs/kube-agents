@@ -32,8 +32,9 @@
 #     selected. On a default install with no GitOps overlay, policy 1 governs zero objects. It
 #     is a backstop on the RBAC a customer's overlay writes, not on the RBAC the operator mints.
 #   - Policy 2 governs the SUBJECT of a (Cluster)RoleBinding, which the binding cannot forge
-#     away — the subject is the thing being privileged — so within the subject kinds it selects
-#     it is not label-evadable. Two limits on that: it only selects `kind: ServiceAccount`, so a
+#     away — the subject is the thing being privileged — and its one exemption keys on the
+#     authenticated user rather than on anything in the manifest, so within the subject kinds it
+#     selects there is nothing an author can put in the object to escape it. Two limits on that: it only selects `kind: ServiceAccount`, so a
 #     `kind: Group` subject such as `system:serviceaccounts:team-x` is not examined at all; and
 #     it denies exactly one hard-coded name, `developer-team-agent`. A cluster-scoped binding to
 #     any other agent ServiceAccount is admitted.
@@ -146,7 +147,7 @@ spec:
       expression: >-
         has(object.subjects) &&
         object.subjects.exists(s, s.kind == 'ServiceAccount' && s.name.endsWith('-agent'))
-    # Exempt what the operator mints for itself. reconcileRBAC (platformagent_controller.go)
+    # Exempt the operator's own reconcile. reconcileRBAC (platformagent_controller.go)
     # unconditionally creates `kubeagents:minimal:<ns>:<name>` as a ClusterRoleBinding whose subject
     # is spec.security.serviceAccountName — and the default, `kubeagents-platform-agent`, ends in
     # `-agent`, so every reconcile on every install is evaluated by the rule below. There is no
@@ -156,16 +157,25 @@ spec:
     # reconcile denied before the Deployment exists, with an admission error nobody would connect
     # back to the example they copied.
     #
-    # `app.kubernetes.io/managed-by: platformagent-controller` is applyManaged's own field-manager
-    # identity (manifest_helpers.go), so this keys on something the controller stamps rather than on
-    # a name convention. A hand-written manifest can of course set the same label — what that buys
-    # is a cluster-scoped binding to `developer-team-agent`, which is the single case below and
-    # which pull-request review is the control for either way.
-    - name: not-operator-managed
+    # Keyed on the authenticated user the API server puts in the AdmissionReview, which no manifest
+    # can carry. An earlier revision keyed on a label the controller stamps; that was a hole rather
+    # than an exemption, because matchConditions are ANDed and a false one drops the object from the
+    # policy entirely — so anyone who set that label on their own ClusterRoleBinding walked straight
+    # past the rule below. request.userInfo.username cannot be set by the object being admitted.
+    #
+    # Two usernames because the two install paths run the controller as different ServiceAccounts:
+    # the kustomize path (INSTALL.md Method 2) applies config/default, whose `namePrefix:
+    # kubeagents-` and `namespace: kubeagents-system` give `kubeagents-controller`, while the chart
+    # runs it as `<release>-operator-sa` in the release namespace. The second entry below is
+    # rewritten to the rendered names by hack/sync-chart-manifests.sh, so the chart's copy names the
+    # identity that release actually reconciles as rather than a guess at it. Each artifact
+    # therefore exempts the reconciler of the install that applies it, and both are listed so an
+    # install that has been through both paths is covered either way.
+    - name: not-the-operator-reconciling
       expression: >-
-        !(has(object.metadata.labels) &&
-          'app.kubernetes.io/managed-by' in object.metadata.labels &&
-          object.metadata.labels['app.kubernetes.io/managed-by'] == 'platformagent-controller')
+        !(request.userInfo.username in [
+          'system:serviceaccount:kubeagents-system:kubeagents-controller',
+          'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'])
   validations:
     # A namespace-scoped tier (developer-team) must never receive a cluster-scoped binding — that would
     # hand a namespace agent cluster-wide reach regardless of the referenced role's own rules.
