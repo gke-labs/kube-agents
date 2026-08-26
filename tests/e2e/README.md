@@ -265,7 +265,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ## 🤖 Running in GitHub Actions (CI)
 
-The workflow file [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) is triggered manually via `workflow_dispatch` (or via GitHub CLI / Web UI).
+Two workflows run this suite. [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) is triggered manually via `workflow_dispatch` (or via GitHub CLI / Web UI). [`.github/workflows/rc-release-pipeline.yml`](../../.github/workflows/rc-release-pipeline.yml) also runs it, unattended, on a three-hourly schedule — its `step-3-run-e2e-tests` job calls the same `scripts/release/execute_e2e_tests.sh`, and `step-4-tag-validated` depends on the result. So a break here stops the release-candidate tag within three hours, whether or not anyone dispatches the manual workflow.
 
 ### Triggering Workflow via GitHub CLI (`gh`):
 

@@ -177,8 +177,13 @@ litellm:
     serviceAccountName: kubeagents-litellm
     #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
     serviceAccountAnnotations: {}
-    # Empty defaults to platformAgent.harness.projectId / .location; location
-    # must be a region (or "global"), so override it on a zonal cluster.
+    # projectId empty defaults to platformAgent.harness.projectId. location
+    # empty defaults to "global", not the harness location: a model is only
+    # callable from a location that serves it, and the cluster's is often not
+    # one — on a zonal cluster it is not even a valid Vertex location. The
+    # global endpoint gives no in-region ML processing guarantee, and a Model
+    # Garden partner model may be served only from specific regions; set a
+    # region here for either reason.
     projectId: ""
     location: ""
   # Keep in step with the kustomize base
@@ -377,12 +382,16 @@ platformAgent:
       # the RuntimeClass natively. Empty omits the field.
       runtimeClassName: ""
     # Extra environment for the agent container, applied after the operator's own
-    # values so it overrides them. The case this exists for is telemetry: the
-    # operator's endpoint ladder always resolves to SOMETHING — an in-cluster
-    # collector if it discovers one, otherwise the GKE managed collector at
-    # opentelemetry-collector.gke-managed-otel — and a cluster that runs neither
-    # has no way to say "no telemetry". The exporter then retries a hostname that
-    # does not resolve for the life of the pod. Turn it off with:
+    # values so it overrides them. Telemetry is the case this exists for, though
+    # a cluster with no collector no longer needs it: when discovery completes
+    # and finds none, the operator itself omits the endpoint and sets
+    # OTEL_SDK_DISABLED=true, and reports `None` in
+    # status.telemetry.otlpEndpointSource.
+    #
+    # What is left for this field is the cases the operator will not decide —
+    # discovery switched off with OTEL_COLLECTOR_DISCOVERY=false, an endpoint
+    # pinned through telemetry.otlpEndpoint, or a collector that exists but that
+    # you do not want this agent exporting to:
     #
     #   env:
     #     - name: OTEL_SDK_DISABLED

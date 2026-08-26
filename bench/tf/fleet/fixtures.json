@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own trio, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'.",
+  "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
+  "cluster_slots": {
+    "a": "Every namespace-level defect, plus the idle and pinned node pools.",
+    "b": "Control plane held one minor behind the REGULAR channel default.",
+    "c": "The consistency outlier: no master authorized networks."
+  },
+  "roles": {
+    "crashloop-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-debug",
+      "probes": ["deployment/payments-api"],
+      "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit"
+    },
+    "no-pdb-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-reliability",
+      "probes": ["deployment/checkout-gateway"],
+      "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace"
+    },
+    "hpa-saturated": {
+      "cluster_slot": "a",
+      "namespace": "seeded-capacity",
+      "probes": ["horizontalpodautoscaler/inference-server"],
+      "fixture": "inference-server HPA settles above pinned-inference-pool's capped capacity, leaving Pending replicas"
+    },
+    "rbac-overgrant": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": ["clusterrolebinding/debug-binding"],
+      "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount"
+    },
+    "idle-nodepool": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": ["node?cloud.google.com/gke-nodepool=idle-batch-pool"],
+      "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint"
+    },
+    "version-laggard": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": [],
+      "fixture": "control plane one minor behind the REGULAR channel default, held by a NO_MINOR_UPGRADES exclusion"
+    },
+    "drift-outlier": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": [],
+      "fixture": "master authorized networks absent where both cohort peers have it on"
+    }
+  }
+}

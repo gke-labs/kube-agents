@@ -154,11 +154,11 @@ jobs:
           # above that the Deployment reports ProgressDeadlineExceeded and this
           # wait returns early however long it was given.
           echo "Waiting for rollout of platform-agent-gateway deployment..."
-          if ! kubectl rollout status deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} --timeout=900s; then
+          if ! kubectl rollout status deployment/platform-agent-gateway -n "$NAMESPACE" --timeout=900s; then
             echo "::error::Rollout failed! Printing debug logs..."
-            kubectl describe deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} || true
-            kubectl get pods -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway || true
-            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway || true
-            kubectl logs -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway --all-containers --tail=50 || true
+            kubectl describe deployment/platform-agent-gateway -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l app=platform-agent-gateway || true
+            kubectl describe pods -n "$NAMESPACE" -l app=platform-agent-gateway || true
+            kubectl logs -n "$NAMESPACE" -l app=platform-agent-gateway --all-containers --tail=50 || true
             exit 1
           fi

@@ -21,6 +21,11 @@ output "cluster_names" {
   ]
 }
 
+output "fleet_reader_service_account" {
+  description = "Read-only service account the evaluation checks read the fleet as. Export it as FLEET_READONLY_SA in the Prow job so hack/fleet-kubeconfigs.sh mints its token instead of using the runner's own credential."
+  value       = google_service_account.fleet_reader.email
+}
+
 output "lagging_version" {
   description = "The version seeded-b is pinned to this cycle (REGULAR default minus one minor, freshest patch)."
   value       = local.lagging_version

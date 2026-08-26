@@ -23,6 +23,29 @@ Each PlatformAgent runs as one long-lived Pod with these managed containers:
    and the `k8s-event-watcher`, which forwards cluster events using a
    non-secret internal key.
 
+The proxy is a **native sidecar** -- an entry in `initContainers` carrying
+`restartPolicy: Always` -- and not an ordinary container, so
+`kubectl get pod -o jsonpath='{.spec.containers[*].name}'` will not list it. It
+is shaped that way because it owns port 8643, which the Service targets, and it
+shares a network namespace with the sandbox: as two ordinary containers they
+started together and raced for the bind, and the sandbox could take the port
+external callers reach. A native sidecar starts before any app container, which
+narrows that race but does not close it: the kubelet waits for the sidecar to have
+**started**, plus its `startupProbe` if it declares one, and this container declares
+only a `readinessProbe`. So the ordering guaranteed is of process creation, not of
+Envoy having bound 8643. Giving the container a `startupProbe` on that port would
+close it; see `buildPodTemplateSpec` in the operator.
+
+Requires Kubernetes 1.29+, where `SidecarContainers` is beta and enabled by
+default. It is alpha and off in 1.28, and GA in 1.33.
+
+On 1.28 the install fails rather than degrading. The API server strips
+`restartPolicy` from the init container, which leaves it declaring a readiness
+probe that a non-restartable init container may not have, so the pod template is
+rejected and the apply fails. There is no configuration in which the proxy runs
+as an ordinary init container with credential isolation quietly weakened. The
+chart's `kubeVersion` refuses the install before that point.
+
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
 send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards
 requests over a private Unix socket to the credential runtime. Slack and Google
@@ -118,10 +141,13 @@ sandbox cannot bypass Envoy by calling the runtime directly. A separate sidecar
 listener authenticates the existing PlatformAgent API on port 8643 and forwards
 to the sandbox API on loopback using a non-secret sentinel.
 
-The containers have the same lifecycle because they are part of the same
-Deployment and Pod. If the sidecar is not ready, the Pod is not ready. If either
-Envoy or the credential runtime exits, the sidecar exits and Kubernetes restarts
-it.
+The containers share a Pod, but not the same lifecycle: the credential proxy is
+a native sidecar, so the kubelet starts it before every app container and stops
+it after them. If the sidecar is not ready, the Pod is not ready -- a restartable
+init container counts toward Pod readiness. If either Envoy or the credential
+runtime exits, the sidecar exits and Kubernetes restarts it; during startup that
+means the app containers have not begun yet, so a bootstrap failure shows up as
+`Init:CrashLoopBackOff` rather than a running Pod with one bad container.
 
 ## Credential Placement
 
@@ -195,7 +221,17 @@ command.
 
 Only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy also rejects
 known credential-disclosure, credential-replacement, and self-modification
-operations. Pipelines and redirections are interpreted by the sandbox shell
+operations, and the GitHub **write** path: merging a pull request
+(`github.merge`), approving a review (`github.assent`), mutating through the
+REST API (`github.api-mutation`), triggering workflows or releases
+(`github.pipeline-trigger`), and repository administration — secrets,
+variables, and repository deletion, archiving or editing
+(`github.repo-administration`). Rulesets are not in that last list because
+`gh ruleset` cannot change one: it has only `check`, `list` and `view`.
+Reshaping a ruleset goes through `gh api`, so `github.api-mutation` is the
+rule that refuses it and the id an operator will see.
+Those five exist because the agent is the proposer: the review gate is only a
+gate if the thing that opens a pull request cannot also merge it. Pipelines and redirections are interpreted by the sandbox shell
 around an individual wrapper invocation, so they cannot execute inside the
 credential sidecar. Requests that cannot be represented safely fail closed,
 including:
@@ -209,9 +245,30 @@ including:
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
 
-The current deny policy applies regular expressions to a shell-escaped rendering
-of the argument vector and permits flags before or between subcommands. This is
-an interim policy mechanism, not a general shell parser. If the policy grows
+The current deny policy applies regular expressions to a normalised rendering of
+the argument vector and permits flags before or between subcommands. Three
+normalisations, and all of them matter for predicting what a rule will match:
+
+- **Free-text flag values are dropped**, so prose the agent wrote is not searched
+  as though it were a command path. Without this a pull request body containing
+  the word "merge" tripped `github.merge`, which refused the product's own
+  GitOps suggestions. The flag names remain, since a rule may key on one.
+- **Attached shorthand values are split**, so `-XPUT` reads as `-X PUT`. gh,
+  kubectl and gcloud are all Cobra/pflag, which accepts a shorthand's value with
+  no separator, and a rule written for the separated spelling would otherwise
+  miss it.
+- **A shorthand buried in a cluster keeps its dash**, so `-iX PUT` reads as
+  `-i -X PUT`. pflag also accepts a boolean shorthand and a value-taking one in
+  the same token, and splitting only the first one off left the `-X` a rule
+  matches on as a bare letter — enough for `gh api -iX PUT …/merge` and
+  `gh auth status -at` to get through. Only the shorthands a shipped rule keys
+  on are re-dashed, and the walk stops at the first non-letter, since
+  everything from there is somebody's value rather than another flag.
+
+A value that looks like a flag is never dropped: the free-text set is applied
+without knowing the subcommand, and a name on it is not always value-taking.
+
+This is an interim policy mechanism, not a general shell parser. If the policy grows
 beyond these narrowly defined commands, it should use tool-specific argument
 parsers over the structured argument vector.
 
@@ -324,8 +381,21 @@ only command output, never a mounted Git credential file.
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
   privilege escalation, and use the runtime-default seccomp profile.
-- The credential sidecar root filesystem is read-only; writable state uses
-  bounded `emptyDir` volumes.
+- Every container the operator builds — the credential-cleanup init container,
+  sandbox, dashboard, sidecar, log shipper — has a read-only root filesystem;
+  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
+  invocations with `HOME=/tmp` before the agent starts, and those two
+  containers already share the data PVC, so the shared volume is not a new
+  channel between them. Note the lifetime this changes: `/tmp` used to be each
+  container's own writable layer, discarded whenever that container restarted.
+  An `emptyDir` is scoped to the Pod, so its contents now survive a container
+  crash or restart and are visible to both containers' next boot. The log
+  shipper gets no `/tmp`: it buffers in memory
+  and keeps its tail database on its own volume. Containers supplied through
+  `spec.deployment.sidecars`/`initContainers` are appended to the Pod as
+  written; the webhook does not require a read-only root of them, so a CR can
+  still add a writable container to this Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when the combined Pod is ready.

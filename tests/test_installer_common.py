@@ -39,6 +39,23 @@ DATA_MODE_STATE = _state_doc(
 )
 
 
+def _autopilot_describe_stub(version="1.31.5-gke.1023000"):
+    """A `clusters describe` stub for an Autopilot cluster.
+
+    The generator asks twice on this path — autopilot.enabled first, then
+    currentMasterVersion for the gVisor floor — so the stub answers on the
+    --format it is given. An empty `version` stands for a version that
+    could not be read.
+    """
+    return (
+        'case "$*" in\n'
+        f"  *currentMasterVersion*) printf '{version}\\n' ;;\n"
+        "  *) printf 'True\\n' ;;\n"
+        "esac\n"
+        "exit 0"
+    )
+
+
 class InstallerCommonTest(unittest.TestCase):
     def _run(
         self,
@@ -187,7 +204,7 @@ class InstallerCommonTest(unittest.TestCase):
             # Exists but not in state (the stub serves no state object).
             self.assertIn("create_cluster             = false", content)
 
-    def test_tfvars_standard_cluster_and_fresh_create_stay_standard(self):
+    def test_tfvars_standard_cluster_and_unasked_fresh_create_stay_standard(self):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             # An existing Standard cluster: describe succeeds, empty output.
@@ -198,7 +215,8 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('cluster_mode               = "standard"', dest.read_text())
-            # No cluster at all: the script-parity create.
+            # No cluster at all and no CLUSTER_MODE: the installer's default
+            # shape, unchanged by --cluster-mode existing.
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k"},
@@ -207,6 +225,184 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('cluster_mode               = "standard"', content)
             self.assertIn("create_cluster             = true", content)
+
+    def test_tfvars_fresh_create_honours_cluster_mode(self):
+        # --cluster-mode reaches the generator through vars.sh. The probe found
+        # nothing, so the interview's choice is the only shape on offer.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopilot"},
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('cluster_mode               = "autopilot"', content)
+            self.assertIn("create_cluster             = true", content)
+
+    def test_tfvars_fresh_create_rejects_an_unknown_cluster_mode(self):
+        # vars.sh is hand-editable, and an unknown shape reaching Terraform
+        # fails at validate with the whole interview already paid for.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopiloot"},
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("autopiloot", proc.stderr)
+
+    def test_tfvars_live_cluster_outranks_a_conflicting_cluster_mode(self):
+        # The teardown path: uninstall.sh and upgrade.sh regenerate through
+        # this generator from vars.sh alone and have no flag to correct a wrong
+        # CLUSTER_MODE with. A persisted value that disagrees with the live
+        # cluster must lose in BOTH directions — either way round, the losing
+        # answer takes the cluster's count to 0 and turns the next apply into a
+        # replacement.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            # Live Autopilot, vars.sh says standard.
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "standard"},
+                describe_stub="printf 'True\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('cluster_mode               = "autopilot"', dest.read_text())
+            # Live Standard, vars.sh says autopilot.
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopilot"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('cluster_mode               = "standard"', dest.read_text())
+
+    # ── ENABLE_GVISOR splits into a pool and a RuntimeClass by cluster shape ──
+
+    def test_tfvars_gvisor_on_standard_asks_for_pool_and_runtime_class(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = true", content)
+            self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
+        # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
+        # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through
+        # made --gvisor=true unusable there rather than sandboxing the agent.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_gvisor_on_a_fresh_autopilot_create_skips_the_version_probe(self):
+        # There is no cluster to describe yet, so the floor check would only
+        # ever produce its "could not read the version" warning. A cluster
+        # created now comes up on its release channel's current version.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "ENABLE_GVISOR": "true",
+                    "CLUSTER_MODE": "autopilot",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("Could not read the GKE version", proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_gvisor_on_autopilot_below_the_version_floor_aborts(self):
+        # Autopilot's gvisor RuntimeClass has a version floor, and a cluster
+        # under it takes the whole apply before failing on a missing agent
+        # Deployment. Abort while nothing has been applied.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+            describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("1.26.9-gke.9999", proc.stderr)
+        self.assertIn("1.27.4-gke.800", proc.stderr)
+
+    def test_tfvars_gvisor_on_autopilot_warns_when_the_version_is_unreadable(self):
+        # An unparseable version is "unknown", not "too old": say so and carry
+        # on rather than blocking an install on a gcloud output change.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub=_autopilot_describe_stub(""),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not read the GKE version", proc.stderr)
+            self.assertIn('agent_runtime_class        = "gvisor"', dest.read_text())
+
+    def test_tfvars_gvisor_on_standard_does_not_check_the_autopilot_floor(self):
+        # The floor is Autopilot's. On Standard the node pool carries the
+        # RuntimeClass, so an old cluster there must not be rejected by it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+                describe_stub=(
+                    'case "$*" in\n'
+                    "  *currentMasterVersion*) printf '1.24.0-gke.100\\n' ;;\n"
+                    "  *) printf '\\n' ;;\n"
+                    "esac\n"
+                    "exit 0"
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("enable_gvisor_node_pool    = true", dest.read_text())
+
+    def test_tfvars_without_gvisor_sets_neither(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_gke_version_at_least_orders_the_gke_suffix_numerically(self):
+        # gke.800 is older than gke.1500, which a lexical compare gets backwards.
+        cases = {
+            "1.27.4-gke.800 1.27.4-gke.800": "0",
+            "1.27.4-gke.1500 1.27.4-gke.800": "0",
+            "1.30.11-gke.1131000 1.27.4-gke.800": "0",
+            "1.28.1-gke.100 1.27.4-gke.800": "0",
+            "1.27.4-gke.700 1.27.4-gke.800": "1",
+            "1.27.3-gke.1700 1.27.4-gke.800": "1",
+            "1.26.9-gke.9999 1.27.4-gke.800": "1",
+        }
+        for pair, want in cases.items():
+            with self.subTest(pair=pair):
+                proc = self._run(f"gke_version_at_least {pair}; echo \"rc=$?\"")
+                self.assertIn(f"rc={want}", proc.stdout, proc.stderr)
 
     def test_tfvars_refuses_to_guess_on_a_transient_describe_failure(self):
         # Anything other than NOT_FOUND must abort: reading an auth expiry or
@@ -305,6 +501,24 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("API_SERVER_KEY", proc.stderr)
+
+    def test_default_vertex_location_is_global(self):
+        proc = self._run('printf "%s" "$DEFAULT_VERTEX_LOCATION"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "global")
+
+    def test_default_vertex_location_is_a_separate_knob_from_the_region(self):
+        # The whole point of the constant: a Vertex model is only callable from
+        # a location that serves it, and DEFAULT_REGION is not one of those for
+        # the vertex_ai default model. Tying the two together is the bug, so
+        # neither the constant nor its expansion may be derived from the other.
+        proc = self._run(
+            'printf "%s %s" "$DEFAULT_REGION" "$DEFAULT_VERTEX_LOCATION"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        region, vertex_location = proc.stdout.split()
+        self.assertEqual(vertex_location, "global")
+        self.assertNotEqual(region, vertex_location)
 
 
 if __name__ == "__main__":

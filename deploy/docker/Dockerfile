@@ -1464,6 +1464,9 @@ USER 10000:10000
 # --- ENTRYPOINT GATE TEST TARGET ---
 # Not shipped, and not a layer of anything that is. Built only by
 # `--target entrypoint-gate-test`, where the RUN either passes or fails the build.
+# `docker-build.yml` then loads the stage and runs the same check a second time as a
+# container under `--read-only`, because a build layer is writable by definition and so
+# the RUN cannot tell you whether the entrypoint needs the write.
 #
 # It exists because the unit tests structurally cannot cover this. They run the entrypoint
 # on a developer host, where every step below the shared-state gate is guarded on

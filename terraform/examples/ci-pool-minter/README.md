@@ -55,6 +55,8 @@ terraform output manual_steps
 
 `terraform plan` before every apply is the check that matters. Onboarding a project that has not been onboarded yet is a create-only plan; **any `destroy` line means the wrong state is loaded** — stop and fix the workspace or the backend prefix rather than confirming.
 
+**Applied for all three pool projects as of 2026-08-24** — `kube-agents-evals`, `kube-agents-evals-2` and `kube-agents-evals-3`, each in its own workspace, each with the App PEM imported (`gcloud kms keys versions list --location us-central1 --keyring github-token-minter-keyring --key github-token-minter-key --project <project>` shows one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each). A fourth pool project is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
+
 `location` and `namespace` default to the values `hack/ci-env.sh` uses (`us-central1`, `kubeagents-system`) and should only be overridden if that file changes: the chart derives the KMS key path from `platformAgent.harness.location`, which `hack/ci-deploy.sh` sets from `REGION`.
 
 > **KMS resources cannot be deleted.** `terraform destroy` removes the key ring and key from state only; re-applying with the same names fails with a 409. The [module README](../../modules/github-minter/README.md) covers the recovery.

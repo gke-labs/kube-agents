@@ -16,6 +16,17 @@
 # one home here so the entry points cannot drift apart.
 DEFAULT_CLUSTER_NAME="platform-agent-host"
 DEFAULT_REGION="us-central1"
+# Vertex serves each model from its own subset of locations, and the cluster's
+# region is usually not one of them -- gemini-3.5-flash, the vertex_ai default,
+# is not served from us-central1 (DEFAULT_REGION), so a region-derived default
+# 404s on a stock install. The global endpoint serves the first-party Gemini
+# models from wherever has capacity, which is the only default that works
+# without knowing the cluster's region. Two reasons to override it: it gives no
+# in-region ML processing guarantee, and a Model Garden partner model (Claude,
+# Llama, Mistral) may be served only from specific regions. Which locations
+# serve which model:
+# https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
+DEFAULT_VERTEX_LOCATION="global"
 DEFAULT_MODEL_PROVIDER="gemini"
 
 # All kube-agents images (k8s-operator, platform-agent, credential-proxy,
@@ -40,6 +51,13 @@ is_valid_model_provider() {
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
   [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
+}
+
+# The cluster shapes the gke-cluster module can build. Matches the module's own
+# variable validation, so a bad value fails at the interview rather than at
+# terraform validate with the cluster interview already paid for.
+is_valid_cluster_mode() {
+  [[ "${1:-}" =~ ^(autopilot|standard)$ ]]
 }
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────
@@ -73,6 +91,22 @@ is_valid_cmek_encryption_state() {
     fi
   done
   return 1
+}
+
+# ─── GKE Version Comparison ───────────────────────────────────────────────────
+# The first GKE version whose Autopilot clusters ship the gvisor RuntimeClass:
+# https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods
+GVISOR_AUTOPILOT_MIN_VERSION="1.27.4-gke.800"
+
+# True when GKE version $1 is at or above $2. `sort -V` reads both the dotted
+# fields and the -gke.N suffix numerically, so it puts gke.800 below gke.1500
+# where a lexical compare does the opposite. Callers check the version's shape
+# themselves: an unparseable string here is "unknown", not "too old", and the
+# two deserve different answers.
+gke_version_at_least() {
+  local have="${1:-}" want="${2:-}"
+  [ "$have" = "$want" ] ||
+    [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | head -n1)" = "$want" ]
 }
 
 retry() {
@@ -344,8 +378,17 @@ write_tfvars_from_state() {
   # install the moment a front door regenerated tfvars against it — the
   # autopilot resource's count went to 0, so uninstall's targeted
   # deletion-protection apply and upgrade's full apply both became cluster
-  # replacements. A fresh create keeps "standard", the installer's default shape.
+  # replacements.
+  #
+  # CLUSTER_MODE (install.sh --cluster-mode, persisted to vars.sh) therefore
+  # decides ONE case: the fresh create, where the probe found no cluster and
+  # the interview is the only information there is. Every branch on which a
+  # cluster exists assigns cluster_mode from the probe, so a stale or
+  # hand-edited CLUSTER_MODE cannot reach a live cluster's tfvars — which
+  # matters because uninstall.sh and upgrade.sh also regenerate through here
+  # and have no flag to correct a wrong value with.
   local create_cluster="true" cluster_mode="standard" autopilot_enabled=""
+  local cluster_exists="false"
   # `trap - ERR` inside the substitution: under bash 3.2 (macOS's default)
   # the caller's inherited ERR trap fires in this subshell even though the
   # failure is the tested condition, printing an abort banner and writing a
@@ -353,9 +396,14 @@ write_tfvars_from_state() {
   if autopilot_enabled=$(trap - ERR; gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(autopilot.enabled)" 2>/dev/null); then
+    cluster_exists="true"
+    # Both branches assign: the probe is the answer, not a chance to override
+    # the initialiser.
     if [ "$autopilot_enabled" = "True" ]; then
       cluster_mode="autopilot"
       print_info "Cluster '${CLUSTER_NAME}' is an Autopilot cluster; generating cluster_mode = \"autopilot\"."
+    else
+      cluster_mode="standard"
     fi
     if tf_state_has_cluster; then
       print_info "Cluster '${CLUSTER_NAME}' exists and is managed by this install's Terraform state."
@@ -377,6 +425,16 @@ write_tfvars_from_state() {
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
     fi
+    # Confirmed absent, so nothing live can be reshaped by getting this wrong:
+    # the interview's choice is the only shape on offer.
+    cluster_mode="${CLUSTER_MODE:-standard}"
+    if ! is_valid_cluster_mode "$cluster_mode"; then
+      print_error "CLUSTER_MODE='${cluster_mode}' is not a cluster shape this install can create. Use autopilot or standard."
+      return 1
+    fi
+    # Not "creating a cluster": uninstall.sh reaches this branch too, on an
+    # install whose cluster is already gone.
+    print_info "Cluster '${CLUSTER_NAME}' does not exist; generating cluster_mode = \"${cluster_mode}\" from the configured shape."
   fi
 
   # The generator's create/adopt decision, exported for the callers that need
@@ -384,6 +442,11 @@ write_tfvars_from_state() {
   # cluster this install created, never on an adopted one it does not own.
   TFVARS_CREATE_CLUSTER="$create_cluster"
   export TFVARS_CREATE_CLUSTER
+  # The shape the apply will actually use — probed when a cluster exists, the
+  # requested one only on a fresh create. install.sh reports this rather than
+  # the flag, so an adoption never claims to have built what it did not.
+  TFVARS_CLUSTER_MODE="$cluster_mode"
+  export TFVARS_CLUSTER_MODE
 
   # Installing onto an existing cluster: fetch its credentials now, before the
   # recovery loop below — adoption is exactly the case where the credentials
@@ -490,6 +553,56 @@ write_tfvars_from_state() {
     fi
   fi
 
+  # ENABLE_GVISOR is one intent — run the agent sandboxed — and the two things
+  # that satisfy it differ by cluster shape. Standard needs the sandbox node
+  # pool AND the RuntimeClass on the pod; Autopilot ships the gvisor
+  # RuntimeClass natively and has no pool to manage, so asking the gke-cluster
+  # module for one there fails the plan. Deriving both from the probed
+  # cluster_mode keeps --gvisor=true meaning the same thing on either shape.
+  local gvisor_node_pool="false" agent_runtime_class=""
+  if is_truthy "${ENABLE_GVISOR:-false}"; then
+    agent_runtime_class="gvisor"
+    if [ "$cluster_mode" = "standard" ]; then
+      gvisor_node_pool="true"
+    elif [ "$cluster_exists" = "false" ]; then
+      # An Autopilot cluster this run is about to create comes up on its
+      # release channel's current version, which has been past the floor since
+      # 2023. There is nothing to describe yet, so checking would only produce
+      # the "could not read the version" warning below on every fresh
+      # --cluster-mode=autopilot --gvisor=true install.
+      print_info "Creating Autopilot cluster '${CLUSTER_NAME}': using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
+    else
+      # Autopilot's gvisor RuntimeClass arrived in a specific GKE version, and
+      # asking an older cluster for it fails late and unrecognisably: the
+      # operator stops at its RuntimeClass check before writing the agent
+      # Deployment, the Helm release still reports success because that
+      # Deployment is operator-created rather than chart-rendered, and
+      # install.sh's post-apply gate exits 1 with "Expected deployment
+      # 'platform-agent-gateway' was not created" — after the cluster, IAM,
+      # KMS, cert-manager and the release have all been applied, naming
+      # nothing about a RuntimeClass. Refuse here instead, which is where the
+      # gke-cluster module's precondition refuses the equivalent Standard
+      # mistake. This branch is reached only when the describe above found a
+      # live Autopilot cluster, so there is always one to ask.
+      #
+      # `trap - ERR` as well as `|| true`, for the bash 3.2 reason the probe
+      # above gives: a gcloud failure here is a best-effort miss, not an abort.
+      local master_version
+      master_version="$(trap - ERR; gcloud container clusters describe "${CLUSTER_NAME}" \
+        --location "${REGION}" --project "${PROJECT_ID}" \
+        --format="value(currentMasterVersion)" 2>/dev/null || true)"
+      master_version="${master_version//[[:space:]]/}"
+      if [[ ! "$master_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-gke\.[0-9]+$ ]]; then
+        print_warning "Could not read the GKE version of Autopilot cluster '${CLUSTER_NAME}'; proceeding as though it supports GKE Sandbox. Below ${GVISOR_AUTOPILOT_MIN_VERSION} the agent Deployment is never created and this run fails at its final check."
+      elif ! gke_version_at_least "$master_version" "$GVISOR_AUTOPILOT_MIN_VERSION"; then
+        print_error "Autopilot cluster '${CLUSTER_NAME}' runs GKE ${master_version}, and its gvisor RuntimeClass needs ${GVISOR_AUTOPILOT_MIN_VERSION} or later."
+        print_info "Upgrade the cluster, or re-run with --gvisor=false. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        return 1
+      fi
+      print_info "Cluster '${CLUSTER_NAME}' is Autopilot: using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
+    fi
+  fi
+
   local old_umask
   old_umask="$(umask)"
   umask 077
@@ -500,15 +613,16 @@ write_tfvars_from_state() {
     echo "cluster_name = $(hcl_str "${CLUSTER_NAME}")"
     echo "location     = $(hcl_str "${REGION}")"
     echo ""
-    echo "# The installer's default shape: a Standard cluster with the DNS endpoint"
-    echo "# open and no deletion protection. An existing cluster keeps its own"
-    echo "# mode — the generator probes the live cluster before writing this."
+    echo "# The DNS endpoint is open and deletion protection is off. cluster_mode is"
+    echo "# the live cluster's own shape whenever there is one to probe, and the"
+    echo "# --cluster-mode the install asked for only on a create."
     echo "cluster_mode               = $(hcl_str "${cluster_mode}")"
     echo "create_cluster             = ${create_cluster}"
     echo "allow_external_dns_traffic = true"
     echo "deletion_protection        = false"
-    echo "enable_gvisor_node_pool    = $(hcl_bool "${ENABLE_GVISOR:-false}")"
+    echo "enable_gvisor_node_pool    = ${gvisor_node_pool}"
     echo "gvisor_pool_name           = $(hcl_str "${GVISOR_POOL_NAME:-gvisor-pool}")"
+    echo "agent_runtime_class        = $(hcl_str "${agent_runtime_class}")"
     echo "enable_cert_manager        = ${enable_cert_manager}"
     echo ""
     echo "image_tag                  = $(hcl_str "${image_tag}")"

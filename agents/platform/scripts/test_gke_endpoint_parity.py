@@ -227,3 +227,7 @@ class PredicateParity(unittest.TestCase):
         self.assertEqual(1, len([c for c in calls if "--help" in c]), calls)
         # Each cluster still gets its own describe: that answer is per-cluster.
         self.assertEqual(3, len([c for c in calls if "describe" in c]), calls)
+
+
+if __name__ == "__main__":
+    unittest.main()

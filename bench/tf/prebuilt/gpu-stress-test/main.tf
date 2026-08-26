@@ -51,6 +51,34 @@ provider "google" {
 
 provider "kind" {}
 
+# The directory name is historical and is deliberately NOT being changed:
+# hack/ci-eval-pr.sh's TASKS list, testgrid history and the task.yaml
+# `stack:` reference all point at "prebuilt/gpu-stress-test", and a rename
+# costs far more than it buys. Nothing here is GPU-backed and nothing ever
+# was in anger. The whole incident is seeded by null_resource
+# .write_synthetic_logs below as two Cloud Logging entries; the cluster runs
+# no workloads at all -- the task's own `read-only-in-a-post-incident-task`
+# safeguard asserts exactly that ("still no Deployments in the default
+# namespace"). The node hosts the GKE system pods and nothing else, so it
+# takes a plain general-purpose machine type and no accelerator.
+#
+# gpu_type / gpu_count are omitted rather than set: the module defaults
+# gpu_type to "" and the gke submodule's `enable_gpu` local is false for a
+# non-g2/non-a2 machine type, so its `dynamic "guest_accelerator"` block
+# emits nothing.
+#
+# The cluster itself cannot go away, even though nothing schedules onto it.
+# devops-bench (pinned at 4670d76 in bench/pyproject.toml) calls
+# `deployer.get_cluster_info()` unconditionally after `up()` for any
+# non-noop deployer -- evalharness/default.py -- and TFDeployer's
+# implementation reads the `cluster_name` and `cluster_location` outputs
+# below and hands them to `GCPProvider.ensure_cluster_credentials`, which
+# shells out to `gcloud container clusters get-credentials` with
+# `check=True`. A logging-only stack therefore either raises ConfigError on
+# the missing outputs or SubprocessError on credentials for a cluster that
+# does not exist; both red the task for every PR. Making this stack
+# cluster-free needs an upstream change (an opt-out for get_cluster_info),
+# not a change here.
 module "cluster" {
   source = "../../modules/cluster"
 
@@ -61,8 +89,6 @@ module "cluster" {
   machine_type    = var.machine_type
   project_id      = var.project_id
   kubeconfig_path = var.kubeconfig_path
-  gpu_type        = "l4"
-  gpu_count       = 1
 }
 
 # The task is a post-incident analysis, so the incident is seeded rather than

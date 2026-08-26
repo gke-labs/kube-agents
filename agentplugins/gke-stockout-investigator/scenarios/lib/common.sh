@@ -31,13 +31,22 @@
 #   scenario_reasons()   echoes a JSON fragment of rejectedMigs/napFailureReasons
 #                        (optional) — this is what steers the diagnosis
 #   scenario_notes()     echoes free text shown after the run (optional)
+#   scenario_preflight() checks this scenario's own prerequisites (optional) — runs at
+#                        the end of preflight(), so before clear_dedup or any workload
+#                        exists. Put a `die` here rather than in a hook: the hooks above
+#                        first run once the run has already mutated both clusters.
 #
-# Each hook runs in a subshell, and scenario_manifest runs more than once per invocation,
-# so nothing a hook assigns reaches the next one. A hook that resolves something at run
-# time must wrap the resolver in scenario_memo (below) or it will resolve repeatedly, and
-# may not resolve the same way twice.
+# Each of the three output hooks runs in a subshell, and scenario_manifest runs more than
+# once per invocation, so nothing they assign reaches the next one. A hook that resolves
+# something at run time must wrap the resolver in scenario_memo (below) or it will resolve
+# repeatedly, and may not resolve the same way twice. scenario_preflight is the exception:
+# preflight() calls it directly, so what it assigns does persist -- which is why it is the
+# right place for a check whose answer the run depends on.
 
 set -euo pipefail
+
+# Enforce system python for gcloud to prevent google-auth AttributeError crashes in CI
+export CLOUDSDK_PYTHON="${CLOUDSDK_PYTHON:-/usr/bin/python3}"
 
 # --------------------------------------------------------------------- settings
 #
@@ -296,6 +305,12 @@ preflight() {
     gcloud pubsub topics describe "$TOPIC" --project="$PROJECT_ID" >/dev/null 2>&1 \
         || die "Pub/Sub topic ${TOPIC} not found in ${PROJECT_ID}"
     ok "topic ${TOPIC} exists"
+
+    # Last, so a scenario's own prerequisite is reported after the shared ones it
+    # depends on -- and still before clear_dedup wipes the registry.
+    if declare -F scenario_preflight >/dev/null; then
+        scenario_preflight
+    fi
 }
 
 # The adapter dedups on cluster + namespace + controller for 24h. Re-running a
@@ -420,11 +435,16 @@ _manifest_part() {
     scenario_manifest | python3 -c '
 import sys, yaml
 want = sys.argv[1]
-INFRA = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-sel = [d for d in docs if (d.get("kind") in INFRA) == (want == "infra")]
+infra_kinds = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
+raw = sys.stdin.read()
+docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, dict)]
+sel = []
+for doc in docs:
+    is_infra = doc.get("kind") in infra_kinds
+    if is_infra == (want == "infra"):
+        sel.append(doc)
 if sel:
-    print(yaml.safe_dump_all(sel, sort_keys=False), end="")
+    print(yaml.safe_dump_all(sel, sort_keys=False))
 ' "$1"
 }
 
@@ -450,10 +470,15 @@ emit_manifest() {
             printf -- '---\n'
             printf '%s\n' "$work" | python3 -c '
 import sys, yaml
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-for d in docs:
-    d.setdefault("metadata", {})["namespace"] = sys.argv[1]
-print(yaml.safe_dump_all(docs, sort_keys=False), end="")
+ns = sys.argv[1]
+raw = sys.stdin.read()
+docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, dict)]
+for doc in docs:
+    meta = doc.setdefault("metadata", {})
+    if isinstance(meta, dict):
+        meta["namespace"] = ns
+if docs:
+    print(yaml.safe_dump_all(docs, sort_keys=False))
 ' "$WORKLOAD_NAMESPACE"
         }
     } > >(if [ "$out" = "-" ]; then cat; else cat > "$out"; fi)
@@ -596,14 +621,63 @@ cleanup_workload() {
 
 # ---------------------------------------------------------------------- watching
 
+# One line per run, not one per poll.
+#
+# watch_investigation calls the readers below every 10 seconds for up to WATCH_TIMEOUT —
+# 600s by default, so sixty times — and prints a `\r` progress counter between calls. An
+# unlatched warning is therefore both repeated sixty times and half-erased by the next
+# tick, which buries the one message it exists to surface under its own repeats.
+#
+# The latch is a file rather than a variable for the same reason scenario_memo above is
+# one: these readers run inside `$( )` and on the left of a pipe, both subshells, so an
+# assignment would be discarded along with the subshell that made it.
+warn_once() {
+    local key="$1"; shift
+    local latch="${SCENARIO_RUN_DIR}/warned.${key}"
+
+    if [ -e "$latch" ]; then
+        return 0
+    fi
+    : > "$latch"
+    # `warn` prints to stdout, and both callers have their stdout consumed by a parser.
+    warn "$@" >&2
+}
+
+# Returns the gateway's session list as JSON, or `{}` — and says which, on stderr, when
+# it is the second one.
+#
+# The `|| echo '{}'` used to cover the whole call, and a rejected request is not a call
+# that failed: `requests.get` returns a 401 body happily, this printed it, and the caller's
+# `.get('data', [])` read it as an empty session list. So a watcher pointed at an agent
+# whose entire API surface was returning 401 reported "nothing has happened yet" and went
+# on doing so until it timed out — which is exactly what issue #786 was, for two months,
+# across every caller shaped like this one. An empty result and a refused one look the
+# same to every consumer downstream, so the distinction has to be made here or nowhere.
+#
+# Still non-fatal: a scenario watcher that aborts on one transient blip is worse than one
+# that waits. The contract is unchanged for callers; what is new is that a human reading
+# the transcript can tell the two apart.
 _sessions_json() {
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+    local out
+    # The diagnostic goes to stdout inside the pod and is CAPTURED, not printed: this
+    # function's stdout is piped straight into a json.load. Only the failure branch
+    # un-captures it, onto stderr, via warn_once.
+    if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         python3 -c "
-import os, requests
+import os, sys, requests
 key = os.environ.get('API_SERVER_KEY', '')
-print(requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
-                   headers={'Authorization': 'Bearer ' + key}, timeout=10).text)
-" 2>/dev/null || echo '{}'
+r = requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
+                 headers={'Authorization': 'Bearer ' + key}, timeout=10)
+if r.status_code != 200:
+    print('the gateway API refused it: HTTP %s %s' % (r.status_code, r.text[:200]))
+    sys.exit(1)
+print(r.text)
+" 2>/dev/null)"; then
+        printf '%s\n' "$out"
+    else
+        warn_once sessions "could not read the agent's session list; treating it as empty — ${out:-no response} (issue #786)"
+        echo '{}'
+    fi
 }
 
 # Sessions started before we published are from earlier runs; only a newer one is ours.
@@ -612,22 +686,51 @@ _task_after() {
     # the alert as a task owned by the specialist profile and never create a gateway
     # session, so watching only for sessions reports "nothing happened" while the
     # investigation runs to completion.
-    local since="$1"
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        env HOME=/tmp hermes kanban ls --json 2>/dev/null | python3 -c "
+    #
+    # Distinguishes a failed read from an empty board for the same reason _sessions_json
+    # does, and it is the same bug: `2>/dev/null` plus `except Exception: sys.exit(0)`
+    # turned a pod that could not be exec'd into, a `hermes kanban` that errored, and a
+    # board with nothing on it into one answer — no output — which watch_investigation
+    # reads as "nothing has happened yet" until it times out. The two exec paths are the
+    # only ones this watcher has, so leaving this one silent would have fixed the report
+    # for `dispatch: api` routes and left `dispatch: kanban` routes lying.
+    local since="$1" out err errtext
+    # stderr goes to a file, not into `out`, and is read only on the failure branch.
+    # It cannot be discarded — on that branch the command's own message is the only
+    # account of what went wrong — but it must not be merged into stdout either: `out`
+    # is piped straight into a json.load below, so one benign line from the CLI or from
+    # kubectl would break the parse and report a working board as broken. Unlike
+    # _sessions_json, the program on the other end is not ours to make print elsewhere.
+    err="$(mktemp)"
+    if ! out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+        env HOME=/tmp hermes kanban ls --json 2>"$err")"; then
+        errtext="$(head -c 200 "$err")"
+        rm -f "$err"
+        warn_once tasks "could not read the agent's kanban board; treating it as empty — ${errtext:-${out:-no response}}"
+        return 0
+    fi
+    rm -f "$err"
+    printf '%s\n' "$out" | python3 -c "
 import json, sys
 since = float('$since')
 try:
     data = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
+    # 3, not 0: the board answered with something that is not JSON, which is a broken
+    # read and not an empty one. The caller turns this into one warning per run.
+    sys.exit(3)
 tasks = data.get('tasks') if isinstance(data, dict) else data
 for t in sorted(tasks or [], key=lambda x: x.get('created_at') or 0, reverse=True):
     if (t.get('created_at') or 0) >= since and str(t.get('title','')).startswith('${ROUTE_NAME}'):
         print('%s\t%s\t%s' % (t.get('id',''), t.get('status') or 'running',
                               (t.get('title') or '')[:70]))
         break
-"
+" || {
+        # Only the parser's own 3 is a broken read; anything else (a SIGPIPE, an
+        # interpreter that is not there) stays as quiet as it was before.
+        [ "$?" -eq 3 ] && warn_once taskjson "the agent's kanban board did not return JSON; treating it as empty — $(printf '%s' "$out" | head -c 200)"
+        return 0
+    }
 }
 
 _session_after() {

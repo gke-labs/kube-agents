@@ -51,8 +51,9 @@ If you run your own collector — say a Service `otel-collector` in namespace `o
 | 1   | `spec.deployment.env[OTEL_EXPORTER_OTLP_ENDPOINT]` | `DeploymentEnv`                       |
 | 2   | `spec.telemetry.otlpEndpoint`                      | `Spec`                                |
 | 3   | `OTEL_COLLECTOR_ENDPOINT` on the operator          | `OperatorEnv`                         |
-| 4   | In-cluster discovery                               | `Discovered`                          |
-| 5   | The GKE managed collector                          | `Default`                             |
+| 4   | In-cluster discovery found one                     | `Discovered`                          |
+| 5   | Discovery ran and this cluster has none            | `None`                                |
+| 6   | The GKE managed collector                          | `Default`                             |
 
 Rungs 1–3 suppress discovery entirely — no probe, no API calls. The result is on the resource, which is the only way to tell "discovered the managed collector" from "fell back to it":
 
@@ -66,7 +67,15 @@ The operator probes a fixed list of well-known Services by name — `gke-managed
 
 A Service qualifies on a TCP port named `otlp-http`, else `http-otlp`, else numbered `4318`. **A collector exposing only 4317 is skipped, not selected** — the agents and LiteLLM speak `http/protobuf` and `hermes_otel` POSTs to `/v1/traces`, so a gRPC-only pick would fail on every span while looking configured. Point at it explicitly if that is what you want. Discovery is structural: a Service can expose 4318 and still refuse OTLP (wrong receiver, mTLS). No TLS is inferred, so an `https://` endpoint has to be set explicitly.
 
-Results are cached cluster-wide for 5 minutes, including the "found nothing" answer. When the answer is the managed default the operator re-probes every 15 minutes, so a collector installed after the agent still gets picked up without a restart. API errors are never cached: the last known good endpoint is reused rather than flapping back to the default and rolling the pod. An install that narrows the operator's cluster-wide RBAC on `services` makes discovery return `Default` silently — `otlpEndpointSource` is what makes that visible.
+Results are cached cluster-wide for 5 minutes, including the "found nothing" answer. When the answer is `None` or `Default` the operator re-probes every 15 minutes, so a collector installed after the agent still gets picked up without a restart. API errors are never cached: the last known good answer is reused — including a cached `None` — rather than flapping and rolling the pod. An install that narrows the operator's cluster-wide RBAC on `services` makes discovery return `Default` silently, and `otlpEndpointSource` is what makes that visible.
+
+`None` and `Default` are different answers and the distinction is the point. `None` means the probe completed and there is no collector here, so the agent is given no `OTEL_EXPORTER_OTLP_ENDPOINT` at all and runs with `OTEL_SDK_DISABLED=true`; the collector egress rule is left out of its NetworkPolicy for the same reason. `Default` means nobody established that — discovery is switched off via `OTEL_COLLECTOR_DISCOVERY=false`, or no probe has completed — and the GKE managed collector is assumed, which is what installs did before discovery existed.
+
+Wiring the managed endpoint on a cluster that does not have it is what the `None` rung exists to stop. What it stops specifically is the OpenTelemetry SDK's **metric** exporter, which reads `OTEL_EXPORTER_OTLP_ENDPOINT` directly: on a collector-less cluster it POSTs `/v1/metrics` to a name that never resolves, once per export interval, for the life of the pod, and the resulting traceback buries every real line in the gateway log. Omitting the variable on its own would not stop it — with nothing set the SDK falls back to its own default of `http://localhost:4318` and trades the DNS failure for a refused connection at the same rate — so `None` sets `OTEL_SDK_DISABLED=true` rather than merely leaving the endpoint out.
+
+`None` does **not** repoint the `hermes_otel` plugin, which is a separate path and the one that carries agent spans. As the section above says, that plugin does not read `OTEL_EXPORTER_OTLP_ENDPOINT`; its backend is baked into the image and rewritten at start-up only when an endpoint is set, so on a `None` cluster it keeps the baked `gke-managed-otel` URL and the gateway still logs `[hermes-otel] ✓ gke-managed-otel at …` at start-up. That is cosmetic rather than noisy — the plugin exports only when there are spans and produces no retry storm — but it does mean the `✓` is not evidence that anything was verified. Tracked in [#933](https://github.com/gke-labs/kube-agents/issues/933).
+
+Nothing here overrides configuration: an operator who sets rung 1 or 2 gets that endpoint on a collector-less cluster. Setting `OTEL_SDK_DISABLED=false` in `spec.deployment.env` re-enables the SDK, but on its own it does not give the exporter anywhere to send — pair it with rung 1 or 2 if you want a working exporter rather than a localhost one.
 
 ### Helm
 

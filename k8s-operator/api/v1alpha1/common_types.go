@@ -66,14 +66,18 @@ type HermesSpec struct {
 	// +optional
 	AgentHome string `json:"agentHome,omitempty"`
 
-	// ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
+	// ApiServerSecretRef references the Secret key holding API_SERVER_EXTERNAL_KEY,
+	// the credential outside callers present to the credential-proxy sidecar. It
+	// does not set API_SERVER_KEY: the value the Hermes API server itself validates
+	// is the non-secret loopback sentinel `cluster-internal-trusted`, a compile-time
+	// constant the sidecar swaps in once it has authenticated the caller.
 	// +optional
 	ApiServerSecretRef *corev1.SecretKeySelector `json:"apiServerSecretRef,omitempty"`
 
 	// SessionKVApiKeySecretRef references the Secret key holding the bearer
 	// token for the pod-local Session KV server on port 8699. Distinct from
-	// ApiServerSecretRef: that path uses the non-secret loopback sentinel
-	// `cluster-internal-trusted`, which would authenticate nothing here.
+	// API_SERVER_KEY, which is that loopback sentinel and would authenticate
+	// nothing here.
 	// +optional
 	SessionKVApiKeySecretRef *corev1.SecretKeySelector `json:"sessionKVApiKeySecretRef,omitempty"`
 
@@ -566,12 +570,16 @@ type StorageStatus struct {
 // found nothing and fell back to it", so the source is reported alongside it — that
 // distinction is the whole diagnostic question when spans do not arrive.
 type TelemetryStatus struct {
-	// OTLPEndpoint is the collector endpoint written into the agent pod.
+	// OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the
+	// source is None, which is the one case where the pod is given no endpoint at all.
 	// +optional
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
 
 	// OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec,
-	// OperatorEnv, Discovered, or Default.
+	// OperatorEnv, Discovered, Default, or None. None means discovery completed and
+	// this cluster has no collector, so the agent runs with OTEL_SDK_DISABLED=true and
+	// exports nothing; Default still means the GKE managed collector, and is what an
+	// install gets when discovery is switched off or could not complete.
 	// +optional
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }

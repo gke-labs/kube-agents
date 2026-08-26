@@ -349,7 +349,7 @@ init_var_model_provider() {
   # model from its own subset.
   if [ "$MODEL_PROVIDER" = "vertex_ai" ]; then
     init_var "VERTEX_PROJECT_ID" "${PROJECT_ID:-}" "Enter Vertex AI Project ID"
-    init_var "VERTEX_LOCATION" "${REGION:-$DEFAULT_REGION}" "Enter Vertex AI Location"
+    init_var "VERTEX_LOCATION" "$DEFAULT_VERTEX_LOCATION" "Enter Vertex AI Location"
   fi
 }
 

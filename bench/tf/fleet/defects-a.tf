@@ -322,15 +322,18 @@ resource "kubernetes_network_policy_v1" "default_deny" {
 }
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
-# more replicas (the HPA settles at three) with no PodDisruptionBudget,
-# which is exactly the planted checkout-gateway defect -- but only
-# checkout-gateway is the fixture. maxUnavailable: 1 is the SOP's own
-# structurally-safe shape; a PDB governs evictions only, so the stockout
-# fixture (a scheduling gap) is untouched. Side effect of that same fixture:
-# with one replica Ready out of three desired, disruptionsAllowed sits at 0
-# permanently, so draining pinned-inference-pool's node waits out GKE's
-# ~1h PDB force-drain timeout. No audit finding results (3.4 decides on the
-# spec), and nothing in the eval path drains that node.
+# more desired replicas with no PodDisruptionBudget, which is exactly the
+# planted checkout-gateway defect -- but only checkout-gateway is the
+# fixture. maxUnavailable: 1 is the SOP's own structurally-safe shape; a PDB
+# governs evictions only, so the stockout fixture (a scheduling gap) is
+# untouched. The HPA's desired count is a load calculation and differs
+# between projects (3/2/3 across the three eval projects on 2026-08-24), so
+# do not depend on a specific number here. Side effect of that same fixture:
+# with the pool pinned at one replica Ready and desired above it,
+# disruptionsAllowed sits at 0 permanently, so draining
+# pinned-inference-pool's node waits out GKE's ~1h PDB force-drain timeout.
+# No audit finding results (3.4 decides on the spec), and nothing in the
+# eval path drains that node.
 resource "kubernetes_pod_disruption_budget_v1" "inference_server" {
   metadata {
     name      = "inference-server"

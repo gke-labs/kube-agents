@@ -185,7 +185,12 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	proxyC, found := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	if !found {
+		t.Errorf("expected Deployment to contain Envoy credential sidecar")
+	} else if proxyC.RestartPolicy == nil || *proxyC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("credential proxy must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+	}
 
 	// Service
 	svc := &corev1.Service{}
@@ -685,7 +690,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	if netpol.Name != "test-agent-gateway-netpol" {
 		t.Errorf("expected Name 'test-agent-gateway-netpol', got %s", netpol.Name)
 	}
@@ -793,7 +798,7 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	if len(netpol.Spec.Ingress) != 1 {
 		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
 	}
@@ -813,7 +818,7 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
 	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
 	// 2. GCP WI / Metadata server (80, 8080)
@@ -843,13 +848,13 @@ func TestBuildNetworkPolicy_CustomAPIHost(t *testing.T) {
 		},
 	}
 
-	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
+	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
 	ruleIPv4 := findAPIServerEgressRule(netpolIPv4)
 	if ruleIPv4 == nil || len(ruleIPv4.To) == 0 || ruleIPv4.To[0].IPBlock == nil || ruleIPv4.To[0].IPBlock.CIDR != "10.0.0.5/32" {
 		t.Errorf("expected IPv4 CIDR '10.0.0.5/32', got %v", ruleIPv4)
 	}
 
-	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, defaultTestNetpolProfile(), false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, defaultTestNetpolProfile(), false, "", false)
 	ruleIPv6 := findAPIServerEgressRule(netpolIPv6)
 	if ruleIPv6 == nil || len(ruleIPv6.To) == 0 || ruleIPv6.To[0].IPBlock == nil || ruleIPv6.To[0].IPBlock.CIDR != "fd00::1/128" {
 		t.Errorf("expected IPv6 CIDR 'fd00::1/128', got %v", ruleIPv6)
@@ -923,7 +928,7 @@ func TestBuildNetworkPolicy_InvalidAPIHost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			netpol := buildNetworkPolicy(agent, tt.apiHosts, defaultTestNetpolProfile(), false, "")
+			netpol := buildNetworkPolicy(agent, tt.apiHosts, defaultTestNetpolProfile(), false, "", false)
 			rule := findAPIServerEgressRule(netpol)
 			if rule == nil {
 				t.Fatalf("API server egress rule (port 6443) not found in netpol")
@@ -949,8 +954,8 @@ func TestBuildNetworkPolicy_Idempotent(t *testing.T) {
 		},
 	}
 
-	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
-	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
+	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
+	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
 	if !reflect.DeepEqual(np1.Spec, np2.Spec) {
 		t.Errorf("buildNetworkPolicy is not idempotent: consecutive calls produced different specs")
 	}
@@ -963,7 +968,7 @@ func TestBuildNetworkPolicy_ExternalHTTPSExceptList(t *testing.T) {
 			Namespace: "test-ns",
 		},
 	}
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
 	var httpsRule *networkingv1.NetworkPolicyEgressRule
 	for i := range netpol.Spec.Egress {
@@ -1029,7 +1034,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 1. IPv4 dynamic DNS clusterIP
-	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "34.118.224.10", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "34.118.224.10", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleGKE := findDNSEgressRule(netpolGKE)
 	if dnsRuleGKE == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolGKE")
@@ -1046,7 +1051,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 2. IPv6 dynamic DNS clusterIP
-	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "2001:db8::10", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "2001:db8::10", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleIPv6 := findDNSEgressRule(netpolIPv6)
 	if dnsRuleIPv6 == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolIPv6")
@@ -1063,7 +1068,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 3. Fallback when invalid or empty
-	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "invalid-ip", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "invalid-ip", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleFallback := findDNSEgressRule(netpolFallback)
 	if dnsRuleFallback == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolFallback")
@@ -1088,7 +1093,7 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
 	// The pre-NAT targets belong on 80 and 8080.
 	got80 := egressCIDRsForPort(netpol, 80)
@@ -2333,7 +2338,7 @@ func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -2657,7 +2662,7 @@ func TestReconcileNetworkPolicy_DynamicDiscovery(t *testing.T) {
 		APIServerCIDROverride: "198.51.100.0/24,203.0.113.1/32",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2750,7 +2755,7 @@ func TestReconcileNetworkPolicy_CustomEgressCIDRsAnnotation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2815,7 +2820,7 @@ func TestReconcileNetworkPolicy_RejectOverlyBroadCIDR(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2868,7 +2873,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2946,7 +2951,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 
 	// 3. Verify disabling annotation deletes FQDNNetworkPolicy
 	delete(agent.Annotations, AnnotationEnableFQDNNetworkPolicy)
-	err = r.reconcileNetworkPolicy(ctx, agent, "")
+	err = r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy after disabling FQDN failed: %v", err)
 	}
@@ -2992,7 +2997,7 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3056,7 +3061,7 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3106,7 +3111,7 @@ func TestReconcileNetworkPolicy_TruncateMaxCIDRs(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3159,7 +3164,7 @@ func TestReconcileNetworkPolicy_PrivateIPOverlap(t *testing.T) {
 		APIServerIP: "172.16.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3384,5 +3389,73 @@ func TestClearForeignPDBBudgetField_LeavesAgreeingBudgetAlone(t *testing.T) {
 	}
 	if err := r.clearForeignPDBBudgetField(ctx, buildPlatformPDB(missing)); err != nil {
 		t.Fatalf("expected NotFound to be tolerated, got %v", err)
+	}
+}
+
+// TestABrokenNativeSidecarIsReportedDegraded guards the status path against the
+// container-list split the native sidecar introduced.
+//
+// The credential proxy is an init container now, so it reports into
+// InitContainerStatuses. When it cannot start, the kubelet never creates the app
+// containers at all and ContainerStatuses is empty -- so a status check that reads
+// only the app list finds nothing wrong, PodScheduled is True, and the CR sits in
+// Provisioning saying it is waiting for replicas while the pod is in
+// Init:CrashLoopBackOff. That is the pod's worst failure reported as silence, and
+// it is the failure this whole change makes more likely to matter, since a proxy
+// that will not start now blocks the entire pod rather than one container.
+func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			// Exactly the shape the kubelet produces: the sidecar is stuck and no
+			// app container was ever created.
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				// A preceding init container that is merely waiting its turn.
+				// Measured on a cluster: this is what the list actually looks
+				// like, and reporting this entry names no fault.
+				Name: "sandbox-credential-cleanup",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason: "PodInitializing",
+				}},
+			}, {
+				Name: "envoy-credential-proxy",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+			// Not empty while the pod is stuck in Init -- the kubelet fills this
+			// in with placeholders, which is why the old code reported
+			// PodInitializing rather than nothing at all.
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded -- a pod stuck in Init reports as healthy", phase)
+	}
+	if reason != "ImagePullBackOff" {
+		t.Errorf("reason = %q, want ImagePullBackOff", reason)
+	}
+	if !strings.Contains(message, "envoy-credential-proxy") {
+		t.Errorf("message does not name the failing container: %q", message)
 	}
 }

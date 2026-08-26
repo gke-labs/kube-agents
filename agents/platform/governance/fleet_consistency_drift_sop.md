@@ -122,7 +122,7 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 - **Do NOT flag:** `DPV2` against a `CALICO` majority or the reverse — two implementations of one control. Emit a finding only when the outlier is `OFF`.
 - **Severity:** base `major`.
 - **Impact:** pod-to-pod traffic is unrestricted in the outlier where peers segment it.
-- **Remediation:** `gcloud` — `gcloud container clusters update … --enable-network-policy` (`# restarts the cluster networking add-ons`).
+- **Remediation:** `gcloud`, two commands in this order — `gcloud container clusters update … --update-addons=NetworkPolicy=ENABLED`, then `gcloud container clusters update … --enable-network-policy` (`# restarts the cluster networking add-ons`). GKE rejects the second with HTTP 400 until the addon is on, and gcloud rejects both flags in one invocation.
 
 #### 4.5 Private nodes, private endpoint, authorized networks (`private-nodes`, `private-endpoint`, `authorized-networks`)
 
@@ -226,8 +226,8 @@ Worked example, for a 4.4 network-policy outlier:
 
 ```json
 "recommendation": {
-  "action": "Enable network policy enforcement on stg-eu-west with gcloud container clusters update stg-eu-west --location europe-west1 --project acme-stg --enable-network-policy.",
-  "rationale": "Every other cluster in the (standard, staging) cohort enforces pod-to-pod policy, so this is the cohort's own baseline rather than an imported standard; migrating the cluster to Dataplane V2 instead would give the same control natively and with better performance, but that cannot be done in place and would mean recreating the cluster to close a gap a single flag closes.",
+  "action": "Enable network policy on stg-eu-west in two steps: gcloud container clusters update stg-eu-west --location europe-west1 --project acme-stg --update-addons=NetworkPolicy=ENABLED, then the same command with --enable-network-policy instead. GKE rejects enforcement with HTTP 400 until the addon is on, and gcloud rejects both flags in one invocation.",
+  "rationale": "Every other cluster in the (standard, staging) cohort enforces pod-to-pod policy, so this is the cohort's own baseline rather than an imported standard; migrating the cluster to Dataplane V2 instead would give the same control natively and with better performance, but that cannot be done in place and would mean recreating the cluster to close a gap two update calls close.",
   "risk": "Enabling enforcement restarts the cluster's networking add-ons, and any namespace that already carries a NetworkPolicy starts enforcing it the moment the engine comes up. List what exists first with kubectl --context stg-eu-west get netpol -A."
 }
 ```

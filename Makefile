@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -101,7 +101,7 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # `make test-python-deps`. CI installs the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Eight globs rather than one because the tests do
+# without editing this file. Thirteen globs rather than one because the tests do
 # not all live under skills -- the admin console, the shared agent scripts,
 # Chat Agent plugins and hooks, image patches, image build and repository
 # tooling in scripts/ each hold their own. scripts/ is here
@@ -116,6 +116,16 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
 # separate, which they must be: those tests import their subject by bare module
 # name, which only resolves with their own directory as the discovery root.
+#
+# tests/integration is the newest entry and the only one that is not a unit
+# suite. It ran alone in its own CI job through a probation period, so that a
+# flake in a young seam test could not red an already-gating job; it finished
+# that period without a single failure, and a tier nothing gates on is a tier
+# people learn to merge around. It is deterministic by construction -- real
+# components, no model calls -- so it belongs in the sweep the `test` job runs
+# rather than beside it. The one thing that costs: the injector seam shells out
+# to `go test`, so every job that expands this list needs a Go toolchain on
+# PATH or those tests skip themselves and the sweep reports green without them.
 PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
@@ -123,11 +133,15 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
+	$(wildcard agentplugins/*/tests/test_*.py) \
+	$(wildcard agentplugins/lib/tests/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
 	$(wildcard scripts/test_*.py) \
-	$(wildcard tests/test_*.py)))
+	$(wildcard tests/integration/test_*.py) \
+	$(wildcard tests/test_*.py) \
+	$(wildcard tests/memory/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
@@ -136,6 +150,16 @@ PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicor
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
+
+e2e-tests: ## Run the live E2E promotion test suite against the target GKE cluster.
+	@./scripts/release/execute_e2e_tests.sh
+
+test-e2e: e2e-tests ## Alias for e2e-tests.
+
+test-e2e-deps: ## Install dependencies required to run the E2E test suite.
+	@python3 -m pip install -r tests/e2e/requirements.txt
+
+e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.
@@ -188,7 +212,7 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 	@failed=""; \
 	for dir in $(PYTHON_TEST_DIRS); do \
 		echo "==> $$dir"; \
-		(cd $$dir && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
+		(cd $$dir && PYTHONPATH="$(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform:$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
 	done; \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
@@ -287,19 +311,42 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # of its tests and errors on both. So it runs under its own target, and
 # scripts/test_test_discovery.py keeps the exclusion explicit rather than an
 # accident of the globs above.
-test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
-	@python3 -m pip install -e bench/ pytest
+# pyyaml is a test-only dependency and is named here rather than in bench's
+# runtime `dependencies`: the harness never parses a task.yaml itself (devops-
+# bench does that before any of this package is imported). One test reads the
+# specs directly -- the roster-collision sweep in tests/test_verifiers.py,
+# which has to see every task's phrases at once -- so the parser belongs with
+# the test runner. Keep in step with bench/pyproject.toml's `dev` group.
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
+	@python3 -m pip install -e bench/ pytest pyyaml
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
 
+# A broken bench case otherwise costs a full presubmit to discover: provision,
+# deploy, run the agent, score, read the log. Most of the ways a task.yaml is
+# broken are static -- an unknown domain slug, a fixture role the seeded fleet
+# never planted, a check with no assertion, a case in no TASKS entry -- so they
+# fail here in a second instead. The same rules gate in CI through
+# scripts/test_task_registration.py; this target is the fast path to them.
+bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
+		exit 1; \
+	}
+	@python3 scripts/validate_bench_cases.py
+
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
-# Deliberately NOT in PYTHON_TEST_DIRS while the tier is on probation: its own
-# CI job is the single runner, so a flake in a young seam test cannot red the
-# already-gating unit job. It joins the unit sweep when the job becomes a
-# required check; the discovery guard's exclusion entry tells the same story.
-test-integration: ## Run the in-process integration seam tests.
+# The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
+# test-python` and the CI `test` job both run it, and a red seam test is a red
+# pull request. This target is a convenience for running that one tier while
+# you work on a seam -- seconds instead of the whole sweep -- and is not what
+# CI invokes, so do not reach for it as the definition of what must pass.
+# Install a Go toolchain before trusting a green run here: the injector seam
+# compiles the real Go client, and without `go` on PATH it skips itself rather
+# than failing, which reads exactly like a pass.
+test-integration: ## Run just the integration seam tests; CI reaches them through `make test-python`.
 	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona

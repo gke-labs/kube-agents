@@ -356,6 +356,16 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
 - **Acknowledge** each surviving trigger (👀) before filing, when the provider supports it. Doing it
   in the gate rather than the worker means the reviewer sees a response within the tick, not after a
   model has been scheduled.
+
+  **Not through the credential proxy.** The reaction is a `gh api -X POST …/reactions` call, and the
+  proxy refuses mutating `gh api` — the same rule that stops the agent merging its own pull request.
+  Narrowing the rule to exempt reaction endpoints was considered and rejected: the rules match a
+  joined command string, so a path-shaped exemption is one that an argv can be built to satisfy, and
+  a recognisable emoji is not worth widening the control that keeps the review gate a gate. So a
+  brokered sweep leaves no 👀; it is best-effort by contract and the reply still lands. It logs the
+  refusal rather than dropping it silently, and the proxy logs one `SECURITY_POLICY_BLOCKED` warning
+  per acknowledgement, which is expected rather than a signal.
+
 - **`--dry-run` reaches into the sweeps, not just the card filing.** The refusal and the 👀 are
   written by the sweep, so a flag that only suppressed `file_card` would still post to a public
   thread — and a refusal carries `agent-refused`, which closes the request it names for good. A dry

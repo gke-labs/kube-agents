@@ -1,0 +1,102 @@
+# ==============================================================================
+# Declarative E2E Test Suite Matrix & Cluster Configuration
+# ==============================================================================
+# Defines the test matrix: GCP environments, clusters, and the test suites to
+# execute. Nothing here provisions infrastructure; the cluster must already exist.
+# ==============================================================================
+
+version: "1.0"
+
+defaults:
+  region: "us-east4"
+  namespace: "kubeagents-system"
+  timeout_seconds: 600
+  default_environment: "investigations-e2e"
+
+environments:
+  # ----------------------------------------------------------------------------
+  # 1. Google Chat Agent E2E Environment
+  # ----------------------------------------------------------------------------
+  - name: "gchat-e2e"
+    description: "Google Chat ingress and messaging E2E test suite"
+    region: "us-east4"
+    namespace: "kubeagents-system"
+    env_vars:
+      CHAT_TOPIC_NAME: "platform-agent-chat-events"
+    tests:
+      - "tests/e2e/gchat_agent_test.py"
+
+  # ----------------------------------------------------------------------------
+  # 2. In-Cluster Incident & Stockout Investigation E2E Environment
+  # ----------------------------------------------------------------------------
+  - name: "investigations-e2e"
+    description: "In-cluster Agent API health and Stockout alert investigation scenarios"
+    region: "us-east4"
+    namespace: "kubeagents-system"
+    env_vars:
+      STOCKOUT_SCENARIOS: "04"
+    tests:
+      - "tests/e2e/test_agent_api_health.py"
+      - "tests/e2e/test_stockout_investigation.py"
+
+  # ----------------------------------------------------------------------------
+  # 3. Fleet SRE Audit E2E Environment
+  # ----------------------------------------------------------------------------
+  - name: "audit-e2e"
+    description: "Fleet SRE Audit, Token isolation, and Dry-run ledger suites across all streams"
+    region: "us-east4"
+    namespace: "kubeagents-system"
+    env_vars:
+      GITHUB_ORG: "test-org-kube-agent"
+      GITHUB_REPO: "test-org-kube-agent/agents-repo"
+      FLEET_AUDIT_STREAMS: "all"
+    tests:
+      - "tests/e2e/test_agent_api_health.py"
+      - "tests/e2e/test_agent_fleet_audit.py"
+
+  # ----------------------------------------------------------------------------
+  # 4. Operator AgentPlugin Reconciliation E2E Environment
+  # ----------------------------------------------------------------------------
+  - name: "agent-plugin-e2e"
+    description: "Operator AgentPlugin CR reconciliation and Hermes overlay lifecycle suite"
+    region: "us-east4"
+    namespace: "kubeagents-system"
+    tests:
+      - "tests/e2e/operator/agentplugins_e2e_test.py"
+
+  # ----------------------------------------------------------------------------
+  # 5. Release Candidate (RC) Promotion Gate Environment
+  # ----------------------------------------------------------------------------
+  - name: "rc-e2e"
+    description: "Release Candidate promotion gate: Agent API health, Fleet SRE Audit ledger validation, and fast stockout RCA (Scenario 04)"
+    region: "us-east4"
+    namespace: "kubeagents-system"
+    env_vars:
+      GITHUB_ORG: "test-org-kube-agent"
+      GITHUB_REPO: "test-org-kube-agent/agents-repo"
+      FLEET_AUDIT_STREAMS: "all"
+      STOCKOUT_SCENARIOS: "04"
+    tests:
+      - "tests/e2e/test_agent_api_health.py"
+      - "tests/e2e/test_agent_fleet_audit.py"
+      - "tests/e2e/test_stockout_investigation.py"
+
+  # ----------------------------------------------------------------------------
+  # 6. Full Nightly E2E Matrix Environment
+  # ----------------------------------------------------------------------------
+  - name: "nightly-e2e"
+    description: "Full Nightly E2E Matrix: all audit streams, all stockout scenarios, operator plugin lifecycle, and chat integration"
+    region: "us-east4"
+    namespace: "kubeagents-system"
+    env_vars:
+      GITHUB_ORG: "test-org-kube-agent"
+      GITHUB_REPO: "test-org-kube-agent/agents-repo"
+      FLEET_AUDIT_STREAMS: "all"
+      STOCKOUT_SCENARIOS: "all"
+      CHAT_TOPIC_NAME: "platform-agent-chat-events"
+    tests:
+      - "tests/e2e/test_agent_api_health.py"
+      - "tests/e2e/test_agent_fleet_audit.py"
+      - "tests/e2e/test_stockout_investigation.py"
+      - "tests/e2e/operator/agentplugins_e2e_test.py"
+      - "tests/e2e/gchat_agent_test.py"

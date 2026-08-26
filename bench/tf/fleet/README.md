@@ -1,8 +1,10 @@
 # The seeded dirty fleet
 
-Three small standing GKE clusters, one trio per eval project (`kube-agents-evals` and
-`kube-agents-evals-2` — see State below), whose defects are planted on
-purpose: they are the fixtures the Phase 2 presubmit scenarios assert on. The fleet is
+Three small standing GKE clusters, one trio per eval project — and the pool has three
+projects, so the stack must be applied three times (see State below) — whose defects are
+planted on purpose: they are the fixtures the Phase 2 presubmit scenarios assert on.
+Boskos leases a project at random, so **a project without this stack applied is a
+project where every fleet check reports `status: "error"`**. The fleet is
 read-only for evaluations — every open pull request shares it, and no scenario may
 mutate it. Because we planted each defect and chose its name, the scenarios' assertions
 can be exact rather than judged.
@@ -17,9 +19,11 @@ State is remote (`backend "gcs"`, partial config), because the operating model i
 re-apply from any checkout — against local state a fresh checkout would plan full
 creates and 409 against the live fleet. The stack applies **once per eval project**,
 and each project keeps its own state: bucket `<project>-tf-state`, prefix
-`seeded-fleet`, always. Both eval projects are live today —
-`gs://kube-agents-evals-tf-state` and `gs://kube-agents-evals-2-tf-state` — and
-project N+1 follows the same convention. The fleet owner creates the bucket once per
+`seeded-fleet`, always. All three pool projects are live as of 2026-08-24 —
+`gs://kube-agents-evals-tf-state`, `gs://kube-agents-evals-2-tf-state` and
+`gs://kube-agents-evals-3-tf-state` — and `hack/fleet-kubeconfigs.sh` confirms all seven
+fixture roles in each of them; project N+1 follows the same convention. The fleet owner
+creates the bucket once per
 project; switching projects means re-initializing against that project's bucket and
 naming the project on the apply:
 
@@ -103,16 +107,16 @@ scenario can be quiet, or expect and announce the gap.
 The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 (`feat/domain-scenarios`); the names here are the source of truth its specs assert on.
 
-| Defect                                                                                                                                                                                                                          | Where                                | Asserting scenario                                   |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------- |
-| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `obtainability-planted-pdb`                          |
-| `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only)                                                                   | `seeded-a`                           | `compliance-rbac-overgrant`                          |
-| `payments-api`, deterministic OOM crashloop                                                                                                                                                                                     | `seeded-a` / ns `seeded-debug`       | `cluster-agent-crashloop-debug`, remediation fixture |
-| `pinned-inference-pool`: one zone, autoscaler at max, HPA settles at 3 with a standing Pending backlog                                                                                                                          | `seeded-a` / ns `seeded-capacity`    | `stockout-pinned-pool`                               |
-| `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                                                                                          | `seeded-a`                           | `fleet-cost-idle-pool`                               |
-| `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                                                                                  | project, `var.zone`                  | `fleet-cost-idle-pool`                               |
-| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `upgrade-readiness-lagging-cluster`                  |
-| Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); all three clusters carry `environment=seeded` so the drift cohort is exactly this fleet | `seeded-c`                           | `consistency-drift-outlier`                          |
+| Defect                                                                                                                                                                                                                          | Where                                | Fixture role         | Asserting scenario                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | -------------------- | ---------------------------------------------------- |
+| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`                          |
+| `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only)                                                                   | `seeded-a`                           | `rbac-overgrant`     | `compliance-rbac-overgrant`                          |
+| `payments-api`, deterministic OOM crashloop                                                                                                                                                                                     | `seeded-a` / ns `seeded-debug`       | `crashloop-workload` | `cluster-agent-crashloop-debug`, remediation fixture |
+| `pinned-inference-pool`: one zone, autoscaler at max, HPA settles at 3 with a standing Pending backlog                                                                                                                          | `seeded-a` / ns `seeded-capacity`    | `hpa-saturated`      | `stockout-pinned-pool`                               |
+| `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                                                                                          | `seeded-a`                           | `idle-nodepool`      | `fleet-cost-idle-pool`                               |
+| `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                                                                                  | project, `var.zone`                  | — (GCE-level)        | `fleet-cost-idle-pool`                               |
+| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`                  |
+| Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); all three clusters carry `environment=seeded` so the drift cohort is exactly this fleet | `seeded-c`                           | `drift-outlier`      | `consistency-drift-outlier`                          |
 
 The `environment=seeded` resource label is the cohort confinement, the same class of
 fixture-determinism as the pool taints: the drift SOP resolves environment from
@@ -131,6 +135,125 @@ SOP's master-behind check compares a cluster's master minor against its own chan
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is
 what stops channel enrollment from healing the lag.
+
+## Addressing a fixture by role
+
+The `Where` column above is documentation. **No scenario may name a cluster or a
+project**, because every eval project carries its own trio of seeded clusters and the
+pool of eval projects is meant to grow: a check that says `seeded-a` in
+`kube-agents-evals` is a check that cannot run in `kube-agents-evals-2`. A scenario
+names the **role** a fixture plays and the runner resolves it inside whichever project
+the run leased.
+
+`fixtures.json` in this directory is the catalog, and the only place role and cluster
+meet. Each role gives a `cluster_slot` (`a`, `b` or `c`) and the namespace the fixture
+lives in, if any. It deliberately carries **no** cluster name, prefix or location:
+those are this Terraform's business, and a catalog that repeated them would agree with
+reality only for as long as nobody applied the stack with a non-default
+`-var cluster_prefix` or into another region — a drift that would surface as failing
+checks rather than as an error in the runner. Planting a new defect means adding a role
+here in the same change; a `bench/tests/test_fleet_verifier.py` test fails when a
+`task.yaml` names a role the catalog lacks, or reads a namespace through a role the
+catalog puts elsewhere.
+
+The chain, end to end:
+
+1. `hack/fleet-kubeconfigs.sh` **discovers** the trio in `$FLEET_PROJECT_ID` (defaulting
+   to `PROJECT_ID`, the project the run leased) by filtering on the labels this stack
+   applies — `environment=seeded` and `managed-by=kube-agents-seeded-fleet`, which
+   nothing else in an eval project carries, not `platform-agent-host` and not the
+   per-run `eval-pr-*` clusters. Each discovered name's trailing `-<slot>` segment says
+   which slot it is. Two labelled clusters in one project whose names end in the same
+   `-<slot>` make that slot ambiguous, and it is dropped rather than resolved by
+   listing order. It then calls `gcloud container clusters get-credentials` once per
+   slot and copies the result to `$BENCH_FLEET_KUBECONFIG_DIR/<role>.kubeconfig` for
+   every role on that slot, writing only inside that directory and never touching the
+   ambient kubeconfig. `hack/ci-eval-pr.sh` sources it after the host-cluster auth.
+2. Before copying, it **reads every object in the role's `probes` list** on that
+   cluster — `deployment/payments-api`, `clusterrolebinding/debug-binding`,
+   `node?cloud.google.com/gke-nodepool=idle-batch-pool` — skips the role unless all are
+   present, and writes the ones it saw to `<role>.confirmed`. A labelled cluster is not
+   a planted fixture: an apply that created the clusters and stopped before the
+   Kubernetes provider ran leaves a trio that answers every API call and holds none of
+   the objects. Confirming presence here, before the agent runs, is what entitles the
+   verifier to read an object that is gone at check time as a fixture the run destroyed
+   rather than one that was never planted. It probes the **objects** and not merely the
+   namespace because four of the seven roles are cluster-scoped and have no namespace:
+   a namespace-only gate published them unconditionally, and `compliance-rbac-overgrant`
+   then reported a catastrophic `fail` against an agent that had touched nothing.
+   Adding a fixture therefore means adding both its role and its probes; every subject
+   a `task.yaml` asserts on must appear in that list, which
+   `bench/tests/test_fleet_verifier.py` enforces in both directions.
+3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
+   `fixture_role: crashloop-workload`.
+4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the
+   verifier binds it to the check's `kubeconfig`.
+
+A role that will not resolve — the stack was never applied in the leased project, its
+apply stopped before planting that fixture, the runner never ran, or that cluster was
+unreachable — is `status: "error"` naming the role and the project. It never falls back
+to the ambient kubeconfig, which points at the agent's host cluster and carries no
+fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
+[Addressing a seeded-fleet fixture by role](../../CUSTOM-TASKS.md#addressing-a-seeded-fleet-fixture-by-role)
+for the spec side, including how the verifier keeps "the fixture is gone" (a fail)
+apart from "the cluster was unreachable" (an error).
+
+## A read-only credential for evaluations
+
+An eval run reads this fleet to check its fixtures survived. It has no business being
+able to change them, and the safeguards are worth less if the credential that checks
+them could also have caused what it is checking for.
+
+**This is not true today, and nothing in this change makes it true.** Measured, not
+assumed: `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com` — the identity
+every presubmit runs as — holds `roles/container.admin`, `roles/container.developer`,
+`roles/storage.admin`, `roles/resourcemanager.projectIamAdmin` and
+`roles/iam.serviceAccountAdmin` in all three eval projects, and
+`kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
+ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceaccount.com`
+subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to
+narrow in-cluster either. A read-only identity does not exist to hand the harness yet.
+
+What this change adds is the **seam**, so that closing the gap is a configuration
+change rather than another code change. The stack provisions
+`seeded-fleet-reader@<project>.iam.gserviceaccount.com` with `roles/container.viewer`
+on the project and nothing else, and grants impersonation to the identities named in
+`var.fleet_reader_token_creators` (a list of IAM members, empty by default) via
+`roles/iam.serviceAccountTokenCreator` on that account alone. Set `FLEET_READONLY_SA` to
+the account's email and `hack/fleet-kubeconfigs.sh` mints a token for it and writes each
+kubeconfig with that token as its only credential. Unset — the state today — the script
+warns loudly on every run and the kubeconfigs carry the runner's own identity.
+
+Closing it needs three things, in order, none of them done here: apply this stack in
+each eval project; add the Prow identity to `fleet_reader_token_creators` and re-apply;
+export `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` in the
+Prow job. Then the property is checkable rather than asserted:
+
+    gcloud auth print-access-token \
+      --impersonate-service-account="seeded-fleet-reader@<project>.iam.gserviceaccount.com" \
+      | xargs -I{} kubectl --token={} auth can-i delete deployments -n seeded-debug
+    # must print: no
+
+Three things about this are worth stating rather than assuming:
+
+- **Impersonation must be a minted token, not a flag on `get-credentials`.**
+  `gke-gcloud-auth-plugin` has no impersonation option, so the exec credential a
+  `get-credentials --impersonate-service-account` writes still resolves to the caller's
+  own identity at `kubectl` time. Only replacing the user entry with a minted access
+  token actually binds it.
+- **`roles/container.viewer` was verified, not assumed.** Its permission set contains no
+  `container.secrets.*` and no create/update/delete/patch verb; the single non-get/list
+  entry is `container.tokenReviews.create`. The bound worth remembering is lifetime: a
+  minted access token lives one hour, which bounds a run, not a fleet. The script mints
+  once, at the start; a run longer than the lifetime sees its fleet checks start
+  erroring, which is loud and correct but is a real operational limit.
+- **Never fold gcloud's stderr into the token.** On the _success_ path
+  `gcloud auth print-access-token --impersonate-service-account=...` prints
+  `WARNING: This command is using service account impersonation...` to stderr. Capturing
+  it with `2>&1` yields a two-line blob that `kubectl config set-credentials` accepts
+  without complaint, after which every API call 401s while the script reports success —
+  a silent break of exactly the path this section recommends. The script captures stderr
+  separately and rejects anything that is not a bare token.
 
 ## Accepted background findings
 

@@ -2,9 +2,29 @@
 """
 E2E Kubernetes Operator Cluster Validation Test Suite (AgentPlugins E2E).
 
-Validates operator build from scratch, deployment, image tag verification,
-AgentPlugin OCI image packaging & deployment, Hermes log activation,
-ConfigMap merging, plugin CR removal, log output silence, and config cleanup.
+Validates operator reconciliation, AgentPlugin OCI image packaging & deployment,
+Hermes log activation, ConfigMap merging, plugin CR removal, log output silence,
+and config cleanup.
+
+Execution Modes:
+1. Non-Destructive Live Cluster Validation (Default in CI / E2E test matrix):
+   Runs against existing k8s-operator and PlatformAgent deployments without rebuilding
+   the operator or mutating deployed images.
+   Usage:
+       pytest tests/e2e/operator/agentplugins_e2e_test.py
+       python3 scripts/release/execute_e2e_tests.py --env agent-plugin-e2e
+
+2. Operator Rebuild & Deployment Test (Opt-in Manual / Dev Run):
+   Rebuilds the operator binary from source, pushes a new operator image to $REGISTRY,
+   and updates the deployment spec.
+   Usage:
+       python3 tests/e2e/operator/agentplugins_e2e_test.py --rebuild-operator
+       REBUILD_OPERATOR=true pytest tests/e2e/operator/agentplugins_e2e_test.py
+
+3. Destructive CRD Deletion Safeguard Test (Opt-in Chaos Test):
+   Exercises cluster-wide CRD deletion and recovery (Step 12).
+   Usage:
+       python3 tests/e2e/operator/agentplugins_e2e_test.py --test-destructive-crd
 """
 
 import io
@@ -21,11 +41,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Enforce UTF-8 stdout/stderr stream handling with replacement for non-decodable characters
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "buffer"):
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# Enforce UTF-8 stdout/stderr stream handling when invoked directly as a script
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # Environment & Resource Constants
 def _get_required_env(var_name: str) -> str:
@@ -34,9 +55,29 @@ def _get_required_env(var_name: str) -> str:
         raise ValueError(f"Environment variable '{var_name}' must be set.")
     return val
 
-KUBE_CONTEXT: str = _get_required_env("KUBE_CONTEXT")
-NAMESPACE: str = _get_required_env("NAMESPACE")
-REGISTRY: str = _get_required_env("REGISTRY")
+def get_kube_context() -> str:
+    val = os.environ.get("KUBE_CONTEXT")
+    if not val:
+        raise ValueError("Environment variable 'KUBE_CONTEXT' must be explicitly set to run operator tests.")
+    return val
+
+def get_namespace() -> str:
+    return os.environ.get("NAMESPACE") or os.environ.get("AGENT_NAMESPACE") or "kubeagents-system"
+
+def get_registry() -> str:
+    reg = os.environ.get("REGISTRY") or os.environ.get("CONTAINER_REGISTRY") or os.environ.get("REGISTRY_PREFIX")
+    if reg:
+        return reg
+    return _get_required_env("REGISTRY")
+
+if __name__ == "__main__":
+    KUBE_CONTEXT: str = _get_required_env("KUBE_CONTEXT")
+    NAMESPACE: str = _get_required_env("NAMESPACE")
+    REGISTRY: str = _get_required_env("REGISTRY")
+else:
+    KUBE_CONTEXT = os.environ.get("KUBE_CONTEXT", "")
+    NAMESPACE = os.environ.get("NAMESPACE", os.environ.get("AGENT_NAMESPACE", "kubeagents-system"))
+    REGISTRY = os.environ.get("REGISTRY", "")
 
 # How container images are produced:
 #   docker - local docker build/push against the real Dockerfiles (needs a daemon)
@@ -46,9 +87,25 @@ IMAGE_BUILDER: str = os.environ.get("IMAGE_BUILDER", "docker").strip().lower()
 SUPPORTED_IMAGE_BUILDERS: tuple[str, ...] = ("docker", "crane")
 # Only consulted for IMAGE_BUILDER=crane.
 CRANE_BIN: str = os.environ.get("CRANE_BIN", "crane")
-# Mirrors the runtime stage of k8s-operator/Dockerfile.
+
+# Execution Mode:
+# By default (rebuild_operator=False), the suite runs non-destructively against the existing
+# deployed operator and PlatformAgent. Pass --rebuild-operator / --deploy-operator or
+# REBUILD_OPERATOR=true to build and mutate the operator deployment.
+REBUILD_OPERATOR: bool = (
+    os.environ.get("REBUILD_OPERATOR", "false").strip().lower() in ("true", "1", "yes")
+    or os.environ.get("DEPLOY_OPERATOR", "false").strip().lower() in ("true", "1", "yes")
+    or "--rebuild-operator" in sys.argv
+    or "--deploy-operator" in sys.argv
+)
+TEST_DESTRUCTIVE_CRD: bool = (
+    os.environ.get("TEST_DESTRUCTIVE_CRD", "false").strip().lower() in ("true", "1", "yes")
+    or "--test-destructive-crd" in sys.argv
+)
+
 OPERATOR_BASE_IMAGE: str = "gcr.io/distroless/static:nonroot"
 OPERATOR_USER: str = "65532:65532"
+
 # Mirrors tests/e2e/operator/templates/plugin_src/Dockerfile.
 PLUGIN_BASE_IMAGE: str = "alpine:3.19"
 # GKE nodes are linux/amd64; a mismatch here yields a CrashLoopBackOff, not a build error.
@@ -128,7 +185,16 @@ def run_cmd(
     if not capture_output:
         print(f"\n$ {cmd_str}", flush=True)
 
-    run_env = {**os.environ, **env} if env else None
+    run_env = {
+        **os.environ,
+        "USE_GKE_GCLOUD_AUTH_PLUGIN": "True",
+        "CLOUDSDK_PYTHON_SITEPACKAGES": "0",
+        "PYTHONNOUSERSITE": "1",
+        "CLOUDSDK_CONTAINER_USE_APPLICATION_DEFAULT_CREDENTIALS": "false",
+        **(env or {}),
+    }
+    if "CLOUDSDK_PYTHON" in run_env:
+        del run_env["CLOUDSDK_PYTHON"]
     res = subprocess.run(
         cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace", capture_output=True, env=run_env
     )
@@ -145,6 +211,28 @@ def run_cmd(
     return res
 
 
+def ensure_docker_registry_auth(image: str) -> None:
+    """Ensure Docker / Crane credential helper is configured for Google Artifact Registry."""
+    if "-docker.pkg.dev" in image:
+        host = image.split("/")[0]
+        try:
+            env = dict(os.environ)
+            if "CLOUDSDK_PYTHON" in env and env["CLOUDSDK_PYTHON"] == "/usr/bin/python3":
+                del env["CLOUDSDK_PYTHON"]
+            token_res = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True, env=env)
+            token = token_res.stdout.strip()
+            if token:
+                subprocess.run(
+                    ["docker", "login", "-u", "oauth2accesstoken", "--password-stdin", f"https://{host}"],
+                    input=token,
+                    text=True,
+                    capture_output=True,
+                )
+            subprocess.run(["gcloud", "auth", "configure-docker", host, "--quiet"], capture_output=True, env=env)
+        except Exception:
+            pass
+
+
 def build_and_push_image(image: str, context_dir: str | Path, no_cache: bool = False) -> None:
     """Build the Dockerfile at the root of context_dir and push the result to image."""
     if IMAGE_BUILDER != "docker":
@@ -152,6 +240,7 @@ def build_and_push_image(image: str, context_dir: str | Path, no_cache: bool = F
             f"Unsupported IMAGE_BUILDER '{IMAGE_BUILDER}'; expected one of {', '.join(SUPPORTED_IMAGE_BUILDERS)}."
         )
 
+    ensure_docker_registry_auth(image)
     build_cmd = ["docker", "build"]
     if no_cache:
         build_cmd.append("--no-cache")
@@ -205,10 +294,6 @@ def build_and_push_operator_image(image: str, operator_dir: Path) -> None:
         build_and_push_image(image, operator_dir, no_cache=True)
         return
 
-    # Reproduce the runtime stage of k8s-operator/Dockerfile without a builder daemon:
-    # cross-compile the manager, then layer it onto the same distroless base and apply
-    # the same entrypoint/user/workdir. No -a flag: Go's build cache is content-keyed,
-    # so it cannot hand back a binary that does not match the current source.
     tmp_dir = Path(tempfile.mkdtemp())
     try:
         binary = tmp_dir / "manager"
@@ -234,8 +319,12 @@ def build_and_push_operator_image(image: str, operator_dir: Path) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+
+
+
 def build_and_push_plugin_image(image: str, context_dir: str | Path) -> None:
     """Build and push the example plugin image using the configured builder."""
+    ensure_docker_registry_auth(image)
     if IMAGE_BUILDER != "crane":
         build_and_push_image(image, context_dir)
         return
@@ -252,13 +341,13 @@ def build_and_push_plugin_image(image: str, context_dir: str | Path) -> None:
 
 def run_kubectl(args: list[str], check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
     """Prepend context to kubectl command."""
-    full_cmd = ["kubectl", "--context", KUBE_CONTEXT] + args
+    full_cmd = ["kubectl", "--context", get_kube_context()] + args
     return run_cmd(full_cmd, check=check, capture_output=capture_output)
 
 
 def get_kubectl_output(args: list[str]) -> str:
     """Execute kubectl command silently, asserting zero exit code, and return stripped stdout."""
-    full_cmd = ["kubectl", "--context", KUBE_CONTEXT] + args
+    full_cmd = ["kubectl", "--context", get_kube_context()] + args
     res = subprocess.run(full_cmd, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
     return res.stdout.strip()
 
@@ -273,7 +362,7 @@ def poll_plugin_status(plugin_name: str, want_reason: str, timeout_sec: int = 90
     phase, reason, message = "", "", ""
     end = time.time() + timeout_sec
     while True:
-        raw = get_kubectl_output(["get", "agentplugin", plugin_name, "-n", NAMESPACE, "-o", "json"])
+        raw = get_kubectl_output(["get", "agentplugin", plugin_name, "-n", get_namespace(), "-o", "json"])
         status = json.loads(raw).get("status", {})
         phase = status.get("phase", "")
         ready = next((c for c in status.get("conditions", []) if c.get("type") == "Ready"), {})
@@ -295,7 +384,7 @@ def apply_crd_manifests(crd_dir: Path) -> None:
 
 def apply_kubectl_manifest(manifest: str) -> None:
     """Apply a YAML manifest via kubectl stdin and raise exception if non-zero exit code."""
-    full_cmd = ["kubectl", "--context", KUBE_CONTEXT, "apply", "-f", "-"]
+    full_cmd = ["kubectl", "--context", get_kube_context(), "apply", "-f", "-"]
     print(f"\n$ {' '.join(full_cmd)} (stdin manifest)", flush=True)
     res = subprocess.run(full_cmd, input=manifest, text=True, encoding="utf-8", errors="replace", capture_output=True)
     if res.stdout:
@@ -395,8 +484,10 @@ def get_pod_image(pod_name: str, container_name: str) -> str:
     ])
 
 
-def poll_pod_with_image(label_selector: str, container_name: str, expected_image: str, timeout_sec: int = 30) -> str:
-    """Poll Kubernetes API until a Running pod matching label selector has the expected container image."""
+def poll_pod_with_image(
+    label_selector: str, container_name: str, expected_image: str = "", timeout_sec: int = 30
+) -> str:
+    """Poll Kubernetes API until a Running pod matching label selector has the expected container image (or any running pod if expected_image is empty)."""
     end_time = time.time() + timeout_sec
     while time.time() < end_time:
         try:
@@ -408,7 +499,7 @@ def poll_pod_with_image(label_selector: str, container_name: str, expected_image
             ]).split()
             for pod_name in pod_names:
                 img = get_pod_image(pod_name, container_name)
-                if img == expected_image:
+                if not expected_image or img == expected_image:
                     return pod_name
         except subprocess.CalledProcessError:
             pass
@@ -479,9 +570,24 @@ def get_platform_configmap_yaml() -> str:
     return get_overlay_yaml("managed-config.yaml")
 
 
+def step1_verify_existing_operator_healthy() -> None:
+    """Step 1 (Default): Verify existing k8s-operator and PlatformAgent deployments are healthy without mutating or rebuilding."""
+    log(f"STEP 1: Verifying existing k8s-operator deployment '{OPERATOR_DEPLOYMENT}' in namespace '{NAMESPACE}'...")
+    wait_deployment_rollout(OPERATOR_DEPLOYMENT)
+
+    pod_name = poll_pod_with_image("control-plane=controller-manager", "manager", timeout_sec=30)
+    assert pod_name != "", f"No running operator pod found for deployment '{OPERATOR_DEPLOYMENT}'"
+    pod_image = get_pod_image(pod_name, "manager")
+    log(f"Running operator pod name:  {pod_name}")
+    log(f"Running operator pod image: {pod_image}")
+
+    wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+    log("STEP 1 SUCCESS: Existing k8s-operator and PlatformAgent deployments verified healthy.")
+
+
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:
-    """Step 1: Rebuild k8s-operator Go binary and container image from scratch, push, apply CRDs, update deployment."""
-    log(f"STEP 1: Rebuilding and deploying k8s-operator from scratch with tag '{operator_tag}'...")
+    """Step 1 (Opt-in Rebuild): Rebuild k8s-operator Go binary and container image from scratch, push, apply CRDs, update deployment."""
+    log(f"STEP 1 (Opt-in Rebuild): Rebuilding and deploying k8s-operator from scratch with tag '{operator_tag}'...")
     operator_dir = REPO_ROOT / "k8s-operator"
 
     run_cmd(["make", "manifests", "generate"], cwd=operator_dir)
@@ -492,17 +598,16 @@ def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) ->
             p.unlink()
 
     build_and_push_operator_image(operator_image, operator_dir)
-
     apply_crd_manifests(operator_dir / "config" / "crd" / "bases")
 
     run_kubectl(["set", "image", f"deployment/{OPERATOR_DEPLOYMENT}", f"manager={operator_image}", "-n", NAMESPACE])
     wait_deployment_rollout(OPERATOR_DEPLOYMENT)
-    log("STEP 1 SUCCESS: k8s-operator built, pushed, and deployed.")
+    log("STEP 1 (Opt-in Rebuild) SUCCESS: k8s-operator built, pushed, and deployed.")
 
 
 def step2_verify_operator_version(operator_image: str) -> None:
-    """Step 2: Verify deployed image tag in deployment spec and active running pod."""
-    log("STEP 2: Verifying deployed version by image tag...")
+    """Step 2 (Opt-in Rebuild): Verify deployed image tag in deployment spec and active running pod."""
+    log("STEP 2 (Opt-in Rebuild): Verifying deployed version by image tag...")
     deployed_image = get_kubectl_output([
         "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
         "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
@@ -522,7 +627,7 @@ def step2_verify_operator_version(operator_image: str) -> None:
     res = run_kubectl(["get", "pod", "-n", NAMESPACE, pod_name, "-o", "wide"], capture_output=True)
     assert "Running" in res.stdout, f"Pod {pod_name} state is not Running in kubectl output: {res.stdout}"
     assert pod_name in res.stdout, f"Pod details output missing expected pod name {pod_name}"
-    log("STEP 2 SUCCESS: Operator image tag verified on cluster.")
+    log("STEP 2 (Opt-in Rebuild) SUCCESS: Operator image tag verified on cluster.")
 
 
 def step3_build_and_push_plugin_image(plugin_image: str, unique_str: str) -> None:
@@ -938,16 +1043,18 @@ def step11_verify_image_pull_failure_status() -> None:
 
 
 def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
-    """Step 12: Verify operator reconciles PlatformAgent gracefully when AgentPlugin CRD is missing."""
-    log("STEP 12: Testing missing AgentPlugin CRD decoupled dependency safeguard...")
+    """Step 12 (Opt-in Destructive): Verify operator reconciles PlatformAgent gracefully when AgentPlugin CRD is missing.
+
+    Ordering constraint: Deleting the AgentPlugin CRD kills the operator's watch for it until
+    the operator restarts, so every step that depends on that watch must run before this one.
+    """
+    log("STEP 12 (Opt-in Destructive): Testing missing AgentPlugin CRD decoupled dependency safeguard...")
     crd_dir = REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases"
 
     try:
-        # 10a. Delete AgentPlugin CRD
         log("Deleting AgentPlugin CRD from cluster...")
         run_kubectl(["delete", "crd", "agentplugins.kubeagents.x-k8s.io"], check=True)
 
-        # 10b. Trigger PlatformAgent reconciliation by updating annotation
         gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         trigger_val = str(int(time.time()))
         run_kubectl([
@@ -955,17 +1062,14 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
             f"e2e.test/crd-missing-trigger={trigger_val}", "--overwrite"
         ])
 
-        # 10c. Wait for PlatformAgent reconciliation to succeed
         wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-        # 10d. Confirm controller manager is still healthy and running
         op_image = get_kubectl_output([
             "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
             "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
         ])
         op_pod = poll_pod_with_image("control-plane=controller-manager", "manager", op_image, timeout_sec=15)
-        # 10e. Verify operator logged reflector warning or info message for missing CRD
         crd_missing_logged = (
             check_operator_error_log("the server could not find the requested resource") or
             check_operator_error_log("AgentPlugin CRD is not installed on cluster")
@@ -974,24 +1078,24 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         log("Verified operator logged missing CRD reflector message while PlatformAgent reconciliation succeeded.")
 
     finally:
-        # 10f. Re-apply CRDs and remove test annotation
         log("Restoring AgentPlugin CRD...")
         apply_crd_manifests(crd_dir)
         run_kubectl([
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             "e2e.test/crd-missing-trigger-"
         ], check=False)
-        # Re-applying the CRD does NOT restore the operator's watch. client-go keeps
-        # retrying the dead AgentPlugin informer with growing backoff, so any later step
-        # that needs a plugin reconciled races that recovery — step 13 saw an empty
-        # status because the reflector was still backed off ~40s after the CRD returned.
-        # Restart the operator so the watch is rebuilt deterministically.
+        # client-go reflector backoff: deleting a CRD stops the informer watch permanently.
+        # Re-creating the CRD is not enough to resume watching — client-go reflector enters
+        # exponential backoff / stops watching the missing resource until the controller process
+        # or deployment is restarted. Restarting the operator forces a fresh informer cache sync.
         log("Restarting operator to rebuild the AgentPlugin watch...")
         run_kubectl(["rollout", "restart", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE])
         run_kubectl(["rollout", "status", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE, "--timeout=180s"])
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-    log("STEP 12 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
+    log("STEP 12 (Opt-in Destructive) SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
+
+
 
 
 def step13_verify_duplicate_plugin_name_collision_safeguard() -> None:
@@ -1580,23 +1684,39 @@ spec:
     log("STEP 17 SUCCESS: stale plugin directory self-heals into the link on startup.")
 
 
-def test_e2e_operator_cluster() -> None:
-    """Execute complete 17-step end-to-end operator cluster validation test."""
+def test_e2e_operator_cluster(rebuild_operator: bool = False, test_destructive_crd: bool = False) -> None:
+    """Execute complete end-to-end operator and plugin cluster validation test.
+
+    By default (rebuild_operator=False), runs non-destructively on the existing operator deployment.
+    Pass --rebuild-operator / --deploy-operator or REBUILD_OPERATOR=true to build and deploy the operator.
+    """
+    ctx = os.environ.get("KUBE_CONTEXT")
+    reg = get_registry() if (os.environ.get("REGISTRY") or os.environ.get("CONTAINER_REGISTRY") or os.environ.get("REGISTRY_PREFIX")) else ""
+    if not ctx or not reg:
+        import pytest
+        pytest.fail("KUBE_CONTEXT and REGISTRY environment variables must be set to validate operator plugins.")
+
+    rebuild = rebuild_operator or REBUILD_OPERATOR
+    destructive_crd = test_destructive_crd or TEST_DESTRUCTIVE_CRD
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     operator_tag = f"v{timestamp}"
-    operator_image = f"{REGISTRY}/k8s-operator:{operator_tag}"
+    operator_image = f"{reg}/k8s-operator:{operator_tag}"
 
     unique_str = f"e2e-build-{timestamp}-{random.randint(1000, 9999)}"
     plugin_tag = f"v{timestamp}"
-    plugin_image = f"{REGISTRY}/example-plugin:{plugin_tag}"
+    plugin_image = f"{reg}/example-plugin:{plugin_tag}"
 
-    log("Starting E2E Operator Cluster Test (AgentPlugins E2E Implementation)")
-    log(f"Operator Image: {operator_image}")
+    log(f"Starting E2E Operator & AgentPlugins Validation (rebuild_operator={rebuild}, test_destructive_crd={destructive_crd})")
     log(f"Plugin Image:   {plugin_image}")
     log(f"Unique String:  {unique_str}")
 
-    step1_rebuild_and_deploy_operator(operator_image, operator_tag)
-    step2_verify_operator_version(operator_image)
+    if rebuild:
+        step1_rebuild_and_deploy_operator(operator_image, operator_tag)
+        step2_verify_operator_version(operator_image)
+    else:
+        step1_verify_existing_operator_healthy()
+
     step3_build_and_push_plugin_image(plugin_image, unique_str)
     step4_deploy_agent_plugin_cr(plugin_image, unique_str)
     step5_verify_plugin_logs_and_config(unique_str)
@@ -1606,9 +1726,8 @@ def test_e2e_operator_cluster() -> None:
     step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image, unique_str)
     step10_verify_orphaned_agent_ref_status(plugin_image)
     step11_verify_image_pull_failure_status()
-    # Deleting the AgentPlugin CRD kills the operator's watch for it until the operator
-    # restarts, so every step that depends on that watch must run before this one.
-    step12_verify_missing_crd_decoupled_dependency_safeguard()
+    if destructive_crd:
+        step12_verify_missing_crd_decoupled_dependency_safeguard()
     step13_verify_duplicate_plugin_name_collision_safeguard()
     step14_verify_target_profile_and_tuning(plugin_image)
     step15_verify_targeting_a_missing_profile(plugin_image)
@@ -1616,7 +1735,7 @@ def test_e2e_operator_cluster() -> None:
     step17_verify_link_self_heals_over_a_stale_directory(plugin_image)
 
     log("==========================================================================")
-    log("ALL E2E SUCCESS CRITERIA PASSED SUCCESSFULLY!")
+    log("ALL E2E OPERATOR PLUGIN SUCCESS CRITERIA PASSED SUCCESSFULLY!")
     log("==========================================================================")
 
 

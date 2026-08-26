@@ -14,8 +14,11 @@ now builds from ``agent-base`` through a short ``proxy-tools`` stage instead, so
 Move ``DEFAULT_IMAGE`` if that ever stops being true -- a gate pointed at the
 shallower chain reports headroom that is not the headroom at risk. The one
 stage deeper than ``platform``, ``entrypoint-gate-test``, is out of scope on
-purpose: buildx alone builds it, buildx has no depth limit, and no daemon ever
-mounts it.
+purpose, but no longer because nothing mounts it: ``docker-build.yml`` loads
+that stage into the daemon and runs it under ``--read-only``. It is out of
+scope because it adds one ``COPY`` and one ``RUN`` on top of ``platform``, so
+the 8-layer gap between ``DEFAULT_MAX_LAYERS`` and ``OVERLAY2_MAX_DEPTH``
+covers it. Narrow that gap and the gate stage is what runs out of room first.
 
 Why a check rather than a comment: the limit belongs to the classic Docker
 daemon, not to the image format. BuildKit has no equivalent limit, so an image

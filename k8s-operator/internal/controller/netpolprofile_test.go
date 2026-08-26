@@ -22,7 +22,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -31,12 +30,11 @@ import (
 func TestResolveNetpolProfile(t *testing.T) {
 	t.Parallel()
 
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = agentv1alpha1.AddToScheme(scheme)
-
 	t.Run("DefaultValues", func(t *testing.T) {
 		t.Parallel()
+		// Per-subtest, not hoisted into the parent: a Scheme shared across
+		// parallel fake clients is a data race. See internal/testing/golden_test.go.
+		scheme := setupScheme()
 		client := fake.NewClientBuilder().WithScheme(scheme).Build()
 		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
 		agent := &agentv1alpha1.PlatformAgent{
@@ -54,6 +52,7 @@ func TestResolveNetpolProfile(t *testing.T) {
 
 	t.Run("DiscoveryKubeDNS", func(t *testing.T) {
 		t.Parallel()
+		scheme := setupScheme()
 		kubeDNSSvc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"},
 			Spec:       corev1.ServiceSpec{ClusterIP: "34.118.224.10"},
@@ -75,6 +74,7 @@ func TestResolveNetpolProfile(t *testing.T) {
 
 	t.Run("OperatorOverrideWinsOverDiscovery", func(t *testing.T) {
 		t.Parallel()
+		scheme := setupScheme()
 		kubeDNSSvc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"},
 			Spec:       corev1.ServiceSpec{ClusterIP: "34.118.224.10"},
@@ -101,6 +101,7 @@ func TestResolveNetpolProfile(t *testing.T) {
 
 	t.Run("AnnotationWinsOverOperatorOverride", func(t *testing.T) {
 		t.Parallel()
+		scheme := setupScheme()
 		kubeDNSSvc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"},
 			Spec:       corev1.ServiceSpec{ClusterIP: "34.118.224.10"},
@@ -134,6 +135,7 @@ func TestResolveNetpolProfile(t *testing.T) {
 
 	t.Run("InvalidInputsIgnored", func(t *testing.T) {
 		t.Parallel()
+		scheme := setupScheme()
 		kubeDNSSvc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"},
 			Spec:       corev1.ServiceSpec{ClusterIP: "34.118.224.10"},

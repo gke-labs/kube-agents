@@ -78,53 +78,109 @@ LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", 
 # name the variable an operator is being told to set.
 SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
 
-# The gateway's own bearer, which is a different value from the sentinel above.
+# The gateway's own bearer. On an operator-managed pod this is the loopback
+# sentinel after all — see _gateway_api_token — but the name is resolved rather
+# than read, because which file answers it is the whole of issue #786.
 GATEWAY_AUTH_ENV = "API_SERVER_KEY"
 
+# Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
+# applies LAST with override=True. The operator mounts it at /etc/hermes and
+# sets HERMES_MANAGED_DIR to the same path explicitly; managed_scope.py's POSIX
+# default is that path too, so the fallback is not a guess.
+#
+# `.strip() or` rather than a plain `get(..., default)`: managed_scope.py treats
+# a set-but-empty value as unset and falls back, and matching that is not
+# pedantry here — `os.path.join("", ".env")` is the RELATIVE path ".env", so the
+# resolver would read whatever .env happens to sit in the server's working
+# directory and hand it back at the highest precedence of all. A stray file in
+# an agent workspace would become the bearer.
+MANAGED_DOTENV_PATH = os.path.join(
+    os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", ".env"
+)
 
-def _gateway_api_token() -> str:
-    """Resolve the bearer the gateway API server will actually accept.
 
-    `os.environ["API_SERVER_KEY"]` is not it, and trusting it is why the relay
-    turn never ran in this deployment. The operator sets that name to the
-    non-secret loopback sentinel `cluster-internal-trusted`
-    (`k8s-operator/internal/controller/platformagent_manifests.go`), on the
-    premise that the listener is loopback-only and the envoy sidecar
-    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes does
-    not honour that premise from this side: it prefers `$HERMES_HOME/.env` over
-    the process environment (`hermes_cli/auth.py` — "Prefer ~/.hermes/.env over
-    os.environ so a deliberate key rotation ... isn't shadowed by a stale shell
-    export"), and its Docker stage2 hook writes a freshly generated strong key
-    into that file whenever it does not already carry one. The sentinel is
-    therefore overridden on every boot, by a value this process never sees, and
-    every loopback caller that trusts the environment gets 401.
+def _dotenv_value(path: str, name: str) -> str:
+    """Return `name`'s value from a dotenv file, or "" if it does not carry one.
 
-    Measured on kage-management 2026-08-18: seven consecutive `github-repo-watcher`
-    relay turns rejected in one pod's first two hours, each degrading to an
-    unrelayed raw report that the scheduler still recorded as delivered. Writing
-    the sentinel into `.env` to force agreement is not an alternative — the API
-    server then declines to bind at all.
-
-    Read per call rather than cached at import: `.env` is rewritten a few seconds
-    *after* this process starts, so an import-time read returns the last boot's
-    key.
+    Deliberately a small hand parser rather than `dotenv.load_dotenv`: this must
+    report what ONE named file says, and load_dotenv mutates `os.environ`, which
+    would make the precedence below unobservable after the first call.
     """
     try:
-        with open(DOTENV_PATH, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
-                name, _, value = line.partition("=")
-                if name.strip() != GATEWAY_AUTH_ENV:
+                key, _, value = line.partition("=")
+                if key.strip() != name:
                     continue
                 value = value.strip().strip('"').strip("'")
                 if value:
                     return value
     except OSError:
-        # No .env, or unreadable: the environment is all there is, and on a
-        # deployment where nothing rewrites the key it is also correct.
+        # Absent or unreadable is an ordinary answer here, not an error: the
+        # managed scope is operator-only, and a plain `docker run` has neither
+        # file.
         pass
+    return ""
+
+
+def _gateway_api_token() -> str:
+    """Resolve the bearer the gateway API server will actually accept.
+
+    KEPT AS A BACKSTOP, no longer load-bearing. The disagreement it was written
+    for is fixed at its source in #786: the operator now pins `API_SERVER_KEY`
+    in the managed `.env` (`renderManagedEnv` in
+    `k8s-operator/internal/controller/platformagent_manifests.go`), which
+    `load_hermes_dotenv` applies LAST with `override=True` — after the PVC file
+    — so `os.environ["API_SERVER_KEY"]` and this function now return the same
+    value on an operator-managed pod, and the fallback below is what runs.
+
+    What went wrong, because the shape recurs. The operator sets that name to
+    the non-secret loopback sentinel `cluster-internal-trusted`, on the premise
+    that the listener is loopback-only and the credential-proxy sidecar
+    authenticates outside callers against `API_SERVER_EXTERNAL_KEY`. Hermes did
+    not honour that premise from this side: `$HERMES_HOME/.env` is loaded over
+    the process environment, deliberately, so that a key rotation in that file
+    is not shadowed by a stale export — and Hermes' Docker stage2 hook writes a
+    freshly generated strong key into that file whenever it does not already
+    carry one. The sentinel was therefore overridden on every boot by a value
+    nothing else in the system had ever seen, and every caller that trusted the
+    environment got 401.
+
+    Measured on kage-management 2026-08-18: seven consecutive
+    `github-repo-watcher` relay turns rejected in one pod's first two hours,
+    each degrading to an unrelayed raw report that the scheduler still recorded
+    as delivered.
+
+    An earlier note here said that writing the sentinel into `.env` to force
+    agreement was tried and made the API server decline to bind. That was
+    confounded — the pod had lost its credential-proxy sidecar in the same
+    window. Hermes' actual constraint is `has_usable_secret(min_length=16)` in
+    `gateway/platforms/api_server.py`'s startup guard, and the 24-character
+    sentinel clears it. The managed `.env` pin does not touch that file at all
+    in any case; it wins by being applied after it.
+
+    The order below MIRRORS `hermes_cli/env_loader.py`, and reproducing it is
+    the point — a resolver that guesses differently from the server it is
+    guessing about is worse than no resolver, because it fails while looking
+    right. Managed `.env` beats PVC `.env` beats the process environment,
+    because that is the order `load_hermes_dotenv` applies them in, each with
+    `override=True`. Reading the PVC file first — this function's original
+    shape, correct before the pin — would now return stage2's generated key on
+    exactly the pods the pin has already fixed.
+
+    Read per call rather than cached at import: `.env` is rewritten a few
+    seconds *after* this process starts, so an import-time read would return the
+    last boot's key on a deployment that still has the disagreement.
+    """
+    for path in (MANAGED_DOTENV_PATH, DOTENV_PATH):
+        value = _dotenv_value(path, GATEWAY_AUTH_ENV)
+        if value:
+            return value
+    # Neither file says anything: the environment is all there is, and on a
+    # deployment where nothing rewrites the key it is also correct.
     return os.environ.get(GATEWAY_AUTH_ENV, "")
 
 
@@ -604,7 +660,48 @@ def get_active_platform() -> str:
             return "google_chat"
     except Exception as exc:
         logger.error(f"Failed to parse config.yaml for active platform: {exc}")
-    if os.environ.get("SLACK_BOT_TOKEN"):
+    # This is the selector on an operator-managed pod, not a corner case.
+    # CONFIG_PATH is $PLATFORM_AGENT_HOME/config.yaml — the agent's own
+    # writable file, seeded from agents/chat/config.yaml. The operator's
+    # `platforms.<p>.enabled` does not go there: renderConfigYAML writes it to
+    # the managed scope mounted read-only at /etc/hermes, which Hermes overlays
+    # per leaf key inside its own config loader rather than merging to disk
+    # (docker-entrypoint.sh, "The pins do NOT come through this file"; the
+    # template block at agents/chat/config.yaml:257 says the same from the
+    # other side). The open() above therefore reads a `platforms` subtree with
+    # no `enabled` key at all, both branches fall through, and control arrives
+    # here on every alert.
+    #
+    # So SLACK_RELAY_URL is not a better fallback signal, it is the answer.
+    # SLACK_BOT_TOKEN never reaches this container — it is a credential, so it
+    # lives in the credential-proxy container, which is what
+    # TestBuildDeploymentSlackIntegration in platformagent_manifests_test.go
+    # pins (TestBuildDeployment holds the general "no Secret-backed env in the
+    # sandbox" rule, but its fixture configures Google Chat only and never
+    # renders a Slack variable to check). Asking for the token here was asking
+    # a question whose answer in a deployed pod is always "no", so every
+    # Slack-only install called itself google_chat and lost the alert to a
+    # `hermes send` against a platform that is not configured. SLACK_RELAY_URL
+    # is set on this container exactly when spec.integration.slack.enabled is.
+    #
+    # Slack-before-Google-Chat matches the try block above, so an install with
+    # both integrations enabled resolves the same way whichever branch answers.
+    # That is a routing change for a dual-platform install, which until now
+    # always landed on google_chat here; see Risk & Rollout on the PR.
+    #
+    # The token is still accepted rather than replaced: it is the signal that
+    # works for a bare `docker run` off the image, where no operator has
+    # rendered anything and an exported token is all there is.
+    # platform_mcp_server.py:690 leans on the same absent SLACK_BOT_TOKEN, but
+    # it is not as badly off: it also accepts SLACK_HOME_CHANNEL, which the
+    # operator does render on this container when spec.integration.slack
+    # .homeChannel is set and which is allowlisted into that child
+    # (agents/platform/config.yaml). So it misroutes only on a Slack install
+    # with no home channel anywhere — an install whose sends have no
+    # destination in any case. It is deliberately left alone here — open PR
+    # #735 fixes that copy, and it needs the MCP env allowlist widened to pass
+    # SLACK_RELAY_URL through, which is that PR's to do.
+    if os.environ.get("SLACK_RELAY_URL") or os.environ.get("SLACK_BOT_TOKEN"):
         return "slack"
     return "google_chat"
 
@@ -803,6 +900,19 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     write: if the row stops being written, take the bullet out again rather
     than leaving a promise the system cannot keep.
 
+    A report with one option is not lettered. "Option A" standing alone asks
+    the reader to pick from a list of one, so that shape labels the bullet
+    **Proposed fix** and stops the call to action at ``apply``. What the letter
+    was also doing is evidence: ``kanban_notifier.actionable_report`` decided
+    which completions earn an ``incidents`` row by looking for ``Option <A-Z>``
+    under ``What to do``, and an unlettered report would have earned none — the
+    bare-``apply`` failure below, reintroduced with nothing red. It now takes
+    the ``To authorize:`` bullet as that evidence, which is the one line both
+    shapes carry. So the label in this template and the pattern in that gate are
+    one decision in two files: change the words here and the gate stops
+    recognising the report. ``test_triage_reply_roundtrip.py`` is the test that
+    holds both halves in scope.
+
     §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
     is about closing chatter, the "let me know if you need anything else" that
     ends a message with nothing in it; rule 1 requires the report to say what
@@ -843,13 +953,16 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"one line to the person waiting for the diagnosis.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
-        f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
-        f"Label them 'Option A', 'Option B', ... in order, and name those same letters in the call-to-action. "
-        f"When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
-        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and end the "
-        f"'To authorize:' bullet after **'apply'**, dropping the \"or name one directly with ...\" clause, since a bare 'apply' is unambiguous.\n\n"
-        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose. "
-        f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
+        f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"
+        f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters in the call-to-action, and mark exactly one of them "
+        f"'✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). "
+        f"The template below shows that shape; repeat its Option line once for each further option you propose.\n\n"
+        f"**With exactly one option:** do not letter it and do not use the word 'Option' — a lettered label asks the reader to pick from a list of one. "
+        f"The 'What to do' section is then these two bullets and nothing else, replacing the ones in the template below:\n"
+        f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action — a bare 'apply' is unambiguous when there is one fix.\n\n"
+        f"Every <...> above and in the template below is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"The last bullet of the 'What to do' section is the call to action, not another option: keep its 'To authorize:' label, "
         f"never give it an Option letter, and never count it when you number the options. "
         f"A reply in this thread reaches an agent that can see your report, so the offer is honoured.\n\n"
