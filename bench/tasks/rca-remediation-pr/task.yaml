@@ -1,6 +1,12 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS since 2026-08-25,
-# and what takes `remediation` off the coverage allowlist in
-# docs/designs/domains.yaml. It was held by A1 and A5
+# REGISTERED, INACTIVE — PARKED on 2026-08-26 until it gets one clean
+# measured run (a commented entry in hack/ci-eval-pr.sh TASKS, and what
+# keeps `remediation` on the coverage allowlist in docs/designs/domains.yaml).
+# The 2026-08-26 smoke run's 85-minute job deadline expired before this task
+# ever started, so its cost and signal are both still unmeasured — and after
+# that run priced full audits at 600-1300s each, activating an unmeasured
+# GitOps-writing scenario would spend presubmit budget on an unknown.
+# Activation is one clean measured run away, most cheaply at the nightly
+# tier or in a hand-driven smoke. It was held by A1 and A5
 # (bench/tasks/DRAFTS.md); both are closed. A4 never applied here: this case
 # is a chat-prompted RCA whose objective reads the PR URL out of the final
 # answer, not a fleet-audit stream that files findings in a ledger issue.
@@ -18,9 +24,10 @@
 # platform-agent-host. What is left of A5 is which identity that kubeconfig
 # carries, not which cluster it reaches.
 #
-# None of this has ever executed. No presubmit has minted a token, cloned an
-# *-infra repo or opened a pull request on one, so this case is part of the
-# FIRST exercise of that path rather than a regression test on it.
+# The minter and workspace halves are proven — the 2026-08-26 audits minted
+# tokens, cloned *-infra repos and published ledgers — but no presubmit has
+# ever opened a PULL REQUEST through submit-suggestion, so this case is still
+# the first exercise of that flow rather than a regression test on it.
 #
 # Domain: remediation. Journey per the (corrected) strategy table: a proposed
 # fix lands as a pull request; nothing is applied directly. The vehicle is the

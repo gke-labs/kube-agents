@@ -1,7 +1,11 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS since 2026-08-25,
-# and what takes `capacity` off the coverage allowlist in
-# docs/designs/domains.yaml. It was held by A1, A4 and A5
-# (bench/tasks/DRAFTS.md); all three are closed.
+# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
+# commented entry in hack/ci-eval-pr.sh TASKS). Its one run failed on
+# agent-endpoint HTTP 502s — transport, not a scenario bug — and the audit
+# shape budgets at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
+# run), which six domains cannot spend in one presubmit. The capacity domain
+# is covered there by capacity-pinned-pool-probe; this full sweep is the
+# SOP-fidelity version and activates with the nightly tier. It was held by
+# A1, A4 and A5 (bench/tasks/DRAFTS.md); all three are closed.
 #
 # A1 and A4 cleared together on 2026-08-25, when
 # GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
@@ -21,9 +25,10 @@
 # platform-agent-host. What is left of A5 is which identity that kubeconfig
 # carries, not which cluster it reaches.
 #
-# None of this has ever executed. No presubmit has minted a token, cloned an
-# *-infra repo or written a ledger issue, so this case is part of the FIRST
-# exercise of that path rather than a regression test on it.
+# The A1/A4 path itself is proven — the 2026-08-26 run minted tokens, cloned
+# *-infra workspaces and published ledgers for the sibling audits — but THIS
+# stream has never completed a run: its one attempt died on endpoint 502s
+# before any ledger was written.
 #
 # Domain: capacity (stockout-prevention SOP). Journey: the stockout and
 # capacity audit names the pool at risk and the shortfall, not a generic

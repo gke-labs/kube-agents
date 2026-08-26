@@ -1,0 +1,85 @@
+# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, and what takes
+# `consistency` off the coverage allowlist in docs/designs/domains.yaml.
+#
+# A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
+# is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
+# transport (agent-endpoint HTTP 502s), and its shape — cohort math over the
+# whole fleet plus a ledger write — budgets like the other audits at
+# 600-1300s. Presubmit coverage of this domain is therefore a targeted
+# question about the planted defect, answered from observed evidence and
+# graded on the reply. Full audit SOP fidelity lives in the fleet-audits
+# canary (compliance-rbac-overgrant, 606s measured 2026-08-26) and in the
+# future nightly tier, where consistency-drift-outlier is parked. Expected
+# cost bracket: ~150-350s.
+#
+# Planted defect required: the seeded fleet's slot-c cluster carries no
+# master authorized-networks config at all, where slots a and b both carry an
+# open-for-eval block — one cluster, one facet, against a two-peer majority.
+# "Master authorized networks" is the planted facet name, so an exact match
+# on it is fair.
+#
+# Isolation class: read-only (chat probe; no audit helper, no GitOps-repo
+# write). Eligible tier: presubmit.
+#
+# No deterministic mutation safeguard, documented: the planted defect is a
+# GKE master authorized-networks facet, not a Kubernetes object, and the
+# role's catalog entry (drift-outlier, bench/tf/fleet/fixtures.json) probes
+# no objects — there is nothing a fleet_resource_property check could ground
+# an assertion on. The fleet's scheduled reconcile owns the defect's
+# integrity; a mutation here surfaces there. Same documented residual as
+# consistency-drift-outlier.
+id: consistency-authorized-networks-probe
+name: Consistency probe names the facet where one cluster differs
+# The prompt names seeded-c, and that needs saying because cases normally
+# name no cluster. This probe's question IS about one specific cluster, and
+# "seeded-c" is a rendering of slot c under the prefix's default — the same
+# contract with bench/tf/fleet/ that the audit scenarios' ledger phrase
+# assertions carry (docs/designs/bench-fleet-catalog.md, "The rule is about
+# where a check points"): it survives the default prefix and breaks loudly
+# and correctly if the prefix ever changes. No check below addresses a
+# cluster by name; the harness resolves clusters only through fixtures.json.
+prompt: >-
+  How does the seeded-c cluster's network and security configuration compare
+  to the rest of the fleet? Derive the baseline from the live fleet itself,
+  name any facet where seeded-c differs from its peers, and cite the
+  configuration you actually read. Do not change anything.
+expected_output: >-
+  A grounded comparison stating that seeded-c differs from its peers on
+  master authorized networks — the other seeded clusters have the config
+  enabled and seeded-c carries none — with the baseline derived from the
+  live fleet rather than any external standard, and a note of how many peers
+  agree. Every claim cites live reads made during this run. No mutation of
+  any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: consistency
+
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster: each eval project carries its own trio and this case has to run
+# unchanged against all of them. Roles are defined in
+# bench/tf/fleet/fixtures.json; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - drift-outlier
+
+# report_contains, not ledger_issue_contains: this is a chat probe, so the
+# findings are the reply. The one-line-closing SOP rule that forced the audit
+# scenarios onto the ledger does not apply here.
+verification_spec:
+  - name: the-probe-names-the-missing-config
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # The planted facet. any_of over its two legitimate spellings: the
+      # matching is lowercased substrings, so "authorized network" covers the
+      # prose forms ("master authorized networks", "authorized network
+      # configuration") and "authorizednetworks" covers the API field forms
+      # (masterAuthorizedNetworksConfig, authorizedNetworksConfig), which
+      # lowercase without the space.
+      any_of_phrases: ["authorized network", "authorizednetworks"]

@@ -225,8 +225,10 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # still commented out of TASKS below, and that was the point: the warnings it
 # prints per project ("carries no clusters labelled environment=seeded") are
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
-# these tasks started gating PRs rather than after. Seven of them are now
-# active, so those warnings have consumers. It costs one clusters.list, one
+# these tasks started gating PRs rather than after. Eight of the active
+# tasks below read the seeded fleet (six domain probes, the fleet-audits
+# canary and cluster-agent-crashloop-debug), so those warnings have
+# consumers. It costs one clusters.list, one
 # get-credentials per seeded cluster, and one namespace read per probe --
 # seconds, against a job measured in tens of minutes.
 #
@@ -448,39 +450,71 @@ fi
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 # agent-kanban-smoke is deployer: noop, so it adds seconds, not a cluster.
 TASKS=(
-  # The six Phase 2 domain scenarios this change activates, ahead of the
-  # incumbents on purpose. The loop below is sequential (one task at a time,
-  # no BENCH_PARALLEL), so the Prow deadline truncates the TAIL of this list.
-  # gpu-stress-test-diagnosis and agent-kanban-smoke have run on every
-  # presubmit for weeks and cluster-agent-crashloop-debug ran in #939; none of
-  # the six below has ever executed, so their cost is unmeasured and their
-  # signal is the only thing this change exists to produce. Ordering the
-  # unmeasured work first means a timeout loses a repeat, not the new signal.
-  "./tasks/obtainability-planted-pdb/task.yaml"
-  "./tasks/stockout-pinned-pool/task.yaml"
+  # SEVEN DOMAINS THROUGH PROBES, THE AUDIT MACHINERY THROUGH ONE CANARY.
+  # The 2026-08-26 smoke run (build 2092638061140643840, kube-agents-evals-3)
+  # measured what six full audits cost: obtainability-planted-pdb PASSED in
+  # 962s and compliance-rbac-overgrant in 606s, the three that failed did so
+  # on agent-endpoint HTTP 502s (transport, not scenario bugs), and the job's
+  # 85-minute deadline expired before rca-remediation-pr ever ran. Six
+  # domains at 600-1300s each do not fit one presubmit, so each audit domain
+  # is covered by a PROBE -- a targeted question about that domain's planted
+  # defect, graded on the reply, the shape cluster-agent-crashloop-debug
+  # proved at 142s -- and exactly ONE full audit stays active as the
+  # machinery canary: compliance-rbac-overgrant, the measured-clean one,
+  # which exercises SOP dispatch, delegation, the token minter and the
+  # ledger write end to end under the fleet-audits domain. Budget: canary
+  # 606s + six probes at ~150-350s + crashloop 142s + the two incumbents,
+  # against the deadline the 2026-08-26 run blew with full audits.
+  #
+  # The six probes sit ahead of the rest on purpose. The loop below is
+  # sequential (one task at a time, no BENCH_PARALLEL), so the Prow deadline
+  # truncates the TAIL of this list; none of the probes has ever executed, so
+  # their cost is unmeasured and their signal is what this change exists to
+  # produce. Ordering the unmeasured work first means a timeout loses a
+  # measured repeat, not the new signal.
+  "./tasks/reliability-pdb-probe/task.yaml"
+  "./tasks/capacity-pinned-pool-probe/task.yaml"
+  "./tasks/security-overgrant-probe/task.yaml"
+  "./tasks/upgrades-lagging-master-probe/task.yaml"
+  "./tasks/consistency-authorized-networks-probe/task.yaml"
+  "./tasks/cost-idle-pool-probe/task.yaml"
+  # The audit-machinery canary: measured 606s clean on 2026-08-26, every
+  # exact check green -- the only task that has proven the A1/A4 path
+  # (minted token, cloned *-infra workspace, published ledger issue) in a
+  # real presubmit.
   "./tasks/compliance-rbac-overgrant/task.yaml"
-  "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
-  "./tasks/consistency-drift-outlier/task.yaml"
-  "./tasks/rca-remediation-pr/task.yaml"
   # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
   # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
   # exercises the whole of step 2b end to end: label discovery, slot-to-role
   # resolution, the .confirmed probe, and fleet_resource_property binding the
   # role to a kubeconfig. It is the cheapest task in this array (142s on the
-  # 2026-08-25 run) and it proves the chain the six above stand on, so it sits
-  # ahead of the two expensive incumbents.
+  # 2026-08-25 run) and it proves the chain the probes above stand on.
   "./tasks/cluster-agent-crashloop-debug/task.yaml"
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # Three of the ten domain scenarios stay commented out. The
-  # task-registration lint counts a commented entry as registered, so a line
-  # here is a promise the scenario exists, not that it runs; the
-  # domain-coverage lint counts only an UNCOMMENTED one, so activating a
-  # scenario also deletes its domain from the allowlist in
-  # docs/designs/domains.yaml. bench/tasks/DRAFTS.md carries the blockers and
-  # the per-scenario status column.
+  # Eight registered scenarios stay commented out. The task-registration lint
+  # counts a commented entry as registered, so a line here is a promise the
+  # scenario exists, not that it runs; the domain-coverage lint counts only
+  # an UNCOMMENTED one, so activating a scenario also deletes its domain from
+  # the allowlist in docs/designs/domains.yaml. bench/tasks/DRAFTS.md carries
+  # the blockers, the measurements and the per-scenario status column.
   #
-  # A1 and A4 are CLOSED, and closing them is what let the six above move up.
+  # Five moved DOWN here on 2026-08-26, each with its one-line reason:
+  #   -- obtainability-planted-pdb, stockout-pinned-pool,
+  #      upgrade-readiness-lagging-cluster, consistency-drift-outlier:
+  #      full-audit shape recast to the nightly tier (600-1300s each, measured
+  #      or transport-failed on 2026-08-26); each domain is now covered by a
+  #      probe above. They remain spec-ready and activation is uncommenting.
+  #   -- rca-remediation-pr: parked until it gets one clean measured run; the
+  #      2026-08-26 run hit the job deadline before reaching it, so its cost
+  #      and signal are still unknown.
+  # "./tasks/obtainability-planted-pdb/task.yaml"
+  # "./tasks/stockout-pinned-pool/task.yaml"
+  # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
+  # "./tasks/consistency-drift-outlier/task.yaml"
+  # "./tasks/rca-remediation-pr/task.yaml"
+  #
+  # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
   # on main. GoogleCloudPlatform/oss-test-infra#2661 merged
   # 2026-08-25T14:36:08Z and supplied both: it exports
@@ -494,10 +528,10 @@ TASKS=(
   # with (A1). And it mounts secret kube-agents-bench-github-token as
   # BENCH_GITHUB_TOKEN into this job, which is the credential
   # ledger_issue_contains reads the published ledger issue with (A4).
-  #
-  # Neither path has ever executed. No presubmit has minted a token, cloned an
-  # *-infra repo or written a ledger issue, so the first exercise of A1/A4 is
-  # the six-way one above.
+  # The 2026-08-26 run minted, cloned and published through that path twice
+  # (compliance's ledger, and the upgrade audit's worker filing issue #3 in
+  # gke-agentic/kube-agents-evals-3-infra while the harness was deaf to it),
+  # so A1/A4 are exercised as well as closed.
   #
   # A5 is CLEARED, and that is what every fleet entry above rests on. Step 2b
   # writes one kubeconfig per seeded-fleet fixture ROLE, and the fleet
@@ -524,6 +558,9 @@ TASKS=(
   #       pool: kube-agents-evals-3 was planted 2026-08-24, three days after
   #       the other two, which makes it 2026-08-31 for the pool and
   #       2026-09-23 for the disks. A replant in any pool project moves them.
+  #       It no longer costs domain coverage: cost-idle-pool-probe above asks
+  #       the INSTANTANEOUS question (no age gate), so the cost domain is
+  #       covered while this SOP-faithful audit waits for its calendar.
   #   A2  chat-routing-fleet-question. AGENT_SERVICE_NAME above is one global
   #       target, so every entry here reaches the platform agent; this
   #       scenario needs the chat front door and would fail its delegation

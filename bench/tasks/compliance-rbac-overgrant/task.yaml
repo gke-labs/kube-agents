@@ -1,6 +1,15 @@
 # ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS since 2026-08-25,
-# and what takes `security` off the coverage allowlist in
-# docs/designs/domains.yaml. It was held by A1, A4 and A5
+# and since 2026-08-26 THE AUDIT-MACHINERY CANARY: the one full audit scenario
+# kept in the presubmit. It exercises SOP dispatch, delegation to a worker,
+# the GitHub token minter, and the ledger write end to end, and it is the
+# scenario that proved that chain — measured 606s clean on 2026-08-26 (build
+# 2092638061140643840, project kube-agents-evals-3), every exact check green.
+# The other audit domains are covered by snappy probes instead (a full audit
+# costs 600-1300s each, which six domains cannot spend in one presubmit); the
+# other full audits are recast to the nightly tier. This is why the task
+# carries the `fleet-audits` domain rather than `security`: what it uniquely
+# covers in presubmit is the machinery, while the planted over-grant itself is
+# probed by security-overgrant-probe. It was held by A1, A4 and A5
 # (bench/tasks/DRAFTS.md); all three are closed.
 #
 # A1 and A4 cleared together on 2026-08-25, when
@@ -21,16 +30,13 @@
 # platform-agent-host. What is left of A5 is which identity that kubeconfig
 # carries, not which cluster it reaches.
 #
-# None of this has ever executed. No presubmit has minted a token, cloned an
-# *-infra repo or written a ledger issue, so this case is part of the FIRST
-# exercise of that path rather than a regression test on it.
-#
-# Domain: security (compliance-audit SOP; the ai-security-audit SOP is the
-# same domain's second stream and gets its own scenario once this one is
-# promoted — its planted defect would be an internet-reachable model server
-# or plaintext registry credential).
-# Journey: the RBAC and posture sweep reports findings in the expected shape,
-# each carrying a remediation.
+# Domain: fleet-audits (SOP machinery; the slug is docs/designs/domains.yaml's
+# and this task is its only carrier). The compliance-audit SOP is the vehicle;
+# the ai-security-audit SOP is the same machinery's second stream and gets its
+# own scenario at the nightly tier — its planted defect would be an
+# internet-reachable model server or plaintext registry credential.
+# Journey: a scheduled audit SOP runs end to end — delegates to a worker,
+# sweeps the fleet, and files a ledger issue a human can act on.
 #
 # Planted defect required: a cluster-scoped ClusterRoleBinding named
 # "debug-binding" on the seeded fleet, granting cluster-admin to the default
@@ -67,7 +73,7 @@ infrastructure:
 validated: false
 
 # Slug per docs/designs/domains.yaml.
-domain: security
+domain: fleet-audits
 
 # The seeded-fleet defect this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run

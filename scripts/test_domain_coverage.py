@@ -1,6 +1,6 @@
 """A domain with no blocking scenario is uncovered, not passing.
 
-docs/designs/domains.yaml holds the ten domains and the allowlist of
+docs/designs/domains.yaml holds the domains and the allowlist of
 known-uncovered ones (its header states the rule and where it comes from).
 This test is what makes the rule a build failure:
 
