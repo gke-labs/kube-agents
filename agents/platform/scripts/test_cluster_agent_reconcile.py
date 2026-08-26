@@ -7,6 +7,7 @@ GKE NotFound. Missing identity, transient errors, and reserved profiles are neve
 deleted.
 """
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import chat_platforms  # noqa: E402
 import cluster_agent_profile as cap  # noqa: E402
 import cluster_agent_reconcile as rec  # noqa: E402
 
@@ -320,10 +322,27 @@ class NotifyTargetTest(unittest.TestCase):
                          ["google_chat", "slack"])
 
     def test_the_message_is_the_same_on_every_platform(self):
+        # Asserts the whole argv of every call, not the set of messages: a set is
+        # equally satisfied by one send, so the set form passed against the
+        # pre-#989 `--to google_chat` and pinned nothing this class exists to pin.
         with mock.patch.object(rec, "enabled_chat_platforms", return_value=["google_chat", "slack"]), \
              mock.patch.object(rec.subprocess, "run") as sub:
             rec._notify("hello")
-        self.assertEqual({call.args[0][4] for call in sub.call_args_list}, {"hello"})
+        self.assertEqual([call.args[0] for call in sub.call_args_list],
+                         [["hermes", "send", "--to", "google_chat", "hello"],
+                          ["hermes", "send", "--to", "slack", "hello"]])
+
+    def test_a_slack_only_environment_reaches_slack_through_the_real_resolver(self):
+        # Every other case here stubs enabled_chat_platforms, so none of them would
+        # notice the two halves being wired together wrongly. This one drives the
+        # real resolver off the environment the operator renders for a Slack-only
+        # install, which is the configuration #989 was reported against.
+        with mock.patch.object(chat_platforms, "CONFIG_PATH", "/nonexistent/config.yaml"), \
+             mock.patch.dict(os.environ, {"SLACK_RELAY_URL": "http://127.0.0.1:8780"}, clear=True), \
+             mock.patch.object(rec.subprocess, "run") as sub:
+            rec._notify("created 1 profile(s): demo")
+        self.assertEqual([call.args[0] for call in sub.call_args_list],
+                         [["hermes", "send", "--to", "slack", "created 1 profile(s): demo"]])
 
 
 class FormatNotificationTest(unittest.TestCase):

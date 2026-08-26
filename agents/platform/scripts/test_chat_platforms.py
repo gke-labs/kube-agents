@@ -104,9 +104,50 @@ class ConfigFileTest(unittest.TestCase):
              _env(SLACK_RELAY_URL="http://x"):
             self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
 
+    def test_valid_yaml_of_the_wrong_shape_does_not_raise(self):
+        # The case the test above does NOT cover: `platforms: [a, b]` is valid YAML,
+        # so safe_load returns cleanly and the wrong type reaches the traversal. A
+        # `.get` on a list raises outside the try, escapes _notify — which
+        # cluster_agent_reconcile.main does not guard — and fails an hourly run that
+        # has already created and pruned profiles, in a script contracted to exit 0.
+        for text in ("platforms: [google_chat, slack]\n", "platforms: slack\n",
+                     "platforms: 3\n", "platforms:\n  slack: enabled\n"):
+            with self.subTest(config=text):
+                with _config(text), _env(SLACK_RELAY_URL="http://x"):
+                    self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
+
+    def test_a_whole_document_of_the_wrong_shape_does_not_raise(self):
+        with _config("- just\n- a list\n"), _env(GOOGLE_CHAT_RELAY_URL="http://x"):
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
+
+    def test_valueless_enabled_is_not_an_explicit_no(self):
+        # `enabled:` with nothing after it parses to None. That is "this file does not
+        # say", not "this file says no", so it must not outrank the relay URL the
+        # operator rendered — the distinction _config_enabled's docstring promises.
+        with _config("platforms:\n  slack:\n    enabled:\n"), \
+             _env(SLACK_RELAY_URL="http://x"):
+            self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
+
     def test_empty_config_degrades_to_the_env(self):
         with _config(""), _env(GOOGLE_CHAT_RELAY_URL="http://x"):
             self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
+
+
+class ConfigPathContractTest(unittest.TestCase):
+    def test_config_path_matches_agent_common_server(self):
+        # CONFIG_PATH is deliberately repeated rather than imported — importing
+        # agent_common_server for it would pull FastMCP in, which ImportCostTest below
+        # exists to prevent. The copy is the cheap half of that trade; this is the
+        # other half, so the two cannot silently desynchronise. Read as text rather
+        # than imported, for the same reason the constant is not imported.
+        here = Path(__file__).resolve().parent
+
+        def config_path_line(module: str) -> str:
+            src = (here / module).read_text().splitlines()
+            return next(l for l in src if l.startswith("CONFIG_PATH ="))
+
+        self.assertEqual(config_path_line("chat_platforms.py"),
+                         config_path_line("agent_common_server.py"))
 
 
 class ImportCostTest(unittest.TestCase):
