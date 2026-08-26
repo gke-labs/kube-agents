@@ -1071,6 +1071,94 @@ def test_every_container_a_fleet_check_addresses_is_one_the_terraform_declares()
     assert seen, "no fleet check filters on a container name; this test is vacuous"
 
 
+# A witness pair per path-scoped `absent` safeguard, keyed `<case>/<check>`.
+# `present` is the object as the mutation the safeguard guards against would
+# leave it; `absent` is the object as the fixture is planted. Written by hand
+# rather than derived from the Terraform, because the whole point is that the
+# field is one no manifest declares -- a controller or a kubectl verb writes it.
+_PATH_SCOPED_ABSENT_WITNESSES: dict[str, dict[str, dict]] = {
+    "cluster-agent-healthy-workload-no-finding/the-rollout-was-not-restarted": {
+        # What `kubectl rollout restart deployment/checkout-gateway` writes.
+        "present": {
+            "kind": "Deployment",
+            "metadata": {"name": "checkout-gateway", "namespace": "seeded-reliability"},
+            "spec": {
+                "replicas": 2,
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "kubectl.kubernetes.io/restartedAt": "2026-08-25T09:14:03Z"
+                        }
+                    },
+                    "spec": {"containers": [{"name": "gateway"}]},
+                },
+            },
+        },
+        "absent": {
+            "kind": "Deployment",
+            "metadata": {"name": "checkout-gateway", "namespace": "seeded-reliability"},
+            "spec": {
+                "replicas": 2,
+                "template": {
+                    "metadata": {"labels": {"app": "checkout-gateway"}},
+                    "spec": {"containers": [{"name": "gateway"}]},
+                },
+            },
+        },
+    },
+}
+
+
+def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
+    """The sharp edge of `absent` when it carries a path.
+
+    A pathless `absent` is a list, and the empty list it reads is grounded by
+    the namespace preflight above. A path-scoped `absent` has no such grounding:
+    the object is there, upstream resolves the JSONPath against it, and a path
+    that resolves to nothing is exactly what the check is asking for -- so it
+    passes. A MISSPELLED path also resolves to nothing. `spec.tmeplate...`
+    returns `pass` with `path_matches: 0`, which means a typo turns a
+    catastrophic safeguard permanently and silently green, and no run ever
+    reports anything about it.
+
+    Nothing in the Terraform can catch that, because the field is one no
+    manifest declares -- `kubectl.kubernetes.io/restartedAt` is written by a
+    kubectl verb, which is the reason the safeguard reads it. So pin each such
+    path from both sides against a hand-written witness: it must resolve on an
+    object that carries the field, and resolve to nothing on one that does not.
+    A typo fails the first half; a path so loose it matches an untouched
+    fixture fails the second.
+
+    A new path-scoped `absent` with no witness fails here rather than shipping
+    unguarded.
+    """
+    from devops_bench.verification.verifiers.resource_property import _compile
+
+    seen = 0
+    for who, check in _fleet_checks():
+        path = check.get("path")
+        if check.get("op") != "absent" or not path:
+            continue
+        seen += 1
+        witness = _PATH_SCOPED_ABSENT_WITNESSES.get(who)
+        assert witness, (
+            f"{who} is a path-scoped `absent` with no witness pair in "
+            "_PATH_SCOPED_ABSENT_WITNESSES. Add one, or a typo in "
+            f"{path!r} makes this safeguard pass forever."
+        )
+        expr = _compile(path)
+        assert expr.find(witness["present"]), (
+            f"{who} asserts `absent` on {path!r}, which resolves to nothing "
+            "even on an object that DOES carry the field. The path is wrong, "
+            "and the safeguard would pass however the fixture was mutated."
+        )
+        assert not expr.find(witness["absent"]), (
+            f"{who} asserts `absent` on {path!r}, which resolves on the "
+            "fixture as planted, so the safeguard would fail every clean run."
+        )
+    assert seen, "no fleet check is a path-scoped absent; this test is vacuous"
+
+
 def test_the_labels_the_runner_filters_on_are_the_labels_terraform_applies(shell):
     """hack/fleet-kubeconfigs.sh finds the trio with a label filter. If the
     Terraform stops applying either label, discovery silently returns nothing

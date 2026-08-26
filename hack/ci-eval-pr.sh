@@ -523,6 +523,19 @@ TASKS=(
   # (`validated: false` in the file). Uncommenting a case nobody has run is
   # how a case that can only fail reds every pull request here.
   # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
+  #
+  # Four more cluster-debugging cases, also not among the ten above. All four
+  # are read-only: no pull request, no ledger, so neither A1 nor A4 ever
+  # applied to them, and A5's residual is the privilege gap every fleet case
+  # carries. Each is commented out for the same reason as the entry above --
+  # `validated: false`, nobody has watched it pass AND fail. The first three
+  # read the crashloop-workload and no-pdb-workload fixtures on seeded
+  # cluster A; the fourth shares hpa-saturated with stockout-pinned-pool, so
+  # activating both means two cases asserting the same HPA cap.
+  # "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
+  # "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
+  # "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
+  # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
 )
 
 # Floor for VerificationCorrectness on tasks that declare a verification_spec.
