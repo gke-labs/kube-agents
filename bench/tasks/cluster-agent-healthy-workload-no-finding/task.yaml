@@ -67,8 +67,9 @@
 # What that objective does NOT do, because a substring check cannot: separate
 # an agent that read the pods from one that guessed the same answer. Its
 # phrase list is chosen so that a report asserting the crashloop cannot
-# satisfy it — the check comment below has the collisions that ruled three
-# earlier phrasings out — which is a weaker claim than "the agent looked".
+# satisfy it — the check comment below has the collisions that ruled two
+# earlier phrasings out, and the leading space that admits a third — which is
+# a weaker claim than "the agent looked".
 #
 # Planted defect required: no-pdb-workload — a two-replica checkout-gateway
 # Deployment in namespace seeded-reliability on seeded cluster A, container
@@ -145,13 +146,28 @@ verification_spec:
       #     fail.
       #   - "0 restarts" is a substring of "10 restarts", with no word
       #     boundaries to stop it, so the invented fault passes on its own
-      #     restart count. " 0 restarts" with a leading space would survive
-      #     that, and is too fragile to lean on at a line start.
+      #     restart count. " 0 restarts" with a leading space survives that
+      #     and is in the list, having been reconsidered: it was first
+      #     rejected as too fragile to lean on at a line start, which is the
+      #     right call for a phrase carrying the check alone and the wrong
+      #     one for an alternative among several. A leading-space miss on a
+      #     line start costs nothing when five other phrasings can match.
       #
       # What is left asserts the absence of the reported symptom in a form a
       # crashloop report does not produce. "2/2" is the kubectl READY column
       # with both containers ready, which a crashlooping pod cannot show.
       # any_of because the rendering is the agent's.
+      #
+      # Widened on 2026-08-26 after the first scored run failed this check on
+      # a report the OutcomeValidity judge scored 1.00 against the expected
+      # output above -- the agent did the case and phrased the finding in
+      # none of the six original alternatives. Every addition holds the same
+      # constraint the originals do: "not crashlooping", "no
+      # crashloopbackoff", "not in crashloopbackoff" and "is healthy" are all
+      # sentences a report ASSERTING the symptom cannot produce ("is
+      # unhealthy" does not contain "is healthy"; "is crashlooping" does not
+      # contain "not crashlooping"), and none of them appears in the bare
+      # delegation card that run produced.
       #
       # The residual, stated rather than papered over: this proves the report
       # SAYS the workload is healthy, not that the agent read the pods. A
@@ -166,6 +182,11 @@ verification_spec:
           "zero restarts",
           "not restarted",
           "not restarting",
+          " 0 restarts",
+          "not crashlooping",
+          "no crashloopbackoff",
+          "not in crashloopbackoff",
+          "is healthy",
         ]
   # Cluster-state safeguards: "the fixture came out the way it went in."
   # Addressed by fixture ROLE, which fleet_resource_property resolves to the
