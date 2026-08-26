@@ -315,6 +315,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// behind a Degraded status that names only the allowlist. The gateway
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
+		//
+		// This closes the hazard at this refusal only. The two refusals above —
+		// step 10's RuntimeClassNotFound and step 10b's
+		// SplitBrokerStrandsEventWatcher — return without reconciling the
+		// gateway policy and still have it. Issue #964 tracks that; do not read
+		// the rule stated here as one the whole function keeps yet.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
 			return ctrl.Result{}, err
 		}

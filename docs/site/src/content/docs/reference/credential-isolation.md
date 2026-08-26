@@ -146,7 +146,7 @@ Against the credential requirements this mechanism is short-lived, audience-boun
 
 ### This blocks nothing today
 
-**Turning this on does not take any egress away from the agent Pod. It cannot.** Adding a NetworkPolicy is a monotone operation: policies selecting one Pod are unioned, the Pod may send whatever any of them permits, and the API has no deny rule at all. The agent Pod is already selected for egress by `<name>-gateway-netpol`, which the operator renders on every reconcile whether or not you set this field, so with the flag on the Pod's permitted egress is a strict _superset_ of what it was with the flag off. In the default shape the one destination it adds is the credential broker on TCP 8765.
+**Turning this on does not take any egress away from the agent Pod. It cannot.** Adding a NetworkPolicy is a monotone operation: policies selecting one Pod are unioned, the Pod may send whatever any of them permits, and the API has no deny rule at all. The agent Pod is already selected for egress by `<name>-gateway-netpol`, which the operator renders on every reconcile whether or not you set this field, so with the flag on the Pod's permitted egress is a strict _superset_ of what it was with the flag off. In the default shape it adds the credential broker on TCP 8765, and — when the agent is not exporting telemetry — the collector namespace on 4317/4318, because the gateway policy renders its own OTel rule only while there is an endpoint to export to and this one is rendered unconditionally. This branch's own golden fixture is that case: `gke-managed-otel` appears in the new policy and not in the gateway one.
 
 That holds in every install shape, on every CNI, enforcing or not. It is a property of the API, not of a particular cluster.
 
