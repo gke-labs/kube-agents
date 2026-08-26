@@ -154,3 +154,36 @@ jobs:
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
     secrets:
       RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+  step-5-teardown-env:
+    name: Step 5 - Tear Down RC Environment
+    # Every earlier job, so that the implicit success() on `needs` is what gates
+    # this one: the RC cluster is destroyed only when the whole run passed. A
+    # failure anywhere leaves the environment standing to be examined live —
+    # which is the point, since the E2E failures worth diagnosing are the ones
+    # that only reproduce on the cluster that produced them. Nothing else
+    # removes it; the next run's pre-install teardown does, up to three hours
+    # later, so a failure that needs longer than that wants the schedule paused.
+    #
+    # The `if:` below does NOT weaken that gate. It adds conditions rather than
+    # replacing the success() check, the way step 4 already skips when step 3
+    # fails despite carrying an `if:` of its own. An `always()` added here would
+    # remove it and start destroying the environments this exists to preserve.
+    needs:
+      [
+        step-1-create-tag,
+        step-2-deploy-env,
+        step-3-run-e2e-tests,
+        step-4-tag-validated,
+      ]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    uses: ./.github/workflows/rc-teardown-environment.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+    secrets:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}

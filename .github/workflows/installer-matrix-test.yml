@@ -80,8 +80,13 @@ jobs:
             # NOT_FOUND on stderr — because the generator only reads that as
             # "cluster absent" and refuses to guess on any other failure
             # (guessing is how a transient error plans a live cluster's
-            # replacement).
-            container\ clusters\ describe*) echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND: Not found." >&2; exit 1 ;;
+            # replacement). STUB_LIVE_AUTOPILOT=true flips it to a live
+            # Autopilot cluster for the adoption assertion below; unset
+            # everywhere else, so every other step sees the absent cluster.
+            container\ clusters\ describe*)
+              if [ "${STUB_LIVE_AUTOPILOT:-}" = "true" ]; then echo "True"; exit 0; fi
+              echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND: Not found." >&2; exit 1 ;;
+            container\ clusters\ get-credentials*) ;;
             # The minter gate's key-version probe: no ENABLED version.
             kms\ keys\ versions\ list*) exit 0 ;;
             storage\ cat*) exit 1 ;;
@@ -121,6 +126,49 @@ jobs:
       - name: Validate Dry-Run Upgrade (Non-Interactive)
         run: |
           PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./upgrade.sh --dry-run -y --upgrade-mode=full --project-id="ci-test-project" --image-tag="$GITHUB_SHA"
+
+      # The gcloud stub answers NOT_FOUND, so every dry run here takes the
+      # fresh-create path — the one case where --cluster-mode has a say. That
+      # makes the generated tfvars the whole assertion.
+      - name: Validate Dry-Run Installer Cluster Mode
+        run: |
+          set -euo pipefail
+          tfvars="terraform/examples/full-install/terraform.tfvars"
+          vars_sh="k8s-operator/scripts/vars.sh"
+          for mode in standard autopilot; do
+            PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./install.sh --dry-run -y \
+              --project-id="ci-test-project" --cluster-name="ci-test-cluster" \
+              --region="us-central1" --cluster-mode="$mode" --image-tag="$GITHUB_SHA"
+            if ! grep -qE "^cluster_mode[[:space:]]+= \"${mode}\"\$" "$tfvars"; then
+              echo "--cluster-mode=${mode} did not reach terraform.tfvars:" >&2
+              grep cluster_mode "$tfvars" >&2
+              exit 1
+            fi
+            # vars.sh is what uninstall.sh and upgrade.sh regenerate from, so
+            # it has to carry the same answer.
+            if ! grep -qE "^export CLUSTER_MODE=${mode}\$" "$vars_sh"; then
+              echo "--cluster-mode=${mode} did not reach vars.sh:" >&2
+              grep CLUSTER_MODE "$vars_sh" >&2
+              exit 1
+            fi
+          done
+
+          # Adoption: the live cluster's shape overrules --cluster-mode, and
+          # vars.sh must end up holding the LIVE shape rather than the request.
+          # A vars.sh naming the other shape is what turns a later upgrade.sh
+          # or uninstall.sh regeneration into a cluster replacement.
+          STUB_LIVE_AUTOPILOT=true PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
+            ./install.sh --dry-run -y --project-id="ci-test-project" \
+            --cluster-name="ci-test-cluster" --region="us-central1" \
+            --cluster-mode="standard" --image-tag="$GITHUB_SHA"
+          for f in "$tfvars:^cluster_mode[[:space:]]+= \"autopilot\"$" \
+                   "$vars_sh:^export CLUSTER_MODE=autopilot$"; do
+            if ! grep -qE "${f#*:}" "${f%%:*}"; then
+              echo "the live Autopilot cluster did not overrule --cluster-mode=standard in ${f%%:*}:" >&2
+              grep -iE "cluster_mode" "${f%%:*}" >&2
+              exit 1
+            fi
+          done
 
       - name: Create Ephemeral Kind Kubernetes Cluster (Linux)
         if: runner.os == 'Linux'
