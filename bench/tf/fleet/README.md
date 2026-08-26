@@ -198,6 +198,24 @@ fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 for the spec side, including how the verifier keeps "the fixture is gone" (a fail)
 apart from "the cluster was unreachable" (an error).
 
+## The second consumer: the presubmit's log-fixture subject
+
+`hack/ci-eval-pr.sh` §3b is the one consumer of this fleet outside the role catalog's
+chain, and `fixtures.json`'s description names it as the exception. On every presubmit
+in a fleet-carrying project it discovers **slot c** by the same two labels, verifies
+its `default` namespace is empty, runs `get-credentials` against it, and hands its
+name to the gpu-stress-test stack, which then creates no per-run cluster: the task's
+synthetic `hypercomputer-agent`/`hpa-controller` Cloud Logging entries name the slot-c
+cluster in their resource labels, on every run. The cluster itself is not mutated —
+the entries are project-level and the stack's teardown removes only its fixture
+resource — but two consequences are standing state this README must own: the agent
+under test is pointed at slot c by name for the length of the eval, and any future
+scenario that reads slot c's Cloud Logging history (a `consistency-drift-outlier`
+investigation, say) will find those fixture entries attributed to it. Slot c carries
+the fleet's only defect that is invisible to a log-analysis task, which is why it is
+the only slot the presubmit may reuse; when it is absent or mid-maintenance, the
+presubmit provisions its own cluster rather than borrowing slot a or b.
+
 ## A read-only credential for evaluations
 
 An eval run reads this fleet to check its fixtures survived. It has no business being

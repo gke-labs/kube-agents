@@ -90,6 +90,21 @@ This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
 
+The shared workspace is the other way in, and it is not closed by the UID split
+either. Both containers mount the agent PVC and both write there with
+`umask 0002`, which they must: each has to be able to change what the other
+created. So a file the credential sidecar writes into a clone — a `.git/config`
+in a repository it cloned, say — is group-writable, and the sandbox is in that
+group. Configuration the sandbox edits there is configuration a later proxied
+command reads, and some of it names programs to run. What the UID split removes
+is the sandbox reading the sidecar's process state and private volumes by
+identity; what it does not remove is the sandbox reaching the sidecar through
+bytes the sidecar itself agreed to read. This predates the UID split — before
+it, those bytes were the sandbox's own — so nothing here made it worse, and
+nothing here closes it. What would close it is refusing the configuration keys
+that select a program to run, and that belongs to the command policy rather
+than to the Pod spec.
+
 ## Scope
 
 ### In scope
@@ -681,6 +696,16 @@ only command output, never a mounted Git credential file.
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
   privilege escalation, and use the runtime-default seccomp profile.
+- The Pod never sets `shareProcessNamespace`, and the two containers run as
+  different users: the sandbox as UID 10000, the `hermes` user the agent image's
+  files belong to, and the sidecar as UID 10001. Neither `/proc` nor a file mode
+  hands the sandbox the sidecar's environment.
+- Both keep GID 10000, which is also the Pod `fsGroup`. The workspace PVC is
+  mounted in both and each writes files the other has to change — the sandbox
+  creates the leased GitOps directory the sidecar clones into, the sidecar writes
+  the kubeconfig pin into a profile home the sandbox created — so both
+  entrypoints run with `umask 0002`. Files that predate the UID split are made
+  group-writable by the kubelet's `fsGroup` pass at every mount.
 - Every container the operator builds — the credential-cleanup init container,
   sandbox, dashboard, sidecar, log shipper — has a read-only root filesystem;
   writable state uses bounded `emptyDir` volumes. The sandbox and dashboard

@@ -20,6 +20,17 @@ variable "infra_provider" {
   description = "The target cloud provider (gcp, kind)"
 }
 
+# Set via TF_VAR_reuse_existing_cluster by hack/ci-eval-pr.sh when the leased
+# project carries the standing seeded fleet (bench/tf/fleet): the stack then
+# creates no cluster, plants its Cloud Logging fixture against the existing
+# cluster named by `cluster_name`/`location`, and destroy leaves that cluster
+# standing. false keeps the per-run cluster for a project without a fleet.
+variable "reuse_existing_cluster" {
+  type        = bool
+  description = "Create no cluster; treat cluster_name/location as an existing cluster the log fixture refers to."
+  default     = false
+}
+
 variable "cluster_name" {
   type        = string
   description = "Name of the cluster to provision"

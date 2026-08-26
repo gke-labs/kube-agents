@@ -108,10 +108,131 @@ uniform bucket-level access, in the cluster's region — and a gitignored
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
 installs in one project keep separate state. Versioning is the recovery story:
-a corrupted or mistakenly-overwritten state file can be restored from a prior
-generation with `gcloud storage restore`. If the state is gone entirely,
+a corrupted or mistakenly-overwritten state file can be rolled back to a prior
+generation by copying it over the live object (`gcloud storage ls -a` lists the
+generations; `gcloud storage restore` is for soft-deleted objects, which is a
+different feature — with versioning on, a previous generation is a noncurrent
+version rather than a soft-deleted object):
+
+```bash
+gcloud storage ls -a gs://<bucket>/<prefix>/default.tfstate
+gcloud storage cp gs://<bucket>/<prefix>/default.tfstate#<generation> \
+  gs://<bucket>/<prefix>/default.tfstate
+```
+
+If the state is gone entirely,
 re-run `lifecycle.sh apply` against the same tfvars — KMS adoption is
 automatic, and `terraform import` covers the rest.
+
+### Recovering from an interrupted apply
+
+An apply killed part-way — Ctrl-C, a dropped connection, a laptop lid — leaves
+state locked, and the next command fails with `Error acquiring the state lock`.
+`terraform force-unlock` is the release, and it works here; what trips people up
+is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
+generation number** of the lock object, not a UUID, and it is the `ID:` in the
+error Terraform just printed:
+
+```text
+Lock Info:
+  ID:        1787242876096737
+  Path:      gs://<bucket>/<prefix>/default.tflock
+```
+
+```bash
+terraform force-unlock 1787242876096737
+```
+
+Run it from a directory whose backend is already configured, or it will not
+reach the lock at all. `force-unlock` acts on whatever backend the working
+directory has, this composition ships no backend block, and `backend_override.tf`
+is gitignored and written only by `lifecycle.sh` — so in a checkout that has
+never been through `lifecycle.sh`, Terraform is on local state and refuses with a
+local-state error that never mentions GCS. That matters here more than it looks:
+`install.sh`, `uninstall.sh` and `upgrade.sh` all drive the apply from a
+disposable clone, so the directory that took the lock is routinely gone by the
+time anyone goes looking for it. The fix is the same one the `BackupPlan` import
+below needs — `KUBE_AGENTS_STATE_BUCKET=<same value> KUBE_AGENTS_STATE_PREFIX=<same value> ./lifecycle.sh adopt-kms`
+first, or work in a directory `lifecycle.sh` has already initialised.
+
+Pass a UUID from anywhere else — the `"ID"` field inside the lock object's own
+JSON, for instance — and it refuses with `Lock ID should be numerical value`,
+which reads like the backend not supporting `force-unlock` at all. It does.
+
+Establish that nothing is still applying before you run it. The ID in the error
+is the generation of the lock as it exists at that moment, so `force-unlock`
+matches it and releases it whether the holder is a dead process or a colleague's
+apply still running — the interactive confirmation is the only thing in the way,
+and `-force` removes that too. What the generation check does catch is a
+**stale** ID: one carried over from an earlier error, after which the lock was
+released and re-taken. Pass that and the command refuses rather than breaking a
+lock you were not looking at. That is the reason to prefer it to
+`gcloud storage rm gs://<bucket>/<prefix>/default.tflock`, which deletes the
+object whatever its generation and is the fallback for a lock whose ID you no
+longer have. `<bucket>` and `<prefix>` are the ones from
+[Remote state](#remote-state) — `<project_id>-kube-agents-tfstate` and
+`kube-agents/<cluster_name>` unless `KUBE_AGENTS_STATE_PREFIX` overrode it.
+
+A connectivity drop mid-apply produces two failures worth recognising, because
+neither means what it looks like:
+
+- **`http2: client connection lost` on the state upload.** Terraform retries this
+  itself and the retry usually succeeds, so the run can report a state-write
+  failure it then recovered from. Check the bucket before concluding state was
+  lost — and remember versioning is on, so a bad write can be rolled back to the
+  previous generation as above.
+- **A `BackupPlan` create that fails while polling its operation.** The
+  long-running operation keeps going server-side, so the plan is often `READY`
+  even though Terraform recorded a failure and holds nothing in state. Check with
+  `gcloud beta container backup-restore backup-plans describe`, then import it and
+  re-apply rather than deleting the plan to let Terraform recreate it.
+
+  Import into the same state the apply used, which on a remote-state install
+  means the backend has to be configured first. `backend_override.tf` is
+  gitignored and written only by `lifecycle.sh`, so in a checkout that has
+  `terraform.tfvars` but no override — one `install.sh` wrote into and something
+  later cleaned, say — a bare `terraform import` silently writes a **local**
+  `terraform.tfstate`, reports success, and leaves the next apply still trying to
+  create the plan. Run
+  `KUBE_AGENTS_STATE_BUCKET=<same value> ./lifecycle.sh adopt-kms` first — it is
+  the cheapest subcommand that initialises the backend — or work in a directory
+  `lifecycle.sh` has already initialised. Carry `KUBE_AGENTS_STATE_PREFIX` across
+  as well if the install set one. `ensure_backend` derives the prefix
+  independently of the bucket and inits with `-reconfigure`, so an omitted
+  override points the backend at the default `kube-agents/<cluster_name>` object,
+  and the import lands in an empty state that reports success while the real one
+  still has no plan.
+
+  `terraform.tfvars` is gitignored too, so a literally fresh clone has neither
+  file and fails earlier and more loudly: `ensure_backend` evaluates
+  `var.project_id` before it can write the override, and `lifecycle.sh` exits
+  with "could not evaluate var.project_id". Restore the tfvars the install used
+  before either recipe.
+
+  The import itself needs the placeholder Helm provider `adopt-kms` writes for
+  its own imports, and `lifecycle.sh` exposes no generic import subcommand to
+  borrow — so write it yourself. `terraform import` configures every provider
+  before it does anything, and the `helm` provider here is built from
+  `module.gke_cluster.cluster_endpoint`; the override was needed in practice even
+  with the cluster already in state. The filename suffix is what makes Terraform
+  treat it as an override, so keep it:
+
+  ```bash
+  cat > providers_lifecycle_override.tf <<'EOF'
+  provider "helm" {
+    kubernetes = {
+      host  = "https://127.0.0.1"
+      token = "placeholder"
+    }
+  }
+  EOF
+  terraform import 'module.gke_backup_plan[0].google_gke_backup_backup_plan.this' \
+    "projects/<project>/locations/<region>/backupPlans/<cluster_name>-backup-plan"
+  rm -f providers_lifecycle_override.tf
+  ```
+
+  Remove the override before the next apply — it is never meant to survive an
+  import, which is why `lifecycle.sh` deletes it on an `EXIT` trap.
 
 ### The `image_tag` rule
 
