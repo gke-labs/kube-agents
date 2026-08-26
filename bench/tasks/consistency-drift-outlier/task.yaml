@@ -17,6 +17,12 @@
 # authorized-networks config and c has none, making c the outlier. NOTE: this scenario is the
 # reason the seeded fleet needs THREE clusters, not two; two clusters have
 # no majority and no outlier.
+#
+# NOT date-gated, unlike fleet-cost-idle-pool. The consistency SOP has no age
+# threshold to wait out and drift-outlier is `available_from_day: 1` in
+# docs/designs/fleet-fixtures.yaml, so a replant of the fixtures does not move
+# this case's activation. Recorded here because the absence of a gate reads the
+# same as a forgotten one.
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped

@@ -167,7 +167,7 @@ identifier appears, add its source here.
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
 | Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |
 | Which CI pool project maps to which GitOps repository | `gitops_repo_for_project()` in `hack/ci-deploy.sh` |
-| Roles the pool verifier accepts as Artifact Registry upload rights, and the API set it requires | `scripts/verify_ci_pool_project.py`, whose `VALID_CMEK_STATES` mirrors `is_valid_cmek_encryption_state()` in `k8s-operator/scripts/installer_common.sh` and whose cluster names mirror `bench/tf/fleet` |
+| Roles the pool verifier accepts as Artifact Registry upload rights, and the API set it requires | `scripts/verify_ci_pool_project.py`, whose `VALID_CMEK_STATES` mirrors `is_valid_cmek_encryption_state()` in `k8s-operator/scripts/installer_common.sh` and whose cluster names mirror `bench/tf/fleet` and whose fixture check parses the summary line `hack/fleet-kubeconfigs.sh` prints |
 
 ## 3. Documentation eras and status
 

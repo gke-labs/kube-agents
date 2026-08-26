@@ -7,7 +7,7 @@ sidebar:
 
 Prow CI smoke tests lease dedicated GCP sandbox projects from a [Boskos](https://github.com/kubernetes-sigs/boskos) resource pool (`kube-agents-evals-project`) to isolate concurrent evaluation runs.
 
-Every GCP project registered in the Boskos pool must be provisioned with the prerequisites below before registering it in `oss-test-infra`.
+Every GCP project registered in the Boskos pool must be provisioned with the prerequisites below before its entry lands in the pool roster. That roster is in `gke-internal/test-infra`, not in `oss-test-infra` with the rest of the Prow config — section 8 covers the split, and section 9 covers the one thing that does live in `oss-test-infra`.
 
 Sections 1 to 6 are what a leasable project must end up holding, and section 7 is how you check it. `scripts/provision_ci_pool_project.sh --project-id=<id>` does all of it — grouped differently from the section order, since it enables the APIs, IAM and registry together before building the host cluster. Run the script rather than the individual commands, which are here so a project provisioned by hand does not miss one. Its flags: `--pem-file=PATH` imports the App private key in section 5 (without it the key stays `PENDING_IMPORT` and the run ends amber); `--skip-host-cluster` and `--skip-fleet` skip sections 2 and 6 for a project that already has them; `--allow-unmapped` downgrades the mapping precondition below to a warning; `--app-id` overrides the App the run provisions and verifies against.
 
