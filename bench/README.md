@@ -15,6 +15,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests against a local HTTP stub.
+- `tools/` — operator-run scripts that are neither tasks nor tests. `live_check_fleet_safeguards.py` drives every `fleet_resource_property` check in the cluster-debugging cases against a live cluster, through the real verifier, without running an agent.
 
 To add a task or plug in a different agent, see
 [CUSTOM-TASKS.md](CUSTOM-TASKS.md).

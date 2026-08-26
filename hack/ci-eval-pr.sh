@@ -431,9 +431,13 @@ TASKS=(
   # sequential and the Prow job's wall clock drops whatever it has not
   # reached -- and the incumbent immediately after them is the only
   # `deployer: tofu` entry in the array, which spends minutes provisioning a
-  # cluster before it scores anything. All three are `deployer: noop`, so
-  # nothing behind them pays for the move. gke-labs/kube-agents#956 orders
-  # its six the same way, for the same reason.
+  # cluster before it scores anything. All three are `deployer: noop`, so the
+  # move adds no provisioning to what runs behind them -- it does add three
+  # agent runs, which is the cost being traded against scoring the fleet
+  # cases at all. gke-labs/kube-agents#956 orders its six the same way, for
+  # the same reason, and both orderings cannot be first: whichever merges
+  # second should reconcile this comment rather than stack another "these run
+  # FIRST" claim beside it.
   # Four more cluster-debugging cases, not among the ten registered below.
   # THREE are active; the fourth is commented out below them, and why is
   # worth reading before uncommenting it. All four are read-only: no pull
@@ -822,7 +826,26 @@ else:
     # evalharness -- so printing it costs a dict lookup and saves a
     # 25-minute round trip.
     detail = []
+    # One check per line, so collapse whitespace inside a reason. A pydantic
+    # ValidationError reason is multi-line, and an embedded newline would put
+    # an unindented continuation into a list the reader is scanning by its
+    # leading '  - '.
+    def one_line(text):
+        return ' '.join((text or '').split())[:400]
     if problems:
+        # A spec entry that failed to parse never reaches
+        # 'verification_report' at all: devops_bench puts it in the separate
+        # top-level 'verification_parse_errors', and rollup() adds one to the
+        # objective denominator per error with nothing to the numerator (fail
+        # closed). So a single typo'd field drops VerificationCorrectness
+        # below the floor while the report holds nothing but passes -- and a
+        # verdict that lists no failing check then reads as 'everything
+        # passed, the score is just wrong'. List these first: a spec that did
+        # not parse is a defect in the case, not in the agent.
+        for pe in rec.get('verification_parse_errors') or []:
+            detail.append(
+                f\"  - {pe.get('name')} [spec] parse-error: {one_line(pe.get('reason'))}\"
+            )
         for e in rec.get('verification_report') or []:
             if e.get('status') == 'pass':
                 continue
@@ -833,7 +856,7 @@ else:
                 where += '/' + str(e.get('severity'))
             detail.append(
                 f\"  - {e.get('name')} [{where}] \"
-                f\"{e.get('status')}: {(e.get('reason') or '').strip()[:400]}\"
+                f\"{e.get('status')}: {one_line(e.get('reason'))}\"
             )
     if not problems:
         print('PASS')

@@ -1,6 +1,6 @@
 # GitHub token minter for a CI evaluation-pool project
 
-Root composition that provisions the [GitHub token minter](../../modules/github-minter/README.md)'s GCP half in **one** project of the Prow evaluation pool (`kube-agents-evals-project`), so that the presubmit eval's GitHub-writing scenarios — the fleet-audit streams and `rca-remediation-pr` — can mint a token scoped to that project's GitOps repository and no other.
+Root composition that provisions the [GitHub token minter](../../modules/github-minter/README.md)'s GCP half in **one** project of the Prow evaluation pool (`kube-agents-evals-project`), so that the presubmit eval's GitHub-writing scenarios — the six fleet-audit streams and both remediation cases — can mint a token scoped to that project's GitOps repository and no other.
 
 This is not an installer. The pool projects already have their `platform-agent-host` cluster, their agent GSA, and their Artifact Registry repository; those were provisioned before this composition existed and stay outside its state. It adds only the three things the minter needs and nothing else:
 

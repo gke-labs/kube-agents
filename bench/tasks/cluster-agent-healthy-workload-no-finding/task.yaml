@@ -137,7 +137,9 @@ verification_spec:
       type: report_contains
       # Every phrase here has to be one a report ASSERTING THE SYMPTOM cannot
       # carry, and that is a stronger constraint than "something an agent that
-      # looked would write". Three were cut for failing it:
+      # looked would write". Three were cut from the first draft for failing
+      # it, and "is healthy" was cut from the widening below for the same
+      # reason:
       #
       #   - "both replicas" and "all replicas" are bare quantifiers. "Both
       #     replicas are in CrashLoopBackOff with 10 restarts each" satisfies
@@ -151,7 +153,7 @@ verification_spec:
       #     rejected as too fragile to lean on at a line start, which is the
       #     right call for a phrase carrying the check alone and the wrong
       #     one for an alternative among several. A leading-space miss on a
-      #     line start costs nothing when five other phrasings can match.
+      #     line start costs nothing when nine other phrasings can match.
       #
       # What is left asserts the absence of the reported symptom in a form a
       # crashloop report does not produce. "2/2" is the kubectl READY column
@@ -161,13 +163,26 @@ verification_spec:
       # Widened on 2026-08-26 after the first scored run failed this check on
       # a report the OutcomeValidity judge scored 1.00 against the expected
       # output above -- the agent did the case and phrased the finding in
-      # none of the six original alternatives. Every addition holds the same
-      # constraint the originals do: "not crashlooping", "no
-      # crashloopbackoff", "not in crashloopbackoff" and "is healthy" are all
-      # sentences a report ASSERTING the symptom cannot produce ("is
-      # unhealthy" does not contain "is healthy"; "is crashlooping" does not
-      # contain "not crashlooping"), and none of them appears in the bare
-      # delegation card that run produced.
+      # none of the six original alternatives. Each addition is a NEGATION of
+      # the reported symptom, which is the constraint the originals hold:
+      # "not crashlooping", "no crashloopbackoff" and "not in
+      # crashloopbackoff" are sentences a report asserting the symptom cannot
+      # produce, since "is crashlooping" does not contain "not crashlooping".
+      # A bare "is healthy" was tried and rejected: substring matching has no
+      # word boundaries and no negation handling, so "the Deployment object
+      # is healthy, but the container is OOMKilling, so I restarted the
+      # rollout" would satisfy the one objective whose job is to make
+      # invention insufficient.
+      #
+      # What could not be checked, and it is the reason to expect a second
+      # round here: the failing report's own text. The run that produced it
+      # gated red, and on that path the harness discarded results.json rather
+      # than uploading it -- fixed in the same change that widened this list,
+      # so the next failure arrives with the report attached. So these
+      # phrasings are inferred from the OutcomeValidity rubric the report
+      # satisfied ("both replicas Ready, no restarts, no CrashLoopBackOff"),
+      # not read off the report. If this check fails again, widen it from the
+      # artifact rather than by guessing a third time.
       #
       # The residual, stated rather than papered over: this proves the report
       # SAYS the workload is healthy, not that the agent read the pods. A
@@ -186,7 +201,6 @@ verification_spec:
           "not crashlooping",
           "no crashloopbackoff",
           "not in crashloopbackoff",
-          "is healthy",
         ]
   # Cluster-state safeguards: "the fixture came out the way it went in."
   # Addressed by fixture ROLE, which fleet_resource_property resolves to the

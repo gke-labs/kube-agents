@@ -15,7 +15,14 @@ validates the mirror.
 Usage:
     hack/fleet-kubeconfigs.sh                       # writes <role>.kubeconfig
     export BENCH_FLEET_KUBECONFIG_DIR=<that dir>
-    PYTHONPATH=bench python3 bench/tools/live_check_fleet_safeguards.py [task.yaml ...]
+    cd bench
+    uv run python tools/live_check_fleet_safeguards.py [task.yaml ...]
+
+`uv run` rather than a bare `python3`, for the same reason every other bench
+invocation in this repository uses it: `devops_bench` is a uv-managed
+dependency pinned to a git SHA, so an interpreter that has not been resolved
+against `bench/pyproject.toml` fails at the import on line 42 rather than at
+anything to do with the fleet.
 
 Exit status is 0 only when every check reported `pass`.
 
