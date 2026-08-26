@@ -15,14 +15,15 @@ output "kms_key_version_name" {
 
 # The two steps Terraform cannot take, spelled out with this project's values
 # already substituted. The PEM must never enter Terraform state, and a GitHub
-# App installation is not a GCP resource.
+# App installation is not a GCP resource. The closing note is not a third step;
+# it says when the two have to be done by.
 output "manual_steps" {
   description = "The human-only half of the setup for this project."
   value       = <<-EOT
     1. Confirm the kube-agents-evals-token-minter App (ID 4675512) is
        installed on ${var.gitops_repo} with contents:write,
-       pull_requests:write and issues:write. It already is for all three pool
-       projects; onboarding a FOURTH project means adding its repository to
+       pull_requests:write and issues:write. It already is for every project
+       onboarded so far; onboarding a new one means adding its repository to
        that installation, and that edit is the security review. This — not
        the minty rule, and not hack/ci-deploy.sh — is what bounds where a run
        can write, because a token the App mints can only ever reach
@@ -47,11 +48,12 @@ output "manual_steps" {
            -key=${module.github_minter.kms_key} \
            -private-key=@/path/to/app-private-key.pem
 
-    3. Set EVAL_GITHUB_APP_ID=4675512 in the Prow job environment.
-       hack/ci-deploy.sh keeps githubMinter.enabled=false until it is set,
-       because the minter Deployment is part of the release helm --wait gates
-       on: enabling it before step 2 fails every presubmit. The value is the
-       same for every pool project — one App serves the pool; what differs
-       per project is the KMS key its PEM was imported into.
+    Do both before Boskos registration, not after. EVAL_GITHUB_APP_ID=4675512
+    has been set pool-wide in the Prow job environment since 2026-08-25
+    (oss-test-infra#2661), so nothing holds githubMinter.enabled=false any
+    more. Register before step 2 and the minter Deployment points at a key
+    with no enabled version: it fails readiness, `helm upgrade --wait
+    --timeout 15m` gates on it, and every lease of the project dies fifteen
+    minutes in.
   EOT
 }

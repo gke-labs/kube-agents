@@ -7,7 +7,15 @@ sidebar:
 
 Prow CI smoke tests lease dedicated GCP sandbox projects from a [Boskos](https://github.com/kubernetes-sigs/boskos) resource pool (`kube-agents-evals-project`) to isolate concurrent evaluation runs.
 
-Every GCP project registered in the Boskos pool must be provisioned with the prerequisites below before registering it in `oss-test-infra`.
+Every GCP project registered in the Boskos pool must be provisioned with the prerequisites below before its entry lands in the pool roster. That roster is in `gke-internal/test-infra`, not in `oss-test-infra` with the rest of the Prow config — section 8 covers the split, and section 9 covers the one thing that does live in `oss-test-infra`.
+
+Sections 1 to 6 are what a leasable project must end up holding, and section 7 is how you check it. `scripts/provision_ci_pool_project.sh --project-id=<id>` does all of it — grouped differently from the section order, since it enables the APIs, IAM and registry together before building the host cluster. Run the script rather than the individual commands, which are here so a project provisioned by hand does not miss one. Its flags: `--pem-file=PATH` imports the App private key in section 5 (without it the key stays `PENDING_IMPORT` and the run ends amber); `--skip-host-cluster` and `--skip-fleet` skip sections 2 and 6 for a project that already has them; `--allow-unmapped` downgrades the mapping precondition below to a warning; `--app-id` overrides the App the run provisions and verifies against.
+
+## 0. Preconditions
+
+Everything below provisions _into_ a project that already exists and already has a billing account linked. The script checks both before it touches anything, because `gcloud services enable` against a project with no billing account fails with a message that does not mention billing. It stops on a project it cannot see, and on billing it can read and finds off; billing it _cannot_ read is a visibility limit, so it warns and continues. Which billing account, and how a project gets linked to it, is not recorded here.
+
+The project must also be mapped in `gitops_repo_for_project()` in `hack/ci-deploy.sh`, to `gke-agentic/<project>-infra`, with the same pair in `_EXPECTED_MAPPING` in `tests/test_ci_gitops_repo.py`. That is a code change the script cannot make, so it checks for it first: an unmapped project fails every lease at that function's refusal, and section 7 would fail on it anyway. Land the mapping before provisioning.
 
 ## 1. Enabled GCP APIs
 
@@ -15,6 +23,7 @@ The project must have the following Google Cloud APIs enabled:
 
 ```bash
 gcloud services enable \
+  compute.googleapis.com \
   container.googleapis.com \
   cloudbuild.googleapis.com \
   artifactregistry.googleapis.com \
@@ -26,7 +35,9 @@ gcloud services enable \
   --project="${PROJECT_ID}"
 ```
 
-`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it.
+`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
+
+This list and `REQUIRED_APIS` in `scripts/verify_ci_pool_project.py` must agree — the verifier fails a project for an API this block does not mention, and passes one that is missing an API only this block names.
 
 ## 2. Host GKE Cluster (`platform-agent-host`)
 
@@ -34,14 +45,24 @@ A long-lived GKE cluster hosting the Platform Agent and evaluation infrastructur
 
 - **Cluster Name**: `platform-agent-host`
 - **Location**: `us-central1` (regional or zonal, matching `hack/ci-env.sh`)
-- **Database Encryption**: CMEK encryption enabled (`ALL_OBJECTS_ENCRYPTION_ENABLED`), required by `hack/ci-deploy.sh` when `ALLOW_UNENCRYPTED_SECRETS=false`.
+- **Database Encryption**: CMEK encryption enabled (`ALL_OBJECTS_ENCRYPTION_ENABLED`). `full-install` creates the cluster this way, so any other state is drift.
 
-The cluster can be provisioned using the Terraform modules in `terraform/examples/full-install`:
+The cluster is provisioned by the `terraform/examples/full-install` composition, through its `lifecycle.sh` rather than a bare `terraform apply` — `cluster_name`, `location`, and `api_server_key` have no defaults, so the bare form fails on the missing variables:
 
 ```bash
 cd terraform/examples/full-install
-terraform apply -var="project_id=${PROJECT_ID}"
+cat > terraform.tfvars <<EOF
+project_id     = "${PROJECT_ID}"
+cluster_name   = "platform-agent-host"
+location       = "us-central1"
+api_server_key = "$(openssl rand -hex 16)"
+EOF
+KUBE_AGENTS_STATE_BUCKET="${PROJECT_ID}-tf-state" \
+KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
+  ./lifecycle.sh apply
 ```
+
+`api_server_key` is generated the same way `hack/ci-deploy.sh` generates it when unset. It is regenerated on every apply, which is why section 8 forbids re-running the provisioning script after registration.
 
 ## 3. Service accounts and IAM
 
@@ -52,11 +73,12 @@ terraform apply -var="project_id=${PROJECT_ID}"
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
   ```
-- **Cloud Build Service Account** (`${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`):
-  - `roles/artifactregistry.writer` in `${PROJECT_ID}` (to push PR build images).
-  - `roles/artifactregistry.reader` in `kube-agents-prow` (to pull the warm `:latest` cache image).
+- **Upload rights on the project's own registry**, so a presubmit can push its PR build images. `roles/artifactregistry.writer` is the grant to make explicitly, and `scripts/provision_ci_pool_project.sh` makes it. The pool projects that predate the script reach the same permission indirectly — Cloud Build through `roles/cloudbuild.builds.builder`, the Compute default SA through the `roles/editor` GCP grants it by default — which is why `AR_WRITER_ROLES` in `scripts/verify_ci_pool_project.py` accepts a set rather than the one role. `roles/owner` is deliberately not in it. Either build identity holding one of those roles satisfies the check.
+- **Reader on the warm cache image**, in the `kube-agents` repository of `kube-agents-prow` — the repository at location `us`, not the project, and not `us-central1`, because that is where `hack/ci-deploy.sh`'s default `CACHE_IMAGE` lives. Both identities need `roles/artifactregistry.reader` there, and the verifier fails the project if either is missing:
+  - `${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`
+  - `${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`
 - **GKE Node Service Account**:
-  - `roles/artifactregistry.reader` in `${PROJECT_ID}` to pull operator and agent images.
+  - `roles/artifactregistry.reader` in `${PROJECT_ID}` to pull operator and agent images. The verifier checks this against the account the host cluster's nodes actually run as, read from `nodePools[].config.serviceAccount` — `default` meaning the Compute default SA. Any role in `AR_PULLER_ROLES` satisfies it, which is `AR_WRITER_ROLES` plus the reader role, since every role that confers push already confers read. Push and pull are separate assertions: a project where only Cloud Build can push fails on this one.
 
 ## 4. Artifact Registry repository and cleanup policy
 
@@ -121,16 +143,23 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 | `kube-agents-evals` | `gke-agentic/kube-agents-evals-infra` |
 | `kube-agents-evals-2` | `gke-agentic/kube-agents-evals-2-infra` |
 | `kube-agents-evals-3` | `gke-agentic/kube-agents-evals-3-infra` |
+| `kube-agents-evals-4` | `gke-agentic/kube-agents-evals-4-infra` |
+| `kube-agents-evals-5` | `gke-agentic/kube-agents-evals-5-infra` |
+| `kube-agents-evals-6` | `gke-agentic/kube-agents-evals-6-infra` |
 
 The repository is kept private: it is throwaway state a bot rewrites on every run. [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) is the layout an audit expects to find, not a required seed — the current pool repositories carry only a LICENSE and a README, because an audit works against an empty tree and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
 
-> **The pool's three projects are all provisioned, as of 2026-08-24.** `kube-agents-evals-3` was added to the Boskos pool on 2026-08-21 with only its GCP half done, so every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal. That is closed. Verified in all three projects:
+> **Every project in the table above is provisioned; not every one is leasable.** A project enters the table when both its halves are done, and gains a Boskos entry later — so which projects a presubmit can actually lease is the roster in `gke-internal/test-infra`, not this page. Everything from `kube-agents-evals-4` on was provisioned by `scripts/provision_ci_pool_project.sh` and verified before registration rather than after, the order this page prescribes. Run `scripts/verify_ci_pool_project.py <project>` for the current state of any one of them; three of the things it checks are:
 >
 > 1. The private GitOps repository exists and is mapped in the table above.
-> 2. App `4675512` resolves to all three pool repositories, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`, `metadata: read`.
+> 2. App `4675512` resolves to every pool repository, still `repository_selection: selected`, with `contents: write`, `issues: write`, `pull_requests: write`, `metadata: read`.
 > 3. `terraform/examples/ci-pool-minter` is applied per project: each carries `kubeagents-github-minter-gsa@<project>.iam.gserviceaccount.com` and the key ring `github-token-minter-keyring` with key `github-token-minter-key` in `us-central1`, and the App PEM is imported — `gcloud kms keys versions list` shows exactly one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each.
 >
-> One step remains and it is not in this repository: `EVAL_GITHUB_APP_ID=4675512` is still unset in the Prow job environment, so `hack/ci-deploy.sh` renders `githubMinter.enabled=false` for every lease and an audit stream still fails at `audit_report.py start` for want of a token. Setting it — together with mounting the ledger-read token the bench verifiers need — is [`GoogleCloudPlatform/oss-test-infra#2661`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2661), open and unmerged. Because the switch is pool-wide, it is only safe to set once the manual half is true of every project in the pool, which it now is.
+> `kube-agents-evals-3` is the counter-example that order exists to prevent. It joined the Boskos pool on 2026-08-21 with only its GCP half provisioned, so for three days every presubmit that leased it stopped at `gitops_repo_for_project()`'s unmapped-project refusal, taking a share of every open pull request's smoke test with it. Its repository landed 2026-08-21, its place in the App installation 2026-08-23, and its minter — the `ci-pool-minter` apply plus the PEM import — on 2026-08-24.
+>
+> **Register a project last, because the switch is pool-wide.** `hack/ci-deploy.sh` enables the minter whenever `GITOPS_REPO` is non-empty and `EVAL_GITHUB_APP_ID` is set, so a project that is mapped but has no key ring renders a `github-token-minter` Deployment pointing at nothing. That pod fails its readiness probe, and the minter is part of the release `helm upgrade --install --wait --timeout 15m` gates on, so the run dies fifteen minutes into the chart-deployment step while leases of the other projects pass. `EVAL_GITHUB_APP_ID` is set in the Prow job environment as of 2026-08-25, so that hazard is live for the next project added rather than hypothetical: the variable means "the manual half is done", and it is only true of the pool when it is true of every project in it.
+>
+> Reverting the mapping is not the fix. It restores the immediate, named refusal at `gitops_repo_for_project()` — more legible than a fifteen-minute timeout, and the fast-fail this page exists to preserve — but a lease of the project still fails, so it buys diagnosability, not a working project. Finish the project or drop it from the pool. Section 7 is how you tell which case you are in without waiting for a presubmit to find out.
 
 ### 5.1 How CI resolves it
 
@@ -138,7 +167,9 @@ The repository is kept private: it is throwaway state a bot rewrites on every ru
 
 CI supplies the value rather than relying on the chart default, and that is deliberate. A presubmit builds and deploys the pull request's own chart, operator, and agent, so a pull request that blanks `platformAgent.integration.github.gitRepo` in `values.yaml`, or breaks the CR-to-`SETTINGS.md` rendering, is exactly the regression the eval should surface as a failed scenario — which it can only do if the value the run is supposed to use comes from outside the artefacts under test. (This is a correctness argument, not the containment boundary; see 5.3.)
 
-Adding a project is one line in `gitops_repo_for_project()` and one row in the table above. An unmapped project stops the deploy:
+Adding a project is one line in `gitops_repo_for_project()`, one row in the table above, and one entry in `_EXPECTED_MAPPING` in [`tests/test_ci_gitops_repo.py`](https://github.com/gke-labs/kube-agents/blob/main/tests/test_ci_gitops_repo.py). The test entry is the one that is easy to skip: the suite iterates that dictionary rather than parsing the function for projects it does not know about, so a mapping added without it stays green and stays untested.
+
+An unmapped project stops the deploy:
 
 - **In a Prow run** (`PULL_NUMBER` or `JOB_NAME` set) the script exits non-zero and names the function to edit. It also refuses an `EVAL_GITOPS_REPO` override, because under Boskos the project is leased per run and a value pinned in the job environment would eventually point one project's run at another project's repository.
 - **On a laptop** the script exits non-zero too, and prints the two ways to say where the run writes: `EVAL_GITOPS_REPO=owner/repo` for your own throwaway repository, or `EVAL_GITOPS_REPO=none` to deploy with the GitHub integration off. Neither path is a default — an empty `gitRepo` is only ever reached by asking for it.
@@ -163,10 +194,10 @@ That provisions the minter GSA, its Workload Identity binding to `kubeagents-sys
 
 Two steps have no Terraform equivalent and must be done by a human with the corresponding rights:
 
-1. **Install the GitHub App on the repository** (org-admin on `gke-agentic`, plus App-manager rights). Grant `contents: write`, `pull_requests: write`, and `issues: write`, on that one repository. **Done for all three current pool projects** — see the App below; a fourth project means adding its repository to the same installation.
+1. **Install the GitHub App on the repository** (org-admin on `gke-agentic`, plus App-manager rights). Grant `contents: write`, `pull_requests: write`, and `issues: write`, on that one repository. **Done for every project in the table above** — see the App below; each further project means adding its repository to the same installation, and that edit is the security review.
 2. **Import the App's private key** into the project's KMS signing key with the Minty CLI. The PEM must never enter Terraform state, so the key is created import-only and empty; the command is in the [composition's README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/ci-pool-minter). Confirm version 1 reaches `ENABLED`. This one is per project — the same PEM, imported into each project's own key.
 
-The pool is served by a single App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on `gke-agentic/kube-agents-evals-infra`, `gke-agentic/kube-agents-evals-2-infra`, and `gke-agentic/kube-agents-evals-3-infra`:
+The pool is served by a single App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on each project's `gke-agentic/<project>-infra` repository and nothing else. The query below is the list, rather than a copy of it kept here to go stale:
 
 ```bash
 gh api /orgs/gke-agentic/installations \
@@ -176,7 +207,7 @@ gh api /orgs/gke-agentic/installations \
 
 It is a dedicated App rather than the organisation's existing all-repositories minter, and that is a deliberate cost. Reusing the staging App would have copied its signing key into every pool project's KMS, added unreviewed presubmit code to the callers of an identity that otherwise only serves merged code, and coupled rotation — an eval incident forcing a key rotation would have taken staging and autopush with it.
 
-Only then set `EVAL_GITHUB_APP_ID=4675512` in the Prow job environment. The value is the same for every pool project. `hack/ci-deploy.sh` keeps `githubMinter.enabled=false` until it is set, because the minter Deployment is part of the release `helm --wait` gates on: enabling it before the key import fails every presubmit instead of degrading quietly.
+Only then does `EVAL_GITHUB_APP_ID=4675512` belong in the Prow job environment. The value is the same for every pool project, and it is set there as of 2026-08-25 ([oss-test-infra#2661](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2661)). `hack/ci-deploy.sh` keeps `githubMinter.enabled=false` while it is unset, because the minter Deployment is part of the release `helm --wait` gates on: enabling it before the key import fails every presubmit instead of degrading quietly. Now that it is set, a project added to the pool before its key import fails that way — which is what section 7 is for.
 
 ### 5.3 What actually bounds where a run can write
 
@@ -196,7 +227,7 @@ tofu init -reconfigure \
 tofu apply -var="project_id=${PROJECT_ID}"
 ```
 
-The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. All three pool projects are applied as of 2026-08-24, and `hack/fleet-kubeconfigs.sh` run against each of them confirms all seven fixture roles — `7 role(s) written, 0 on clusters that could not be resolved or reached, 0 whose fixtures were not present`. That command is the check to re-run before believing this paragraph; a project it reports anything else for is a project the stack needs re-applying in.
+The fleet owner creates `gs://${PROJECT_ID}-tf-state` once per project. Confirming the apply is section 7's job: `scripts/verify_ci_pool_project.py` runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles, so there is no separate command to remember here and no dated claim about which projects are planted to go stale. Anything other than `7 role(s) written, 0 on clusters that could not be resolved or reached, 0 whose fixtures were not present` is a project the stack needs re-applying in.
 
 Nothing outside the fleet's own catalog addresses these clusters by name. `hack/fleet-kubeconfigs.sh` discovers them in the leased project by the labels the stack applies (`environment=seeded`, `managed-by=kube-agents-seeded-fleet`), so a project may use a different `cluster_prefix` or region without any scenario changing. The one other sanctioned consumer discovers by the same labels: `hack/ci-eval-pr.sh` §3b reuses the slot-c cluster as the presubmit's log-fixture subject instead of provisioning a per-run cluster, mutating nothing in it — the fleet's catalog (`bench/tf/fleet/fixtures.json`) records the exception.
 
@@ -211,7 +242,30 @@ The seam exists: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.i
 1. Add the Prow identity to `fleet_reader_token_creators` and re-apply the stack, which binds it `roles/iam.serviceAccountTokenCreator` on that account alone.
 2. Export `FLEET_READONLY_SA=seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` in the Prow job. Unset, `hack/fleet-kubeconfigs.sh` warns on every run and the kubeconfigs carry the runner's own identity.
 
-## 7. Boskos pool registration
+## 7. Pre-flight verification
+
+`scripts/verify_ci_pool_project.py` checks the live project against the sections above. Run it before section 8.
+
+```bash
+python3 scripts/verify_ci_pool_project.py --project-id kube-agents-evals-4 \
+  --confirmed-repo-in-app-installation
+```
+
+It exits `0` when everything checked passed, `1` when a prerequisite failed, and **`2` when nothing failed but something could not be checked**. The third code exists because a script that prints "ALL CHECKS PASSED" over items it merely could not read gives the same false assurance that let `kube-agents-evals-3` into the pool. Treat `2` as "go and look", not as a pass.
+
+`scripts/provision_ci_pool_project.sh` runs it as its own last step, so a project provisioned by the script has been through this already.
+
+One check is not a read-only API call. `Seeded Fleet Fixtures` runs `hack/fleet-kubeconfigs.sh`, which needs `kubectl` and fetches cluster credentials into a temporary directory it removes on the way out. Without `kubectl` on `PATH` that item reports as unverified rather than failing the project.
+
+**It is not a complete reading of this page.** `REQUIRED_APIS` in the script is the list it enforces for section 1, the seeded fleet's three clusters and `gs://<project>-tf-state` from section 6 are checked by name and its planted fixtures by running `hack/fleet-kubeconfigs.sh`, and the section 3 grants it covers are the `kube-agents-prow` reader grants and the host cluster's node account's pull rights on the project's own registry — read off `nodePools[].config.serviceAccount` rather than assumed to be the Compute default — but not the host cluster's location. Read the script's check list rather than assuming a green run means every paragraph above is satisfied.
+
+Some items report `2` rather than passing or failing on their own. The first two always need an operator; the third only when the probe cannot run at all.
+
+- **The mapping on `main`.** The check reads `hack/ci-deploy.sh` twice, from this checkout and from `gke-labs/main`, because a presubmit runs main's copy rather than your branch's. A row that exists only on the branch reports `2` with `not yet on gke-labs/main`. The project is provisioned; registering it before the row merges is the `kube-agents-evals-3` outage again. Land the pull request and re-run. What it reads for main is the remote-tracking ref — the last `git fetch`, not GitHub — so the warning names that snapshot's date, and a snapshot old enough to predate `gitops_repo_for_project()` itself reports `2` saying the copy could not be read rather than claiming any project is unmapped.
+- **Installation membership.** Listing an App installation's selected repositories needs a token authorized to the App itself; an operator PAT is not one, and no OAuth scope makes it one. Open the installation's settings page on the `gke-agentic` org — `gh api /orgs/gke-agentic/installations --jq '.installations[] | select(.app_id==4675512) | .html_url'` prints the URL — confirm `gke-agentic/<project>-infra` is in the list, and pass `--confirmed-repo-in-app-installation`. The summary then reports the item as operator-confirmed rather than machine-checked. If the list ever does become readable and the repository is genuinely absent, the flag does not override that.
+- **Signing.** The script asks KMS to sign a GitHub App JWT and calls `GET /app` to see whether GitHub accepts it as App `4675512`. It signs with the version the chart deploys — `githubMinter.kms.keyVersion` in `charts/kube-agents/values.yaml`, which nothing in `hack/ci-deploy.sh` overrides — rather than the newest enabled one, and fails the project when that version is not `ENABLED`. A rotation that imports a new version and disables the pinned one would otherwise pass here and then fail every lease, because the deployed minter loads the pinned version and nothing else. This is the only check that proves the imported material is a private key of _this_ App: KMS stores opaque bytes, so a PEM from another App imports cleanly, reports `ENABLED`, satisfies every attribute check, and fails for the first time at a real push. Signing needs `cloudkms.cryptoKeyVersions.useToSign` on the key. Without it — or without egress to `api.github.com` — the run reports `2` rather than failing the project, because that is a limit of the operator's credentials and not a defect in the project. No attestation flag is offered for this one, unlike membership above: whether the bytes in KMS belong to this App is not something anyone can establish by looking at a console.
+
+## 8. Boskos pool registration
 
 Once the GCP project is provisioned with the prerequisites above, register the project ID under the `kube-agents-evals-project` resource type in the Prow Boskos deployment configuration:
 
@@ -229,4 +283,14 @@ This roster does not live in `oss-test-infra` with the rest of the Prow config �
 
 **Register the project last.** Everything above — the APIs, the cluster, the registry, the GitOps repository, the App installation, the key import, the `gitops_repo_for_project()` row, the seeded fleet — is a prerequisite of the entry in this list, not a follow-up to it. A project that becomes leasable before it is onboarded takes a share of every presubmit and fails it, which is how `kube-agents-evals-3` broke the smoke test for every open pull request on 2026-08-21.
 
+**And do not re-run `scripts/provision_ci_pool_project.sh` after it.** Registration is the boundary in both directions. Before it, re-running is free and expected — a first run rarely reaches the end, and every section above is written to be repeatable. After it, the script is the wrong tool: step 2.1 generates a fresh `api_server_key` on each invocation and `terraform/examples/full-install` writes it into the agent's Secret, so a re-run rotates a credential out from under whatever run currently holds the lease, and the agent pod keeps serving the old value until something restarts it. Nothing in the script stops you, and nothing in the failure looks like its cause. Repairing a registered project is a different job from onboarding one, and there is no tooling for it yet.
+
 > **Important:** The Boskos janitor must be disabled for `kube-agents-evals-project` so that the long-lived `platform-agent-host` cluster and pre-warmed state are preserved across leases.
+
+## 9. Raise the presubmit's concurrency
+
+Registration makes a project leasable; it does not make the presubmit use it. The evaluation job's `max_concurrency` in `oss-test-infra` caps how many runs are in flight at once, and the pool size is only a ceiling above it — add five projects without raising that number and the presubmit runs exactly as many evals as it did before, with the new projects idle.
+
+Raise it to the number of leasable projects, not the number provisioned. A slot with no project to lease blocks on Boskos rather than running.
+
+This is the one step in a different repository from section 8's roster: `oss-test-infra` holds the job config, `gke-internal/test-infra` holds the pool. Neither knows about the other, so a change to one is never a prompt to change the other.
