@@ -477,17 +477,16 @@ TASKS=(
   #       oss-test-infra#2661 mounts secret kube-agents-bench-github-token
   #       into the presubmit as exactly that.
   #   A5  CLEARED, and that is what the active entry above rests on. Step 2b
-  #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
-  #       fleet safeguards use `fleet_resource_property` with a
+  #       writes one kubeconfig per seeded-fleet fixture ROLE, and every
+  #       fleet safeguard uses `fleet_resource_property` with a
   #       `fixture_role:` instead of reading the ambient kubeconfig (which
   #       is platform-agent-host and carries no seeded namespace). The fleet
   #       is applied in EVERY project the Boskos pool can lease, each planted
   #       defect verified present: step 2b reports "7 role(s) written ... 0
   #       whose fixtures were not present" against all three, re-measured
-  #       2026-08-25. The five other fleet scenarios were never held by A5
-  #       alone -- each also carries A1, A3 or A4 -- so they stay commented
-  #       out on those, and DRAFTS.md's status column no longer names A5 at
-  #       all. One residual, which is hardening rather than a gate: with
+  #       2026-08-25. No scenario was ever held by A5 alone except the active
+  #       one, and DRAFTS.md's status column no longer names A5 at all. One
+  #       residual, which is hardening rather than a gate: with
   #       FLEET_READONLY_SA unset the role kubeconfigs carry the runner's own
   #       identity, which can write to the shared fleet
   #       (roles/container.admin via the GKE IAM webhook, nothing to narrow
