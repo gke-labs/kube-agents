@@ -1,14 +1,19 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS.
+# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS.
 #
 # Domain: cluster debugging. Journey: the RCA has to be backed by what the
 # agent actually observed, not by a plausible label.
 #
 # A1 and A4 closed on 2026-08-25 and never applied here: this case opens no
-# pull request and reads no ledger. A5's residual applies as it does to every
-# fleet case — without FLEET_READONLY_SA the safeguard runs under the
+# pull request and reads no ledger. A5's residual applies as it does to
+# every fleet case — without FLEET_READONLY_SA the safeguard runs under the
 # runner's own read-write identity, a privilege gap rather than a functional
-# block. What keeps it commented out is that it has never been run
-# (`validated: false`).
+# block. It is uncommented while still `validated: false`, as
+# cluster-agent-crashloop-debug was: only a scored presubmit run closes that
+# field. The verification half has been watched both ways — on 2026-08-26
+# every safeguard here passed against real Kubernetes objects matching the
+# fixture, then failed against each mutation a misbehaving agent would make,
+# then passed again on revert. What is left to watch is the agent half, and
+# activating this is what buys it.
 #
 # What it adds over cluster-agent-crashloop-debug. That case's
 # expected_output asks for the root cause "quoting the exact evidence

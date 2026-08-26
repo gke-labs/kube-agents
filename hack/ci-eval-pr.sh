@@ -427,6 +427,36 @@ fi
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 # agent-kanban-smoke is deployer: noop, so it adds seconds, not a cluster.
 TASKS=(
+  # These four run FIRST, ahead of the incumbents, because the loop below is
+  # sequential and the Prow job's wall clock drops whatever it has not
+  # reached -- and the incumbent immediately after them is the only
+  # `deployer: tofu` entry in the array, which spends minutes provisioning a
+  # cluster before it scores anything. All four are `deployer: noop`, so
+  # nothing behind them pays for the move. gke-labs/kube-agents#956 orders
+  # its six the same way, for the same reason.
+  # Four more cluster-debugging cases, not among the ten registered below, and
+  # ACTIVE. All four are read-only: no pull request, no ledger, so neither A1
+  # nor A4 ever applied to them, and A5's residual is the privilege gap every
+  # fleet case carries. The first three read the crashloop-workload and
+  # no-pdb-workload fixtures on seeded cluster A; the fourth shares
+  # hpa-saturated with stockout-pinned-pool, which asserts the same HPA cap
+  # and is still commented out, so nothing here asserts it twice yet.
+  #
+  # They are uncommented while still `validated: false`, which is the state
+  # cluster-agent-crashloop-debug activated in and for the same reason: only a
+  # scored presubmit run closes that field, so leaving them commented out is
+  # what makes it uncloseable. What that field does NOT still stand for here
+  # is the verification half. On 2026-08-26 all nine fleet safeguards across
+  # the four were driven through the real FleetResourcePropertyVerifier
+  # against live Kubernetes objects matching the fixtures: nine pass on the
+  # fixtures as planted, nine fail -- each naming the actual value -- against
+  # the mutation a misbehaving agent would make, and nine pass again on
+  # revert. So the way these red the presubmit is an agent-side or
+  # harness-side surprise, not a safeguard that cannot read its own cluster.
+  "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
+  "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
+  "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
+  "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # The ten domain scenarios. ONE is active -- cluster-agent-crashloop-debug,
@@ -441,8 +471,8 @@ TASKS=(
   # one, so activating a scenario also deletes its domain from the allowlist
   # in docs/designs/domains.yaml.
   #
-  # cluster-agent-crashloop-debug went first because it was blocked on A5 and
-  # nothing else -- no GitHub write, so no A1 and no A4 -- and because it
+  # cluster-agent-crashloop-debug was the first of the ten to activate,
+  # because it was blocked on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and because it
   # exercises the whole of step 2b end to end: label discovery, slot-to-role
   # resolution, the .confirmed probe, and fleet_resource_property binding the
   # role to a kubeconfig. Proving that chain in a real Prow run against a
@@ -524,18 +554,6 @@ TASKS=(
   # how a case that can only fail reds every pull request here.
   # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
   #
-  # Four more cluster-debugging cases, also not among the ten above. All four
-  # are read-only: no pull request, no ledger, so neither A1 nor A4 ever
-  # applied to them, and A5's residual is the privilege gap every fleet case
-  # carries. Each is commented out for the same reason as the entry above --
-  # `validated: false`, nobody has watched it pass AND fail. The first three
-  # read the crashloop-workload and no-pdb-workload fixtures on seeded
-  # cluster A; the fourth shares hpa-saturated with stockout-pinned-pool, so
-  # activating both means two cases asserting the same HPA cap.
-  # "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
-  # "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
-  # "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
-  # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
 )
 
 # Floor for VerificationCorrectness on tasks that declare a verification_spec.
