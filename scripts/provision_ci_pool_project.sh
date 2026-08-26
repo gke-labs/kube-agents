@@ -363,6 +363,7 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
       cp "${TFVARS}" "${TFVARS_BACKUP}"
       echo "  (backed up existing terraform.tfvars; it will be restored)"
     fi
+    # shellcheck disable=SC2329  # invoked by the EXIT trap below, not by name
     restore_tfvars() {
       if [ -n "${TFVARS_BACKUP}" ]; then
         mv -f "${TFVARS_BACKUP}" "${TFVARS}"

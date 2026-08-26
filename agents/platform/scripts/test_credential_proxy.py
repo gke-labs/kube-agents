@@ -28,8 +28,10 @@ from credential_proxy import (
     Policy,
     SlackRelay,
     _chat_error_fields,
+    _git_plan,
     _slack_error_detail,
     _slack_error_fields,
+    git_argument_violation,
     is_valid_repository,
     parse_gke_context,
     read_current_context,
@@ -430,6 +432,854 @@ class GitLeaseGateTest(unittest.TestCase):
         self.assertEqual(credential_proxy.GIT_LEASE_MARKER, gitops_workspace.LEASE_FILENAME)
 
 
+class GitHardeningTest(unittest.TestCase):
+    """git's own configuration, as a way into the container holding the creds.
+
+    Every test here drives *real git* and asserts what it did, never that a
+    variable is set. Asserting the variable would restate the code: the
+    question is whether git obeys it, and the only three things that answer
+    that are git, the attack, and a control.
+
+    Each hardening variable has at least one test here that turns red when the
+    variable is deleted from `CommandExecutor.environment`, checked by removing
+    each in turn and running the suite. Note that is a property of the *set*,
+    not of every test: `test_the_protocol_allowlist_refuses_nothing_it_should_allow`
+    guards the value rather than the variable and stays green if the variable
+    is deleted outright, which is what its sibling above it is for.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.marker = Path(self.temp_dir.name) / "EXECUTED"
+        self.payload = Path(self.temp_dir.name) / "payload.sh"
+        self.payload.write_text(
+            f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
+        )
+        self.payload.chmod(0o755)
+
+    def executor(self, max_output_bytes=1 << 16):
+        return CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=max_output_bytes,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+
+    def executed(self):
+        """Did the payload run? Consumes the marker so cases cannot bleed."""
+        hit = self.marker.exists()
+        self.marker.unlink(missing_ok=True)
+        return hit
+
+    def repository(self, executor, name="repo"):
+        """A git repository where the agent has one: inside the workspace."""
+        path = executor.workspace_dir / name
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
+        )
+        return path
+
+    def append_repository_config(self, repository, text):
+        """Write to `.git/config` — a file the agent shares a group with."""
+        config = repository / ".git" / "config"
+        config.write_text(config.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+    def test_the_ext_transport_cannot_execute_a_command(self):
+        # The finding. `ext::` hands the rest of the URL to a shell, and
+        # `-c protocol.ext.allow=always` is the agent turning it on. This runs
+        # through `execute`, which is *below* the argv refusal in the handler,
+        # so what it demonstrates is that the environment stops it on its own.
+        # That layering is deliberate: the parser must not be the boundary.
+        executor = self.executor()
+        result = executor.execute(
+            [
+                "git",
+                "-c",
+                "protocol.ext.allow=always",
+                "clone",
+                f"ext::{self.payload}",
+                str(executor.workspace_dir / "cloned"),
+            ],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertFalse(
+            self.executed(),
+            "ext:: executed a command inside the credential container",
+        )
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("not allowed", result.stderr)
+
+    def test_the_protocol_allowlist_refuses_nothing_it_should_allow(self):
+        # GIT_ALLOW_PROTOCOL is a colon-separated list, and the empty string is
+        # a list of one empty protocol name — it allows *nothing*, so setting it
+        # wrong bricks every clone rather than quietly permitting them. This is
+        # the test that dies if someone empties the value: the clone below fails
+        # either way (there is no network here), but only an empty allowlist
+        # makes it fail with "transport 'https' not allowed".
+        executor = self.executor()
+        result = executor.execute(
+            [
+                "git",
+                "clone",
+                "https://github.invalid/acme/fleet.git",
+                str(executor.workspace_dir / "https-clone"),
+            ],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertNotIn("transport 'https' not allowed", result.stderr)
+
+    def test_a_hook_in_the_repository_does_not_run(self):
+        # Reachable with no unusual argv at all: write the file, wait for any
+        # skill to commit. `git commit` appears nine times across the skills.
+        executor = self.executor()
+        repository = self.repository(executor)
+        hook = repository / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), ".git/hooks/pre-commit ran")
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_a_hooks_path_in_the_repository_config_is_overridden(self):
+        # The same attack one layer up, and the reason the pin has to be in the
+        # environment rather than written into a config file: the forced-config
+        # layer outranks `.git/config`, a file on the shared volume.
+        executor = self.executor()
+        repository = self.repository(executor)
+        hooks = Path(self.temp_dir.name) / "agent-hooks"
+        hooks.mkdir()
+        (hooks / "pre-commit").write_text(
+            f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
+        )
+        (hooks / "pre-commit").chmod(0o755)
+        self.append_repository_config(repository, f"\n[core]\n\thooksPath = {hooks}\n")
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "repository core.hooksPath ran a hook")
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_the_hooks_directory_is_empty_and_not_writable(self):
+        # `core.hooksPath` only disables hooks because there is nothing in the
+        # directory it names and nothing can be put there. Both halves are the
+        # control, so both are asserted.
+        executor = self.executor()
+        self.assertEqual([], list(executor.git_hooks_dir.iterdir()))
+        self.assertEqual(0o500, executor.git_hooks_dir.stat().st_mode & 0o777)
+
+    def test_a_system_config_is_ignored(self):
+        # GIT_CONFIG_NOSYSTEM. /etc/gitconfig is not writable from a test, so
+        # the system file is relocated with GIT_CONFIG_SYSTEM — which
+        # GIT_CONFIG_NOSYSTEM also suppresses, and which is exactly the claim:
+        # no system-scope file is read, wherever it is.
+        executor = self.executor()
+        system = Path(self.temp_dir.name) / "system-gitconfig"
+        system.write_text("[kubeagents]\n\tprobe = system\n", encoding="utf-8")
+        executor.environment["GIT_CONFIG_SYSTEM"] = str(system)
+        result = executor.execute(
+            ["git", "config", "--get", "kubeagents.probe"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("", result.stdout.strip())
+        self.assertEqual(1, result.exit_code)
+
+    def test_the_global_config_is_pinned_and_survives_a_moved_home(self):
+        # GIT_CONFIG_GLOBAL. The global file is out of the agent's reach today
+        # only because HOME is the sidecar-only state dir — deployment
+        # geometry, not a control. Naming the path keeps the property when the
+        # geometry moves, which is what this asserts: HOME is repointed at a
+        # directory holding a hostile .gitconfig and git must not read it.
+        executor = self.executor()
+        executor.git_config_global.write_text(
+            "[kubeagents]\n\tprobe = pinned\n", encoding="utf-8"
+        )
+        elsewhere = Path(self.temp_dir.name) / "moved-home"
+        elsewhere.mkdir()
+        (elsewhere / ".gitconfig").write_text(
+            "[kubeagents]\n\tprobe = agent-controlled\n", encoding="utf-8"
+        )
+        executor.environment["HOME"] = str(elsewhere)
+        result = executor.execute(
+            ["git", "config", "--get", "kubeagents.probe"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("pinned", result.stdout.strip())
+
+    def test_the_global_config_is_still_writable(self):
+        # The reason GIT_CONFIG_GLOBAL is not /dev/null. `gh auth setup-git`
+        # installs the GitHub credential helper by running `git config
+        # --global credential.helper …` in this same environment, so a global
+        # config that cannot be written is authenticated push and fetch gone.
+        # Hardening that breaks the product gets reverted, and then nothing is
+        # hardened.
+        executor = self.executor()
+        written = executor.execute(
+            ["git", "config", "--global", "credential.helper", "!gh auth git-credential"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual(0, written.exit_code, written.stderr)
+        read_back = executor.execute(
+            ["git", "config", "--get", "credential.helper"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("!gh auth git-credential", read_back.stdout.strip())
+
+    def test_an_fsmonitor_in_the_repository_config_does_not_run(self):
+        # core.fsmonitor is run by `git status` — a *read* verb, so the lease
+        # gate never sees it.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, f"\n[core]\n\tfsmonitor = {self.payload}\n"
+        )
+        executor.execute(["git", "status", "--porcelain"], cwd=str(repository))
+        self.assertFalse(self.executed(), "core.fsmonitor ran")
+
+    def test_a_pager_in_the_repository_config_does_not_run(self):
+        # `core.pager` is NOT in GIT_FORCED_CONFIG and is not refused in argv.
+        # What closes it is that `_execute` captures output through a pipe, so
+        # git never sees a terminal on stdout and never starts a pager. That is
+        # an implementation detail of the executor rather than a control, which
+        # is exactly why it is pinned here.
+        #
+        # Measured against git 2.55 under the same pinned environment, varying
+        # only the descriptor: with stdout on a pty, a repository-local
+        # `core.pager` executes on `git log`, `git diff`, `git show` and
+        # `git branch` — all read verbs, none of which takes a lease. With
+        # stdout on a pipe none of them runs it, and `--paginate`/`-p` does not
+        # change that.
+        #
+        # So if this test ever fails, the executor has started giving git a
+        # terminal, and a repository-local config value the agent writes is
+        # arbitrary code execution in the credential container again. The fix
+        # then is not to pin `core.pager` — `pager.<cmd>` reaches the same place
+        # with an arbitrary name in the key — it is to keep the pipe.
+        executor = self.executor()
+        repository = self.repository(executor)
+        # The fixture has to carry a commit. `self.repository` only runs
+        # `git init`, and `git log` in an empty repository exits 128 with
+        # nothing to page -- so the log subTests below would pass on a pty too,
+        # which is exactly the silent disarming this test exists to prevent.
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "--allow-empty", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        self.append_repository_config(
+            repository, f"\n[core]\n\tpager = {self.payload}\n"
+        )
+        for argv in (
+            ["git", "log", "--oneline"],
+            ["git", "branch"],
+            ["git", "--paginate", "log", "--oneline"],
+        ):
+            with self.subTest(argv=argv):
+                result = executor.execute(argv, cwd=str(repository))
+                # Assert the command actually ran, so a future fixture change
+                # cannot turn these into vacuous passes.
+                self.assertEqual(0, result.exit_code, result.stderr)
+                self.assertFalse(self.executed(), f"core.pager ran for {argv}")
+
+    def dirty_repository(self, executor, name="repo"):
+        """A repository with one tracked file and an uncommitted change."""
+        repository = self.repository(executor, name)
+        tracked = repository / "manifest.yaml"
+        tracked.write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"], cwd=repository, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        tracked.write_text("replicas: 2\n", encoding="utf-8")
+        return repository
+
+    def test_every_forced_config_key_reaches_git(self):
+        # GIT_CONFIG_COUNT has to match the number of key/value pairs exactly:
+        # git reads indices below the count and silently ignores the rest, so a
+        # count that drifts low disarms the tail of the list with nothing
+        # failing. Asserting through `git config --get` means the count, the
+        # keys and the values are checked by the program that consumes them.
+        # The exit code is asserted as well as the value. `git config --get`
+        # prints an empty line for a key pinned to the empty string and also
+        # for a key that is not set at all, so a value-only assertion cannot
+        # tell "pinned" from "missing" and would stay green if a key name were
+        # misspelled. It exits 0 when the key is present and 1 when it is not.
+        executor = self.executor()
+        expected = {
+            "core.hooksPath": str(executor.git_hooks_dir),
+            "core.fsmonitor": "false",
+            "commit.gpgsign": "false",
+            "tag.gpgSign": "false",
+            "gpg.program": "false",
+            # `gpg.program` is the openpgp format's key only; the other two
+            # formats read their own, and `gpg.format` is repository-local.
+            "gpg.ssh.program": "false",
+            "gpg.ssh.defaultKeyCommand": "false",
+            "gpg.x509.program": "false",
+            "help.autocorrect": "0",
+        }
+        for key, value in expected.items():
+            result = executor.execute(
+                ["git", "config", "--get", key], cwd=str(executor.workspace_dir)
+            )
+            self.assertEqual(0, result.exit_code, f"{key} never reached git")
+            self.assertEqual(value, result.stdout.strip(), f"{key} has the wrong value")
+        self.assertEqual(
+            str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
+        )
+
+    def test_an_editor_named_by_the_repository_config_does_not_run(self):
+        # `core.editor` is a command, and `.git/config` is a file the agent can
+        # write. `git commit` with no `-m` launches it — one flag away from the
+        # argv the skills send nine times. Demonstrated firing before
+        # GIT_EDITOR was set. The variable outranks the config layer, so this
+        # is a boundary and not a pin; `-c core.editor=` does not beat it.
+        executor = self.executor()
+        repository = self.dirty_repository(executor)
+        self.append_repository_config(
+            repository, f'\n[core]\n\teditor = {self.payload}\n'
+        )
+        result = executor.execute(
+            ["git", "commit", "--allow-empty"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "core.editor ran a command")
+        # The negative above is also true of a commit that died for an
+        # unrelated reason, so pin *why* it failed: git names the editor it
+        # ran, and it is the pinned one rather than the repository's.
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("editor 'false'", result.stderr.lower())
+        # And the positive beside it: the verb the skills actually issue still
+        # works with the editor neutralised.
+        self.assertEqual(
+            0,
+            executor.execute(
+                ["git", "commit", "--allow-empty", "-m", "real"], cwd=str(repository)
+            ).exit_code,
+        )
+
+    def test_a_sequence_editor_named_by_the_repository_config_does_not_run(self):
+        # `sequence.editor` is the second editor git runs, for `rebase -i`, and
+        # GIT_EDITOR does not cover it — it needs GIT_SEQUENCE_EDITOR of its
+        # own. Verified: with GIT_EDITOR set and this one unset, the payload
+        # runs and the rebase reports success, exit 0.
+        #
+        # The repository has to be *clean*. Written first against
+        # `dirty_repository`, this test passed and then survived deleting the
+        # variable it exists to guard: rebase refuses an unstaged change before
+        # it ever reaches the editor, so "the payload did not run" was true of
+        # `error: Please commit or stash them` — a control that is really an
+        # error path rather than a control. The assertion on git's own message
+        # below is what pins the difference.
+        executor = self.executor()
+        repository = self.repository(executor)
+        (repository / "manifest.yaml").write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        self.append_repository_config(
+            repository, f'\n[sequence]\n\teditor = {self.payload}\n'
+        )
+        result = executor.execute(
+            ["git", "rebase", "--interactive", "--root"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "sequence.editor ran a command")
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("editor 'false'", result.stderr.lower())
+
+    def test_signing_cannot_run_a_program_named_by_the_repository(self):
+        # `gpg.program` is a command and `commit.gpgsign` decides whether git
+        # runs it — both settable in `.git/config`, and the trigger is `git
+        # commit -m`, the argv the fleet-audit skill already issues. Watch the
+        # failure shape: unpinned, the payload runs and git *then* exits 128,
+        # so an exit-code assertion alone would have called this working.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository,
+            f'\n[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = {self.payload}\n',
+        )
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "gpg.program ran")
+        # The positive beside the negative: the commit did not merely fail to
+        # sign, it succeeded.
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_signing_cannot_run_a_program_through_a_second_format(self):
+        # `gpg.program` covers the openpgp format only. `gpg.format` is
+        # repository-local too, and each format reads its own program key, so
+        # `[gpg] format = ssh` walks past that pin into `gpg.ssh.program`.
+        # Measured before the pins below existed: `git commit -S` and
+        # `git tag -s` both executed the payload, with a clean argv --
+        # `-S`/`-s` are not refused and should not be.
+        #
+        # `defaultKeyCommand` is the spelling that needs no `user.signingkey`,
+        # and `x509` is the third format. Unlike the arbitrary-name keys in the
+        # design doc's limitation table, this set is closed: three formats,
+        # three fixed key names.
+        executor = self.executor()
+        for label, config, argv in (
+            (
+                "gpg.ssh.program",
+                '\n[gpg]\n\tformat = ssh\n[gpg "ssh"]\n\tprogram = {p}\n'
+                '[user]\n\tsigningkey = "key::ssh-ed25519 AAAA"\n',
+                ["git", "commit", "-S", "--allow-empty", "-m", "audit"],
+            ),
+            (
+                "gpg.ssh.defaultKeyCommand",
+                '\n[gpg]\n\tformat = ssh\n[gpg "ssh"]\n\tdefaultKeyCommand = {p}\n',
+                ["git", "commit", "-S", "--allow-empty", "-m", "audit"],
+            ),
+            (
+                "gpg.x509.program",
+                '\n[gpg]\n\tformat = x509\n[gpg "x509"]\n\tprogram = {p}\n'
+                '[user]\n\tsigningkey = whatever\n',
+                ["git", "commit", "-S", "--allow-empty", "-m", "audit"],
+            ),
+            (
+                "gpg.ssh.program via tag -s",
+                '\n[gpg]\n\tformat = ssh\n[gpg "ssh"]\n\tprogram = {p}\n'
+                '[user]\n\tsigningkey = "key::ssh-ed25519 AAAA"\n',
+                ["git", "tag", "-s", "-m", "release", "v1"],
+            ),
+        ):
+            with self.subTest(key=label):
+                repository = self.repository(executor, name=label.replace(" ", "_"))
+                subprocess.run(
+                    ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                     "commit", "--quiet", "--allow-empty", "-m", "seed"],
+                    cwd=repository, check=True, capture_output=True,
+                )
+                self.append_repository_config(
+                    repository, config.format(p=self.payload)
+                )
+                executor.execute(argv, cwd=str(repository))
+                self.assertFalse(self.executed(), f"{label} ran")
+        # And the unsigned commit the skills actually issue still works.
+        plain = self.repository(executor, name="plain")
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(plain)
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_a_misspelled_subcommand_is_not_autocorrected_past_the_refusal(self):
+        # Without `help.autocorrect` pinned, the subcommand refusal list is not
+        # a control: `[help] autocorrect = immediate` in the agent's own
+        # `.git/config` makes git resolve `bisct` to `bisect` and run it, while
+        # the refusal list — which compares whole tokens — sees a word that is
+        # on no list. Demonstrated at exit 0 before the pin.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, "\n[help]\n\tautocorrect = immediate\n"
+        )
+        self.assertIsNone(git_argument_violation(["git", "bisct", "run", "x"]))
+        result = executor.execute(
+            ["git", "bisct", "run", str(self.payload)], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "an autocorrected bisect ran a command")
+        self.assertNotEqual(0, result.exit_code)
+
+    def test_writing_a_config_file_by_path_is_refused(self):
+        # `git config --file <path>` writes the same file `--global` names,
+        # spelled explicitly — and `git config --list --show-origin` prints
+        # that path, so it is not a secret. Refusing `--global` alone left this
+        # open, and it is the same three-call vector as 1.6: write an alias
+        # into the proxy's own global config, then run it.
+        executor = self.executor()
+        target = executor.git_config_global
+        for argv in (
+            ["git", "config", "--file", str(target), "alias.zz", "!sh"],
+            ["git", "config", f"--file={target}", "alias.zz", "!sh"],
+            ["git", "config", "-f", str(target), "alias.zz", "!sh"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # `-f` is only refused because `config` is in this argv. On every other
+        # verb it is `--force`, which the skills issue, so it stays allowed.
+        self.assertIsNone(git_argument_violation(["git", "clean", "-fdq"]))
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "-f", "origin", "audit"])
+        )
+
+    def test_a_subcommand_that_runs_a_command_is_refused(self):
+        # `git bisect run <cmd>` executes <cmd> in the credential container.
+        # Demonstrated through the proxy from inside a valid lease, in two
+        # calls, with no config file and no unusual flag: `bisect` is not a
+        # mutating verb so it needs no lease, and it is a C builtin so it
+        # cannot be absent from the image. `filter-branch --tree-filter` and
+        # `send-email --smtp-server=<path>` were demonstrated the same way.
+        for argv in (
+            ["git", "bisect", "run", "/opt/data/payload.sh"],
+            ["git", "difftool", "--extcmd=/opt/data/payload.sh", "HEAD~1", "HEAD"],
+            ["git", "filter-branch", "-f", "--tree-filter", "/opt/data/payload.sh"],
+            ["git", "send-email", "--smtp-server=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "mergetool"],
+            ["git", "instaweb"],
+            # `git submodule foreach <cmd>` runs <cmd> per submodule, at exit 0
+            # through the executor. `submodule` itself stays allowed, so the
+            # inner verb is what is refused.
+            ["git", "submodule", "foreach", "/opt/data/payload.sh"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_a_flag_that_runs_a_command_on_an_ordinary_verb_is_refused(self):
+        # The same category as the refused subcommands, hiding on verbs the
+        # product has no reason to refuse. Both of the first two were
+        # demonstrated executing through the real executor under the full
+        # environment hardening, at exit 0.
+        #
+        # `git grep -O<cmd>` is the sharpest of the two: `grep` is a read verb,
+        # so it needs no lease, and it needs nothing written to the volume.
+        # Its value is attached to the flag rather than separated, which is the
+        # case `split("=")` alone does not catch.
+        for argv in (
+            ["git", "rebase", "-x", "/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "--exec=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "grep", "-O/opt/data/payload.sh", "apiVersion"],
+            ["git", "grep", "--open-files-in-pager=/opt/data/payload.sh", "kind"],
+            # git lets short options cluster and carry an attached value, so
+            # the same attack one byte longer is a different token. Each of
+            # these was demonstrated executing at exit 0 against a matcher
+            # that handled only the tidy spelling above.
+            ["git", "grep", "-iO/opt/data/payload.sh", "apiversion"],
+            ["git", "grep", "-nO/opt/data/payload.sh", "apiVersion"],
+            ["git", "rebase", "-x/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "-fx/opt/data/payload.sh", "HEAD~1"],
+            # Reachable only if GIT_ALLOW_PROTOCOL is widened to allow `file`,
+            # which the paired control shows is the one thing stopping them.
+            ["git", "clone", "--upload-pack=/opt/data/payload.sh", "/tmp/r", "d"],
+            ["git", "fetch", "--upload-pack", "/opt/data/payload.sh", "origin"],
+            ["git", "push", "--receive-pack=/opt/data/payload.sh", "origin", "main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_the_help_viewer_cannot_run_a_command(self):
+        # `git help -m <page>` runs `man.<man.viewer>.cmd` through
+        # `execl(SHELL_PATH, "-c", ...)`, and `git help -w` does the same
+        # through `web.browser` and `browser.<tool>.cmd`. Both keys carry an
+        # arbitrary name, so neither can be pinned in GIT_FORCED_CONFIG.
+        #
+        # Measured against git 2.55 under this file's own pinned environment:
+        #
+        #   git config man.viewer evil       # repo-local, no lease
+        #   git config man.evil.cmd 'id #'   # repo-local, no lease
+        #   git help -m git                  # -> prints uid=...
+        #
+        # Three ordinary proxied calls, no lease anywhere: `help` is not in
+        # GIT_MUTATING_SUBCOMMANDS and `config` is not a mutating verb either.
+        # Refusing `web--browse` did not close this -- `git help -w` reaches
+        # that code path internally, so the token never appears in the argv.
+        # The verb is what has to be refused.
+        for argv in (
+            ["git", "help", "-m", "git"],
+            ["git", "help", "-w", "git"],
+            ["git", "help", "git"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_the_help_flag_cannot_run_a_command_on_an_ordinary_verb(self):
+        # `git <verb> --help` is not a usage message. git dispatches it to the
+        # same viewer `git help` uses, so it runs `man.<man.viewer>.cmd`
+        # through a shell with the verb still sitting in the subcommand slot.
+        # Refusing the `help` subcommand does not reach it, and the first cut
+        # of this change shipped that gap.
+        #
+        # Measured against git 2.55 under the pinned environment, with
+        # `man.viewer`/`man.evil.cmd` set repository-locally:
+        #
+        #   git commit --help    -> the configured command runs
+        #   git status --help    -> runs; a read verb, so no lease anywhere
+        #   git version --help   -> runs
+        #
+        # `status` is the cheapest path this file has closed: three ordinary
+        # requests, none of them mutating, and `status` is on the shipped path.
+        for argv in (
+            ["git", "commit", "--help"],
+            ["git", "status", "--help"],
+            ["git", "version", "--help"],
+            ["git", "log", "--help"],
+            ["git", "add", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # `-h` is answered from the subcommand's own option table and prints
+        # usage without dispatching to a viewer -- verified with the payload
+        # configured -- so refusing it would cost a harmless verb for nothing.
+        self.assertIsNone(git_argument_violation(["git", "status", "-h"]))
+        # Adding a long option widens the abbreviation match, so pin the
+        # neighbouring `--h...` flags the skills do send. `git reset --hard
+        # --quiet` is `gitops_workspace.ensure_workspace`'s reset path.
+        for argv in (
+            ["git", "reset", "--hard", "--quiet"],
+            ["git", "ls-remote", "--heads", "origin"],
+            ["git", "diff", "--histogram"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_the_subcommand_match_scans_every_token_on_purpose(self):
+        # `help` is compared against every token rather than against the
+        # subcommand slot, which refuses `git commit -m help`. That is a real
+        # cost and it is deliberate: resolving the slot means agreeing with
+        # git about which global options take a value, and this file does not
+        # know them all. Measured against git 2.55 --
+        #
+        #   git --attr-source HEAD help -m git    -> the payload runs
+        #   _git_plan(...)                        -> reports subcommand 'HEAD'
+        #
+        # -- so a position-aware check allows the very thing this refuses.
+        # Scanning every token cannot disagree with git about where the
+        # subcommand is.
+        self.assertEqual(
+            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "HEAD"
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "HEAD", "help", "-m", "git"])
+        )
+        # The over-refusal that buys it. Only an argument that is exactly the
+        # word collides; a message merely containing it is one token and passes.
+        self.assertIsNotNone(git_argument_violation(["git", "commit", "-m", "help"]))
+        self.assertIsNone(git_argument_violation(["git", "commit", "-m", "help me"]))
+        self.assertIsNone(
+            git_argument_violation(["git", "commit", "-m", "chore: add help text"])
+        )
+
+    def test_a_trailer_command_cannot_run_on_the_commit_path(self):
+        # `trailer.<name>.cmd` produces a trailer's value by running a command,
+        # and the arbitrary name in the key puts it out of reach of the pins.
+        # What makes it worse than the other unpinnable keys is where it lands:
+        # `commit -m`, the argv the skills already send.
+        #
+        # Measured against git 2.55 under the pinned environment:
+        #
+        #   git config trailer.zz.cmd 'id #'        # repo-local, no lease
+        #   git commit -m msg --trailer zz:v        # trailer value is uid=...
+        #
+        # `--trailer` is the trigger: with the token already present in the
+        # input and no flag, the configured command does not run. So refusing
+        # the flag is what closes it, and `interpret-trailers` is refused as
+        # the subcommand whose whole job is this mechanism.
+        for argv in (
+            ["git", "commit", "-m", "chore: x", "--trailer", "zz:v"],
+            ["git", "commit", "-m", "chore: x", "--trailer=zz:v"],
+            # git's subcommand options take unambiguous prefixes.
+            ["git", "commit", "-m", "chore: x", "--trai", "zz:v"],
+            ["git", "interpret-trailers", "--trailer", "zz:v"],
+            ["git", "interpret-trailers", "--parse"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # The neighbouring `--t...` flags the skills do send are not prefixes
+        # of `--trailer` and stay allowed.
+        for argv in (
+            ["git", "push", "--tags", "origin"],
+            ["git", "fetch", "--tags", "origin"],
+            ["git", "log", "--topo-order"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_writing_the_proxys_own_git_config_is_refused(self):
+        # `git config --global alias.zz '!<payload>'` followed by `git zz` was
+        # arbitrary code execution: `config` is not a mutating verb, so it
+        # needs no lease, and the file it writes is the one GIT_CONFIG_GLOBAL
+        # pins. Repository-local `git config` is what the skills use and stays
+        # allowed -- `gitops_workspace.configure_identity` sets user.name and
+        # user.email that way, deliberately.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--global", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--system", "core.pager", "sh"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.email", "a@b.invalid"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--get", "remote.origin.url"])
+        )
+
+    def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
+        # `_execute` refuses a cwd outside the shared workspace and the lease
+        # gate resolves cwd plus every `-C`, but neither looks at `--git-dir`.
+        # So this ran, from inside a valid lease, against a repository on the
+        # sidecar's own filesystem — verified before the refusal was added, as
+        # both a read and a commit. The containment check is on the working
+        # directory, so the flag that stops naming a repository by working
+        # directory has to be refused rather than resolved.
+        executor = self.executor()
+        outside = Path(self.temp_dir.name) / "sidecar-only"
+        outside.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=outside, check=True, capture_output=True
+        )
+        argv = [
+            "git",
+            f"--git-dir={outside / '.git'}",
+            f"--work-tree={outside}",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "escaped",
+        ]
+        self.assertIsNotNone(git_argument_violation(argv))
+        # And the control: the working-directory check alone does not catch it.
+        self.assertIsNone(executor.git_lease_violation(argv, str(self.leased(executor))))
+
+    def leased(self, executor, lease="t_card", repo="acme__fleet"):
+        holder = executor.workspace_dir / "gitops" / lease
+        (holder / repo).mkdir(parents=True, exist_ok=True)
+        (holder / ".lease").write_text(json.dumps({"lease": lease}), encoding="utf-8")
+        return holder / repo
+
+    def test_ordinary_git_still_works(self):
+        # The hardening is worth nothing if it is reverted next week because it
+        # broke the skills, so the paths they actually use are asserted green.
+        # `git diff` is in this list because it was not, and a pin that broke
+        # it shipped for one commit. `diff.external` was pinned to "" to stop
+        # a repository config naming an external diff program; git reads the
+        # empty value as a program to execute, so every `git diff` died with
+        # `fatal: external diff died`. The test that was supposed to cover it
+        # asserted only that the payload had not run, which is true of a
+        # command that fails before diffing anything — a control that passes
+        # for the wrong reason. The pin is gone; this line is what would have
+        # caught it.
+        executor = self.executor()
+        repository = self.dirty_repository(executor)
+        for argv in (
+            ["git", "commit", "--allow-empty", "-m", "remediate netpol"],
+            ["git", "status", "--porcelain"],
+            ["git", "log", "--oneline"],
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "diff"],
+            ["git", "diff", "--cached", "--quiet"],
+            ["git", "config", "user.email", "audit@kube-agents.invalid"],
+        ):
+            result = executor.execute(argv, cwd=str(repository))
+            self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")
+
+
+class GitArgumentRefusalTest(unittest.TestCase):
+    """The backup check: argv that would override the environment.
+
+    `-c` sets configuration at a layer that outranks the forced-config
+    environment — verified against real git — so this is the only thing
+    standing between an agent and `-c core.hooksPath=…`. It is a backup for the
+    `ext::` transport, where GIT_ALLOW_PROTOCOL is the boundary, and the
+    control for hooks, where it is not.
+    """
+
+    def test_refuses_the_flags_that_override_the_environment(self):
+        for argv in (
+            ["git", "-c", "protocol.ext.allow=always", "clone", "ext::sh -c id", "d"],
+            ["git", "-c", "core.hooksPath=/opt/data/hooks", "commit", "-m", "x"],
+            ["git", "--config-env=core.hooksPath=EVIL", "commit", "-m", "x"],
+            ["git", "--exec-path=/opt/data/bin", "status"],
+            ["git", "--exec-path", "/opt/data/bin", "status"],
+            ["git", "--git-dir=/home/hermes/.git", "log"],
+            ["git", "--git-dir", "/home/hermes/.git", "log"],
+            ["git", "--work-tree=/home/hermes", "checkout", "--", "."],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_allows_the_git_the_skills_actually_run(self):
+        for argv in (
+            ["git", "clone", "--quiet", "https://github.com/acme/fleet.git", "d"],
+            ["git", "--literal-pathspecs", "add", "--", "clusters/prod"],
+            ["git", "commit", "-m", "remediate netpol"],
+            ["git", "push", "--force-with-lease", "origin", "fleet-audit/x"],
+            ["git", "-C", "/opt/data/gitops/t_card/acme__fleet", "status"],
+            ["git", "checkout", "--force", "-B", "audit", "origin/main"],
+            # `submodule update` is the guard on refusing `foreach`: the
+            # refusal has to land on the inner verb, because `submodule` itself
+            # is a working-tree write the product performs. Widening the
+            # refusal from `foreach` to `submodule` turns this line red.
+            ["git", "submodule", "update", "--init"],
+            # `-u` and `--oneline` are here because `-O` is matched as a
+            # prefix rather than as a whole argument. Neither is caught today;
+            # they are the regression guard on a future maintainer widening
+            # that prefix, which is the failure mode a prefix match invites.
+            ["git", "log", "--oneline", "-n", "5"],
+            ["git", "push", "-u", "origin", "fleet-audit/x"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_refuses_the_abbreviations_git_accepts(self):
+        # git's *subcommand* options are parsed by parse-options, which takes
+        # any unambiguous prefix. Every one of these was demonstrated running
+        # against a checker that matched the full spelling only, and the
+        # `config --glo` line is the sharp one: it wrote an alias into the
+        # broker's own global config and `git zz` then executed it, which is a
+        # vector this file had already closed and a release note would have
+        # said was fixed.
+        #
+        # git's own options are the asymmetry that hides this. `--git-dir`,
+        # `--exec-path` and `--config-env` are compared exactly in git.c and
+        # are not abbreviable, so a test written only against those spellings
+        # says the problem does not exist.
+        for argv in (
+            ["git", "config", "--glo", "alias.zz", "!/opt/data/payload.sh"],
+            ["git", "config", "--sys", "alias.zz", "!/opt/data/payload.sh"],
+            ["git", "rebase", "--exe", "/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "--ex=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "grep", "--open=/opt/data/payload.sh", "apiVersion"],
+            ["git", "clone", "--upload-pac", "/opt/data/payload.sh", "/tmp/r", "d"],
+            ["git", "push", "--receive-pac=/opt/data/payload.sh", "origin", "main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_an_abbreviation_match_does_not_swallow_unrelated_flags(self):
+        # The match is "the argument is a prefix of a refused option", not the
+        # reverse, so a longer flag that merely shares a first letter is
+        # untouched. Inverting the comparison would refuse every one of these
+        # and break the skills, which is the failure mode the rule invites.
+        for argv in (
+            ["git", "log", "--oneline"],              # vs --open-files-in-pager
+            ["git", "diff", "--cached"],              # vs --config-env
+            ["git", "add", "--update", "--", "x"],    # vs --upload-pack
+            ["git", "log", "--graph"],                # vs --git-dir
+            ["git", "push", "--set-upstream", "o", "b"],   # vs --system
+            ["git", "config", "--get", "remote.origin.url"],  # vs --git-dir
+            ["git", "clone", "--recurse-submodules", "u", "d"],  # vs --receive-pack
+            ["git", "commit", "--allow-empty", "-m", "x"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_scopes_itself_to_git(self):
+        # `-c` is a container selector for kubectl and must keep working.
+        self.assertIsNone(git_argument_violation(["kubectl", "logs", "-c", "istio"]))
+        self.assertIsNone(git_argument_violation(["gh", "pr", "view", "-c"]))
+
+    def test_matches_the_flag_wherever_it_appears(self):
+        # Scanned across the whole argv rather than only the region before the
+        # subcommand, where git honours it. Agreeing with git about where the
+        # options end would be a guess about git's parser, and every Critical
+        # this project has found was a checker and an executor disagreeing
+        # about exactly that. Refusing a literal `-c` argument is the price.
+        self.assertIsNotNone(git_argument_violation(["git", "commit", "-c", "HEAD"]))
+
+
 class GitLeaseGateWiringTest(unittest.TestCase):
     """The gate as the agent meets it — over HTTP, through /v1/exec."""
 
@@ -477,6 +1327,22 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
         self.assertEqual("git.workspace.lease", body["rule"])
         self.assertIn("audit_report.py start", body["message"])
+
+    def test_a_config_flag_comes_back_as_a_policy_block(self):
+        # Refused before the lease check, and with its own rule id: an agent
+        # that gets "take a lease" back for `git -c` would take a lease and try
+        # again, which is a refusal that teaches the wrong lesson.
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {
+                "argv": ["git", "-c", "protocol.ext.allow=always", "clone",
+                         "ext::sh -c id", "d"],
+                "cwd": str(workspace),
+            }
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.argument.refused", body["rule"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
@@ -2071,6 +2937,91 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
         # Should report the denylist rule, not read-only
         self.assertEqual("kubernetes.token-disclosure", payload["rule"])
         self.assertEqual([], self.executed)
+
+
+class BackendSocketModeTest(unittest.TestCase):
+    """The backend socket must not inherit a permissive umask.
+
+    Nothing behind this socket authenticates its callers, so its mode is the
+    second lock after the mount. The sidecar's entrypoint now sets `umask 0002`
+    so that proxied commands leave group-writable files on the workspace the
+    agent shares — and a group-writable *socket* is a connectable socket for
+    anyone in the agent's group. `serve` therefore has to set the mode itself
+    rather than take whatever the process umask happens to be, which is what
+    this asserts by binding under the widest umask there is.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        # `serve` assigns these on the class; put them back for whatever runs
+        # next. Some are bare annotations until something sets them, so an
+        # unset one has to be unset again rather than restored.
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def test_the_backend_socket_is_not_group_or_world_connectable(self):
+        owner = self
+        bound = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "policy.json"
+            policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+            socket_path = Path(tmp) / "backend.sock"
+            args = types.SimpleNamespace(
+                policy=str(policy_path),
+                host="127.0.0.1",
+                port=0,
+                unix_socket=str(socket_path),
+                timeout_seconds=5,
+                max_request_bytes=1 << 20,
+                max_output_bytes=1 << 20,
+                state_dir=str(Path(tmp) / "state"),
+            )
+            previous_umask = os.umask(0o000)
+            try:
+                with mock.patch.dict(os.environ, {"API_SERVER_EXTERNAL_KEY": "external"}, clear=True), \
+                        mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                        mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                        mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                    with self.assertRaises(self._Stop):
+                        credential_proxy.serve(args)
+                # Read back before the outer restore: the process umask has to be
+                # the one it started with, because the same process goes on to run
+                # proxied commands that must leave group-writable files behind.
+                left_behind = os.umask(0o000)
+            finally:
+                os.umask(previous_umask)
+                for server in bound:
+                    server.server_close()
+
+            self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
+            mode = socket_path.stat().st_mode & 0o777
+            self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
 
 
 if __name__ == "__main__":

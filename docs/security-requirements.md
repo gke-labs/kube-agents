@@ -84,7 +84,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the sidecar for this reason.
 
-The sandbox and credential sidecar must not share a process namespace while the sidecar holds credentials. The current dashboard-enabled Pod configuration shares the process namespace and runs both containers as the same user, which may expose sidecar environment variables through `/proc`. This must be removed or otherwise isolated before the credential-isolation requirement is satisfied.
+The sandbox and credential sidecar must not share a process namespace, and must not run as the same user, while the sidecar holds credentials: either one exposes the sidecar's environment variables through `/proc`. The Pod does neither. `shareProcessNamespace` is unset in every configuration, including the dashboard-enabled one that previously set it, and the sidecar runs as a user of its own. The two containers do still share a Pod, and so a network namespace and one Pod identity; see the limitation in the design.
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 
@@ -113,4 +113,4 @@ The selected configuration is accepted when:
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 
-Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Criterion 5 is not satisfied while the sandbox shares a process namespace with the credential sidecar. Implementation status for the remaining criteria is stated in the corresponding sections above.
+Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Implementation status for the remaining criteria is stated in the corresponding sections above.

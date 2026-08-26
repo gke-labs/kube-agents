@@ -960,6 +960,432 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
 
+# Directory `core.hooksPath` is pinned to. It lives under the state dir, which
+# is a sidecar-only emptyDir, and is created empty and mode 0500 at startup.
+# A hook only runs if git finds an executable file of the right name in the
+# hooks directory, so an empty directory the agent cannot write is a hook
+# directory that can never fire. Pinning to a *nonexistent* path also works
+# today, but it would rest on that path staying absent, which is a weaker
+# claim than "exists, empty, and not writable by the agent".
+GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
+
+# Config keys forced onto every git invocation, as the `GIT_CONFIG_COUNT`
+# layer. That layer outranks system, global and repo-local config, which is
+# the point: the agent owns the working tree, so `.git/config` is a file it
+# can write, and every key below turns a string in that file into a command
+# the credential holder executes.
+#
+#   core.hooksPath   `.git/hooks/pre-commit` is executed by `git commit`, and
+#                    `git commit` is a verb the skills issue nine times.
+#                    Pinning the path also neutralises hooks installed into a
+#                    fresh clone through `init.templateDir`.
+#   core.fsmonitor   run by `git status`, i.e. by a read verb.
+#
+# **This list is known-incomplete and is not a boundary.** `filter.<name>.smudge`
+# and `alias.<name>` reach the same place and cannot be pinned, because the key
+# contains an arbitrary name and there is nothing to enumerate. They are open,
+# they are recorded as open, and the fix for the class is to stop executing
+# subprocesses in a directory the agent controls at all (content-passing).
+# What this buys is blast radius, not closure — do not read it as more.
+#
+# Only keys whose "off" value is a *working* value belong here. `diff.external`
+# was pinned to "" in an earlier revision and reverted: git does not read an
+# empty value as "no external diff", it tries to execute the empty string, so
+# every `git diff` died with `fatal: external diff died` — a read verb broken
+# by the hardening, reported in a way that reads as a broken image rather than
+# a refusal. There is no value that turns it off, and since anyone who can
+# write the `.git/config` that sets it can equally use the two unpinnable keys
+# above, the pin cost a working verb and removed no capability from an
+# attacker who has that write.
+#   commit.gpgsign   turns `git commit -m` — the argv the skills already send —
+#   gpg.program      into a run of whatever `gpg.program` names. Signing is a
+#   tag.gpgSign      program git executes, and both halves are settable from
+#                    `.git/config`. Note the failure shape: the payload runs and
+#                    *then* git exits 128, so a test asserting only a non-zero
+#                    exit would have called this working.
+#   help.autocorrect Without it the subcommand refusal list below is not a
+#                    control at all: set it in `.git/config` and `git bisct run`
+#                    resolves to `bisect run`, matching nothing on a list that
+#                    compares whole tokens. Pinned to 0 — never autocorrect —
+#                    which is also git's own default.
+GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.fsmonitor", "false"),
+    ("commit.gpgsign", "false"),
+    ("tag.gpgSign", "false"),
+    ("gpg.program", "false"),
+    # `gpg.program` only covers the openpgp format. `gpg.format` is settable
+    # from the repository's own config, and each format reads its own program
+    # key, so `[gpg] format = ssh` walks straight past the pin above. Measured
+    # against git 2.55 under this environment: with `gpg.format=ssh` and
+    # `gpg.ssh.program=<payload>` set repository-locally, `git commit -S` and
+    # `git tag -s` both execute the payload. `gpg.ssh.defaultKeyCommand` does
+    # the same with no `user.signingkey` at all, and `x509` has its own
+    # `gpg.x509.program`. `-S`/`-s` are not refused in argv and there is no
+    # reason to refuse them, so the pin is the control.
+    #
+    # Unlike the unpinnable keys, this set is closed: git defines exactly three
+    # signature formats and each names its program in a fixed key. Verified
+    # that the pins close all four spellings and that an unsigned
+    # `git commit -m` is untouched. Nothing under `agents/`, `k8s-operator/`
+    # or `scripts/` signs anything.
+    #
+    # The trigger is the `-S`/`-s` flag, and `commit` and `tag` are both
+    # lease-gated -- which is a speed bump rather than a barrier, since the
+    # agent creates its own leases. There is no lease-free read route in:
+    # `log --show-signature`, `show --show-signature`, `verify-commit` and the
+    # `%G?`/`%GS` formats were all tried against a commit carrying a crafted
+    # SSH signature header and none of them ran the configured program.
+    ("gpg.ssh.program", "false"),
+    ("gpg.ssh.defaultKeyCommand", "false"),
+    ("gpg.x509.program", "false"),
+    ("help.autocorrect", "0"),
+)
+
+
+def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
+
+    git reads `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` for n in
+    `[0, GIT_CONFIG_COUNT)`. The two failure directions are not symmetric,
+    which is why the count is derived rather than written down: a count higher
+    than the pairs supplied is a hard failure on every git command (`error:
+    missing config key GIT_CONFIG_KEY_1`, exit 128), and a count *lower*
+    silently ignores the tail, disarming the last pin with nothing to see.
+    Building both from one sequence is what keeps them in step.
+    """
+    environment = {"GIT_CONFIG_COUNT": str(len(pairs))}
+    for index, (key, value) in enumerate(pairs):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+# git global options that override something the proxy decided, refused in
+# argv. Each value says which control the flag defeats, because a refusal that
+# does not say what it protected gets read as an arbitrary restriction and
+# argued away.
+#
+# The first three are config and code injection, and they are the backup to the
+# environment hardening — except for hooks, where `-c` beats the
+# `GIT_CONFIG_COUNT` layer outright and this is the only control there is.
+#
+# The last two are containment, not configuration. `_execute` refuses a `cwd`
+# outside the shared workspace and `git_lease_violation` resolves `cwd` plus
+# every `-C`, but neither looks at `--git-dir`, so `git --git-dir=<elsewhere>
+# --work-tree=<elsewhere> commit` runs against a repository on the sidecar's
+# own filesystem from inside a perfectly valid lease. Verified: it reads and it
+# writes. `-C` stays allowed — the containment check already follows it, and
+# the skills use it.
+_GIT_REFUSED_ARGUMENTS = {
+    "-c": "sets configuration that outranks the proxy's own",
+    "--config-env": "sets configuration that outranks the proxy's own",
+    "--exec-path": "chooses where git looks for the program to run",
+    "--git-dir": "points git at a repository outside the shared workspace",
+    "--work-tree": "points git at a tree outside the shared workspace",
+    # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
+    # `config` is not a mutating verb so it needs no lease. Demonstrated: the
+    # agent writes `alias.zz = !<payload>` into the broker's own global config
+    # through the proxy, then runs `git zz`. Everything the forced-config layer
+    # does not pin is agent-settable at global scope this way, from outside any
+    # repository. Shipped code sets identity repository-locally and says so
+    # (`gitops_workspace.py:594`); `gh auth setup-git` writes the global file
+    # from inside the broker, which does not pass through this gate.
+    "--global": "writes git configuration the proxy pins for every command",
+    "--system": "writes git configuration the proxy pins for every command",
+    # `git config --file <path>` writes the same file `--global` names, just
+    # spelled explicitly, and the path is not a secret — `git config --list
+    # --show-origin` prints it. Refusing `--global` without this closed the
+    # front door and left the side one open. It is also an arbitrary INI write
+    # to any path: the containment check inspects `cwd`, not this.
+    "--file": "writes a git configuration file the proxy does not control",
+    # Flags that name a command directly, on a subcommand that is otherwise
+    # ordinary. These are the same category as the refused subcommands below —
+    # git running a string the caller chose — but they hide on verbs the
+    # product has no reason to refuse outright, so the flag is what gets
+    # refused rather than the verb.
+    #
+    #   --exec/-x   `git rebase -x <cmd> HEAD~1` runs <cmd> once per commit.
+    #               `rebase` *is* in GIT_MUTATING_SUBCOMMANDS, so it needs a
+    #               lease — which is not a barrier, since the agent creates its
+    #               own leases. Demonstrated through the executor, exit 0.
+    #   -O          `git grep -O<cmd>` runs <cmd> as the pager over the
+    #               matches. `grep` is a *read* verb, so unlike rebase this one
+    #               needs no lease and no file on the volume: one call, and the
+    #               value is attached to the flag rather than separated, which
+    #               is why the matcher below has to handle the attached form.
+    #   --trailer   `git commit -m msg --trailer <name>:<value>` runs
+    #               `trailer.<name>.cmd` to compute the value, so the payload
+    #               lands on `commit` — the argv the skills already send, and
+    #               the one the design doc calls reachable with no unusual
+    #               argument at all. The key's arbitrary name puts it out of
+    #               reach of the pins. Measured under the pinned environment
+    #               against git 2.55: `git config trailer.zz.cmd 'id #'` then
+    #               `git commit -m msg --trailer zz:v` writes the credential
+    #               container's `uid=` into the commit message. It has no short
+    #               form on either subcommand that accepts it.
+    #   --help      `git <any-verb> --help` is not a usage message: it is
+    #               dispatched to the same viewer `git help` uses, so it runs
+    #               `man.<man.viewer>.cmd` through a shell. Refusing the `help`
+    #               subcommand does not touch it, because the verb in argv is
+    #               `status`. Measured under the pinned environment against git
+    #               2.55, with `man.viewer`/`man.evil.cmd` set repository-locally:
+    #               `git commit --help`, `git status --help`, `git version --help`
+    #               and `git log --help` all execute the configured command. The
+    #               `status` spelling is the cheapest path in this file — a read
+    #               verb, so no lease is taken anywhere in the sequence, and
+    #               `status` is squarely on the shipped path.
+    #
+    #               `-h` is NOT refused and must not be: git answers it from the
+    #               subcommand's own option table and prints usage without
+    #               dispatching to a viewer. Verified — `git status -h` prints
+    #               `usage: git status ...` with the payload configured.
+    #               `--help` also takes no abbreviation (`git status --hel` is
+    #               `error: unknown option`), so this one literal entry is the
+    #               whole closure.
+    #
+    # `-x` and `-O` are refused wherever they appear, so `git clean -x` and
+    # `git cherry-pick -x` are refused too. Neither is in shipped code.
+    "--exec": "runs a command the caller names, once per commit",
+    "-x": "runs a command the caller names, once per commit",
+    "--open-files-in-pager": "runs a command the caller names over the matches",
+    "-O": "runs a command the caller names over the matches",
+    "--help": "runs the caller-named viewer git help would run",
+    "--trailer": "runs a command the caller names to compute a trailer value",
+    # Programs git runs on the far side of a transport. Blocked today only by
+    # GIT_ALLOW_PROTOCOL refusing `file` — the paired control fires as soon as
+    # the allowlist is widened — so these are here to make that widening safe
+    # rather than because they are reachable now.
+    # Their short forms are NOT here and this is the one deliberate gap in the
+    # list. `-u` is `--upload-pack` on `git clone` only; on other verbs the
+    # same two characters mean `--set-upstream` (`push`), `--update` (`add`)
+    # and `--update-head-ok` (`fetch`). No shipped skill issues any of them
+    # today — the pushes on file are `-f` and `--force-with-lease` — but this
+    # list is matched across the whole argv, so refusing `-u` would refuse all
+    # four spellings on every verb, to close a vector the protocol allowlist
+    # already holds shut. That trade is not worth making blind. The
+    # consequence is precise — widen GIT_ALLOW_PROTOCOL to `file` and `clone -u`
+    # is arbitrary code execution again even though `--upload-pack` is refused.
+    # Do not widen it without revisiting this.
+    "--upload-pack": "names a program git runs for the remote end of a fetch",
+    "--receive-pack": "names a program git runs for the remote end of a push",
+}
+
+# Refused short options, matched anywhere inside a single-dash token. git lets
+# a short option carry its value attached (`-O/opt/data/payload`) and lets
+# several cluster into one argument (`-iO/opt/data/payload`, `-fx<cmd>`), so
+# matching the whole token against `-O` catches only the tidiest spelling of
+# the attack — `git grep -iO<cmd>` is one byte longer and was demonstrated
+# executing past a matcher that only handled the attached form.
+#
+# Any single-dash token containing one of these letters is refused, without
+# working out which letter consumes the value. Working that out means knowing
+# each subcommand's option table, and this file has already been wrong once
+# about agreeing with git's parser. The over-refusal is real but empty: the
+# only clustered short option in shipped git argv is `clean -fdq`
+# (`gitops_workspace.py:548`), and no shipped call attaches a value to a short
+# one. Checked against the tree, not against another comment — the first draft
+# of this note also claimed `git rm -rf`, which nothing issues.
+_GIT_REFUSED_SHORT = frozenset("cxO")
+
+# Short options whose meaning depends on the subcommand, refused only when that
+# subcommand appears in the argv. `git config -f <path>` is `--file`, but `-f`
+# on every other verb is `--force`, which the skills issue (`clean -fdq`,
+# `push -f`). Scoping by "the subcommand token is present anywhere" is coarse
+# on purpose — it does not require deciding where the options end, only that a
+# `git clean -f` whose pathspec happens to be the word `config` is refused.
+_GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
+    "config": (frozenset("f"), "writes a git configuration file the proxy does not control"),
+}
+
+# Subcommands whose entire purpose is to run a command the caller names. None
+# needs a config file, a shared-volume write or a lease, and none is in
+# `GIT_MUTATING_SUBCOMMANDS`. Demonstrated through the proxy from inside a
+# valid lease: `git bisect start HEAD HEAD~1` then `git bisect run <payload>`
+# executes <payload> in the credential container, as do
+# `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
+#
+# **This is a denylist over a set that is not closed, and it is the weakest
+# thing in this file.** git keeps a command in configuration for `difftool`,
+# `mergetool`, `web--browse`, `instaweb`, `help`, and the `p4`/`svn`
+# bridges, and a new one can arrive in any release. The structurally correct
+# fix is to allowlist the ~20 subcommands the product actually issues and fail
+# closed on the rest, which is a change to the denylist-not-allowlist decision
+# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
+# unknown *read* verb failing closed against a concurrency race, and was not
+# weighing it against arbitrary code execution. Revisit it with that evidence
+# rather than treating this list as sufficient.
+_GIT_REFUSED_SUBCOMMANDS = {
+    "bisect": "runs a command the caller names (`bisect run`)",
+    "difftool": "runs a command the caller names (`--extcmd`)",
+    "mergetool": "runs a command the caller names",
+    "filter-branch": "runs a command the caller names (`--tree-filter`)",
+    "send-email": "runs a command the caller names (`--smtp-server`)",
+    "instaweb": "starts a caller-named HTTP daemon",
+    # Directly invocable, and it does run the configured command: with
+    # `browser.evilb.cmd` set repository-locally, both
+    # `git web--browse --browser=evilb <url>` and `git web--browse -b evilb <url>`
+    # execute it. It is NOT here to cover `git help -w`, which reaches this code
+    # path internally without the token ever appearing in argv — that route is
+    # closed by the `help` entry and by `--help` in `_GIT_REFUSED_ARGUMENTS`.
+    "web--browse": "runs a caller-named browser command",
+    # `git help -m <page>` runs `man.<man.viewer>.cmd` through
+    # `execl(SHELL_PATH, "-c", "<cmd> <page>")`, and `git help -w` does the same
+    # through `web.browser` and `browser.<tool>.cmd`. Both keys carry an
+    # arbitrary name, so neither can be pinned in `GIT_FORCED_CONFIG` — the same
+    # shape as `filter.<name>.smudge`. Measured under this file's own pinned
+    # environment against git 2.55: `git config man.viewer evil`, `git config
+    # man.evil.cmd 'id #'`, `git help -m git` prints the credential container's
+    # `uid=`. All three are repository-local `config` writes and a read verb, so
+    # no lease is taken anywhere in the sequence.
+    #
+    # This entry is half the closure. The other half is `--help` in
+    # `_GIT_REFUSED_ARGUMENTS`, because `git status --help` reaches the same
+    # viewer with `status` in the subcommand slot — refusing this token alone
+    # left that open, and the first cut of this change shipped exactly that gap.
+    #
+    # **The cost is a collision with ordinary text.** `help` is matched against
+    # every token in the argv, so `git commit -m help` and `git checkout -b help`
+    # are refused, with a message that says `git help` is refused. Only an
+    # argument that is *exactly* the word survives the comparison — `git commit
+    # -m "help me"` is one token and passes. Nothing shipped issues a git argv
+    # containing a bare `help` (checked across `agents/`, `k8s-operator/` and
+    # `scripts/`), and the refusal is loud and names the rule.
+    #
+    # Matching the subcommand *slot* instead would remove the collision and was
+    # considered. It is not done, and the reason is measurable: git has
+    # value-taking global options this file does not know about, so resolving
+    # the slot is a guess about git's parser. `git --attr-source HEAD help -m
+    # git` executes the payload, while `_git_plan` reports the subcommand as
+    # `HEAD` — a position-aware check would allow it. Scanning every token
+    # cannot disagree with git about where the subcommand is, and over-refusing
+    # a commit message is the direction this is meant to fail in.
+    "help": "runs a caller-named viewer command (`help -m`, `help -w`)",
+    "p4": "bridges to a caller-named external tool",
+    "svn": "bridges to a caller-named external tool",
+    "fast-import": "runs caller-supplied stream commands",
+    # `trailer.<name>.cmd` is run to produce a trailer's value, and the key's
+    # arbitrary name puts it out of reach of the pins. `--trailer` below is the
+    # trigger and refusing the flag is what closes the vector; this entry
+    # refuses the subcommand whose whole job is that mechanism, so a future git
+    # that grows a second trigger does not reopen it. Measured: without
+    # `--trailer` the configured command does not run, even when the token is
+    # already present in the input.
+    "interpret-trailers": "applies trailer configuration that can name a command",
+    # `git submodule foreach <cmd>` runs <cmd> in each initialised submodule.
+    # Demonstrated through the executor at exit 0 with a submodule present.
+    # `submodule` itself stays allowed — `submodule update` is a working-tree
+    # write the product does — so the refused token is the inner verb. It is
+    # matched wherever it appears, which also refuses a commit message that is
+    # the bare word `foreach`; that is the same trade the rest of this file
+    # makes.
+    "foreach": "runs a command the caller names in each submodule",
+}
+
+
+# The long options above, for the abbreviation match in `_git_refused_name`.
+_GIT_REFUSED_LONG = tuple(
+    name for name in _GIT_REFUSED_ARGUMENTS if name.startswith("--")
+)
+
+
+def _git_refused_name(argument: str) -> str:
+    """The refused option `argument` spells, or `argument` itself.
+
+    Three spellings beyond the plain one have to collapse to the same name,
+    because git accepts all of them, and a checker that recognises fewer
+    spellings than the executor accepts is a parser differential — the one
+    kind of bug this policy layer keeps producing.
+
+    1. `--flag=value`, handled by splitting on the first `=`.
+    2. `-Ovalue` and `-iOvalue`, the attached and clustered short forms,
+       handled by `_GIT_REFUSED_SHORT` against every letter in the token.
+    3. **`--fl`, an abbreviation.** git's *subcommand* options go through
+       parse-options, which accepts any unambiguous prefix, so `git rebase
+       --exe <cmd>` and `git config --glo alias.zz '!<cmd>'` both run. Both
+       were demonstrated executing against a checker that matched the full
+       spelling only, the second of them reinstating a vector this file had
+       already closed. Note the asymmetry that makes this easy to miss: git's
+       *own* options — `--git-dir`, `--exec-path`, `--config-env` — are parsed
+       by hand in git.c with exact comparisons and are **not** abbreviable, so
+       testing only those spellings suggests the problem does not exist.
+
+    An argument is refused when it is a prefix of a refused option, which is
+    strictly more conservative than git: git takes a prefix only when it is
+    unambiguous among the options that subcommand defines, and this does not
+    know the subcommand. Deliberately so — deciding ambiguity here would mean
+    reimplementing parse-options and agreeing with it forever. The cost is
+    refusing `--g`, `--ex` and the like as literal arguments, which nothing
+    sends. Note the direction: `--oneline` is *not* refused, because it is not
+    a prefix of anything on the list; only `--o` and `--op` would be.
+    """
+    if argument.startswith("-") and not argument.startswith("--"):
+        refused = _GIT_REFUSED_SHORT.intersection(argument[1:])
+        if refused:
+            return f"-{sorted(refused)[0]}"
+    name = argument.split("=", 1)[0]
+    if name in _GIT_REFUSED_ARGUMENTS or not name.startswith("--"):
+        return name
+    if name == "--":
+        # The end-of-options separator, not an abbreviation of anything. It is
+        # a prefix of every long option, so without this it matches the first
+        # entry on the list and refuses `git add -- clusters/prod`, which the
+        # fleet-audit skill issues. Caught by the over-refusal test below it.
+        return name
+    return next(
+        (full for full in _GIT_REFUSED_LONG if full.startswith(name)), name
+    )
+
+
+def git_argument_violation(argv: list[str]) -> str | None:
+    """Why this git argv may not run, or None if it may.
+
+    Matched across the whole argv rather than only the global-option region
+    before the subcommand, which is the only place git honours these. That is
+    deliberate: a check that has to agree with git about where the options end
+    is a *guess* about git's parser, and every serious defect found in this
+    policy layer so far was a checker and an executor parsing the same input
+    differently. Scanning everything cannot disagree with git about scope.
+
+    The cost is refusing a git command with a literal `-c` somewhere in its
+    arguments — a commit message, a pathspec. Nothing shipped does that, and
+    refusing something harmless is the direction this is meant to fail in.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return None
+    rest = argv[1:]
+    scoped: dict[str, str] = {}
+    for subcommand, (letters, why) in _GIT_REFUSED_SHORT_FOR_SUBCOMMAND.items():
+        if subcommand in rest:
+            scoped.update({f"-{letter}": why for letter in letters})
+    for argument in rest:
+        name = _git_refused_name(argument)
+        if name not in _GIT_REFUSED_ARGUMENTS and scoped:
+            # Same cluster rule as `_GIT_REFUSED_SHORT`, for the letters that
+            # are only refused because of the subcommand in this argv.
+            if argument.startswith("-") and not argument.startswith("--"):
+                name = next(
+                    (flag for flag in scoped if flag[1] in argument[1:]), name
+                )
+        reason = (
+            _GIT_REFUSED_ARGUMENTS.get(name)
+            or scoped.get(name)
+            or _GIT_REFUSED_SUBCOMMANDS.get(argument)
+        )
+        if reason is not None:
+            return (
+                f"`git {name}` is refused: it {reason}. The proxy runs git with "
+                "its transport allowlist, configuration files and hooks "
+                "directory pinned, because git takes both its transport and its "
+                "helper programs from configuration that lives on the volume "
+                "the agent writes — `-c protocol.ext.allow=always` re-enables "
+                "the `ext::` transport's arbitrary command execution, and `-c "
+                "core.hooksPath=` re-enables hooks. No skill needs any of these: "
+                "use `-C` to choose a directory inside a leased workspace, and "
+                "ask an operator for anything that has to change the proxy's own "
+                "configuration."
+            )
+    return None
+
 
 def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
     """The subcommand in `argv`, plus every directory its `-C` flags select.
@@ -1019,6 +1445,20 @@ class CommandExecutor:
         # no window in which the document can change between validation and use,
         # because the agent never had a handle on the document at all.
         self.kubeconfig_dir = self.state_dir / "kubeconfigs"
+        self.git_hooks_dir = self.state_dir / GIT_HOOKS_DISABLED_DIR
+        # git reads its global config from $HOME/.gitconfig, and $HOME is the
+        # sidecar-only state dir, so the agent cannot open the file directly.
+        # It can still *write* it through the proxy unless `git config
+        # --global` is refused, which is why that flag is on the refusal list —
+        # the mount geometry is not on its own a reason to trust this file.
+        # Naming the path explicitly means the location stays fixed if the
+        # mounts are ever rearranged — the same argument the KUBECTL_KUBERC
+        # line below makes.
+        # It is deliberately not /dev/null: `gh auth setup-git` writes the
+        # GitHub credential helper into *this* file via `git config --global`,
+        # so pointing it at /dev/null does not harden anything, it just severs
+        # authenticated push and fetch.
+        self.git_config_global = self.home_dir / ".gitconfig"
         for path in (
             self.home_dir,
             self.workspace_dir,
@@ -1028,8 +1468,16 @@ class CommandExecutor:
             self.local_state_dir,
             self.kube_dir,
             self.kubeconfig_dir,
+            self.git_hooks_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        # Re-applied on every start rather than only at creation: the state dir
+        # is an emptyDir, but the mode is the whole control, so it is cheaper to
+        # assert it than to reason about who else may have touched it.
+        try:
+            self.git_hooks_dir.chmod(0o500)
+        except OSError:
+            LOGGER.warning("could not restrict %s", self.git_hooks_dir)
         # Serialises the `get-credentials` that fills a cache miss. Generation is
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
@@ -1060,6 +1508,55 @@ class CommandExecutor:
             # This turns the feature off outright so the property survives
             # someone rearranging the mounts. Nothing here needs kuberc.
             "KUBECTL_KUBERC": "false",
+            # git is the one allowed executable that takes both its transport
+            # and its hook programs from configuration, and two of the three
+            # config layers it reads are files the agent can write. Verified
+            # against git 2.55: `git -c protocol.ext.allow=always clone
+            # "ext::<cmd>"` executes <cmd> here, in the container holding the
+            # cloud credentials, and a `.git/hooks/pre-commit` in a leased
+            # workspace does the same on the next `git commit` with no unusual
+            # argv at all.
+            #
+            # GIT_ALLOW_PROTOCOL is the interesting one. It is not a default:
+            # when it is set, it outranks `protocol.<name>.allow` from every
+            # config layer *including* `-c` on the command line, which is what
+            # makes the environment the boundary here and leaves argv
+            # inspection as the backup check rather than the control.
+            #
+            # It is a colon-separated list, and the empty string is not
+            # "allow all" — it is a list containing one empty protocol name,
+            # so it allows nothing and breaks every clone. The value must stay
+            # non-empty. `https` alone is correct today because every URL the
+            # skills clone, fetch or push is https (gitops_workspace builds
+            # them from a fixed https prefix).
+            #
+            # It also refuses the `file` protocol, and that is load-bearing
+            # rather than incidental: `--upload-pack=<cmd>` and
+            # `--receive-pack=<cmd>` name a program git runs for a local-path
+            # remote, and the paired control says this variable is the only
+            # thing stopping them — widen it to `https:file` for a local-path
+            # clone and both become arbitrary code execution again. They are on
+            # the argv refusal list below so that widening is survivable, but
+            # anyone reaching for `https:file` should read that list first.
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(self.git_config_global),
+            # An editor is a command git runs, and `core.editor` is settable
+            # from the `.git/config` the agent can write. `git commit` with no
+            # `-m` and `git tag -a` with no `-m` both launch it — argv the
+            # skills nearly send already. These two variables outrank
+            # `core.editor`/`sequence.editor` from every config layer including
+            # `-c`, verified the same way GIT_ALLOW_PROTOCOL was, so this is a
+            # boundary rather than a pin. `false` rather than empty: git treats
+            # an unset editor as "fall back to vi", and an editor that exits
+            # non-zero is how a non-interactive container should fail. Nothing
+            # is lost — there is no terminal here, so a commit that needs an
+            # editor could never have succeeded.
+            "GIT_EDITOR": "false",
+            "GIT_SEQUENCE_EDITOR": "false",
+            **_git_forced_config_environment(
+                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
+            ),
         }
         # Forward only variables required by supported credential clients. Chat
         # tokens and proxy control variables must never enter an agent-selected
@@ -1732,6 +2229,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Backup check only. The boundary for the `ext::` transport is
+        # GIT_ALLOW_PROTOCOL in the executor's environment, which git honours
+        # over anything argv can say; this refuses the flags that would
+        # otherwise re-enable git's hook execution, and it refuses them before
+        # the lease check because it does not depend on the working directory.
+        violation = git_argument_violation(argv)
+        if violation is not None:
+            LOGGER.warning("git argument refused request_id=%s", request_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "git.argument.refused",
+                    "message": violation,
+                },
+            )
+            return
+
         # Not a policy rule: the policy matches on argv alone, and this refusal
         # turns on the working directory as well.
         violation = self.executor.git_lease_violation(argv, cwd)
@@ -2069,7 +2585,18 @@ def serve(args: argparse.Namespace) -> None:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         socket_path.unlink(missing_ok=True)
-        server = ThreadingUnixHTTPServer(str(socket_path), CredentialProxyHandler)
+        # Nothing behind this socket authenticates its callers: reaching it is
+        # reaching the credentials, past Envoy and past the whole command policy.
+        # The mount keeps it in this container, and the mode is the second lock —
+        # 0600, so it stays connectable only by this container's own user however
+        # wide the sidecar's umask is set for the shared workspace. Applied as a
+        # umask rather than a chmod after the fact so there is no window in which
+        # the bound socket is more permissive than this.
+        previous_umask = os.umask(0o177)
+        try:
+            server = ThreadingUnixHTTPServer(str(socket_path), CredentialProxyHandler)
+        finally:
+            os.umask(previous_umask)
         LOGGER.info("credential proxy listening on unix socket %s", socket_path)
     else:
         server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)

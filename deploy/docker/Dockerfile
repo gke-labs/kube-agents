@@ -1419,6 +1419,29 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /etc/envoy
 
+# The Pod runs this container as UID 10001 — not the sandbox's 10000 — so the two
+# containers do not share a user (see the UID constants in the operator's
+# platformagent_manifests.go). An unknown UID is a passwd lookup that fails, and
+# gcloud, gh and git all do one; give the UID a name here rather than debug it
+# later. The group stays hermes (GID 10000): both containers mount the agent PVC
+# and each has to be able to write what the other created there.
+#
+# The chmod is the other half of the same split. `agent-base` creates
+# /opt/defaults mode 0700, and only the `platform` stage normalises the tree —
+# a stage this image no longer builds from. UID 10001 therefore cannot traverse
+# into /opt/defaults/scripts, where start-services runs credential_proxy.py
+# from, and the container dies with `Permission denied` on its own entrypoint.
+# 0750 rather than 0755: the directory is hermes:hermes and every process in
+# this image is in that group, so the group bit is the whole fix and `other`
+# needs nothing.
+#
+# Below the install, not above it, per the ordering note on this stage: the apt
+# layer is the expensive one and belongs first.
+RUN getent group 10000 >/dev/null || groupadd --gid 10000 hermes; \
+    useradd --no-log-init --no-create-home --uid 10001 --gid 10000 \
+      --home-dir /tmp/credential-proxy --shell /usr/sbin/nologin credential-proxy; \
+    chmod 0750 /opt/defaults
+
 COPY --from=envoy-bin --chmod=0755 /usr/local/bin/envoy /usr/local/bin/envoy
 COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
 COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
