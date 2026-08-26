@@ -535,15 +535,28 @@ Four things hold it together, and they are not equally strong:
   structural form of it is the separate broker Pod, where there is no shared mount
   to name.
 
-Two resource notes, because the trees are on the runtime's own emptyDir and that
-is node ephemeral storage rather than a disk of its own. The number of open
-workspaces is capped and a clone that comes in over `CREDENTIAL_PROXY_MAX_CLONE_BYTES`
-(256 MiB by default) is removed rather than kept, so a repository the runtime
-cannot afford does not sit half-cloned on the node. Separately, the content routes
-raise the request-body cap to twice the total-payload limit, and the listener is
-threaded with no connection cap, so peak heap is roughly concurrency times that
-figure. Neither is reachable from outside the Pod, but both are worth knowing
-before the flag is armed anywhere it matters.
+Resource notes, because the trees are on the runtime's own emptyDir and that is
+node ephemeral storage rather than a disk of its own.
+
+The number of open workspaces is capped, and a clone that comes in over
+`CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB by default) is removed rather than
+kept, so a repository the runtime cannot afford does not sit half-cloned on the
+node. Read those two together rather than separately: the ceiling is **per
+clone**, so the two defaults multiply out to about 2 GiB retained across eight
+open workspaces, by design. Size the node's ephemeral storage against the
+product, not against either number.
+
+The ceiling is also measured after the clone finishes, so it bounds what is
+_retained_ and not the peak: a repository far over the limit still lands on the
+disk before it is removed, and the only thing bounding that is the runtime's
+per-invocation timeout. A shallow clone plus the ceiling would bound both and is
+the right follow-up; neither alone does.
+
+Separately, the content routes raise the request-body cap to twice the
+total-payload limit, and the listener is threaded with no connection cap, so peak
+heap is roughly concurrency times that figure. None of this is reachable from
+outside the Pod, but it is worth knowing before the flag is armed anywhere it
+matters.
 
 Every verb takes a lock for its whole duration. The handler is threaded, so two
 requests naming one handle genuinely interleave, and each verb is a read-then-act

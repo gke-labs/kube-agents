@@ -44,10 +44,11 @@ itself about what `manifests/../.git/config` means is the defect class that has
 produced every Critical in this project so far.
 
 Two things that are easy to state and were not true until they were enforced.
-No response carries a filesystem path — that now includes the error responses,
-which is where a path leaks, because git quotes absolute paths in its own
-messages and nobody writes an error thinking about it; `_redact` is what makes
-the sentence true rather than aspirational. And every verb takes a lock for its
+No response carries an absolute filesystem path — including the error
+responses, which is where one leaks, because git quotes paths in its own
+messages and nobody writes an error thinking about it. `_redact` is what makes
+that a property rather than an intention, and it scrubs every absolute path
+rather than the two this module happens to know the names of. And every verb takes a lock for its
 whole duration, because the handler is threaded and each verb is a
 read-then-act on a tree another verb may delete or reset underneath it.
 """
@@ -113,6 +114,10 @@ WORKSPACE_GIT_SUBCOMMANDS = frozenset(
 _HANDLE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 # The same grammar unanchored, for taking handles back out of git's stderr.
 _ANY_HANDLE_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
+# Any remaining absolute path in a message bound for the wire. The lookbehind
+# keeps it off the tail of a ref -- `origin/main` and `refs/heads/x` are not
+# paths and must survive, since they are most of what a git error is about.
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w/])/(?:[\w.@+-]+/)*[\w.@+-]+")
 _GIT_SHORTNAME_RE = re.compile(r"\Agit~[0-9]+\Z", re.IGNORECASE)
 
 
@@ -477,7 +482,13 @@ class ContentWorkspaceStore:
         agent_workspace_root: str | Path,
         runner: GitRunner,
     ) -> None:
-        self.tree_root = Path(tree_root)
+        # Resolved, because `assert_disjoint_roots` resolves both sides and
+        # `_redact` matches this value against paths git prints -- which git
+        # has already resolved. Unresolved, a symlinked prefix makes the
+        # redaction match only the tail (`/private<workspace-root>/...` on a
+        # Mac), and the module's invariant would depend on whichever caller
+        # happened to resolve the root before handing it over.
+        self.tree_root = Path(tree_root).resolve()
         assert_disjoint_roots(self.tree_root, Path(agent_workspace_root))
         self.tree_root.mkdir(parents=True, exist_ok=True)
         # 0o700 rather than the default: the state directory is the broker's
@@ -508,16 +519,28 @@ class ContentWorkspaceStore:
         # matches or lands its commit on the other's branch while reporting its
         # own.
         #
-        # Reentrant because the verbs call `get`, which takes it too. Coarse on
-        # purpose: these operations are seconds of git, the caller is one agent
-        # Pod, and a per-workspace lock would still need this one to guard the
-        # dict it lives in. Correct and boring beats clever here.
+        # Reentrant because the verbs call `get`, which takes it too.
+        #
+        # Coarse on purpose, and the cost is real rather than theoretical: this
+        # is held across `clone`, `fetch` and `push`, so it is held across
+        # network I/O bounded only by the executor's timeout, not by anything
+        # here. Measured: a `get` on an *unrelated* workspace blocked 2.7s
+        # behind a 3s clone. The store therefore serves one request at a time,
+        # worst case for as long as the timeout allows, and that includes
+        # `close` -- the verb an operator reaches for when they want the tree
+        # gone. Note that `max_workspaces` advertises a concurrency this
+        # forbids: eight may be open, one may be doing anything.
+        #
+        # Still the right trade for a single agent Pod publishing one pull
+        # request at a time, and a per-workspace lock would still need this one
+        # to guard the dict it lives in. Worth revisiting the day a caller has
+        # a reason to run two workspaces at once, which nothing does today.
         self._lock = threading.RLock()
 
     # -- git -------------------------------------------------------------
 
     def _redact(self, text: object) -> str:
-        """git's stderr, with the tree root taken out of it.
+        """git's stderr, with every absolute path taken out of it.
 
         Every docstring in this module says no response carries a filesystem
         path, and until this existed that was an assertion with nothing
@@ -526,17 +549,40 @@ class ContentWorkspaceStore:
         500 bytes of stderr on the wire. An error message is exactly where a
         path leaks, because nobody writes an error message thinking about it.
 
-        The handle goes too, not just the root. A handle is a bearer capability
-        -- it is the one string in that path worth having, and a caller who has
-        it does not need to read it back out of an error.
+        Three passes, widening. The tree root and the handle are the two that
+        matter, and they get their own markers so the message still reads. The
+        third pass takes out *any* remaining absolute path, and it is the one
+        that makes the claim true rather than nearly true: a first version of
+        this knew only the root and the handle grammar, and git has other paths
+        to talk about. `warning: unable to access '<broker-home>/.gitconfig'`
+        is one the broker really can emit, because `$HOME` is deliberately the
+        broker's own state dir; `error: could not lock config file <tmp>/...`
+        is another. Neither is agent-writable and neither is worth much to an
+        attacker, but a claim asserted in four places should not have a list of
+        exceptions -- the leak nobody predicted is the whole failure mode here.
+
+        The cost is that an error naming a path says `<path>` instead. The verb
+        and the reason survive, which is what a caller can act on anyway; the
+        unredacted text goes to the broker's log, where the operator can read
+        it.
         """
         rendered = (text or "").strip() if isinstance(text, str) else ""
-        rendered = rendered.replace(str(self.tree_root), "<workspace-root>")
+        # The root *and everything under it*, in one substitution. Replacing
+        # only the root leaves `<workspace-root>/<handle>/repo`, and the third
+        # pass then chews the tail into a second marker -- a message that is
+        # correctly redacted and unreadable. One marker for one path.
+        rendered = re.sub(
+            re.escape(str(self.tree_root)) + r"(?:/[\w.@+-]+)*",
+            "<workspace-root>",
+            rendered,
+        )
         # By shape, not by lookup. The handle that most needs removing is the
         # one whose `open` just failed, and that one is not in `_workspaces`
         # yet -- registration is the last thing `open` does. Matching the
-        # handle grammar catches it and every registered one with one rule.
+        # handle grammar catches it and every registered one with one rule,
+        # including one quoted on its own rather than inside a path.
         rendered = _ANY_HANDLE_RE.sub("<handle>", rendered)
+        rendered = _ABSOLUTE_PATH_RE.sub("<path>", rendered)
         return rendered[:500]
 
     def _git(self, workspace_or_dir, argv: list[str], *, check: bool = True):

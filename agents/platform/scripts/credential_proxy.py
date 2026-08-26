@@ -2478,10 +2478,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         path, because a path handed back is a directory the agent can be told to
         `cd` into — which is precisely the arrangement this replaces. The
         `handle` is a broker-minted opaque token, not a location. That holds for
-        the error responses too: `ContentWorkspaceStore._redact` takes the tree
-        root and the handle back out of git's stderr before it goes on the wire,
-        which is the only reason the sentence above is a property rather than an
-        intention.
+        the error responses too: `ContentWorkspaceStore._redact` takes every
+        absolute path, plus the handle, back out of git's stderr before it goes
+        on the wire. That is the only reason the sentence above is a property
+        rather than an intention, and it scrubs by shape rather than by a list
+        of known paths -- the leak nobody predicted is the failure mode here.
 
         These routes deliberately do **not** go through `Policy.blocked_by`,
         `git_argument_violation` or `git_lease_violation`. Those three inspect an

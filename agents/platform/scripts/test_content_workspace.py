@@ -11,6 +11,7 @@ reasons before the control is believable.
 from __future__ import annotations
 
 import base64
+import faulthandler
 import os
 import subprocess
 import tempfile
@@ -541,6 +542,15 @@ class ConcurrencyTest(unittest.TestCase):
     """
 
     def setUp(self):
+        # A deadlock here does not fail, it hangs -- and a hang in CI is a job
+        # timeout with no test named and nothing pointing at this file. Arm a
+        # watchdog for the duration of this class only: if any method in it
+        # stops making progress, the process dumps every thread's stack, which
+        # names the exact line holding the lock, and dies. Scoped rather than
+        # module-level because the rest of the suite runs alongside longer
+        # ones and must not inherit a deadline.
+        faulthandler.dump_traceback_later(60, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         self.agent = self.base / "data"
@@ -677,22 +687,45 @@ class ConcurrencyTest(unittest.TestCase):
     def test_ordinary_sequential_use_is_not_slowed_to_a_stop(self):
         """Paired ordinary use: the lock is reentrant and does not self-deadlock.
 
-        Every verb takes it and every verb calls `get`, which takes it too. A
-        plain `Lock` here would hang on the first request rather than fail, and
-        a hang in the credential holder is worse than an exception.
+        Every verb takes it and every verb calls `get`, which takes it too, so
+        a plain `Lock` deadlocks on the first request.
+
+        Run on a worker with a bounded join rather than inline, because the
+        failure mode here is a *hang*, not an exception. Inline, swapping
+        `RLock` for `Lock` does not turn this red -- it stops the suite dead,
+        which in CI is a job timeout with no failing test named and nothing
+        pointing at this file. A deadlock the test cannot report is a test that
+        only works when someone is watching.
         """
         store, workspace, _ = self.store_with_workspace()
-        self.assertIs(workspace, store.get(workspace.handle))
-        self.assertEqual([], store.list(workspace.handle))
-        self.assertTrue(
-            store.commit(
-                workspace.handle,
-                "platform-agent/change",
-                "feat: a change",
-                [Change(repo_relative("a.yaml"), b"a\n")],
-            )["committed"]
+        done = []
+
+        def sequence():
+            done.append(store.get(workspace.handle))
+            done.append(store.list(workspace.handle))
+            done.append(
+                store.commit(
+                    workspace.handle,
+                    "platform-agent/change",
+                    "feat: a change",
+                    [Change(repo_relative("a.yaml"), b"a\n")],
+                )
+            )
+            store.close(workspace.handle)
+            done.append("closed")
+
+        worker = threading.Thread(target=sequence, daemon=True)
+        worker.start()
+        worker.join(timeout=20)
+        self.assertFalse(
+            worker.is_alive(),
+            "a verb deadlocked: every verb takes the store lock and every verb "
+            "calls get(), which takes it too, so it has to be reentrant",
         )
-        store.close(workspace.handle)
+        self.assertIs(workspace, done[0])
+        self.assertEqual([], done[1])
+        self.assertTrue(done[2]["committed"])
+        self.assertEqual("closed", done[3])
         self.assertEqual({}, store._workspaces)
 
 
@@ -770,13 +803,19 @@ class ErrorRedactionTest(unittest.TestCase):
 
     def test_git_stderr_reaches_the_caller_without_the_tree_root_in_it(self):
         handle = "e" * 32
-        tree_root = self.base / "trees"
-        leaky = (
-            f"fatal: could not create work tree dir "
-            f"'{tree_root}/{handle}/repo': Permission denied"
-        )
-        runner = RecordingRunner({"clone": FakeResult(128, "", leaky)})
-        store = ContentWorkspaceStore(tree_root, self.agent, runner)
+        runner = RecordingRunner()
+        store = ContentWorkspaceStore(self.base / "trees", self.agent, runner)
+        # Built from the store's own root, because git prints the path it
+        # actually used and git resolves. A fixture using the unresolved
+        # spelling tests a string the broker never emits.
+        runner.responses = {
+            "clone": FakeResult(
+                128,
+                "",
+                f"fatal: could not create work tree dir "
+                f"'{store.tree_root}/{handle}/repo': Permission denied",
+            )
+        }
 
         with self.assertRaises(content_workspace.GitFailed) as caught:
             store.open("acme/fleet")
@@ -784,12 +823,20 @@ class ErrorRedactionTest(unittest.TestCase):
 
         self.assertNotIn(str(store.tree_root), message)
         self.assertNotIn(str(self.base), message)
-        self.assertRegex(message, r"<workspace-root>")
-        # The handle goes too. It is a bearer capability, and the handle whose
-        # `open` just failed is not in `_workspaces` yet -- so this has to be
-        # matched by shape, which is what the assertion below pins.
+        # Root and tail collapse to one marker rather than leaving a shredded
+        # path behind.
+        self.assertIn("'<workspace-root>'", message)
+        # And no handle survives in any spelling. It is a bearer capability,
+        # and the handle whose `open` just failed is not registered yet, so it
+        # has to be caught by shape.
         self.assertNotRegex(message, r"[0-9a-f]{32}")
-        self.assertIn("<handle>", message)
+
+        # Paired: a handle quoted on its own, outside any path, still goes.
+        runner.responses = {"clone": FakeResult(128, "", f"fatal: bad object {handle}")}
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        self.assertIn("<handle>", str(caught.exception))
+        self.assertNotRegex(str(caught.exception), r"[0-9a-f]{32}")
 
         # Paired ordinary use: the part of the message that helps a caller
         # debug is still there. Redaction that removes everything is just a
@@ -797,6 +844,89 @@ class ErrorRedactionTest(unittest.TestCase):
         self.assertIn("could not create work tree dir", message)
         self.assertIn("Permission denied", message)
         self.assertIn("exit code 128", message)
+
+    def test_the_root_is_resolved_so_a_symlinked_prefix_still_matches(self):
+        """git prints the path it used, and git resolves. So must the root.
+
+        Constructed with an unresolved, symlinked spelling -- which is what a
+        caller hands over -- while git's stderr names the real path underneath.
+        Unresolved, the substitution matches only the tail and the message goes
+        out as `/private<workspace-root>/...`. That is how it surfaced: in a
+        real run on a machine where the temp directory is behind a symlink.
+
+        It is unreachable in production only because `CommandExecutor` happens
+        to resolve the root before handing it over, which makes this module's
+        invariant depend on a caller somewhere else. Resolving here is what
+        makes it this module's property.
+        """
+        real = self.base / "real"
+        real.mkdir()
+        linked = self.base / "linked"
+        linked.symlink_to(real)
+
+        runner = RecordingRunner()
+        store = ContentWorkspaceStore(linked / "trees", self.agent, runner)
+        self.assertEqual(
+            (real / "trees").resolve(), store.tree_root, "the root was not resolved"
+        )
+
+        # The path git would actually print, from under the symlink.
+        runner.responses = {
+            "clone": FakeResult(
+                128,
+                "",
+                f"fatal: could not create work tree dir "
+                f"'{(real / 'trees').resolve()}/{'e' * 32}/repo': Permission denied",
+            )
+        }
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        message = str(caught.exception)
+        self.assertIn("'<workspace-root>'", message)
+        self.assertNotIn(str(real), message)
+        self.assertNotIn("/private", message)
+
+    def test_an_absolute_path_that_is_not_the_tree_root_goes_too(self):
+        """The claim is "no filesystem path", not "not that one path".
+
+        Knowing only the tree root and the handle grammar left every other
+        absolute path in git's stderr on the wire. These two the broker really
+        can produce: `$HOME` is deliberately pointed at the broker's own state
+        dir, so a config it cannot read names that dir, and a lock failure
+        names wherever the config lives.
+        """
+        leaky = (
+            "warning: unable to access '/var/run/broker-state/.gitconfig': "
+            "Permission denied\n"
+            "error: could not lock config file /tmp/xyz/.git/config: Permission denied"
+        )
+        runner = RecordingRunner({"clone": FakeResult(128, "", leaky)})
+        store = ContentWorkspaceStore(self.base / "trees3", self.agent, runner)
+
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        message = str(caught.exception)
+
+        self.assertNotIn("/var/run/broker-state", message)
+        self.assertNotIn("/tmp/xyz", message)
+        self.assertNotIn(".gitconfig", message)
+        self.assertEqual(2, message.count("<path>"))
+
+        # Paired: the reason survives, and a ref is not a path -- `origin/main`
+        # and `refs/heads/x` are most of what a git error is about and must
+        # come through intact.
+        self.assertIn("unable to access", message)
+        self.assertIn("could not lock config file", message)
+        self.assertIn("Permission denied", message)
+
+        refs = RecordingRunner(
+            {"clone": FakeResult(1, "", "error: failed to push some refs to origin/main")}
+        )
+        store = ContentWorkspaceStore(self.base / "trees4", self.agent, refs)
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        self.assertIn("origin/main", str(caught.exception))
+        self.assertNotIn("<path>", str(caught.exception))
 
 
 class IndexUnreadableTest(unittest.TestCase):
