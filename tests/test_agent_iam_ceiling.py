@@ -245,6 +245,70 @@ class SharedValidatorTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn("has been removed", result.stdout + result.stderr)
 
+    def test_the_explanation_survives_the_spellings_a_stale_config_carries(self):
+        """Not covered by the rejected-values test above, which only checks the exit code.
+
+        common.sh trims and lowercases before calling the gate; install.sh
+        passes `--permission-set` through raw. So the two front doors disagreed
+        about which spellings reach the named arm, and the one that did not was
+        the flag -- the path a GitHub environment variable or a hand-edited
+        vars.sh arrives on. A non-zero exit is not the point of this function;
+        the explanation is.
+        """
+        for value in ["gke-admin", "GKE-ADMIN", "Gke-Admin", "  gke-admin  ", "gke-admin\t"]:
+            with self.subTest(value=value):
+                result = self._source(f'require_supported_permission_set "{value}"')
+                combined = result.stdout + result.stderr
+                self.assertNotEqual(0, result.returncode, combined)
+                self.assertIn(
+                    "has been removed",
+                    combined,
+                    f"{value!r} was rejected, but with the generic error rather than the "
+                    "explanation -- so a cached config reads as a typo",
+                )
+
+    def test_a_custom_role_list_reaching_the_removed_ceiling_is_flagged(self):
+        """`custom` is the supported way to widen; it should not be the quiet way.
+
+        `--custom-roles="roles/container.admin"` lands in a machine-generated
+        terraform.tfvars that nobody opens, so on the installer path the
+        "naming each role puts it in front of a reviewer" argument does not
+        hold on its own. The warning is what puts it in front of someone. It
+        does not refuse -- an operator entitled to that grant still gets it.
+        """
+        for roles in [
+            "roles/container.admin",
+            "roles/container.viewer,roles/container.admin",
+            "roles/container.viewer roles/owner",
+        ]:
+            with self.subTest(roles=roles):
+                result = self._source(f'warn_on_overreaching_custom_roles "{roles}"')
+                self.assertEqual(0, result.returncode, "this warns, it does not refuse")
+                self.assertIn("GKE authorizes on either", result.stdout + result.stderr)
+
+    def test_a_benign_custom_role_list_is_not_flagged(self):
+        """A warning that fires on everything is a warning nobody reads."""
+        result = self._source(
+            'warn_on_overreaching_custom_roles "roles/container.viewer roles/logging.viewer"'
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("", (result.stdout + result.stderr).strip())
+
+    def test_the_warning_covers_every_role_the_ceiling_test_forbids(self):
+        """One list, two homes -- so assert they are the same list.
+
+        The shell cannot import FORBIDDEN_ROLES, so the drift this catches is
+        real: a role added here and not there leaves a set the tests forbid but
+        the installer waves through.
+        """
+        declared = re.search(
+            r'^OVERREACHING_AGENT_ROLES="([^"]*)"',
+            INSTALLER_COMMON_SH.read_text(encoding="utf-8"),
+            re.M,
+        )
+        self.assertIsNotNone(declared, "OVERREACHING_AGENT_ROLES moved or was renamed")
+        self.assertEqual(FORBIDDEN_ROLES, set(declared.group(1).split()))
+
     def test_the_shared_gate_still_accepts_what_remains(self):
         for value in ACCEPTED_VALUES:
             with self.subTest(value=value):
@@ -401,6 +465,27 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
         r"^\s*(#|//)|error_message\s*=|description\s*=|print_(error|warning|info)\b"
     )
 
+    # The two places a forbidden role is named in order to be refused rather
+    # than granted, exempted by name so the exemption is visible in the diff
+    # that adds it. Both are executed by SharedValidatorTest, so nothing here
+    # goes unchecked -- what is waived is the text sweep, not the behaviour.
+    _DENYLIST_EXEMPT = (
+        r'^OVERREACHING_AGENT_ROLES="[^"]*"',  # the whole line, not just the name
+        r"^require_supported_permission_set\(\) \{.*?^\}$",
+        r"^warn_on_overreaching_custom_roles\(\) \{.*?^\}$",
+    )
+
+    def _exempt_lines(self) -> set[str]:
+        source = INSTALLER_COMMON_SH.read_text(encoding="utf-8")
+        exempt: set[str] = set()
+        for pattern in self._DENYLIST_EXEMPT:
+            match = re.search(pattern, source, re.M | re.S)
+            self.assertIsNotNone(
+                match, f"the refusal machinery matching {pattern!r} moved or was renamed"
+            )
+            exempt.update(match.group(0).splitlines())
+        return exempt
+
     def _shipped_install_sources(self) -> list[Path]:
         paths = sorted(TERRAFORM_DIR.rglob("*.tf"))
         paths += sorted(TERRAFORM_DIR.rglob("*.tfvars.example"))
@@ -414,12 +499,13 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
             yield n, line
 
     def test_no_shipped_install_source_grants_a_forbidden_role(self):
+        exempt = self._exempt_lines()
         offenders = [
             f"{path.relative_to(REPO_ROOT)}:{n}: {role}"
             for path in self._shipped_install_sources()
             for n, line in self._effective_lines(path)
             for role in FORBIDDEN_ROLES
-            if role in line
+            if role in line and line not in exempt
         ]
         self.assertEqual(
             [],
@@ -429,16 +515,10 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
         )
 
     def test_no_shipped_install_source_offers_the_removed_permission_set(self):
-        # require_supported_permission_set is the refusal itself; it has to
-        # compare against the literal to recognise it. SharedValidatorTest
-        # executes that function, so nothing here is going unchecked.
-        refusal = re.search(
-            r"^require_supported_permission_set\(\) \{.*?^\}$",
-            INSTALLER_COMMON_SH.read_text(encoding="utf-8"),
-            re.M | re.S,
-        )
-        self.assertIsNotNone(refusal, "the shared permission-set gate moved or was renamed")
-        exempt = set(refusal.group(0).splitlines())
+        # The refusal itself has to compare against the literal to recognise
+        # it. SharedValidatorTest executes that function, so nothing here is
+        # going unchecked.
+        exempt = self._exempt_lines()
 
         offenders = [
             f"{path.relative_to(REPO_ROOT)}:{n}: {line.strip()}"

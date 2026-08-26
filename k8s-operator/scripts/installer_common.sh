@@ -74,7 +74,14 @@ is_valid_permission_set() {
 # before the removal fails with an explanation rather than a bare "invalid".
 # Follows this file's contract: the caller defines print_error.
 require_supported_permission_set() {
-  local value="${1:-}"
+  # Normalised here rather than left to the caller. common.sh trims and
+  # lowercases before calling; install.sh passes --permission-set through raw,
+  # so without this `--permission-set=GKE-ADMIN` fell past the named arm and
+  # got the generic "invalid" instead of the explanation this function exists
+  # to give. The uppercase spelling is not hypothetical: it is what a GitHub
+  # environment variable or a hand-edited vars.sh tends to carry.
+  local value
+  value=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if [ "$value" = "gke-admin" ]; then
     print_error "The 'gke-admin' permission set has been removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and the container.clusters.impersonate it carries applies to every cluster in the project. Use 'read-only', or 'custom' with an explicit role list if you accept that risk."
     return 1
@@ -82,6 +89,39 @@ require_supported_permission_set() {
   if ! is_valid_permission_set "$value"; then
     print_error "Invalid Platform Agent Permission Set '$value'. Must be one of: read-only, custom."
     return 1
+  fi
+  return 0
+}
+
+# Roles that hand the agent the authority the removed `gke-admin` bundle did.
+# Kept in step with FORBIDDEN_ROLES in tests/test_agent_iam_ceiling.py, which is
+# what asserts no built-in set grants any of them.
+OVERREACHING_AGENT_ROLES="roles/container.admin roles/container.clusterAdmin roles/container.developer roles/container.hostServiceAgentUser roles/monitoring.admin roles/logging.admin roles/owner roles/editor roles/iam.serviceAccountTokenCreator"
+
+# Warn when a `custom` role list reaches the ceiling `gke-admin` was removed for.
+#
+# `custom` is the supported way to widen, and the argument for it is that naming
+# each role puts the grant somewhere a reviewer sees it. That argument does not
+# hold on the installer path: --custom-roles goes into a machine-generated
+# terraform.tfvars nobody opens, so `--permission-set=custom
+# --custom-roles="roles/container.admin"` reaches IAM-identical authority to the
+# bundle that was removed, silently. This does not refuse it -- an operator who
+# means it is entitled to it -- it just declines to let it happen quietly.
+#
+# Returns 0 always: this is a warning, not a gate. Caller defines print_warning.
+warn_on_overreaching_custom_roles() {
+  local roles="${1:-}"
+  local found=""
+  local role listed
+  for role in $OVERREACHING_AGENT_ROLES; do
+    for listed in ${roles//,/ }; do
+      if [ "$listed" = "$role" ]; then
+        found="${found}${found:+, }${role}"
+      fi
+    done
+  done
+  if [ -n "$found" ]; then
+    print_warning "The custom role list grants ${found}. GKE authorizes on either IAM or Kubernetes RBAC, so a role like roles/container.admin authorizes the agent through IAM regardless of how narrow its Kubernetes RBAC is -- this is the authority the removed 'gke-admin' set granted, reached the long way round. Continuing; grant it only if you mean to."
   fi
   return 0
 }

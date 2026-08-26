@@ -6,9 +6,17 @@
 # evadable by a manifest that carries neither the `kube-agents/tier` label nor
 # the `*-agent` naming convention.
 #
-# Turn off for: a cluster below Kubernetes 1.30 (where the policy API is not yet
-# v1 and the install would fail), or a second kube-agents release in a cluster
-# that already has these — the objects are cluster singletons with fixed names.
+# You do not need to turn this off for an old cluster: the template also checks
+# `.Capabilities.KubeVersion` and renders nothing below Kubernetes 1.30, where
+# the policy API is not yet v1 and the objects would fail to apply. Turn it off
+# for a second kube-agents release in a cluster that already has these — they
+# are cluster singletons with fixed names, so Helm refuses the second install on
+# ownership rather than duplicating them.
+#
+# What the policies do and do not enforce is in the header of
+# templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
+# on a default install with no GitOps overlay, the content policy matches
+# nothing the operator creates.
 admissionPolicy:
   enabled: true
 

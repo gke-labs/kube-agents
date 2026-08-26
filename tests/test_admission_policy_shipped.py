@@ -50,6 +50,14 @@ SYNC_SCRIPT = REPO_ROOT / "hack" / "sync-chart-manifests.sh"
 
 VALUES_GATE = "admissionPolicy"
 
+# The template's first line, which gates it twice over. Matched exactly rather
+# than loosely: load_chart_objects() strips this line to parse the rest, so a
+# change to it has to be seen here before the stripping can be trusted.
+TEMPLATE_GATE = (
+    "{{- if and .Values.admissionPolicy.enabled "
+    '(semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}'
+)
+
 EXPECTED_OBJECTS = {
     ("ValidatingAdmissionPolicy", "kube-agents-agent-readonly"),
     ("ValidatingAdmissionPolicyBinding", "kube-agents-agent-readonly"),
@@ -72,7 +80,7 @@ def load_chart_objects() -> list[dict]:
     parsing something else.
     """
     lines = CHART_TEMPLATE.read_text(encoding="utf-8").splitlines()
-    if lines[0] != "{{- if .Values.admissionPolicy.enabled }}" or lines[-1] != "{{- end }}":
+    if lines[0] != TEMPLATE_GATE or lines[-1] != "{{- end }}":
         raise AssertionError(
             "the chart template is no longer 'gate + generated source + end'; "
             "this test's stripping is invalid, so re-read it before trusting it"
@@ -111,6 +119,24 @@ class ChartShipsThePoliciesTest(unittest.TestCase):
         for binding in bindings:
             with self.subTest(binding=binding["metadata"]["name"]):
                 self.assertIn(binding["spec"]["policyName"], policies)
+
+    def test_the_template_is_gated_on_the_version_that_serves_the_api(self):
+        """Chart.yaml accepts 1.29; ValidatingAdmissionPolicy is v1 only from 1.30.
+
+        Without the version half of the gate, a default `helm install` on a
+        cluster the chart says it supports fails on `no matches for kind` --
+        and through Terraform that fails the whole apply, not just the
+        policies. `helm template --kube-version 1.29.0` rendering nothing is
+        the behaviour; this asserts the mechanism that produces it, since the
+        suite has no helm to render with.
+        """
+        first = CHART_TEMPLATE.read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(TEMPLATE_GATE, first)
+        self.assertIn(
+            "1.30.0",
+            first,
+            "the version floor moved; ValidatingAdmissionPolicy reached v1 in 1.30",
+        )
 
     def test_the_gate_defaults_to_on(self):
         values = yaml.safe_load(CHART_VALUES.read_text(encoding="utf-8"))
@@ -185,7 +211,17 @@ class ChartCopyHasNotDriftedTest(unittest.TestCase):
 
 
 class PolicyContentTest(unittest.TestCase):
-    """Only the denials that are actually in the policies — see the module docstring."""
+    """Only the denials that are actually in the policies — see the module docstring.
+
+    These assertions read the CEL as text. There is no CEL runtime in this
+    repository, so what they catch is a denial being deleted or weakened in a
+    way that changes the string; a semantically broken rewrite that keeps the
+    substring passes. Do not read a green here as "the expressions were
+    evaluated". The one thing that does evaluate them is the API server, which
+    compiles every expression when the policy object is admitted -- so a
+    `kubectl apply --dry-run=server` of the source file is the check that
+    covers syntax, and enforcement on a live cluster covers the rest.
+    """
 
     def setUp(self):
         # Policies only: a binding shares its policy's name, so an unfiltered
@@ -227,12 +263,60 @@ class PolicyContentTest(unittest.TestCase):
         )
         self.assertIn("secrets", expressions)
 
-    def test_the_binding_scope_policy_selects_on_the_subject_not_a_label(self):
-        """The one selector an author cannot drop from the manifest."""
+    def test_the_operator_own_bindings_are_exempt_from_the_binding_scope_policy(self):
+        """The policy asserted an invariant the controller violates by construction.
+
+        `reconcileRBAC` unconditionally mints `kubeagents:minimal:<ns>:<name>`
+        as a ClusterRoleBinding whose subject is
+        `spec.security.serviceAccountName`. The default value ends in `-agent`,
+        so the binding-scope policy evaluates every reconcile on every install;
+        an agent configured with the namespace-tier ServiceAccount name from
+        the shipped GitOps example would have that reconcile denied. The
+        operator has no namespace-tier path -- it only ever binds the platform
+        tier -- so exempting what it stamps removes a contradiction rather than
+        a control.
+        """
         conditions = self.by_name["kube-agents-agent-binding-scope"]["spec"]["matchConditions"]
         joined = " ".join(c["expression"] for c in conditions)
-        self.assertIn("object.subjects", joined)
-        self.assertNotIn("metadata.labels", joined)
+        self.assertIn(
+            "platformagent-controller",
+            joined,
+            "the binding-scope policy no longer exempts operator-managed bindings, so a "
+            "reconcile can be denied by the policy the same install ships",
+        )
+        self.assertIn("app.kubernetes.io/managed-by", joined)
+
+    def test_the_binding_scope_policy_selects_on_the_subject_not_a_label(self):
+        """The one selector an author cannot drop from the manifest.
+
+        A label may narrow what the policy examines -- the operator exemption
+        above is exactly that -- but it may never be what brings an object into
+        scope in the first place, because an author who omits it then walks
+        past the policy. So this checks the selecting condition by name rather
+        than the conditions as a block: `binds-agent-sa` has to key on the
+        subject, and any label test has to live in a different condition whose
+        only effect is to exclude.
+        """
+        conditions = self.by_name["kube-agents-agent-binding-scope"]["spec"]["matchConditions"]
+        by_name = {c.get("name"): c["expression"] for c in conditions}
+        self.assertIn(
+            "binds-agent-sa", by_name, "the subject selector moved or was renamed"
+        )
+        self.assertIn("object.subjects", by_name["binds-agent-sa"])
+        self.assertNotIn(
+            "metadata.labels",
+            by_name["binds-agent-sa"],
+            "the policy now selects on a label, which an author can simply omit",
+        )
+        for name, expression in by_name.items():
+            if name == "binds-agent-sa" or "metadata.labels" not in expression:
+                continue
+            with self.subTest(condition=name):
+                self.assertTrue(
+                    expression.lstrip().startswith("!("),
+                    f"matchCondition {name!r} tests a label without being a negation, so it "
+                    "may be selecting on one rather than excluding on one",
+                )
 
 
 if __name__ == "__main__":

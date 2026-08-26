@@ -1756,6 +1756,9 @@ main() {
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
   fi
+  if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
+    warn_on_overreaching_custom_roles "$custom_roles"
+  fi
   local enable_gvisor="${PARAM_ENABLE_GVISOR:-false}"
   if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
     print_error "--gvisor must be either true or false."

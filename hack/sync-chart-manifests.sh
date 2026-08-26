@@ -90,9 +90,16 @@ fi
 [[ -f "$VAP_SRC" ]] || fail "admission policy source missing: $VAP_SRC"
 tmp=$(mktemp)
 {
-  echo '{{- if .Values.admissionPolicy.enabled }}'
+  echo '{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}'
   echo "# GENERATED from $VAP_SRC — do not edit by hand; run \`make chart-sync\`."
   echo '# See values.yaml (admissionPolicy) for the gate and when to turn it off.'
+  echo '#'
+  echo '# The semverCompare half is not the same switch as the values gate. ValidatingAdmissionPolicy'
+  echo '# only reached v1 in Kubernetes 1.30, and Chart.yaml accepts >=1.29.0-0, so on a 1.29 cluster'
+  echo '# a default install would fail the whole release (and, through Terraform, the whole apply) on'
+  echo '# `no matches for kind`. Rendering nothing there is the only behaviour that keeps the chart'
+  echo '# installable across the range it claims. It is a condition on this one template, not a'
+  echo '# second delivery path.'
   cat "$VAP_SRC"
   echo '{{- end }}'
 } >"$tmp"

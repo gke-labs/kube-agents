@@ -70,8 +70,6 @@ The default **read-only** set binds viewer roles only:
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
-The **custom** set binds exactly the roles listed in `PLATFORM_AGENT_CUSTOM_ROLES` (space- or comma-separated; the installer requires a non-empty value when this set is selected) — none of the built-in bundle is added.
-
 ### Why there is no `gke-admin` set
 
 There used to be a third set, `gke-admin`, which bound `roles/container.clusterAdmin` and `roles/container.admin`. It was removed rather than deprecated because it did not simply widen the ceiling — it removed one:
@@ -107,16 +105,18 @@ kubectl describe rolebinding -n kubeagents-system kubeagents:leader:kubeagents-s
 
 ### The admission backstop on agent RBAC
 
-The RBAC above is what the operator creates. Two cluster-scoped `ValidatingAdmissionPolicy` objects reject agent RBAC that goes beyond it at apply time, whoever applies it — the operator, your GitOps reconciler, or a human with `kubectl`. One source, [`k8s-operator/config/admission/agent-rbac-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/agent-rbac-policy.yaml), and which installs apply it depends on how you install:
+The RBAC above is what the operator creates. Alongside it, two cluster-scoped `ValidatingAdmissionPolicy` objects reject some agent RBAC at apply time, whoever applies it. One source, [`k8s-operator/config/admission/agent-rbac-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/agent-rbac-policy.yaml), and which installs apply it depends on how you install:
 
-| Install method                                                                | Ships the policies?                                                                                     |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| The install engine — `install.sh`, or Terraform + Helm directly (Methods 0/1) | **Yes** — `templates/agent-rbac-admission-policy.yaml`, gated on `admissionPolicy.enabled`, default on. |
-| Manual `make install && make deploy` (Method 2)                               | **No** — apply the source yourself; INSTALL.md Method 2 Step 4 has the command.                         |
+| Install method                                                                | Ships the policies?                                                                                                                                     |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The install engine — `install.sh`, or Terraform + Helm directly (Methods 0/1) | **Yes on Kubernetes 1.30+** — `templates/agent-rbac-admission-policy.yaml`, gated on `admissionPolicy.enabled` (default on) and on the cluster version. |
+| Manual `make install && make deploy` (Method 2)                               | **No** — apply the source yourself; INSTALL.md Method 2 Step 4 has the command.                                                                         |
 
 They are outside the kustomize overlay on purpose: its `namePrefix` rewrites each policy's name but not the `spec.policyName` its binding refers to, which would leave the bindings pointing at nothing and the policies inert with no error. A plain `kubectl apply` has no such transform.
 
-They need Kubernetes 1.30 or later, where the policy API reached `v1`. Below that the chart install fails; set `admissionPolicy.enabled=false` there, and note that this leaves agent RBAC unbackstopped at admission.
+They need Kubernetes 1.30 or later, where the policy API reached `v1`. The chart template checks the cluster's version as well as the values gate, so on 1.29 it renders nothing rather than failing the install — which also means an install there is not backstopped at admission and nothing says so at the time.
+
+**What they govern is narrower than "agent RBAC", and the gap is worth knowing before you rely on them.** Policy 1 selects only objects carrying the `kube-agents/tier` label. Nothing the operator creates carries it — `commonLabels()` stamps the four `app.kubernetes.io/*` labels and no tier — so on a default install with no GitOps overlay, **policy 1 matches nothing at all**. It is a backstop on the RBAC your overlay writes, not on the RBAC the operator mints. Policy 2 does see the operator's `kubeagents:minimal:*` ClusterRoleBinding, whose subject ends in `-agent`, and deliberately exempts it: `reconcileRBAC` has no namespace-tier path, so the one case policy 2 denies is one the operator cannot produce.
 
 | Policy                            | Governs                                                                          | Denies                                                                                                             |
 | --------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -127,6 +127,8 @@ What they do **not** cover, stated plainly because a backstop misread as complet
 
 - **They cannot check the role a binding points at.** CEL in a `ValidatingAdmissionPolicy` sees only the object being admitted, so an unlabelled write `Role` bound to an agent ServiceAccount is admitted. Closing that needs a cross-object webhook, which is not built.
 - **The content policy is label-selected.** `kube-agents-agent-readonly` only looks at objects carrying `kube-agents/tier`. A hand-written manifest that omits the label is not examined at all; pull-request review is what catches that. The binding-scope policy is not evadable this way — it keys on the ServiceAccount being privileged, which the binding cannot omit.
+- **Policy 2 denies exactly one ServiceAccount name.** A cluster-scoped binding to any other agent ServiceAccount is admitted. Combined with the label point above, this means an unlabelled `ClusterRole` granting `*` on `*`, bound to the agent's own ServiceAccount, is admitted by both policies on a default install. Pull-request review on the GitOps repository is the control for that, which is what the [branch-protection guidance](https://github.com/gke-labs/kube-agents/blob/main/examples/gitops-repo/.github/branch-protection.md) shipped with the example overlay is for.
+- **Policy 2 only examines `kind: ServiceAccount` subjects.** A binding whose subject is a `kind: Group` — `system:serviceaccounts:team-x`, say — is not selected. The subject is unforgeable for the kinds the policy looks at; choosing a different kind steps outside them.
 - **They govern agent RBAC, not the operator's own.** The controller's ClusterRole below is unlabelled and out of scope by design.
 
 ### The operator controller is a separate identity

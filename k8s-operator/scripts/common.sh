@@ -367,6 +367,7 @@ init_var_platform_agent_permission_set() {
       print_error "Custom permission set selected, but PLATFORM_AGENT_CUSTOM_ROLES is empty."
       exit 1
     fi
+    warn_on_overreaching_custom_roles "$PLATFORM_AGENT_CUSTOM_ROLES"
   fi
 }
 

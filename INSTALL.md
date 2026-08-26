@@ -427,7 +427,8 @@ name without rewriting the `spec.policyName` its binding refers to, leaving both
 at nothing and the policies silently inert:
 
 ```bash
-# Kubernetes 1.30+ only (ValidatingAdmissionPolicy v1). Skip on older clusters.
+# Kubernetes 1.30+ only (ValidatingAdmissionPolicy v1). Skip on older clusters -- unlike
+# the chart, which checks the version itself, this apply will fail there.
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 ```
 

@@ -356,11 +356,14 @@ check the rules of a role a binding _references_ — CEL cannot read another
 object — and the content policy only selects manifests carrying the
 `kube-agents/tier` label; see that file's header.
 
-Set `admissionPolicy.enabled=false` on a cluster below Kubernetes 1.30 (the
-policy API is not `v1` there and the install fails), or for a second kube-agents
-release in a cluster that already has them — the objects are cluster singletons
-with fixed names, so Helm refuses the second install on ownership rather than
-duplicating them.
+The template checks `.Capabilities.KubeVersion` as well as this value, so on a
+cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
+renders nothing instead of failing the install. `Chart.yaml` accepts `>=1.29.0-0`,
+so that case is inside the supported range and has to work.
+
+Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
+that already has them: the objects are cluster singletons with fixed names, so
+Helm refuses the second install on ownership rather than duplicating them.
 
 ## Uninstalling
 
