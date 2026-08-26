@@ -14,6 +14,9 @@ The `kube-agents` test execution model partitions tests across three distinct au
 | **Tier 2: RC Promotion Gate**   | Release Candidate build (`rc-release-pipeline.yml`)                                 | Validates candidate container images on a freshly provisioned GKE cluster before tagging `_validated` | `make test-e2e` (`scripts/release/execute_e2e_tests.py`)                 |
 | **Tier 3: Nightly & On-Demand** | Nightly cron or manual dispatch (`e2e-nightly-matrix.yml`, `e2e-manual-runner.yml`) | Full matrix across multi-cluster environments, audit streams, and GPU/scarcity stockout scenarios     | `make test-e2e` with `FLEET_AUDIT_STREAMS=all`, `STOCKOUT_SCENARIOS=all` |
 
+Tier 2's "freshly provisioned" is the intent. What the pipeline does today, and why it differs,
+is in [`scripts/release/README.md`](../../scripts/release/README.md).
+
 ---
 
 ## 2. The 4-Stage E2E Test Pipeline

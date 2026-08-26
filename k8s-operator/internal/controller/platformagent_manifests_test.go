@@ -409,8 +409,8 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
 	}
 
-	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
-		t.Errorf("expected ShareProcessNamespace true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
+		t.Errorf("expected ShareProcessNamespace unset, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
 
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
@@ -955,8 +955,11 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			}
 
 			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
-			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
-				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+			// The dashboard used to be the reason the Pod shared a process
+			// namespace, which put the credential sidecar's environment in
+			// /proc for the sandbox to read. Enabling it must no longer do that.
+			if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
+				t.Errorf("expected ShareProcessNamespace to be unset with the dashboard enabled, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
 			// 3: the credential proxy is a native sidecar and lives in InitContainers.
 			if len(dep.Spec.Template.Spec.Containers) != 3 {
@@ -1213,6 +1216,115 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	}
 	if !stateMounted {
 		t.Errorf("expected private proxy state volume mount, got %#v", container.VolumeMounts)
+	}
+	// The point of the constant is that it differs from the sandbox's. Checked
+	// here rather than through the rendered value, which cannot distinguish the
+	// two once they are equal.
+	if credentialProxyUID == sandboxUID {
+		t.Errorf("the credential sidecar UID must not be the sandbox UID %d", sandboxUID)
+	}
+	sc := container.SecurityContext
+	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != credentialProxyUID {
+		t.Fatalf("expected the credential sidecar to run as its own UID %d, got %#v", credentialProxyUID, sc)
+	}
+	// The shared group is what keeps the agent PVC writable from both sides
+	// once the users differ.
+	if sc.RunAsGroup == nil || *sc.RunAsGroup != agentFSGroup {
+		t.Errorf("expected the credential sidecar in the shared group %d, got %#v", agentFSGroup, sc.RunAsGroup)
+	}
+}
+
+// TestBuildPodTemplateSpecIsolatesTheSidecarUser covers the two Pod-level halves
+// of the credential boundary: the sandbox must not be able to read the sidecar's
+// process state, and the two must not run as one user.
+func TestBuildPodTemplateSpecIsolatesTheSidecarUser(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{DashboardEnabled: ptr.To(true)},
+			},
+		},
+	}
+
+	spec := buildPodTemplateSpec(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true}).Spec
+
+	if spec.ShareProcessNamespace != nil {
+		t.Errorf("expected no shared process namespace, got %v", *spec.ShareProcessNamespace)
+	}
+	podSC := spec.SecurityContext
+	if podSC == nil || podSC.RunAsUser == nil || *podSC.RunAsUser != sandboxUID {
+		t.Fatalf("expected the Pod default user to be the sandbox UID %d, got %#v", sandboxUID, podSC)
+	}
+	if podSC.FSGroup == nil || *podSC.FSGroup != agentFSGroup || podSC.RunAsGroup == nil || *podSC.RunAsGroup != agentFSGroup {
+		t.Errorf("expected the shared group %d as both fsGroup and runAsGroup, got %#v", agentFSGroup, podSC)
+	}
+
+	// Init containers included, and that is the whole point: the credential proxy
+	// is a native sidecar, so it is in InitContainers and a walk of Containers
+	// alone never reaches it. Written that way first, and the sidecar assertion
+	// below was unreachable — deleting RunAsUser from buildCredentialProxySidecar
+	// left this test green.
+	all := append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+	sawProxy := false
+	for _, container := range all {
+		user := podSC.RunAsUser
+		if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
+			user = container.SecurityContext.RunAsUser
+		}
+		isProxy := container.Name == "envoy-credential-proxy"
+		if isProxy {
+			sawProxy = true
+		}
+		if isProxy && *user != credentialProxyUID {
+			t.Errorf("expected the credential sidecar to run as %d, got %d", credentialProxyUID, *user)
+		}
+		if !isProxy && *user != sandboxUID {
+			t.Errorf("expected container %s to run as the sandbox UID %d, got %d", container.Name, sandboxUID, *user)
+		}
+	}
+	// Without this the walk passes vacuously the day the sidecar moves, is
+	// renamed, or stops being built.
+	if !sawProxy {
+		t.Errorf("no envoy-credential-proxy container in the Pod; walked %d containers", len(all))
+	}
+}
+
+// TestTheProcessNamespaceIsUnsharedOnEverySpecShape covers the spec shape
+// nothing else reaches.
+//
+// ShareProcessNamespace used to be set on the dashboard branch, and the
+// existing assertions about its absence sit on specs that all configure the
+// harness: TestBuildDeployment, TestBuildDeployment_DashboardDisabled,
+// TestBuildPodTemplateSpecIsolatesTheSidecarUser, and all three golden
+// fixtures, which enable the dashboard. One shape had no assertion of its
+// own — the configuration a first-time user gets, a PlatformAgent with no
+// harness configuration at all. Setting the field on that branch alone leaves
+// every one of those tests green; verified by mutation. The field is
+// unsettable anywhere in the operator today, which makes this cheap insurance
+// rather than a live risk.
+//
+// Dashboard-disabled is deliberately absent: TestBuildDeployment_DashboardDisabled
+// already asserts it, and a second copy would only look like coverage.
+func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
+	stock := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"no harness configuration at all", stock},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spec := buildPodTemplateSpec(testCase.agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true}).Spec
+			if spec.ShareProcessNamespace != nil {
+				t.Errorf("a shared process namespace puts the credential holder's /proc/<pid>/environ "+
+					"inside a directory the sandbox can read; got shareProcessNamespace=%v",
+					*spec.ShareProcessNamespace)
+			}
+		})
 	}
 }
 

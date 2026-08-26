@@ -633,11 +633,27 @@ for TASK in "${TASKS[@]}"; do
   #             for the infra owner. A noop-deployer task prepares nothing,
   #             so its pre-record death is never weather -- it is a harness
   #             or agent crash and classifies BROKEN instead.
+  #             Also: a scored record the harness marked with
+  #             KUBE_AGENTS_INFRA_FAILURE -- see below.
   #   BROKEN -- the run died somewhere no infrastructure excuse exists: a
   #             record with no scores (the scoring pass crashed), or any
   #             pre-record death on a noop task. BLOCKS -- treating these as
   #             infra would let a crash turn the whole gate green.
   #   OK     -- a record with scores; the gate below decides.
+  #
+  # KUBE_AGENTS_INFRA_FAILURE is the marker kube_agents_bench.harness puts on
+  # errors[0] when the agent endpoint failed in transport on every attempt, so
+  # no turn ever reached the agent. The record IS scored -- the judge grades
+  # the empty output and returns 0.0 -- but there is no answer in it to grade,
+  # and gating on that score reds the PR for a pod restart. The harness raises
+  # this only after exhausting its retries on a gateway status or a dropped
+  # connection; a 4xx, a 500, or any answer the agent actually returned stays
+  # OK and is graded normally.
+  #
+  # No noop carve-out here, unlike the two branches above: those infer infra
+  # from an absent record, which a noop task cannot honestly claim, whereas
+  # this marker is the harness stating what happened. An unreachable agent
+  # endpoint is infrastructure whatever the task's deployer provisions.
   RUN_CLASS=$(python3 -c "
 import json, os
 path = '${LATEST_RESULT}'
@@ -657,7 +673,13 @@ else:
             print('BROKEN' if deployer == 'noop' else 'INFRA')
         else:
             rec = data[0] if isinstance(data, list) else data
-            print('OK' if rec and isinstance(rec, dict) and rec.get('scores') else 'BROKEN')
+            rec = rec if isinstance(rec, dict) else {}
+            errors = rec.get('errors') or []
+            # Before the scores test: the record carries both.
+            if any('KUBE_AGENTS_INFRA_FAILURE' in str(e) for e in errors):
+                print('INFRA')
+            else:
+                print('OK' if rec.get('scores') else 'BROKEN')
     except Exception:
         print('BROKEN')
 " 2>/dev/null || echo "BROKEN")
@@ -675,15 +697,19 @@ else:
     fi
     FAILED_TASKS+=("${TASK_NAME} (run produced no scored record)")
   elif [ "${RUN_CLASS}" = "INFRA" ]; then
-    echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation or teardown failed! (The evaluation is skipped)"
+    # RESOURCE_PREPARATION_FAILED is kept verbatim as the grep token even
+    # though the class now also covers an unreachable agent endpoint; the
+    # artifact below says which of the two it was.
+    echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation, teardown, or agent transport failed! (The evaluation is skipped)"
     ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
     mkdir -p "${ARTIFACT_DIR}"
     cp "${EVAL_LOG}" "${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log" 2>/dev/null || true
     [ -n "${NEW_RUN_DIR}" ] && cp "${EVAL_LOG}" "${NEW_RUN_DIR}/resource_prep_failure.log" 2>/dev/null || true
     echo "Saved resource preparation log to artifact: ${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log"
-    echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown error (Duration: ${TASK_DURATION}s)"
-    # Deliberately NOT appended to FAILED_TASKS: an OpenTofu stockout or a
-    # teardown race says nothing about the pull request under test, and
+    echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown or agent transport error (Duration: ${TASK_DURATION}s)"
+    # Deliberately NOT appended to FAILED_TASKS: an OpenTofu stockout, a
+    # teardown race, or an agent pod that went away mid-task says nothing
+    # about the pull request under test, and
     # redding the job for it teaches people to ignore the job. The log line
     # above and the artifact are the record; whoever owns the eval
     # infrastructure greps for RESOURCE_PREPARATION_FAILED, not the PR author.
