@@ -535,6 +535,22 @@ Four things hold it together, and they are not equally strong:
   structural form of it is the separate broker Pod, where there is no shared mount
   to name.
 
+Two resource notes, because the trees are on the runtime's own emptyDir and that
+is node ephemeral storage rather than a disk of its own. The number of open
+workspaces is capped and a clone that comes in over `CREDENTIAL_PROXY_MAX_CLONE_BYTES`
+(256 MiB by default) is removed rather than kept, so a repository the runtime
+cannot afford does not sit half-cloned on the node. Separately, the content routes
+raise the request-body cap to twice the total-payload limit, and the listener is
+threaded with no connection cap, so peak heap is roughly concurrency times that
+figure. Neither is reachable from outside the Pod, but both are worth knowing
+before the flag is armed anywhere it matters.
+
+Every verb takes a lock for its whole duration. The handler is threaded, so two
+requests naming one handle genuinely interleave, and each verb is a read-then-act
+on a working tree the other is entitled to delete or reset underneath it. Without
+it a `close` landing inside a `commit` leaves the commit re-creating the tree the
+close just removed, with no handle pointing at it.
+
 Be precise about what arming this does and does not do. It does not change what
 `git` executes: a repository-local `.git/config` planted in the runtime's own tree
 still runs what it names, measured both ways. What changes is who can write that

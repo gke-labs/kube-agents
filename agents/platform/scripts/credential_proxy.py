@@ -2076,7 +2076,15 @@ class CommandExecutor:
         if cwd:
             requested_cwd = Path(cwd).resolve()
             if not _within(root, requested_cwd):
-                raise ValueError("working directory is outside the shared workspace")
+                # Name the root that was actually checked. With one message for
+                # both, a refusal on the workspace path reads as though the
+                # agent-shared containment fired, which sends whoever is
+                # debugging it to the wrong control.
+                raise ValueError(
+                    "working directory is outside the shared workspace"
+                    if root == self.workspace_dir
+                    else "working directory is outside the content workspace"
+                )
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
@@ -2469,7 +2477,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         Every response here is content or a name. Nothing returns a filesystem
         path, because a path handed back is a directory the agent can be told to
         `cd` into — which is precisely the arrangement this replaces. The
-        `handle` is a broker-minted opaque token, not a location.
+        `handle` is a broker-minted opaque token, not a location. That holds for
+        the error responses too: `ContentWorkspaceStore._redact` takes the tree
+        root and the handle back out of git's stderr before it goes on the wire,
+        which is the only reason the sentence above is a property rather than an
+        intention.
 
         These routes deliberately do **not** go through `Policy.blocked_by`,
         `git_argument_violation` or `git_lease_violation`. Those three inspect an

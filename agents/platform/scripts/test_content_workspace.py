@@ -14,6 +14,7 @@ import base64
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -408,7 +409,11 @@ class StoreTest(unittest.TestCase):
         A sequential id would look identical to every other test here.
         """
         store = self.store()
-        handles = {store.open("acme/fleet").handle for _ in range(16)}
+        # Above the workspace ceiling on purpose: the ceiling is a resource
+        # control and this test is about entropy, so raise it rather than
+        # measure sixteen handles against a limit of eight.
+        with mock.patch.object(content_workspace, "max_workspaces", lambda: 64):
+            handles = {store.open("acme/fleet").handle for _ in range(16)}
         self.assertEqual(16, len(handles), "handles must not repeat")
         for handle in handles:
             self.assertRegex(handle, r"\A[0-9a-f]{32}\Z")
@@ -451,6 +456,347 @@ class StoreTest(unittest.TestCase):
         # Paired: the handle the store minted resolves to the workspace.
         workspace = store.open("acme/fleet")
         self.assertIs(workspace, store.get(workspace.handle))
+
+
+class ListAndOpenArgumentTest(unittest.TestCase):
+    """Two arguments that looked validated and were not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, RecordingRunner()
+        )
+        self.workspace = Workspace(
+            handle="f" * 32,
+            repo="acme/fleet",
+            tree=self.store.tree_root / ("f" * 32) / "repo",
+            base="main",
+            base_sha="0" * 40,
+        )
+        for relative in ("a/y.yaml", "ab/x.yaml", "a/deep/z.yaml", "b/w.yaml"):
+            target = self.workspace.tree / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("kind: ConfigMap\n")
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def test_a_list_prefix_names_a_directory_not_a_string(self):
+        """`prefix="a"` must not return `ab/x.yaml`.
+
+        A string comparison reads as a filter and behaves as a glob without the
+        star, so a caller asking for one directory pages through its siblings.
+        """
+        paths = [
+            entry["path"] for entry in self.store.list(self.workspace.handle, "a")
+        ]
+        self.assertEqual(["a/deep/z.yaml", "a/y.yaml"], paths)
+        self.assertNotIn("ab/x.yaml", paths)
+
+        # Paired ordinary use: the sibling is reachable under its own name, and
+        # no prefix still lists everything.
+        self.assertEqual(
+            ["ab/x.yaml"],
+            [e["path"] for e in self.store.list(self.workspace.handle, "ab")],
+        )
+        self.assertEqual(4, len(self.store.list(self.workspace.handle)))
+
+    def test_the_base_branch_is_checked_the_way_the_commit_branch_is(self):
+        """`base` reached git unvalidated while `branch` went through the check.
+
+        Not reachable as an option today -- every use of it is prefixed with
+        `origin/` first -- but the asymmetry is the kind a later caller removes
+        without noticing, and a reader comparing the two assumes it is not
+        there.
+        """
+        for name in ("--upload-pack=/bin/sh", "-x", "--force"):
+            with self.subTest(name=name):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store.open("acme/fleet", name)
+
+        # Paired ordinary use: an ordinary base branch is accepted, and so is a
+        # protected one. Reading `main` is not authoring onto it, and basing a
+        # workspace on the rollout branch is the normal case -- the write path
+        # is where `PROTECTED_BRANCHES` belongs, and this is the read side.
+        self.assertEqual(
+            "release/2026-08",
+            self.store.open("acme/fleet", "release/2026-08").base,
+        )
+        self.assertEqual("main", self.store.open("acme/fleet", "main").base)
+        # And the write path still refuses to author onto it.
+        with self.assertRaises(ContentWorkspaceError):
+            check_branch("main")
+
+
+class ConcurrencyTest(unittest.TestCase):
+    """Two requests naming one handle, which `ThreadingHTTPServer` produces.
+
+    Every verb here is a read-then-act on a working tree another verb is
+    entitled to delete or reset underneath it. Both interleavings below were
+    reproduced against the unlocked store before the lock went in; the
+    injection is single-threaded on purpose, because it pins the exact
+    interleaving rather than hoping a race scheduler finds it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store_with_workspace(self):
+        # `diff --cached --quiet` exits 1 when something is staged, which is
+        # what makes these commits reach the `commit` call at all.
+        runner = RecordingRunner({"diff --cached": FakeResult(1)})
+        store = ContentWorkspaceStore(self.base / "trees", self.agent, runner)
+        workspace = Workspace(
+            handle="d" * 32,
+            repo="acme/fleet",
+            tree=store.tree_root / ("d" * 32) / "repo",
+            base="main",
+            base_sha="0" * 40,
+        )
+        workspace.tree.mkdir(parents=True, exist_ok=True)
+        store._workspaces[workspace.handle] = workspace
+        return store, workspace, runner
+
+    def commit_with(self, store, workspace, interleaved):
+        """Run `interleaved` from another thread once the commit is mid-flight.
+
+        The victim point is the first write of the payload loop, i.e. after
+        `checkout` and `clean` and before anything is staged.
+        """
+        arrived = threading.Event()
+        finished = threading.Event()
+        original = content_workspace._no_symlink_on_the_way
+
+        def once(root, relative):
+            if not arrived.is_set():
+                arrived.set()
+                thread = threading.Thread(
+                    target=lambda: (interleaved(), finished.set())
+                )
+                thread.start()
+                # If the lock works, the other verb cannot finish while this
+                # commit holds it. A generous wait keeps the assertion about
+                # the lock rather than about scheduling.
+                thread.join(timeout=2)
+                # Snapshot it *here*. Read after the commit returns, this is
+                # always true -- the other verb runs the moment the lock is
+                # released -- and the test would pass against no lock at all.
+                self.finished_during_commit = finished.is_set()
+                self.other = thread
+            return original(root, relative)
+
+        content_workspace._no_symlink_on_the_way = once
+        self.addCleanup(
+            setattr, content_workspace, "_no_symlink_on_the_way", original
+        )
+        try:
+            outcome = store.commit(
+                workspace.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [Change(repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+            )
+        finally:
+            content_workspace._no_symlink_on_the_way = original
+        self.other.join(timeout=10)
+        return outcome, self.finished_during_commit
+
+    def test_a_close_cannot_land_inside_a_commit(self):
+        """Unlocked, this left a tree on disk with no handle pointing at it.
+
+        `close` pops the handle and removes the tree; the commit already past
+        `get` then re-creates it with `mkdir(parents=True)` and writes into it.
+        Nothing can reach the result afterwards, and the trees live on the
+        broker's ephemeral storage -- so a `close`/`commit` loop is node disk
+        pressure, through the new surface, with the flag on.
+        """
+        store, workspace, _ = self.store_with_workspace()
+        outcome, finished_during_commit = self.commit_with(
+            store, workspace, lambda: store.close(workspace.handle)
+        )
+
+        self.assertFalse(
+            finished_during_commit,
+            "close() completed while a commit held the workspace",
+        )
+        self.assertTrue(outcome["committed"])
+        # close() ran after the commit released, so it removed a tree that was
+        # whole. Nothing is registered and nothing is left behind.
+        self.assertEqual({}, store._workspaces)
+        self.assertEqual(
+            [], list(store.tree_root.iterdir()), "a tree was orphaned on disk"
+        )
+
+    def test_a_second_commit_cannot_land_inside_the_first(self):
+        """Unlocked, the second commit's `clean -fdxq` deleted the first's files.
+
+        The first then either failed on a pathspec that no longer matched or
+        landed its commit on the other's branch while reporting its own -- and
+        the response still said `committed: true`, so a caller could push a
+        branch whose content is not what it sent.
+        """
+        store, workspace, runner = self.store_with_workspace()
+
+        def other_commit():
+            store.commit(
+                workspace.handle,
+                "platform-agent/theirs",
+                "feat: theirs",
+                [Change(repo_relative("manifests/theirs.yaml"), b"kind: Theirs\n")],
+            )
+
+        outcome, finished_during_commit = self.commit_with(
+            store, workspace, other_commit
+        )
+
+        self.assertFalse(
+            finished_during_commit,
+            "a second commit completed while the first held the workspace",
+        )
+        self.assertTrue(outcome["committed"])
+        self.assertEqual("platform-agent/change", outcome["branch"])
+        # The two commits ran end to end, so each staged its own path and
+        # neither saw the other's checkout.
+        staged = [
+            argv for argv, _ in runner.calls if argv[1:3] == ["--literal-pathspecs", "add"]
+        ]
+        self.assertEqual(
+            [
+                ["git", "--literal-pathspecs", "add", "--", "manifests/mine.yaml"],
+                ["git", "--literal-pathspecs", "add", "--", "manifests/theirs.yaml"],
+            ],
+            staged,
+        )
+
+    def test_ordinary_sequential_use_is_not_slowed_to_a_stop(self):
+        """Paired ordinary use: the lock is reentrant and does not self-deadlock.
+
+        Every verb takes it and every verb calls `get`, which takes it too. A
+        plain `Lock` here would hang on the first request rather than fail, and
+        a hang in the credential holder is worse than an exception.
+        """
+        store, workspace, _ = self.store_with_workspace()
+        self.assertIs(workspace, store.get(workspace.handle))
+        self.assertEqual([], store.list(workspace.handle))
+        self.assertTrue(
+            store.commit(
+                workspace.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [Change(repo_relative("a.yaml"), b"a\n")],
+            )["committed"]
+        )
+        store.close(workspace.handle)
+        self.assertEqual({}, store._workspaces)
+
+
+class ResourceCeilingTest(unittest.TestCase):
+    """Nothing bounded how much disk the trees could take between them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, runner=None):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner or RecordingRunner()
+        )
+
+    def test_the_number_of_open_workspaces_is_capped(self):
+        store = self.store()
+        with mock.patch.object(content_workspace, "max_workspaces", lambda: 3):
+            for _ in range(3):
+                store.open("acme/fleet")
+            with self.assertRaises(TooLarge):
+                store.open("acme/fleet")
+
+            # Paired ordinary use: closing one makes room for the next, so the
+            # ceiling is a ceiling and not a lifetime quota.
+            store.close(next(iter(store._workspaces)))
+            self.assertIsNotNone(store.open("acme/fleet"))
+        self.assertEqual(3, len(store._workspaces))
+        self.assertEqual(3, len(list(store.tree_root.iterdir())))
+
+    def test_a_clone_over_the_byte_ceiling_is_removed_not_kept(self):
+        """A repository the broker cannot afford is not one to hold half of."""
+
+        class FatCloneRunner(RecordingRunner):
+            def __call__(self, argv, cwd):
+                result = super().__call__(argv, cwd)
+                if argv[1] == "clone":
+                    target = Path(argv[-1])
+                    target.mkdir(parents=True, exist_ok=True)
+                    (target / "blob.bin").write_bytes(b"x" * 4096)
+                return result
+
+        store = self.store(FatCloneRunner())
+        with mock.patch.object(content_workspace, "max_clone_bytes", lambda: 1024):
+            with self.assertRaises(TooLarge):
+                store.open("acme/fleet")
+        self.assertEqual({}, store._workspaces)
+        self.assertEqual(
+            [], list(store.tree_root.iterdir()), "the oversized tree was kept"
+        )
+
+        # Paired: under the ceiling the same clone is accepted and stays.
+        with mock.patch.object(content_workspace, "max_clone_bytes", lambda: 1 << 20):
+            workspace = store.open("acme/fleet")
+        self.assertEqual([workspace.handle], [p.name for p in store.tree_root.iterdir()])
+
+
+class ErrorRedactionTest(unittest.TestCase):
+    """The invariant three docstrings assert: no response carries a path.
+
+    `GitFailed` puts git's stderr on the wire, and git quotes absolute paths in
+    its errors without being asked. Until this was enforced, the claim was a
+    sentence with nothing behind it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_git_stderr_reaches_the_caller_without_the_tree_root_in_it(self):
+        handle = "e" * 32
+        tree_root = self.base / "trees"
+        leaky = (
+            f"fatal: could not create work tree dir "
+            f"'{tree_root}/{handle}/repo': Permission denied"
+        )
+        runner = RecordingRunner({"clone": FakeResult(128, "", leaky)})
+        store = ContentWorkspaceStore(tree_root, self.agent, runner)
+
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        message = str(caught.exception)
+
+        self.assertNotIn(str(store.tree_root), message)
+        self.assertNotIn(str(self.base), message)
+        self.assertRegex(message, r"<workspace-root>")
+        # The handle goes too. It is a bearer capability, and the handle whose
+        # `open` just failed is not in `_workspaces` yet -- so this has to be
+        # matched by shape, which is what the assertion below pins.
+        self.assertNotRegex(message, r"[0-9a-f]{32}")
+        self.assertIn("<handle>", message)
+
+        # Paired ordinary use: the part of the message that helps a caller
+        # debug is still there. Redaction that removes everything is just a
+        # worse error.
+        self.assertIn("could not create work tree dir", message)
+        self.assertIn("Permission denied", message)
+        self.assertIn("exit code 128", message)
 
 
 class IndexUnreadableTest(unittest.TestCase):
