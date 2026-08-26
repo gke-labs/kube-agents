@@ -540,8 +540,9 @@ still owns, clears the cluster's deletion protection, and forgets the undeletabl
 resources from state so their key versions are never scheduled for destruction — the next
 `lifecycle.sh apply` adopts them back automatically.
 
-An install with **no Terraform state** (none in the GCS bucket, none locally) was made by a
-release that predates this engine; `uninstall.sh` says so and stops. Re-run it with
+With **no Terraform state** (none in the GCS bucket, none locally), `uninstall.sh` says so and
+stops with exit **3**, touching nothing. Either nothing is installed against those coordinates,
+or the install was made by a release that predates this engine — re-run it with
 `--source-ref=<that release>` so the matching teardown runs.
 
 ### Manual Local Uninstall

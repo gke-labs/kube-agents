@@ -90,6 +90,21 @@ This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
 
+The shared workspace is the other way in, and it is not closed by the UID split
+either. Both containers mount the agent PVC and both write there with
+`umask 0002`, which they must: each has to be able to change what the other
+created. So a file the credential sidecar writes into a clone — a `.git/config`
+in a repository it cloned, say — is group-writable, and the sandbox is in that
+group. Configuration the sandbox edits there is configuration a later proxied
+command reads, and some of it names programs to run. What the UID split removes
+is the sandbox reading the sidecar's process state and private volumes by
+identity; what it does not remove is the sandbox reaching the sidecar through
+bytes the sidecar itself agreed to read. This predates the UID split — before
+it, those bytes were the sandbox's own — so nothing here made it worse, and
+nothing here closes it. What would close it is refusing the configuration keys
+that select a program to run, and that belongs to the command policy rather
+than to the Pod spec.
+
 ## Scope
 
 ### In scope
@@ -272,6 +287,230 @@ This is an interim policy mechanism, not a general shell parser. If the policy g
 beyond these narrowly defined commands, it should use tool-specific argument
 parsers over the structured argument vector.
 
+### git configuration
+
+A kubeconfig is not the only executable configuration the agent can author.
+`git` selects both its transport and several helper programs from configuration
+files, and it reads those from the shared workspace volume as well as from the
+credential runtime's own home directory. Left at its defaults, a `git` the
+sandbox requested can therefore name a program for the credential runtime to
+execute, without the argument vector containing anything the deny policy would
+match — the argv is only ever `git commit`.
+
+The runtime consequently overrides those defaults for every command it runs,
+through the environment rather than through a configuration file, so that the
+settings cannot be edited by anything holding the volume:
+
+- the transport allowlist is restricted to `https`, which git honors above the
+  equivalent setting from every configuration file, including one supplied on
+  the command line;
+- the system configuration file is suppressed and the global configuration file
+  is pinned to a path inside the runtime's private `emptyDir`. It is pinned
+  rather than disabled because `gh auth setup-git` installs the GitHub
+  credential helper by writing that file;
+- the hooks directory is pinned to an empty, non-writable directory, which also
+  neutralizes hooks installed into a fresh clone from a template directory;
+- the filesystem monitor, which names a program and is invoked by a read-only
+  verb, is disabled;
+- commit and tag signing are disabled, and the signing program is set to a
+  command that fails — for every signature format, not just the default one.
+  Signing runs a program named in configuration, and the trigger is an ordinary
+  `git commit`, so like the hooks pin above it its absence is reachable with no
+  unusual argument at all. One pin is not enough here: git supports three
+  signature formats, `gpg.format` is settable from the repository's own
+  configuration, and each format reads its own program key, so pinning only the
+  openpgp one leaves `[gpg] format = ssh` with `gpg.ssh.program` — and
+  `gpg.ssh.defaultKeyCommand`, which needs no signing key configured at all —
+  reaching a command through `git commit -S` and `git tag -s`. All four keys
+  are pinned. The set is closed, which is what separates this from the
+  arbitrary-name keys in the limitation below: three formats, three fixed key
+  names. The `-S`/`-s` flags themselves are not refused, and need not be;
+- subcommand autocorrection is disabled. This one is not defence in depth but a
+  precondition for the refusal list below: with autocorrection enabled from a
+  repository's configuration, a misspelled subcommand resolves to the real one,
+  and a list that compares whole tokens matches nothing; and
+- both editors git launches — the message editor and the rebase sequence editor
+  — are set to a command that does nothing and fails. They are set through the
+  environment for the same reason as the transport allowlist: those two
+  variables outrank the equivalent configuration setting from every file and
+  from the command line. Nothing is lost, because the runtime has no terminal
+  and so a command that needs an editor could never have succeeded.
+
+Only settings whose disabled value is a working value are pinned this way. There
+is no value of `diff.external` that means "no external diff" — git executes an
+empty value — so pinning it replaces one code-execution setting with a `git diff`
+that always fails, and it is deliberately not pinned.
+
+The runtime additionally refuses, in the argument vector, the global options that
+would undo the above: `-c` and `--config-env`, which set configuration ranking
+above the pinned values; `--exec-path`, which selects the directory git executes
+`git-<subcommand>` from; `--git-dir` and `--work-tree`, which identify a
+repository directly and so bypass the containment check applied to the request's
+working directory; and `--global`, `--system` and `--file`, which write the
+configuration files being pinned. `--file` names its target explicitly and the
+target is not a secret — `git config --list --show-origin` prints it — so
+refusing the first two without the third would have closed nothing; it is also
+an unrestricted write to any path, since the containment check inspects the
+request's working directory and not this. Its short spelling `-f` is refused
+only when `config` appears in the same argument vector, because on every other
+subcommand `-f` is `--force`, which the skills issue. `-C` remains accepted
+because the containment check resolves
+it, and repository-local `git config` remains accepted because that is how a
+clone's commit identity is set. Also refused are the subcommands whose function
+is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
+(`--extcmd`), `mergetool`, `filter-branch` (`--tree-filter`), `send-email`
+(`--smtp-server`), `instaweb`, `web--browse`, `help`, `fast-import`, the `p4`
+and `svn` bridges, `interpret-trailers`, and `submodule foreach`.
+
+The documentation viewer takes two entries rather than one, because it has two
+triggers. `git help -m <page>` executes `man.<man.viewer>.cmd` through a shell
+and `git help -w` does the same through `web.browser` and `browser.<tool>.cmd`,
+which the `help` subcommand entry covers. But `git <any-verb> --help` is
+dispatched to that same viewer with the verb still in the subcommand slot, so
+`git status --help` reaches it while nothing in the argument vector is `help`.
+The `--help` option is therefore refused as well, and both are needed: refusing
+either alone leaves the other open. The keys carry an arbitrary name and so
+cannot be pinned, and the cheapest sequence that reaches them is three ordinary
+requests taking no lease at all — two repository-local `git config` writes and a
+read verb. `-h` is not refused: git answers it from the subcommand's own option
+table and prints usage without dispatching to a viewer. `web--browse` stays on
+the subcommand list on its own account, because it is directly invocable and
+runs the configured browser command; it never covered the `git help -w` route,
+which reaches that code internally without the token appearing in the argument
+vector.
+
+The same category appears as options on subcommands the product has no reason to
+refuse outright, so those options are refused instead: `--exec` and `-x`, which
+run a caller-named command once per commit during a rebase; `-O` and
+`--open-files-in-pager`, which run one over the matches of a search — reachable
+by a read-only verb, needing neither a lease nor a file on the volume;
+`--help`, described above; `--trailer`, which runs `trailer.<name>.cmd` to
+compute a trailer's value and so puts a caller-named command on `git commit -m`,
+the argument vector the skills already send; and
+`--upload-pack` and `--receive-pack`, which name a program to run for the remote
+end of a transfer. The last two are unreachable while the transport allowlist
+excludes local paths, and are refused so that widening the allowlist does not
+silently reintroduce them. `--upload-pack` has a short spelling and it is
+deliberately not refused: `-u` means `--upload-pack` on `git clone`, but the
+same two characters mean `--set-upstream`, `--update` and `--update-head-ok` on
+other subcommands, and refusing it would refuse all four everywhere.
+(`--receive-pack` has no short form.)
+
+Every entry is matched against the whole argument vector rather than only the
+region where git would honour it; against any abbreviation of it that git would
+accept, since git's subcommand options take unambiguous prefixes; and, for short
+options, anywhere inside a cluster, since git lets short options group into one
+argument and carry a value attached to the last of them. Each of those three is
+a spelling git honours, and a checker that recognises fewer spellings than the
+executor accepts is the one defect this codebase keeps producing. Deciding where
+a subcommand's options end, or which prefixes it leaves unambiguous, would mean
+agreeing with git's parser indefinitely; the checker is instead strictly more
+conservative than git. The cost is a refusal the argument's position would
+otherwise excuse — a commit message that is the bare word `foreach` or `help`,
+or `git clean -x` — which is the direction this is meant to fail in.
+
+Matching the subcommand by position instead would remove that last cost, and it
+is deliberately not done. Resolving the subcommand slot means knowing which of
+git's global options take a separated value, and the list is not one this
+runtime can keep complete: `git --attr-source HEAD help -m <page>` runs the
+configured viewer while a position-aware reading of the same argument vector
+sees the subcommand as `HEAD`. Scanning every argument cannot disagree with git
+about where the subcommand is.
+
+Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
+`git.argument.refused`. No shipped skill uses any of them; every skill clone,
+fetch and push uses an `https` URL built from a fixed prefix.
+
+**Limitation.** Two gaps remain and both are consequences of the same thing —
+the runtime executing inside a directory the sandbox owns.
+
+The pins do not extend to configuration stored in a repository's own
+`.git/config`. That file is inside the shared workspace, so the sandbox can write
+it directly, with no proxied command involved and nothing for the argument-vector
+checks to inspect; the runtime then reads it on the next request. Where every way
+of reaching such a key is itself nameable, those triggers are refused instead —
+that is what the `help` and `interpret-trailers` subcommand entries and the
+`--help` and `--trailer` option entries above are for. This is weaker than a pin
+and should be read that way. The key stays settable, so the refusals hold only
+while the set of triggers is complete, and completeness is an empirical claim
+about a program that changes: `man.<tool>.cmd` turned out to have two triggers
+rather than one, and the second was found after the first had been closed and
+documented as closed.
+
+Measured against git 2.55 under the pinned environment, driving the runtime's own
+executor, these repository-local keys still reach a command:
+
+| Key                      | Reached by                                                          | Lease | Why it is not pinned            |
+| ------------------------ | ------------------------------------------------------------------- | ----- | ------------------------------- |
+| `diff.external`          | `git diff`, `git log --ext-diff`                                    | no    | no value disables it; see above |
+| `diff.<driver>.command`  | `git diff`                                                          | no    | arbitrary name                  |
+| `diff.<driver>.textconv` | `git diff`, `git log -p`, `git blame`, `git show`                   | no    | arbitrary name                  |
+| `filter.<name>.clean`    | `git status`, `git diff`; also `git add`, `git stash`, `git commit` | no    | arbitrary name                  |
+| `filter.<name>.process`  | `git status`, `git diff`; also `git add`, `git stash`               | no    | arbitrary name                  |
+| `filter.<name>.smudge`   | `git checkout`                                                      | yes   | arbitrary name                  |
+| `merge.<driver>.driver`  | `git merge`, `git cherry-pick`, `git rebase`                        | yes   | arbitrary name                  |
+| `alias.<name>`           | `git <name>`                                                        | no    | arbitrary name                  |
+
+Every key that needs `.gitattributes` is no harder to reach for it, because that
+file is in the workspace as well. The two `filter.*` rows need the tracked file
+to be modified as well as the attribute to be set; with both in place a bare
+`git status` runs the configured command.
+
+The lease column is measured against the runtime's own check, not assumed. Six of
+the eight are reachable without one, `git status` and `git diff` being the widest
+of those routes; the two that do need a lease are only bounded by it in the weak
+sense noted above, since the agent creates its own leases. Extending the pinned layer
+does not close any of the eight: seven take an arbitrary name inside the key, so
+there is nothing to enumerate, and the eighth has no value that means "off".
+This is what separates them from the signature-format keys pinned earlier, where
+the set of key names is fixed and finite and pinning therefore works.
+
+The same measurement found several keys that do **not** reach a command here, and
+each is worth knowing because it is a control rather than an accident, except the
+last: `core.editor` and `sequence.editor` are outranked by `GIT_EDITOR` and
+`GIT_SEQUENCE_EDITOR`; `core.sshCommand` is unreachable while the transport
+allowlist is `https` only; `init.templateDir` installs hooks that the
+`core.hooksPath` pin then ignores; and `core.hooksPath` and `core.fsmonitor` are
+pinned directly.
+
+`core.pager` is the exception, and it is closed by accident. It executes on a
+read verb — `git log`, `git diff`, `git show`, `git branch` — whenever git has a
+terminal on stdout. It does not execute here only because the runtime captures
+output through a pipe, so git never starts a pager; `--paginate` does not change
+that. Nothing declares this, so a change to how the runtime captures output would
+turn a repository-local config value into arbitrary code execution. Pinning
+`core.pager` would not help, because `pager.<command>` reaches the same place with
+an arbitrary name in the key. The pipe is the control, and there is a test that
+fails if it goes away.
+
+`include.path` and `includeIf` are honoured from repository-local configuration,
+so any of the keys above can be pulled in from an absolute path outside the
+workspace rather than written into `.git/config` directly. That widens where the
+value may sit; it adds no capability, and an included setting is still subject to
+the pinned layer — an included `core.hooksPath` loses to the pin exactly as a
+direct one does.
+
+That file reaches the credential as well as the program search. A credential
+helper configured there is itself a command, and it runs for any host the
+installed GitHub helper declines to answer for — so it both executes and is
+handed the credential being requested; a URL rewrite configured there changes
+which host a fetch or push contacts, and the transport allowlist does not help
+because the substituted host is `https` too. Neither is closed today. The
+credential-helper half is closable — resetting the helper list in the pinned
+layer and reinstating the runtime's own helper immediately after it discards a
+repository's helper while leaving authenticated push working — but that couples
+the runtime to the value `gh auth setup-git` writes, and it has not been done.
+
+The refused-subcommand list is likewise a denylist over a set that is not closed:
+git holds a command in configuration for several tools, and a future release may
+add another. Allowlisting the subcommands the product issues, and failing closed
+on the rest, is the structurally correct form and is the recommended follow-up.
+
+Reducing both is the motivation for having the runtime receive file content from
+the sandbox rather than operate inside a directory the sandbox controls; until
+that lands, a cloned working tree is sandbox-controlled input and not a trust
+boundary.
+
 ### Agent-supplied kubeconfigs
 
 A Cluster Agent profile pins itself to one cluster through `KUBECONFIG`, and
@@ -381,6 +620,16 @@ only command output, never a mounted Git credential file.
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
   privilege escalation, and use the runtime-default seccomp profile.
+- The Pod never sets `shareProcessNamespace`, and the two containers run as
+  different users: the sandbox as UID 10000, the `hermes` user the agent image's
+  files belong to, and the sidecar as UID 10001. Neither `/proc` nor a file mode
+  hands the sandbox the sidecar's environment.
+- Both keep GID 10000, which is also the Pod `fsGroup`. The workspace PVC is
+  mounted in both and each writes files the other has to change — the sandbox
+  creates the leased GitOps directory the sidecar clones into, the sidecar writes
+  the kubeconfig pin into a profile home the sandbox created — so both
+  entrypoints run with `umask 0002`. Files that predate the UID split are made
+  group-writable by the kubelet's `fsGroup` pass at every mount.
 - Every container the operator builds — the credential-cleanup init container,
   sandbox, dashboard, sidecar, log shipper — has a read-only root filesystem;
   writable state uses bounded `emptyDir` volumes. The sandbox and dashboard

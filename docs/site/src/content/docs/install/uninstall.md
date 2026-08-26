@@ -51,6 +51,8 @@ Once the CR is gone, the operator's finalizer first removes the cluster-scoped R
 ./uninstall.sh
 ```
 
+`terraform` must be on your `PATH` — it is the teardown engine as much as the install engine, and unlike `install.sh` this script installs nothing on your behalf. With an install to tear down and no terraform it refuses with exit 1, so a machine that only ever had the installer's auto-install cannot tear the install down. The check runs after the state lookup below, so a target with no state exits 3 without it. See [Prerequisites](/kube-agents/install/prerequisites/).
+
 `uninstall.sh` runs the install engine in reverse: it finds the install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix `kube-agents/<cluster>` — derived from the install coordinates, so a fresh clone works), regenerates `terraform.tfvars`, and drives `terraform destroy` through the composition's [`lifecycle.sh destroy`](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/lifecycle.sh). Pass `--project-id`, `--cluster-name`, and `--region` to name the target explicitly; otherwise they come from the saved `vars.sh`.
 
 Four things in the stack are not symmetric — destroying them is not the inverse of applying them — and `lifecycle.sh destroy` handles each one before `terraform destroy` runs:
@@ -64,7 +66,7 @@ Four things in the stack are not symmetric — destroying them is not the invers
 
 These steps are irreversible and run **before** Terraform's own prompt, which is why the script asks for one confirmation up front (`--non-interactive` skips it).
 
-**Installs that predate the Terraform engine.** An install with no Terraform state anywhere was created by a pre-Terraform release; this uninstaller cannot take it apart, and it exits saying so. Re-run with `--source-ref=<the release that installed it>` — the uninstaller fetches that release and hands over to its own `uninstall.sh`, so the code that made the install is what takes it apart:
+**No Terraform state anywhere.** With no state in the GCS bucket and none locally, the uninstaller exits **3** without touching anything and says so. Either nothing is installed against those coordinates — the ordinary answer on a clean project, and not a failure — or the install was created by a pre-Terraform release, which this uninstaller cannot take apart. For the second case, re-run with `--source-ref=<the release that installed it>` — the uninstaller fetches that release and hands over to its own `uninstall.sh`, so the code that made the install is what takes it apart:
 
 ```bash
 curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- --source-ref=<old release tag>
