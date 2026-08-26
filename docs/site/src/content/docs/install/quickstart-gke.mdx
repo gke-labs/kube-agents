@@ -61,7 +61,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
    ./install.sh
    ```
 
-   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, image tag, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). Answers are saved to `k8s-operator/scripts/vars.sh` (git-ignored, `chmod 600`), the install's machine-readable record; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two cannot disagree. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
+   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, the new cluster's shape, image tag, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). Answers are saved to `k8s-operator/scripts/vars.sh` (git-ignored, `chmod 600`), the install's machine-readable record; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two stay in step. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
 
 3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the created topic (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The installer prints the exact topic name and step-by-step instructions when it finishes.
 
@@ -73,6 +73,8 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
    ```
 
    You should see one `PlatformAgent` resource plus pods for the operator (`kubeagents-controller-manager`), the Platform Agent gateway (`platform-agent-gateway`), and LiteLLM (`litellm`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When the Platform Agent gateway pod is `Running` and Google Chat is configured, DM your Chat app and it should reply.
+
+   The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential-proxy sidecar on loopback before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container rather than the relay reporting the error.
 
 </Steps>
 
@@ -87,6 +89,7 @@ Changing your mind later is the same engine: `./install.sh --menu` opens a Day-2
 ## Common flags and toggles
 
 - `--dry-run` — always runs `terraform validate`, and adds a full `terraform plan` preview when Application Default Credentials exist; nothing is created, and state stays local. It still overwrites `vars.sh`.
+- `--cluster-mode=autopilot|standard` — the shape of a cluster this run creates; `standard` unless you say otherwise, and the interactive installer asks when it is about to create one. Autopilot clusters are regional, so `--region` must name a region — that is checked at the interview, though an invalid value aborts the run whatever the target is. The chosen shape has no bearing on a cluster that already exists: the installer writes that cluster's probed shape instead, for the reason [`k8s-operator/scripts/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/README.md) gives.
 - `--gvisor=true` — runs the agent under the `gvisor` RuntimeClass. On a Standard cluster that also provisions the sandbox node pool (the `gke-cluster` module's `enable_gvisor_node_pool`); Autopilot ships the RuntimeClass and needs no pool, from GKE 1.27.4-gke.800 onwards. The installer stops before applying anything if an Autopilot cluster is older than that.
 - `--enable-google-chat` — provisions the Google Chat Pub/Sub backend and enables the CR's `googleChat` integration.
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.

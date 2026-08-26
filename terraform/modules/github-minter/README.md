@@ -16,6 +16,16 @@ cd /tmp/minty && go run ./cmd/minty tools import-pk \
 
 `install.sh` runs this import for you when it collects a PEM path. The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA, minty rule ConfigMap) is the chart's `githubMinter.*` values; the minter pod fails its readiness probe until the key version imported here is ENABLED.
 
+The clone-and-run needs a Go toolchain that can build and execute a binary, which is not a given on a locked-down workstation. `gcloud` and `openssl` do the same wrapping in four commands — [Importing Without the Minty CLI](../../../k8s-operator/config/integrations/github/README.md#importing-without-the-minty-cli) is canonical for that path, including the wait for the import job to reach `ACTIVE` and the `CLOUDSDK_PYTHON_SITEPACKAGES=1` that the wrapping step needs. It is parameterised on `${KMS_LOCATION}`, which is the same value as `<region>` in the clone-and-run above: this module's `location` with any zone suffix stripped, so `us-central1-a` becomes `us-central1`.
+
+## Moving the install to another region re-imports the App key
+
+The keyring follows `var.location`, which the full-install composition passes straight from the cluster's location — so changing `location` on an install that has the minter enabled creates a **new, empty** keyring in the new region. Nothing is copied across: the key is `import_only` and KMS never releases private key material, so the version in the old keyring stays where it is.
+
+What that costs depends on whether you still have the PEM GitHub issued. KMS is not the source of truth for the App key; that file is. `import_github_pem` derives the KMS location from the region, and imports `GITHUB_PEM_PATH` whenever the key in that location has no ENABLED version — which is exactly the state a region move produces — so re-running `install.sh` against the new region with the same PEM completes the move. `install.sh` persists `GITHUB_PEM_PATH` into `vars.sh`, and the gcloud path above takes the location as an input, so either route works.
+
+Only if the PEM is gone does the move cost a credential: GitHub does not re-issue a private key it has already handed out, and the KMS copy cannot be exported, so there is nothing left to import and you have to generate a fresh one on the App and import that. Either way the old keyring and key stay in the project forever, per the warning below.
+
 > **KMS resources cannot be deleted.** Cloud KMS key rings and keys are never actually
 > destroyed — `terraform destroy` only removes them from state, and a subsequent apply
 > with the same names fails with a 409. Recover by importing the existing resources

@@ -56,21 +56,25 @@ domains:
 # Known-uncovered. The two kanban probes cover chat-and-routing, so it is
 # already off the list. Phase 2's exit criterion is an empty list.
 #
-# Reliability, capacity, security, upgrades, consistency and remediation came
-# off on 2026-08-25, when their six scenarios were uncommented in
-# hack/ci-eval-pr.sh's TASKS array. What let them activate was
-# GoogleCloudPlatform/oss-test-infra#2661 merging that day and closing
-# blockers A1 and A4 together: it set EVAL_GITHUB_APP_ID, which is what makes
-# hack/ci-deploy.sh render a real GitOps target and enable the token minter,
-# and it mounted BENCH_GITHUB_TOKEN, which is what ledger_issue_contains reads
-# the published ledger issue with.
+# cluster-debugging came off first, in #939. Reliability, capacity, security,
+# upgrades, consistency and remediation follow, when their six scenarios are
+# uncommented in hack/ci-eval-pr.sh's TASKS array. What let them activate was
+# GoogleCloudPlatform/oss-test-infra#2661 merging 2026-08-25T14:36:08Z and
+# closing blockers A1 and A4 together: it set EVAL_GITHUB_APP_ID, which is what
+# makes hack/ci-deploy.sh render a real GitOps target and enable the token
+# minter, and it mounted BENCH_GITHUB_TOKEN, which is what
+# ledger_issue_contains reads the published ledger issue with.
 allowlist:
   # A3 (bench/tasks/DRAFTS.md): fleet-cost-idle-pool needs an unattached disk
-  # older than the SOP's literal creationTimestamp<-P30D filter, against a
-  # fleet planted 2026-08-21 -- not before 2026-09-20, and a replant restarts
-  # the clock.
+  # older than the SOP's literal creationTimestamp<-P30D filter. The binding
+  # clock is the NEWEST fleet in the Boskos pool, not the oldest, because a
+  # lease picks a project at random: kube-agents-evals and -2 were planted
+  # 2026-08-21, kube-agents-evals-3 on 2026-08-24 -- so not before 2026-09-23,
+  # and a replant in any pool project restarts that project's clock.
   - cost
-  - cluster-debugging
+  # cluster-debugging left this list on 2026-08-25, the first Phase 2 domain
+  # to do so: cluster-agent-crashloop-debug is active in hack/ci-eval-pr.sh's
+  # TASKS array.
   # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
   # post-incident RCA, and incident-triage means event-fired autoops triage.
   # Real coverage needs autoops-warning-event-triage, which has no scenario
