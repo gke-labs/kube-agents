@@ -1,10 +1,15 @@
 name: Auto Request Review
 
 # A human reviewer is requested once kube-agents-bot's `AI Review` check has
-# completed on something other than a failure -- not when the pull request
-# opens. Before this, the reviewer was pinged minutes ahead of the bot's read
-# and re-read a diff the author was about to change. Which conclusions clear the
-# gate is `ai_review_block_reason` in scripts/request_reviewers.py, not here.
+# completed -- not when the pull request opens. Before this, the reviewer was
+# pinged minutes ahead of the bot's read and re-read a diff the author was about
+# to change.
+#
+# Completed, not green. The bot reserves `success` for "No findings", so waiting
+# for green meant a review that found something never assigned anyone. See
+# `scripts/request_reviewers.py`, `ai_review_block_reason` -- which is also
+# where the one completed outcome that still holds, a branch that does not
+# merge, is decided. None of that is decided here.
 #
 # No trigger here can be a `pull_request` one. Every pull request here comes
 # from a fork, and on a fork pull request `pull_request` and
@@ -15,14 +20,21 @@ name: Auto Request Review
 # check suites Actions itself created, so there is no recursion to guard
 # against.
 #
-# That reasoning picks the triggers but does not make one of them enough.
-# `check_run` fires once, and the answer the gate gives at that moment can be
-# "not yet" for a reason that later stops being true. A pull request opened as a
-# draft -- the normal flow here -- has its `AI Review` complete while
-# `skip_reason` is still correctly returning "the pull request is a draft", and
-# nothing fires again when it is marked ready, so it never gets a reviewer at
-# all. `pull_request_target: [ready_for_review]` re-runs the same gate at the
-# one moment draft-ness stops being a reason to skip.
+# That reasoning picks the triggers but does not make `check_run` enough on its
+# own. It fires once, and the answer the gate gives at that moment can be "not
+# yet" for a reason that later stops being true. `skip_reason` refuses a draft,
+# correctly -- so an `AI Review` that completed while the pull request was still
+# a draft (a `/review` on a draft posts one) assigns nobody, and marking the
+# pull request ready re-evaluates nothing. Draft-first is the normal flow here.
+#
+# The bot is documented to start a review of its own on `ready_for_review`,
+# which would post a second check run and fire `check_run` again -- but that is
+# the bot's behaviour, not this repository's, and it is exactly what is missing
+# during an outage of it (gke-labs/kube-agents-bot#18). The retry belongs on
+# this side of the line. `pull_request_target: [ready_for_review]` re-runs the
+# same gate at the one moment draft-ness stops being a reason to skip; if the
+# bot does post a fresh review, the two runs agree, and `skip_reason` will not
+# request a reviewer twice.
 on:
   check_run:
     types: [completed]
@@ -87,9 +99,10 @@ jobs:
     #   - `/request-review` from someone with write access, the override for a
     #     finding the author has pushed back on, or a bot that never reported;
     #   - a draft marked ready, the one event that retracts a `skip_reason`
-    #     nothing else would retry. The `types:` filter already narrows this to
-    #     `ready_for_review`; `draft == false` is asserted anyway so a future
-    #     added type cannot quietly widen the entry point.
+    #     nothing on this side would otherwise retry. The `types:` filter
+    #     already narrows this to `ready_for_review`; `draft == false` is
+    #     asserted anyway so a future added type cannot quietly widen the entry
+    #     point.
     if: >-
       (github.event_name == 'check_run' &&
         github.event.check_run.name == 'AI Review' &&
@@ -129,7 +142,7 @@ jobs:
       # empty for fork pull requests. The script reads the check run back from
       # the API for the commit and the verdict, then finds the pull request that
       # commit belongs to.
-      - name: Request a reviewer now the AI review has passed
+      - name: Request a reviewer now the AI review has finished
         if: github.event_name == 'check_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -141,9 +154,11 @@ jobs:
 
       # The draft-to-ready retry. `--require-ai-review-pass` is kept
       # deliberately: this is not a bypass, it re-evaluates the same gate at the
-      # one moment draft-ness stops being a reason to skip. No check run id,
-      # because this event has none -- given `--pr` the script reads the head
-      # commit's `AI Review` back from the API itself.
+      # one moment draft-ness stops being a reason to skip. A draft with no
+      # `AI Review` yet is still held here, by "there is no AI Review check run
+      # on the head commit", and picked up by `check_run` when one lands. No
+      # check run id, because this event has none -- given `--pr` the script
+      # reads the head commit's `AI Review` back from the API itself.
       #
       # `PR_NUMBER` reaches the script through `env:`, never interpolated into
       # the `run:` body: on a `pull_request_target` every event field is

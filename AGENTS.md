@@ -397,15 +397,16 @@ believes are real without being sure. The `agent:ignore` label opts a pull reque
 outranks both.
 
 **A human reviewer is requested once its check completes.** The bot posts an `AI Review` check run
-alongside its review — `success` when it found nothing, `neutral` when it did or when the review
-did not run at all — and `.github/workflows/auto_request_review.yml` assigns anyone from
-`.github/auto_request_review.yml` on either. A `failure` or `timed_out` still holds it back.
-Opening a pull request no longer pings a human; the check completing does, and a draft gets its
-reviewer when you mark it ready. Two exceptions: a pull request opened by a bot is assigned
-whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
-owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
-assign a reviewer immediately — the override for a finding you have answered but disagree with, or
-for a review that never arrived. Nothing here changes who is picked; that is still the config file.
+alongside its review — `success` for "No findings", `neutral` for everything else, findings and
+breakage alike — and `.github/workflows/auto_request_review.yml` assigns from
+`.github/auto_request_review.yml` on either, not on green. Opening a pull request still pings
+nobody; marking a draft ready re-runs the gate. The one outcome that assigns no one is
+`Conflicts with the base branch`, where nothing was read — merge `main` in and comment `/review`,
+since the push alone starts no review. Two exceptions: a bot's pull request is assigned whatever the
+conclusion, because Dependabot cannot re-run `/review` on itself; and an owner, member, or
+collaborator can comment `/request-review` (at the start of the comment) to assign one immediately —
+the override for a finding you answered but disagree with, or a review that never arrived. Who is
+picked is unchanged; that is still the config file.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
 and **offer to wait for it** instead of reporting the work as finished — unless you opened a draft,
