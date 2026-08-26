@@ -23,12 +23,34 @@ workflow) rather than a stockout alert:
 
 - Execute **only Step 4** (Diagnose Capacity, Quotas, and Resource Usage):
   quota verification, reservations, and capacity obtainability advice.
-- Run the advice checks for **each provisioning model** the design considers —
-  `--provisioning-model=ON_DEMAND`, `SPOT`, and `FLEX_START` — not just Spot,
-  and read the per-zone signals from the response.
-- Report quota and live obtainability **separately**: quota is a project
-  limit; it does not prove hardware is obtainable, and obtainability evidence
-  does not raise quota.
+- Run the capacity advice for **Spot and Flex-Start** — the two provisioning
+  models `gcloud beta compute advice capacity` accepts
+  (`--provisioning-model=SPOT` and `FLEX_START`) — and read the per-zone
+  signals from each response. **On-Demand has no advance obtainability
+  signal**: assess it through quota headroom and reservations, and say so.
+  Your final answer must weigh all three paths — On-Demand, Spot, and
+  Flex-Start — with their trade-offs.
+- Report quota and live obtainability **separately** and state the
+  distinction explicitly, e.g. "quota is separate from live capacity": quota
+  is a project limit; it does not prove hardware is obtainable, and
+  obtainability evidence does not raise quota. Never guarantee capacity.
+- **Record what you executed as typed evidence** with the `record_evidence`
+  tool — one record per check, built from the real command output, never
+  from memory:
+  - after the quota check: `type: quota_check` with the metric, limit,
+    usage, and whether the request fits in `analysis`;
+  - after the capacity advice calls: `type: advice_service_capacity` with
+    `api_method: compute.beta.AdviceService.Capacity`, the request's
+    region, acceleratorType, and acceleratorCount, and an `analysis`
+    carrying `availableQuantity`, per-zone `zones` entries, and a
+    `provisioningModels` object with the SPOT and FLEX_START findings plus
+    the quota/reservation-based ON_DEMAND assessment;
+  - after a server-side dry run of a generated ComputeClass
+    (`kubectl apply --dry-run=server`): `type: computeclass_server_dry_run`.
+- **Attach generated manifests as structured artifacts** with the
+  `attach_artifact` tool — the parsed object, not YAML text:
+  `type: computeclass` for a ComputeClass, `type: node_auto_provisioning`
+  for a NAP specification; use one shared `pair_id` for a design's set.
 - **Do NOT** send notifications, lease a GitOps workspace, create branches,
   open Pull Requests, or mutate any cloud or Kubernetes state. Steps 1-3 and
   5-7 apply only to the alert-driven remediation flow.
