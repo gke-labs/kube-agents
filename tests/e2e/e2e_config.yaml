@@ -19,10 +19,6 @@ environments:
   # ----------------------------------------------------------------------------
   - name: "gchat-e2e"
     description: "Google Chat ingress and messaging E2E test suite"
-    region: "us-east4"
-    namespace: "kubeagents-system"
-    env_vars:
-      CHAT_TOPIC_NAME: "platform-agent-chat-events"
     tests:
       - "tests/e2e/gchat_agent_test.py"
 

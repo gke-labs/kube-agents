@@ -8,6 +8,43 @@
 {{- if not (hasKey $defaultModels $provider) }}
 {{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
+{{- /* Both fenceposts at zero leaves the Deployment no way to make progress and
+       the API server rejects it ("may not be 0 when maxSurge is 0"), so fail
+       the render rather than the apply. See values.yaml's litellm.rollingUpdate.
+
+       A fencepost with no usable value takes the values.yaml default and
+       renders explicitly below. "No usable value" has to mean the empty string
+       as well as nil: `--set litellm.rollingUpdate.maxUnavailable=` and a
+       values file's `maxUnavailable: ""` both reach here as an empty string,
+       which is a perfectly good `kind` and so survives a nil test. Rendering
+       either through would emit `maxUnavailable:` with nothing after it, and
+       Kubernetes then applies its own 25% default, which rounds down to 0 at
+       the default replicaCount of 2 — the exact stall this guard exists to
+       catch, reached with nothing to see in the manifest.
+
+       Both fields are IntOrString, which is what makes the zero test awkward:
+       `int` is cast.ToInt and reads "25%" as 0, so it would refuse a pair of
+       perfectly good percentages, while a list of literal spellings misses
+       "0.0". Compare numerically with the percent sign stripped — "0%"
+       resolves to 0 on the cluster, so it is the same misconfiguration spelled
+       differently. `float64` is cast.ToFloat64, which reports anything it
+       cannot parse as 0, so the numeric test is gated on both values actually
+       being numeric: without that, `maxSurge: abc` is refused as a zero and
+       the message names the wrong problem. Non-numeric input is left to the
+       API server, which is where it was rejected before this guard existed. */}}
+{{- $ru := .Values.litellm.rollingUpdate | default dict }}
+{{- $surge := $ru.maxSurge }}
+{{- $unavail := $ru.maxUnavailable }}
+{{- if or (kindIs "invalid" $surge) (eq (toString $surge) "") }}{{- $surge = 1 }}{{- end }}
+{{- if or (kindIs "invalid" $unavail) (eq (toString $unavail) "") }}{{- $unavail = 1 }}{{- end }}
+{{- $surgeNum := trimSuffix "%" (trim (toString $surge)) }}
+{{- $unavailNum := trimSuffix "%" (trim (toString $unavail)) }}
+{{- $numeric := "^[0-9]+(\\.[0-9]+)?$" }}
+{{- if and (regexMatch $numeric $surgeNum) (regexMatch $numeric $unavailNum) }}
+{{- if and (eq (float64 $surgeNum) 0.0) (eq (float64 $unavailNum) 0.0) }}
+{{- fail (printf "litellm.rollingUpdate: maxSurge (%v) and maxUnavailable (%v) may not both be zero — the Deployment would have no way to make progress, and the API server rejects it." $surge $unavail) }}
+{{- end }}
+{{- end }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
 {{- $vertex := .Values.litellm.vertex | default dict }}
 {{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
@@ -77,8 +114,12 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+      # Why maxUnavailable defaults to 1 rather than 0, and when to change it:
+      # values.yaml's litellm.rollingUpdate block owns that argument. The short
+      # form is that 0 makes the surge Pod mandatory, which a full namespace
+      # ResourceQuota turns into a stalled rollout (#749).
+      maxSurge: {{ $surge }}
+      maxUnavailable: {{ $unavail }}
   selector:
     matchLabels:
       app: litellm
@@ -272,9 +313,10 @@ spec:
         - ipBlock:
             cidr: 169.254.169.254/32
     # GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-    # the node rewrites 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    # the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
     # is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
     # policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
+    # Port 987 (ALTS) is deliberately omitted because standard OAuth2/REST token fetches do not use DirectPath.
     - ports:
         - port: 988
           protocol: TCP

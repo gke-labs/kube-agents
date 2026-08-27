@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +64,10 @@ func setupScheme() *runtime.Scheme {
 func defaultTestNetpolProfile() netpolProfile {
 	return netpolProfile{DNSClusterIP: defaultDNSClusterIP, MetadataDaemonIP: metadataDaemonIP}
 }
+
+// ssaApplyInterceptor is the shorter name the credential-broker tests use for
+// the fake client's Server-Side Apply support. One aliases the other.
+func ssaApplyInterceptor() interceptor.Funcs { return fakeServerSideApplyInterceptors() }
 
 // fakeServerSideApplyInterceptors returns interceptor.Funcs to handle Server-Side Apply (SSA) in the controller-runtime fake client.
 func fakeServerSideApplyInterceptors() interceptor.Funcs {
@@ -281,8 +286,6 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	objects := []client.Object{
 		agent,
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
@@ -711,7 +714,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
 	}
 	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules (DNS, GCP Metadata port 80/8080, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter), got %d", len(netpol.Spec.Egress))
+		t.Errorf("expected 9 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -739,7 +742,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
 	})
 	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
-		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80/8080)")
+		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80)")
 	}
 	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
 	// address as well as the link-local one even when the cluster has no nodes.
@@ -821,7 +824,7 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
 	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
-	// 2. GCP WI / Metadata server (80, 8080)
+	// 2. GCP WI / Metadata server (80)
 	// 3. GKE WI Host Network Daemon (988)
 	// 4. LiteLLM Gateway (80, 4000, 8080)
 	// 5. vLLM Gemma Server (80, 8000)
@@ -1095,16 +1098,11 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
-	// The pre-NAT targets belong on 80 and 8080.
+	// The pre-NAT target belongs on port 80.
 	got80 := egressCIDRsForPort(netpol, 80)
 	want80 := []string{"169.254.169.254/32"}
 	if !reflect.DeepEqual(got80, want80) {
 		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
-	}
-
-	got8080 := egressCIDRsForPort(netpol, 8080)
-	if !reflect.DeepEqual(got8080, want80) {
-		t.Errorf("expected port 8080 metadata peers %v, got %v", want80, got8080)
 	}
 
 	// Port 988 is the post-DNAT destination on Dataplane V1, carrying the metadata
@@ -1117,6 +1115,47 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 	if !reflect.DeepEqual(got988, want988) {
 		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
 	}
+
+	// Every port the metadata server is reachable on, across all egress rules. 8080 —
+	// the pre-NAT ALTS handshaker port — must not be among them: Dataplane V2 evaluates
+	// policy pre-NAT at the socket layer, so pairing 8080 with the link-local address
+	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
+	// to the platform goldens, which are snapshots that `go test -update` re-blesses
+	// from whatever the code emits.
+	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
+	wantPorts := []int32{80, 988}
+	if !reflect.DeepEqual(gotPorts, wantPorts) {
+		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	}
+}
+
+// egressPortsForCIDR returns the sorted, deduplicated ports every egress rule naming
+// cidr as an ipBlock peer opens towards it.
+func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32 {
+	seen := map[int32]bool{}
+	for i := range netpol.Spec.Egress {
+		matched := false
+		for _, peer := range netpol.Spec.Egress[i].To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == cidr {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port != nil {
+				seen[p.Port.IntVal] = true
+			}
+		}
+	}
+	ports := make([]int32, 0, len(seen))
+	for p := range seen {
+		ports = append(ports, p)
+	}
+	sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+	return ports
 }
 
 // egressCIDRsForPort returns the ipBlock CIDRs of the first egress rule naming port.

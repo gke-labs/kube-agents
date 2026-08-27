@@ -399,11 +399,11 @@ Default image: derived dynamically from the operator's container image at runtim
 
 - `serviceAccountName` — the KSA the pod runs as. `kubeagents-platform-agent` by convention.
 - `serviceAccountAnnotations` — passed through to the KSA. Typically holds `iam.gke.io/gcp-service-account` for Workload Identity binding.
+- `splitCredentialBrokerPod` — default `false`, and **leave it off for now**. Renders the credential broker as its own Deployment and Service instead of a sidecar. The broker still runs commands in a directory the agent created on the shared data volume, so today both Pods have to see the same files: on the default ReadWriteOnce disk the broker Pod cannot attach the volume, never becomes ready, and every proxied command reports the credential proxy as unavailable. That coupling is being removed rather than worked around — the broker will own the workspace on its own ordinary volume and take file content from the agent instead of a directory — and the flag becomes adoptable then. A ReadWriteMany claim satisfies the current design if you want it, but it is not something this product requires of you, and co-scheduling both Pods on one node is not a workaround. **Also requires `harness.eventWatcher.enabled: false`** — the event watcher lives in the credential container and delivers over the agent Pod's loopback, so the split strands it; asking for both is refused with `Degraded`/`SplitBrokerStrandsEventWatcher`. See [Credential isolation § Splitting the broker into its own Pod](/kube-agents/reference/credential-isolation/#splitting-the-broker-into-its-own-pod).
 
 The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by the [`kube-agents-iam` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) with one of these permission sets:
 
 - `read-only` (default)
-- `gke-admin`
 - `custom` (roles supplied via the installer's `--custom-roles`, the composition's `project_roles`)
 
 ## `spec.telemetry`

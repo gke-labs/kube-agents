@@ -1,0 +1,103 @@
+name: RC Step 5 - Tear Down Environment
+
+permissions:
+  contents: read
+
+on:
+  #checkov:skip=CKV_GHA_7:Standalone launch requires the release candidate tag or commit SHA to pick the teardown engine
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA (Mandatory for Step 5 standalone launch)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA"
+        required: true
+        type: string
+    secrets:
+      GCP_SA_KEY:
+        description: "Google Cloud Service Account JSON key"
+        required: false
+
+jobs:
+  teardown-rc:
+    runs-on: ubuntu-latest
+    environment: rc
+    # Same group as the deploy and E2E jobs: this destroys the environment both
+    # of those operate on, so it must never overlap a run that is still using it.
+    concurrency:
+      group: rc-environment
+      cancel-in-progress: false
+    # A GKE cluster destroy is slower than its create — node pools drain before
+    # the control plane goes, and lifecycle.sh clears the PlatformAgent
+    # finalizers first. Below step 2's 60 because there is no image build here.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CLOUDSDK_PYTHON: "/usr/bin/python3"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Commit SHA from Release Tag
+        id: resolve_target
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      # The teardown engine has to be the candidate's own, not main's. The four
+      # asymmetric resources lifecycle.sh handles before `terraform destroy` are
+      # the ones the candidate's composition created, and a newer lifecycle.sh
+      # can expect state layouts this environment was never installed with.
+      - name: Checkout repository at exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve_target.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
+
+      # kubectl and gke-gcloud-auth-plugin, because lifecycle.sh fetches cluster
+      # credentials itself and clears the PlatformAgent finalizers with kubectl
+      # before terraform runs. kubectl is named explicitly rather than left to
+      # the runner image: that cleanup is written `kubectl ... 2>/dev/null ||
+      # true`, so a missing binary skips it in silence and `terraform destroy`
+      # then blocks on the finalizers it was supposed to have removed. install.sh
+      # would auto-install it; uninstall.sh installs nothing.
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin,kubectl"
+
+      # No Go step, unlike the deploy job: nothing is built here. See the deploy
+      # job for why terraform_wrapper must stay off.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Tear Down Environment in GCP
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+        run: ./scripts/release/teardown_rc_environment.sh

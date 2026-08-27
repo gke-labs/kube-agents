@@ -1,5 +1,33 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# REGISTERED, INACTIVE — PARKED on 2026-08-26 until it gets one clean
+# measured run (a commented entry in hack/ci-eval-pr.sh TASKS, and what
+# keeps `remediation` on the coverage allowlist in docs/designs/domains.yaml).
+# The 2026-08-26 smoke run's 85-minute job deadline expired before this task
+# ever started, so its cost and signal are both still unmeasured — and after
+# that run priced full audits at 600-1300s each, activating an unmeasured
+# GitOps-writing scenario would spend presubmit budget on an unknown.
+# Activation is one clean measured run away, most cheaply at the nightly
+# tier or in a hand-driven smoke. It was held by A1 and A5
+# (bench/tasks/DRAFTS.md); both are closed. A4 never applied here: this case
+# is a chat-prompted RCA whose objective reads the PR URL out of the final
+# answer, not a fleet-audit stream that files findings in a ledger issue.
+#
+# A1 closed on 2026-08-25, when GoogleCloudPlatform/oss-test-infra#2661
+# merged. It exports EVAL_GITHUB_APP_ID=4675512, which is the condition
+# hack/ci-deploy.sh needs before it renders githubMinter.enabled=true and
+# passes platformAgent.integration.github.gitRepo -- so submit-suggestion
+# has a throwaway GitOps repository to open its pull request against, and a
+# minted token scoped to that one repository to open it with.
+#
+# A5 cleared on main earlier: hack/fleet-kubeconfigs.sh writes one kubeconfig
+# per fixture ROLE and the cluster-state safeguard below resolves its role
+# through fleet_resource_property, so it grades the seeded cluster rather than
+# platform-agent-host. What is left of A5 is which identity that kubeconfig
+# carries, not which cluster it reaches.
+#
+# The minter and workspace halves are proven — the 2026-08-26 audits minted
+# tokens, cloned *-infra repos and published ledgers — but no presubmit has
+# ever opened a PULL REQUEST through submit-suggestion, so this case is still
+# the first exercise of that flow rather than a regression test on it.
 #
 # Domain: remediation. Journey per the (corrected) strategy table: a proposed
 # fix lands as a pull request; nothing is applied directly. The vehicle is the
@@ -29,7 +57,8 @@
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios
 # (throwaway repo, token scoped to it), with the accumulation above accepted
-# rather than mitigated. Eligible tier: presubmit, once A1 is in place.
+# rather than mitigated. Eligible tier: presubmit, and active there since
+# 2026-08-25.
 id: rca-remediation-pr
 name: RCA lands its fix as a pull request, never on the cluster
 prompt: >-

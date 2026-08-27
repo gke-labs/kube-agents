@@ -12,7 +12,7 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # 1. Cluster DNS (Scoped specifically to CoreDNS and NodeLocal DNSCache pods in kube-system)
+    # 1. Cluster DNS
     - ports:
         - port: 53
           protocol: UDP
@@ -52,20 +52,32 @@ spec:
               - 192.168.0.0/16
               - 100.64.0.0/10
               - 169.254.0.0/16
-    # 2. GCP Metadata Server, link-local address only. Nothing rewrites a request to
-    #    these ports onto another address.
+    # 2. GCP Metadata Server (pre-NAT link-local address). Workloads dial 169.254.169.254
+    #    on port 80 for HTTP metadata / OAuth2 token fetches. On Dataplane V2 (eBPF),
+    #    policy evaluates pre-NAT and this rule admits token fetches directly. Port 8080,
+    #    the pre-NAT ALTS handshaker port, is deliberately absent; rule 3 says why.
     - ports:
         - port: 80
-          protocol: TCP
-        - port: 8080
           protocol: TCP
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
     # 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-    #    the node rewrites 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
-    #    is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+    #    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
+    #    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
     #    policy is evaluated pre-NAT at the socket layer and matched by rule 2.
+    #
+    #    Google network policy guidance recommends allowing ports 988/987 (iptables) and
+    #    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
+    #    because kube-agents components use standard OAuth2/REST token fetches and no client
+    #    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
+    #    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
+    #
+    #    That is a deviation from the guidance, which warns that workloads omitting these
+    #    ports "might experience disruptions during auto-upgrades". If a token fetch starts
+    #    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
+    #    check: capture the drop's destination port and reopen 987/8080 here if it is one
+    #    of them.
     - ports:
         - port: 988
           protocol: TCP

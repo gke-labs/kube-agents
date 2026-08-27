@@ -17,6 +17,8 @@ import time
 import urllib.error
 import urllib.request
 
+from credential_proxy_client import authorization_headers
+
 
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -72,7 +74,9 @@ def refresh_git_credentials(
         request = urllib.request.Request(
             url,
             data=json.dumps({"repository": repository}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            # Empty in the sidecar deployment; carries the caller's projected
+            # ServiceAccount token when the broker runs in its own Pod.
+            headers={"Content-Type": "application/json", **authorization_headers()},
             method="POST",
         )
         try:

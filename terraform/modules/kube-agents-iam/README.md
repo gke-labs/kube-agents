@@ -13,8 +13,13 @@ them.
 By default the module grants the read-only role set (the composition's
 `permission_set = "read-only"`, also the installer's default). Pass `project_roles = []` to grant
 nothing and manage roles yourself — but note the agent fails every GCP call until an
-equivalent role set exists. The `gke-admin` set can be reproduced by passing those
-roles explicitly (see `local.gke_admin_roles` in the full-install composition).
+equivalent role set exists.
+
+There is no admin preset to mirror: the `gke-admin` bundle was removed (see
+[Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),
+and this module has never had one. Passing admin roles through `project_roles` is
+possible and is the module's equivalent of `permission_set = "custom"` — it puts
+the grant in your Terraform, where it is reviewed.
 
 ## Usage
 

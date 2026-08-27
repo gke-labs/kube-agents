@@ -354,13 +354,12 @@ init_var_model_provider() {
 }
 
 init_var_platform_agent_permission_set() {
-  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
+  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-  if ! is_valid_permission_set "$PLATFORM_AGENT_PERMISSION_SET"; then
-    print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, gke-admin, custom."
-    exit 1
-  fi
+  # require_supported_permission_set (installer_common.sh) owns the vocabulary
+  # and the explanation for the removed `gke-admin` value.
+  require_supported_permission_set "$PLATFORM_AGENT_PERMISSION_SET" || exit 1
 
   if [ "$PLATFORM_AGENT_PERMISSION_SET" = "custom" ]; then
     init_var "PLATFORM_AGENT_CUSTOM_ROLES" "" "Enter Custom GCP IAM Roles (space or comma-separated)"
@@ -368,6 +367,7 @@ init_var_platform_agent_permission_set() {
       print_error "Custom permission set selected, but PLATFORM_AGENT_CUSTOM_ROLES is empty."
       exit 1
     fi
+    warn_on_overreaching_custom_roles "$PLATFORM_AGENT_CUSTOM_ROLES"
   fi
 }
 

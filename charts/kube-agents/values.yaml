@@ -1,3 +1,25 @@
+# Cluster-wide ValidatingAdmissionPolicies that backstop agent RBAC at apply
+# time: read verbs only, no Secrets, and no cluster-scoped binding to a
+# namespace-tier agent ServiceAccount. Read the header of
+# templates/agent-rbac-admission-policy.yaml before relying on them — notably,
+# they cannot check the rules of a *referenced* Role, and the content policy is
+# evadable by a manifest that carries neither the `kube-agents/tier` label nor
+# the `*-agent` naming convention.
+#
+# You do not need to turn this off for an old cluster: the template also checks
+# `.Capabilities.KubeVersion` and renders nothing below Kubernetes 1.30, where
+# the policy API is not yet v1 and the objects would fail to apply. Turn it off
+# for a second kube-agents release in a cluster that already has these — they
+# are cluster singletons with fixed names, so Helm refuses the second install on
+# ownership rather than duplicating them.
+#
+# What the policies do and do not enforce is in the header of
+# templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
+# on a default install with no GitOps overlay, the content policy matches
+# nothing the operator creates.
+admissionPolicy:
+  enabled: true
+
 global:
   # Registry prefix for the images built from this repo (operator, agent,
   # credential proxy). Empty leaves them on the public defaults below.
@@ -198,6 +220,40 @@ litellm:
     tag: v1.96.2
     pullPolicy: IfNotPresent
   replicaCount: 2
+  # Rollout strategy — the canonical home for this argument. The chart template
+  # and examples/litellm-gemini defer here directly; the kustomize base defers
+  # to the template, which defers on to this. Unlike
+  # podDisruptionBudget below this one is configurable, because the right answer
+  # depends on something the chart cannot see: whether a namespace ResourceQuota
+  # has room for a surge Pod.
+  #
+  # maxUnavailable: 0 is the zero-downtime shape, and it makes the surge Pod
+  # mandatory — under a full quota the old ReplicaSet may not shrink, the surge
+  # Pod is refused with FailedCreate, and the rollout stalls rather than
+  # completing (#749).
+  #
+  # The default of 1 lets the Deployment replace in place, and that trade is
+  # taken on every install rather than only quota-constrained ones: at 0 a
+  # rollout cost no serving capacity at all, and at 1 the old ReplicaSet gives up
+  # a slot as soon as it starts. At the default replicaCount of 2 one replica
+  # keeps serving throughout. At replicaCount 1 there is no second replica, so a
+  # rollout becomes a real gap for as long as the new Pod takes to pass its
+  # startupProbe — up to the 3 minutes that probe sanctions.
+  #
+  # Set maxUnavailable to 0 on an install with quota headroom that would rather a
+  # rollout stall than drop a request; keep 1 anywhere a baseline quota is applied
+  # as policy. Both at 0 is rejected in any spelling — 0, "0", 0%, 0.0 — and the
+  # template fails the render rather than letting it reach the cluster, where the
+  # API server would reject it anyway.
+  #
+  # Emptying a fencepost rather than setting it (`--set …maxUnavailable=`, or
+  # `maxUnavailable: ""`, or removing the key) resolves to the 1 below, not to
+  # nothing. Rendering it empty would hand Kubernetes its own 25% default, which
+  # rounds down to 0 at replicaCount 2 — the stall above, reached silently. Keep
+  # these two literals in step with that fallback in templates/litellm.yaml.
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 1
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
     # not configurable: minAvailable is the shape that deadlocks node drains,

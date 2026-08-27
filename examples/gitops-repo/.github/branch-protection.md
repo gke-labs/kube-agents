@@ -19,9 +19,10 @@ acceptance (A3) is satisfied end to end.
 
 ## Why both this and the ValidatingAdmissionPolicy
 
-Defense in depth: human review + CI here catch a bad change **before** merge; the
-`policy/vap-agent-readonly.yaml` `ValidatingAdmissionPolicy` rejects it **at apply time even if merged
-anyway** (03 §11). Phase 0 acceptance A3 requires both halves.
+Defense in depth: human review + CI here catch a bad change **before** merge; the agent-RBAC
+`ValidatingAdmissionPolicy` the harness installs (see [../policy/README.md](../policy/README.md))
+rejects it **at apply time even if merged anyway** (03 §11). Phase 0 acceptance A3 requires both
+halves — and the admission half does not cover everything review does, so neither is optional.
 
 ## Enabling (reference)
 

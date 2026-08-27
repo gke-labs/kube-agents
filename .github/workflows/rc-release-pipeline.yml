@@ -54,7 +54,6 @@ jobs:
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
   step-3-run-e2e-tests:
     name: Step 3 - Run E2E Tests
@@ -94,7 +93,6 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
 
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
@@ -106,7 +104,7 @@ jobs:
         uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
         with:
           cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
-          location: ${{ vars.GCP_REGION || 'us-east4' }}
+          location: ${{ vars.GCP_REGION }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Connect to GKE & Wait for Pod Readiness
@@ -117,28 +115,28 @@ jobs:
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
         run: ./scripts/release/wait_for_gke_readiness.sh
 
-      - name: Configure Docker Authentication for Artifact Registry
-        env:
-          GCP_REGION: ${{ vars.GCP_REGION }}
-        run: |
-          REGION="${GCP_REGION:-us-east4}"
-          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true
-
-      - name: Execute E2E Suite
+      - name: Execute Mandatory Google Chat E2E Gate
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-          REGISTRY: ${{ vars.REGISTRY || vars.REGISTRY_PREFIX || (vars.GCP_PROJECT_ID && format('{0}-docker.pkg.dev/{1}/kube-agents', vars.GCP_REGION || 'us-east4', vars.GCP_PROJECT_ID)) || '' }}
-          GITHUB_ORG: ${{ vars.GH_ORG || 'test-org-kube-agent' }}
-          GITHUB_REPO: ${{ vars.GH_REPO || 'test-org-kube-agent/agents-repo' }}
-          STOCKOUT_SCENARIOS: "04"
-          E2E_ENV: "rc-e2e"
+          E2E_ENV: "gchat-e2e"
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
           E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
           E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
           E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
-          CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
+        run: make test-e2e
+
+      - name: Execute Optional Cluster & Fleet Audit E2E Tests
+        continue-on-error: true
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          E2E_ENV: "rc-e2e"
+          STOCKOUT_SCENARIOS: "04"
+          FLEET_AUDIT_STREAMS: "all"
         run: make test-e2e
 
   step-4-tag-validated:
@@ -154,3 +152,36 @@ jobs:
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
     secrets:
       RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+  step-5-teardown-env:
+    name: Step 5 - Tear Down RC Environment
+    # Every earlier job, so that the implicit success() on `needs` is what gates
+    # this one: the RC cluster is destroyed only when the whole run passed. A
+    # failure anywhere leaves the environment standing to be examined live —
+    # which is the point, since the E2E failures worth diagnosing are the ones
+    # that only reproduce on the cluster that produced them. Nothing else
+    # removes it; the next run's pre-install teardown does, up to three hours
+    # later, so a failure that needs longer than that wants the schedule paused.
+    #
+    # The `if:` below does NOT weaken that gate. It adds conditions rather than
+    # replacing the success() check, the way step 4 already skips when step 3
+    # fails despite carrying an `if:` of its own. An `always()` added here would
+    # remove it and start destroying the environments this exists to preserve.
+    needs:
+      [
+        step-1-create-tag,
+        step-2-deploy-env,
+        step-3-run-e2e-tests,
+        step-4-tag-validated,
+      ]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    uses: ./.github/workflows/rc-teardown-environment.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+    secrets:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}

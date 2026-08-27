@@ -77,6 +77,8 @@ gcloud services enable iamcredentials.googleapis.com \
   storage.googleapis.com \
   pubsub.googleapis.com \
   gkebackup.googleapis.com \
+  logging.googleapis.com \
+  artifactregistry.googleapis.com \
   --project="${PROJECT_ID}"
 
 # 3. Create Service Account
@@ -89,9 +91,16 @@ gcloud iam service-accounts create "${SA_NAME}" \
 echo "Granting necessary roles to the Service Account..."
 # Base roles required for standard CI deployments:
 ROLES=(
+  # Cloud KMS keyring and CryptoKey management for GKE CMEK database encryption, Backup for GKE, and GitHub Token Minter key provisioning
   "roles/cloudkms.admin"
+
+  # Full GKE cluster lifecycle management (cluster provisioning, node pools, and gVisor sandbox configuration)
   "roles/container.admin"
+
+  # Read-only Compute Engine and VPC inspection for GKE node-pool instance groups, machine types, reservations, and quota advice
   "roles/compute.viewer"
+
+  # Enabling and consuming required Google Cloud APIs across the platform
   "roles/serviceusage.serviceUsageAdmin"
   "roles/serviceusage.serviceUsageConsumer"
 )
@@ -114,6 +123,12 @@ if [ "$IS_ADMIN" = true ]; then
 
     # Terraform remote state management (creating and managing gs://<project>-kube-agents-tfstate)
     "roles/storage.admin"
+
+    # Cloud Logging sink creation and filter routing for event and autoscaler log ingestion into Pub/Sub
+    "roles/logging.configWriter"
+
+    # Artifact Registry repository creation and image management for agent plugin extensions
+    "roles/artifactregistry.admin"
   )
 fi
 

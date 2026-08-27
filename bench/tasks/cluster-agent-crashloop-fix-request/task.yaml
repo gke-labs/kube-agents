@@ -6,9 +6,10 @@
 # the Prow job now exports EVAL_GITHUB_APP_ID, and the repo-side half
 # (ci-deploy.sh mapping each pool project to its *-infra repo and scoping the
 # minter to it) was already on main. A5's residual applies as it does to every
-# fleet case — without FLEET_READONLY_SA the safeguard below still runs, but
-# under the runner's own read-write identity, which is a privilege gap rather
-# than a functional block.
+# fleet case — until the fleet_reader_token_creators grant is applied in the
+# leased project, the safeguard below still runs, but under the runner's own
+# read-write identity, which is a privilege gap rather than a functional
+# block.
 #
 # What keeps it commented out is that it has never been run. It stays that way
 # until it has been watched to both pass and fail (`validated: false`);

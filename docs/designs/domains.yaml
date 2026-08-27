@@ -1,5 +1,5 @@
-# The ten domains the Platform Agent operates in, as data. Each is a job area
-# with its own SOP, cron stream, and journeys (the testing-strategy design
+# The eleven domains the Platform Agent operates in, as data. Each is a job
+# area with its own SOP, cron stream, and journeys (the testing-strategy design
 # document, in review, is the source of the list; until it lands this file is
 # self-contained).
 #
@@ -20,6 +20,16 @@
 # entry hiding progress). The shrinking allowlist is the tier-2 progress
 # metric of the testing implementation plan, as line coverage is the tier-1
 # one.
+#
+# PROBES AND THE CANARY, because the journey lines below assume it: the
+# 2026-08-26 measurement (bench/tasks/DRAFTS.md) put a full audit sweep at
+# 600-1300s per domain, which six domains cannot spend inside one presubmit.
+# So in presubmit each audit domain is covered by a PROBE -- a targeted
+# question about that domain's planted defect, answered from observed
+# evidence and graded on the reply -- while the audit-SOP machinery itself
+# (dispatch, delegation, token minter, ledger write) is exercised end to end
+# by exactly one audit kept as a canary, under the `fleet-audits` domain.
+# The full audit scenarios remain spec-ready for the nightly tier.
 
 domains:
   - slug: chat-and-routing
@@ -27,22 +37,25 @@ domains:
     journey: Ask the fleet a question; routed to the right specialist, answered from observed evidence
   - slug: reliability
     name: Reliability (obtainability-audit)
-    journey: Daily reliability sweep names the workload that breaks on a drain or an upgrade
+    journey: A targeted probe asks whether the planted workload survives a drain and answers from observed evidence
   - slug: capacity
     name: Capacity (stockout-prevention)
-    journey: Stockout audit names the pool at risk and the shortfall
+    journey: A targeted probe asks whether the pinned pool can absorb load and names the cap that stops it
   - slug: cost
     name: Cost (fleet-wide-cost-analysis)
-    journey: Weekly waste audit names the idle resource in resource units
+    journey: A targeted probe names the node pool running no workloads right now, from live reads
   - slug: security
     name: Security (compliance-audit, ai-security-audit)
-    journey: RBAC and AI workload posture findings, each carrying a remediation
+    journey: A targeted probe asks whether the planted RBAC binding is appropriately scoped and names the over-grant
   - slug: upgrades
     name: Upgrades (security-patch-orchestrator)
-    journey: Upgrade readiness reports the versions and blockers it actually read
+    journey: A targeted probe asks whether a control plane is current and reports the lag it actually read
   - slug: consistency
     name: Consistency (fleet-consistency-drift)
-    journey: Drift sweep compares each cluster against the live-fleet majority
+    journey: A targeted probe compares one cluster's configuration against its live peers and names the differing facet
+  - slug: fleet-audits
+    name: Fleet audits (SOP machinery)
+    journey: "A scheduled audit SOP runs end to end: delegates to a worker, sweeps the fleet, and files a ledger issue a human can act on"
   - slug: remediation
     name: Remediation (fleet-audit cron remediation, RCA chat prompt via submit-suggestion)
     journey: A proposed fix lands as a pull request; nothing applied directly
@@ -53,20 +66,21 @@ domains:
     name: Incident triage (autoops)
     journey: A warning event is triaged to a root cause and a pull request, never a cluster write
 
-# Known-uncovered. The two kanban probes cover chat-and-routing, so it is
-# already off the list. Phase 2's exit criterion is an empty list.
+# Known-uncovered. The two kanban probes cover chat-and-routing;
+# cluster-debugging came off first among the Phase 2 domains, in #939.
+# Reliability, capacity, security, upgrades, consistency and cost are covered
+# by the six domain probes, and fleet-audits by the compliance-audit canary --
+# see the header above for why probes rather than six full audits. Phase 2's
+# exit criterion is an empty list.
 allowlist:
-  - reliability
-  - capacity
-  - cost
-  - security
-  - upgrades
-  - consistency
+  # rca-remediation-pr is registered in hack/ci-eval-pr.sh's TASKS array but
+  # parked until it gets one clean measured run: the 2026-08-26 smoke run
+  # (bench/tasks/DRAFTS.md) hit its 85-minute job deadline before reaching it,
+  # so its cost and signal are still unmeasured and activating it would spend
+  # presubmit budget on an unknown.
   - remediation
-  # cluster-debugging left this list on 2026-08-25, the first Phase 2 domain
-  # to do so: cluster-agent-crashloop-debug is active in hack/ci-eval-pr.sh's
-  # TASKS array.
   # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
   # post-incident RCA, and incident-triage means event-fired autoops triage.
-  # Real coverage arrives with the autoops-warning-event-triage scenario.
+  # Real coverage needs autoops-warning-event-triage, which has no scenario
+  # driver to apply its incident workload -- tracked as #954.
   - incident-triage

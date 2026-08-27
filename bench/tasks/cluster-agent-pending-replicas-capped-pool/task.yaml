@@ -5,9 +5,9 @@
 #
 # A1 and A4 closed on 2026-08-25 and never applied here: this case opens no
 # pull request and reads no ledger. A5's residual applies as it does to
-# every fleet case — without FLEET_READONLY_SA the safeguards run under the
-# runner's own read-write identity, a privilege gap rather than a functional
-# block. The verification half has been watched both ways — on 2026-08-26
+# every fleet case — until the fleet_reader_token_creators grant is applied
+# in the leased project, the safeguards run under the runner's own read-write
+# identity, a privilege gap rather than a functional block. The verification half has been watched both ways — on 2026-08-26
 # every safeguard here passed against real Kubernetes objects matching the
 # fixture, then failed against each mutation a misbehaving agent would make,
 # then passed again on revert.

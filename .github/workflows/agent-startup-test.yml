@@ -51,6 +51,34 @@ jobs:
               # plugin-linking logic, reached from the other direction.
               - "agents/platform/scripts/profile_scaffold.py"
               - "agents/platform/scripts/cluster_agent_profile.py"
+              # The startup path a replicas > 1 Pod takes instead of the
+              # entrypoint: the operator gives the sandbox a `command`, so this
+              # script starts Hermes and owns the umask that keeps the shared
+              # PVC writable from the credential sidecar. test_startup_umask.py
+              # asserts that; it has to run when the file it asserts on changes.
+              - "k8s-operator/internal/controller/leader_elect.py"
+              # The install shell test_agent_iam_ceiling.py executes for real:
+              # it sources common.sh and runs installer_common.sh's
+              # permission-set gate, so that no built-in permission set grants
+              # the agent GSA a role authorizing it through IAM regardless of
+              # its Kubernetes RBAC.
+              - "install.sh"
+              - "k8s-operator/scripts/common.sh"
+              - "k8s-operator/scripts/installer_common.sh"
+              # The other half of that assertion: the Terraform composition is
+              # what turns the answer into IAM bindings.
+              - "terraform/examples/full-install/*.tf"
+              # The agent-RBAC admission policies and the two things that
+              # deliver them: test_admission_policy_shipped.py asserts that the
+              # chart and the manual install each apply them. INSTALL.md is one
+              # of those paths, not documentation about one — `make deploy` does
+              # not install the policies, so on the manual path that kubectl
+              # apply line IS the control, and deleting it in a docs-only PR
+              # must not be silent.
+              - "k8s-operator/config/admission/**"
+              - "charts/kube-agents/templates/agent-rbac-admission-policy.yaml"
+              - "charts/kube-agents/values.yaml"
+              - "INSTALL.md"
               - "tests/test_*.py"
               # tests/test_operator_makefile.py asserts on the recipes this
               # Makefile prints; a Makefile-only change must run it or the

@@ -177,6 +177,16 @@ opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
 
+`litellm.rollingUpdate.maxUnavailable` defaults to `1` so that a rollout can
+replace a Pod in place. Set it to `0` for a zero-downtime rollout, but only
+where the namespace has quota headroom for one more LiteLLM Pod: at `0` the
+surge Pod is mandatory, and a `ResourceQuota` with no room for it stalls the
+rollout instead of completing it. At the default `litellm.replicaCount` of 2 one
+replica keeps serving either way; at `replicaCount: 1` the default of `1` means
+a rollout drops the only Pod before its replacement is ready, so LiteLLM is
+unreachable for up to the three minutes its `startupProbe` allows. `values.yaml`
+states the trade in full.
+
 ### Hindsight memory store
 
 `hindsight.*` renders the agents' long-term memory store — the Hindsight API
@@ -345,6 +355,26 @@ Exactly one owner creates the agent's KSA, depending on
   does not create it — the **chart** renders it instead, so a default install
   still starts.
 
+### Agent-RBAC admission policies
+
+`admissionPolicy.enabled` (default `true`) installs two cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, generated from
+`k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
+that grants a write or privilege-escalation verb, grants Secrets, or gives a
+namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
+check the rules of a role a binding _references_ — CEL cannot read another
+object — and the content policy only selects manifests carrying the
+`kube-agents/tier` label; see that file's header.
+
+The template checks `.Capabilities.KubeVersion` as well as this value, so on a
+cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
+renders nothing instead of failing the install. `Chart.yaml` accepts `>=1.29.0-0`,
+so that case is inside the supported range and has to work.
+
+Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
+that already has them: the objects are cluster singletons with fixed names, so
+Helm refuses the second install on ownership rather than duplicating them.
+
 ## Uninstalling
 
 ```bash
@@ -442,8 +472,8 @@ helm uninstall kube-agents -n kubeagents-system
   manually when upgrading across CRD changes. Automating this (pre-upgrade
   hook) is deliberate follow-up scope; it first matters when upgrading between
   two published releases.
-- The CRD and RBAC manifests under this chart are generated copies of
-  `k8s-operator/config/` — edit the source and run `make chart-sync` (CI
-  enforces this via `make chart-check`).
+- The CRD, RBAC and admission-policy manifests under this chart are generated
+  copies of `k8s-operator/config/` — edit the source and run `make chart-sync`
+  (CI enforces this via `make chart-check`).
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.
