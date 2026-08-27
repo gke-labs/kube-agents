@@ -23,6 +23,8 @@ and each project keeps its own state: bucket `<project>-tf-state`, prefix
 `seeded-fleet`, always. Whether a given project's apply is complete is not recorded here,
 because a list of project names goes stale silently: `scripts/verify_ci_pool_project.py`
 runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles.
+A role on a cluster it could not reach usually reports as unchecked rather than absent; the
+warnings that override that default are in the site's `deploy/ci-pool-projects` §6.
 Project N+1 follows the same convention. The fleet owner creates the bucket once per project; switching projects means
 re-initializing against that project's bucket and naming the project on the apply:
 

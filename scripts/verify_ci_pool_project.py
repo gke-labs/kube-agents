@@ -176,6 +176,147 @@ def run_cmd(
     return proc.returncode, proc.stdout, proc.stderr
 
 
+# gcloud ends a denied read with "(or it may not exist)", and means it: the API
+# will not say whether the caller may not see the resource or the resource is
+# not there. Neither can this script, so it must stop asserting the second
+# reading. These patterns cover what gcloud and gh print when the caller is
+# authenticated and unprivileged -- PERMISSION_DENIED from the IAM and Artifact
+# Registry APIs, `code=403` from the container API, `does not have
+# storage.buckets.get access` from GCS, `403 Forbidden` from GitHub.
+_DENIAL_PATTERNS = (
+    re.compile(r"permission[ _]denied", re.I),
+    re.compile(r"denied on resource", re.I),
+    re.compile(r"does not have (?:permission|\S+ access)", re.I),
+    re.compile(r"permission\(s\) for", re.I),
+    re.compile(r"is required to perform this operation", re.I),
+    re.compile(r"(?:httperror|error|code[=: ])\s*403\b", re.I),
+    re.compile(r"403 forbidden", re.I),
+    # gh's own form, which is neither of the two above: `gh: Must have admin
+    # rights to Repository. (HTTP 403)`. The message half varies with the
+    # endpoint and carries no word any of these patterns look for, so without
+    # this one a SAML-unauthorised or under-scoped token reads as a missing
+    # GitHub App installation.
+    re.compile(r"\(http 403\)", re.I),
+    re.compile(r"insufficient authentication scopes", re.I),
+    re.compile(r"resource not accessible", re.I),
+)
+
+# Not refusals, but not reads either. A call that timed out and a credential
+# that expired mid-run both leave the resource unread, and "absent" is as wrong
+# a reading there as it is after a 403 -- `gcloud auth list` reads the local
+# credential store without contacting the network, so an expired refresh token
+# clears check_toolchain and then fails every call that follows it. These stay
+# out of _DENIAL_PATTERNS because the call sites that ask specifically whether a
+# read was *refused* -- the Artifact Registry policy pair -- must keep telling
+# the two apart; _record_unreadable files them the same way because the
+# consequence for the caller is identical.
+_UNREAD_PATTERNS = (
+    re.compile(r"timed out after \d+s", re.I),
+    re.compile(r"invalid_grant", re.I),
+    re.compile(r"problem refreshing your current auth tokens", re.I),
+    re.compile(r"reauthentication (?:required|failed)", re.I),
+)
+
+# gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
+# for one the token's scopes do not reach. Only call sites that know a 404
+# cannot mean "absent" may use this; see check_github_repo_and_app.
+_GITHUB_NOT_FOUND = re.compile(r"\b404\b|\bnot found\b", re.I)
+
+# hack/fleet-kubeconfigs.sh reports a cluster it could not reach and a fleet
+# that is not what the catalog describes through the same "unresolved" count,
+# and only its warning text separates them. These four are the second kind: the
+# cluster list came back and what it held was wrong, which is a finding about
+# the project rather than about this run's credential. Their sources are
+# hack/fleet-kubeconfigs.sh lines 406, 411, 215 and 224.
+_FLEET_LOOKED_AND_FOUND_WRONG = re.compile(
+    r"carries no clusters labelled"
+    r"|none resolved to a catalog slot"
+    r"|matches no slot the catalog declares"
+    r"|more than one labelled seeded cluster",
+    re.I,
+)
+
+# ...except that a refused `clusters list` produces the first of those four
+# anyway. hack/fleet-kubeconfigs.sh:370-373 sets `listing=""` when the call is
+# refused, which drives `labelled=0` and emits the byte-identical "carries no
+# clusters labelled" warning at :406 -- so read on its own, that string would
+# fail a healthy project for an operator without container.clusters.list, which
+# is the bug this file is being changed to remove. The refusal path emits this
+# marker first, and it is the only thing separating the two.
+_FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
+
+
+def _denial_reason(err: str) -> Optional[str]:
+    """The line of `err` showing the command was refused, or None if it was not.
+
+    None means the failure has some cause other than permissions, so "the
+    resource is absent" is a reading the caller may act on.
+    """
+    text = (err or "").strip()
+    if not text:
+        return None
+    for line in text.splitlines():
+        if any(p.search(line) for p in _DENIAL_PATTERNS):
+            return line.strip()[:200]
+    return None
+
+
+def _unread_reason(err: str) -> Optional[str]:
+    """The line of `err` showing the read did not happen, or None if it did.
+
+    Wider than _denial_reason by the transient causes in _UNREAD_PATTERNS: a
+    refusal, a timeout and an expired credential differ in what the operator
+    should do next, and not at all in what this run may conclude from them.
+    """
+    reason = _denial_reason(err)
+    if reason is not None:
+        return reason
+    for line in (err or "").strip().splitlines():
+        if any(p.search(line) for p in _UNREAD_PATTERNS):
+            return line.strip()[:200]
+    return None
+
+
+def _record_unreadable(
+    err: str,
+    absent: str,
+    unchecked: str,
+    details: List[str],
+    warnings: List[str],
+) -> bool:
+    """File a non-zero command exit under either absence or visibility.
+
+    Returns True when the command did not read the resource -- refused, timed
+    out, or stopped by a credential that had expired. That is not evidence the
+    resource is missing, so the caller keeps passing and the run exits 2 with
+    the operator told what to confirm by hand. Returns False for every other
+    cause, where "the resource is absent" is the right reading and the caller
+    must fail.
+    """
+    reason = _unread_reason(err)
+    if reason is None:
+        details.append(absent)
+        return False
+    warnings.append(f"{unchecked}: {reason}")
+    return True
+
+
+def _partial_summary(items: List[Tuple[str, bool]]) -> str:
+    """A summary naming what this run verified and what it did not, or "".
+
+    Empty means every item was checked and the caller should say so in its own
+    words. Both halves go in otherwise: naming only what was skipped hands the
+    operator a longer manual list than they owe, and naming only what passed is
+    the false assurance the exit-2 state exists to prevent.
+    """
+    verified = [label for label, done in items if done]
+    unchecked = [label for label, done in items if not done]
+    if not unchecked:
+        return ""
+    prefix = f"{', '.join(verified)} verified; " if verified else ""
+    return f"{prefix}{', '.join(unchecked)} not checked"
+
+
 def _load_json(out: str):
     """Parse command output as JSON, tolerating `gh --jq`'s multi-object form.
 
@@ -352,14 +493,27 @@ def check_codebase_mapping(project_id: str) -> CheckResult:
 
 def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]:
     """Verify the project exists, read its number, and check enabled APIs."""
+    name = "GCP Project & APIs"
     rc, out, err = run_cmd(["gcloud", "projects", "describe", project_id, "--format=json"])
     if rc != 0:
-        return None, CheckResult("GCP Project & APIs", False, f"Project describe failed: {err.strip()}")
+        reason = _denial_reason(err)
+        if reason is None:
+            return None, CheckResult(name, False, f"Project describe failed: {err.strip()}")
+        return None, CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[
+                f"Could not describe {project_id}, so neither it nor anything derived from its project "
+                f"number was checked: {reason}. Reading a project needs "
+                f"resourcemanager.projects.get on it."
+            ],
+        )
 
     try:
         project_number = _load_json(out).get("projectNumber")
     except Exception as exc:
-        return None, CheckResult("GCP Project & APIs", False, f"Failed parsing project description: {exc}")
+        return None, CheckResult(name, False, f"Failed parsing project description: {exc}")
 
     rc, out, err = run_cmd([
         "gcloud", "services", "list",
@@ -368,7 +522,18 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
         "--format=value(config.name)",
     ])
     if rc != 0:
-        return project_number, CheckResult("GCP Project & APIs", False, f"Failed listing enabled services: {err.strip()}")
+        reason = _denial_reason(err)
+        if reason is None:
+            return project_number, CheckResult(name, False, f"Failed listing enabled services: {err.strip()}")
+        return project_number, CheckResult(
+            name,
+            True,
+            f"Project number: {project_number}; enabled APIs not checked",
+            warnings=[
+                f"Could not list the enabled services on {project_id}, so the {len(REQUIRED_APIS)} required "
+                f"API(s) were not checked: {reason}"
+            ],
+        )
 
     missing_apis = REQUIRED_APIS - set(out.split())
     if missing_apis:
@@ -387,7 +552,10 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
     """Verify Workload Identity and the cross-project Artifact Registry reader grants."""
     details = []
+    warnings: List[str] = []
     passed = True
+    wi_checked = False
+    prow_checked = False
 
     gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
@@ -397,9 +565,17 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Missing GSA or failed reading policy for {gsa_email}")
+        if not _record_unreadable(
+            err,
+            f"Missing GSA or failed reading policy for {gsa_email}",
+            f"Could not read the IAM policy on {gsa_email}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        wi_checked = True
         try:
             policy = _load_json(out)
             expected_member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
@@ -424,9 +600,20 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}")
+        # A cross-project read. The pool project can be perfectly configured
+        # while the caller simply holds nothing on kube-agents-prow, which is
+        # the common case for anyone who is not the Prow service account.
+        if not _record_unreadable(
+            err,
+            f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}",
+            "Could not read the IAM policy on kube-agents-prow's kube-agents repository, so this "
+            "project's Cloud Build and Compute SAs were not checked for reader on the warm cache image",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        prow_checked = True
         try:
             policy = _load_json(out)
             cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
@@ -445,11 +632,26 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
 
+    # The summary must not assert an item a warning above retracts.
+    partial = _partial_summary(
+        [
+            ("the Workload Identity binding", wi_checked),
+            ("the cross-project AR reader grants", prow_checked),
+        ]
+    )
+    if not passed:
+        message = "IAM requirements missing"
+    elif partial:
+        message = partial
+    else:
+        message = "Workload Identity and cross-project AR reader grants verified"
+
     return CheckResult(
         "Service Accounts & IAM Grants",
         passed,
-        "Workload Identity and cross-project AR reader grants verified" if passed else "IAM requirements missing",
+        message,
         details=details,
+        warnings=warnings,
     )
 
 
@@ -503,7 +705,9 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
     cleanup policy the presubmit images accumulate without bound.
     """
     details = []
+    warnings: List[str] = []
     passed = True
+    repo_checked = False
 
     rc, out, err = run_cmd([
         "gcloud", "artifacts", "repositories", "describe", "kube-agents",
@@ -512,9 +716,17 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Missing Artifact Registry repository kube-agents in {location}: {err.strip()[:160]}")
+        if not _record_unreadable(
+            err,
+            f"Missing Artifact Registry repository kube-agents in {location}: {err.strip()[:160]}",
+            f"Could not read the Artifact Registry repository kube-agents in {location}, so neither its "
+            "presence nor its cleanup policy was checked",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        repo_checked = True
         try:
             repo = _load_json(out)
             if repo.get("format") != "DOCKER":
@@ -544,6 +756,8 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
     writers = set()
     pullers = set()
     policy_read = False
+    policy_denials: List[str] = []
+    policy_errors: List[str] = []
     for cmd in (
         ["gcloud", "projects", "get-iam-policy", project_id, "--format=json"],
         [
@@ -553,10 +767,16 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
     ):
         rc, out, err = run_cmd(cmd)
         if rc != 0:
+            reason = _denial_reason(err)
+            if reason:
+                policy_denials.append(reason)
+            else:
+                policy_errors.append(err.strip()[:160] or f"exit {rc}")
             continue
         try:
             policy = _load_json(out)
-        except Exception:
+        except Exception as exc:
+            policy_errors.append(f"unparseable policy: {exc}")
             continue
         policy_read = True
         for b in policy.get("bindings", []):
@@ -566,18 +786,56 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
             if role in AR_PULLER_ROLES:
                 pullers.update(b.get("members", []))
 
-    warnings: List[str] = []
     node_pull_checked = False
+    push_checked = False
     if not policy_read:
-        passed = False
-        details.append(f"Could not read any IAM policy granting image push rights on {project_id}")
-    else:
-        if not (build_sas & writers):
+        # Nothing is known about push rights either way. Where every attempt was
+        # refused that is a limit of the caller's credential and not a finding
+        # about the project, so it takes the same route as every other denial
+        # here. Where some other cause stopped the read -- an unparseable policy,
+        # a call that failed for a reason that is not permissions -- the check
+        # still fails, because that is not a limit anyone can confirm by hand.
+        if policy_errors:
             passed = False
             details.append(
+                f"Could not read any IAM policy granting image push rights on {project_id}: "
+                f"{policy_errors[0]}"
+            )
+        else:
+            warnings.append(
+                f"Could not read any IAM policy on {project_id}, so image push rights and "
+                f"{HOST_CLUSTER}'s node pull rights were not checked: "
+                f"{policy_denials[0] if policy_denials else 'no policy readable'}"
+            )
+    else:
+        # A grant found in either policy settles the question; its absence is
+        # settled only when BOTH were read. One policy refused and the other
+        # returning nothing relevant looks identical to no grant anywhere --
+        # and the grants provision_ci_pool_project.sh makes are project-level,
+        # so the refused half is usually the half that holds them.
+        #
+        # `not policy_errors` here and below is always true as the loop stands:
+        # reaching this branch means one of the two policies was read, so the
+        # other contributed at most one of a denial or an error. It is the
+        # condition the branch means rather than the one the arithmetic
+        # currently allows, and stays correct if a third policy source is added.
+        push_ok = bool(build_sas & writers)
+        push_checked = push_ok or not policy_denials
+        if not push_ok and policy_denials and not policy_errors:
+            warnings.append(
+                f"No role granting image push to {project_id} was found for the Cloud Build or Compute "
+                f"SA, but one of the two IAM policies could not be read, so push rights were not "
+                f"checked: {policy_denials[0]}"
+            )
+        elif not push_ok:
+            passed = False
+            detail = (
                 f"Neither the Cloud Build SA nor the Compute SA holds a role granting image push on {project_id} "
                 f"(any of: {', '.join(sorted(AR_WRITER_ROLES))}); PR image pushes will fail"
             )
+            if policy_errors:
+                detail += f" -- read from a partial policy; the other could not be read: {policy_errors[0]}"
+            details.append(detail)
 
         node_members, node_err = _host_cluster_node_members(project_id, project_number)
         if node_err:
@@ -590,27 +848,46 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
                 "so their pull rights on the kube-agents repository were not checked"
             )
         else:
-            node_pull_checked = True
             starved = [m for m in node_members if m not in pullers]
-            if starved:
+            if starved and policy_denials and not policy_errors:
+                # Same asymmetry as push above: a pull grant this run was
+                # refused sight of reads exactly like one that is not there.
+                warnings.append(
+                    f"No role granting image pull on {project_id} was found for {HOST_CLUSTER}'s node "
+                    f"account(s) {', '.join(sorted(starved))}, but one of the two IAM policies could not "
+                    f"be read, so node pull rights were not checked: {policy_denials[0]}"
+                )
+            elif starved:
                 passed = False
-                details.append(
+                detail = (
                     f"{HOST_CLUSTER}'s node account(s) {', '.join(sorted(starved))} hold no role granting "
                     f"image pull on {project_id} (any of: {', '.join(sorted(AR_PULLER_ROLES))}); the build "
                     "will push and every pod will land in ImagePullBackOff on the first lease"
                 )
+                if policy_errors:
+                    detail += f" -- read from a partial policy; the other could not be read: {policy_errors[0]}"
+                details.append(detail)
+            else:
+                node_pull_checked = True
 
     # The summary must not assert the item the warning above retracts. A line
     # reading "...and node pull rights" over a warning saying they could not be
     # checked is the same false assurance the exit-2 code exists to prevent, and
     # it would be worst on exactly the run where the operator most needs to read
     # the warning.
+    partial = _partial_summary(
+        [
+            ("the repository and its cleanup policy", repo_checked),
+            ("push rights", push_checked),
+            ("node pull rights", node_pull_checked),
+        ]
+    )
     if not passed:
         message = "Artifact Registry not ready"
-    elif node_pull_checked:
-        message = f"kube-agents ({location}) present with a cleanup policy, push rights, and node pull rights"
+    elif partial:
+        message = partial
     else:
-        message = f"kube-agents ({location}) present with a cleanup policy and push rights; node pull rights not checked"
+        message = f"kube-agents ({location}) present with a cleanup policy, push rights, and node pull rights"
 
     return CheckResult(
         "Artifact Registry Repository",
@@ -629,8 +906,12 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     that created the clusters and died before the Kubernetes provider ran
     satisfies every assertion here.
     """
+    name = "GKE Clusters & Terraform State"
     details = []
+    warnings: List[str] = []
     passed = True
+    clusters_checked = False
+    bucket_checked = False
 
     # name and encryption state in one listing: a separate describe would need
     # the cluster's location, which this call is what would have told us.
@@ -640,44 +921,71 @@ def check_gke_and_state(project_id: str) -> CheckResult:
         "--format=value(name,databaseEncryption.state)",
     ])
     if rc != 0:
-        return CheckResult("GKE Clusters & Seeded Fleet", False, f"Failed listing clusters: {err.strip()}")
+        if not _record_unreadable(
+            err,
+            f"Failed listing clusters: {err.strip()}",
+            f"Could not list the clusters in {project_id}, so neither the four expected clusters nor "
+            f"{HOST_CLUSTER}'s CMEK state was checked",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        clusters_checked = True
 
     encryption_by_cluster = {}
-    for line in out.splitlines():
-        if not line.strip():
-            continue
-        fields = line.split()
-        encryption_by_cluster[fields[0]] = fields[1] if len(fields) > 1 else ""
+    if clusters_checked:
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split()
+            encryption_by_cluster[fields[0]] = fields[1] if len(fields) > 1 else ""
 
-    missing_clusters = EXPECTED_CLUSTERS - set(encryption_by_cluster)
-    if missing_clusters:
-        passed = False
-        details.append(f"Missing GKE cluster(s): {', '.join(sorted(missing_clusters))}")
-
-    if HOST_CLUSTER in encryption_by_cluster:
-        state = encryption_by_cluster[HOST_CLUSTER]
-        if state not in VALID_CMEK_STATES:
+        missing_clusters = EXPECTED_CLUSTERS - set(encryption_by_cluster)
+        if missing_clusters:
             passed = False
-            details.append(
-                f"{HOST_CLUSTER} databaseEncryption.state is '{state or 'unset'}', not one of "
-                f"{', '.join(sorted(VALID_CMEK_STATES))}; full-install creates the host cluster "
-                "encrypted, so this is drift"
-            )
+            details.append(f"Missing GKE cluster(s): {', '.join(sorted(missing_clusters))}")
 
+        if HOST_CLUSTER in encryption_by_cluster:
+            state = encryption_by_cluster[HOST_CLUSTER]
+            if state not in VALID_CMEK_STATES:
+                passed = False
+                details.append(
+                    f"{HOST_CLUSTER} databaseEncryption.state is '{state or 'unset'}', not one of "
+                    f"{', '.join(sorted(VALID_CMEK_STATES))}; full-install creates the host cluster "
+                    "encrypted, so this is drift"
+                )
+
+    # `buckets describe` needs storage.buckets.get, which `storage ls` does not,
+    # so this is the call most likely to be refused for a caller who can see the
+    # bucket's contents perfectly well.
     state_bucket = f"gs://{project_id}-tf-state"
     rc, out, err = run_cmd(["gcloud", "storage", "buckets", "describe", state_bucket])
     if rc != 0:
-        passed = False
-        details.append(f"Missing Terraform state bucket: {state_bucket}")
+        if not _record_unreadable(
+            err,
+            f"Missing Terraform state bucket: {state_bucket}",
+            f"Could not read {state_bucket}, so the Terraform state bucket was not checked",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        bucket_checked = True
 
-    return CheckResult(
-        "GKE Clusters & Terraform State",
-        passed,
-        f"All 4 clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
-        if passed
-        else "GKE/state resources missing",
-        details=details,
-    )
+    if not passed:
+        message = "GKE/state resources missing"
+    elif clusters_checked and bucket_checked:
+        message = f"All 4 clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
+    else:
+        verified = []
+        unchecked = []
+        (verified if clusters_checked else unchecked).append("clusters and CMEK")
+        (verified if bucket_checked else unchecked).append("state bucket")
+        prefix = f"{'; '.join(verified)} present; " if verified else ""
+        message = f"{prefix}{'; '.join(unchecked)} not checked"
+
+    return CheckResult(name, passed, message, details=details, warnings=warnings)
 
 
 def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
@@ -744,6 +1052,17 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
+            reason = _denial_reason(err)
+            if reason:
+                return CheckResult(
+                    name,
+                    True,
+                    "Not checked",
+                    warnings=[
+                        f"hack/fleet-kubeconfigs.sh exited {rc} because it was refused, so nothing is "
+                        f"known about the fixtures in {project_id}: {reason}"
+                    ],
+                )
             return CheckResult(
                 name,
                 False,
@@ -769,17 +1088,65 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
     if written == expected and not unresolved and not unplanted:
         return CheckResult(name, True, f"All {expected} fixture roles planted and reachable")
 
-    details = [
+    counts = (
         f"{written}/{expected} role(s) written, {unresolved} on clusters that could not be "
         f"resolved or reached, {unplanted} whose fixtures were not present"
-    ]
+    )
     # The counts say how many; only the warnings say which. Both go in, because
     # "re-apply the stack" is the wrong advice for a cluster that is there and
     # unreachable, and the script's own wording is what distinguishes them.
-    details.extend(
-        line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))
+    notes = [line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))]
+
+    # The script's own two categories are already the distinction this check
+    # needs. A role counted unresolved sits on a cluster this run could not
+    # reach, and nothing was learned about it; a role counted unplanted sits on
+    # a cluster that answered and did not hold the fixture. Only the second is
+    # evidence about the project. A credential without container.clusters.get
+    # fails every resolve and lands here as 0/7 written -- which, read as a
+    # finding, accuses a healthy fleet of being absent.
+    #
+    # "Unresolved" alone is not enough to conclude that, though, because a
+    # cluster that is genuinely absent also fails to resolve. The two are
+    # separable only in the fleet script's own wording, and _FLEET_LOOKED_AND_
+    # FOUND_WRONG is the half that means it read the cluster list and what came
+    # back was not what the catalog describes. Relying instead on
+    # check_gke_and_state to fail the absent case does not work: that check
+    # matches EXPECTED_CLUSTERS by name, while hack/fleet-kubeconfigs.sh
+    # discovers by the environment/managed-by labels and then by slot suffix,
+    # so a cluster that kept its name and lost its label passes there and is
+    # unresolved here.
+    # ...and the one string that undoes that reading is checked first. A refused
+    # `clusters list` reaches here as an empty listing plus its own warning, and
+    # the "no clusters labelled" line follows from the empty listing rather than
+    # from anything the script saw. Where the script says it could not look, no
+    # note it printed afterwards is evidence about the fleet.
+    could_not_look = any(_FLEET_COULD_NOT_LOOK.search(n) for n in notes)
+    looked_and_found_wrong = (
+        []
+        if could_not_look
+        else [n for n in notes if _FLEET_LOOKED_AND_FOUND_WRONG.search(n)]
     )
-    return CheckResult(name, False, "Seeded fleet incomplete", details=details)
+    if unresolved and not unplanted and not looked_and_found_wrong:
+        return CheckResult(
+            name,
+            True,
+            f"{unresolved} of {expected} fixture role(s) not checked",
+            # One warning, not one per note. report() counts warnings to fill in
+            # "N item(s) could not be checked", and three unreachable clusters
+            # are evidence for a single item -- this project's seeded fleet --
+            # rather than three separate things to go and confirm.
+            warnings=[
+                "\n      ".join(
+                    [
+                        f"{counts}. Nothing was found missing: the clusters carrying those roles could "
+                        f"not be reached, so their fixtures were never checked. Confirm the seeded "
+                        f"fleet in {project_id} before registering it.",
+                        *notes,
+                    ]
+                )
+            ],
+        )
+    return CheckResult(name, False, "Seeded fleet incomplete", details=[counts, *notes])
 
 
 def check_github_repo_and_app(
@@ -797,6 +1164,11 @@ def check_github_repo_and_app(
     attested = False
     repo_slug = f"gke-agentic/{project_id}-infra"
 
+    # Deliberately not routed through _record_unreadable. GitHub answers 404 for
+    # a repository that does not exist and 404 for one the token cannot see, so
+    # treating the second as unverified would make this check unable to report
+    # the first -- and a GitOps repository that was never created is exactly the
+    # onboarding gap it exists to catch. The message names both readings instead.
     rc, out, err = run_cmd(["gh", "repo", "view", repo_slug, "--json", "isPrivate,name"])
     if rc != 0:
         passed = False
@@ -814,7 +1186,20 @@ def check_github_repo_and_app(
         "gh", "api", "/orgs/gke-agentic/installations",
         "--jq", f".installations[] | select(.app_id=={app_id}) | {{id, repository_selection}}",
     ])
-    if rc != 0 or not out.strip():
+    # An org with no installations answers 200 with an empty list, so rc == 0
+    # and no output really is "the App is not installed" and stays a failure.
+    # A non-zero exit is something else: GET /orgs/{org}/installations needs the
+    # `admin:org` scope and answers 404 -- not 403 -- to a token without it, so
+    # the failure this call site cannot distinguish is a scope gap, and calling
+    # it an uninstalled App names a correctly configured org as the defect.
+    if rc != 0 and (_denial_reason(err) or _GITHUB_NOT_FOUND.search(err or "")):
+        warnings.append(
+            f"Could not list org gke-agentic's App installations with this token, so App {app_id}'s "
+            "installation was not checked. That endpoint needs the `admin:org` scope and answers 404 "
+            "without it. Re-run with a token carrying that scope, or confirm the installation at "
+            "https://github.com/organizations/gke-agentic/settings/installations"
+        )
+    elif rc != 0 or not out.strip():
         passed = False
         details.append(f"GitHub App {app_id} installation not found on org gke-agentic")
     else:
@@ -1041,6 +1426,10 @@ def check_token_minter(
     enabled_versions: List[str] = []
     version_states: dict = {}
     algorithm_ok = False
+    versions_checked = False
+    key_checked = False
+    signer_checked = False
+    gsa_checked = False
 
     # Which version matters is the chart's business, not KMS's. The pool
     # deploys through helm: charts/kube-agents/templates/github-minter.yaml
@@ -1061,9 +1450,17 @@ def check_token_minter(
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Cloud KMS key {key} in keyring {keyring} ({location}) not found or error: {err.strip()}")
+        if not _record_unreadable(
+            err,
+            f"Cloud KMS key {key} in keyring {keyring} ({location}) not found or error: {err.strip()}",
+            f"Could not list the versions of KMS key {key} in keyring {keyring} ({location}), so whether "
+            "the App PEM has been imported was not checked",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        versions_checked = True
         try:
             versions = _load_json(out)
             # The key existing only proves Terraform ran; the composition creates
@@ -1102,9 +1499,17 @@ def check_token_minter(
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Failed reading KMS key {key}: {err.strip()[:160]}")
+        if not _record_unreadable(
+            err,
+            f"Failed reading KMS key {key}: {err.strip()[:160]}",
+            f"Could not describe KMS key {key}, so its purpose, algorithm and import-only setting were "
+            "not checked",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        key_checked = True
         try:
             key_desc = _load_json(out)
             purpose = key_desc.get("purpose")
@@ -1142,9 +1547,17 @@ def check_token_minter(
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Failed reading IAM policy for KMS key {key}: {err.strip()[:160]}")
+        if not _record_unreadable(
+            err,
+            f"Failed reading IAM policy for KMS key {key}: {err.strip()[:160]}",
+            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's signing rights were "
+            "not checked",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        signer_checked = True
         try:
             signers = set()
             for b in _load_json(out).get("bindings", []):
@@ -1167,9 +1580,17 @@ def check_token_minter(
         "--format=json",
     ])
     if rc != 0:
-        passed = False
-        details.append(f"Missing Minter GSA or failed reading policy for {minter_gsa}")
+        if not _record_unreadable(
+            err,
+            f"Missing Minter GSA or failed reading policy for {minter_gsa}",
+            f"Could not read the IAM policy on {minter_gsa}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
     else:
+        gsa_checked = True
         try:
             expected_member = f"serviceAccount:{project_id}.svc.id.goog[{MINTER_KSA}]"
             bound = any(
@@ -1231,13 +1652,25 @@ def check_token_minter(
         else:
             probe = f", {message}"
 
-    signing_version = f" v{probe_version}" if probe_version else ""
-    message = (
-        "Token minter not provisioned / PEM key missing or wrong"
-        if not passed
-        else f"Import-only signing key{signing_version} (the version the chart deploys) ENABLED, "
-        f"minter GSA can sign and be impersonated{probe}"
+    # The summary must not assert an item a warning above retracts.
+    partial = _partial_summary(
+        [
+            ("the imported key versions", versions_checked),
+            ("the key's purpose, algorithm and import-only setting", key_checked),
+            ("the minter GSA's signing rights", signer_checked),
+            ("the minter GSA's Workload Identity binding", gsa_checked),
+        ]
     )
+    signing_version = f" v{probe_version}" if probe_version else ""
+    if not passed:
+        message = "Token minter not provisioned / PEM key missing or wrong"
+    elif partial:
+        message = partial
+    else:
+        message = (
+            f"Import-only signing key{signing_version} (the version the chart deploys) ENABLED, "
+            f"minter GSA can sign and be impersonated{probe}"
+        )
 
     return CheckResult(
         "Token Minter KMS & GSA",
@@ -1263,6 +1696,17 @@ def run_checks(
     if project_number:
         checks.append(check_iam_and_service_accounts(project_id, project_number))
         checks.append(check_artifact_registry(project_id, project_number, location))
+    elif proj_check.passed:
+        # The project number is missing because reading the project was refused,
+        # not because the project is wrong. Failing the two checks that need it
+        # would put the conflation straight back, one level up.
+        for skipped in ("Service Accounts & IAM Grants", "Artifact Registry Repository"):
+            checks.append(CheckResult(
+                skipped,
+                True,
+                "Not checked",
+                warnings=[f"Not checked: {project_id}'s project number could not be read"],
+            ))
     else:
         checks.append(CheckResult("Service Accounts & IAM Grants", False, "Skipped: could not determine project number"))
         checks.append(CheckResult("Artifact Registry Repository", False, "Skipped: could not determine project number"))
@@ -1323,10 +1767,17 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
 def check_toolchain() -> List[str]:
     """Reasons the checks below cannot be trusted, before any of them run.
 
-    Every check reads a non-zero gcloud/gh exit as "the resource is absent", so a
-    missing binary or an expired credential produces a confident, specific and
-    wrong "not provisioned" for a project that is fine. Catch it here and exit 2
-    -- unverified -- rather than 1.
+    A missing binary or no credential at all would leave every check reporting
+    its resource as unreadable, which is exit 2 and a screenful of warnings
+    naming resources when the real answer is one line about the toolchain. Catch
+    those here and say that instead.
+
+    Two cases get past this and are caught per-check by _record_unreadable(),
+    which files them the same way for the same reason. A credential that is
+    present and holds no IAM on the project being verified is invisible here by
+    definition. So is one that has expired: `gcloud auth list` reads the local
+    credential store without contacting the network, so a revoked refresh token
+    still prints as ACTIVE and only the calls that follow fail.
     """
     blockers = []
     # An empty active-account list is exit 0 with no output, not an error, so the
