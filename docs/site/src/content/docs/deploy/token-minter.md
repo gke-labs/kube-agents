@@ -50,7 +50,7 @@ A personal-account App is created as "Only on this account", which cannot instal
 
 - **No raw key material on disk.** KMS holds the key; Minty never sees it.
 - **Auditable.** Every sign operation logs to Cloud Audit Logs.
-- **Rotatable without redeploy.** Import a new key version to KMS; Minty picks it up.
+- **Rotatable without touching the cluster's key material.** Import a new key version to KMS; nothing on the node ever held the old one. Rotation is not free of a redeploy, though — the Deployment names one `cryptoKeyVersions/<n>`, not the key, so a new version also needs `githubMinter.kms.keyVersion` bumped and the chart re-applied.
 
 The Minty CLI handles the KMS import — it deals with PKCS#1 to PKCS#8 conversion, provisions the KMS Import Job, and does RSA-OAEP wrapping automatically. The installer shallow-clones the Minty repo at `v2.7.1` and runs `go run ./cmd/minty tools import-pk` from the tree (requires `git` and `go` on the install host; the `go run <module>@v2.7.1` form does not resolve because upstream's go.mod lacks the `/v2` suffix its v2 tags require). The import is deliberately not a Terraform resource, so the PEM never enters Terraform state.
 
