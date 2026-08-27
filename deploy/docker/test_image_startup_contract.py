@@ -540,8 +540,19 @@ class SkillProvenanceContractTest(unittest.TestCase):
         # rewrite reports whatever it is told to; the third is the config template
         # entrypoint step 2d back-fills absent keys into the live default profile
         # from, on every boot, so a key added to the image copy installs itself.
-        chowned = re.search(r"chown -R root:root ([^;]*)", self.generation_block())
-        self.assertIsNotNone(chowned, "the manifest RUN no longer chowns anything to root")
+        #
+        # The barrier is allowed to be applied in more than one RUN of the stage:
+        # the base plugin tree is chowned in the stage's FIRST RUN so its ~130MB
+        # copy-up layer caches across template edits, with the repo's staged
+        # plugins arriving root-owned through the final RUN's cp -a. What this
+        # test holds is that every root is behind SOME root chown in the stage,
+        # not where that chown sits.
+        code = "\n".join(
+            line for line in self.stage.splitlines() if not line.lstrip().startswith("#")
+        )
+        chowns = re.findall(r"chown -R root:root ([^;\n]*)", code)
+        self.assertTrue(chowns, "the platform stage no longer chowns anything to root")
+        covered = " ".join(chowns)
         for root in (
             "/opt/hermes/skills",
             "/opt/hermes/plugins",
@@ -551,7 +562,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
             "/opt/defaults/scripts",
         ):
             with self.subTest(root=root):
-                self.assertRegex(chowned.group(1), rf"{re.escape(root)}(\s|$)")
+                self.assertRegex(covered, rf"{re.escape(root)}(\s|$)")
 
     def test_the_barrier_reaches_the_sidecars_copy_of_the_shared_scripts(self):
         # /opt/defaults/scripts exists twice. The platform stage's copy is
