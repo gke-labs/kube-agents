@@ -10,6 +10,7 @@ from cuj.utils.interaction import (
     completed_evidence,
     projected_records,
     projected_tasks,
+    substantive_output,
     tool_operations,
     unnormalized_tool_calls,
 )
@@ -465,7 +466,9 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         any(key.startswith(model) for key in populated_models)
         for model in ("spot", "flex")
     )
-    answer = str(interaction.get("output") or "")
+    # Score the reply that follows the delegation acknowledgment; the
+    # hand-off boilerplate is not an answer.
+    answer = substantive_output(interaction)
     # Word-bounded so prose like "inflexible" or "spotted" cannot satisfy a
     # provisioning path; "flex" still matches Flex, Flex-Start, and
     # flex-start spellings.
@@ -546,7 +549,7 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
     final_output_available = "output" in interaction
-    result_text = str(interaction.get("output") or "")
+    result_text = substantive_output(interaction)
     claims_met, claims_observed = capacity_claims(result_text)
     unnormalized_calls = unnormalized_tool_calls(interaction)
     suite = MilestoneSuite(MILESTONES)
