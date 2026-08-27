@@ -1125,19 +1125,43 @@ class IamGrantsTest(unittest.TestCase):
 
 
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
-    """PLATFORM_GSA_ROLES must equal the module default it duplicates.
+    """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
 
     Hardcoding the eight roles is what lets this check run without a Terraform
     toolchain, and it is also how the two drift apart. Without this test,
-    narrowing the module would leave every correctly-provisioned project failing
-    verification weeks later, with nothing pointing at the module as the cause.
+    narrowing the granted set would leave every correctly-provisioned project
+    failing verification weeks later, with nothing pointing at Terraform as the
+    cause.
+
+    The set is written in three places, and only one of them is applied. Pool
+    projects are installed through terraform/examples/full-install, whose
+    `local.agent_project_roles` passes `local.read_only_roles` into the module
+    (main.tf) -- so the module's own `project_roles` default is never read on
+    that path and pinning it alone would leave this test green through exactly
+    the drift it exists to catch. Both are asserted below: the composition
+    because it is what runs, the module default because it is live for a caller
+    invoking the module directly and nothing else joins the two.
     """
 
-    def test_matches_variables_tf_default(self):
+    def _roles(self, text, pattern, what):
+        block = re.search(pattern, text, re.S | re.M)
+        self.assertIsNotNone(block, f"could not find {what}")
+        return set(re.findall(r'"(roles/[^"]+)"', block.group(1)))
+
+    def test_matches_the_composition_the_install_applies(self):
+        main = (checker._ROOT / "terraform" / "examples" / "full-install" / "main.tf").read_text()
+        applied = self._roles(
+            main, r"^[ \t]*read_only_roles[ \t]*=[ \t]*\[(.*?)\]", "local.read_only_roles in full-install/main.tf"
+        )
+        self.assertEqual(applied, checker.PLATFORM_GSA_ROLES)
+
+    def test_the_module_default_matches_the_composition(self):
         tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()
-        block = re.search(r'variable\s+"project_roles".*?default\s*=\s*\[(.*?)\]', tf, re.S)
-        self.assertIsNotNone(block, "could not find the project_roles default in variables.tf")
-        declared = set(re.findall(r'"(roles/[^"]+)"', block.group(1)))
+        declared = self._roles(
+            tf,
+            r'variable\s+"project_roles".*?default\s*=\s*\[(.*?)\]',
+            "the project_roles default in variables.tf",
+        )
         self.assertEqual(declared, checker.PLATFORM_GSA_ROLES)
 
 

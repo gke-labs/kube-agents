@@ -29,12 +29,11 @@
 # activation blocker A3 has the command and a dated worked example.
 # Turning it on early produces a red presubmit that is the SOP behaving
 # correctly.
-# One unsettled detail: the
-# 3.7 command (`gcloud container node-pools list`) returns no creation field,
-# so pool age is whatever the agent infers -- if it reads node age, the
-# rolling node recreation from a GKE_METADATA or machine-type change resets
-# the 7-day gate even though the pool object is untouched. See DRAFTS.md,
-# activation blocker A3.
+# One unsettled detail: the 3.7 command (`gcloud container node-pools list`)
+# returns no creation field, so pool age is whatever the agent infers -- if it
+# reads node age, the rolling node recreation from a GKE_METADATA or
+# machine-type change resets the 7-day gate even though the pool object is
+# untouched. See DRAFTS.md, activation blocker A3.
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped

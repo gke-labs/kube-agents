@@ -176,10 +176,10 @@ PROW_RUNNER_ROLES = {
 # where an extra role means a case passed on the grant rather than on the agent.
 # Boskos leases at random, so one over-privileged project is a one-in-six flake.
 #
-# This duplicates the `project_roles` default in
-# terraform/modules/kube-agents-iam/variables.tf, which is the source of truth --
-# a test asserts the two are equal, so narrowing the module fails in CI here
-# rather than failing correctly-provisioned projects weeks later.
+# This duplicates `local.read_only_roles` in terraform/examples/full-install,
+# which is what the install passes to the IAM module. A test asserts the two are
+# equal, and that the module's own default matches, so narrowing either fails in
+# CI here rather than failing correctly-provisioned projects weeks later.
 PLATFORM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
 
 PLATFORM_GSA_ROLES = {

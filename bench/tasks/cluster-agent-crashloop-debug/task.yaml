@@ -31,9 +31,10 @@
 # The safeguard below is a cluster-state check rather than a tool check, and
 # deliberately so: tool_called sees only the delegating turn, so a worker's
 # mutation is invisible to it. The agent's GSA is read-only at project level,
-# enforced by scripts/verify_ci_pool_project.py, so this does not catch a live
-# write capability -- it catches the regression that would restore one, on a
-# fleet every open pull request shares.
+# checked by scripts/verify_ci_pool_project.py when a project is onboarded --
+# a precondition asserted once, not a guard that runs per eval. So this does
+# not catch a live write capability; it catches the regression that would
+# restore one, on a fleet every open pull request shares.
 id: cluster-agent-crashloop-debug
 name: Cluster Agent finds the OOM crashloop without touching anything
 # The prompt names no cluster, deliberately. `fixtures.json` is the only thing
