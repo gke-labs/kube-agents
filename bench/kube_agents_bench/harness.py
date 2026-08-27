@@ -79,8 +79,10 @@ _log = logging.getLogger("kube_agents_bench.harness")
 
 SERVICE_API_PORT = 8642
 
-# Prefix on ``AgentResult.errors[0]`` that marks a run as never having reached
-# the agent at all. ``hack/ci-eval-pr.sh`` matches this string in results.json
+# Prefix on ``AgentResult.errors[0]`` that marks a run whose transport died on
+# every attempt: the opening turn never reached the agent, or the delegation
+# wait lost the endpoint on every status-turn retry with cards still
+# outstanding. ``hack/ci-eval-pr.sh`` matches this string in results.json
 # and classifies the task ``RUN_CLASS=INFRA``, so it lands in
 # ``INFRA_FAILED_TASKS`` instead of failing the pull request. The literal is the
 # contract between the two files: change it in both or in neither.
@@ -702,7 +704,7 @@ def _post_turn(
 
 
 def _infra_failure(detail: str) -> AgentResult:
-    """A run that never reached the agent, recorded as infrastructure.
+    """A run whose transport died under it, recorded as infrastructure.
 
     ``output`` is deliberately left empty. ``AgentResult.errored`` copies its
     message into ``output``, which the eval harness writes to results.json as
@@ -719,6 +721,19 @@ def _infra_failure(detail: str) -> AgentResult:
         errors=[f"{INFRA_FAILURE_MARKER}: {detail}"],
         metadata={"infra_failure": detail},
     )
+
+
+class _DelegationTransportExhausted(Exception):
+    """The delegation wait lost its transport on every status-turn retry.
+
+    Raised out of ``_await_delegated_work`` instead of appending to
+    ``result.errors``: an appended error still reaches the judge with the
+    delegation receipt graded as the answer (build 2093030474753511424:
+    ``rca-remediation-pr`` scored 0.0 for a pod restart while its worker filed
+    the real remediation PR). ``_execute`` catches this and replaces the graded
+    result wholesale with :func:`_infra_failure`, the same run class the
+    opening turn returns on exhaustion. Carries the marker detail as ``str``.
+    """
 
 
 class KubeAgentsHarness(AgentHarness):
@@ -797,11 +812,12 @@ class KubeAgentsHarness(AgentHarness):
         }
 
         # Same shape as the status-turn retry in _await_delegated_work: count
-        # the transport failures, log each one against the ceiling, and give up
-        # at _MAX_TRANSPORT_FAILURES. What differs is the escape between
-        # attempts -- there is no poll interval to back off over here, and the
-        # 502 this exists for is a live proxy over a dead upstream, so the
-        # tunnel is torn down and respawned rather than merely probed.
+        # the transport failures, log each one against the ceiling, respawn the
+        # tunnel between attempts, and give up at _MAX_TRANSPORT_FAILURES. What
+        # differs is only the pacing -- there is no poll interval to back off
+        # over here. The 502 both loops exist for is a live proxy over a dead
+        # upstream, so the tunnel is torn down and respawned, never merely
+        # probed.
         transport_failures = 0
         while True:
             try:
@@ -836,18 +852,25 @@ class KubeAgentsHarness(AgentHarness):
                     _log.warning("port-forward respawn failed before retry: %s", pf_exc)
 
         if delegation_timeout > 0:
-            session_id = (
-                self._await_delegated_work(
-                    result,
-                    url=url,
-                    body=body,
-                    headers=headers,
-                    timeout=timeout,
-                    delegation_timeout=delegation_timeout,
-                    poll_interval=poll_interval,
+            try:
+                session_id = (
+                    self._await_delegated_work(
+                        result,
+                        url=url,
+                        body=body,
+                        headers=headers,
+                        timeout=timeout,
+                        delegation_timeout=delegation_timeout,
+                        poll_interval=poll_interval,
+                        local_port=local_port,
+                    )
+                    or session_id
                 )
-                or session_id
-            )
+            except _DelegationTransportExhausted as exc:
+                # Not AgentResult.errored, and not the delegating turn's
+                # partial result either: see _infra_failure. The wait died in
+                # transport, so this is the run class, not an answer.
+                return _infra_failure(str(exc))
 
         # One lookup, after the last turn: the session row is cumulative over
         # the conversation, so it supersedes the summed envelopes outright.
@@ -872,6 +895,7 @@ class KubeAgentsHarness(AgentHarness):
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
+        local_port: int,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -885,12 +909,17 @@ class KubeAgentsHarness(AgentHarness):
         context. Cards filed *during* a status turn join the wait.
 
         A turn that fails in transport is retried up to
-        :data:`_MAX_TRANSPORT_FAILURES` times running, and one reporting no
+        :data:`_MAX_TRANSPORT_FAILURES` times running -- through a fresh
+        tunnel each time, like the opening turn -- and one reporting no
         outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS`.
 
         Returns:
             The session id from the last status turn, or ``""`` when no status
             turn ran or the header was absent.
+
+        Raises:
+            _DelegationTransportExhausted: Every retry died without an HTTP
+                answer; the run is infrastructure, not a gradable result.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -952,10 +981,39 @@ class KubeAgentsHarness(AgentHarness):
                 if transport_failures < _MAX_TRANSPORT_FAILURES:
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
+                    # A retryable failure means the endpoint never answered,
+                    # and the tunnel is the prime suspect (build
+                    # 2092638061140643840: three 502s over a live listener
+                    # whose upstream pod had been replaced), so it is torn
+                    # down and respawned first, exactly like the opening turn.
+                    if exc.retryable:
+                        try:
+                            _reset_port_forward(local_port)
+                        except RuntimeError as pf_exc:
+                            # Counted, not raised: a forward that will not
+                            # come back is the same outage, and the ceiling
+                            # ends it.
+                            _log.warning(
+                                "port-forward respawn failed before retry: %s", pf_exc
+                            )
                     continue
-                # Recorded, not just logged: abandoning the wait silently
-                # leaves the run validating with the delegation receipt graded
-                # as the answer, the exact failure this wait exists to prevent.
+                if exc.retryable:
+                    # Classified, not graded: appending here used to leave the
+                    # run validating with the delegation receipt graded as the
+                    # answer -- the exact failure this wait exists to prevent.
+                    # The cards' on-disk state still has to go (nothing is
+                    # settled into a record that is about to be replaced, but
+                    # a rerun must not find this attempt's leavings), then the
+                    # run becomes infrastructure, mirroring the opening turn.
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"status turns failed in transport {transport_failures} times "
+                        "running; still waiting on: " + ", ".join(outstanding)
+                    ) from exc
+                # The endpoint answered every time (a 4xx, a 500, non-JSON):
+                # that is the agent's own failure, so it stays in front of the
+                # judge as before -- recorded, not just logged, which is what
+                # stops devops-bench promoting the partial record.
                 result.errors.append(
                     f"status turns failed in transport {transport_failures} times running; "
                     "still waiting on: " + ", ".join(outstanding)

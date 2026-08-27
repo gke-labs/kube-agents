@@ -767,8 +767,10 @@ for TASK in "${TASKS[@]}"; do
   #   OK     -- a record with scores; the gate below decides.
   #
   # KUBE_AGENTS_INFRA_FAILURE is the marker kube_agents_bench.harness puts on
-  # errors[0] when the agent endpoint failed in transport on every attempt, so
-  # no turn ever reached the agent. The record IS scored -- the judge grades
+  # errors[0] when the agent endpoint failed in transport on every attempt --
+  # on the opening turn, so no turn ever reached the agent, or on every
+  # delegation status turn, so the delegated work's results were unreachable
+  # with cards still outstanding. The record IS scored -- the judge grades
   # the empty output and returns 0.0 -- but there is no answer in it to grade,
   # and gating on that score reds the PR for a pod restart. The harness raises
   # this only after exhausting its retries on a gateway status or a dropped

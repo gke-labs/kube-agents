@@ -1617,6 +1617,9 @@ def test_delegation_budget_exhaustion_is_an_error_not_a_crash(
     assert result.has_errors()
     assert _TASK_ID in result.errors[0]
     assert "running" in result.errors[0]
+    # A wait that timed out against a LIVE endpoint is agent slowness, not
+    # transport: it grades, and must never borrow the INFRA class.
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # Partial, not empty: whatever the agent did say is still recorded.
     assert result.trajectory
 
@@ -1872,26 +1875,148 @@ def test_a_transient_transport_failure_is_retried_not_abandoned(
     assert result.output.endswith(_RCA_RESULT)
 
 
-def test_repeated_transport_failures_end_the_wait_and_record_it(
-    stub_agent: _StubAgentServer, instant_polls: None
-) -> None:
-    """A genuinely dead endpoint stops the wait, but never silently.
+# --- the delegation wait's transport retry ------------------------------------
+#
+# Builds 2092638061140643840 and 2093030474753511424: the same pod-restart
+# outage hit both transport paths, side by side in the second build. The
+# opening turn (fixed above, #959) retried through a fresh tunnel and ended
+# INFRA in 41s; the delegation wait retried through the same dead tunnel and
+# then graded the delegation receipt -- rca-remediation-pr scored 0.0 while
+# its worker filed the real remediation PR mid-outage.
 
-    The first turn is kept, since discarding it would throw away work the agent
-    really did. The recorded error is what stops devops-bench promoting the
-    receipt as a validated deliverable.
+
+def test_a_status_turn_gateway_storm_is_infrastructure_not_an_answer(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+) -> None:
+    """A 502 on every status retry gives up, and gives up as a run class.
+
+    Appending-and-grading here is what put the delegation receipt in front of
+    the judge on 2092638061140643840 while the worker's real findings sat in
+    the ledger. The record is replaced wholesale: empty output, marker on
+    ``errors[0]``, and the cards' on-disk state still purged so a rerun cannot
+    read this attempt's leavings.
     """
     stub_agent.turns = [_create_turn(), _show_turn("done")]
-    stub_agent.fail_after = 1
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert _TASK_ID in result.errors[0]
+    assert "failed in transport" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
+    # The tunnel was replaced between each pair of attempts, none after the
+    # last -- the same cadence as the opening turn.
+    port = stub_agent.server_address[1]
+    assert recorded_pf_resets == [port] * (harness._MAX_TRANSPORT_FAILURES - 1)
+    # The filed card's state is still cleared, even though nothing is graded.
+    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert len(purges) == 1
+    assert _TASK_ID in purges[0]
+
+
+def test_a_status_turn_502_recovers_through_a_fresh_tunnel(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """One gateway error mid-wait costs a reset and a retry, not the result.
+
+    The retry has to go through a NEW tunnel: ``kubectl port-forward`` keeps
+    accepting on 127.0.0.1 after the pod behind it is replaced, so re-asking
+    through the old one spins to the ceiling against a dead upstream.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done", body=_RCA_RESULT)]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert result.output.endswith(_RCA_RESULT)
+    assert recorded_pf_resets == [stub_agent.server_address[1]]
+
+
+def test_a_status_turn_connection_drop_is_retried_the_same_way(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """The socket dying in flight takes the OSError arm to the same retry.
+
+    2093030474753511424's outage opened as ``RemoteDisconnected`` before the
+    proxy started rendering 502s, so both arms of ``retryable`` have to reach
+    the reset.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done", body=_RCA_RESULT)]
+    stub_agent.drop_on = frozenset({2})
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert result.output.endswith(_RCA_RESULT)
+    assert recorded_pf_resets == [stub_agent.server_address[1]]
+
+
+def test_a_failed_respawn_mid_wait_is_absorbed_and_the_run_still_ends_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunnel that will not come back is the same outage, not a crash.
+
+    If ``_reset_port_forward``'s RuntimeError escaped the wait, the harness
+    would die un-graded instead of recording the INFRA class -- the delegation
+    twin of the opening turn's absorbed-respawn contract.
+    """
+    respawn_attempts: list[int] = []
+
+    def _failing_reset(port: int) -> None:
+        respawn_attempts.append(port)
+        raise RuntimeError("port-forward did not become ready")
+
+    monkeypatch.setattr(harness, "_reset_port_forward", _failing_reset)
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+    # The failed respawns did not shortcut the ceiling: every attempt ran.
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
+    assert len(respawn_attempts) == harness._MAX_TRANSPORT_FAILURES - 1
+
+
+def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
+    stub_agent: _StubAgentServer, instant_polls: None, recorded_pf_resets: list[int]
+) -> None:
+    """A 500 storm is the endpoint answering, so it keeps the old behaviour.
+
+    The INFRA class is only for retries that never got an HTTP answer. An
+    endpoint that keeps answering badly is the agent's own failure: the wait
+    still ends, the error is recorded (which stops devops-bench promoting the
+    receipt as a validated deliverable), the first turn's work survives, and
+    the healthy tunnel is left alone.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 500
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert result.has_errors()
     assert "failed in transport" in result.errors[0]
     assert _TASK_ID in result.errors[0]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # The delegation turn survived.
     assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
     assert result.output == f"I've started this as task {_TASK_ID}."
+    # An endpoint that answers is not a tunnel problem: no reset.
+    assert recorded_pf_resets == []
 
 
 # --- cumulative (replayed) payloads ------------------------------------------
