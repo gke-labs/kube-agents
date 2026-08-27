@@ -53,6 +53,12 @@ ARG ENVOY_VERSION=v1.39.1
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
+# Declared here as well as in the `platform` stage that consumes it, so the
+# credential-proxy build -- which shares deploy/docker/cloudbuild.yaml and is
+# therefore handed the same --build-arg -- does not warn about an argument no
+# stage declares. The value and what it is for are documented where the ENV is
+# set, at the end of the `platform` stage.
+ARG KUBE_AGENTS_VERSION=dev
 FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 
 # Every binary in the final image must match the architecture the image ships
@@ -1541,6 +1547,24 @@ RUN set -eu; \
     chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
 
 USER 10000:10000
+
+# The build this image came from, for the `User-Agent` that remote MCP calls
+# carry. Hermes resolves `${KUBE_AGENTS_VERSION}` in an `mcp_servers` entry's
+# `args` from the agent process environment, so the value has to be on the
+# container rather than only in the config -- see the `--header` argument on the
+# mcp-remote entries in deploy/shared/defaults/config.yaml.
+#
+# Last instruction in the stage, not beside the ARGs at the top: the value
+# changes on every commit, and an ENV that early would invalidate the whole
+# `platform` chain's cache on every build. ENV writes no filesystem diff, so it
+# costs nothing against the layer budget.
+#
+# `dev` is the default (declared with the other build args above) because an
+# unset build arg must still produce a well-formed header. The publish workflows
+# pass the commit SHA the image is tagged with, so a User-Agent on the wire
+# names the exact image.
+ARG KUBE_AGENTS_VERSION
+ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
 
 # --- CREDENTIAL PROXY TOOLING ---
 # Everything the sidecar needs that is not agent source: the credential-aware
