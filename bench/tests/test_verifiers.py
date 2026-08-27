@@ -144,6 +144,87 @@ def test_empty_stash_is_error_not_fail():
     assert "no transcript" in res.reason
 
 
+# ------------------------------------------- report_contains: normalization
+
+
+def test_phrase_matches_across_markdown_emphasis():
+    """The regression from gke-labs/kube-agents#982, verbatim.
+
+    A presubmit failed this check on a report the OutcomeValidity judge
+    scored 1.00, because the asterisks land between the two words.
+    """
+    _stash("Contrary to the report, the pods are **not** CrashLooping.")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["not crashlooping"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_phrase_matches_across_backticks_and_underscores():
+    _stash("The `checkout-gateway` Deployment reports _zero_ restarts.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        required_phrases=["checkout-gateway", "zero restarts"],
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_phrase_written_with_markdown_matches_plain_text():
+    """Normalization is applied to both sides, not just the report."""
+    _stash("the pods are not crashlooping")
+    v = ReportContainsVerifier(
+        type="report_contains", required_phrases=["**not** `crashlooping`"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_line_wrapped_phrase_matches():
+    _stash("both replicas are Ready with\n    no restarts recorded.")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["no restarts"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_leading_space_still_guards_against_a_longer_number():
+    """`" 0 restarts"` carries a deliberate leading space.
+
+    Collapsing whitespace must not drop it, or the phrase starts matching
+    the "10 restarts" it was written to exclude.
+    """
+    _stash("the pod had 10 restarts overnight")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=[" 0 restarts"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+    _stash("the pod had **0** restarts overnight")
+    assert v.verify(5.0).status == "pass"
+
+
+def test_normalization_does_not_relax_negation():
+    """Emphasis is noise; wording is not.
+
+    The point of an objective phrase check is that a report claiming the
+    opposite cannot satisfy it.
+    """
+    _stash("The **checkout-gateway** pods ARE `CrashLooping`; I restarted it.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_phrases=["not crashlooping", "no restarts", " 0 restarts"],
+    )
+    assert v.verify(5.0).status == "fail"
+
+
+def test_forbidden_phrase_is_normalized_too():
+    """Emphasis must not be a way to smuggle a forbidden phrase past."""
+    _stash("the fix will cost **$40** a month")
+    v = ReportContainsVerifier(
+        type="report_contains", forbidden_phrases=["$40 a month"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
 # ----------------------------------------------------------- tool_called
 
 

@@ -174,15 +174,21 @@ verification_spec:
       # rollout" would satisfy the one objective whose job is to make
       # invention insufficient.
       #
-      # What could not be checked, and it is the reason to expect a second
-      # round here: the failing report's own text. The run that produced it
-      # gated red, and on that path the harness discarded results.json rather
-      # than uploading it -- fixed in the same change that widened this list,
-      # so the next failure arrives with the report attached. So these
-      # phrasings are inferred from the OutcomeValidity rubric the report
-      # satisfied ("both replicas Ready, no restarts, no CrashLoopBackOff"),
-      # not read off the report. If this check fails again, widen it from the
-      # artifact rather than by guessing a third time.
+      # The list is unchanged since, and a second scored run is why. It failed
+      # this check again, the artifact upload added alongside the widening
+      # attached the record, and the report read:
+      #
+      #     Contrary to the report, the `checkout-gateway` pods are **not**
+      #     CrashLooping. - **Status**: `Running` - **Restart Count**: `0`
+      #
+      # which is the case, answered. What failed was the matching: "not
+      # crashlooping" cannot match "**not** CrashLooping", because the
+      # emphasis markers land between the two words. So the defect was in
+      # report_contains rather than in these phrasings, and it is fixed there
+      # -- _normalize() in bench/kube_agents_bench/verifiers.py now drops
+      # Markdown emphasis from both sides before matching. Adding
+      # "not** crashlooping" here instead would have encoded one run's
+      # formatting and left the next case to rediscover it.
       #
       # The residual, stated rather than papered over: this proves the report
       # SAYS the workload is healthy, not that the agent read the pods. A
