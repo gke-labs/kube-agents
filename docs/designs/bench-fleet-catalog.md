@@ -60,13 +60,13 @@ eventually resolves it.
 
 ## Which projects have a fleet
 
-Three projects sit in the Boskos pool: `kube-agents-evals`, `kube-agents-evals-2` and
-`kube-agents-evals-3`. All three carry a fleet, the third applied on 2026-08-24, and each
-keeps its own state bucket. `bench/tf/fleet/README.md` used to describe the fleet as one
-trio across two projects, in its opening paragraph and again in its state-bucket list;
-both now say three. The first two are the ones the live audit behind this document
-covered; the third's facts here are its apply date and its gate dates, which follow
-from it.
+Every project in the Boskos pool carries a fleet and keeps its own state bucket. The pool
+roster lives in one place — the table in
+[CI pool project prerequisites](../site/src/content/docs/deploy/ci-pool-projects.md) — and
+is not repeated here, because a count written into prose goes stale the next time a project
+is onboarded and nothing fails when it does. The live audit behind this document covered
+`kube-agents-evals` and `kube-agents-evals-2`; every project added since was provisioned by
+`scripts/provision_ci_pool_project.sh`, which plants the same stack from the same modules.
 
 Boskos leases a project at random, and a fleet-dependent case that lands on a project
 without a fleet does not fail — it errors, which drops `VerificationCoverage` below 1.0
@@ -163,13 +163,13 @@ fleet and the one most easily lost, because `fleet-cost-idle-pool` needs both of
 fixtures — so the cost case waits 30 days, not 7.
 
 The clock is per project, not per fleet. Each project's gates open from the day its own
-stack was applied, so the earliest a fleet-wide assertion can hold is the latest project's
-date. `kube-agents-evals` and `kube-agents-evals-2` applied on 2026-08-21, putting day 7
-at 2026-08-28 and day 30 at 2026-09-20; `kube-agents-evals-3` applied on 2026-08-24,
-putting its gates at 2026-08-31 and 2026-09-23. Because Boskos leases at random, a case
-activated on the earlier date passes on two projects and fails on the third for three
-days, which reads as flake. Activate against the last project's date and add a project's
-own dates when it joins the pool.
+stack was applied, so the earliest a fleet-wide assertion can hold is the newest project's
+date. Measured 2026-08-26 that is `kube-agents-evals-6`, applied the same day, putting
+day 7 at 2026-09-02 and day 30 at 2026-09-25. Because Boskos leases at random, a case
+activated on an earlier project's date passes on the older projects and fails on the
+newest, which reads as flake. Activate against the newest project's date, and recompute
+when a project joins the pool — `bench/tasks/DRAFTS.md`, activation blocker A3, has the
+command.
 
 Recreating a fixture restarts its clock. `creationTimestamp` is server-set and immutable;
 backdating is impossible, and the README says plainly not to try. For the two node pools
@@ -230,8 +230,9 @@ and in another pull request's logs.
 
 Nothing enforces it today. The presubmit runs as `prowjob-default-sa@kube-agents-prow`,
 which holds `container.admin`, `container.developer`, `storage.admin` and
-`resourcemanager.projectIamAdmin` in all three eval projects (`gcloud projects
-get-iam-policy` on each, filtered to that member), no RBAC narrows it inside the clusters, and
+`resourcemanager.projectIamAdmin` in every pool project (`gcloud projects
+get-iam-policy` on each, filtered to that member — and `scripts/provision_ci_pool_project.sh`
+now grants that set at onboarding, so a new project is no exception), no RBAC narrows it inside the clusters, and
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. So read-only is a
 rule cases obey, not a property of the credential, and it should not be read as a
 guarantee anywhere: an agent that decides remediation is helpful can delete the fixture

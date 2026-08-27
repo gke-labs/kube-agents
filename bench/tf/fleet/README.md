@@ -225,7 +225,8 @@ them could also have caused what it is checking for.
 assumed: `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com` — the identity
 every presubmit runs as — holds `roles/container.admin`, `roles/container.developer`,
 `roles/storage.admin`, `roles/resourcemanager.projectIamAdmin` and
-`roles/iam.serviceAccountAdmin` in all three eval projects, and
+`roles/iam.serviceAccountAdmin` in every eval project — `scripts/provision_ci_pool_project.sh`
+grants that set at onboarding, so onboarding another one does not dilute it — and
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
 ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceaccount.com`
 subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to

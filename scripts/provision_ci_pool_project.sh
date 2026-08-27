@@ -589,6 +589,16 @@ if [ "${VERIFY_RC}" -eq 2 ] && [ -t 0 ]; then
 fi
 
 echo -e "\n================================================================================"
+if [ "${SKIP_FLEET}" != "true" ]; then
+  # No date printed on purpose: a gate date is the newest fleet's age measured
+  # against the cost SOP's windows, named in the echo below, and both terms move.
+  echo "NOTE: this planted a fresh fleet, now the newest in the pool. Age-gated"
+  echo "      scenarios gate on the newest fleet, so their activation dates just"
+  echo "      moved pool-wide. The windows are in"
+  echo "      agents/platform/governance/fleet_wide_cost_analysis_sop.md"
+  echo "      (§3.4 unattached-disk 30d, §3.7 idle-nodepool 7d); add them to today."
+  echo ""
+fi
 if [ "${VERIFY_RC}" -eq 0 ]; then
   echo "🎉 ${PROJECT_ID} is provisioned and verified. Register it in Boskos last."
 else
