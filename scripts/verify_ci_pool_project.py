@@ -261,13 +261,29 @@ def _mapping_function_body(text: str) -> Optional[str]:
 
 
 def _mapping_row_present(text: str, project_id: str) -> bool:
-    """Does this ci-deploy.sh text carry the project's gitops_repo_for_project() row?"""
+    """Does this ci-deploy.sh text carry the project's gitops_repo_for_project() row?
+
+    Three things the pattern has to get right, each of which a looser one gets
+    wrong in the direction of a false pass:
+
+    - The row must start the line. Unanchored, `kube-agents-evals)` matches
+      inside `kube-agents-evals-2)`, so onboarding project 2 reads as already
+      mapped and its `case` arm is never written.
+    - A commented-out row is not a row. `case` ignores it, so a project whose
+      arm was parked behind a `#` deploys to whatever the `*)` default names.
+    - The repo name must end where it should. `-infra` is a prefix of
+      `-infra-old`, and a row pointing at an archived repository would pass.
+    """
     body = _mapping_function_body(text)
     if body is None:
         return False
     expected_repo = f"gke-agentic/{project_id}-infra"
-    pattern = rf"{re.escape(project_id)}\)\s*echo\s*[\"']?{re.escape(expected_repo)}[\"']?"
-    return re.search(pattern, body) is not None
+    pattern = (
+        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s*"
+        rf"([\"']){re.escape(expected_repo)}\1|"
+        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s*{re.escape(expected_repo)}(?=[\s;&|)]|$)"
+    )
+    return re.search(pattern, body, re.MULTILINE) is not None
 
 
 def _upstream_remote() -> Optional[str]:
@@ -287,10 +303,30 @@ def _upstream_remote() -> Optional[str]:
         parts = line.split()
         if len(parts) < 3 or parts[2] != "(fetch)":
             continue
-        url = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
-        if url.endswith(_UPSTREAM_SLUG):
+        if _is_upstream_url(parts[1]):
             return parts[0]
     return None
+
+
+def _is_upstream_url(url: str) -> bool:
+    """Does this remote URL address gke-labs/kube-agents on GitHub?
+
+    Host and path are both matched, because a suffix test on the slug alone
+    accepts two URLs that are not this repository, and returning either one
+    means reading a stranger's main and reporting the verdict with the same
+    confidence as a correct one:
+
+    - `git@github.com:not-gke-labs/kube-agents` -- any owner ending in the
+      real one, which is a name anybody can register.
+    - `git@example.com:gke-labs/kube-agents` -- the right path on a host that
+      has nothing to do with GitHub, such as an internal mirror.
+    """
+    url = url[:-4] if url.endswith(".git") else url
+    m = re.match(r"^(?:[\w.+-]+://)?(?:[^@/]+@)?([^/:]+)[:/](.+)$", url)
+    if not m:
+        return False
+    host, path = m.group(1), m.group(2).strip("/")
+    return host.lower() == "github.com" and path == _UPSTREAM_SLUG
 
 
 def _ref_committed_at(remote: str) -> str:
@@ -467,9 +503,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing policy for {gsa_email}: {exc}")
 
-    # Read off the project's own policy. A role inherited from a folder would not
-    # appear here, but none of the six pool projects gets one that way -- every
-    # binding on this account was made against the project directly.
+    # Read off the project's own policy, which is not the effective one: a role
+    # inherited from an ancestor does not appear here. Checked 2026-08-26, the
+    # pool projects sit directly under the organization with no folder between,
+    # so an organization-level grant is the only thing this read can miss.
     rc, out, err = run_cmd(["gcloud", "projects", "get-iam-policy", project_id, "--format=json"])
     if rc != 0:
         passed = False
@@ -1320,14 +1357,17 @@ def check_token_minter(
         details.append(
             f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, which does not exist "
             f"(present: {', '.join(sorted(version_states)) or 'none'}). Every lease would deploy a minter "
-            "that cannot sign."
+            "that cannot sign. The pin is read from this checkout, so try `git fetch && git rebase` "
+            "first -- a stale tree reports a version main has already moved past."
         )
     elif version_states[pinned_version] != "ENABLED":
         passed = False
         details.append(
             f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, whose state is "
             f"{version_states[pinned_version]}. Every lease would deploy a minter that cannot sign, and "
-            "helm --wait would kill the run at its fifteen-minute timeout without naming the key."
+            "helm --wait would kill the run at its fifteen-minute timeout without naming the key. "
+            "The pin is read from this checkout, so try `git fetch && git rebase` first -- a stale "
+            "tree reports a version main has already moved past."
         )
     else:
         probe_version = pinned_version
@@ -1396,6 +1436,22 @@ EXIT_FAILED = 1
 # script exists to prevent, so it does not get to share an exit code with a
 # clean run.
 EXIT_UNVERIFIED = 2
+# argparse exits 2 on a bad command line, which would be indistinguishable from
+# a run that completed with unverified items -- a typo in a flag would read as
+# "nothing failed, go confirm these by hand". 64 is EX_USAGE from sysexits.h.
+#
+# Python itself also exits 2 when the script path does not exist, and that one
+# cannot be fixed from in here: it happens before this file is read. A caller
+# that must tell the two apart has to check the path exists first.
+EXIT_USAGE = 64
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser that exits EXIT_USAGE rather than argparse's own 2."""
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
 def report(project_id: str, checks: List[CheckResult]) -> int:
@@ -1484,7 +1540,7 @@ def verify_project(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description="Verify CI pool project prerequisites before Boskos registration.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -1492,6 +1548,9 @@ def main() -> int:
             "  0  every prerequisite checked and passed\n"
             "  1  a prerequisite failed -- do not register this project\n"
             "  2  nothing failed, but something could not be checked automatically\n"
+            " 64  bad command line. Note that Python exits 2, not 64, when the\n"
+            "     script path itself does not exist -- that happens before this\n"
+            "     file runs, so a caller must check the path separately.\n"
         ),
     )
     parser.add_argument("--project-id", required=True, help="GCP project ID to verify (e.g. kube-agents-evals-3)")

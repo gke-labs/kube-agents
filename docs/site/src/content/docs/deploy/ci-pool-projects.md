@@ -275,6 +275,8 @@ python3 scripts/verify_ci_pool_project.py --project-id kube-agents-evals-4 \
 
 It exits `0` when everything checked passed, `1` when a prerequisite failed, and **`2` when nothing failed but something could not be checked**. The third code exists because a script that prints "ALL CHECKS PASSED" over items it merely could not read gives the same false assurance that let `kube-agents-evals-3` into the pool. Treat `2` as "go and look", not as a pass.
 
+A bad command line exits `64`, not `2`, so a mistyped flag cannot be mistaken for an unverified item. One case stays ambiguous and cannot be fixed inside the script: if the *path* to the script is wrong, Python exits `2` before the file is read. A wrapper that branches on `2` should check the path exists first.
+
 `scripts/provision_ci_pool_project.sh` runs it as its own last step, so a project provisioned by the script has been through this already.
 
 One check is not a read-only API call. `Seeded Fleet Fixtures` runs `hack/fleet-kubeconfigs.sh`, which needs `kubectl` and fetches cluster credentials into a temporary directory it removes on the way out. Without `kubectl` on `PATH` that item reports as unverified rather than failing the project.

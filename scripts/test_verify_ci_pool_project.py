@@ -1186,6 +1186,24 @@ class ExitStatusTest(unittest.TestCase):
         status, _ = self._report([minter])
         self.assertEqual(status, checker.EXIT_FAILED)
 
+    def test_a_bad_command_line_exits_usage_not_unverified(self):
+        # argparse's own error() exits 2, which a caller would read as "nothing
+        # failed, go confirm these by hand" -- so a typo would look like a run
+        # that finished.
+        with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--no-such-flag"]), \
+             mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                checker.main()
+        self.assertEqual(raised.exception.code, checker.EXIT_USAGE)
+        self.assertNotEqual(checker.EXIT_USAGE, checker.EXIT_UNVERIFIED)
+
+    def test_a_missing_required_argument_exits_usage(self):
+        with mock.patch("sys.argv", ["verify_ci_pool_project.py"]), \
+             mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                checker.main()
+        self.assertEqual(raised.exception.code, checker.EXIT_USAGE)
+
 
 class ToolchainTest(unittest.TestCase):
     """A broken toolchain must not be reported as an unprovisioned project."""
@@ -1359,6 +1377,56 @@ class CodebaseMappingTest(unittest.TestCase):
             r = checker.check_codebase_mapping("kube-agents-evals-6")
         self.assertNotIn("dated", r.warnings[0])
         self.assertIn("not yet on gke-labs/main", r.message)
+
+    def test_a_longer_project_id_does_not_satisfy_a_shorter_one(self):
+        # Unanchored, `kube-agents-evals)` matches inside the -2 row, so
+        # onboarding project 2 would read as already mapped.
+        body = _ci_deploy_text("kube-agents-evals-2")
+        self.assertFalse(checker._mapping_row_present(body, "kube-agents-evals"))
+        self.assertTrue(checker._mapping_row_present(body, "kube-agents-evals-2"))
+
+    def test_a_commented_out_row_is_not_a_row(self):
+        # `case` ignores it, so the project deploys to whatever `*)` names.
+        commented = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            '    # kube-agents-evals-6) echo "gke-agentic/kube-agents-evals-6-infra" ;;\n'
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(commented, "kube-agents-evals-6"))
+
+    def test_a_row_pointing_at_an_archived_repo_is_not_the_row(self):
+        # `-infra` is a prefix of `-infra-old`.
+        stale = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            '    kube-agents-evals-6) echo "gke-agentic/kube-agents-evals-6-infra-old" ;;\n'
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(stale, "kube-agents-evals-6"))
+
+    def test_an_unquoted_row_is_still_a_row(self):
+        # Nothing forces the quotes, and an unquoted echo behaves identically.
+        unquoted = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            "    kube-agents-evals-6) echo gke-agentic/kube-agents-evals-6-infra ;;\n"
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertTrue(checker._mapping_row_present(unquoted, "kube-agents-evals-6"))
+
+    def test_a_lookalike_owner_is_not_the_upstream_remote(self):
+        # `not-gke-labs` ends with the real slug, and is a name anyone can take.
+        impostor = "origin\tgit@github.com:not-gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=impostor):
+            self.assertIsNone(checker._upstream_remote())
+
+    def test_the_right_path_on_another_host_is_not_the_upstream_remote(self):
+        mirror = "mirror\tgit@example.com:gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=mirror):
+            self.assertIsNone(checker._upstream_remote())
+
+    def test_the_upstream_remote_may_be_named_anything(self):
+        archive = "archive\tgit@github.com:gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=archive):
+            self.assertEqual(checker._upstream_remote(), "archive")
 
 
 class RunChecksTest(unittest.TestCase):
