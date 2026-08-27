@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import urllib.parse
 import uuid
@@ -127,6 +128,36 @@ def tool_operations(
         for call in projected_tool_calls(interaction)
         if not completed_only or call.get("status") == "completed"
     ]
+
+
+#: Paragraphs a coordinator emits when it hands work off — "Delegated to the
+#: platform agent … I've started this as task t_… The answer will post into
+#: this thread as soon as it's ready." — carry no answer content. Evaluators
+#: must score the reply that follows them, or a journey whose specialist never
+#: reported back would be judged on boilerplate.
+_DELEGATION_ACK = re.compile(
+    r"delegated to the platform agent"
+    r"|\bstarted this\b[^.\n]{0,80}\btask t_[0-9a-f]+"
+    r"|\btask t_[0-9a-f]+\b"
+    r"|\bwill post\b[^.\n]{0,60}\b(?:thread|here)\b",
+    re.IGNORECASE,
+)
+
+
+def substantive_output(interaction: dict[str, Any]) -> str:
+    """The user-visible answer with leading delegation acknowledgments skipped.
+
+    Splits the terminal output into paragraphs and drops leading ones that
+    read as hand-off boilerplate. Returns an empty string when nothing but
+    the acknowledgment ever arrived, which is itself the finding.
+    """
+
+    text = str(interaction.get("output") or "")
+    paragraphs = re.split(r"\n\s*\n", text)
+    index = 0
+    while index < len(paragraphs) and _DELEGATION_ACK.search(paragraphs[index]):
+        index += 1
+    return "\n\n".join(paragraphs[index:]).strip()
 
 
 def unnormalized_tool_calls(interaction: dict[str, Any]) -> list[str]:
