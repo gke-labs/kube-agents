@@ -51,6 +51,61 @@ workflow) rather than a stockout alert:
   `attach_artifact` tool — the parsed object, not YAML text:
   `type: computeclass` for a ComputeClass, `type: node_auto_provisioning`
   for a NAP specification; use one shared `pair_id` for a design's set.
+- **Your final report must name every provisioning path by name** — the
+  words On-Demand, Spot, and Flex-Start must each appear with their
+  trade-off, even when a path's probe failed (then state the failure and
+  what you used instead). A path you analyzed but never mentioned does not
+  exist for the reader.
+- **Generated manifests must use the real schemas.** Do not invent API
+  versions or fields; start from these shapes and adjust values only:
+
+  A GKE ComputeClass is `cloud.google.com/v1` (never `autopilot.gke.io/*`),
+  `machineFamily` takes a family (`a2`), not a machine type, and GPU
+  fallback tiers select accelerators via `gpu.type`:
+
+  ```yaml
+  apiVersion: cloud.google.com/v1
+  kind: ComputeClass
+  metadata:
+    name: <design>-cc
+  spec:
+    priorities:
+      - machineFamily: a2          # primary: the requested accelerator family
+        spot: true
+      - gpu:                       # fallback tier: smaller accelerator
+          type: nvidia-l4
+          count: 1
+      - gpu:                       # last-resort tier
+          type: nvidia-tesla-t4
+          count: 1
+    nodePoolAutoCreation:
+      enabled: true
+  ```
+
+  Call out explicitly that the L4/T4 fallback tiers change the workload's
+  GPU class and interconnect characteristics.
+
+  A Node Auto-Provisioning alternative constrains machine families through
+  node affinity, and its location policy lives under `location`:
+
+  ```yaml
+  kind: NodeAutoProvisioningSpec
+  spec:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/machine-family
+                operator: In
+                values: [n2, n2d, c2d]
+    location:
+      locationPolicy: ANY
+  ```
+
+- **Validate before attaching**: run `kubectl apply --dry-run=server -f` on
+  the generated ComputeClass and record the outcome with
+  `record_evidence(type: computeclass_server_dry_run)`; a manifest the API
+  server rejects is a finding, not a deliverable.
 - **Do NOT** send notifications, lease a GitOps workspace, create branches,
   open Pull Requests, or mutate any cloud or Kubernetes state. Steps 1-3 and
   5-7 apply only to the alert-driven remediation flow.
