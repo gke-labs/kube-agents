@@ -179,6 +179,19 @@ def redact_kubernetes_evidence(value: object) -> str:
             return cleaned
         if isinstance(item, list):
             return [scrub(child) for child in item]
+        if isinstance(item, str) and item[:1] in "{[":
+            # kubectl.kubernetes.io/last-applied-configuration carries the
+            # whole applied spec as a JSON string; scrub embedded documents
+            # the same way or they re-leak the values redacted above.
+            try:
+                embedded = json.loads(item)
+            except json.JSONDecodeError:
+                return item
+            if isinstance(embedded, (dict, list)):
+                return json.dumps(
+                    scrub(embedded), sort_keys=True, ensure_ascii=False
+                )
+            return item
         return item
 
     return redact_evidence(scrub(parsed))

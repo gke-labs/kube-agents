@@ -488,6 +488,37 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
         self.assertNotIn("master-key-literal", stdout)
         self.assertIn("debug", stdout)
 
+    def test_last_applied_configuration_annotation_is_scrubbed(self):
+        payload = platform_agents()
+        payload["items"][0]["metadata"]["annotations"] = {
+            "kubectl.kubernetes.io/last-applied-configuration": json.dumps(
+                {
+                    "spec": {
+                        "deployment": {
+                            "env": [
+                                {
+                                    "name": "API_SERVER_KEY",
+                                    "value": "LAST-APPLIED-LEAK",
+                                },
+                                {"name": "LOG_LEVEL", "value": "debug"},
+                            ]
+                        }
+                    }
+                }
+            )
+        }
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(payload),
+            cloud=FakeCloud(),
+            runtime=FakeRuntime(),
+        ).inspect()
+
+        stdout = snapshot["evidence"][0]["stdout"]
+        self.assertNotIn("LAST-APPLIED-LEAK", stdout)
+        self.assertIn("[REDACTED]", stdout)
+        self.assertIn("debug", stdout)
+
     def test_kubernetes_read_failure_is_not_reported_as_missing_resource(self):
         snapshot = GoogleChatIntegrationService(
             TARGET,
