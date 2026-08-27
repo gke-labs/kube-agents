@@ -220,13 +220,10 @@ echo "Project Number: ${PROJECT_NUMBER}"
 # found on its first run. Projects 1-3 never showed it: their GSAs predate this
 # script and were already in state.
 
-# Which identity Cloud Build runs as is project-dependent: projects created
-# before the 2024 default change run builds as the legacy
-# <number>@cloudbuild.gserviceaccount.com, newer ones as the Compute Engine
-# default SA. Both are granted because the script cannot tell which applies --
-# add-iam-policy-binding accepts a member that does not exist, so a grant to the
-# absent one is an inert no-op rather than an error. kube-agents-evals-2 is the
-# live example of the drift this avoids: it carries only the compute-SA grant.
+# All six pool projects build as the Compute Engine default SA, measured
+# 2026-08-26 with `gcloud builds list --format='value(serviceAccount)'`. The
+# legacy <number>@cloudbuild.gserviceaccount.com is granted too, as an inert
+# no-op in case a project ever defaults the other way.
 CLOUDBUILD_SA="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
 COMPUTE_SA="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
@@ -253,6 +250,37 @@ for member in "${CLOUDBUILD_SA}" "${COMPUTE_SA}"; do
     --location=us \
     --member="${member}" \
     --role="roles/artifactregistry.reader" \
+    --quiet >/dev/null
+done
+
+# The pull-kube-agents-smoke-test job runs on the build-kube-agents cluster, not
+# in this project. It leases this project from Boskos and reaches in as
+# prowjob-default-sa@kube-agents-prow for cluster credentials, the chart deploy
+# and the build. Without these it leases a fully provisioned project and dies on
+# the first gcloud call (gke-labs/kube-agents#966).
+#
+# The set kube-agents-evals holds, kept as measured rather than trimmed. No
+# Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
+# `gcloud builds submit` as substitutions, so Cloud Build does the push and the
+# GKE nodes do the pull. This account touches the registry at no point.
+PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
+echo "Granting the Prow runner access to ${PROJECT_ID}..."
+for role in \
+  roles/cloudbuild.builds.editor \
+  roles/cloudbuild.builds.viewer \
+  roles/container.admin \
+  roles/container.developer \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/logging.logWriter \
+  roles/logging.viewer \
+  roles/resourcemanager.projectIamAdmin \
+  roles/serviceusage.serviceUsageConsumer \
+  roles/storage.admin \
+  roles/viewer; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="${PROW_RUNNER_SA}" \
+    --role="${role}" \
     --quiet >/dev/null
 done
 

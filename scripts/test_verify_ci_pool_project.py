@@ -993,18 +993,34 @@ class IamGrantsTest(unittest.TestCase):
     def _reader_policy(self, members):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
+    def _project_policy(self, prow_roles=None, conditional_roles=()):
+        """The project's own policy, granting the Prow runner every role it needs."""
+        roles = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
+        bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(roles)]
+        bindings += [
+            {
+                "role": r,
+                "members": [checker.PROW_RUNNER_MEMBER],
+                "condition": {"title": "expires", "expression": "request.time < timestamp('2020-01-01T00:00:00Z')"},
+            }
+            for r in sorted(conditional_roles)
+        ]
+        return json.dumps({"bindings": bindings})
+
+    def _both_build_identities(self):
+        return self._reader_policy(
+            [
+                "serviceAccount:123456@cloudbuild.gserviceaccount.com",
+                "serviceAccount:123456-compute@developer.gserviceaccount.com",
+            ]
+        )
+
     def test_both_build_identities_granted_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
-                _ok(
-                    self._reader_policy(
-                        [
-                            "serviceAccount:123456@cloudbuild.gserviceaccount.com",
-                            "serviceAccount:123456-compute@developer.gserviceaccount.com",
-                        ]
-                    )
-                ),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -1014,6 +1030,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-2")),
+                _ok(self._project_policy()),
                 _ok(self._reader_policy(["serviceAccount:123456-compute@developer.gserviceaccount.com"])),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-2", "123456")
@@ -1024,18 +1041,56 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(json.dumps({"bindings": []})),
-                _ok(
-                    self._reader_policy(
-                        [
-                            "serviceAccount:123456@cloudbuild.gserviceaccount.com",
-                            "serviceAccount:123456-compute@developer.gserviceaccount.com",
-                        ]
-                    )
-                ),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
         self.assertTrue(any("Workload Identity" in d for d in result.details), result.details)
+
+    def test_prow_runner_missing_role_fails(self):
+        # kube-agents-evals-6 as it stood on 2026-08-26: fully provisioned,
+        # verified green, and its first lease died at get-credentials.
+        without_container_admin = checker.PROW_RUNNER_ROLES - {"roles/container.admin"}
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._project_policy(prow_roles=without_container_admin)),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+    def test_prow_runner_conditional_binding_does_not_count(self):
+        # A condition the presubmit does not satisfy grants nothing, so counting
+        # the binding would pass a project the runner still cannot use.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(
+                    self._project_policy(
+                        prow_roles=checker.PROW_RUNNER_ROLES - {"roles/container.admin"},
+                        conditional_roles={"roles/container.admin"},
+                    )
+                ),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+    def test_prow_runner_extra_role_passes(self):
+        # The check reports absences only; a project holding more than the
+        # measured set is not a misconfiguration this script has an opinion on.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(prow_roles=checker.PROW_RUNNER_ROLES | {"roles/artifactregistry.writer"})),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
 
 
 class ExitStatusTest(unittest.TestCase):

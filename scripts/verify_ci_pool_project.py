@@ -141,6 +141,36 @@ AR_WRITER_ROLES = {
 AR_PULLER_ROLES = AR_WRITER_ROLES | {"roles/artifactregistry.reader"}
 
 
+# Every other identity this script checks lives inside the pool project. This one
+# does not: the presubmit runs on the build-kube-agents cluster as
+# prowjob-default-sa@kube-agents-prow, leases a project, and reaches in. Nothing
+# in the project's own configuration implies the grant, which is how
+# kube-agents-evals-4 through -6 were provisioned, verified green and registered
+# without it -- until a lease of -6 died on gke-labs/kube-agents#966 with
+# `Required "container.clusters.get" permission(s)`.
+PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
+
+# The set kube-agents-evals holds, matched literally rather than by permission.
+# Not minimal -- container.admin subsumes container.developer, viewer subsumes
+# logging.viewer and cloudbuild.builds.viewer -- but the point is that a new
+# project matches one a presubmit has passed on, which a permission-equivalent
+# set would not. Only a missing role fails; extra roles are not reported.
+PROW_RUNNER_ROLES = {
+    "roles/cloudbuild.builds.editor",
+    "roles/cloudbuild.builds.viewer",
+    "roles/container.admin",
+    "roles/container.developer",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/logging.logWriter",
+    "roles/logging.viewer",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/serviceusage.serviceUsageConsumer",
+    "roles/storage.admin",
+    "roles/viewer",
+}
+
+
 class CheckResult:
     def __init__(
         self,
@@ -385,7 +415,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity and the cross-project Artifact Registry reader grants."""
+    """Verify Workload Identity, the Prow runner's roles, and the cross-project AR reader grants."""
     details = []
     passed = True
 
@@ -413,6 +443,37 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing policy for {gsa_email}: {exc}")
+
+    # Read off the project's own policy. A role inherited from a folder would not
+    # appear here, but none of the six pool projects gets one that way -- every
+    # binding on this account was made against the project directly.
+    rc, out, err = run_cmd(["gcloud", "projects", "get-iam-policy", project_id, "--format=json"])
+    if rc != 0:
+        passed = False
+        details.append(f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}")
+    else:
+        try:
+            policy = _load_json(out)
+            held = set()
+            for b in policy.get("bindings", []):
+                # A conditional binding grants nothing outside its condition, so
+                # counting it would pass a project the runner still cannot use.
+                if b.get("condition"):
+                    continue
+                if PROW_RUNNER_MEMBER in b.get("members", []):
+                    held.add(b.get("role"))
+            missing = PROW_RUNNER_ROLES - held
+            if missing:
+                passed = False
+                details.append(
+                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
+                    "A presubmit authenticates as this account after leasing the project, so it "
+                    "will fail on the first gcloud call rather than at registration"
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing the IAM policy for {project_id}: {exc}")
 
     # The warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE to lives in the
     # `us` multi-region repository of kube-agents-prow, not in us-central1.
@@ -448,7 +509,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     return CheckResult(
         "Service Accounts & IAM Grants",
         passed,
-        "Workload Identity and cross-project AR reader grants verified" if passed else "IAM requirements missing",
+        "Workload Identity, Prow runner roles and cross-project AR reader grants verified"
+        if passed
+        else "IAM requirements missing",
         details=details,
     )
 
@@ -532,11 +595,10 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
             passed = False
             details.append(f"Failed parsing Artifact Registry repository: {exc}")
 
-    # Which identity Cloud Build runs as is project-dependent -- the legacy
-    # <number>@cloudbuild SA for older projects, the Compute Engine default SA
-    # for newer ones -- so accept upload rights on either rather than
-    # manufacturing a failure with no correct remediation. A grant can sit on
-    # the project or directly on the repository, so both policies are consulted.
+    # All six pool projects build as the Compute Engine default SA (measured
+    # 2026-08-26), but the legacy <number>@cloudbuild SA is accepted too so a
+    # project that defaults the other way is not failed with no remediation. A
+    # grant can sit on the project or on the repository, so both are consulted.
     build_sas = {
         f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com",
         f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com",
