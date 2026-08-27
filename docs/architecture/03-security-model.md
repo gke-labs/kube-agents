@@ -174,8 +174,11 @@ RBAC at runtime. Consequences:
     **convention the render overlay stamps** on the pre-created identity manifests (§3,
     [06](06-api-and-data-contracts.md) §2) — the overlay stamps the **`kube-agents/tier` label** on the
     agent SA **and** its `Role`/`ClusterRole`, names the SA `<tier>-agent`, and places it in
-    `kubeagents-system` (or the team namespace). (The **controller mints no RBAC**, so it cannot be the
-    labeler; the overlay is.)
+    `kubeagents-system` (or the team namespace). (The controller does mint RBAC — `reconcileRBAC` creates the
+    agent's `kubeagents:minimal:*` ClusterRole and binding, and its two namespaced Roles — but it
+    stamps only the `app.kubernetes.io/*` labels and never `kube-agents/tier`, so it is not the
+    labeler and its objects are outside the first policy's selector. Assuming it minted none is
+    what let the second policy be written so that it denied the controller's own binding.)
   - a **second `ValidatingAdmissionPolicy` governs `(Cluster)RoleBinding`s by their bound _subject_** —
     not by a label the author controls. `matchConstraints` on `roles`/`clusterroles` alone never see
     bindings, so a `ClusterRoleBinding` of a namespace-tier SA to a cluster-wide role would otherwise be

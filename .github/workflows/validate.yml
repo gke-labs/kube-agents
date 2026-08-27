@@ -79,6 +79,26 @@ jobs:
           )
           helm lint charts/kube-agents "${SET_FLAGS[@]}"
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" > /dev/null
+          # A default render must carry the agent-RBAC admission policies. The
+          # Python suite checks the template and the values gate; only a real
+          # render proves the two combine into installable objects.
+          for name in kube-agents-agent-readonly kube-agents-agent-binding-scope; do
+            count=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              | grep -c "^  name: $name$" || true)
+            if [ "$count" -ne 2 ]; then
+              echo "expected the policy and its binding for $name in a default render, found $count" >&2
+              exit 1
+            fi
+          done
+          # And must render none of them on 1.29, which Chart.yaml still accepts:
+          # ValidatingAdmissionPolicy is only v1 from 1.30, so without the version
+          # guard a default install there fails the whole release on `no matches
+          # for kind` -- and through Terraform, the whole apply.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" --kube-version 1.29.0 \
+            | grep -q "ValidatingAdmissionPolicy"; then
+            echo "the admission policies rendered on 1.29, where the API is not v1" >&2
+            exit 1
+          fi
           # Render again with explicit image tags to cover the override path.
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --set operator.image.tag=v9.9.9 \

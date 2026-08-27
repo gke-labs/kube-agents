@@ -97,6 +97,18 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
 			},
 		},
+		{
+			// The gate on. Diff this against platformagent-tagged.yaml to see
+			// exactly what splitting the credential broker into its own Pod
+			// changes, and nothing else.
+			name:         "PlatformAgentSplitCredentialBroker",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-split-broker.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-split-broker.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
 	}
 
 	for _, tt := range tests {

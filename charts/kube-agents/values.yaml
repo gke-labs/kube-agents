@@ -1,3 +1,25 @@
+# Cluster-wide ValidatingAdmissionPolicies that backstop agent RBAC at apply
+# time: read verbs only, no Secrets, and no cluster-scoped binding to a
+# namespace-tier agent ServiceAccount. Read the header of
+# templates/agent-rbac-admission-policy.yaml before relying on them — notably,
+# they cannot check the rules of a *referenced* Role, and the content policy is
+# evadable by a manifest that carries neither the `kube-agents/tier` label nor
+# the `*-agent` naming convention.
+#
+# You do not need to turn this off for an old cluster: the template also checks
+# `.Capabilities.KubeVersion` and renders nothing below Kubernetes 1.30, where
+# the policy API is not yet v1 and the objects would fail to apply. Turn it off
+# for a second kube-agents release in a cluster that already has these — they
+# are cluster singletons with fixed names, so Helm refuses the second install on
+# ownership rather than duplicating them.
+#
+# What the policies do and do not enforce is in the header of
+# templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
+# on a default install with no GitOps overlay, the content policy matches
+# nothing the operator creates.
+admissionPolicy:
+  enabled: true
+
 global:
   # Registry prefix for the images built from this repo (operator, agent,
   # credential proxy). Empty leaves them on the public defaults below.

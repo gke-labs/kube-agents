@@ -508,8 +508,7 @@ TASKS=(
   #      probe above. They remain spec-ready and activation is uncommenting.
   #   -- rca-remediation-pr: parked until it gets one clean measured run; the
   #      2026-08-26 run hit the job deadline before reaching it, so its cost
-  #      and signal are still unknown.
-  # "./tasks/obtainability-planted-pdb/task.yaml"
+  #      and signal are still unknown.  # "./tasks/obtainability-planted-pdb/task.yaml"
   # "./tasks/stockout-pinned-pool/task.yaml"
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
@@ -558,7 +557,11 @@ TASKS=(
   #       Boskos leases at random, so the gate is the NEWEST fleet in the
   #       pool: kube-agents-evals-3 was planted 2026-08-24, three days after
   #       the other two, which makes it 2026-08-31 for the pool and
-  #       2026-09-23 for the disks. A replant in any pool project moves them.
+  #       2026-09-23 for the disks. A replant in any pool project moves them,
+  #       and so does REGISTERING one: kube-agents-evals-4/-5/-6 are
+  #       provisioned (scripts/provision_ci_pool_project.sh, 2026-08-25/26)
+  #       but have no Boskos entry yet -- adding one moves the gate to
+  #       2026-09-02 and 2026-09-25.
   #       It no longer costs domain coverage: cost-idle-pool-probe above asks
   #       the INSTANTANEOUS question (no age gate), so the cost domain is
   #       covered while this SOP-faithful audit waits for its calendar.

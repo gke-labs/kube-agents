@@ -86,11 +86,10 @@ Kubernetes RBAC, which is read-only in every set, and it does not gate the GitOp
 path, which works in every set. See the site's
 [security and IAM reference](../../../docs/site/src/content/docs/reference/security-and-iam.md).
 
-| Set         | Grants                                                             |
-| ----------- | ------------------------------------------------------------------ |
-| `read-only` | Viewer roles only — no GCP write capability. **Default.**          |
-| `gke-admin` | `container.clusterAdmin`, `container.admin`, `monitoring.admin`, … |
-| `custom`    | Exactly the roles passed in `--custom-roles`; no built-in bundle.  |
+| Set         | Grants                                                            |
+| ----------- | ----------------------------------------------------------------- |
+| `read-only` | Viewer roles only — no GCP write capability. **Default.**         |
+| `custom`    | Exactly the roles passed in `--custom-roles`; no built-in bundle. |
 
 ## Machine-Readable Results
 
@@ -130,7 +129,7 @@ are listed there, not here. Run `./install.sh --help` for the authoritative list
 | `--gemini-api-key=KEY`               | Gemini API key                                                                                                                                         | Looked up in Secret Manager                     |
 | `--openai-api-key=KEY`               | OpenAI API key                                                                                                                                         | _unset_                                         |
 | `--anthropic-api-key=KEY`            | Anthropic API key                                                                                                                                      | _unset_                                         |
-| `--permission-set=SET`               | Agent GCP IAM set: `read-only` \| `gke-admin` \| `custom`                                                                                              | `read-only`                                     |
+| `--permission-set=SET`               | Agent GCP IAM set: `read-only` \| `custom`                                                                                                             | `read-only`                                     |
 | `--custom-roles=ROLES`               | Roles for `--permission-set=custom` (space- or comma-separated)                                                                                        | _unset_                                         |
 | `--gitops-org=ORG`                   | GitHub org/user for the GitOps IaC repository                                                                                                          | _unset_                                         |
 | `--gitops-repo=REPO`                 | GitOps IaC repository name                                                                                                                             | `gke-fleet-iac`                                 |

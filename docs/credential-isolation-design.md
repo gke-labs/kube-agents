@@ -56,18 +56,36 @@ The credential sidecar receives secret environment variables, credential state,
 and its identity token. It also receives a second, separately-audienced
 Kubernetes-API token, CA, and namespace projection, which the event watcher it
 hosts uses to reach the management cluster. Neither token is mounted in the
-agent or dashboard containers. The credential sidecar also authenticates callers of the
+agent or dashboard containers. (`spec.security.splitCredentialBrokerPod: true`
+is the exception, and the only one: it mounts a third, audience-bound token
+into the agent container so the agent can authenticate to the broker across
+the network. Every unqualified "the sandbox holds no token" claim below
+describes the sidecar layout.) The credential sidecar also authenticates callers of the
 PlatformAgent API before forwarding requests with a non-secret internal
 sentinel. Pod-wide automatic KSA token mounting is disabled.
 
 ### Guarantee
 
-The operator does not place managed credentials in the sandbox container's:
+In the sidecar layout the operator does not place managed credentials in the
+sandbox container's:
 
 - environment;
 - root filesystem;
 - persistent agent volume; or
 - mounted ServiceAccount token path.
+
+The last of those four is given up under
+`spec.security.splitCredentialBrokerPod: true`, which mounts a projected
+ServiceAccount token in the sandbox deliberately; the other three hold in both
+layouts.
+
+The shared agent volume is outside all four, and it is the live gap in both
+layouts. A repository's own `.git/config` is read by every `git` invocation, so
+a `core.fsmonitor` entry the sandbox writes under the workspace root runs in the
+credential holder on the next `git status` — with no lease taken and no
+mutating verb, which is why neither the workspace-lease floor nor the
+argument-level deny policy reaches it. Closing it means the broker owning its
+workspace rather than operating in the agent's.
 
 `spec.deployment.env` is applied to the credential sidecar because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
@@ -215,6 +233,10 @@ to a per-process random salt with one warning.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential sidecar.
+The table above describes the sidecar layout; under
+`spec.security.splitCredentialBrokerPod: true` a token with the same audience
+is also mounted read-only in the sandbox, because that is how the agent
+authenticates to a broker that is no longer on loopback.
 The event watcher has a separate one-hour token with the Kubernetes API's
 default audience, plus the cluster CA and Pod namespace, mounted at the
 conventional in-cluster path in the same credential sidecar. Two differently
@@ -615,7 +637,9 @@ only command output, never a mounted Git credential file.
 - `automountServiceAccountToken: false` applies to the Pod.
 - Two separately projected ServiceAccount token volumes are mounted only by the
   credential sidecar — its own, and the event watcher's; neither is mounted by
-  the agent or dashboard containers.
+  the agent or dashboard containers. Under `spec.security.splitCredentialBrokerPod: true`
+  the agent container does mount one — the broker-audience token it presents
+  to the broker Service.
 - Secret and credential-state volumes are mounted only by the credential
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
@@ -651,21 +675,27 @@ only command output, never a mounted Git credential file.
 
 ## Deployment and Migration
 
-The operator always creates the sandbox and Envoy credential sidecar together
-in the existing `<agent>-gateway` Deployment and retains the existing
-`<agent>-data` PVC. Before the sandbox starts, a managed init container removes
-legacy gcloud, GitHub, Git, Kubernetes, AWS, Azure, Docker, npm, and Python
-credential files from that PVC. This preserves agent state without carrying
-credentials forward from an older deployment. It deletes operator-owned
-resources from the abandoned two-Pod design:
+The operator creates the sandbox and Envoy credential sidecar together in the
+existing `<agent>-gateway` Deployment and retains the existing `<agent>-data`
+PVC — unless `spec.security.splitCredentialBrokerPod` is enabled, in which case
+the credential runtime is rendered as its own `<agent>-credential-proxy`
+Deployment and Service instead of as a sidecar. Before the sandbox starts, a
+managed init container removes legacy gcloud, GitHub, Git, Kubernetes, AWS,
+Azure, Docker, npm, and Python credential files from that PVC. This preserves
+agent state without carrying credentials forward from an older deployment. It
+deletes operator-owned resources from the abandoned two-Pod design:
 
-- `<agent>-credential-proxy` Deployment;
 - `<agent>-sandbox` Deployment;
-- `<agent>-credential-proxy` Service;
 - `<agent>-sandbox` ServiceAccount; and
 - `<agent>-sandbox-metadata-deny` NetworkPolicy.
 
 Deletion refuses to remove resources not owned by the PlatformAgent.
+
+Two names that used to be on that list are no longer deleted, and the
+difference is load-bearing. The `<agent>-credential-proxy` Deployment and
+Service are not legacy any more: they are exactly what the operator renders
+under `splitCredentialBrokerPod: true`, and it owns them in both directions —
+applied while the flag is on, deleted when it goes off.
 
 The credential-sidecar image contains Envoy, the real credential-aware CLIs,
 and the credential runtime. The sandbox image contains only the wrappers for
@@ -700,13 +730,18 @@ per-container network identity.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
-   volume, or ServiceAccount token mount, and no Secret-backed env other than
-   the two pod-scoped Session KV values named above — the assertion enumerates
-   them, so a third one cannot be added without amending this list;
+   volume, and no Secret-backed env other than the two pod-scoped Session KV
+   values named above — the assertion enumerates them, so a third one cannot
+   be added without amending this list. In the sidecar layout it also has no
+   ServiceAccount token mount; under `splitCredentialBrokerPod: true` it
+   mounts exactly one token, the broker-audience projection, and still none
+   of the rest;
 2. only the credential sidecar mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;
-4. wrapper URLs resolve to `127.0.0.1:8765`;
+4. wrapper URLs resolve to `127.0.0.1:8765` in the sidecar layout, and to
+   `http://<agent>-credential-proxy.<namespace>.svc.cluster.local:8765` when
+   `splitCredentialBrokerPod` is enabled;
 5. Envoy can reach the Unix-socket backend and `/healthz` reflects both;
 6. unsupported executables, raw shell requests, and blocked disclosure commands
    fail closed;
@@ -714,7 +749,11 @@ CI and deployment tests should assert that:
    with no `exec`, `server`, `proxy-url`, or `tokenFile` value from the supplied
    document reaching it, whether it arrives through `KUBECONFIG` or
    `--kubeconfig`;
-8. the old proxy Deployment and Service are absent after reconciliation;
+8. the `<agent>-credential-proxy` Deployment and Service are absent after
+   reconciliation in the sidecar layout, and present under
+   `splitCredentialBrokerPod: true` — the name is reconciled in both
+   directions, not unconditionally removed. The `<agent>-sandbox`
+   Deployment and ServiceAccount are absent in every configuration;
 9. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
 10. Pod readiness fails when either Envoy or the credential runtime fails.

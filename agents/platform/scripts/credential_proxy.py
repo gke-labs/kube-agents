@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import hmac
 import http.client
 import io
@@ -18,9 +19,11 @@ import shlex
 import signal
 import shutil
 import socketserver
+import ssl
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -95,6 +98,319 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
+
+
+# ---------------------------------------------------------------------------
+# Who is calling
+#
+# For as long as the broker ran as a sidecar, nothing on this path
+# authenticated anything.  What kept the credentials safe was geometry: Envoy
+# bound 127.0.0.1, so only the Pod could reach it, and the socket behind Envoy
+# was 0600 in an emptyDir that only this container mounted.  Both of those
+# properties are properties of *sharing a network namespace*, and both
+# evaporate the moment the broker becomes its own Pod.  So a split needs an
+# answer to "who is calling", and this is it.
+#
+# The answer is a Kubernetes ServiceAccount token, projected into the caller
+# with a dedicated audience, presented as a bearer token, and verified here
+# with a TokenReview against the API server.  Three reasons for that shape
+# rather than mTLS or a Unix socket per caller:
+#
+#   * It needs no PKI.  This repository has no cert-manager for workloads, no
+#     service mesh and no SPIFFE; mTLS would mean standing all of that up, or
+#     minting certificates in the operator, before a single request could be
+#     authenticated.  The projected token already exists in the cluster.
+#   * It needs no Envoy filter.  The Envoy config is baked into the image and
+#     loaded by absolute path, so an ext_authz or JWT filter is an image
+#     rebuild that cannot vary per agent.  A bearer header rides through the
+#     router filter untouched and is checked here, in code the operator can
+#     configure with an environment variable.
+#   * It forecloses nothing.  mTLS is a transport underneath this, not a
+#     replacement for it: adding a client certificate later leaves the request
+#     shape, the handler and this verifier intact, and gives ``Principal`` a
+#     second, stronger source for the same field.  gRPC carries bearer
+#     credentials in exactly the same ``authorization`` metadata key, so a
+#     later move to gRPC ports the identity model verbatim.  What it does
+#     foreclose is a Unix socket per caller — but a Unix socket needs a shared
+#     filesystem, which is the one thing splitting the Pods takes away.
+#
+# What it is honestly *not*: encryption.  The token crosses the cluster
+# network in cleartext, exactly as the github-token-minter call already does
+# (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
+# the namespace can replay it until it expires.  mTLS closes that, and the
+# NetworkPolicy work in the next task narrows who can open the connection at
+# all.  Neither is done here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
+
+
+class AuthenticationError(Exception):
+    """The caller could not be identified.
+
+    The message is for this process's log. It is deliberately never returned
+    to the client, which gets an undifferentiated 401 — telling an unidentified
+    caller *why* it failed tells it how to succeed.
+    """
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Who the broker believes is on the other end of a request.
+
+    ``workload`` is what the transport can prove today: the Kubernetes identity
+    of the ServiceAccount whose projected token authenticated the connection.
+
+    Read that literally — it is **per-ServiceAccount**, and weaker than
+    per-Pod. The agent Pod and the broker Pod run as the same ServiceAccount,
+    because the Workload Identity IAM binding names it and giving the agent one
+    of its own would take the broker's cloud credentials with it. So this field
+    excludes every other workload in the cluster and nothing finer: it cannot
+    distinguish the agent Pod from the broker Pod, let alone one session inside
+    the agent Pod from another. It answers "which ServiceAccount", not "which
+    Pod" and not "on whose behalf".
+
+    ``caller`` is where a per-caller identity would go, and it is deliberately
+    a field on the object rather than a second parameter threaded through the
+    handler. When that model is settled, the agent obtains a capability token
+    scoped to one session — *attenuating*, so it can never name more authority
+    than the workload token it was exchanged for — and sends it alongside the
+    workload token. This class grows one more verification step that populates
+    ``caller`` from it, ``authenticate`` keeps its signature, and the policy
+    layer downstream reads ``principal.caller`` where it reads
+    ``principal.workload`` today. Nothing about the request shape, the
+    handler, or the operator's rendering has to change again.
+    ``caller`` stays None until then. What must hold in the meantime is that
+    neither field is ever derived from the request body — from ``argv``, from
+    ``cwd``, from anything a model produced. Both come from a token the API
+    server verified.
+    """
+
+    workload: str
+    uid: str = ""
+    groups: tuple[str, ...] = ()
+    caller: str | None = None
+
+    def describe(self) -> str:
+        if self.caller:
+            return f"{self.workload} (caller {self.caller})"
+        return self.workload
+
+
+class NullAuthenticator:
+    """Accept every caller. Only sound behind a private Unix socket.
+
+    ``serve`` refuses to start this on a TCP listener, because on a TCP
+    listener "no authentication" means "the credentials belong to whoever
+    reaches the port".
+    """
+
+    authenticates = False
+
+    def authenticate(self, headers: Any) -> Principal:  # noqa: ARG002
+        return Principal(workload="unauthenticated")
+
+
+@dataclass
+class _CacheEntry:
+    expires_at: float
+    principal: Principal
+
+
+class ServiceAccountAuthenticator:
+    """Verify a projected ServiceAccount token with a Kubernetes TokenReview.
+
+    The audience is the whole point. A token projected with audience
+    ``kubeagents-credential-proxy`` is rejected by every other API-server-aware
+    service in the cluster, and the API server refuses to authenticate it here
+    unless the audience matches — so a token stolen from the agent cannot be
+    replayed against the Kubernetes API, and a token minted for anything else
+    cannot be replayed against the broker.
+    """
+
+    authenticates = True
+
+    def __init__(
+        self,
+        audience: str,
+        allowed_callers: frozenset[str],
+        api_host: str,
+        api_port: str,
+        ca_file: str,
+        token_file: str,
+        timeout_seconds: float = 10.0,
+        cache_seconds: float = 60.0,
+    ) -> None:
+        if not audience:
+            raise ValueError("an audience is required to authenticate callers")
+        if not allowed_callers:
+            raise ValueError("at least one allowed caller is required")
+        if not api_host:
+            raise ValueError("the Kubernetes API server address is not configured")
+        self.audience = audience
+        self.allowed_callers = allowed_callers
+        self.api_host = api_host
+        self.api_port = api_port
+        self.ca_file = ca_file
+        self.token_file = token_file
+        self.timeout_seconds = timeout_seconds
+        self.cache_seconds = cache_seconds
+        self._cache: dict[str, _CacheEntry] = {}
+        self._cache_lock = threading.Lock()
+
+    def authenticate(self, headers: Any) -> Principal:
+        header = headers.get("Authorization", "") or ""
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise AuthenticationError("no bearer token was presented")
+        token = token.strip()
+
+        cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cached = self._cached(cache_key)
+        if cached is not None:
+            return cached
+
+        principal = self._review(token)
+        self._remember(cache_key, principal)
+        return principal
+
+    def _cached(self, key: str) -> Principal | None:
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at <= now:
+                # Expired entries are dropped rather than served, so revoking a
+                # ServiceAccount takes effect within cache_seconds rather than
+                # for the lifetime of the process.
+                del self._cache[key]
+                return None
+            return entry.principal
+
+    def _remember(self, key: str, principal: Principal) -> None:
+        now = time.monotonic()
+        with self._cache_lock:
+            # Only successful reviews are cached, so a rejected token costs the
+            # API server one round trip every time it is retried.
+            self._cache = {
+                cached_key: entry
+                for cached_key, entry in self._cache.items()
+                if entry.expires_at > now
+            }
+            self._cache[key] = _CacheEntry(now + self.cache_seconds, principal)
+
+    def _own_token(self) -> str:
+        try:
+            return Path(self.token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise AuthenticationError(
+                f"this pod's own API server token is unreadable: {type(exc).__name__}"
+            ) from exc
+
+    def _review(self, token: str) -> Principal:
+        body = json.dumps(
+            {
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenReview",
+                "spec": {"token": token, "audiences": [self.audience]},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://{self.api_host}:{self.api_port}/apis/authentication.k8s.io/v1/tokenreviews",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self._own_token()}",
+            },
+            method="POST",
+        )
+        try:
+            # Inside the try: a missing or unreadable ca.crt raises
+            # FileNotFoundError here, and an OSError escaping this method is
+            # not an AuthenticationError — it would reach
+            # socketserver.handle_error as a traceback and a dropped
+            # connection, where the caller deserves a 401.
+            context = ssl.create_default_context(cafile=self.ca_file or None)
+            with urllib.request.urlopen(
+                request, timeout=self.timeout_seconds, context=context
+            ) as response:
+                review = json.load(response)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # A TokenReview that cannot be completed is a rejection, not an
+            # allow. An API server outage must not turn into an open broker.
+            raise AuthenticationError(
+                f"TokenReview could not be completed: {type(exc).__name__}"
+            ) from exc
+        return self._principal_from(review)
+
+    def _principal_from(self, review: Any) -> Principal:
+        status = review.get("status") if isinstance(review, dict) else None
+        if not isinstance(status, dict):
+            raise AuthenticationError("TokenReview returned no status")
+        if status.get("error"):
+            raise AuthenticationError("TokenReview reported an error")
+        if status.get("authenticated") is not True:
+            raise AuthenticationError("the presented token is not authenticated")
+        audiences = status.get("audiences") or []
+        if self.audience not in audiences:
+            # The API server echoes the audiences it actually validated. A token
+            # it authenticated for some other audience is not for us.
+            raise AuthenticationError("the presented token is for another audience")
+        user = status.get("user") or {}
+        username = user.get("username") or ""
+        if username not in self.allowed_callers:
+            raise AuthenticationError("the authenticated caller is not permitted")
+        groups = user.get("groups") or []
+        return Principal(
+            workload=username,
+            uid=str(user.get("uid") or ""),
+            groups=tuple(str(group) for group in groups if isinstance(group, str)),
+        )
+
+
+def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
+    """Build the caller authenticator the environment asks for.
+
+    ``none`` is the default so that the sidecar deployment, where the socket
+    and the loopback listener are the access control, is unchanged. ``serve``
+    is what makes that default safe: it refuses to serve on TCP with it.
+    """
+    mode = os.getenv("CREDENTIAL_PROXY_AUTH_MODE", "none").strip().lower()
+    if mode in {"", "none"}:
+        return NullAuthenticator()
+    if mode != "serviceaccount":
+        raise RuntimeError(
+            f"unsupported CREDENTIAL_PROXY_AUTH_MODE {mode!r}; expected 'none' or 'serviceaccount'"
+        )
+    allowed = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_ALLOWED_CALLERS", "").split(",")
+        if caller.strip()
+    )
+    if not allowed:
+        raise RuntimeError(
+            "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount requires "
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS to name at least one ServiceAccount"
+        )
+    return ServiceAccountAuthenticator(
+        audience=os.getenv(
+            "CREDENTIAL_PROXY_AUDIENCE", DEFAULT_CREDENTIAL_PROXY_AUDIENCE
+        ).strip(),
+        allowed_callers=allowed,
+        api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
+        api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
+        ca_file=os.getenv(
+            "CREDENTIAL_PROXY_KUBE_CA_FILE",
+            "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+        ).strip(),
+        token_file=os.getenv(
+            "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
+            "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        ).strip(),
+    )
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -198,7 +514,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         return value.replace("\r", "").replace("\n", "")
 
     def log_message(self, message: str, *args: Any) -> None:
-        LOGGER.info("agent-api " + message, *args)
+        # BaseHTTPRequestHandler hands the raw request line through here, so
+        # every argument is caller text and it is logged before any
+        # authentication runs. See CredentialProxyHandler.log_message.
+        LOGGER.info("agent-api " + message, *_sanitized_log_args(args))
 
 
 class GoogleChatRelay:
@@ -2058,21 +2377,54 @@ def read_only_enforced() -> bool:
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
 
 
-def _sanitize_for_logging(s: str) -> str:
-    """Strip control characters to prevent log forgery, with 64-char length cap.
+def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
+    """Strip control characters to prevent log forgery, with a length cap.
 
     Removes C0/C1 control characters, line/paragraph separators (Unicode), and
     all characters that could be interpreted as line boundaries by consumers
     (Python splitlines, JS /m, JSON parsers, etc). Also caps length to prevent
     unbounded agent-controlled hint expansion.
+
+    ``max_length`` is raised only for a value the agent does not control. A
+    ServiceAccount username is
+    ``system:serviceaccount:<namespace>:<name>``, which reaches 65 characters
+    at ordinary lengths and truncated at 64 exactly where the discriminating
+    part of the name is -- observed on the dev install, where the principal
+    logged as ``...:kubeagents-platform-agen``. Namespace and name are each
+    bounded at 253 by the API server, so the value cannot grow without bound
+    either way.
     """
     import unicodedata
 
-    # Characters in Cc (control), Cf (format), Zl (line sep), Zp (para sep)
-    # will forge log lines in text-mode consumers.
-    filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))
-    # Cap at 64 chars (no real flag name exceeds this)
-    return filtered[:64]
+    # Cc (control), Cf (format), Zl (line sep) and Zp (para sep) forge log
+    # lines in text-mode consumers.
+    #
+    # Cs is here for the opposite reason: a lone surrogate does not forge a
+    # record, it deletes one. json.loads turns "\\ud800" into a real lone
+    # surrogate, which no UTF-8 encoder will accept, so the handler raises
+    # UnicodeEncodeError, logging prints "--- Logging error ---" to stderr and
+    # drops the record - while the request it was supposed to describe carries
+    # on and succeeds. An authenticated caller could execute a command and
+    # leave no exec line behind. Verified against a byte-encoding handler; a
+    # StringIO one does not reproduce it, which is why the unit tests below
+    # write through a real UTF-8 encoder.
+    filtered = ''.join(
+        c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')
+    )
+    return filtered[:max_length]
+
+
+def _sanitized_log_args(args: tuple[Any, ...], max_length: int = 512) -> tuple[Any, ...]:
+    """Sanitize the string arguments of a log record, leaving the rest alone.
+
+    For the BaseHTTPRequestHandler log hooks, where the format string is the
+    stdlib's and every argument is caller-controlled. Non-strings (status
+    codes, sizes) are passed through so the format specifiers still match.
+    """
+    return tuple(
+        _sanitize_for_logging(arg, max_length=max_length) if isinstance(arg, str) else arg
+        for arg in args
+    )
 
 
 def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
@@ -2116,8 +2468,45 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    # Replaced by serve(). The default keeps the sidecar deployment, where the
+    # Unix socket is the access control, behaving as it did before there was an
+    # authenticator at all.
+    authenticator: NullAuthenticator | ServiceAccountAuthenticator = NullAuthenticator()
+    # Set per request once the caller is identified; read by the policy layer.
+    principal: Principal | None = None
+
+    def _authenticated(self) -> Principal | None:
+        """Identify the caller, or answer 401 and return None.
+
+        Everything but /healthz goes through here. /healthz is the readiness
+        probe and reveals nothing, and the probe runs before any token would be
+        available; every other route on this listener either runs a
+        credentialed command or relays through a credentialed client.
+
+        Binding ``self.principal`` is this method's job rather than each
+        route's. The chat relays and the GitHub refresh spend the broker's
+        credentials just as ``/v1/exec`` does, so a seam that were populated on
+        only one of them would be a seam the next change has to fix before it
+        can use it: whoever adds a per-caller check would find the value
+        present on the route they tested and None on the two they did not.
+        """
+        try:
+            self.principal = self.authenticator.authenticate(self.headers)
+            return self.principal
+        except AuthenticationError as exc:
+            LOGGER.warning(
+                "rejected an unauthenticated request path=%s reason=%s",
+                _sanitize_for_logging(self.path),
+                exc,
+            )
+            self._json(
+                HTTPStatus.UNAUTHORIZED, {"error": "caller could not be authenticated"}
+            )
+            return None
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/healthz" and self._authenticated() is None:
+            return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
                 self._json(
@@ -2149,6 +2538,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"status": "ok"})
 
     def do_POST(self) -> None:  # noqa: N802
+        principal = self._authenticated()
+        if principal is None:
+            return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
             return
@@ -2196,12 +2588,42 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
-        request_id = str(payload.get("requestId", ""))
+        # Sanitized here rather than at each of the eight log sites below, and
+        # sanitized at all because it is caller-supplied text going into a
+        # line-oriented formatter. A newline in it ends the record and starts a
+        # new one, so an unsanitized requestId lets the caller write a whole
+        # forged entry into the audit trail - including one naming a
+        # ServiceAccount that made no request. It is never echoed back to the
+        # client, so narrowing it costs nothing.
+        #
+        # This is one route into the log, not all of them. The access line goes
+        # through log_message above, which had the same defect from an
+        # unauthenticated caller; both are fixed, and any new log site taking
+        # caller text needs the same treatment.
+        request_id = _sanitize_for_logging(str(payload.get("requestId", "")))
+        # The principal reaches the decision point, rather than being checked at
+        # the door and thrown away. Every policy refusal below is a judgement
+        # about *what* was asked. A per-caller model is what would let them
+        # become judgements about who asked, and self.principal — bound for
+        # this route and for every other authenticated one by _authenticated —
+        # is the value they would read. Today it is what the audit trail
+        # records and nothing else.
+        LOGGER.info(
+            "exec request_id=%s principal=%s executable=%s",
+            request_id,
+            # 512 rather than the default 64: this value comes from the
+            # TokenReview, not from the request, and a truncated identity is
+            # an audit line that names the wrong ServiceAccount.
+            _sanitize_for_logging(principal.describe(), max_length=512),
+            # Logged before the allowlist check below, so at this point it is
+            # arbitrary caller text and gets the same treatment as request_id.
+            _sanitize_for_logging(argv[0]),
+        )
         if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,
-                argv[0],
+                _sanitize_for_logging(argv[0]),
             )
             self._json(
                 HTTPStatus.FORBIDDEN,
@@ -2253,7 +2675,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         violation = self.executor.git_lease_violation(argv, cwd)
         if violation is not None:
             LOGGER.warning(
-                "git lease refused request_id=%s cwd=%s", request_id, cwd
+                "git lease refused request_id=%s cwd=%s",
+                request_id,
+                _sanitize_for_logging(cwd or "", max_length=256),
             )
             self._json(
                 HTTPStatus.FORBIDDEN,
@@ -2292,7 +2716,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # them from reading as an unexplained proxy outage — the agent can
             # correct the path instead of guessing.
             LOGGER.warning(
-                "command rejected request_id=%s reason=%s", request_id, exc
+                # The message embeds the caller's own cwd or kubeconfig path.
+                "command rejected request_id=%s reason=%s",
+                request_id,
+                _sanitize_for_logging(str(exc), max_length=256),
             )
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -2507,7 +2934,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
     def log_message(self, message: str, *args: Any) -> None:
-        LOGGER.info("http " + message, *args)
+        # BaseHTTPRequestHandler.log_request passes self.requestline through
+        # here verbatim, and this runs on every response - including the 401 an
+        # unauthenticated caller gets. A vertical tab in the request line is
+        # enough to end the record and start another, so an unauthenticated
+        # caller could write a whole audit-shaped line of its own. The request
+        # line's own tokenizer stops at whitespace, which limits the shape of
+        # the forgery and does not prevent it.
+        LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -2518,7 +2952,85 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def start_agent_api_proxy() -> ThreadingHTTPServer:
+    """Bind the authenticated front door for the agent's own API.
+
+    This runs wherever the agent's API server is reachable on loopback. In the
+    sidecar deployment that is this same container; when the broker is split
+    into its own Pod it is a container in the *agent's* Pod, because 8642 binds
+    127.0.0.1 and is guarded by a fixed non-secret sentinel key. Moving this
+    across a network boundary would mean exposing that port and that sentinel
+    to the cluster network, so it does not move.
+    """
+    AgentAPIProxyHandler.external_key = os.getenv("API_SERVER_EXTERNAL_KEY", "").strip()
+    if not AgentAPIProxyHandler.external_key:
+        raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
+    AgentAPIProxyHandler.upstream_key = os.getenv(
+        "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
+    )
+    port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
+    LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
+    return server
+
+
+def reachable_off_pod(args: argparse.Namespace) -> bool:
+    """Can something outside this Pod open a connection to the broker?
+
+    Two ways in. The Python server can bind a TCP port itself, which is the
+    branch `--unix-socket` normally avoids. Or Envoy, which fronts the Unix
+    socket, can be told to listen on the Pod IP rather than loopback — and
+    then the Unix socket's 0600 mode protects nothing, because the connection
+    arrives through Envoy as Envoy's own user.
+    """
+    if not args.unix_socket:
+        return True
+    envoy_address = os.getenv("CREDENTIAL_PROXY_ENVOY_ADDRESS", "").strip()
+    return bool(envoy_address) and envoy_address not in {"127.0.0.1", "::1", "localhost"}
+
+
+def resolve_role() -> str:
+    """Which halves of this process to run.
+
+    ``combined`` is the sidecar deployment and the default: one container is
+    both the credential broker and the agent-API front door, because both ends
+    are on the same loopback. Splitting the broker into its own Pod splits
+    those two roles across two containers in two Pods.
+    """
+    role = os.getenv("CREDENTIAL_PROXY_ROLE", "combined").strip().lower() or "combined"
+    if role not in {"combined", "broker", "api-proxy"}:
+        raise RuntimeError(
+            f"unsupported CREDENTIAL_PROXY_ROLE {role!r}; "
+            "expected 'combined', 'broker' or 'api-proxy'"
+        )
+    return role
+
+
 def serve(args: argparse.Namespace) -> None:
+    role = resolve_role()
+    if role == "api-proxy":
+        start_agent_api_proxy().serve_forever()
+        return
+
+    # Decided before anything credentialed starts, so a misconfigured
+    # deployment fails at boot rather than on the first request.
+    CredentialProxyHandler.authenticator = build_authenticator()
+    if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
+        # A listener the cluster can reach, with no authentication, hands the
+        # credentials to whoever reaches the port. The sidecar deployment gets
+        # away without an authenticator because loopback plus a 0600 socket is
+        # the control; a reachable listener has no such fallback.
+        raise RuntimeError(
+            "refusing to serve the credential broker on a listener reachable from "
+            "outside this Pod with CREDENTIAL_PROXY_AUTH_MODE=none; set "
+            "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount, or keep Envoy on loopback "
+            "and the runtime on a Unix socket"
+        )
+    LOGGER.info(
+        "caller authentication mode=%s",
+        "serviceaccount" if CredentialProxyHandler.authenticator.authenticates else "none",
+    )
+
     CredentialProxyHandler.policy = Policy.load(args.policy)
     executor = CommandExecutor(
         timeout_seconds=args.timeout_seconds,
@@ -2569,18 +3081,9 @@ def serve(args: argparse.Namespace) -> None:
                     )
 
         threading.Thread(target=initialize_slack_relay, daemon=True).start()
-    AgentAPIProxyHandler.external_key = os.getenv("API_SERVER_EXTERNAL_KEY", "").strip()
-    if not AgentAPIProxyHandler.external_key:
-        raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
-    AgentAPIProxyHandler.upstream_key = os.getenv(
-        "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
-    )
-    api_server = ThreadingHTTPServer(
-        ("0.0.0.0", int(os.getenv("AGENT_API_PROXY_PORT", "8643"))),
-        AgentAPIProxyHandler,
-    )
-    threading.Thread(target=api_server.serve_forever, daemon=True).start()
-    LOGGER.info("authenticated PlatformAgent API proxy listening on port 8643")
+    if role == "combined":
+        api_server = start_agent_api_proxy()
+        threading.Thread(target=api_server.serve_forever, daemon=True).start()
     if args.unix_socket:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
