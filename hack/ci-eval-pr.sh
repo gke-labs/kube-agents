@@ -479,6 +479,14 @@ TASKS=(
   "./tasks/upgrades-lagging-master-probe/task.yaml"
   "./tasks/consistency-authorized-networks-probe/task.yaml"
   "./tasks/cost-idle-pool-probe/task.yaml"
+  # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
+  # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
+  # the job deadline before reaching it), so this entry's first smoke IS the
+  # measurement. Placed after the six probes (proven, ~20 min together) and
+  # before the canary so a surprise here cannot starve the probes of budget.
+  # The one active task that WRITES: it files a remediation PR against the
+  # leased project's throwaway GitOps repo via submit-suggestion.
+  "./tasks/rca-remediation-pr/task.yaml"
   # The audit-machinery canary: measured 606s clean on 2026-08-26, every
   # exact check green -- the only task that has proven the A1/A4 path
   # (minted token, cloned *-infra workspace, published ledger issue) in a
@@ -506,13 +514,13 @@ TASKS=(
   #      full-audit shape recast to the nightly tier (600-1300s each, measured
   #      or transport-failed on 2026-08-26); each domain is now covered by a
   #      probe above. They remain spec-ready and activation is uncommenting.
-  #   -- rca-remediation-pr: parked until it gets one clean measured run; the
-  #      2026-08-26 run hit the job deadline before reaching it, so its cost
-  #      and signal are still unknown.  # "./tasks/obtainability-planted-pdb/task.yaml"
+  #   -- rca-remediation-pr was parked here too until 2026-08-27; it is now
+  #      active above, this pull request's smoke run being the clean measured
+  #      run it was waiting for.
+  # "./tasks/obtainability-planted-pdb/task.yaml"
   # "./tasks/stockout-pinned-pool/task.yaml"
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
-  # "./tasks/rca-remediation-pr/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
