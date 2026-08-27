@@ -132,6 +132,17 @@ class ConfigFileTest(unittest.TestCase):
         with _config(""), _env(GOOGLE_CHAT_RELAY_URL="http://x"):
             self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
 
+    def test_no_pyyaml_degrades_to_the_env(self):
+        # PyYAML is on the agent image, so this branch never runs there — it exists
+        # because the import is inside the function precisely so that an interpreter
+        # without it still resolves a platform instead of failing the cron run.
+        # `sys.modules[name] = None` is what makes `import name` raise ImportError.
+        with _config("platforms:\n  slack:\n    enabled: false\n"), \
+             _env(SLACK_RELAY_URL="http://x"), \
+             mock.patch.dict(sys.modules, {"yaml": None}):
+            # The config's explicit `false` would have won had it been readable.
+            self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
+
 
 class ConfigPathContractTest(unittest.TestCase):
     def test_config_path_matches_agent_common_server(self):
