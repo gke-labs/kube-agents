@@ -23,8 +23,11 @@
     "hpa-saturated": {
       "cluster_slot": "a",
       "namespace": "seeded-capacity",
-      "probes": ["horizontalpodautoscaler/inference-server"],
-      "fixture": "inference-server HPA settles above pinned-inference-pool's capped capacity, leaving Pending replicas"
+      "probes": [
+        "horizontalpodautoscaler/inference-server",
+        "deployment/inference-server"
+      ],
+      "fixture": "inference-server HPA settles above pinned-inference-pool's capped capacity, leaving Pending replicas. Both halves are probed: the HPA declares the gap and cluster-agent-pending-replicas-capped-pool additionally asserts the Deployment's nodeSelector and CPU request, the two fields that would make the Pending replicas schedulable"
     },
     "rbac-overgrant": {
       "cluster_slot": "a",

@@ -324,6 +324,34 @@ trusted interaction, user, task, or proxy request identifiers remain labeled
 as missing. The ledger page and selected event are persisted in the URL;
 free-text and facet filters remain local to the browser session.
 
+## Google Chat integration
+
+The **Integration → Google Chat** page is a read-only projection of the
+canonical live `PlatformAgent` and its exact Google Cloud resources. It derives
+the project, topic, subscription, mode, user allowlist, home channel, and
+workload service account from the CR, then verifies the required APIs, topic,
+pull subscription, routing, and publisher/subscriber IAM.
+
+The page also reports Google Chat sessions observed by Hermes in the last 30
+days. Observed traffic is the only proof that the Chat console's saved topic
+is correct, because that setting has no read API. While no traffic has
+arrived, the service reads the project's other Pub/Sub topics and flags those
+whose IAM policies accept the Google Chat publisher identities as the likely
+root cause — a console still pointing at a topic from an earlier installation.
+
+The ordered checklist is the single source of truth: each check carries its
+own plain-language label, diagnosis, and, when actionable, fix steps with
+copyable values (the console link to open in a browser signed in to the
+owning Google account, and the exact **Cloud Pub/Sub** topic to save). The
+snapshot's status, message, and severity are derived from the first
+non-passed check — `Ready`, `Not receiving messages`, `Needs attention`,
+`Verification incomplete`, or `Disabled` — so the page renders without
+interpreting: one verdict banner, the first problem's actions, the milestone
+list, and collapsed detail sections. When every milestone passes, the same
+test-and-verify steps render as a next-step block under the banner, because
+delivery evidence only proves the Chat console setting as of the last
+received message. Raw evidence redacts credential-shaped Kubernetes values.
+
 ## Validate
 
 ```bash

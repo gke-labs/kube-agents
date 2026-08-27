@@ -412,7 +412,24 @@ Two shapes read differently:
   operator requires a `path`, and the value operators require a `value`.
 
 "No object matched" and "objects matched but the path resolved nothing" are kept distinct: the
-second is a real observation and fails, rather than quietly passing on an empty set.
+second is a real observation and fails, rather than quietly passing on an empty set — for every
+operator **except `absent`**, which is asking for that emptiness and returns `pass`.
+
+That exception has a sharp edge, because a **misspelled** path also resolves to nothing. A
+path-scoped `absent` whose path carries a typo is a check that passes on every run, forever, and
+reports nothing to say so — and where the check is a catastrophic safeguard, that is a safeguard
+silently switched off. Nothing in the Terraform catches it either, since the field such a
+safeguard reads is typically one no manifest declares (`kubectl.kubernetes.io/restartedAt` is
+written by a kubectl verb, which is the reason a safeguard reads it).
+
+So a path-scoped `absent` in this repository owes a **witness pair**:
+`_PATH_SCOPED_ABSENT_WITNESSES` in `bench/tests/test_fleet_verifier.py`, keyed `<case>/<check>`,
+holding a `present` object that carries the field and an `absent` object shaped like the fixture
+as planted. The lint beside it asserts the path resolves on the first and resolves to nothing on
+the second, so a typo fails the build and a path loose enough to match an untouched fixture fails
+it too. A new path-scoped `absent` with no witness pair fails that test rather than shipping.
+Pathless `absent` — the blast-radius shape above — needs none: it is a list, and the runner's
+namespace preflight grounds the empty result.
 
 `across_matches` quantifies over a wildcard segment in the path — over the _elements_ that segment
 selects, not the values the full path resolves to. `every` requires each element to resolve the

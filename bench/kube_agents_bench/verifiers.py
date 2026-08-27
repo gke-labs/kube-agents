@@ -79,15 +79,51 @@ _NO_TRANSCRIPT_REASON = (
     "could not be evaluated"
 )
 
+# Emphasis and code markers, dropped before matching. The agent answers in
+# Markdown, and a phrase spanning an emphasised word cannot match the raw
+# text: "not crashlooping" against a report that reads "the pods are **not**
+# CrashLooping" fails on the asterisks alone. That failed a real presubmit
+# (gke-labs/kube-agents#982) on a report the OutcomeValidity judge scored
+# 1.00, and enumerating markdown shapes in every task.yaml would only encode
+# one run's formatting.
+_MARKDOWN_NOISE = str.maketrans("", "", "*_`")
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, strip Markdown emphasis, collapse runs of whitespace.
+
+    Applied to BOTH sides, so a phrase may be written with or without the
+    markers and match either way.
+
+    Boundary whitespace survives. ``" 0 restarts"`` carries a leading space
+    on purpose -- it is what stops the phrase matching "10 restarts" -- and
+    ``" ".join(str.split())`` would drop it and hand back the false positive
+    the space was added to prevent.
+    """
+    stripped = text.translate(_MARKDOWN_NOISE)
+    collapsed = " ".join(stripped.split())
+    if stripped[:1].isspace():
+        collapsed = " " + collapsed
+    if stripped[-1:].isspace():
+        collapsed += " "
+    return collapsed.lower()
+
 
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
     """Exact phrase checks against the agent's answer.
 
-    Case-insensitive substring matching, deliberately: the task author chose
-    the phrase (a planted defect's name, a required noun), so an exact match
-    is fair, and case is the one variation a correct report may legitimately
-    introduce. Anything fuzzier belongs to the judge, not to a blocking check.
+    Substring matching, deliberately: the task author chose the phrase (a
+    planted defect's name, a required noun), so an exact match is fair.
+    Anything fuzzier belongs to the judge, not to a blocking check.
+
+    Both sides are normalized first, by ``_normalize`` above: lowercased,
+    Markdown emphasis dropped, whitespace runs collapsed. These are the
+    variations a correct report may legitimately introduce without changing
+    what it claims -- an agent that bolds a word has not said anything
+    different. Nothing about the wording is relaxed: word order, negation and
+    vocabulary still have to match, which is what keeps a check like
+    "not crashlooping" unsatisfiable by a report saying the opposite.
 
     ``scope`` picks the text under test. The default, ``final``, is what the
     user ultimately receives: the delegating turn's own closing message plus,
@@ -119,11 +155,13 @@ class ReportContainsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
-        text = (snap.final_message if self.scope == "final" else snap.output).lower()
-        missing = [p for p in self.required_phrases if p.lower() not in text]
-        present = [p for p in self.forbidden_phrases if p.lower() in text]
+        text = _normalize(
+            snap.final_message if self.scope == "final" else snap.output
+        )
+        missing = [p for p in self.required_phrases if _normalize(p) not in text]
+        present = [p for p in self.forbidden_phrases if _normalize(p) in text]
         any_of_miss = bool(self.any_of_phrases) and not any(
-            p.lower() in text for p in self.any_of_phrases
+            _normalize(p) in text for p in self.any_of_phrases
         )
         if missing or present or any_of_miss:
             parts = []

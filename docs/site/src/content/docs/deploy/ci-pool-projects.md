@@ -133,7 +133,7 @@ gcloud artifacts repositories set-cleanup-policies kube-agents \
 
 ## 5. GitOps repository and GitHub token minter
 
-The evaluation scenarios that exercise the GitOps workflow — the six fleet-audit streams and `rca-remediation-pr` — write to GitHub. Step 0 of a fleet-audit stream (`audit_report.py start`) mints a repository-scoped GitHub App token and clones the workspace named by the `Git Repo:` line of `/opt/data/SETTINGS.md`; `finish` rewrites a ledger issue and opens remediation pull requests.
+The evaluation scenarios that exercise the GitOps workflow — the six fleet-audit streams and both remediation cases — write to GitHub. Step 0 of a fleet-audit stream (`audit_report.py start`) mints a repository-scoped GitHub App token and clones the workspace named by the `Git Repo:` line of `/opt/data/SETTINGS.md`; `finish` rewrites a ledger issue and opens remediation pull requests.
 
 **Every pool project needs its own private GitOps repository.** Two leases must not share a ledger issue or race on a remediation branch, and a token minted in one lease must not reach another lease's repository.
 

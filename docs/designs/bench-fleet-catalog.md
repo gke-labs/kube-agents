@@ -103,11 +103,15 @@ The `inference-server` HPA under `hpa-saturated` does not compute a stable desir
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
 `kube-agents-evals`, 2 in `kube-agents-evals-2` and 3 in `kube-agents-evals-3` — same
 stack, same manifests, three projects, two different answers. The fixture holds anyway,
-and that is the point: desired exceeds the pinned maximum of 1 in every project, which is
-the whole claim. The number it exceeds it by is a load calculation over live utilisation,
-and it moves. So a case must assert the pin and the unmet demand — `maxReplicas` at 1,
-`desiredReplicas` above it — and never a specific figure, because there is no figure that
-is true everywhere the case might land.
+and that is the point: in every project the HPA wants more replicas than the pool can
+place, and the pool can place one. The number it wants beyond that is a load calculation
+over live utilisation, and it moves. So a case must assert the pin and the unmet demand —
+the pool's `max_node_count` at 1, the HPA's `maxReplicas` at 10, `desiredReplicas` above
+what a single e2-small can fit — and never a specific figure for the backlog, because
+there is no figure that is true everywhere the case might land. The two ceilings are easy to
+conflate and mean opposite things: `max_node_count = 1` is the pool's, in
+`bench/tf/fleet/main.tf`, and it is what makes the demand unmeetable; `max_replicas = 10` is
+the HPA's, in `bench/tf/fleet/defects-a.tf`, and it is the gap the fixture declares.
 
 Two things about this vocabulary are worth knowing before it confuses someone, because
 neither is going to be obvious from a slug.
@@ -234,13 +238,16 @@ guarantee anywhere: an agent that decides remediation is helpful can delete the 
 every other pull request depends on, and the first evidence will be somebody else's case
 going red.
 
-Making it a guarantee means a second, narrower credential for fleet-dependent runs. Seven
-of the ten drafted cases already need a GitOps-repo write path — the six audit scenarios
-and `rca-remediation-pr` — which is contained by pinning
+Making it a guarantee means a second, narrower credential for fleet-dependent runs. Most
+of the drafted cases already need a GitOps-repo write path — the six audit scenarios and
+both remediation cases — which is contained by pinning
 it to a throwaway repository per eval project rather than by asking the agent not to; the
 cluster credential wants the same treatment. Until then, a case author's assertion that
 their case is read-only is the only control there is.
 
-Asserting read-only from inside a case is `resource_property` against the fixture — "the
+Asserting read-only from inside a case is a state check against the fixture — "the
 planted defect survived the run" — and not `tool_called`, which sees only the delegating
-turn's calls and would be blind to a worker's mutation.
+turn's calls and would be blind to a worker's mutation. On the standing fleet that check
+is `fleet_resource_property`, which resolves the cluster from the fixture role; plain
+`resource_property` reads the ambient kubeconfig and suits only a case whose deployer
+built its own cluster, as `gpu-stress-test-diagnosis` does.
