@@ -51,6 +51,11 @@ LOGGING_TIMEOUT_SECONDS = 60
 TRACE_TIMEOUT_SECONDS = 30
 TELEMETRY_LOAD_DEADLINE_SECONDS = 90
 _SECRET_KEY = re.compile(rf"(?i){_SECRET_NAME}")
+# EnvVar names use bare segments the inline pattern misses (API_SERVER_KEY,
+# LITELLM_MASTER_KEY); match credential words as whole underscore segments.
+_ENV_SECRET_NAME = re.compile(
+    r"(?i)(?:^|_)(key|token|secret|password|passwd|credential|auth)s?(?:_|$)"
+)
 
 
 @dataclass(frozen=True)
@@ -167,7 +172,9 @@ def redact_kubernetes_evidence(value: object) -> str:
         if isinstance(item, dict):
             cleaned = {str(key): scrub(child) for key, child in item.items()}
             name = str(item.get("name") or "")
-            if "value" in cleaned and _SECRET_KEY.search(name):
+            if "value" in cleaned and (
+                _SECRET_KEY.search(name) or _ENV_SECRET_NAME.search(name)
+            ):
                 cleaned["value"] = "[REDACTED]"
             return cleaned
         if isinstance(item, list):

@@ -1,4 +1,4 @@
-"""Live Google Chat integration status and configuration handoff."""
+"""Google Chat integration: verdict, fix, milestones — all served by the API."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ st.caption(
 st.button("Refresh status", type="primary")
 client = portal_api(target)
 try:
-    with st.spinner("Checking the PlatformAgent and Google Chat backend…"):
+    with st.spinner("Checking the Google Chat integration…"):
         snapshot = client.inspect_google_chat_integration()
 except PortalApiError as exc:
     st.error(str(exc))
@@ -45,100 +45,75 @@ except PortalApiError as exc:
 
 status = str(snapshot.get("status") or "Verification incomplete")
 message = str(snapshot.get("message") or "No integration result was returned.")
+severity = str(snapshot.get("severity") or "warning")
 configuration = snapshot.get("configuration") or {}
-activity = snapshot.get("activity") or {}
-checks = list(snapshot.get("checks") or [])
+checks = [item for item in snapshot.get("checks") or [] if isinstance(item, dict)]
 evidence = list(snapshot.get("evidence") or [])
 
-session_count = activity.get("sessionCount")
-activity_truncated = bool(activity.get("truncated"))
-status_columns = st.columns(3)
-status_columns[0].metric("Backend", status)
-status_columns[1].metric(
-    "Delivery evidence",
-    (
-        "Unknown"
-        if session_count is None
-        else "None in sample"
-        if activity_truncated and session_count == 0
-        else f"{session_count}+ sessions"
-        if activity_truncated
-        else "None observed"
-        if session_count == 0
-        else f"{session_count} sessions"
-    ),
-)
-status_columns[2].metric(
-    "PlatformAgent", configuration.get("platformAgent") or "Unavailable"
-)
+# The service decides what is wrong and what to do; this page only renders.
+banner = {
+    "success": st.success,
+    "info": st.info,
+    "warning": st.warning,
+    "error": st.error,
+}.get(severity, st.warning)
+passed_checks = [item for item in checks if item.get("status") == "passed"]
+open_checks = [item for item in checks if item.get("status") != "passed"]
 
-if status == "Backend ready":
-    st.success(message)
-elif status == "Disabled":
-    st.info(message)
-elif status == "Needs attention":
-    st.error(message)
-else:
-    st.warning(message)
+# With open items, their first entry carries the diagnosis; keep the banner
+# to the verdict so nothing is said twice.
+banner(f"**{status}**" if open_checks else f"**{status}** — {message}")
 
-if session_count == 0 and activity_truncated:
-    st.warning(
-        "No Google Chat event appears in the newest 500 sessions. The result "
-        "is partial, so older events in the 30-day window may exist."
-    )
-elif session_count == 0 and status == "Backend ready":
-    st.info(
-        "No Google Chat event was observed in the last 30 days. Confirm the "
-        "Chat app topic below, send a message, then refresh status."
-    )
-elif isinstance(session_count, int) and session_count > 0:
-    latest_at = str(activity.get("latestAt") or "")
-    qualifier = "at least " if activity_truncated else ""
-    st.caption(
-        f"Observed {qualifier}{session_count} Google Chat session"
-        f"{'s' if session_count != 1 else ''}; latest activity {latest_at}."
-    )
+next_steps = [
+    item for item in snapshot.get("nextSteps") or [] if isinstance(item, dict)
+]
+if next_steps:
+    st.subheader("Next step")
+    for index, action in enumerate(next_steps):
+        text = str(action.get("text") or "")
+        if text and index == 0:
+            st.warning(text)
+        elif text:
+            st.markdown(text)
+        copy_value = str(action.get("copy") or "")
+        if copy_value:
+            st.code(copy_value, language="text")
 
-topic_path = str(configuration.get("topicPath") or "")
-if configuration.get("enabled") and topic_path:
-    st.subheader("Google Chat setup")
-    st.write(
-        "Set the Chat app connection to **Cloud Pub/Sub** with this topic:"
-    )
-    st.code(topic_path, language="text")
-    configuration_url = str(configuration.get("configurationUrl") or "")
-    if configuration_url:
-        st.link_button(
-            "Open Google Chat configuration",
-            configuration_url,
-            icon=":material/open_in_new:",
+if passed_checks:
+    with st.expander(f"✅ {len(passed_checks)} steps completed"):
+        st.markdown(
+            "  \n".join(
+                f"✅ {item.get('label') or item.get('id')}"
+                for item in passed_checks
+            )
         )
-    st.caption(
-        "Backend ready does not prove this separate Google Chat setting was saved."
-    )
+
+icons = {"failed": "❌", "unknown": "❓", "not_observed": "◻️"}
+for index, item in enumerate(open_checks):
+    icon = icons.get(str(item.get("status")), "❓")
+    st.markdown(f"{icon} **{item.get('label') or item.get('id')}**")
+    if index == 0:
+        detail = str(item.get("detail") or "")
+        if detail:
+            st.markdown(detail)
+        actions = list(item.get("actions") or [])
+        if actions:
+            st.markdown("**What to do:**")
+            for action in actions:
+                text = str(action.get("text") or "")
+                if text:
+                    st.markdown(text)
+                copy_value = str(action.get("copy") or "")
+                if copy_value:
+                    st.code(copy_value, language="text")
 
 if checks:
-    status_label = {
-        "passed": "Passed",
-        "failed": "Failed",
-        "unknown": "Could not verify",
-        "not_observed": "Not observed",
-    }
-    passed = sum(item.get("status") == "passed" for item in checks)
-    unresolved = sum(
-        item.get("status") in {"failed", "unknown"} for item in checks
-    )
-    check_summary = f"Live checks · {passed} passed"
-    if unresolved:
-        check_summary += f" · {unresolved} need attention"
-    with st.expander(check_summary, expanded=unresolved > 0):
+    with st.expander("Check details"):
         st.dataframe(
             [
                 {
                     "Check": str(item.get("label") or item.get("id") or "Check"),
-                    "Result": status_label.get(
-                        str(item.get("status") or "unknown"), "Could not verify"
-                    ),
+                    "Result": str(item.get("status") or "unknown"),
                     "Detail": str(item.get("detail") or ""),
                 }
                 for item in checks
@@ -151,12 +126,15 @@ if checks:
                 "Detail": st.column_config.TextColumn(width="large"),
             },
         )
-else:
-    st.caption("No checks were returned.")
 
 if configuration:
     with st.expander("Integration details"):
         left, right = st.columns(2)
+        left.caption("Topic")
+        left.code(
+            str(configuration.get("topicPath") or "Not configured"),
+            language="text",
+        )
         left.caption("Subscription")
         left.code(
             str(configuration.get("subscriptionPath") or "Not configured"),
@@ -184,17 +162,17 @@ if configuration:
         right.caption("Home channel")
         right.write(str(configuration.get("homeChannel") or "Not configured"))
 
+
 @st.fragment
 def raw_evidence_section() -> None:
-    st.divider()
-    st.subheader("Raw evidence")
-    st.caption(
-        "Commands and responses used for the backend checks. Credential-shaped "
-        "Kubernetes values are redacted."
-    )
-    if st.toggle("Show raw evidence", value=False):
-        for item in evidence:
-            render_command_evidence(item, expanded=True)
+    with st.expander("Raw evidence"):
+        st.caption(
+            "Commands and responses used for the checks. Credential-shaped "
+            "Kubernetes values are redacted."
+        )
+        if st.toggle("Show raw evidence", value=False):
+            for item in evidence:
+                render_command_evidence(item, expanded=True)
 
 
 raw_evidence_section()

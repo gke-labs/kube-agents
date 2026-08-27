@@ -83,6 +83,10 @@ class FakeKube:
         )
 
 
+STRAY_TOPIC_PATH = f"projects/{TARGET.project_id}/topics/hermes-chat-events"
+QUIET_TOPIC_PATH = f"projects/{TARGET.project_id}/topics/unrelated-events"
+
+
 class FakeCloud:
     def __init__(
         self,
@@ -90,10 +94,12 @@ class FakeCloud:
         conditional_publisher: bool = False,
         omit_subscriber: bool = False,
         push_subscription: bool = False,
+        stray_topic: bool = False,
     ) -> None:
         self.conditional_publisher = conditional_publisher
         self.omit_subscriber = omit_subscriber
         self.push_subscription = push_subscription
+        self.stray_topic = stray_topic
         self.calls: list[list[str]] = []
 
     def run(self, arguments: list[str], *, timeout: int = 15):
@@ -107,9 +113,29 @@ class FakeCloud:
                 {"config": {"name": "pubsub.googleapis.com"}},
                 {"config": {"name": "gsuiteaddons.googleapis.com"}},
             ]
+        elif command[:3] == ("pubsub", "topics", "list"):
+            names = [TOPIC_PATH]
+            if self.stray_topic:
+                names.extend([STRAY_TOPIC_PATH, QUIET_TOPIC_PATH])
+            payload = [{"name": name} for name in names]
         elif command[:3] == ("pubsub", "topics", "describe"):
             payload = {"name": TOPIC_PATH}
         elif command[:3] == ("pubsub", "topics", "get-iam-policy"):
+            if command[3] == STRAY_TOPIC_PATH:
+                payload = {
+                    "bindings": [
+                        {
+                            "role": "roles/pubsub.publisher",
+                            "members": [
+                                "serviceAccount:chat-api-push@"
+                                "system.gserviceaccount.com"
+                            ],
+                        }
+                    ]
+                }
+                return CommandResult(0, stdout=json.dumps(payload))
+            if command[3] == QUIET_TOPIC_PATH:
+                return CommandResult(0, stdout=json.dumps({"bindings": []}))
             members = [
                 "serviceAccount:chat-api-push@system.gserviceaccount.com"
             ]
@@ -159,13 +185,19 @@ class FakeCloud:
 
 
 class FakeRuntime:
-    def __init__(self, conversations=()) -> None:
+    def __init__(
+        self, conversations=(), *, truncated: bool = False, error=None
+    ) -> None:
         self.conversations = conversations
+        self.truncated = truncated
+        self.error = error
 
     def list_conversations(self, agent, *, cutoff, limit=200):
+        if self.error is not None:
+            raise self.error
         return SimpleNamespace(
             conversations=self.conversations,
-            truncated=False,
+            truncated=self.truncated,
         )
 
 
@@ -179,7 +211,8 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
             runtime=FakeRuntime(),
         ).inspect()
 
-        self.assertEqual(snapshot["status"], "Backend ready")
+        self.assertEqual(snapshot["status"], "Ready")
+        self.assertEqual(snapshot["severity"], "info")
         self.assertEqual(snapshot["configuration"]["topicPath"], TOPIC_PATH)
         self.assertEqual(
             snapshot["configuration"]["subscriptionPath"], SUBSCRIPTION_PATH
@@ -237,8 +270,8 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
             for check in snapshot["checks"]
             if check["status"] == "failed"
         }
-        self.assertIn("chat_publishers", failed)
-        self.assertIn("missing", failed["chat_publishers"]["detail"])
+        self.assertIn("topic_ready", failed)
+        self.assertIn("missing", failed["topic_ready"]["detail"])
 
     def test_push_subscription_is_not_accepted_as_agent_backend(self):
         snapshot = GoogleChatIntegrationService(
@@ -252,7 +285,7 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
         check = next(
             item
             for item in snapshot["checks"]
-            if item["id"] == "subscription_delivery_type"
+            if item["id"] == "subscription_ready"
         )
         self.assertEqual(check["status"], "failed")
         self.assertIn("pull subscription", check["detail"])
@@ -272,7 +305,8 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
             runtime=runtime,
         ).inspect()
 
-        self.assertEqual(snapshot["status"], "Backend ready")
+        self.assertEqual(snapshot["status"], "Ready")
+        self.assertEqual(snapshot["severity"], "success")
         self.assertEqual(snapshot["activity"]["sessionCount"], 1)
         self.assertEqual(
             snapshot["activity"]["latestAt"], last_active.isoformat()
@@ -296,12 +330,163 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
         check = next(
             item
             for item in snapshot["checks"]
-            if item["id"] == "agent_subscriber"
+            if item["id"] == "subscription_ready"
         )
         self.assertEqual(snapshot["status"], "Needs attention")
         self.assertEqual(check["status"], "failed")
         self.assertIn("missing", check["detail"])
         self.assertNotIn("can consume", check["detail"])
+
+    def test_zero_delivery_with_stray_chat_topic_names_the_root_cause(self):
+        cloud = FakeCloud(stray_topic=True)
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents()),
+            cloud=cloud,
+            runtime=FakeRuntime(),
+        ).inspect()
+
+        self.assertEqual(snapshot["status"], "Not receiving messages")
+        self.assertEqual(snapshot["severity"], "error")
+        self.assertIn("hermes-chat-events", snapshot["message"])
+        self.assertEqual(
+            snapshot["configuration"]["strayChatTopics"], [STRAY_TOPIC_PATH]
+        )
+        console_check = next(
+            item
+            for item in snapshot["checks"]
+            if item["id"] == "chat_console_topic"
+        )
+        self.assertEqual(console_check["status"], "failed")
+        self.assertFalse(console_check["required"])
+        self.assertIn("hermes-chat-events", console_check["detail"])
+        self.assertNotIn("unrelated-events", console_check["detail"])
+        copy_values = [
+            action.get("copy")
+            for action in console_check["actions"]
+            if action.get("copy")
+        ]
+        self.assertIn(TOPIC_PATH, copy_values)
+
+    def test_zero_delivery_without_stray_topics_reports_unverifiable_console(
+        self,
+    ):
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents()),
+            cloud=FakeCloud(),
+            runtime=FakeRuntime(),
+        ).inspect()
+
+        console_check = next(
+            item
+            for item in snapshot["checks"]
+            if item["id"] == "chat_console_topic"
+        )
+        self.assertEqual(console_check["status"], "unknown")
+        self.assertEqual(snapshot["status"], "Ready")
+        self.assertEqual(snapshot["severity"], "info")
+        copy_values = [
+            action.get("copy")
+            for action in console_check["actions"]
+            if action.get("copy")
+        ]
+        self.assertIn(TOPIC_PATH, copy_values)
+        self.assertEqual(snapshot["configuration"]["strayChatTopics"], [])
+
+    def test_observed_delivery_confirms_console_topic_without_stray_reads(self):
+        cloud = FakeCloud(stray_topic=True)
+        runtime = FakeRuntime(
+            (
+                SimpleNamespace(
+                    platform="google_chat",
+                    last_active=datetime(2026, 8, 19, 20, tzinfo=UTC),
+                ),
+            )
+        )
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents()),
+            cloud=cloud,
+            runtime=runtime,
+        ).inspect()
+
+        console_check = next(
+            item
+            for item in snapshot["checks"]
+            if item["id"] == "chat_console_topic"
+        )
+        self.assertEqual(console_check["status"], "passed")
+        self.assertEqual(snapshot["configuration"]["strayChatTopics"], [])
+        stray_reads = [
+            arguments
+            for arguments in cloud.calls
+            if STRAY_TOPIC_PATH in arguments
+        ]
+        self.assertEqual(stray_reads, [])
+
+    def test_failed_activity_read_is_not_reported_as_silence(self):
+        from admin_console.agent_runtime import AgentRuntimeError
+
+        cloud = FakeCloud(stray_topic=True)
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents()),
+            cloud=cloud,
+            runtime=FakeRuntime(error=AgentRuntimeError("gateway pod down")),
+        ).inspect()
+
+        self.assertEqual(snapshot["status"], "Verification incomplete")
+        console_check = next(
+            item
+            for item in snapshot["checks"]
+            if item["id"] == "chat_console_topic"
+        )
+        self.assertEqual(console_check["status"], "unknown")
+        self.assertNotIn("No Google Chat message has arrived", snapshot["message"])
+        stray_reads = [
+            arguments
+            for arguments in cloud.calls
+            if STRAY_TOPIC_PATH in arguments
+        ]
+        self.assertEqual(stray_reads, [])
+
+    def test_truncated_empty_activity_read_is_not_reported_as_silence(self):
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents()),
+            cloud=FakeCloud(stray_topic=True),
+            runtime=FakeRuntime(truncated=True),
+        ).inspect()
+
+        self.assertEqual(snapshot["status"], "Verification incomplete")
+        console_check = next(
+            item
+            for item in snapshot["checks"]
+            if item["id"] == "chat_console_topic"
+        )
+        self.assertEqual(console_check["status"], "unknown")
+
+    def test_env_credential_names_are_redacted_in_evidence(self):
+        payload = platform_agents()
+        payload["items"][0]["spec"]["deployment"] = {
+            "env": [
+                {"name": "API_SERVER_KEY", "value": "gateway-key-literal"},
+                {"name": "LITELLM_MASTER_KEY", "value": "master-key-literal"},
+                {"name": "LOG_LEVEL", "value": "debug"},
+            ]
+        }
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(payload),
+            cloud=FakeCloud(),
+            runtime=FakeRuntime(),
+        ).inspect()
+
+        stdout = snapshot["evidence"][0]["stdout"]
+        self.assertNotIn("gateway-key-literal", stdout)
+        self.assertNotIn("master-key-literal", stdout)
+        self.assertIn("debug", stdout)
 
     def test_kubernetes_read_failure_is_not_reported_as_missing_resource(self):
         snapshot = GoogleChatIntegrationService(
