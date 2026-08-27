@@ -993,10 +993,13 @@ class IamGrantsTest(unittest.TestCase):
     def _reader_policy(self, members):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
-    def _project_policy(self, prow_roles=None, conditional_roles=()):
-        """The project's own policy, granting the Prow runner every role it needs."""
-        roles = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
-        bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(roles)]
+    def _project_policy(self, project_id="kube-agents-evals-3", prow_roles=None, platform_roles=None, conditional_roles=()):
+        """The project's own policy: both identities holding exactly what they should."""
+        prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
+        platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
+        platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+        bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(prow)]
+        bindings += [{"role": r, "members": [platform_member]} for r in sorted(platform)]
         bindings += [
             {
                 "role": r,
@@ -1030,7 +1033,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-2")),
-                _ok(self._project_policy()),
+                _ok(self._project_policy("kube-agents-evals-2")),
                 _ok(self._reader_policy(["serviceAccount:123456-compute@developer.gserviceaccount.com"])),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-2", "123456")
@@ -1055,7 +1058,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-6")),
-                _ok(self._project_policy(prow_roles=without_container_admin)),
+                _ok(self._project_policy("kube-agents-evals-6", prow_roles=without_container_admin)),
                 _ok(self._both_build_identities()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
@@ -1070,6 +1073,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-6")),
                 _ok(
                     self._project_policy(
+                        "kube-agents-evals-6",
                         prow_roles=checker.PROW_RUNNER_ROLES - {"roles/container.admin"},
                         conditional_roles={"roles/container.admin"},
                     )
@@ -1091,6 +1095,50 @@ class IamGrantsTest(unittest.TestCase):
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
+
+    def test_platform_gsa_missing_role_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    platform_roles=checker.PLATFORM_GSA_ROLES - {"roles/container.viewer"})),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.viewer" in d for d in result.details), result.details)
+
+    def test_platform_gsa_extra_admin_role_fails(self):
+        # The drift the swap on 2026-08-26 cleared: projects provisioned before
+        # the module narrowed kept container.admin, so the agent under test could
+        # write to the shared fleet on half the pool.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    platform_roles=checker.PLATFORM_GSA_ROLES | {"roles/container.admin"})),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+
+class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
+    """PLATFORM_GSA_ROLES must equal the module default it duplicates.
+
+    Hardcoding the eight roles is what lets this check run without a Terraform
+    toolchain, and it is also how the two drift apart. Without this test,
+    narrowing the module would leave every correctly-provisioned project failing
+    verification weeks later, with nothing pointing at the module as the cause.
+    """
+
+    def test_matches_variables_tf_default(self):
+        tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()
+        block = re.search(r'variable\s+"project_roles".*?default\s*=\s*\[(.*?)\]', tf, re.S)
+        self.assertIsNotNone(block, "could not find the project_roles default in variables.tf")
+        declared = set(re.findall(r'"(roles/[^"]+)"', block.group(1)))
+        self.assertEqual(declared, checker.PLATFORM_GSA_ROLES)
 
 
 class ExitStatusTest(unittest.TestCase):

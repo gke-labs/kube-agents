@@ -170,6 +170,29 @@ PROW_RUNNER_ROLES = {
     "roles/viewer",
 }
 
+# The agent's own identity, checked in both directions -- a missing role fails
+# and so does an extra one, unlike the Prow runner above. That account is
+# infrastructure and a superset is harmless; this one is the subject under test,
+# where an extra role means a case passed on the grant rather than on the agent.
+# Boskos leases at random, so one over-privileged project is a one-in-six flake.
+#
+# This duplicates the `project_roles` default in
+# terraform/modules/kube-agents-iam/variables.tf, which is the source of truth --
+# a test asserts the two are equal, so narrowing the module fails in CI here
+# rather than failing correctly-provisioned projects weeks later.
+PLATFORM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
+
+PLATFORM_GSA_ROLES = {
+    "roles/container.clusterViewer",
+    "roles/container.viewer",
+    "roles/compute.viewer",
+    "roles/monitoring.viewer",
+    "roles/logging.viewer",
+    "roles/iam.serviceAccountUser",
+    "roles/iam.securityReviewer",
+    "roles/mcp.toolUser",
+}
+
 
 class CheckResult:
     def __init__(
@@ -415,7 +438,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the Prow runner's roles, and the cross-project AR reader grants."""
+    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, and the cross-project AR reader grants."""
     details = []
     passed = True
 
@@ -454,15 +477,23 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     else:
         try:
             policy = _load_json(out)
-            held = set()
+            platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+            prow_held = set()
+            platform_held = set()
             for b in policy.get("bindings", []):
                 # A conditional binding grants nothing outside its condition, so
                 # counting it would pass a project the runner still cannot use.
+                # For the platform GSA the same skip errs the safe way: an
+                # unconditional extra role is what makes the agent write-capable.
                 if b.get("condition"):
                     continue
-                if PROW_RUNNER_MEMBER in b.get("members", []):
-                    held.add(b.get("role"))
-            missing = PROW_RUNNER_ROLES - held
+                members = b.get("members", [])
+                if PROW_RUNNER_MEMBER in members:
+                    prow_held.add(b.get("role"))
+                if platform_member in members:
+                    platform_held.add(b.get("role"))
+
+            missing = PROW_RUNNER_ROLES - prow_held
             if missing:
                 passed = False
                 details.append(
@@ -470,6 +501,28 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
                     "A presubmit authenticates as this account after leasing the project, so it "
                     "will fail on the first gcloud call rather than at registration"
+                )
+
+            platform_missing = PLATFORM_GSA_ROLES - platform_held
+            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            if platform_missing:
+                passed = False
+                details.append(
+                    f"The platform agent GSA is missing {len(platform_missing)} role(s) on "
+                    f"{project_id}: {', '.join(sorted(platform_missing))}. The agent under test "
+                    "authenticates as this account, so eval cases on this project fail on a "
+                    "credential the agent lacks rather than on the agent's reasoning"
+                )
+            if platform_extra:
+                passed = False
+                details.append(
+                    f"The platform agent GSA holds {len(platform_extra)} role(s) on {project_id} "
+                    f"beyond the read-only set: {', '.join(sorted(platform_extra))}. What they "
+                    "grant is not inspected -- the set is closed because the agent is the subject "
+                    "under test and Boskos leases at random, so any project that differs grades "
+                    "differently. Swap them per "
+                    "docs/site/src/content/docs/reference/security-and-iam.md -- re-running the "
+                    "install does not strip roles it no longer grants"
                 )
         except Exception as exc:
             passed = False
@@ -509,7 +562,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     return CheckResult(
         "Service Accounts & IAM Grants",
         passed,
-        "Workload Identity, Prow runner roles and cross-project AR reader grants verified"
+        "Workload Identity, Prow runner and platform GSA project roles, and cross-project AR reader grants verified"
         if passed
         else "IAM requirements missing",
         details=details,
