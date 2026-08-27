@@ -10,6 +10,7 @@ from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterio
 from cuj.utils.interaction import (
     projected_records,
     projected_tasks,
+    substantive_output,
     tool_operations,
     unnormalized_tool_calls,
 )
@@ -343,7 +344,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and created_at <= top_start
         and top_start + JOB_DURATION <= created_at + PLANNING_HORIZON
     )
-    final_output = str(interaction.get("output") or "")
+    final_output = substantive_output(interaction)
     recommended_in_output = (
         bool(top)
         and str(top.get("zone") or "") in final_output
