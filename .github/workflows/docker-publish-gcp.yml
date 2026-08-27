@@ -46,7 +46,7 @@ jobs:
         run: |
           gcloud builds submit \
             --config=deploy/docker/cloudbuild.yaml \
-            --substitutions="_IMAGE_URI=$GCP_REGISTRY/platform-agent:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG" \
+            --substitutions="_IMAGE_URI=$GCP_REGISTRY/platform-agent:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_BUILDCACHE_URI=$GCP_REGISTRY/platform-agent:buildcache" \
             .
           DIGEST=$(gcloud artifacts docker images describe "$GCP_REGISTRY/platform-agent:$GITHUB_SHA" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
@@ -67,7 +67,7 @@ jobs:
         run: |
           gcloud builds submit \
             --config=deploy/docker/cloudbuild.yaml \
-            --substitutions="_IMAGE_URI=$GCP_REGISTRY/credential-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG" \
+            --substitutions="_IMAGE_URI=$GCP_REGISTRY/credential-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_BUILDCACHE_URI=$GCP_REGISTRY/credential-proxy:buildcache" \
             .
           DIGEST=$(gcloud artifacts docker images describe "$GCP_REGISTRY/credential-proxy:$GITHUB_SHA" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"

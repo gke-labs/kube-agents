@@ -248,8 +248,11 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform
 # miss instead of cold-building. Default false so a broken cache source cannot
 # block the PR that fixes it.
 export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest}"
+# The postsubmit's mode=max cache manifests; CACHE_IMAGE stays the fallback.
+export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
+export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
 gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
+  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
   --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
 echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 

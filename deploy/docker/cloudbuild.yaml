@@ -28,6 +28,40 @@ steps:
       - "--build-arg"
       - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
       - "."
+  # Publish a mode=max build cache beside the image: inline cache above covers
+  # only the final image's layers, so presubmits re-ran every intermediate
+  # stage. Writing needs a container-driver builder; reading does not.
+  # Fail-open on purpose: empty _BUILDCACHE_URI or any failure skips with a
+  # warning, and presubmits fall back to the inline cache.
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ -z "$_BUILDCACHE_URI" ]; then
+          echo "no _BUILDCACHE_URI; skipping mode=max cache publish"
+          exit 0
+        fi
+        if ! docker buildx version >/dev/null 2>&1; then
+          echo "WARNING: buildx unavailable on this worker; skipping mode=max cache publish (consumers fall back to inline cache)"
+          exit 0
+        fi
+        docker buildx create --name cachepub --driver docker-container >/dev/null 2>&1 || true
+        docker buildx build --builder cachepub \
+          --platform linux/amd64 \
+          -f deploy/docker/Dockerfile \
+          --target "$_TARGET" \
+          --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          --cache-from "type=registry,ref=$_BUILDCACHE_URI" \
+          --cache-from "type=registry,ref=$_IMAGE_URI_LATEST" \
+          --cache-to "type=registry,ref=$_BUILDCACHE_URI,mode=max" \
+          . \
+          || echo "WARNING: mode=max cache publish failed; consumers fall back to inline cache"
+
+# The cache-publish step's cold case (first publish) outlives the 600s
+# default, and a build killed there never pushes `images:`.
+timeout: 3600s
+
 images:
   - "$_IMAGE_URI"
   - "$_IMAGE_URI_LATEST"
@@ -36,3 +70,4 @@ substitutions:
   _IMAGE_URI_LATEST: ""
   _TARGET: ""
   _HERMES_AGENT_TAG: ""
+  _BUILDCACHE_URI: ""

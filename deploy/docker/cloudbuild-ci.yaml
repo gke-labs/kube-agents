@@ -15,38 +15,39 @@
 # already in the daemon's cache and only the delta runs
 # (gke-labs/kube-agents#635).
 steps:
-  # Only platform's cache is seeded from the canonical postsubmit image
-  # maintained by .github/workflows/docker-publish-gcp.yml in kube-agents-prow.
-  # credential-proxy's own cache is not pulled: the step below inherits
-  # agent-base from the platform build on this worker, and pulling a second
-  # whole image to save the handful of instructions above that would cost far
-  # more than it saves.
-  - id: warm-cache
+  # No eager cache pull: BuildKit resolves --cache-from remotely and pulls
+  # only the blobs it needs; the old full pull cost 70-100s per presubmit.
+  # This probe just makes a missing cache loud, and fatal under
+  # _REQUIRE_CACHE — keyed on the platform sources alone, since a reachable
+  # proxy cache must not green a run whose platform build would go cold.
+  - id: cache-probe
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
     args:
       - "-c"
       - |
-        echo "Pulling cache image: $_CACHE_IMAGE"
-        max_attempts=3
-        attempt=1
-        pulled=false
-        until [ "$attempt" -gt "$max_attempts" ]; do
-          if docker pull "$_CACHE_IMAGE"; then
-            pulled=true
-            echo "✓ Cache image pulled successfully."
-            break
+        probe() {
+          docker manifest inspect "$1" >/dev/null 2>&1 && return 0
+          sleep 5
+          docker manifest inspect "$1" >/dev/null 2>&1
+        }
+        found=false
+        for ref in "$_BUILDCACHE_IMAGE" "$_CACHE_IMAGE"; do
+          [ -n "$ref" ] || continue
+          if probe "$ref"; then
+            echo "✓ platform cache source reachable: $ref"
+            found=true
+          else
+            echo "⚠ platform cache source missing or unreadable: $ref"
           fi
-          echo "⚠ Attempt $attempt/$max_attempts failed to pull $_CACHE_IMAGE."
-          if [ "$attempt" -lt "$max_attempts" ]; then
-            echo "Retrying in 5s..."
-            sleep 5
-          fi
-          attempt=$((attempt + 1))
         done
-
-        if [ "$pulled" != "true" ]; then
-          echo "WARNING: CACHE MISS — could not pull $_CACHE_IMAGE after $max_attempts attempts."
+        if [ -n "$_PROXY_BUILDCACHE_IMAGE" ]; then
+          probe "$_PROXY_BUILDCACHE_IMAGE" \
+            && echo "✓ proxy cache source reachable: $_PROXY_BUILDCACHE_IMAGE" \
+            || echo "⚠ proxy cache source missing or unreadable (informational): $_PROXY_BUILDCACHE_IMAGE"
+        fi
+        if [ "$found" != "true" ]; then
+          echo "WARNING: CACHE MISS — no cache source is reachable."
           echo "Check that docker-publish-gcp.yml is green on main and that Cloud Build"
           echo "holds roles/artifactregistry.reader on kube-agents-prow."
           if [ "$_REQUIRE_CACHE" = "true" ]; then
@@ -64,9 +65,17 @@ steps:
     args:
       - "-c"
       - |
+        # Best source first: the postsubmit's mode=max buildcache covers the
+        # intermediate stages inline cache cannot; :latest is the fallback.
+        # BARE refs on purpose — a pre-buildx CLI comma-splits the extended
+        # `type=registry,ref=…` form into garbage and silently imports
+        # nothing, while a bare ref works on every CLI generation.
         CACHE_ARGS=()
+        if [ -n "$_BUILDCACHE_IMAGE" ]; then
+          CACHE_ARGS+=(--cache-from "$_BUILDCACHE_IMAGE")
+        fi
         if [ -n "$_CACHE_IMAGE" ]; then
-          CACHE_ARGS=(--cache-from "$_CACHE_IMAGE")
+          CACHE_ARGS+=(--cache-from "$_CACHE_IMAGE")
         fi
 
         # Deployment targets are always amd64 GKE nodes; the multi-arch bases
@@ -80,28 +89,32 @@ steps:
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
           .
 
-  # No --cache-from and no waitFor: this runs straight after platform on the
-  # same worker, which is the entire point of collapsing the submits. What it
-  # inherits is agent-base, the ancestor the two images share -- it does not
-  # build on the platform image itself, and has not since the proxy-tools stage
-  # landed.
+  # No waitFor: this runs straight after platform on the same worker, which is
+  # the entire point of collapsing the submits. What it inherits locally is
+  # agent-base, the ancestor the two images share -- it does not build on the
+  # platform image itself, and has not since the proxy-tools stage landed. Its
+  # buildcache ref covers the proxy-only stages the daemon state cannot.
   - id: credential-proxy
     name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
     env:
       - "DOCKER_BUILDKIT=1"
     args:
-      - "build"
-      - "--platform"
-      - "linux/amd64"
-      - "-t"
-      - "$_PROXY_URI"
-      - "-f"
-      - "deploy/docker/Dockerfile"
-      - "--target"
-      - "credential-proxy"
-      - "--build-arg"
-      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
-      - "."
+      - "-c"
+      - |
+        # Bare ref for the same pre-buildx-CLI reason as the platform step.
+        CACHE_ARGS=()
+        if [ -n "$_PROXY_BUILDCACHE_IMAGE" ]; then
+          CACHE_ARGS+=(--cache-from "$_PROXY_BUILDCACHE_IMAGE")
+        fi
+        docker build \
+          --platform linux/amd64 \
+          -t "$_PROXY_URI" \
+          "$${CACHE_ARGS[@]}" \
+          -f deploy/docker/Dockerfile \
+          --target credential-proxy \
+          --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          .
 
   # k8s-operator/Dockerfile shares no stage with the agent images, so it starts
   # immediately instead of queueing behind them. It is much the shorter build
@@ -145,5 +158,7 @@ substitutions:
   _PROXY_URI: ""
   _OPERATOR_URI: ""
   _CACHE_IMAGE: ""
+  _BUILDCACHE_IMAGE: ""
+  _PROXY_BUILDCACHE_IMAGE: ""
   _HERMES_AGENT_TAG: ""
   _REQUIRE_CACHE: "false"
