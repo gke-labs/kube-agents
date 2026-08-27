@@ -448,7 +448,8 @@ fi
 # Paths are relative to BENCH_DIR, which is where devops-bench runs. Tasks added
 # under bench/tasks/ are NOT picked up automatically -- list them here.
 BENCH_DIR="${SCRIPT_DIR}/../bench"
-# agent-kanban-smoke is deployer: noop, so it adds seconds, not a cluster.
+# agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
+# (~100-300s), not a cluster.
 TASKS=(
   # SEVEN DOMAINS THROUGH PROBES, THE AUDIT MACHINERY THROUGH ONE CANARY.
   # The 2026-08-26 smoke run (build 2092638061140643840, kube-agents-evals-3)
