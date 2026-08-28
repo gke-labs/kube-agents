@@ -137,9 +137,14 @@ resource "null_resource" "incident" {
       # A plain get-credentials is the right call and needs no DNS-endpoint
       # handling: it is exactly what hack/ci-eval-pr.sh does for this same
       # cluster and what GCPProvider does for every other stack.
-      KUBECONFIG="$(mktemp)"
+      # A directory, not `mktemp` on its own: get-credentials refuses to load an
+      # existing empty file, so it warns, writes a dated `.backup` beside it that
+      # nothing then cleans up, and prints a WARNING that reads like a failure in
+      # a CI log. Handing it a path that does not exist yet skips all three.
+      kubeconfig_dir="$(mktemp -d)"
+      trap 'rm -rf "$kubeconfig_dir"' EXIT
+      KUBECONFIG="$kubeconfig_dir/config"
       export KUBECONFIG
-      trap 'rm -f "$KUBECONFIG"' EXIT
 
       project="${var.project_id}"
       if [ -z "$project" ]; then
@@ -284,9 +289,14 @@ resource "null_resource" "incident" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
-      KUBECONFIG="$(mktemp)"
+      # A directory, not `mktemp` on its own: get-credentials refuses to load an
+      # existing empty file, so it warns, writes a dated `.backup` beside it that
+      # nothing then cleans up, and prints a WARNING that reads like a failure in
+      # a CI log. Handing it a path that does not exist yet skips all three.
+      kubeconfig_dir="$(mktemp -d)"
+      trap 'rm -rf "$kubeconfig_dir"' EXIT
+      KUBECONFIG="$kubeconfig_dir/config"
       export KUBECONFIG
-      trap 'rm -f "$KUBECONFIG"' EXIT
 
       project="${self.triggers.host_project}"
       if [ -z "$project" ]; then
