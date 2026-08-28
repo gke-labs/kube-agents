@@ -30,6 +30,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -2223,6 +2224,99 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	expectedMetricsVerbs := []string{"get", "list"}
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
+	}
+}
+
+// ruleHasWriteVerbs reports whether a rule carries any verb beyond the
+// read set (get/list/watch).
+func ruleHasWriteVerbs(rule rbacv1.PolicyRule) bool {
+	for _, v := range rule.Verbs {
+		if v != "get" && v != "list" && v != "watch" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildMinimalPlatformRoleReadOnlyByDefault(t *testing.T) {
+	// nil Security, nil AllowMutations and an explicit false must all produce
+	// the identical read-only role: the field defaulting to off IS the
+	// backwards-compatibility guarantee for every pre-existing install.
+	cases := map[string]*agentv1alpha1.SecuritySpec{
+		"nil security":       nil,
+		"nil allowMutations": {},
+		"explicit false":     {AllowMutations: ptr.To(false)},
+	}
+	for name, security := range cases {
+		t.Run(name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					AgentSpec: agentv1alpha1.AgentSpec{Security: security},
+				},
+			}
+
+			role := buildMinimalPlatformRole(agent)
+			if len(role.Rules) != 8 {
+				t.Fatalf("expected the 8 read-only PolicyRules, got %d", len(role.Rules))
+			}
+			for i, rule := range role.Rules {
+				if ruleHasWriteVerbs(rule) {
+					t.Errorf("rule %d carries write verbs %v without mutation mode", i, rule.Verbs)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildMinimalPlatformRoleMutationMode(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{AllowMutations: ptr.To(true)},
+			},
+		},
+	}
+
+	role := buildMinimalPlatformRole(agent)
+	if len(role.Rules) != 8+6 {
+		t.Fatalf("expected 8 read rules + 6 mutation rules, got %d", len(role.Rules))
+	}
+
+	writeVerbs := []string{"create", "update", "patch", "delete"}
+	for i, rule := range role.Rules[8:] {
+		if !slices.Equal(rule.Verbs, writeVerbs) {
+			t.Errorf("mutation rule %d: expected Verbs %v, got %v", i, writeVerbs, rule.Verbs)
+		}
+	}
+
+	// The write rule for the core group must cover the workload resources and
+	// nothing identity-shaped.
+	coreWrite := role.Rules[8]
+	expectedCoreWrite := []string{"namespaces", "pods", "services", "persistentvolumeclaims", "configmaps"}
+	if !slices.Equal(coreWrite.Resources, expectedCoreWrite) {
+		t.Errorf("expected core write Resources %v, got %v", expectedCoreWrite, coreWrite.Resources)
+	}
+
+	// The boundaries mutation mode exists to keep: no secrets anywhere in the
+	// role with any verb, and no write verb on serviceaccounts, nodes, or
+	// anything in the RBAC API group.
+	for i, rule := range role.Rules {
+		if slices.Contains(rule.Resources, "secrets") || slices.Contains(rule.Resources, "*") {
+			t.Errorf("rule %d grants secrets (or a wildcard covering them): %v", i, rule.Resources)
+		}
+		if slices.Contains(rule.APIGroups, "rbac.authorization.k8s.io") || slices.Contains(rule.APIGroups, "*") {
+			t.Errorf("rule %d touches the RBAC API group: %v", i, rule.APIGroups)
+		}
+		if !ruleHasWriteVerbs(rule) {
+			continue
+		}
+		for _, res := range []string{"serviceaccounts", "nodes"} {
+			if slices.Contains(rule.Resources, res) {
+				t.Errorf("rule %d grants write verbs on %s: %v %v", i, res, rule.Resources, rule.Verbs)
+			}
+		}
 	}
 }
 

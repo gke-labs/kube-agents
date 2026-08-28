@@ -399,6 +399,68 @@ func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
 	}
 }
 
+// TestReconcileRBAC_MutationModeToggle covers the flip in both directions on a
+// LIVE ClusterRole, not just the builder: applyManaged reconciles the role by
+// server-side apply, whose rules list is atomic, so turning the field off must
+// leave a read-only role behind rather than the union of both reconciles.
+func TestReconcileRBAC_MutationModeToggle(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{AllowMutations: ptr.To(true)},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRBAC with mutation mode on failed: %v", err)
+	}
+
+	role := &rbacv1.ClusterRole{}
+	roleKey := types.NamespacedName{Name: "kubeagents:minimal:test-ns:test-agent"}
+	if err := cl.Get(context.Background(), roleKey, role); err != nil {
+		t.Fatalf("failed to get minimal ClusterRole: %v", err)
+	}
+
+	hasWriteVerbs := func(role *rbacv1.ClusterRole) bool {
+		for _, rule := range role.Rules {
+			for _, v := range rule.Verbs {
+				if v == "create" || v == "update" || v == "patch" || v == "delete" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if !hasWriteVerbs(role) {
+		t.Fatalf("expected write verbs with mutation mode on, got rules: %v", role.Rules)
+	}
+	for i, rule := range role.Rules {
+		for _, res := range rule.Resources {
+			if res == "secrets" {
+				t.Errorf("rule %d grants secrets even in mutation mode: %v", i, rule)
+			}
+		}
+	}
+
+	// Flip the toggle off and reconcile again: the live role must revert.
+	agent.Spec.Security.AllowMutations = ptr.To(false)
+	if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRBAC with mutation mode off failed: %v", err)
+	}
+	if err := cl.Get(context.Background(), roleKey, role); err != nil {
+		t.Fatalf("failed to get minimal ClusterRole after toggle off: %v", err)
+	}
+	if hasWriteVerbs(role) {
+		t.Errorf("expected the role to revert to read-only after toggling mutation mode off, got rules: %v", role.Rules)
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 

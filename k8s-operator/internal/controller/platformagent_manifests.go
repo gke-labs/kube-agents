@@ -3385,9 +3385,26 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 }
 
-// buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
+// mutationModeEnabled reports whether the agent asked for Kubernetes workload
+// mutation (spec.security.allowMutations). Nil means false: read-only is the
+// behaviour every install had before the field existed.
+func mutationModeEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return agent.Spec.Security != nil &&
+		agent.Spec.Security.AllowMutations != nil &&
+		*agent.Spec.Security.AllowMutations
+}
+
+// buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest.
+//
+// With spec.security.allowMutations set, the write rules from
+// buildMutationRules are appended; the read rules below are the role either
+// way. The role is reconciled by server-side apply with ForceOwnership
+// (applyManaged), and a ClusterRole's rules list is atomic under apply, so
+// every reconcile rewrites the whole list — flipping the field off reverts a
+// live role to read-only on the next pass instead of leaving the write verbs
+// behind.
 func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
+	role := &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
 			Kind:       "ClusterRole",
@@ -3436,6 +3453,64 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 				Resources: []string{"customresourcedefinitions"},
 				Verbs:     []string{"get", "list", "watch"},
 			},
+		},
+	}
+
+	if mutationModeEnabled(agent) {
+		role.Rules = append(role.Rules, buildMutationRules()...)
+	}
+
+	return role
+}
+
+// buildMutationRules is the extra verb set mutation mode grants: write verbs
+// on the workload resources the read-only rules above already cover, and
+// nothing else. The boundary is deliberate and mirrors what the admission
+// backstop (config/admission/agent-rbac-policy.yaml) refuses for overlay RBAC:
+//
+//   - No Secrets, with any verb. A read on Secrets is a credential
+//     exfiltration path (ServiceAccount tokens, app credentials), so the
+//     read-only ceiling excludes them and mutation mode keeps excluding them.
+//   - No writes on ServiceAccounts, Nodes, or RBAC objects. Any of these turns
+//     "can edit a Deployment" into "can become another identity": a writable
+//     ServiceAccount plus a pod spec is a token for that ServiceAccount, and a
+//     writable RoleBinding is a grant of anything at all.
+//
+// Mutation mode widens what the agent can do to workloads, not who the agent
+// can become. Anything beyond this set is a hand-written role bound by the
+// customer's overlay, where pull-request review is the control.
+func buildMutationRules() []rbacv1.PolicyRule {
+	writeVerbs := []string{"create", "update", "patch", "delete"}
+	return []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{""},
+			Resources: []string{"namespaces", "pods", "services", "persistentvolumeclaims", "configmaps"},
+			Verbs:     writeVerbs,
+		},
+		{
+			APIGroups: []string{"apps"},
+			Resources: []string{"deployments", "statefulsets", "daemonsets", "replicasets"},
+			Verbs:     writeVerbs,
+		},
+		{
+			APIGroups: []string{"batch"},
+			Resources: []string{"jobs", "cronjobs"},
+			Verbs:     writeVerbs,
+		},
+		{
+			APIGroups: []string{"networking.k8s.io"},
+			Resources: []string{"networkpolicies", "ingresses"},
+			Verbs:     writeVerbs,
+		},
+		{
+			APIGroups: []string{"autoscaling"},
+			Resources: []string{"horizontalpodautoscalers"},
+			Verbs:     writeVerbs,
+		},
+		{
+			APIGroups: []string{"policy"},
+			Resources: []string{"poddisruptionbudgets"},
+			Verbs:     writeVerbs,
 		},
 	}
 }

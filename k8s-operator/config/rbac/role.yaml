@@ -8,6 +8,7 @@ rules:
       - ""
     resources:
       - configmaps
+      - namespaces
       - persistentvolumeclaims
       - pods
       - serviceaccounts
@@ -26,7 +27,6 @@ rules:
       - endpoints
       - events
       - limitranges
-      - namespaces
       - nodes
       - persistentvolumes
       - pods/log
@@ -47,15 +47,8 @@ rules:
       - apps
     resources:
       - daemonsets
-      - replicasets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - apps
-    resources:
       - deployments
+      - replicasets
       - statefulsets
     verbs:
       - create
@@ -76,8 +69,12 @@ rules:
     resources:
       - horizontalpodautoscalers
     verbs:
+      - create
+      - delete
       - get
       - list
+      - patch
+      - update
       - watch
   - apiGroups:
       - batch
@@ -85,8 +82,12 @@ rules:
       - cronjobs
       - jobs
     verbs:
+      - create
+      - delete
       - get
       - list
+      - patch
+      - update
       - watch
   - apiGroups:
       - coordination.k8s.io
@@ -169,13 +170,6 @@ rules:
       - networking.k8s.io
     resources:
       - ingresses
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - networking.k8s.io
-    resources:
       - networkpolicies
     verbs:
       - create

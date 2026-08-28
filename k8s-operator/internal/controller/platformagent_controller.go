@@ -163,6 +163,18 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// Mutation mode (spec.security.allowMutations) has buildMinimalPlatformRole grant write
+// verbs on the workload resources below, and RBAC escalation prevention means the operator
+// can only grant verbs it holds itself — so it holds them even on installs that never turn
+// the mode on. The markers stop where buildMutationRules stops: no secrets at all, and no
+// writes on serviceaccounts, nodes, or RBAC objects beyond what reconciliation itself needs.
+// pods/services/configmaps/persistentvolumeclaims, deployments/statefulsets,
+// networkpolicies and poddisruptionbudgets already carry write verbs above.
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=create;update;patch;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=create;update;patch;delete
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
