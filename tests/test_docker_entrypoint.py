@@ -115,6 +115,37 @@ class SharedStateGateTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup, "the gateway container must build the shared tree")
 
+    def test_the_setup_creates_a_group_accessible_scratch_dir(self):
+        """Step 4.5: the `gh --body-file` handoff directory must exist,
+        group-accessible, before any script lazily creates it with whatever
+        umask that process happens to carry. The sandbox (uid 10000) stages
+        body files there and the credential sidecar (uid 10001) reads them
+        through the shared fsGroup — group bits are the whole bridge since the
+        #955 uid split; #1030 is what their absence looks like."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "gateway", "run"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_WAIT_SECS": "0",
+                },
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            scratch = home / "scratch"
+            self.assertTrue(scratch.is_dir(), "the setup must create scratch/")
+            mode = scratch.stat().st_mode
+            self.assertEqual(
+                mode & 0o070,
+                0o070,
+                f"scratch/ is {oct(mode & 0o777)}: the sidecar reaches it only "
+                "through the group bits",
+            )
+
     def test_dashboard_sidecar_skips_the_setup(self):
         proc, ran_setup = self._run(["hermes", "dashboard"])
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -613,6 +613,61 @@ class HarnessTestCase(BaseTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# The body-file handoff to the credential sidecar
+# --------------------------------------------------------------------------- #
+
+
+class WriteTempTest(BaseTestCase):
+    """The #955 uid split: the sandbox writes the body file, the sidecar's
+    `gh` — a different user — reads it. Group permissions are the only bridge,
+    and a fallback into this container's private tmp is a file the sidecar can
+    never see at all (#1030)."""
+
+    def test_the_body_file_is_group_readable_across_the_uid_split(self):
+        scratch = self.tmp_path / "scratch"
+        self.patch_attr("SCRATCH_DIR", str(scratch))
+        path = audit_report._write_temp("the report body")
+        self.addCleanup(audit_report._unlink, path)
+        self.assertTrue(
+            Path(path).is_relative_to(scratch),
+            f"{path} is not in the shared scratch directory {scratch}",
+        )
+        mode = os.stat(path).st_mode
+        self.assertEqual(
+            mode & 0o060,
+            0o060,
+            f"body file is {oct(mode & 0o777)}: the sidecar (a different uid "
+            "since #955) can only read it through the group bits",
+        )
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "the report body")
+
+    def test_an_unusable_scratch_dir_fails_loudly_with_no_private_tmp_file(self):
+        # The uid split simulated by permissions: a parent the test cannot
+        # write through stands in for a scratch mount the sandbox uid cannot
+        # create files in.
+        parent = self.tmp_path / "readonly"
+        parent.mkdir()
+        parent.chmod(0o500)
+        self.addCleanup(parent.chmod, 0o700)
+        self.patch_attr("SCRATCH_DIR", str(parent / "scratch"))
+        private = self.tmp_path / "private-tmp"
+        private.mkdir()
+        with patch.object(tempfile, "tempdir", str(private)):
+            with self.assertRaises(RuntimeError) as ctx:
+                audit_report._write_temp("body")
+        message = str(ctx.exception)
+        self.assertIn("publish path broken", message)
+        self.assertIn(str(parent / "scratch"), message)
+        self.assertIn("#1030", message)
+        self.assertEqual(
+            list(private.iterdir()),
+            [],
+            "a body file landed in the container-private temp dir, which the "
+            "sidecar can never read — the silent-fallback failure of #1030",
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
 
