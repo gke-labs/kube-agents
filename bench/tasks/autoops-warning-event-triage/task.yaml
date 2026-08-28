@@ -54,10 +54,15 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: incident-triage
 
-# The board read, not the diagnosis. The agent this prompt reaches is the chat
-# front door; the triage was produced minutes earlier by a different session
-# the event watcher opened, and the thing under test is whether that pipeline
-# delivered. So the prompt must not let the agent answer from its own
+# The board read, not the diagnosis. The triage was produced minutes earlier by
+# a different session -- the one k8s-event-watcher opened, worked by a cluster-*
+# agent -- and the thing under test is whether that pipeline delivered. The
+# session this prompt reaches is not that one and holds none of its context: it
+# is the platform agent, because hack/ci-eval-pr.sh exports a single
+# AGENT_SERVICE_NAME and port-forwards that one service, so every entry in TASKS
+# lands there. That profile carries the kanban toolset (agents/platform/
+# config.yaml lists it under the top-level `toolsets`), which is all the board
+# read needs. So the prompt must not let the agent answer from its own
 # investigation -- an agent that kubectl-describes the pod and writes a correct
 # report would satisfy every phrase check here while proving nothing about
 # AutoOps.
@@ -133,6 +138,31 @@ verification_spec:
   # already defaults to assert, and a mutation once made stays made, so one
   # read after the turn is the whole question.
 
+  - name: triage-was-read-off-the-board
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      # Provenance, deterministically. Everything else here is report_contains
+      # over the final message, and an agent that ignored "do not diagnose
+      # anything yourself", ran `kubectl describe` and wrote a correct report
+      # would satisfy all three while proving nothing about the AutoOps
+      # pipeline -- which is the only thing this case exists to measure.
+      #
+      # kanban_list rather than kanban_show, though the prompt asks for both:
+      # ToolCalledVerifier reads the DELEGATING turn's trajectory, and
+      # _fold_status_turn keeps the harness's poll turns out of it. The board
+      # search is in the first turn; the polling kanban_show may not be.
+      #
+      # This is a floor, not a proof of exclusivity: it says the board was
+      # read, not that the cluster was left alone. Nothing available here can
+      # say the second -- config.yaml grants mcp-gke, whose remote tool names
+      # we cannot enumerate -- so the judge's expected_output still carries
+      # that half.
+      tool_names: ["kanban_list"]
+      # An errored call read no board.
+      require_success: true
+
   - name: triage-names-the-workload
     role: objective
     mode: assert
@@ -191,10 +221,15 @@ verification_spec:
   # config.yaml grants mcp-gke, a Google-hosted server whose remote tools we
   # cannot list.
   #
-  # They read the ambient kubeconfig, which points at the host cluster: the
-  # runner authenticates to it before any task runs, and the deployer re-runs
-  # `gcloud container clusters get-credentials` against this stack's
-  # cluster_name output -- the host cluster -- immediately after apply.
+  # They read the ambient kubeconfig, and it points at the host cluster by the
+  # time they run: devops-bench calls get_cluster_info() immediately after apply,
+  # which runs `gcloud container clusters get-credentials` against this stack's
+  # cluster_name output -- the host cluster, passed straight through.
+  #
+  # That, and not the runner's own `get-credentials` before the task loop, is
+  # what makes it true. Any deployer: tofu task earlier in TASKS re-points the
+  # ambient context to its own cluster on the way past, which is why the stack
+  # itself fetches into a kubeconfig of its own rather than inheriting one.
   #
   # The two remediations the triage is supposed to PROPOSE are exactly the two
   # writes it must not MAKE, so each gets its own check. A single "the
