@@ -172,6 +172,10 @@ type PlatformAgentReconciler struct {
 // networkpolicies and poddisruptionbudgets already carry write verbs above.
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=create;update;patch;delete
+// Subresources are separate RBAC paths — a verb held on deployments is not held on
+// deployments/scale — so granting the agent the scale subresources requires holding
+// them here too, even though the operator itself never calls the scale API.
+// +kubebuilder:rbac:groups=apps,resources=deployments/scale;statefulsets/scale;replicasets/scale,verbs=create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=create;update;patch;delete

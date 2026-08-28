@@ -2299,6 +2299,19 @@ func TestBuildMinimalPlatformRoleMutationMode(t *testing.T) {
 		t.Errorf("expected core write Resources %v, got %v", expectedCoreWrite, coreWrite.Resources)
 	}
 
+	// The apps rule must name the scale subresources explicitly: RBAC never
+	// extends a grant on the parent to a subresource, so without these
+	// `kubectl scale` stayed Forbidden on a live cluster while a patch of
+	// spec.replicas on the parent went through.
+	appsWrite := role.Rules[9]
+	expectedAppsWrite := []string{
+		"deployments", "statefulsets", "daemonsets", "replicasets",
+		"deployments/scale", "statefulsets/scale", "replicasets/scale",
+	}
+	if !slices.Equal(appsWrite.Resources, expectedAppsWrite) {
+		t.Errorf("expected apps write Resources %v, got %v", expectedAppsWrite, appsWrite.Resources)
+	}
+
 	// The boundaries mutation mode exists to keep: no secrets anywhere in the
 	// role with any verb, and no write verb on serviceaccounts, nodes, or
 	// anything in the RBAC API group.

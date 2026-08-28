@@ -59,6 +59,17 @@ rules:
       - update
       - watch
   - apiGroups:
+      - apps
+    resources:
+      - deployments/scale
+      - replicasets/scale
+      - statefulsets/scale
+    verbs:
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
       - authentication.k8s.io
     resources:
       - tokenreviews

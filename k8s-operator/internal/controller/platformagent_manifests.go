@@ -3506,9 +3506,21 @@ func buildMutationRules() []rbacv1.PolicyRule {
 			Verbs:     writeVerbs,
 		},
 		{
+			// The /scale entries are not redundant: RBAC matches a request
+			// against the full resource path and never extends a grant on the
+			// parent to its subresources, so writes on "deployments" alone
+			// leave `kubectl scale` — and anything else going through the
+			// scale API, which PATCHes "deployments/scale" — Forbidden.
+			// Confirmed by SubjectAccessReview on a live cluster; patching
+			// spec.replicas on the parent worked while the scale subresource
+			// was denied. Same verb set as the parents for consistency
+			// (update/patch are the ones the scale API actually exercises).
 			APIGroups: []string{"apps"},
-			Resources: []string{"deployments", "statefulsets", "daemonsets", "replicasets"},
-			Verbs:     writeVerbs,
+			Resources: []string{
+				"deployments", "statefulsets", "daemonsets", "replicasets",
+				"deployments/scale", "statefulsets/scale", "replicasets/scale",
+			},
+			Verbs: writeVerbs,
 		},
 		{
 			APIGroups: []string{"batch"},

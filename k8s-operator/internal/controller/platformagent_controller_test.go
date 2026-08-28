@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -439,6 +440,21 @@ func TestReconcileRBAC_MutationModeToggle(t *testing.T) {
 	}
 	if !hasWriteVerbs(role) {
 		t.Fatalf("expected write verbs with mutation mode on, got rules: %v", role.Rules)
+	}
+	// The scale subresources must be granted by name — RBAC does not extend a
+	// grant on "deployments" to "deployments/scale", and their absence left
+	// `kubectl scale` Forbidden on a live cluster with mutation mode on.
+	for _, sub := range []string{"deployments/scale", "statefulsets/scale", "replicasets/scale"} {
+		found := false
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.Resources, sub) && slices.Contains(rule.Verbs, "patch") && slices.Contains(rule.Verbs, "update") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("mutation mode on: no rule grants patch/update on %s", sub)
+		}
 	}
 	for i, rule := range role.Rules {
 		for _, res := range rule.Resources {
