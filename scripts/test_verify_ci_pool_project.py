@@ -227,6 +227,31 @@ class RequiredApisTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertIn("not checked", result.message)
 
+    def test_a_timed_out_project_describe_is_unverified_not_failed(self):
+        # A read that did not happen, filed the same way whatever stopped it.
+        # These two call sites classified with _denial_reason alone until the
+        # #1008 review, so a timeout or a mid-run credential expiry reported
+        # "Project describe failed" -- exit 1 for a project nothing was learned
+        # about, plus two derived checks skipped behind it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("timed out after 120s: gcloud projects describe p")]
+            number, result = checker.check_project_and_apis("kube-agents-evals-6")
+        self.assertIsNone(number)
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(result.warnings)
+
+    def test_a_lapsed_credential_on_the_service_list_is_unverified_not_failed(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"projectNumber": "123456"})),
+                _fail("ERROR: (gcloud.services.list) There was a problem refreshing your current "
+                      "auth tokens: ('invalid_grant: Bad Request', {'error': 'invalid_grant'})"),
+            ]
+            number, result = checker.check_project_and_apis("kube-agents-evals-6")
+        self.assertEqual("123456", number)
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
+
 
 class GkeAndCmekTest(unittest.TestCase):
     def _clusters(self, host_state: str) -> str:
@@ -404,12 +429,50 @@ class SeededFleetFixturesTest(unittest.TestCase):
         # the project. A credential without container.clusters.get fails every
         # resolve and arrives here as 0/7 written -- the exact shape a healthy
         # kube-agents-evals-6 produced while it was passing a 13-task presubmit.
+        #
+        # The warning lines matter and are not decoration: the count alone no
+        # longer earns the excuse, because a count alone is also what a slot
+        # that lost its labels produces. See the test below.
+        stderr = "\n".join([
+            f"WARNING: no credentials for seeded cluster seeded-{slot} in kube-agents-evals-5: "
+            f'code=403, message=Required "container.clusters.get" permission(s).'
+            for slot in ("a", "b", "c")
+        ] + [self._summary(0, unresolved=self._roles())])
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(0, unresolved=self._roles()))]
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertTrue(result.passed, result.details)
         self.assertTrue(result.warnings)
         self.assertIn("not checked", result.message)
+
+    def test_unresolved_with_no_warning_at_all_still_fails(self):
+        # The hole the excuse opened, and the reason it now wants positive
+        # evidence rather than the absence of a contrary warning. A seeded
+        # cluster that keeps its name and loses its labels never enters the
+        # listing: no per-cluster warning names it (:215 fires only for a
+        # LABELLED cluster), `labelled` stays non-zero so :406 is silent, the
+        # other slots resolve so :411 is silent, and its roles increment
+        # `unresolved` with nothing printed. check_gke_and_state matches by
+        # name and passes it, so this check is the only one that can fail it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles() - 2, unresolved=2)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result.message)
+
+    def test_a_skipped_cluster_is_a_visibility_limit_too(self):
+        # hack/fleet-kubeconfigs.sh:386. Not a refusal, but the slot ends up
+        # with no kubeconfig for a reason that says nothing about the fleet.
+        stderr = "\n".join([
+            "WARNING: could not create a temporary file; skipping seeded cluster seeded-a",
+            self._summary(self._roles() - 1, unresolved=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
 
     def test_unlabelled_fleet_still_fails_though_every_role_is_unresolved(self):
         # The absent/misconfigured fleet, which arrives in the same "unresolved"
@@ -476,6 +539,21 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertTrue(any("container.clusters.get" in w for w in result.warnings), result.warnings)
 
+    def test_script_timing_out_is_unverified_not_failed(self):
+        # A fleet script that never finished says nothing about the fleet, and
+        # it is the likeliest non-zero exit here: it walks every seeded cluster
+        # with a get-credentials each. Classified with _denial_reason alone it
+        # was a hard failure, which is the same wrong answer this file was
+        # opened to remove, arriving one exit code later.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (124, "", "timed out after 300s: hack/fleet-kubeconfigs.sh"),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("timed out" in w for w in result.warnings), result.warnings)
+
     def test_missing_kubectl_is_unverified_not_failed(self):
         # 127 is "could not look", and reporting it as an absent fleet would
         # block a project that is fine on a missing binary.
@@ -514,14 +592,19 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertIsNotNone(match, rendered)
 
     def test_the_fleet_warning_phrases_are_the_ones_the_script_prints(self):
-        # Same standard as the test above, for the two regexes that decide fail
-        # against unverified. A phrase reworded in hack/fleet-kubeconfigs.sh and
-        # not here stops matching in silence: every project with a genuinely
-        # absent fleet drops from exit 1 to exit 2, and nothing else notices.
+        # Same standard as the test above, for the three regexes that decide
+        # fail against unverified. A phrase reworded in hack/fleet-kubeconfigs.sh
+        # and not here stops matching in silence, and it breaks both ways now:
+        # a _FLEET_LOOKED_AND_FOUND_WRONG phrase that stops matching drops every
+        # genuinely absent fleet from exit 1 to exit 2, and a _FLEET_UNREACHABLE
+        # one that stops matching fails every project whose clusters were merely
+        # refused -- the bug this file exists to remove.
         text = checker._FLEET_KUBECONFIGS.read_text(encoding="utf-8")
-        phrases = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
-        self.assertEqual(4, len(phrases))
-        for phrase in [*phrases, checker._FLEET_COULD_NOT_LOOK.pattern]:
+        wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
+        unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
+        self.assertEqual(4, len(wrong))
+        self.assertEqual(2, len(unreachable))
+        for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
                 self.assertRegex(text, phrase)
 
@@ -787,6 +870,42 @@ class ArtifactRegistryTest(unittest.TestCase):
         self.assertIn("not checked", result.message)
         self.assertNotIn("push rights, and node pull rights", result.message)
 
+    def test_timed_out_policies_are_unverified_not_failed(self):
+        # Same conclusion as the pair of refusals above, from the pair of reads
+        # that never happened. This is the site where the two classifiers had to
+        # stay apart -- policy_errors still feeds the "partial policy" wording --
+        # so the fix routes unreads into policy_denials rather than widening
+        # what "denied" means. Before it, two timeouts hit policy_errors and
+        # printed "Could not read any IAM policy" as a hard failure.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("timed out after 120s: gcloud projects get-iam-policy kube-agents-evals-3"),
+                _fail("ERROR: (gcloud.artifacts.repositories.get-iam-policy) There was a problem "
+                      "refreshing your current auth tokens: invalid_grant"),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Could not read any IAM policy" in d for d in result.details), result.details)
+        self.assertIn("not checked", result.message)
+
+    def test_a_timed_out_policy_read_is_not_reported_as_a_partial_read(self):
+        # The half-and-half case, and the reason the routing had to preserve the
+        # policy_denials/policy_errors split rather than merge the buckets: the
+        # "partial policy" wording is for a read that produced a usable answer
+        # alongside one that broke, and a timeout produced no answer at all.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("timed out after 120s: gcloud projects get-iam-policy kube-agents-evals-3"),
+                _ok(self._EMPTY),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("image push" in d for d in result.details), result.details)
+        self.assertTrue(any("push rights were not checked" in w for w in result.warnings), result.warnings)
+
     def test_denied_repository_describe_is_unverified_not_missing(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
@@ -987,6 +1106,22 @@ class GithubAppInstallationTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertFalse(any("installation not found" in d for d in result.details), result.details)
         self.assertTrue(any("admin:org" in w for w in result.warnings), result.warnings)
+        self.assertIn("NOT verified", result.message)
+
+    def test_a_timed_out_installations_lookup_is_unverified_not_an_uninstalled_app(self):
+        # The same manufactured claim as the test above, reached by a different
+        # road: this call site classified with _denial_reason alone until the
+        # #1008 review, so a `gh api` that never answered produced the flat
+        # assertion "GitHub App <id> installation not found on org gke-agentic"
+        # about an org nothing had been read from.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra"})),
+                (124, "", "timed out after 120s: gh api /orgs/gke-agentic/installations"),
+            ]
+            result = checker.check_github_repo_and_app("kube-agents-evals-6", self._APP_ID)
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("installation not found" in d for d in result.details), result.details)
         self.assertIn("NOT verified", result.message)
 
     def test_confirmation_flag_clears_the_warning_but_says_it_was_attested(self):

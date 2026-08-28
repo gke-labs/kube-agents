@@ -245,6 +245,22 @@ _FLEET_LOOKED_AND_FOUND_WRONG = re.compile(
 # marker first, and it is the only thing separating the two.
 _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 
+# The listing is not the only thing that can be refused. A cluster that the
+# listing returned and `get-credentials` would not open is unread for the same
+# reason and to the same effect, and so is one skipped because a temporary file
+# could not be created. Sources: hack/fleet-kubeconfigs.sh lines 394 and 386.
+#
+# One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
+# role may be excused. Excusing on the *absence* of a "looked and found wrong"
+# warning instead reads absence of evidence as evidence, and there is a path
+# that produces neither: a slot whose cluster kept its name and lost its labels
+# never enters the listing, so no per-cluster warning names it, `labelled`
+# stays non-zero so :406 is silent, something else resolves so :411 is silent,
+# and its roles increment `unresolved` with nothing printed at all.
+_FLEET_UNREACHABLE = re.compile(
+    r"no credentials for seeded cluster|could not create a temporary file", re.I
+)
+
 
 def _denial_reason(err: str) -> Optional[str]:
     """The line of `err` showing the command was refused, or None if it was not.
@@ -496,7 +512,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
     name = "GCP Project & APIs"
     rc, out, err = run_cmd(["gcloud", "projects", "describe", project_id, "--format=json"])
     if rc != 0:
-        reason = _denial_reason(err)
+        reason = _unread_reason(err)
         if reason is None:
             return None, CheckResult(name, False, f"Project describe failed: {err.strip()}")
         return None, CheckResult(
@@ -522,7 +538,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
         "--format=value(config.name)",
     ])
     if rc != 0:
-        reason = _denial_reason(err)
+        reason = _unread_reason(err)
         if reason is None:
             return project_number, CheckResult(name, False, f"Failed listing enabled services: {err.strip()}")
         return project_number, CheckResult(
@@ -767,7 +783,12 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
     ):
         rc, out, err = run_cmd(cmd)
         if rc != 0:
-            reason = _denial_reason(err)
+            # _unread_reason, not _denial_reason: policy_denials is the bucket
+            # meaning "do not conclude absence from this", and a timeout earns
+            # that as much as a 403 does. The split with policy_errors survives
+            # because it feeds the "read from a partial policy" wording below,
+            # which is about whether the other policy produced a usable answer.
+            reason = _unread_reason(err)
             if reason:
                 policy_denials.append(reason)
             else:
@@ -1052,15 +1073,15 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
-            reason = _denial_reason(err)
+            reason = _unread_reason(err)
             if reason:
                 return CheckResult(
                     name,
                     True,
                     "Not checked",
                     warnings=[
-                        f"hack/fleet-kubeconfigs.sh exited {rc} because it was refused, so nothing is "
-                        f"known about the fixtures in {project_id}: {reason}"
+                        f"hack/fleet-kubeconfigs.sh exited {rc} without reading the fleet, so nothing "
+                        f"is known about the fixtures in {project_id}: {reason}"
                     ],
                 )
             return CheckResult(
@@ -1126,7 +1147,14 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         if could_not_look
         else [n for n in notes if _FLEET_LOOKED_AND_FOUND_WRONG.search(n)]
     )
-    if unresolved and not unplanted and not looked_and_found_wrong:
+    # Positive evidence, not the lack of contrary evidence. An unresolved role
+    # is excused only where the script said it could not look or could not
+    # reach; a run that looked, reached what it found, and still came up short
+    # is describing the fleet, and the count is the finding.
+    could_not_reach = could_not_look or any(
+        _FLEET_UNREACHABLE.search(n) for n in notes
+    )
+    if unresolved and not unplanted and not looked_and_found_wrong and could_not_reach:
         return CheckResult(
             name,
             True,
@@ -1192,7 +1220,7 @@ def check_github_repo_and_app(
     # `admin:org` scope and answers 404 -- not 403 -- to a token without it, so
     # the failure this call site cannot distinguish is a scope gap, and calling
     # it an uninstalled App names a correctly configured org as the defect.
-    if rc != 0 and (_denial_reason(err) or _GITHUB_NOT_FOUND.search(err or "")):
+    if rc != 0 and (_unread_reason(err) or _GITHUB_NOT_FOUND.search(err or "")):
         warnings.append(
             f"Could not list org gke-agentic's App installations with this token, so App {app_id}'s "
             "installation was not checked. That endpoint needs the `admin:org` scope and answers 404 "
