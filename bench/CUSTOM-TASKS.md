@@ -128,6 +128,16 @@ provider fills in defaults for any variable the task did not set:
 `PROJECT_ID` and `CLUSTER_NAME` are not optional in practice: the run refuses to start without them
 unless you pass `--no-infra`, so the kind fallbacks in that table are unreachable from the CLI.
 
+**A second channel, with different precedence.** `hack/ci-eval-pr.sh` also exports
+`TF_VAR_host_cluster_name`, `TF_VAR_host_cluster_location` and `TF_VAR_agent_namespace` for the
+whole run, naming the install the runner deployed. Any stack that declares those variables receives
+them; one that does not, ignores them. They are not in the table above because they arrive by a
+different route and lose a different tie: the provider's defaults are passed as `-var` and beat a
+`variables.tf` default, while `TF_VAR_` beats a default but loses to `-var`. So a task's own
+`variables:` block naming `host_cluster_name` silently wins over the runner's — which is why
+`bench/tasks/autoops-warning-event-triage/task.yaml` sets everything else there and deliberately
+not those.
+
 Declare each of these in your stack's `variables.tf` to receive it. An injected variable the stack
 does not declare is dropped with nothing but a log warning, so a missing declaration surfaces as a
 stack built with the wrong defaults rather than as an error. A variable the _task_ sets and the

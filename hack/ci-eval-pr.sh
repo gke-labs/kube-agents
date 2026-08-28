@@ -565,8 +565,8 @@ TASKS=(
   # TAIL; these three are measured -- 190s, 142s and 220s on build
   # 2092719124550520832 -- so ordering them first would protect the known at
   # the expense of the unknown, which is backwards. What they do need is to
-  # stay AHEAD of gpu-stress-test-diagnosis below, the array's only
-  # `deployer: tofu` entry, which spends minutes provisioning a cluster
+  # stay AHEAD of gpu-stress-test-diagnosis below, the first of the array's two
+  # `deployer: tofu` entries, which spends minutes provisioning a cluster
   # before it scores anything. All three are `deployer: noop`.
   #
   # A fourth is commented out beneath them, and why is worth reading before
