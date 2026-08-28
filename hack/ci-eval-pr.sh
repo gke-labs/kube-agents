@@ -275,6 +275,15 @@ export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
+# The harness's default delegation wait (1800s) sits INSIDE the compliance
+# canary's observed completion spread: on 2026-08-27 (build
+# 2093054394793725952, kube-agents-evals-2) the audit worker finished and
+# rewrote its ledger at 20:30:37Z -- five minutes AFTER the wait gave up at
+# ~20:24 -- and the run graded a bare receipt as the answer. Observed audit
+# completions: 606s / 827s / 1497s / ~2170s on identical inputs. 2700s puts
+# the ceiling above the worst observed; the variance itself is #985's
+# problem, this export just stops mislabeling slowness as wrongness.
+export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
 # For opentofu provider
