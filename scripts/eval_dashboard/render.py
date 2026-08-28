@@ -24,6 +24,12 @@ The reader contract is schema_version 1 of the collector's data.json.
 Optional fields may be absent and unknown additive fields are ignored, so
 this renderer and the collector can ship independently.
 
+The rendered page is also live: render.py bakes the data and notes into the
+template, whose script re-renders in place from a fresh ``data.json`` fetch
+every 60 seconds and keeps a freshness badge honest (see the template's
+"Live read side" comment). The Python fragment builders here and the JS
+mirrors there are intentionally parallel -- change them together.
+
 Only stdlib + PyYAML (already in requirements-test.txt) -- no build step.
 """
 
@@ -579,12 +585,22 @@ def freshness_html(data: dict) -> str:
     return f"updated {generated:%H:%M} UTC" if generated else "updated —"
 
 
+def bootstrap_json(value) -> str:
+    """JSON safe to inline in a <script> block: '</' is escaped so no data
+    string can close the tag early."""
+    return json.dumps(value, separators=(",", ":")).replace("</", "<\\/")
+
+
 def render_page(data: dict, notes: dict) -> str:
     page = TEMPLATE.read_text()
     for token, value in (
         ("__META__", meta_html(data)),
         ("__FRESHNESS__", freshness_html(data)),
         ("__APP__", app_html(data, notes)),
+        # The live read side: the template's script re-renders from this
+        # baked copy on load, then polls data.json every 60s.
+        ("__DATA_JSON__", bootstrap_json(data)),
+        ("__NOTES_JSON__", bootstrap_json(notes)),
     ):
         if token not in page:
             raise SystemExit(f"ERROR: template is missing the {token} marker")

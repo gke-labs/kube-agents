@@ -281,6 +281,54 @@ class CaseNotesTest(unittest.TestCase):
         self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985"])
 
 
+class LiveReadSideTest(unittest.TestCase):
+    """The 60s-refresh script render.py bakes into every page."""
+
+    @classmethod
+    def setUpClass(cls):
+        data = fixture_data()
+        # A hostile string proves the inline-JSON escaping: without it this
+        # would close the <script> block early.
+        data["cases"][0]["novel_field"] = "</script><b>boom</b>"
+        data["stale_after_s"] = 600
+        cls.html, _, cls._tmp = render_fixture(data)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_bootstrap_data_is_embedded_and_script_safe(self):
+        self.assertIn('"generated_at":"2026-08-28T14:02:11Z"', self.html)
+        self.assertNotIn("</script><b>boom</b>", self.html)
+        self.assertIn("<\\/script><b>boom<\\/b>", self.html)
+
+    def test_polls_data_json_every_60_seconds(self):
+        self.assertIn("refreshMs: 60000", self.html)
+        self.assertIn('fetch("data.json", { cache: "no-store" })', self.html)
+        self.assertIn("setInterval(refresh, DASH.refreshMs)", self.html)
+
+    def test_stale_threshold_read_from_data_with_7200_default(self):
+        self.assertIn("stale_after_s", self.html)
+        self.assertIn("staleDefaultS: 7200", self.html)
+        self.assertIn('"stale_after_s":600', self.html)
+
+    def test_stale_and_unreachable_states_carry_text_labels(self):
+        # Not color alone: the amber badge always carries a written label.
+        self.assertIn("STALE · ", self.html)
+        self.assertIn("UNREACHABLE · ", self.html)
+        self.assertIn(".fresh.stale", self.html)
+
+    def test_notes_travel_with_the_bootstrap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notes_path = pathlib.Path(tmp) / "notes.yaml"
+            notes_path.write_text(
+                'notes:\n  reliability-pdb-probe:\n    issues: ["#1010"]\n'
+            )
+            html, _, tmp_render = render_fixture(fixture_data(), notes_path=notes_path)
+            self.addCleanup(tmp_render.cleanup)
+        self.assertIn('"reliability-pdb-probe":{"note":null,"issues":["#1010"]}', html)
+
+
 class PublishTest(unittest.TestCase):
     def _rendered_out_dir(self):
         _, out_dir, tmp = render_fixture(fixture_data())
