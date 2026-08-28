@@ -78,7 +78,8 @@ Two behaviours worth knowing before the first run:
   the scripts and the container image stay on one revision; pass `--allow-unverified-source` to
   override that while iterating on the installer itself.
 - **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
-  controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
+  controls cloud-plane writes only — Kubernetes RBAC is its own knob (`--mutation-mode`, read-only
+  by default; even on it never grants Secrets or identity/RBAC writes), and the GitOps
   pull-request path works in every set. See the site's
   [security and IAM reference](docs/site/src/content/docs/reference/security-and-iam.md).
 

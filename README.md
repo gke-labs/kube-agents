@@ -81,7 +81,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 
 `kube-agents` is designed for enterprise fleets where agents must be powerful _and_ provably contained:
 
-- **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
+- **Least-privilege RBAC** — the agent's Kubernetes identity is read-only by default (opt-in `--mutation-mode` adds workload writes) and can never read Secrets.
 - **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
 - **Kernel-level sandboxing** — agent workloads can run under a gVisor RuntimeClass (GKE Sandbox).
