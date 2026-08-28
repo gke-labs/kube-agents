@@ -188,6 +188,57 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
 
+# ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
+# Re-renders and republishes the eval dashboard at the very end of every run,
+# red or green, from the EXIT trap below. FAIL-SAFE BY CONTRACT: the dashboard
+# must never break the job it observes, so every failure mode -- the sibling
+# dashboard PRs not merged yet (no scripts/eval_dashboard/), the IAM grant not
+# applied, a gsutil error, a python crash, a hung upload -- logs exactly ONE
+# "eval-dashboard publish skipped: <reason>" line and never changes the job's
+# exit code. Nothing publishes until BOTH prerequisites exist:
+#   1. the Prow job exports EVAL_DASHBOARD_TARGET
+#      (gs://kube-agents-prow/dashboards/evals/) -- an oss-test-infra change;
+#   2. prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com holds
+#      roles/storage.objectAdmin condition-scoped to the dashboards/ prefix.
+# Until both land this costs one log line per run.
+# scripts/test_eval_dashboard_publish.py runs this function out of this file
+# and asserts the fail-safe holds.
+publish_eval_dashboard() {
+  if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
+    echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
+    return 0
+  fi
+  local dash_src="${SCRIPT_DIR}/../scripts/eval_dashboard"
+  if [ ! -f "${dash_src}/collect.py" ]; then
+    echo "eval-dashboard publish skipped: ${dash_src}/collect.py does not exist (sibling dashboard PRs not merged yet)"
+    return 0
+  fi
+  local dash_tmp dash_rc=0
+  dash_tmp="$(mktemp -d)" || { echo "eval-dashboard publish skipped: mktemp -d failed"; return 0; }
+  # One timeout over the whole collect -> render -> publish pipeline so a hung
+  # gsutil cannot eat the job's tail. errexit lives inside the child only; out
+  # here any failure becomes the one skip line. The array idiom is the
+  # PROFILE_ROWS one above: no `timeout` binary (a laptop) must degrade to
+  # running unbounded, not to breaking the trap.
+  local dash_timeout=(timeout 120)
+  command -v timeout >/dev/null 2>&1 || dash_timeout=()
+  # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
+  # shellcheck disable=SC2016
+  ${dash_timeout[@]+"${dash_timeout[@]}"} bash -c '
+    set -euo pipefail
+    python3 "$1/collect.py" --pr-glob "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --out "$2/data.json"
+    python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
+    python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
+  ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?
+  if [ "${dash_rc}" -eq 0 ]; then
+    echo "eval-dashboard: published to ${EVAL_DASHBOARD_TARGET}"
+  else
+    echo "eval-dashboard publish skipped: pipeline exited ${dash_rc} (124 means the 120s timeout): $(tail -n 3 "${dash_tmp}/publish.log" 2>/dev/null | tr '\n' ' ')"
+  fi
+  rm -rf "${dash_tmp}" || true
+  return 0
+}
+
 # Print the profile on every exit — success, gate failure, or a set -e death —
 # then hand the original exit code to the artifact dumper ci-env.sh provides.
 #
@@ -215,6 +266,10 @@ profile_and_dump_on_exit() {
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
+  # Dashboard last, after the artifacts the run itself needs; the exit code
+  # was captured above and publish_eval_dashboard never returns non-zero, so
+  # this cannot change what Prow reports (errexit is already cleared above).
+  publish_eval_dashboard
 }
 trap profile_and_dump_on_exit EXIT
 

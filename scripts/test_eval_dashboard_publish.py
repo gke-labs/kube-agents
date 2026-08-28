@@ -1,0 +1,182 @@
+"""The eval-dashboard publish hook must NEVER change the eval job's exit code.
+
+`publish_eval_dashboard` in hack/ci-eval-pr.sh runs from the script's EXIT
+trap on every run, red or green. The dashboard observes the presubmit; a
+dashboard failure that reds the presubmit -- or launders a red to green --
+would break the thing it observes. So the contract is: any failure mode
+(EVAL_DASHBOARD_TARGET unset, scripts/eval_dashboard/ absent because the
+sibling PRs have not merged, a crashing collector, a broken publisher) prints
+exactly one "eval-dashboard publish skipped: <reason>" line and leaves the
+job's exit code exactly what it was.
+
+Like scripts/test_ci_eval_trap.py, this runs the real function -- and the real
+trap body around it -- lifted out of the real file, rather than grepping for
+guards, so it fails if the fail-safe is weakened by any future edit.
+"""
+
+import pathlib
+import re
+import subprocess
+import tempfile
+import textwrap
+import unittest
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
+SKIP = "eval-dashboard publish skipped:"
+
+
+def lifted(name: str) -> str:
+    """A function as written, lifted from the script."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.S | re.M)
+    if match is None:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"{name}() not found in {SCRIPT}")
+    return match.group(0)
+
+
+def run_hook(
+    exit_code: int, script_dir: pathlib.Path, target: str
+) -> subprocess.CompletedProcess:
+    """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
+
+    The trap body is the script's own (its other three callees stubbed, as in
+    test_ci_eval_trap.py); publish_eval_dashboard is the real thing, pointed
+    at `script_dir` so a test controls whether collect.py exists and what the
+    pipeline stubs do.
+    """
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f'SCRIPT_DIR="{script_dir}"',
+            f'export EVAL_DASHBOARD_TARGET="{target}"',
+            "collect_bench_results() { :; }",
+            "profile_report() { :; }",
+            "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
+            lifted("publish_eval_dashboard"),
+            lifted("profile_and_dump_on_exit"),
+            "trap profile_and_dump_on_exit EXIT",
+            f"exit {exit_code}",
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+
+def dashboard_stubs(root: pathlib.Path, collect_body: str) -> pathlib.Path:
+    """A fake repo layout: hack/ beside scripts/eval_dashboard/ stubs.
+
+    Returns the fake SCRIPT_DIR. render.py and publish.py record that they
+    ran; collect.py's behaviour is the test's to choose.
+    """
+    (root / "hack").mkdir()
+    dash = root / "scripts" / "eval_dashboard"
+    dash.mkdir(parents=True)
+    (dash / "collect.py").write_text(textwrap.dedent(collect_body))
+    for name in ("render.py", "publish.py"):
+        (dash / name).write_text(
+            f"import pathlib, sys\n"
+            f"pathlib.Path(sys.path[0], '{name}.ran').touch()\n"
+        )
+    return root / "hack"
+
+
+class PublishHookFailSafeTest(unittest.TestCase):
+    def assert_skipped_once(self, result, exit_code: int, reason_fragment: str):
+        """One skip line naming the reason, dumper reached, exit code intact."""
+        self.assertEqual(result.returncode, exit_code, result.stderr)
+        self.assertEqual(result.stdout.count(SKIP), 1, result.stdout)
+        skip_line = next(l for l in result.stdout.splitlines() if SKIP in l)
+        self.assertIn(reason_fragment, skip_line)
+        self.assertIn(f"called dumper with {exit_code}", result.stdout)
+
+    def test_unset_target_skips_and_preserves_the_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for code in (0, 7):
+                result = run_hook(code, pathlib.Path(tmp), target="")
+                self.assert_skipped_once(result, code, "EVAL_DASHBOARD_TARGET")
+
+    def test_missing_collect_py_skips_fast_and_preserves_the_exit_code(self):
+        """This PR may merge before the siblings that add scripts/eval_dashboard/."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = pathlib.Path(tmp) / "hack"
+            fake_hack.mkdir()
+            for code in (0, 7):
+                result = run_hook(
+                    code, fake_hack, target="gs://kube-agents-prow/dashboards/evals/"
+                )
+                self.assert_skipped_once(result, code, "does not exist")
+
+    def test_a_crashing_collector_skips_and_preserves_the_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp), "import sys; sys.exit(3)\n"
+            )
+            for code in (0, 7):
+                result = run_hook(
+                    code, fake_hack, target="gs://kube-agents-prow/dashboards/evals/"
+                )
+                self.assert_skipped_once(result, code, "pipeline exited 3")
+
+    def test_a_working_pipeline_publishes_and_preserves_the_exit_code(self):
+        """The hook runs on green AND red: a red run is still a data point."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp),
+                """\
+                import pathlib, sys
+                out = sys.argv[sys.argv.index("--out") + 1]
+                pathlib.Path(out).write_text("{}")
+                """,
+            )
+            for code in (0, 7):
+                result = run_hook(
+                    code, fake_hack, target="gs://kube-agents-prow/dashboards/evals/"
+                )
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertIn(
+                    "eval-dashboard: published to gs://kube-agents-prow/dashboards/evals/",
+                    result.stdout,
+                )
+                self.assertNotIn(SKIP, result.stdout)
+
+    def test_the_pipeline_stops_at_the_first_failing_stage(self):
+        """collect crashing means render/publish never run -- errexit lives
+        inside the child pipeline, and only there."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp), "import sys; sys.exit(3)\n"
+            )
+            run_hook(7, fake_hack, target="gs://x/")
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            self.assertEqual(list(dash.glob("*.ran")), [])
+
+    def test_the_hook_survives_errexit_without_the_traps_guard(self):
+        """The function is errexit-safe in its own right: even called under
+        live `set -e` (not just after the trap's `set +e`), a crashing
+        pipeline neither aborts the caller nor changes its exit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp), "import sys; sys.exit(3)\n"
+            )
+            script = "\n".join(
+                [
+                    "set -euo pipefail",
+                    f'SCRIPT_DIR="{fake_hack}"',
+                    'export EVAL_DASHBOARD_TARGET="gs://x/"',
+                    lifted("publish_eval_dashboard"),
+                    "publish_eval_dashboard",
+                    "echo reached-after-hook",
+                ]
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("reached-after-hook", result.stdout)
+            self.assertEqual(result.stdout.count(SKIP), 1, result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
