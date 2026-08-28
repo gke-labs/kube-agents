@@ -235,6 +235,9 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   can publish its own Pages site.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
+- **AI Agent Attribution & Commit Authorship:**
+  - Do not add AI agents as git commit co-authors or include `Co-Authored-By:` trailers in commit messages.
+  - Note AI assistance in the PR description (e.g. `Generated with the help of <Agent/Model>.`).
 - **Write PR titles, bodies, commit messages, and review replies the same way** the Documentation
   Guidelines' "Write it straight" rule requires: what changed and why, in plain declaratives. Do
   not grade your own work — "comprehensive", "significantly improves", and "production-ready" are

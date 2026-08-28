@@ -100,6 +100,10 @@ spec:
   telemetry:
     otlpEndpoint: {{ . | quote }}
   {{- end }}
+  {{- with .Values.platformAgent.networkPolicy }}
+  networkPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
   {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled }}
   integration:

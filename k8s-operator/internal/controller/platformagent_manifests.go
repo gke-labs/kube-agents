@@ -21,7 +21,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path"
 	"reflect"
@@ -3861,12 +3860,16 @@ func otlpCollectorNamespace(endpoint string) string {
 }
 
 // formatCIDRPeers normalises a mix of bare IPs and CIDRs into sorted, deduplicated
-// NetworkPolicyPeers. A bare IP becomes a single-host /32 or /128; a CIDR is kept as
-// written. Anything unparseable is dropped.
+// NetworkPolicyPeers. A bare IP becomes a single-host /32 or /128. Anything unparseable
+// is dropped.
 //
 // enforceMinPrefix rejects CIDRs broader than /12 (IPv4) or /48 (IPv6), which stops a
 // caller-supplied range from being weaponised into an unrestricted egress bypass. Pass
 // false only where the input cannot come from outside the operator.
+//
+// normalizeCIDRTarget does the per-entry work, shared with toEgressRules -- including
+// the address-family rule that keeps an IPv4-mapped IPv6 block from clearing the IPv6
+// floor and then printing as 0.0.0.0/0.
 func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.NetworkPolicyPeer {
 	seen := make(map[string]bool, len(raw))
 	var cidrs []string
@@ -3878,33 +3881,8 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 	}
 
 	for _, entry := range raw {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		if strings.Contains(entry, "/") {
-			_, ipNet, err := net.ParseCIDR(entry)
-			if err != nil {
-				continue
-			}
-			if enforceMinPrefix {
-				ones, bits := ipNet.Mask.Size()
-				if (bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix) {
-					continue
-				}
-			}
+		if ipNet, ok := normalizeCIDRTarget(entry, enforceMinPrefix); ok {
 			add(ipNet.String())
-			continue
-		}
-		bare := strings.Trim(entry, "[]")
-		ip := net.ParseIP(bare)
-		if ip == nil {
-			continue
-		}
-		if ip.To4() != nil {
-			add(bare + "/32")
-		} else {
-			add(bare + "/128")
 		}
 	}
 
@@ -3927,13 +3905,9 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
-	dnsClusterIP := strings.Trim(profile.DNSClusterIP, "[]")
-	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
-		dnsClusterIP = defaultDNSClusterIP
-	}
-	dnsCidr := dnsClusterIP + "/32"
-	if strings.Contains(dnsClusterIP, ":") {
-		dnsCidr = dnsClusterIP + "/128"
+	dnsIPs := profile.DNSClusterIPs
+	if len(dnsIPs) == 0 {
+		dnsIPs = []string{defaultDNSClusterIP}
 	}
 
 	apiPeers := formatCIDRPeers(apiCIDRs, true)
@@ -3945,11 +3919,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// evaluates policy pre-NAT, so this peer matches there on the pre-DNAT ports;
 	// Dataplane V1 DNATs first, so its token fetches are matched by rule 3 instead.
 	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
-	// Everything the rewritten packet can be addressed to, all of it on port 988:
-	// the metadata daemon's own link-local address on the iptables datapath.
-	// See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
@@ -4013,12 +3982,19 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 				CIDR: "169.254.20.10/32",
 			},
 		},
-		{
-			IPBlock: &networkingv1.IPBlock{
-				CIDR: dnsCidr,
-			},
-		},
 	}
+
+	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
+	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
+	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
+	// operator, which always widen to a single host. The default is the fallback for
+	// nothing surviving, not for each entry that does not parse -- two bad entries
+	// used to emit the default twice.
+	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
+	if len(dnsIPPeers) == 0 {
+		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
+	}
+	dnsPeers = append(dnsPeers, dnsIPPeers...)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
@@ -4039,30 +4015,38 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: linkLocalPeers,
 		},
-		// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-		//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
-		//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
-		//    policy is evaluated pre-NAT at the socket layer and matched by rule 2.
-		//
-		//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
-		//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
-		//    because kube-agents components use standard OAuth2/REST token fetches and no client
-		//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
-		//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
-		//
-		//    That is a deviation from the guidance, which warns that workloads omitting these
-		//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
-		//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
-		//    check: capture the drop's destination port and reopen 987/8080 here if it is one
-		//    of them.
-		{
+	}
+
+	// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+	//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
+	//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+	//    policy is evaluated pre-NAT at the socket layer and matched by rule 2. If
+	//    profile.MetadataDaemonIP == "", rule 3 is suppressed.
+	//
+	//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
+	//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
+	//    because kube-agents components use standard OAuth2/REST token fetches and no client
+	//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
+	//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
+	//
+	//    That is a deviation from the guidance, which warns that workloads omitting these
+	//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
+	//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
+	//    check: capture the drop's destination port and reopen 987/8080 here if it is one
+	//    of them.
+	if profile.MetadataDaemonIP != "" {
+		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(988))},
 			},
 			To: metadataDaemonPeers,
-		},
+		})
+	}
+
+	egressRules = append(egressRules,
 		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
@@ -4086,7 +4070,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 		// 5. vLLM Gemma Server in the agent namespace (Service port 80 and container port 8000)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8000))},
@@ -4102,7 +4086,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 		// 6. Kubernetes API Server (Control Plane Endpoints and ClusterIP VIP)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(6443))},
@@ -4110,7 +4094,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: apiPeers,
 		},
-	}
+	)
 
 	// 7. External HTTPS (Google APIs, GitHub, etc.)
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
@@ -4176,6 +4160,34 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 	})
+
+	// 10. Hindsight memory API in the agent namespace (Service and container port 8888).
+	//     Unconditional, like rules 4, 5 and 9: the selector matches nothing on an
+	//     install without --memory=hindsight. Without it every memory_retain and
+	//     memory_recall from the gateway times out. A cluster that does not enforce
+	//     NetworkPolicy at all connects anyway, which is why the missing rule went
+	//     unnoticed: the install it breaks is the one that enforces the policy.
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8888))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name":      "hindsight",
+						"app.kubernetes.io/component": "api",
+					},
+				},
+			},
+		},
+	})
+
+	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
+	// addition to the operator's own set rather than being interleaved with it.
+	if len(profile.AdditionalEgress) > 0 {
+		egressRules = append(egressRules, profile.AdditionalEgress...)
+	}
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{

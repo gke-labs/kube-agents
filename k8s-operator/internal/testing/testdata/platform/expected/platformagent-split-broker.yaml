@@ -1340,6 +1340,14 @@ spec:
         - podSelector:
             matchLabels:
               app: github-token-minter
+    - ports:
+        - port: 8888
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+              app.kubernetes.io/name: hindsight
   ingress:
     - from:
         - podSelector: {}

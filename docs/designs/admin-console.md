@@ -12,8 +12,10 @@ The console is implemented in `admin_console/`. Setup's Connection page owns
 Google Cloud project selection, connection, disconnect, and the diagnostic
 checklist. Setup's LLM Gateway page reads and updates the inference provider,
 then tests the same in-cluster path the agents use. The Observability pages read
-bounded live Cloud Logging and Cloud Trace data. Remote authentication and
-operator-managed deployment remain follow-up work.
+bounded live Cloud Logging and Cloud Trace data. Integration's Google Chat page
+derives the live Chat wiring from the canonical `PlatformAgent` and verifies its
+Google Cloud backend. Remote authentication and operator-managed deployment
+remain follow-up work.
 
 ## Product questions
 
@@ -47,6 +49,9 @@ Browser
        -> LLM gateway service
             -> Kubernetes Deployment, Service, ConfigMap, and Secret writes
             -> production-path model request from a Platform Agent pod
+       -> Google Chat integration read model
+            -> PlatformAgent spec plus Pub/Sub, IAM, and service reads
+            -> bounded Hermes delivery evidence
 ```
 
 The production console should run in a separate Deployment with a dedicated
@@ -261,6 +266,36 @@ The API never serializes a submitted credential into command arguments,
 responses, validation errors, or portal state. Device OAuth returns the
 authorization log without waiting for readiness; a bounded status poll waits
 for the new rollout before verification.
+
+#### Integration status
+
+```text
+GET /api/v1/integrations/google-chat
+```
+
+The Google Chat read model selects the canonical `PlatformAgent`, reads its
+`spec.integration.googleChat` values, and describes that exact project,
+topic, and subscription. It verifies all three required APIs, pull-compatible
+subscription state, route agreement, and the live publisher/subscriber IAM
+policies. The response includes the full topic path, project number, service
+identities, one normalized checklist, and command evidence. It redacts
+credential-shaped Kubernetes values before returning that evidence. It
+does not infer that the separate Google Chat API console configuration was
+saved because that app configuration has no corresponding read resource in the
+Chat REST API. It also labels publisher IAM only as bindings: the check verifies that the
+two expected Google publisher identities hold unconditional bindings on the
+topic, which proves the grants exist, not that the console-side Chat app
+registration was saved.
+The same response includes a bounded 30-day Google Chat session observation
+from the canonical runtime. Absence is reported separately from backend health;
+it becomes positive evidence only after an event reaches Hermes. While no
+session has been observed, the read model lists the project's other topics
+(bounded) and reports those whose IAM policies accept the Google Chat
+publisher identities — `strayChatTopics` plus a non-required
+`chat_console_topic` check — as the observable trace of a console saved
+against an earlier installation's topic. An observed session marks that check
+passed instead, because arriving traffic proves the console names the
+configured topic.
 
 #### Start and observe an interaction
 
@@ -678,6 +713,15 @@ override identity or correlation fields.
   Activity Explorer, Task Kanban, and Scheduled Cron. A shared connection gate
   replaces provider-backed content with concise connection guidance until the
   selected target is verified.
+- **Integration:** the navigation group after Observability. Its first page,
+  Google Chat, renders the snapshot without interpreting it: the service
+  derives status, message, and severity from the first non-passed check in
+  its ordered checklist, and each check carries its own diagnosis and fix
+  steps (copyable configuration link and Cloud Pub/Sub topic). The page shows
+  one verdict banner, the first problem's actions, the milestone list with
+  pass marks, and collapsed detail sections. It never substitutes chart
+  defaults or configured project values for the connected installation's live
+  resources.
 - **Overview:** activity volume, human/autonomous split, attention items,
   attribution coverage, recent outcomes, and page-local activity scope.
 - **Chat:** an always-discoverable session workspace with recent Hermes
@@ -755,6 +799,7 @@ remain labeled as missing instead of being filled with demo data.
 | Credential-proxy activity               | Not ingested; no proxy events are fabricated                                                             | N/A    | Yes                 | No                       | Normalize proxy request ID, policy decision, command digest, execution state, exit code, and duration   |
 | Approval activity                       | Live Trace spans and structured request/response audit records                                           | No     | Yes                 | Yes                      | Correlate requester, approver, policy, command digest, and interaction ID                               |
 | Scheduled Cron page                     | Bounded live Hermes job stores, execution databases, profile ticker health, and recent/upcoming calendar | No     | Yes                 | Yes                      | Add a dedicated policy-aware scheduler API and retained execution pagination                            |
+| Google Chat integration status          | Live CR-derived wiring checks, stray-topic root-cause hints, and bounded 30-day delivery evidence        | No     | Yes                 | Yes                      | Add a Chat-side read or publish-metric signal to verify the console topic directly                      |
 | Time window and retention state         | URL window, session-local Logging/Trace cursors, and visible source errors/truncation                    | No     | Yes                 | Yes                      | Add retention and sampling metadata from source configuration                                           |
 | Refreshable and shareable investigation | Project, cluster, and window persist; local filters do not                                               | N/A    | N/A                 | Partial                  | Persist filters, interaction, and selected evidence in URL query parameters                             |
 | Saved case or evidence export           | Not implemented                                                                                          | N/A    | N/A                 | No                       | Export access-controlled evidence bundles with source IDs, query scope, redaction state, and timestamps |

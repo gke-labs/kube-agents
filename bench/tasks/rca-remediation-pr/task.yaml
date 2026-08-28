@@ -1,12 +1,12 @@
-# REGISTERED, INACTIVE — PARKED on 2026-08-26 until it gets one clean
-# measured run (a commented entry in hack/ci-eval-pr.sh TASKS, and what
-# keeps `remediation` on the coverage allowlist in docs/designs/domains.yaml).
-# The 2026-08-26 smoke run's 85-minute job deadline expired before this task
-# ever started, so its cost and signal are both still unmeasured — and after
-# that run priced full audits at 600-1300s each, activating an unmeasured
-# GitOps-writing scenario would spend presubmit budget on an unknown.
-# Activation is one clean measured run away, most cheaply at the nightly
-# tier or in a hand-driven smoke. It was held by A1 and A5
+# ACTIVE — uncommented in hack/ci-eval-pr.sh TASKS on 2026-08-27, taking
+# `remediation` off the coverage allowlist in docs/designs/domains.yaml.
+# Parked 2026-08-26→27 because its cost and signal were unmeasured (the
+# 2026-08-26 run's 85-minute deadline expired before it ever started); the
+# activating pull request's own smoke run is the clean measured run it was
+# parked for. The one active scenario that WRITES: the agent files a real
+# remediation PR against the leased project's throwaway GitOps repo via
+# submit-suggestion — record its measured duration here after the run.
+# It was held by A1 and A5
 # (bench/tasks/DRAFTS.md); both are closed. A4 never applied here: this case
 # is a chat-prompted RCA whose objective reads the PR URL out of the final
 # answer, not a fleet-audit stream that files findings in a ledger issue.

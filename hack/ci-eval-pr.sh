@@ -275,6 +275,15 @@ export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
+# The harness's default delegation wait (1800s) sits INSIDE the compliance
+# canary's observed completion spread: on 2026-08-27 (build
+# 2093054394793725952, kube-agents-evals-2) the audit worker finished and
+# rewrote its ledger at 20:30:37Z -- five minutes AFTER the wait gave up at
+# ~20:24 -- and the run graded a bare receipt as the answer. Observed audit
+# completions: 606s / 827s / 1497s / ~2170s on identical inputs. 2700s puts
+# the ceiling above the worst observed; the variance itself is #985's
+# problem, this export just stops mislabeling slowness as wrongness.
+export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
 # For opentofu provider
@@ -479,6 +488,14 @@ TASKS=(
   "./tasks/upgrades-lagging-master-probe/task.yaml"
   "./tasks/consistency-authorized-networks-probe/task.yaml"
   "./tasks/cost-idle-pool-probe/task.yaml"
+  # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
+  # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
+  # the job deadline before reaching it), so this entry's first smoke IS the
+  # measurement. Placed after the six probes (proven, ~20 min together) and
+  # before the canary so a surprise here cannot starve the probes of budget.
+  # The one active task that WRITES: it files a remediation PR against the
+  # leased project's throwaway GitOps repo via submit-suggestion.
+  "./tasks/rca-remediation-pr/task.yaml"
   # The audit-machinery canary: measured 606s clean on 2026-08-26, every
   # exact check green -- the only task that has proven the A1/A4 path
   # (minted token, cloned *-infra workspace, published ledger issue) in a
@@ -552,14 +569,13 @@ TASKS=(
   #      full-audit shape recast to the nightly tier (600-1300s each, measured
   #      or transport-failed on 2026-08-26); each domain is now covered by a
   #      probe above. They remain spec-ready and activation is uncommenting.
-  #   -- rca-remediation-pr: parked until it gets one clean measured run; the
-  #      2026-08-26 run hit the job deadline before reaching it, so its cost
-  #      and signal are still unknown.
+  #   -- rca-remediation-pr was parked here too until 2026-08-27; it is now
+  #      active above, this pull request's smoke run being the clean measured
+  #      run it was waiting for.
   # "./tasks/obtainability-planted-pdb/task.yaml"
   # "./tasks/stockout-pinned-pool/task.yaml"
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
-  # "./tasks/rca-remediation-pr/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
@@ -760,8 +776,10 @@ for TASK in "${TASKS[@]}"; do
   #   OK     -- a record with scores; the gate below decides.
   #
   # KUBE_AGENTS_INFRA_FAILURE is the marker kube_agents_bench.harness puts on
-  # errors[0] when the agent endpoint failed in transport on every attempt, so
-  # no turn ever reached the agent. The record IS scored -- the judge grades
+  # errors[0] when the agent endpoint failed in transport on every attempt --
+  # on the opening turn, so no turn ever reached the agent, or on every
+  # delegation status turn, so the delegated work's results were unreachable
+  # with cards still outstanding. The record IS scored -- the judge grades
   # the empty output and returns 0.0 -- but there is no answer in it to grade,
   # and gating on that score reds the PR for a pod restart. The harness raises
   # this only after exhausting its retries on a gateway status or a dropped

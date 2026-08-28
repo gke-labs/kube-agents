@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
@@ -62,7 +63,13 @@ func setupScheme() *runtime.Scheme {
 }
 
 func defaultTestNetpolProfile() netpolProfile {
-	return netpolProfile{DNSClusterIP: defaultDNSClusterIP, MetadataDaemonIP: metadataDaemonIP}
+	return netpolProfile{
+		Generated:            true,
+		DNSClusterIPs:        []string{defaultDNSClusterIP},
+		DNSSource:            netpolSourceDefault,
+		MetadataDaemonIP:     metadataDaemonIP,
+		MetadataDaemonSource: netpolSourceDefault,
+	}
 }
 
 // ssaApplyInterceptor is the shorter name the credential-broker tests use for
@@ -713,8 +720,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
 	}
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -784,6 +791,15 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if ruleMinter == nil || ruleMinter.To[0].PodSelector == nil || ruleMinter.To[0].PodSelector.MatchLabels["app"] != "github-token-minter" {
 		t.Errorf("expected GitHub Token Minter egress rule to match app 'github-token-minter'")
 	}
+	// Both labels, not just the name: the postgresql pod carries
+	// app.kubernetes.io/name=hindsight too, and the database is meant to be
+	// reachable from the API pod alone (hindsight/networkpolicy.yaml).
+	ruleHindsight := findEgressRule(8888, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app.kubernetes.io/name"] == "hindsight"
+	})
+	if ruleHindsight == nil || ruleHindsight.To[0].PodSelector.MatchLabels["app.kubernetes.io/component"] != "api" {
+		t.Errorf("expected Hindsight egress rule on 8888 to match the api component, not every hindsight pod")
+	}
 }
 
 func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
@@ -822,7 +838,7 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
-	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	// Expected 9 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
 	// 2. GCP WI / Metadata server (80)
 	// 3. GKE WI Host Network Daemon (988)
@@ -831,8 +847,9 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	// 6. Kubernetes API Server (443, 6443, 8443)
 	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
 	// 8. GitHub Token Minter (8080)
-	if len(netpol.Spec.Egress) != 8 {
-		t.Errorf("expected 8 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 9. Hindsight memory API (8888)
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -1037,7 +1054,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 1. IPv4 dynamic DNS clusterIP
-	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "34.118.224.10", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
+	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"34.118.224.10"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleGKE := findDNSEgressRule(netpolGKE)
 	if dnsRuleGKE == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolGKE")
@@ -1054,7 +1071,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 2. IPv6 dynamic DNS clusterIP
-	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "2001:db8::10", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
+	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"2001:db8::10"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleIPv6 := findDNSEgressRule(netpolIPv6)
 	if dnsRuleIPv6 == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolIPv6")
@@ -1071,7 +1088,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 3. Fallback when invalid or empty
-	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "invalid-ip", MetadataDaemonIP: metadataDaemonIP}, false, "", false)
+	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"invalid-ip"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleFallback := findDNSEgressRule(netpolFallback)
 	if dnsRuleFallback == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolFallback")
@@ -1086,6 +1103,108 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	if !foundFallback {
 		t.Errorf("expected fallback 10.96.0.10/32 for invalid DNS clusterIP")
 	}
+
+	// 4. Dual-stack: both ClusterIPs reach the port-53 rule.
+	// TestResolveNetpolProfile/DiscoveryKubeDNS_DualStack proves the resolver returns
+	// two addresses; without this case nothing checked that both survive into the
+	// policy, so a read of dnsIPs[0] would leave a dual-stack cluster with IPv4-only
+	// DNS egress and a green suite.
+	netpolDualStack := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"10.96.0.10", "2001:db8::10"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
+	dnsRuleDualStack := findDNSEgressRule(netpolDualStack)
+	if dnsRuleDualStack == nil {
+		t.Fatalf("DNS egress rule (port 53) not found in netpolDualStack")
+	}
+	wantDualStack := map[string]bool{"10.96.0.10/32": false, "2001:db8::10/128": false}
+	for _, peer := range dnsRuleDualStack.To {
+		if peer.IPBlock == nil {
+			continue
+		}
+		if _, ok := wantDualStack[peer.IPBlock.CIDR]; ok {
+			wantDualStack[peer.IPBlock.CIDR] = true
+		}
+	}
+	for cidr, found := range wantDualStack {
+		if !found {
+			t.Errorf("expected %s in DNS egress peers for a dual-stack kube-dns", cidr)
+		}
+	}
+}
+
+// The two branches buildNetworkPolicy grew for spec.networkPolicy, tested where
+// they are implemented. TestResolveNetpolProfile covers the profile they read;
+// nothing covered the policy they build, so deleting either append would have
+// shipped green.
+func TestBuildNetworkPolicy_ProfileDrivenRules(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	t.Run("AdditionalEgressIsAppended", func(t *testing.T) {
+		profile := defaultTestNetpolProfile()
+		tcp := corev1.ProtocolTCP
+		port := intstr.FromInt32(5432)
+		profile.AdditionalEgress = []networkingv1.NetworkPolicyEgressRule{{
+			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &port}},
+			To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "10.200.0.0/16"},
+			}},
+		}}
+
+		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+		found := false
+		for _, rule := range netpol.Spec.Egress {
+			for _, peer := range rule.To {
+				if peer.IPBlock != nil && peer.IPBlock.CIDR == "10.200.0.0/16" {
+					found = true
+					if len(rule.Ports) != 1 || rule.Ports[0].Port.IntValue() != 5432 {
+						t.Errorf("additional egress rule lost its ports: %+v", rule.Ports)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("profile.AdditionalEgress was not appended to the generated policy")
+		}
+	})
+
+	t.Run("EmptyMetadataDaemonIPSuppressesRule3", func(t *testing.T) {
+		profile := defaultTestNetpolProfile()
+		profile.MetadataDaemonIP = ""
+		profile.MetadataDaemonSource = netpolSourceSuppressed
+
+		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+		for _, rule := range netpol.Spec.Egress {
+			for _, p := range rule.Ports {
+				if p.Port != nil && p.Port.IntValue() == 988 {
+					t.Fatalf("rule 3 (port 988) survived metadataDaemon.endpoint suppression")
+				}
+			}
+		}
+
+		// The pre-DNAT rule 2 is a separate rule and must NOT go with it.
+		withDaemon := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+		if len(netpol.Spec.Egress) != len(withDaemon.Spec.Egress)-1 {
+			t.Errorf("suppression removed %d rules, want exactly 1", len(withDaemon.Spec.Egress)-len(netpol.Spec.Egress))
+		}
+		found80 := false
+		for _, rule := range netpol.Spec.Egress {
+			for _, p := range rule.Ports {
+				if p.Port != nil && p.Port.IntValue() == 80 {
+					for _, peer := range rule.To {
+						if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
+							found80 = true
+						}
+					}
+				}
+			}
+		}
+		if !found80 {
+			t.Errorf("rule 2 (link-local metadata on port 80) was removed along with rule 3")
+		}
+	})
 }
 
 func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
@@ -2377,7 +2496,7 @@ func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -2701,7 +2820,7 @@ func TestReconcileNetworkPolicy_DynamicDiscovery(t *testing.T) {
 		APIServerCIDROverride: "198.51.100.0/24,203.0.113.1/32",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2794,7 +2913,7 @@ func TestReconcileNetworkPolicy_CustomEgressCIDRsAnnotation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2859,7 +2978,7 @@ func TestReconcileNetworkPolicy_RejectOverlyBroadCIDR(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2912,7 +3031,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2990,7 +3109,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 
 	// 3. Verify disabling annotation deletes FQDNNetworkPolicy
 	delete(agent.Annotations, AnnotationEnableFQDNNetworkPolicy)
-	err = r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err = r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy after disabling FQDN failed: %v", err)
 	}
@@ -3036,7 +3155,7 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3048,8 +3167,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -3100,7 +3219,7 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "", false)
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3111,8 +3230,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 
@@ -3150,7 +3269,7 @@ func TestReconcileNetworkPolicy_TruncateMaxCIDRs(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3203,7 +3322,7 @@ func TestReconcileNetworkPolicy_PrivateIPOverlap(t *testing.T) {
 		APIServerIP: "172.16.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, "", false); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3428,6 +3547,321 @@ func TestClearForeignPDBBudgetField_LeavesAgreeingBudgetAlone(t *testing.T) {
 	}
 	if err := r.clearForeignPDBBudgetField(ctx, buildPlatformPDB(missing)); err != nil {
 		t.Fatalf("expected NotFound to be tolerated, got %v", err)
+	}
+}
+
+// fqdnNetworkPolicyObject builds the unstructured FQDNNetworkPolicy the operator owns
+// for an agent. The GVK is not in the scheme -- the CRD is GKE Dataplane V2's -- which is
+// the reason the disabled path reads it as unstructured and why it is worth covering
+// separately from the typed NetworkPolicy beside it.
+func fqdnNetworkPolicyObject(namespace, name string, owner *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.gke.io",
+		Version: "v1alpha1",
+		Kind:    "FQDNNetworkPolicy",
+	})
+	u.SetNamespace(namespace)
+	u.SetName(name)
+	if owner != nil {
+		u.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1",
+			Kind:       "PlatformAgent",
+			Name:       owner.Name,
+			UID:        owner.UID,
+			Controller: ptr.To(true),
+		}})
+	}
+	return u
+}
+
+func TestReconcileNetworkPolicy_Disabled_DeletesOwnedOnly(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			UID:       types.UID("1234-5678"),
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+					Enabled: ptr.To(false),
+				},
+			},
+		},
+	}
+
+	// 1. Owned NetworkPolicy (should be deleted)
+	ownedNetpol := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-netpol",
+			Namespace: "test-ns",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "kubeagents.x-k8s.io/v1alpha1",
+					Kind:       "PlatformAgent",
+					Name:       agent.Name,
+					UID:        agent.UID,
+					Controller: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, ownedNetpol).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	// Created through the client rather than seeded with WithObjects: the
+	// FQDNNetworkPolicy GVK is not in the scheme, and Create is the path that
+	// registers it, the same one the reconciler takes on the enabled path.
+	ownedFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", agent)
+	if err := cl.Create(ctx, ownedFQDN); err != nil {
+		t.Fatalf("failed to seed owned FQDNNetworkPolicy: %v", err)
+	}
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: cl,
+		Scheme:    scheme,
+	}
+
+	profile := r.resolveNetpolProfile(ctx, agent)
+	if profile.Generated {
+		t.Fatalf("expected profile.Generated=false when enabled=false")
+	}
+
+	if err := r.reconcileNetworkPolicy(ctx, agent, profile, "", false); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	checkNetpol := &networkingv1.NetworkPolicy{}
+	err := cl.Get(ctx, types.NamespacedName{Name: ownedNetpol.Name, Namespace: ownedNetpol.Namespace}, checkNetpol)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected owned NetworkPolicy to be deleted, got err=%v", err)
+	}
+
+	// 2. Owned FQDNNetworkPolicy (should be deleted). The docs promise enabled:false
+	// removes both policies the operator owns; without this the FQDN half could stop
+	// matching its owner reference and keep domain filtering on for an agent whose
+	// policy management was switched off, with the suite green.
+	checkFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", nil)
+	err = cl.Get(ctx, types.NamespacedName{Name: ownedFQDN.GetName(), Namespace: ownedFQDN.GetNamespace()}, checkFQDN)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected owned FQDNNetworkPolicy to be deleted, got err=%v", err)
+	}
+
+	// 3. Non-owned NetworkPolicy with same name (should NOT be deleted)
+	foreignNetpol := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-netpol",
+			Namespace: "test-ns",
+		},
+	}
+	clForeign := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, foreignNetpol).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	foreignFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", nil)
+	if err := clForeign.Create(ctx, foreignFQDN); err != nil {
+		t.Fatalf("failed to seed foreign FQDNNetworkPolicy: %v", err)
+	}
+
+	rForeign := &PlatformAgentReconciler{
+		Client:    clForeign,
+		APIReader: clForeign,
+		Scheme:    scheme,
+	}
+
+	if err := rForeign.reconcileNetworkPolicy(ctx, agent, profile, "", false); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	err = clForeign.Get(ctx, types.NamespacedName{Name: foreignNetpol.Name, Namespace: foreignNetpol.Namespace}, checkNetpol)
+	if err != nil {
+		t.Errorf("expected unowned/foreign NetworkPolicy to be preserved, got err=%v", err)
+	}
+
+	// 4. Non-owned FQDNNetworkPolicy with the same name (should NOT be deleted).
+	checkForeignFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", nil)
+	err = clForeign.Get(ctx, types.NamespacedName{Name: foreignFQDN.GetName(), Namespace: foreignFQDN.GetNamespace()}, checkForeignFQDN)
+	if err != nil {
+		t.Errorf("expected unowned/foreign FQDNNetworkPolicy to be preserved, got err=%v", err)
+	}
+}
+
+func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+					DNSClusterIPs: []string{"10.200.0.10"},
+					MetadataDaemon: &agentv1alpha1.MetadataDaemonSpec{
+						Endpoint: "169.254.169.245",
+					},
+				},
+			},
+		},
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{
+			ReadyReplicas: 1,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, dep).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: cl,
+		Scheme:    scheme,
+	}
+
+	profile := r.resolveNetpolProfile(ctx, agent)
+	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile)
+	if err != nil {
+		t.Fatalf("updateStatusReady failed: %v", err)
+	}
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready", phase)
+	}
+
+	if !agent.Status.NetworkPolicy.Generated {
+		t.Errorf("expected Status.NetworkPolicy.Generated to be true")
+	}
+	if agent.Status.NetworkPolicy.DNSClusterIPsSource != "Spec" {
+		t.Errorf("got DNSClusterIPsSource %q, want Spec", agent.Status.NetworkPolicy.DNSClusterIPsSource)
+	}
+	if !reflect.DeepEqual(agent.Status.NetworkPolicy.DNSClusterIPs, []string{"10.200.0.10"}) {
+		t.Errorf("got DNSClusterIPs %v, want [10.200.0.10]", agent.Status.NetworkPolicy.DNSClusterIPs)
+	}
+	if agent.Status.NetworkPolicy.MetadataDaemonIP != "169.254.169.245" {
+		t.Errorf("got MetadataDaemonIP %q, want 169.254.169.245", agent.Status.NetworkPolicy.MetadataDaemonIP)
+	}
+	if agent.Status.NetworkPolicy.MetadataDaemonIPSource != "Spec" {
+		t.Errorf("got MetadataDaemonIPSource %q, want Spec", agent.Status.NetworkPolicy.MetadataDaemonIPSource)
+	}
+}
+
+// TestReconcileNetworkPolicy_StatusReporting_Disabled covers the one state
+// status.networkPolicy.generated exists to express.
+//
+// Generated deliberately carries no omitempty: encoding/json drops a false bool
+// under omitempty, so a disabled agent would serialise as `networkPolicy: {}` and
+// an operator asking "is the operator managing my policy?" would get silence.
+// That choice is defended by a comment in common_types.go and by nothing else --
+// re-adding omitempty during a cleanup looks like tidying up next to the field's
+// five omitempty neighbours, and every existing assertion is on Generated == true,
+// which omitempty does not touch. The JSON check below is the tripwire.
+//
+// The DNS and metadata assertions cover the same reconcile's early return:
+// resolveNetpolProfile bails before either ladder runs when enabled is false, so a
+// Spec pin that is set here must still report nothing.
+func TestReconcileNetworkPolicy_StatusReporting_Disabled(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+					Enabled: ptr.To(false),
+					// Set, and must still not be reported: the early return
+					// precedes the DNS ladder.
+					DNSClusterIPs: []string{"10.200.0.10"},
+					MetadataDaemon: &agentv1alpha1.MetadataDaemonSpec{
+						Endpoint: "169.254.169.245",
+					},
+				},
+			},
+		},
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{
+			ReadyReplicas: 1,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, dep).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: cl,
+		Scheme:    scheme,
+	}
+
+	profile := r.resolveNetpolProfile(ctx, agent)
+	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile); err != nil {
+		t.Fatalf("updateStatusReady failed: %v", err)
+	}
+
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}, stored); err != nil {
+		t.Fatalf("failed to read the agent back: %v", err)
+	}
+
+	netpol := stored.Status.NetworkPolicy
+	if netpol.Generated {
+		t.Errorf("got Status.NetworkPolicy.Generated=true, want false for enabled=false")
+	}
+	if len(netpol.DNSClusterIPs) != 0 {
+		t.Errorf("got DNSClusterIPs %v, want none: the DNS ladder never runs when generation is off", netpol.DNSClusterIPs)
+	}
+	if netpol.DNSClusterIPsSource != "" {
+		t.Errorf("got DNSClusterIPsSource %q, want empty", netpol.DNSClusterIPsSource)
+	}
+	if netpol.MetadataDaemonIP != "" {
+		t.Errorf("got MetadataDaemonIP %q, want empty", netpol.MetadataDaemonIP)
+	}
+	if netpol.MetadataDaemonIPSource != "" {
+		t.Errorf("got MetadataDaemonIPSource %q, want empty", netpol.MetadataDaemonIPSource)
+	}
+
+	// The whole point of the missing omitempty: the key has to survive encoding.
+	encoded, err := json.Marshal(netpol)
+	if err != nil {
+		t.Fatalf("failed to marshal NetworkPolicyStatus: %v", err)
+	}
+	if got := string(encoded); !strings.Contains(got, `"generated":false`) {
+		t.Errorf("encoded status is %s, want it to carry \"generated\":false -- omitempty on Generated would erase the one state this field reports", got)
 	}
 }
 

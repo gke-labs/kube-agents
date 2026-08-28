@@ -580,6 +580,136 @@ type TelemetrySpec struct {
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
 }
 
+// NetworkPolicySpec configures the operator-generated egress NetworkPolicy.
+// Tier-2 typed equivalent of the kubeagents.x-k8s.io/{dns-cluster-ip,metadata-daemon-ip}
+// annotations; the annotations remain as the escape hatch and win over this field.
+type NetworkPolicySpec struct {
+	// Enabled turns operator-managed NetworkPolicy generation off entirely, for
+	// installs that manage network policy through their own tooling. Unset means on.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// DNSClusterIPs pins the cluster DNS Service ClusterIPs. Setting it disables
+	// discovery, like spec.telemetry.otlpEndpoint. Each entry is a bare IP with no
+	// prefix; the operator writes it into rule 1 as a /32 or /128.
+	//
+	// The per-item pattern is here rather than left to the resolver because an entry
+	// the resolver cannot parse is dropped and the pin silently reverts to discovery.
+	// It bounds the IPv4 octets and rejects the leading-zero form net.ParseIP refuses
+	// (010.96.0.10), so the usual typos are apply-time errors -- but it is a shape
+	// check, not net.ParseIP: a malformed IPv6 literal the hextet alternation admits
+	// still reaches the resolver, which logs it and falls back to discovery.
+	// EgressPeer.CIDR and MetadataDaemonSpec.Endpoint below carry the same bound for
+	// the same reason.
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=45
+	// +kubebuilder:validation:items:Pattern=`^((((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
+	// +optional
+	DNSClusterIPs []string `json:"dnsClusterIPs,omitempty"`
+
+	// MetadataDaemon describes the node-local cloud metadata daemon. There is no
+	// discovery for this one, unlike the DNS ClusterIP above: leave nil and the
+	// operator takes the kubeagents.x-k8s.io/metadata-daemon-ip annotation, then its
+	// own --kubernetes-metadata-daemon-ip flag, then the documented default
+	// 169.254.169.252. Present with Endpoint "" emits no post-NAT rule at all, for
+	// datapaths that evaluate pre-NAT or clouds without one.
+	// +optional
+	MetadataDaemon *MetadataDaemonSpec `json:"metadataDaemon,omitempty"`
+
+	// AdditionalEgress appends CIDR-and-port egress rules to the generated policy.
+	// Entries are not passed through untouched: every peer CIDR is canonicalised,
+	// and three things the schema below cannot express are dropped by the operator
+	// instead -- an IPv4-mapped IPv6 peer, which clears the IPv6 prefix floor and
+	// then fails the IPv4 one once collapsed to the block it means; an except that
+	// is not a strict subset of its peer, which the API server would reject the
+	// whole policy for; and a rule left with no usable peer, which would otherwise
+	// permit egress to every destination. Each drop is logged and costs only the
+	// entry it names. Everything else is rejected at admission -- except an entry
+	// with no ports, which is admitted and opens every port to its peers. See
+	// EgressRule.ports.
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
+}
+
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+type MetadataDaemonSpec struct {
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// the empty alternative in the pattern is required because the API server
+	// validates an explicitly-set "", which omitempty does not suppress.
+	// +kubebuilder:validation:Pattern=`^($|(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
+	// +kubebuilder:validation:MaxLength=45
+	Endpoint string `json:"endpoint"`
+}
+
+// EgressRule is a deliberately narrow projection of networkingv1.NetworkPolicyEgressRule:
+// CIDR + port list only. It keeps the CRD OpenAPI small and forbids the selector-based
+// peers that would let a CR reference pods/namespaces the operator does not vet.
+type EgressRule struct {
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	To []EgressPeer `json:"to"`
+
+	// Ports restricts the rule to these destination ports. Omitting it emits a rule
+	// with peers and no ports, which in NetworkPolicy semantics permits EVERY port
+	// to those peers -- the mirror of the case the operator refuses to emit, a rule
+	// with ports and no surviving peer. That is standard NetworkPolicy behaviour and
+	// a legitimate thing to ask for, so it is admitted rather than blocked and
+	// nothing is logged; list the ports if you did not mean it.
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Ports []EgressPort `json:"ports,omitempty"`
+}
+
+// EgressPeer defines a CIDR block and optional exclusions.
+type EgressPeer struct {
+	// CIDR is an IPv4/IPv6 block or host IP, e.g. 10.0.0.0/24 or 10.0.0.1.
+	//
+	// The prefix length is bounded by the pattern rather than left to the resolver:
+	// 12-32 for IPv4 and 48-128 for IPv6, the same floors toEgressRules enforces.
+	// Stating them at admission turns "the rule silently never took effect" into an
+	// apply-time error.
+	//
+	// One case the pattern cannot express and the resolver handles instead: an
+	// IPv4-mapped IPv6 block such as ::ffff:0:0/96 is a 128-bit prefix by every
+	// textual measure, so it clears the IPv6 floor here, and is then collapsed to its
+	// IPv4 equivalent and re-measured against the IPv4 floor by normalizeCIDRTarget --
+	// which is what stops it emitting as 0.0.0.0/0. Excluding the mapped form by
+	// regex would mean enumerating every zero-compression spelling of the first five
+	// hextets; the resolver decides it in one comparison.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=49
+	// +kubebuilder:validation:Pattern=`^((((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(1[2-9]|2[0-9]|3[0-2]))?)|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/(4[89]|[5-9][0-9]|1[01][0-9]|12[0-8]))?))$`
+	CIDR string `json:"cidr"`
+
+	// Except carves ranges out of CIDR. Each entry must be a strict subset of CIDR --
+	// contained by it and narrower than it -- because ValidateIPBlock rejects the
+	// whole NetworkPolicy otherwise, which would freeze every other egress rule at
+	// its previous revision. The resolver applies the same test and drops an except
+	// that fails it rather than forwarding it.
+	//
+	// An entry may be a bare host address as well as a block, the same as CIDR above
+	// -- a bare address means a /32 or /128. The prefix is optional here for that
+	// symmetry alone: writing 10.0.1.5 next to a cidr that accepts 10.0.1.5 should
+	// not be an apply-time rejection quoting a 200-character regex. Unlike CIDR
+	// there is no prefix floor, because an except is bounded by having to be a
+	// strict subset of its peer.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=49
+	// +kubebuilder:validation:items:Pattern=`^((((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/([0-9]|[12][0-9]|3[0-2]))?)|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?))$`
+	// +optional
+	Except []string `json:"except,omitempty"`
+}
+
+// EgressPort defines a port and transport protocol.
+type EgressPort struct {
+	// +kubebuilder:validation:Enum=TCP;UDP;SCTP
+	Protocol string `json:"protocol"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+}
+
 // AgentSpec defines the common infrastructure configuration shared across all agent types.
 type AgentSpec struct {
 	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
@@ -593,6 +723,10 @@ type AgentSpec struct {
 	// Telemetry configures OpenTelemetry export for this agent.
 	// +optional
 	Telemetry *TelemetrySpec `json:"telemetry,omitempty"`
+
+	// NetworkPolicy configures the operator-generated egress NetworkPolicy.
+	// +optional
+	NetworkPolicy *NetworkPolicySpec `json:"networkPolicy,omitempty"`
 }
 
 type DeploymentStatus struct {
@@ -637,6 +771,45 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
+// NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
+// the same diagnostic split as TelemetryStatus: the value alone cannot say whether a DNS
+// IP was discovered or pinned.
+type NetworkPolicyStatus struct {
+	// Note, deliberately not a doc comment — the blank line below keeps it out of the
+	// CRD description that `kubectl explain` prints. No omitempty, deliberately:
+	// encoding/json omits a false bool under omitempty, so a disabled agent would
+	// serialise as `networkPolicy: {}` and the one state this field exists to report
+	// would be the one it could not express. The key is therefore always present,
+	// including before anything has resolved it — which is what the doc comment below
+	// has to scope, and why this field is not a *bool: a pointer would put the key
+	// back to absent for exactly the CR an operator is most likely to be inspecting.
+
+	// Generated reports whether the operator is managing a NetworkPolicy for this
+	// agent: true once a reconcile has generated one, false when
+	// spec.networkPolicy.enabled is false. It is written only by the Ready status
+	// update, so read it alongside the Ready condition — a CR that went Degraded
+	// before its first successful reconcile reports false because nothing has
+	// resolved the field yet, not because generation is off.
+	// +optional
+	Generated bool `json:"generated"`
+
+	// DNSClusterIPs are the ClusterIPs written into rule 1.
+	// +optional
+	DNSClusterIPs []string `json:"dnsClusterIPs,omitempty"`
+
+	// DNSClusterIPsSource reports which rung answered the DNS ClusterIP (Annotation, Spec, OperatorEnv, Discovered, or Default).
+	// +optional
+	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
+
+	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// +optional
+	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
+
+	// MetadataDaemonIPSource reports which rung answered the metadata daemon IP (Annotation, Spec, OperatorEnv, Default, or Suppressed).
+	// +optional
+	MetadataDaemonIPSource string `json:"metadataDaemonIPSource,omitempty"`
+}
+
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
 	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
@@ -679,6 +852,17 @@ type AgentStatus struct {
 	// Telemetry reports the resolved OpenTelemetry export configuration.
 	// +optional
 	Telemetry TelemetryStatus `json:"telemetry,omitempty"`
+
+	// Note, deliberately not a doc comment — the blank line below keeps it out of the
+	// CRD description that `kubectl explain` prints. As on the three status structs
+	// above, omitempty does nothing here: encoding/json has no notion of an empty
+	// struct, so this key is always serialised, as `{}` before the first reconcile. It
+	// is kept for consistency with its neighbours — read the field, not the key's
+	// absence, to tell whether network policy has been resolved.
+
+	// NetworkPolicy reports the resolved egress NetworkPolicy configuration.
+	// +optional
+	NetworkPolicy NetworkPolicyStatus `json:"networkPolicy,omitempty"`
 }
 
 const (

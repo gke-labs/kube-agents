@@ -519,6 +519,25 @@ platformAgent:
     # add them to the existing Secret (upgrade.sh backfills them additively).
     create: false
     data: {}
+  # spec.networkPolicy on the PlatformAgent CR, passed through verbatim. Empty
+  # omits the field, which is what leaves the operator to discover the cluster
+  # DNS ClusterIPs and use the default metadata-daemon address. Not to be
+  # confused with the `networkPolicy: true` booleans under litellm, hindsight
+  # and githubMinter above, which toggle those components' own policies.
+  #
+  #   networkPolicy:
+  #     enabled: true              # false stops generation and deletes the
+  #                                # operator-owned <name>-gateway-netpol and
+  #                                # <name>-fqdn-netpol
+  #     dnsClusterIPs: ["10.96.0.10"]
+  #     metadataDaemon:
+  #       endpoint: "169.254.169.252"  # "" suppresses the post-NAT rule
+  #     additionalEgress:
+  #       - to: [{ cidr: "10.200.0.0/16" }]
+  #         ports: [{ protocol: TCP, port: 5432 }]
+  #
+  # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
+  networkPolicy: {}
   integration:
     github:
       # Target GitOps repository for the GitHub integration (owner/repo or

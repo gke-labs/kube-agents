@@ -30,7 +30,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 
 _(Or via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
 
-This interactive installer guides you through GCP authentication, project selection, GKE cluster setup (Standard or Autopilot), chat integrations (Google Chat & Slack), and LLM model provider credentials.
+This interactive installer guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials.
 
 ### 🤖 AI Agent & Automation Usage
 

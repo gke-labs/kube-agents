@@ -25,10 +25,11 @@ spec:
   deployment: { ... } # container image, pull policy, containers, volumes
   security: { ... } # service account + Workload Identity
   telemetry: { ... } # OTLP collector endpoint (optional)
+  networkPolicy: { ... } # generated egress NetworkPolicy (optional)
   integration: { ... } # Google Chat, Slack, GitHub
 ```
 
-`spec.deployment`, `spec.security`, and `spec.telemetry` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration` and `spec.telemetry` are optional.
+`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, and `spec.networkPolicy` are optional.
 
 ## `spec.harness`
 
@@ -412,6 +413,51 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 
 Optional, and omitting it is the point: with the field absent the operator discovers an in-cluster collector, falls back to GKE Managed OpenTelemetry when it cannot establish what the cluster has, and disables export altogether when discovery finds no collector (`otlpEndpointSource: None`). Setting it pins the endpoint and suppresses discovery. The full precedence ladder, the discovery order, and the Helm value that drives LiteLLM and the NetworkPolicy alongside this field are on [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
+## `spec.networkPolicy`
+
+Configures the operator-generated egress `NetworkPolicy`.
+
+- `enabled` (bool, optional) — toggle operator-managed NetworkPolicy generation. Default `true` (unset
+  means on). Setting `false` stops generation and deletes the two policies the operator owns for this
+  agent, `<name>-gateway-netpol` and the `<name>-fqdn-netpol` `FQDNNetworkPolicy`. Both deletions
+  check the owner reference first, so a policy of the same name that the operator did not create
+  survives.
+- `dnsClusterIPs` ([]string, optional, max 8 items) — pins the cluster DNS Service ClusterIPs in
+  rule 1, suppressing dynamic discovery from `kube-system/kube-dns`. Each entry is a bare IPv4 or
+  IPv6 address with no prefix. Admission bounds the IPv4 octets and rejects the leading-zero form
+  (`010.96.0.10`) that Go's `net.ParseIP` refuses, so the usual typos are apply-time errors; a malformed
+  IPv6 literal can still get past it, in which case the operator drops the entry and falls back to
+  discovery, and says so in its log.
+- `metadataDaemon` (object, optional) — pins the node-local cloud metadata daemon IP in rule 3. Its
+  one field, `endpoint`, is required within it, so `metadataDaemon: {}` is rejected; an explicit
+  `endpoint: ""` suppresses rule 3 entirely, for datapaths without a post-NAT daemon. Unlike
+  `dnsClusterIPs` there is no discovery behind this one — leave it out and the operator falls
+  through the annotation and its own environment variable to `169.254.169.252`, which is why
+  `metadataDaemonIPSource` has no `Discovered` value.
+- `additionalEgress` ([]EgressRule, optional, max 32 items) — appends custom CIDR and port egress
+  rules to the generated policy. A peer CIDR broader than `/12` (IPv4) or `/48` (IPv6) is rejected at
+  admission, so that a caller-supplied range cannot be widened into an unrestricted egress bypass.
+  One shape gets past that check and is dropped by the operator instead: an IPv4-mapped IPv6 block
+  such as `::ffff:0:0/96` is a 128-bit prefix by every textual measure, so it clears the IPv6 floor,
+  and the operator re-measures it against the IPv4 floor once it has collapsed it to the IPv4 block
+  it means. An `except` block that is not a strict subset of its peer's CIDR is dropped too — the API
+  server rejects the whole policy for one that is not — and a rule left with no usable peer is
+  dropped whole — a rule carrying ports and no peer would otherwise permit egress to every
+  destination. All three are logged, so the operator's log is where a rule that did not take effect
+  explains itself.
+
+  A rule's `ports` list is optional, and omitting it is not one of those drops: a rule with peers
+  and no ports permits **every** port to those peers, which is what a NetworkPolicy egress rule with
+  an empty port list means. Nothing is logged, because nothing was dropped. List the ports unless
+  that is what you want.
+
+  A peer's `except` entries may be written bare (`10.0.1.5`, meaning a `/32`) as well as with a
+  prefix, the same as `cidr`. Unlike `cidr` there is no prefix floor on them, because an `except`
+  has to be a strict subset of its peer to be kept at all.
+
+Annotations (`kubeagents.x-k8s.io/dns-cluster-ip` and `kubeagents.x-k8s.io/metadata-daemon-ip`) remain
+available as escape hatches and take precedence over `spec.networkPolicy`.
+
 ## `spec.integration`
 
 Enables external integrations. Only the enabled ones need to be present.
@@ -426,18 +472,23 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 The operator writes observed state to the `status` subresource:
 
-| Field                            | Type   | Purpose                                                                                          |
-| -------------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
-| `phase`                          | string | Overall state (`Pending`, `Provisioning`, `Ready`, `Failed`).                                    |
-| `address`                        | string | Fully qualified domain name (FQDN) of the agent service.                                         |
-| `lastReconcileTime`              | time   | Timestamp of the last status update.                                                             |
-| `conditions`                     | list   | Standard `metav1.Condition` observations, keyed by `type`.                                       |
-| `deploymentStatus.name`          | string | Name of the underlying Deployment.                                                               |
-| `deploymentStatus.readyReplicas` | int32  | Number of fully ready replicas.                                                                  |
-| `serviceStatus.endpoint`         | string | Primary URL/IP (with protocol and port) to reach the agent.                                      |
-| `storageStatus.bound`            | bool   | Whether the primary PVC has been provisioned.                                                    |
-| `telemetry.otlpEndpoint`         | string | The OTLP collector the agent was wired to.                                                       |
-| `telemetry.otlpEndpointSource`   | string | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`. |
+| Field                                  | Type     | Purpose                                                                                             |
+| -------------------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
+| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Failed`).                                       |
+| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                            |
+| `lastReconcileTime`                    | time     | Timestamp of the last status update.                                                                |
+| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                          |
+| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                  |
+| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                     |
+| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                         |
+| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                       |
+| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                          |
+| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.    |
+| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled. |
+| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                             |
+| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.               |
+| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                            |
+| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Default`, or `Suppressed`.               |
 
 Three condition types appear in `conditions`, and only the first is always present:
 

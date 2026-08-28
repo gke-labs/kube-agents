@@ -73,12 +73,6 @@ domains:
 # see the header above for why probes rather than six full audits. Phase 2's
 # exit criterion is an empty list.
 allowlist:
-  # rca-remediation-pr is registered in hack/ci-eval-pr.sh's TASKS array but
-  # parked until it gets one clean measured run: the 2026-08-26 smoke run
-  # (bench/tasks/DRAFTS.md) hit its 85-minute job deadline before reaching it,
-  # so its cost and signal are still unmeasured and activating it would spend
-  # presubmit budget on an unknown.
-  - remediation
   # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
   # post-incident RCA, and incident-triage means event-fired autoops triage.
   # Real coverage needs autoops-warning-event-triage, which has no scenario

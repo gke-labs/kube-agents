@@ -11,21 +11,22 @@ tooling) share.
 agree on. `install.sh`, `uninstall.sh`, and `upgrade.sh` source it rather than keeping
 their own copies:
 
-| Symbol                                   | What it fixes                                                       |
-| ---------------------------------------- | ------------------------------------------------------------------- |
-| `DEFAULT_CLUSTER_NAME`                   | GKE cluster name (`platform-agent-host`)                            |
-| `DEFAULT_REGION`                         | GCP region (`us-central1`)                                          |
-| `DEFAULT_VERTEX_LOCATION`                | Vertex AI serving location (`global`)                               |
-| `DEFAULT_MODEL_PROVIDER`                 | Model provider (`gemini`)                                           |
-| `DEFAULT_REGISTRY_PREFIX`                | Container registry prefix                                           |
-| `default_model_for_provider <provider>`  | The default model for a provider                                    |
-| `is_valid_model_provider <provider>`     | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`    |
-| `is_valid_permission_set <set>`          | Accepted GCP IAM permission sets: `read-only`, `custom`             |
-| `require_supported_permission_set <set>` | The same check, reporting why a rejected value is rejected          |
-| `is_valid_cluster_mode <mode>`           | Accepted cluster shapes: `autopilot`, `standard`                    |
-| `derive_kms_location <region>`           | Region for Cloud KMS (strips a zone suffix)                         |
-| `tf_state_bucket` / `tf_state_prefix`    | Where the install's Terraform state lives in GCS                    |
-| `write_tfvars_from_state <dest> [tag]`   | The `terraform.tfvars` generator (reads the `vars.sh` variable set) |
+| Symbol                                   | What it fixes                                                                          |
+| ---------------------------------------- | -------------------------------------------------------------------------------------- |
+| `DEFAULT_CLUSTER_NAME`                   | GKE cluster name (`platform-agent-host`)                                               |
+| `DEFAULT_REGION`                         | GCP region (`us-central1`)                                                             |
+| `DEFAULT_CLUSTER_MODE`                   | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
+| `DEFAULT_VERTEX_LOCATION`                | Vertex AI serving location (`global`)                                                  |
+| `DEFAULT_MODEL_PROVIDER`                 | Model provider (`gemini`)                                                              |
+| `DEFAULT_REGISTRY_PREFIX`                | Container registry prefix                                                              |
+| `default_model_for_provider <provider>`  | The default model for a provider                                                       |
+| `is_valid_model_provider <provider>`     | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_valid_permission_set <set>`          | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
+| `require_supported_permission_set <set>` | The same check, reporting why a rejected value is rejected                             |
+| `is_valid_cluster_mode <mode>`           | Accepted cluster shapes: `autopilot`, `standard`                                       |
+| `derive_kms_location <region>`           | Region for Cloud KMS (strips a zone suffix)                                            |
+| `tf_state_bucket` / `tf_state_prefix`    | Where the install's Terraform state lives in GCS                                       |
+| `write_tfvars_from_state <dest> [tag]`   | The `terraform.tfvars` generator (reads the `vars.sh` variable set)                    |
 
 Change a default here and every front door follows. Do **not** restate these values in
 `install.sh`, in a chart, or in prose — link to this table instead.

@@ -51,6 +51,11 @@ LOGGING_TIMEOUT_SECONDS = 60
 TRACE_TIMEOUT_SECONDS = 30
 TELEMETRY_LOAD_DEADLINE_SECONDS = 90
 _SECRET_KEY = re.compile(rf"(?i){_SECRET_NAME}")
+# EnvVar names use bare segments the inline pattern misses (API_SERVER_KEY,
+# LITELLM_MASTER_KEY); match credential words as whole underscore segments.
+_ENV_SECRET_NAME = re.compile(
+    r"(?i)(?:^|_)(key|token|secret|password|passwd|credential|auth)s?(?:_|$)"
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,45 @@ def redact_evidence(value: object) -> str:
     if len(rendered) > _DETAIL_LIMIT:
         return rendered[:_DETAIL_LIMIT] + "\n… [truncated by portal]"
     return rendered
+
+
+def redact_kubernetes_evidence(value: object) -> str:
+    """Redact Kubernetes EnvVar values whose names identify credentials."""
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return redact_evidence(value)
+    else:
+        parsed = value
+
+    def scrub(item: object) -> object:
+        if isinstance(item, dict):
+            cleaned = {str(key): scrub(child) for key, child in item.items()}
+            name = str(item.get("name") or "")
+            if "value" in cleaned and (
+                _SECRET_KEY.search(name) or _ENV_SECRET_NAME.search(name)
+            ):
+                cleaned["value"] = "[REDACTED]"
+            return cleaned
+        if isinstance(item, list):
+            return [scrub(child) for child in item]
+        if isinstance(item, str) and item[:1] in "{[":
+            # kubectl.kubernetes.io/last-applied-configuration carries the
+            # whole applied spec as a JSON string; scrub embedded documents
+            # the same way or they re-leak the values redacted above.
+            try:
+                embedded = json.loads(item)
+            except json.JSONDecodeError:
+                return item
+            if isinstance(embedded, (dict, list)):
+                return json.dumps(
+                    scrub(embedded), sort_keys=True, ensure_ascii=False
+                )
+            return item
+        return item
+
+    return redact_evidence(scrub(parsed))
 
 
 def _first(mapping: dict[str, Any], *keys: str) -> str:

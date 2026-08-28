@@ -16,6 +16,17 @@
 # one home here so the entry points cannot drift apart.
 DEFAULT_CLUSTER_NAME="platform-agent-host"
 DEFAULT_REGION="us-central1"
+# Autopilot, because it is the shape this project is developed and validated
+# against: the autopush and staging installs already run it, the chart needs no
+# node pool, and gVisor comes from Autopilot's built-in RuntimeClass rather than
+# a dedicated pool. Standard remains a first-class choice and is what
+# --cluster-mode=standard, CLUSTER_MODE=standard, or a hand-written tfvars
+# selects; it is also required for a zonal install, which Autopilot cannot do.
+#
+# This decides ONE thing: the shape a FRESH install creates. It never reaches a
+# cluster that already exists -- see write_tfvars_from_state, where every branch
+# with a live cluster takes its mode from the probe instead.
+DEFAULT_CLUSTER_MODE="autopilot"
 # Vertex serves each model from its own subset of locations, and the cluster's
 # region is usually not one of them -- gemini-3.5-flash, the vertex_ai default,
 # is not served from us-central1 (DEFAULT_REGION), so a region-derived default
@@ -129,6 +140,15 @@ warn_on_overreaching_custom_roles() {
 # The cluster shapes the gke-cluster module can build. Matches the module's own
 # variable validation, so a bad value fails at the interview rather than at
 # terraform validate with the cluster interview already paid for.
+# True when a location names a region (us-central1) rather than a zone
+# (us-central1-a). Autopilot clusters are regional, so this is what decides
+# whether the default shape is creatable at a given location. One home for the
+# pattern: install.sh both demotes the default and validates an explicit
+# --cluster-mode against it, and the two must agree.
+location_is_region() {
+  [[ "${1:-}" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]
+}
+
 is_valid_cluster_mode() {
   [[ "${1:-}" =~ ^(autopilot|standard)$ ]]
 }
@@ -460,7 +480,10 @@ write_tfvars_from_state() {
   # hand-edited CLUSTER_MODE cannot reach a live cluster's tfvars — which
   # matters because uninstall.sh and upgrade.sh also regenerate through here
   # and have no flag to correct a wrong value with.
-  local create_cluster="true" cluster_mode="standard" autopilot_enabled=""
+  # The initialiser is never the answer: both probe branches below assign, and
+  # the fresh-create branch assigns from CLUSTER_MODE. It tracks
+  # DEFAULT_CLUSTER_MODE only so the default has one spelling.
+  local create_cluster="true" cluster_mode="${DEFAULT_CLUSTER_MODE}" autopilot_enabled=""
   local cluster_exists="false"
   # `trap - ERR` inside the substitution: under bash 3.2 (macOS's default)
   # the caller's inherited ERR trap fires in this subshell even though the
@@ -486,9 +509,11 @@ write_tfvars_from_state() {
     fi
   else
     # Only a genuine NOT_FOUND means "create it". Reading any other failure —
-    # auth expiry, a network blip — as absence would regenerate
-    # cluster_mode="standard"/create_cluster=true against a live Autopilot
-    # install and plan its replacement under -auto-approve. Refuse to guess.
+    # auth expiry, a network blip — as absence would regenerate the configured
+    # shape with create_cluster=true against a live cluster of the OTHER shape
+    # and plan its replacement under -auto-approve. That is a risk in both
+    # directions and does not depend on which mode is the default. Refuse to
+    # guess.
     local describe_err
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
@@ -500,7 +525,7 @@ write_tfvars_from_state() {
     fi
     # Confirmed absent, so nothing live can be reshaped by getting this wrong:
     # the interview's choice is the only shape on offer.
-    cluster_mode="${CLUSTER_MODE:-standard}"
+    cluster_mode="${CLUSTER_MODE:-$DEFAULT_CLUSTER_MODE}"
     if ! is_valid_cluster_mode "$cluster_mode"; then
       print_error "CLUSTER_MODE='${cluster_mode}' is not a cluster shape this install can create. Use autopilot or standard."
       return 1
