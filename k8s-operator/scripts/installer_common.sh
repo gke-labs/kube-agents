@@ -728,6 +728,10 @@ write_tfvars_from_state() {
     if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
+    # Kubernetes-side knob, deliberately separate from permission_set above:
+    # that one decides the agent's GCP IAM, this one decides the cluster RBAC
+    # the operator mints, and neither implies the other.
+    echo "agent_allow_mutations = $(hcl_bool "${MUTATION_MODE:-false}")"
     echo ""
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-false}")"
     echo "chat_topic_name           = $(hcl_str "${CHAT_TOPIC_NAME:-platform-agent-chat-events}")"

@@ -78,6 +78,7 @@ PARAM_GITOPS_REPO="${GITHUB_REPO:-}"
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
+PARAM_MUTATION_MODE="${MUTATION_MODE:-false}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
 PARAM_MEMORY="${MEMORY:-file}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
@@ -126,6 +127,12 @@ Flags for AI Agents & Automation:
                                 (default: read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
+  --mutation-mode=true|false    Let the agent mutate Kubernetes workloads: adds
+                                create/update/patch/delete on the resources its RBAC
+                                already reads. Never grants Secrets, and never write
+                                access to ServiceAccounts, Nodes, or RBAC objects.
+                                Kubernetes-side only — GCP IAM stays whatever
+                                --permission-set says. (default: false, read-only)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
   --user-profile-enabled=BOOL   Enable user profile persona extensions (default: false)
   --memory=MODE                 Long-term agent memory: file | hindsight | off
@@ -186,6 +193,7 @@ parse_args() {
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
+      --mutation-mode=*) PARAM_MUTATION_MODE="${1#*=}"; shift ;;
       --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
       --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
       --user-profile-enabled=*) PARAM_USER_PROFILE_ENABLED="${1#*=}"; shift ;;
@@ -863,6 +871,7 @@ write_json_report() {
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-false},
+  "mutation_mode": ${mutation_mode:-false},
   "memory_mode": "$(json_escape "${memory_mode:-file}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "vars_file": "$(json_escape "${vars_file:-}")",
@@ -1177,6 +1186,7 @@ run_menu_system() {
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   local enable_gvisor="${ENABLE_GVISOR:-false}"
+  local mutation_mode="${MUTATION_MODE:-false}"
   local enable_webui="${HERMES_DASHBOARD_ENABLED:-false}"
   local github_org="${GITHUB_ORG:-}"
   local github_repo="${GITHUB_REPO:-gke-fleet-iac}"
@@ -1200,13 +1210,14 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
+    echo -e "  • ${C_CYAN}Kubernetes RBAC:${C_RESET} $([ "$mutation_mode" = "true" ] && echo -e "${C_YELLOW}Mutation Mode (workload writes)${C_RESET}" || echo "Read-Only")"
 
     local menu_choice=""
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
       "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
-      "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
+      "🛡️ Modify Security & Permission Boundaries (GCP IAM / K8s Mutation Mode)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (gke-fleet-iac)" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
       "🚪 Exit Control Panel" \
@@ -1283,9 +1294,10 @@ run_menu_system() {
         ;;
       4)
         local p_opt=""
-        prompt_menu "Select GCP IAM Permission Set:" \
-          "read-only — auditing and observability, no GCP write capability (Default)" \
-          "custom — exactly the roles you list, no built-in bundle" \
+        prompt_menu "Select Security Boundary to Modify:" \
+          "GCP IAM: read-only — auditing and observability, no GCP write capability (Default)" \
+          "GCP IAM: custom — exactly the roles you list, no built-in bundle" \
+          "Kubernetes RBAC: toggle mutation mode (currently: ${mutation_mode})" \
           p_opt
         case "$p_opt" in
           1) permission_set="read-only" ;;
@@ -1297,6 +1309,18 @@ run_menu_system() {
               print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
             done
             warn_on_overreaching_custom_roles "$custom_roles"
+            ;;
+          3)
+            # Mirrors the Web UI toggle above; the operator reverts the live
+            # ClusterRole on the apply that follows, so turning this off here
+            # really does take the write verbs back.
+            if [ "$mutation_mode" = "true" ]; then
+              mutation_mode="false"
+              print_success "Kubernetes mutation mode disabled — agent RBAC returns to read-only on the next apply."
+            else
+              mutation_mode="true"
+              print_warning "Kubernetes mutation mode enabled: the agent can create/update/patch/delete workloads. Secrets stay unreadable and ServiceAccount/Node/RBAC writes stay denied."
+            fi
             ;;
         esac
         ;;
@@ -1315,6 +1339,7 @@ run_menu_system() {
         export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
+        export PARAM_MUTATION_MODE="$mutation_mode"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
 
         save_var PROJECT_ID "$project_id"
@@ -1339,6 +1364,7 @@ run_menu_system() {
           save_var PLATFORM_AGENT_CUSTOM_ROLES "$custom_roles"
         fi
         save_var ENABLE_GVISOR "$enable_gvisor"
+        save_var MUTATION_MODE "$mutation_mode"
         save_var HERMES_DASHBOARD_ENABLED "$enable_webui"
         save_var GITHUB_ORG "$github_org"
         save_var GITHUB_REPO "$github_repo"
@@ -1879,6 +1905,11 @@ main() {
     print_error "--gvisor must be either true or false."
     exit 1
   fi
+  local mutation_mode="${PARAM_MUTATION_MODE:-false}"
+  if [[ ! "$mutation_mode" =~ ^(true|false)$ ]]; then
+    print_error "--mutation-mode must be either true or false."
+    exit 1
+  fi
   if [[ ! "${PARAM_ENABLE_WEBUI:-false}" =~ ^(true|false)$ ]]; then
     print_error "--enable-web-ui must be either true or false."
     exit 1
@@ -1900,9 +1931,10 @@ main() {
   fi
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
-    # RBAC stays read-only in every set, and the GitOps pull-request path works in
-    # every set, so neither belongs in these labels. read-only leads because it is
-    # the documented default and the only set that enforces no cloud-plane writes.
+    # RBAC is its own knob (--mutation-mode, read-only unless asked), and the GitOps
+    # pull-request path works in every set, so neither belongs in these labels.
+    # read-only leads because it is the documented default and the only set that
+    # enforces no cloud-plane writes.
     # See docs/site/src/content/docs/reference/security-and-iam.md.
     local perm_choice=""
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
@@ -2041,6 +2073,7 @@ main() {
   write_state_var "$vars_file" KMS_LOCATION "$(derive_kms_location "$region")"
   write_state_var "$vars_file" ENABLE_GVISOR "$enable_gvisor"
   write_state_var "$vars_file" GVISOR_POOL_NAME "gvisor-pool"
+  write_state_var "$vars_file" MUTATION_MODE "$mutation_mode"
   write_state_var "$vars_file" MODEL_PROVIDER "$model_provider"
   write_state_var "$vars_file" MODEL_DEFAULT_NAME "$model_default_name"
   write_state_var "$vars_file" VERTEX_PROJECT_ID "$vertex_project_id"
@@ -2124,6 +2157,7 @@ main() {
   # probed the live shape and the flag had no say.
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
+  echo -e "  • ${C_CYAN}K8s Mutation Mode:${C_RESET} ${mutation_mode} $([ "$mutation_mode" = "true" ] && echo "(agent can write workloads; Secrets/RBAC stay off-limits)" || echo "(agent RBAC is read-only)")"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
@@ -2287,6 +2321,7 @@ main() {
   echo -e "  • ${C_CYAN}GCP Project:${C_RESET} ${project_id} (Project Number: ${project_number})"
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-${cluster_mode:-standard}}"))"
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
+  echo -e "  • ${C_CYAN}K8s Mutation Mode:${C_RESET} ${mutation_mode:-false}"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"
   if [ "${google_chat_enabled:-false}" = "true" ]; then

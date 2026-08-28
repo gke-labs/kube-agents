@@ -454,6 +454,10 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        # Kubernetes mutation mode (install.sh --mutation-mode). Separate from
+        # permission_set on purpose: that decides GCP IAM, this decides the
+        # cluster RBAC the operator mints, and neither implies the other.
+        allowMutations = var.agent_allow_mutations
       }
       credentials = {
         create = true

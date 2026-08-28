@@ -87,6 +87,14 @@ spec:
     {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
+    {{- /*
+      Rendered even when false: the operator treats absent and false the same,
+      but an explicit value on the CR is what an operator reading `kubectl get
+      platformagent -o yaml` needs to see to know mutation mode was decided,
+      not forgotten. `default false` covers values files from before the key
+      existed.
+    */}}
+    allowMutations: {{ .Values.platformAgent.security.allowMutations | default false }}
     {{- with .Values.platformAgent.security.serviceAccountAnnotations }}
     serviceAccountAnnotations:
       {{- toYaml . | nindent 6 }}

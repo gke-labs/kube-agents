@@ -491,6 +491,13 @@ platformAgent:
     # Annotations applied to that KSA, e.g. for Workload Identity:
     #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
     serviceAccountAnnotations: {}
+    # Kubernetes mutation mode. false (the default) keeps the agent's
+    # ClusterRole read-only; true adds create/update/patch/delete on the
+    # workload resources it already reads. Secrets stay ungranted and
+    # ServiceAccounts/Nodes/RBAC stay read-only in BOTH settings — that
+    # boundary lives in the operator, not in this value. This is the
+    # Kubernetes-side knob; the GCP IAM side is permission_set/--permission-set.
+    allowMutations: false
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

@@ -42,6 +42,12 @@ variable "gvisor_pool_name" {
   default     = "gvisor-pool"
 }
 
+variable "agent_allow_mutations" {
+  description = "Whether the Platform Agent's Kubernetes RBAC allows workload mutation (create/update/patch/delete on the workload resources it already reads). False keeps the read-only role every install has by default. Secrets stay ungranted and ServiceAccounts/Nodes/RBAC stay read-only either way — that boundary is fixed in the operator, not configured here. This is the Kubernetes-side knob; permission_set governs the GCP IAM side."
+  type        = bool
+  default     = false
+}
+
 variable "agent_runtime_class" {
   description = "RuntimeClass for the agent pod, overriding what enable_gvisor_node_pool implies. Autopilot ships the gvisor RuntimeClass with no node pool to manage — and enable_gvisor_node_pool fails the plan there — so \"gvisor\" here is how an Autopilot install asks for the sandbox without reaching for extra_helm_values. Empty derives the value from enable_gvisor_node_pool."
   type        = string
