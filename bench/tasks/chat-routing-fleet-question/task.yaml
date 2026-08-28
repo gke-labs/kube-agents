@@ -12,7 +12,7 @@
 #
 # NOT ACTIVATABLE by uncommenting, and for a harness reason rather than a
 # fixture one -- unlike autoops-warning-event-triage, which was in the same
-# category until #954 built it a scenario driver: hack/ci-eval-pr.sh exports a
+# category until #1045 built it a scenario driver: hack/ci-eval-pr.sh exports a
 # single AGENT_SERVICE_NAME ("platform-agent") and the runner port-forwards
 # that one service, so every entry in TASKS reaches the platform agent. This
 # prompt would land on the specialist directly and never touch the front door

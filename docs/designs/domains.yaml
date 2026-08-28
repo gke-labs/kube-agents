@@ -77,7 +77,7 @@ domains:
 # Phase 2 domains, in #939. Reliability, capacity, security, upgrades,
 # consistency and cost are covered by the six domain probes, and fleet-audits
 # by the compliance-audit canary -- see the header above for why probes rather
-# than six full audits. incident-triage came off last, in #954, once
+# than six full audits. incident-triage came off last, in #1045, once
 # bench/tf/prebuilt/autoops-incident gave autoops-warning-event-triage an
 # incident to triage; note that gpu-stress-test-diagnosis never covered it,
 # being a chat-prompted post-incident RCA rather than event-fired triage.
