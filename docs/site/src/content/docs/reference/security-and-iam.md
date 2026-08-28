@@ -165,14 +165,18 @@ With `MODEL_PROVIDER=vertex_ai` the LiteLLM gateway gets its own KSA (`kubeagent
       --member="serviceAccount:${GSA_EMAIL}" --role="${role}"
   done
 
-  # Add the read-only roles
-  for role in roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer; do
+  # Add the read-only roles -- all eight, not just the three removed above.
+  # add-iam-policy-binding is idempotent, so naming one the GSA already holds
+  # costs nothing.
+  for role in roles/container.clusterViewer roles/container.viewer roles/compute.viewer \
+    roles/monitoring.viewer roles/logging.viewer roles/iam.serviceAccountUser \
+    roles/iam.securityReviewer roles/mcp.toolUser; do
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="serviceAccount:${GSA_EMAIL}" --role="${role}"
   done
   ```
 
-  Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
+  The eight are `local.read_only_roles` in `terraform/examples/full-install/main.tf`, and a unit test pins the verifier's copy to them.
 
 The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 

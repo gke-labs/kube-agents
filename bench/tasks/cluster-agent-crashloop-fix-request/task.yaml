@@ -75,10 +75,11 @@
 # Permission. It turns on the agent GSA's roles in the leased pool project,
 # which this repository does not record — the chart's default permission set
 # is read-only (docs/site/src/content/docs/reference/security-and-iam.md).
-# Measured at kubeagents-platform-gsa holding container.admin and
-# container.clusterAdmin at project level in all three eval projects, as of
-# 2026-08-25, on the branch of #939; re-check it in the leased project rather
-# than trusting this line, because it is a measurement and measurements rot.
+# Measured 2026-08-28 at kubeagents-platform-gsa holding exactly the eight
+# read-only roles on all ten pool projects, so this count now settles against
+# activation: the mutation is not possible on IAM grounds. Re-check it in the
+# leased project rather than trusting this line, because it is a measurement
+# and measurements rot.
 #
 # Reachability. The mutation would be a Cluster Agent worker's, and
 # hack/ci-deploy.sh scaffolds no profile for seeded cluster A — it sets only

@@ -271,11 +271,11 @@ def _mapping_row_present(text: str, project_id: str) -> bool:
     Three things the pattern has to get right, each of which a looser one gets
     wrong in the direction of a false pass:
 
-    - The row must start the line. Unanchored, `kube-agents-evals)` matches
-      inside `kube-agents-evals-2)`, so onboarding project 2 reads as already
-      mapped and its `case` arm is never written.
-    - A commented-out row is not a row. `case` ignores it, so a project whose
-      arm was parked behind a `#` deploys to whatever the `*)` default names.
+    - The row must start its own line. Unanchored, the pattern matches inside a
+      row commented out with `#` -- and `case` ignores such a row, so a project
+      whose arm was parked behind a comment deploys to whatever the `*)` default
+      names. A longer project id is not the risk here: `kube-agents-evals)` does
+      not occur inside `kube-agents-evals-2)`, because the `)` does not line up.
     - The repo name must end where it should. `-infra` is a prefix of
       `-infra-old`, and a row pointing at an archived repository would pass.
     - `echo` needs whitespace after it. `echogke-agentic/...` is a command no
@@ -540,8 +540,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     public_held.add(b.get("role"))
                 # A conditional binding grants nothing outside its condition, so
                 # counting it would pass a project the runner still cannot use.
-                # For the platform GSA the same skip errs the safe way: an
-                # unconditional extra role is what makes the agent write-capable.
+                # For the platform GSA the same skip is a blind spot rather than
+                # a safe error: container.admin conditioned on `request.time <
+                # 2030` is write access every day until then, and platform_extra
+                # below would not see it. Nothing in this repository grants a
+                # conditional role and the pool projects hold none, so this is a
+                # gap to close before one does rather than a live hole.
                 if b.get("condition"):
                     continue
                 if PROW_RUNNER_MEMBER in members:

@@ -60,13 +60,21 @@ eventually resolves it.
 
 ## Which projects have a fleet
 
-Every project in the Boskos pool carries a fleet and keeps its own state bucket. The pool
-roster lives in one place — the table in
-[CI pool project prerequisites](../site/src/content/docs/deploy/ci-pool-projects.md) — and
-is not repeated here, because a count written into prose goes stale the next time a project
-is onboarded and nothing fails when it does. The live audit behind this document covered
-`kube-agents-evals` and `kube-agents-evals-2`; every project added since was provisioned by
-`scripts/provision_ci_pool_project.sh`, which plants the same stack from the same modules.
+Every project in the Boskos pool carries a fleet and keeps its own state bucket. Which
+projects those are is not repeated here, because a count written into prose goes stale the
+next time a project is onboarded and nothing fails when it does. Two lists hold it and they
+are not the same list: the table in
+[CI pool project prerequisites](../site/src/content/docs/deploy/ci-pool-projects.md) is every
+project this codebase maps to a GitOps repository, while the leasable roster is
+`gke-internal/test-infra`. A project is mapped before it is registered, so the table runs
+ahead.
+
+The live audit behind this document covered `kube-agents-evals` and `kube-agents-evals-2`.
+`kube-agents-evals-3` predates `scripts/provision_ci_pool_project.sh`; every project from
+`kube-agents-evals-4` on was provisioned by that script, which plants the same stack from the
+same modules. The distinction is provenance rather than outcome — `-3` passes the same
+preflight verification as the rest — but it means "provisioned by the script" is not on its
+own a reason to skip verifying a project.
 
 Boskos leases a project at random, and a fleet-dependent case that lands on a project
 without a fleet does not fail — it errors, which drops `VerificationCoverage` below 1.0
@@ -164,8 +172,8 @@ fixtures — so the cost case waits 30 days, not 7.
 
 The clock is per project, not per fleet. Each project's gates open from the day its own
 stack was applied, so the earliest a fleet-wide assertion can hold is the newest project's
-date. Measured 2026-08-26 that is `kube-agents-evals-6`, applied the same day, putting
-day 7 at 2026-09-02 and day 30 at 2026-09-25. Because Boskos leases at random, a case
+date. Measured 2026-08-28 that is `kube-agents-evals-10`, applied the same day, putting
+day 7 at 2026-09-04 and day 30 at 2026-09-27. Because Boskos leases at random, a case
 activated on an earlier project's date passes on the older projects and fails on the
 newest, which reads as flake. Activate against the newest project's date, and recompute
 when a project joins the pool — `bench/tasks/DRAFTS.md`, activation blocker A3, has the
