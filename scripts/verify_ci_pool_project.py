@@ -174,13 +174,18 @@ PROW_RUNNER_ROLES = {
 # and so does an extra one, unlike the Prow runner above. That account is
 # infrastructure and a superset is harmless; this one is the subject under test,
 # where an extra role means a case passed on the grant rather than on the agent.
-# Boskos leases at random, so one over-privileged project is a one-in-six flake.
+# Boskos leases at random, so one over-privileged project flakes whichever pull
+# request happens to draw it.
 #
 # This duplicates `local.read_only_roles` in terraform/examples/full-install,
 # which is what the install passes to the IAM module. A test asserts the two are
 # equal, and that the module's own default matches, so narrowing either fails in
 # CI here rather than failing correctly-provisioned projects weeks later.
 PLATFORM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
+
+# Neither belongs on a pool project at all. Called out separately because the
+# two checks above scan for one literal member each and would not see these.
+_PUBLIC_MEMBERS = {"allUsers", "allAuthenticatedUsers"}
 
 PLATFORM_GSA_ROLES = {
     "roles/container.clusterViewer",
@@ -273,15 +278,18 @@ def _mapping_row_present(text: str, project_id: str) -> bool:
       arm was parked behind a `#` deploys to whatever the `*)` default names.
     - The repo name must end where it should. `-infra` is a prefix of
       `-infra-old`, and a row pointing at an archived repository would pass.
+    - `echo` needs whitespace after it. `echogke-agentic/...` is a command no
+      shell resolves, and quoting does not save it -- word splitting runs
+      before quote removal -- so the row reads as mapped and never runs.
     """
     body = _mapping_function_body(text)
     if body is None:
         return False
     expected_repo = f"gke-agentic/{project_id}-infra"
     pattern = (
-        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s*"
+        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s+"
         rf"([\"']){re.escape(expected_repo)}\1|"
-        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s*{re.escape(expected_repo)}(?=[\s;&|)]|$)"
+        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s+{re.escape(expected_repo)}(?=[\s;&|)]|$)"
     )
     return re.search(pattern, body, re.MULTILINE) is not None
 
@@ -320,13 +328,17 @@ def _is_upstream_url(url: str) -> bool:
       real one, which is a name anybody can register.
     - `git@example.com:gke-labs/kube-agents` -- the right path on a host that
       has nothing to do with GitHub, such as an internal mirror.
+
+    Two forms must keep matching, since rejecting one drops the comparison to a
+    warning: a port, which would otherwise parse as the head of the path, and
+    an owner in any casing, because GitHub resolves `GKE-Labs`.
     """
     url = url[:-4] if url.endswith(".git") else url
-    m = re.match(r"^(?:[\w.+-]+://)?(?:[^@/]+@)?([^/:]+)[:/](.+)$", url)
+    m = re.match(r"^(?:[\w.+-]+://)?(?:[^@/]+@)?([^/:]+)(?::\d+)?[:/](.+)$", url)
     if not m:
         return False
     host, path = m.group(1), m.group(2).strip("/")
-    return host.lower() == "github.com" and path == _UPSTREAM_SLUG
+    return host.lower() == "github.com" and path.lower() == _UPSTREAM_SLUG
 
 
 def _ref_committed_at(remote: str) -> str:
@@ -503,10 +515,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing policy for {gsa_email}: {exc}")
 
-    # Read off the project's own policy, which is not the effective one: a role
-    # inherited from an ancestor does not appear here. Checked 2026-08-26, the
-    # pool projects sit directly under the organization with no folder between,
-    # so an organization-level grant is the only thing this read can miss.
+    # Read off the project's own policy, which is not the effective one. Two
+    # things it hides from a literal-member scan: a role inherited from an
+    # ancestor (checked 2026-08-26, the pool projects sit directly under the
+    # organization with no folder between), and a binding whose member is a group
+    # holding the GSA. Both make the extra-role check below a floor rather than
+    # the closed set it reads as.
     rc, out, err = run_cmd(["gcloud", "projects", "get-iam-policy", project_id, "--format=json"])
     if rc != 0:
         passed = False
@@ -517,14 +531,19 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             prow_held = set()
             platform_held = set()
+            public_held = set()
             for b in policy.get("bindings", []):
+                members = b.get("members", [])
+                # Reported whatever the condition, unlike the two below: a
+                # condition narrows when the grant applies, not who holds it.
+                if _PUBLIC_MEMBERS.intersection(members):
+                    public_held.add(b.get("role"))
                 # A conditional binding grants nothing outside its condition, so
                 # counting it would pass a project the runner still cannot use.
                 # For the platform GSA the same skip errs the safe way: an
                 # unconditional extra role is what makes the agent write-capable.
                 if b.get("condition"):
                     continue
-                members = b.get("members", [])
                 if PROW_RUNNER_MEMBER in members:
                     prow_held.add(b.get("role"))
                 if platform_member in members:
@@ -560,6 +579,14 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "differently. Swap them per "
                     "docs/site/src/content/docs/reference/security-and-iam.md -- re-running the "
                     "install does not strip roles it no longer grants"
+                )
+            if public_held:
+                passed = False
+                details.append(
+                    f"{project_id} grants {len(public_held)} role(s) to allUsers or "
+                    f"allAuthenticatedUsers: {', '.join(sorted(public_held))}. The pool holds "
+                    "an App signing key and every lease's build artifacts, so a public binding "
+                    "reaches further than the one project it is on"
                 )
         except Exception as exc:
             passed = False

@@ -993,7 +993,14 @@ class IamGrantsTest(unittest.TestCase):
     def _reader_policy(self, members):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
-    def _project_policy(self, project_id="kube-agents-evals-3", prow_roles=None, platform_roles=None, conditional_roles=()):
+    def _project_policy(
+        self,
+        project_id="kube-agents-evals-3",
+        prow_roles=None,
+        platform_roles=None,
+        conditional_roles=(),
+        extra_bindings=(),
+    ):
         """The project's own policy: both identities holding exactly what they should."""
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
@@ -1008,6 +1015,7 @@ class IamGrantsTest(unittest.TestCase):
             }
             for r in sorted(conditional_roles)
         ]
+        bindings += list(extra_bindings)
         return json.dumps({"bindings": bindings})
 
     def _both_build_identities(self):
@@ -1123,6 +1131,37 @@ class IamGrantsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
 
+    def test_a_public_binding_fails(self):
+        # Neither identity check would see this: both scan for one literal
+        # member, and allUsers is not either of them.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    extra_bindings=[{"role": "roles/storage.objectViewer", "members": ["allUsers"]}])),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("allUsers" in d for d in result.details), result.details)
+
+    def test_a_conditional_public_binding_still_fails(self):
+        # Unlike the two checks below it: a condition narrows when the grant
+        # applies, not who holds it, so the exposure is still there.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(extra_bindings=[{
+                    "role": "roles/storage.objectViewer",
+                    "members": ["allAuthenticatedUsers"],
+                    "condition": {"title": "t", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
+                }])),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("allAuthenticatedUsers" in d for d in result.details), result.details)
+
 
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
     """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
@@ -1163,6 +1202,37 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
             "the project_roles default in variables.tf",
         )
         self.assertEqual(declared, checker.PLATFORM_GSA_ROLES)
+
+
+class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
+    """PROW_RUNNER_ROLES must equal what the two granting sites grant.
+
+    The twelve are written here, in the provisioning script's loop, and in the
+    repair block on the prerequisites page, and none reads another. Drift is
+    silent the worst way round: a role dropped from the script leaves a project
+    the verifier still passes, registered, dying on its first lease as #966 did.
+    """
+
+    def _loop_roles(self, text, what):
+        loops = [
+            m.group(1)
+            for m in re.finditer(r"for role in(.*?);\s*do(.*?)done", text, re.S)
+            if re.search(r"prowjob-default-sa|PROW_RUNNER_SA", m.group(2))
+        ]
+        self.assertEqual(len(loops), 1, f"expected exactly one Prow runner grant loop in {what}")
+        return set(re.findall(r"roles/[\w.]+", loops[0]))
+
+    def test_matches_the_loop_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        granted = self._loop_roles(script, "provision_ci_pool_project.sh")
+        self.assertEqual(granted, checker.PROW_RUNNER_ROLES)
+
+    def test_matches_the_repair_block_on_the_prerequisites_page(self):
+        page = (
+            checker._ROOT / "docs" / "site" / "src" / "content" / "docs" / "deploy" / "ci-pool-projects.md"
+        ).read_text()
+        documented = self._loop_roles(page, "deploy/ci-pool-projects.md")
+        self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
 
 
 class ExitStatusTest(unittest.TestCase):
@@ -1436,11 +1506,44 @@ class CodebaseMappingTest(unittest.TestCase):
         )
         self.assertTrue(checker._mapping_row_present(unquoted, "kube-agents-evals-6"))
 
+    def test_an_unquoted_row_missing_its_space_is_not_a_row(self):
+        # `echogke-agentic/...` is a command no shell resolves, so the arm is
+        # dead and the project would fall through to `*)` at lease time.
+        jammed = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            "    kube-agents-evals-6) echogke-agentic/kube-agents-evals-6-infra ;;\n"
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(jammed, "kube-agents-evals-6"))
+
+    def test_a_quoted_row_missing_its_space_is_not_a_row(self):
+        # Quoting does not rescue it: word splitting runs before quote removal,
+        # so `echo"gke-agentic/..."` is the same single dead token.
+        jammed = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            '    kube-agents-evals-6) echo"gke-agentic/kube-agents-evals-6-infra" ;;\n'
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(jammed, "kube-agents-evals-6"))
+
     def test_a_lookalike_owner_is_not_the_upstream_remote(self):
         # `not-gke-labs` ends with the real slug, and is a name anyone can take.
         impostor = "origin\tgit@github.com:not-gke-labs/kube-agents.git (fetch)\n"
         with _git(remotes=impostor):
             self.assertIsNone(checker._upstream_remote())
+
+    def test_an_ssh_url_carrying_a_port_is_the_upstream_remote(self):
+        # `git clone` accepts it, and the port must not be read as path.
+        ported = "origin\tssh://git@github.com:22/gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=ported):
+            self.assertEqual(checker._upstream_remote(), "origin")
+
+    def test_the_owner_is_matched_case_insensitively(self):
+        # GitHub resolves `GKE-Labs`; rejecting it loses the upstream comparison
+        # silently, leaving the operator a warning instead of a verdict.
+        shouted = "origin\thttps://github.com/GKE-Labs/kube-agents.git (fetch)\n"
+        with _git(remotes=shouted):
+            self.assertEqual(checker._upstream_remote(), "origin")
 
     def test_the_right_path_on_another_host_is_not_the_upstream_remote(self):
         mirror = "mirror\tgit@example.com:gke-labs/kube-agents.git (fetch)\n"

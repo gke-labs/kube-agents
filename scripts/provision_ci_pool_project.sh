@@ -590,27 +590,55 @@ fi
 
 echo -e "\n================================================================================"
 if [ "${SKIP_FLEET}" != "true" ]; then
+  # Conditional because the fleet apply is idempotent: a re-run to clear one
+  # amber item replants nothing, and the unconditional wording had the operator
+  # push activation dates out over an apply that changed no fixture.
+  #
   # No date printed on purpose: a gate date is the newest fleet's age measured
   # against the cost SOP's windows, named in the echo below, and both terms move.
-  echo "NOTE: this planted a fresh fleet, now the newest in the pool. Age-gated"
-  echo "      scenarios gate on the newest fleet, so their activation dates just"
-  echo "      moved pool-wide. The windows are in"
+  echo "NOTE: if the fleet apply above created or replaced fixtures, they are now"
+  echo "      the newest in the pool. Age-gated scenarios gate on the newest"
+  echo "      fleet, so their activation dates just moved pool-wide. The windows"
+  echo "      are in"
   echo "      agents/platform/governance/fleet_wide_cost_analysis_sop.md"
   echo "      (§3.4 unattached-disk 30d, §3.7 idle-nodepool 7d); add them to today."
   echo ""
 fi
-if [ "${VERIFY_RC}" -eq 0 ]; then
-  echo "🎉 ${PROJECT_ID} is provisioned and verified. Register it in Boskos last."
-else
-  echo "⚠ ${PROJECT_ID} is provisioned, but verification has not gone green."
-  echo "  Nothing failed; one or more items could not be checked. Clear them, then:"
-  # --app-id and --location are spelled out even though the verifier defaults to
-  # these same values: the operator may have passed --app-id or --region to this
-  # script, and a hint that omits them silently verifies a different App or
-  # region than the one just provisioned.
+# --app-id and --location are spelled out even though the verifier defaults to
+# these same values: the operator may have passed --app-id or --region to this
+# script, and a hint that omits them silently verifies a different App or region
+# than the one just provisioned.
+reverify_hint() {
   echo "    python3 scripts/verify_ci_pool_project.py --project-id ${PROJECT_ID} \\"
   echo "      --app-id ${APP_ID} --location ${REGION} \\"
   echo "      --confirmed-repo-in-app-installation"
+}
+
+# Four arms, because three codes reach here and they mean different things. The
+# catch-all is 2 and anything unrecognised; it is the only one that gets the
+# "nothing failed" wording, which is a lie on the other two.
+if [ "${VERIFY_RC}" -eq 0 ]; then
+  echo "🎉 ${PROJECT_ID} is provisioned and verified. Register it in Boskos last."
+elif [ "${VERIFY_RC}" -eq 1 ]; then
+  # Only from the re-run: the first call's exit 1 already left at the guard
+  # above. The installation was confirmed and a check still failed, so this is a
+  # real failure rather than something the operator can clear by confirming.
+  echo "✗ ${PROJECT_ID} is provisioned, but verification FAILED."
+  echo "  Do not register it in Boskos. Clear what the report above lists, then:"
+  reverify_hint
+  exit 1
+elif [ "${VERIFY_RC}" -eq 64 ]; then
+  # The verifier's usage code. This script builds that command line, so a bad
+  # one is a defect here; the operator has nothing to clear and the project is
+  # neither verified nor known to be broken.
+  echo "✗ this script called the verifier with a bad command line (exit 64)."
+  echo "  ${PROJECT_ID} is provisioned but unverified. Report the argument error"
+  echo "  above against scripts/provision_ci_pool_project.sh."
+  exit 1
+else
+  echo "⚠ ${PROJECT_ID} is provisioned, but verification has not gone green."
+  echo "  Nothing failed; one or more items could not be checked. Clear them, then:"
+  reverify_hint
   echo "  Boskos registration waits on that exiting 0."
 fi
 echo "================================================================================"
