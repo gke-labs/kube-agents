@@ -106,9 +106,12 @@ prompt: |
   Make no changes to the cluster.
 expected_output: |
   critical requirements:
-  - The report comes from the AutoOps triage card the k8s-event-watcher
-    incident opened, retrieved from the kanban board, and not from the agent's
-    own fresh investigation of the namespace.
+  - The report is the triage the AutoOps card already produced, read off the
+    kanban board rather than worked out fresh from the namespace. Judge that on
+    what the reply contains -- a reproduction of the card's report, with no
+    investigation of the agent's own alongside it. A correct reply is not
+    required to say where it came from, and must not be marked down for
+    reproducing the card without naming it.
   - It identifies the workload 'eval-incident-workload' as the subject.
   - It gives the root cause as the container being OOM-killed: it allocates
     more memory than its own container memory limit allows, so the kubelet
@@ -120,10 +123,15 @@ expected_output: |
     authorize, not made.
 
 verification_spec:
-  # Every check here is `mode: assert` rather than the converge default where
-  # it reads the transcript: the final message is immutable once the run ends,
-  # so polling a failed phrase check would only wait out the timeout. The
-  # cluster-state safeguards keep the default, where polling is meaningful.
+  # The transcript checks below set `mode: assert` explicitly, to override the
+  # converge default an objective otherwise gets (devops_bench
+  # verification/spec.py: converge for role objective, assert for everything
+  # else). The final message is immutable once the run ends, so polling a
+  # failed phrase check would only wait out the timeout.
+  #
+  # The cluster-state safeguards set no mode and do not need one: a safeguard
+  # already defaults to assert, and a mutation once made stays made, so one
+  # read after the turn is the whole question.
 
   - name: triage-names-the-workload
     role: objective
