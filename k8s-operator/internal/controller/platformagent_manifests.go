@@ -1950,6 +1950,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Value: resolveMemoryProvider(agent),
 	})
 
+	// The persona-facing echo of spec.security.allowMutations, always set and
+	// always with the real answer ("true"/"false") so an agent asking `echo
+	// $MUTATION_MODE` never has to distinguish "off" from "nobody said". The
+	// SOUL.md personas read this variable to decide between the default GitOps
+	// PR path and direct kubectl mutation; the ClusterRole minted from the same
+	// field (see buildMinimalPlatformRole) is what actually enforces the
+	// boundary, so the two must come from one resolver and cannot drift.
+	// Cluster Agent profiles are spawned as subprocesses of this container
+	// (cluster_agent_profile.py builds their env from os.environ), so they
+	// inherit it and need no second copy. Appended after the plugin merge for
+	// the same reason as MEMORY_PROVIDER above: extractAgentPluginEnvVars
+	// copies a plugin's spec.env verbatim, and a security posture flag is
+	// exactly what a plugin must not be able to flip silently.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "MUTATION_MODE",
+		Value: strconv.FormatBool(mutationModeEnabled(agent)),
+	})
+
 	var runtimeClassName *string
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName

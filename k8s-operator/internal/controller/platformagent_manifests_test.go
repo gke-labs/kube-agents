@@ -4160,6 +4160,44 @@ func TestMemoryProviderNoneMeansNoProvider(t *testing.T) {
 	}
 }
 
+// MUTATION_MODE is the persona's copy of spec.security.allowMutations — the SOUL.md
+// rules gate direct kubectl mutation on it, while the ClusterRole minted from the same
+// field is the enforcement. Asserted always-present with the real answer: nil spec,
+// nil field, and explicit false must all say "false", because an absent variable would
+// leave the persona guessing and an accidental "true" would flip its default stance
+// with no RBAC to grant it.
+func TestMutationModeEnvVar(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		security *agentv1alpha1.SecuritySpec
+		want     string
+	}{
+		{"nil security", nil, "false"},
+		{"nil allowMutations", &agentv1alpha1.SecuritySpec{}, "false"},
+		{"explicit false", &agentv1alpha1.SecuritySpec{AllowMutations: ptr.To(false)}, "false"},
+		{"enabled", &agentv1alpha1.SecuritySpec{AllowMutations: ptr.To(true)}, "true"},
+	} {
+		agent := newTestPlatformAgent()
+		agent.Spec.Security = tc.security
+
+		dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{})
+		found := false
+		for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+			if env.Name != "MUTATION_MODE" {
+				continue
+			}
+			found = true
+			if env.Value != tc.want {
+				t.Errorf("%s: MUTATION_MODE = %q, want %q", tc.name, env.Value, tc.want)
+			}
+		}
+		if !found {
+			t.Errorf("%s: MUTATION_MODE was not set at all; the persona cannot "+
+				"distinguish \"read-only\" from \"nothing said\"", tc.name)
+		}
+	}
+}
+
 // Tuning alone must produce an overlay: limits apply to a profile hosting no plugins.
 func TestBuildConfigMapDataTuningOnlyOverlay(t *testing.T) {
 	agent := agentWithTuning(&agentv1alpha1.TuningSpec{
