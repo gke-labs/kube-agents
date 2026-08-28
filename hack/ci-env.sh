@@ -14,25 +14,6 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../k8s-operator/scripts" && pwd)/gk
 # TODO(boskos): Once oss-test-infra#2655 merges and deploys Boskos project leasing,
 # consider failing closed if JOB_NAME is set and PROJECT_ID is unset.
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
-
-# ─── TEMPORARY PIN — REVERT BEFORE MERGE ─────────────────────────────────────
-# Pins this pull request's presubmit to kube-agents-evals-7, so the newly
-# provisioned project gets one real run before it is registered in Boskos.
-# Registering it first would put an unexercised project into the pool, where
-# a defect surfaces as a red presubmit on somebody else's pull request.
-#
-# The assignment is unconditional on purpose. The Prow job exports
-# PROJECT_ID="${LEASED_PROJECT}" *before* sourcing this file, so the `:-`
-# default above cannot override a lease and a pin written that way would be
-# silently ignored. Boskos still leases a project and leaves it idle; deploy,
-# eval and teardown all follow PROJECT_ID, so -7 is what gets used and what
-# gets cleaned up, and the idle lease is released as normal.
-#
-# This must not merge: on main it would send every presubmit to one project,
-# serialising the pool behind it.
-export PROJECT_ID="kube-agents-evals-7"
-# ─────────────────────────────────────────────────────────────────────────────
-
 export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 
