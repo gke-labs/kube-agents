@@ -547,6 +547,26 @@ type SecuritySpec struct {
 	// network in cleartext.
 	// +optional
 	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+
+	// AllowMutations widens the agent's Kubernetes RBAC from the read-only
+	// audit ceiling to workload mutation: create, update, patch and delete on
+	// the workload resources the minimal ClusterRole already reads
+	// (Deployments, Pods, ConfigMaps, Jobs, HPAs, and so on — see
+	// buildMinimalPlatformRole for the exact list).
+	//
+	// It deliberately does NOT widen the credential or identity surface:
+	// Secrets stay entirely ungranted, and ServiceAccounts, Nodes and RBAC
+	// objects stay read-only. An agent that can mutate workloads must still
+	// be unable to read credentials or mint itself a broader identity — those
+	// verbs are the escalation path from "can edit a Deployment" to "is
+	// cluster-admin", so they are not a configuration away.
+	//
+	// Defaults to false, the read-only behaviour every install had before
+	// this field existed. The operator re-applies the ClusterRole on every
+	// reconcile, so flipping this back to false (or removing it) reverts the
+	// live role rather than leaving the wider grant behind.
+	// +optional
+	AllowMutations *bool `json:"allowMutations,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.
