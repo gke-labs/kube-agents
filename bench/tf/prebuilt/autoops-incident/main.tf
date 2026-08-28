@@ -48,20 +48,12 @@ terraform {
 }
 
 locals {
-  # kubectl reads the ambient kubeconfig, which hack/ci-eval-pr.sh has already
-  # pointed at the host cluster (its `cluster-auth: gcloud get-credentials`
-  # step) before any task runs, and which nothing between there and here
-  # re-points -- the seeded-fleet path writes to a KUBECONFIG of its own and
-  # the per-task exports set variables rather than contexts. Re-running
-  # get-credentials from inside the stack would need the same DNS-endpoint
-  # decision k8s-operator/scripts/gke_dns_endpoint.sh makes for the installer,
-  # and that helper is unreachable from here: the deployer copies bench/tf into
-  # a per-run scratch directory, so nothing outside that tree resolves.
-  #
-  # Assumed, therefore -- but asserted rather than trusted. The guard below
-  # fails the apply when the current context is some other cluster, which turns
-  # planting the incident where no watcher can see it into an error with the
-  # fix in it.
+  # Every kubectl below runs against a kubeconfig this stack fetches for itself
+  # in step 0, never the ambient one. The ambient current-context is the wrong
+  # cluster by the time this apply runs -- see step 0 for the chain -- and
+  # writing to a file of our own also leaves it undisturbed for whatever runs
+  # next, which is the idiom hack/ci-eval-pr.sh already uses for the seeded
+  # fleet's per-role kubeconfigs.
   kubectl = "kubectl --namespace=${var.incident_namespace}"
 
   # Kept in one place because the poll, the manifest and the teardown all name
@@ -98,8 +90,13 @@ locals {
 resource "null_resource" "incident" {
   triggers = {
     # Destroy-time provisioners may read only `self`, so everything the
-    # teardown needs is copied in here.
-    namespace = local.ns
+    # teardown needs is copied in here -- including the cluster coordinates,
+    # because the destroy has to fetch its own credentials for the same reason
+    # step 0 does and cannot reach `var`.
+    namespace     = local.ns
+    host_cluster  = var.host_cluster_name
+    host_location = var.host_cluster_location
+    host_project  = var.project_id
 
     # Re-plant when any of it changes. Without this the resource is inert after
     # the first apply, and a local run that edited the manifest would keep
@@ -118,22 +115,49 @@ resource "null_resource" "incident" {
     command     = <<-EOT
       set -euo pipefail
 
-      # ---- 0. Prove we are pointed at the cluster the watcher is on --------
-      # A context naming any other cluster plants the incident where nothing is
-      # watching, and the only symptom would be the poll below timing out after
-      # several minutes with no explanation.
-      current="$(kubectl config current-context 2>/dev/null || true)"
-      if [ -z "$current" ]; then
-        echo "ERROR: no current kubectl context. This stack plants its incident on the cluster the Platform Agent runs on and cannot authenticate for you; run 'gcloud container clusters get-credentials ${var.host_cluster_name} --region ${var.host_cluster_location} --project ${var.project_id}' first." >&2
+      # ---- 0. Point kubectl at the cluster the watcher is on ----------------
+      # Fetched here rather than inherited, because the ambient current-context
+      # is NOT the host cluster by the time this apply runs. hack/ci-eval-pr.sh
+      # points it there once before the task loop, and then devops-bench moves
+      # it: evalharness/default.py calls deployer.get_cluster_info()
+      # unconditionally after up(), TFDeployer's implementation hands the stack's
+      # cluster_name output to GCPProvider.ensure_cluster_credentials, and that
+      # shells `gcloud container clusters get-credentials` with no --kubeconfig.
+      # gpu-stress-test-diagnosis sits two entries above this one in TASKS, is
+      # also deployer: tofu, and outputs its own per-run task cluster -- so the
+      # context in hand here names that cluster. bench/kube_agents_bench/harness.py
+      # documents the same mechanism, which is why it pins the agent connection
+      # with --context.
+      #
+      # An incident planted on the wrong cluster is never seen: k8s-event-watcher
+      # runs in-cluster inside the Platform Agent pod and watches only the cluster
+      # it is in. The old form of this step asserted the context instead of
+      # setting it, which would have failed the apply on every presubmit run.
+      #
+      # A plain get-credentials is the right call and needs no DNS-endpoint
+      # handling: it is exactly what hack/ci-eval-pr.sh does for this same
+      # cluster and what GCPProvider does for every other stack.
+      KUBECONFIG="$(mktemp)"
+      export KUBECONFIG
+      trap 'rm -f "$KUBECONFIG"' EXIT
+
+      project="${var.project_id}"
+      if [ -z "$project" ]; then
+        # GCPProvider.resolve_variables injects project_id for every task, so
+        # this is the local-run path rather than the CI one.
+        project="$(gcloud config get-value project 2>/dev/null || true)"
+      fi
+      if [ -z "$project" ]; then
+        echo "ERROR: no project id. Pass -var project_id=... or set a gcloud default project; this stack needs one to fetch credentials for ${var.host_cluster_name}." >&2
         exit 1
       fi
-      case "$current" in
-        *"${var.host_cluster_name}"*) : ;;
-        *)
-          echo "ERROR: current kubectl context is '$current', which does not name the host cluster '${var.host_cluster_name}'. k8s-event-watcher only sees the cluster the Platform Agent pod runs in, so an incident planted anywhere else is never triaged. Point kubectl at ${var.host_cluster_name} and re-run." >&2
-          exit 1
-          ;;
-      esac
+
+      gcloud container clusters get-credentials "${var.host_cluster_name}" \
+        --location "${var.host_cluster_location}" --project "$project" --quiet
+
+      # Recorded before anything is planted, so the step-3 log poll cannot match
+      # a `fire` line left by an earlier run against this same namespace name.
+      started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
       # ---- 1. Plant it ------------------------------------------------------
       kubectl create namespace "${local.ns}" --dry-run=client -o yaml | kubectl apply -f -
@@ -215,15 +239,19 @@ resource "null_resource" "incident" {
       #
       # k8s-event-watcher is a peer process inside the credential proxy
       # container, not a container of its own, which is why -c names that one.
+      #
+      # --since-time, not --since: the namespace name is static, so a wall-clock
+      # window would also match the `fire` line from an earlier run against a
+      # recycled Boskos lease and return before this run's incident exists.
       elapsed=0
       until kubectl logs "deployment/${var.agent_deployment}" \
-              -n "${var.agent_namespace}" -c envoy-credential-proxy \
-              --since=30m --tail=-1 2>/dev/null \
+              -n "${var.agent_namespace}" -c "${var.agent_container}" \
+              --since-time="$started_at" --tail=-1 2>/dev/null \
             | grep -q "fire .*pod=${local.ns}/"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no 'fire' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \
-            -c envoy-credential-proxy --since=30m --tail=200 >&2 || true
+            -c "${var.agent_container}" --since-time="$started_at" --tail=200 >&2 || true
           exit 1
         fi
         sleep 10
@@ -243,10 +271,33 @@ resource "null_resource" "incident" {
   # The presubmit isolation rule admits a mutating case only if it is read-only
   # or namespace-scoped, and a scenario that leaves its namespace behind is
   # neither by the second run.
+  #
+  # It fetches credentials the same way step 0 does, and for a sharper reason: a
+  # create-time provisioner that failed taints the resource, and _teardown runs
+  # `tofu destroy` from a `finally` on that path too, so this can execute with
+  # the ambient context pointed anywhere at all. Deleting a namespace by name on
+  # the wrong cluster is the kind of thing --ignore-not-found makes survivable
+  # rather than safe.
   provisioner "local-exec" {
-    when       = destroy
-    on_failure = continue
-    command    = "kubectl delete namespace ${self.triggers.namespace} --ignore-not-found --wait=false"
+    when        = destroy
+    on_failure  = continue
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      KUBECONFIG="$(mktemp)"
+      export KUBECONFIG
+      trap 'rm -f "$KUBECONFIG"' EXIT
+
+      project="${self.triggers.host_project}"
+      if [ -z "$project" ]; then
+        project="$(gcloud config get-value project 2>/dev/null || true)"
+      fi
+
+      gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
+        --location "${self.triggers.host_location}" --project "$project" --quiet
+
+      kubectl delete namespace "${self.triggers.namespace}" --ignore-not-found --wait=false
+    EOT
   }
 }
 

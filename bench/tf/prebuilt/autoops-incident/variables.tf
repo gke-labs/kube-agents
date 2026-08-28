@@ -57,6 +57,16 @@ variable "agent_deployment" {
   default     = "platform-agent-gateway"
 }
 
+# A variable rather than a literal for the same reason as the two above: the
+# watcher is a peer process inside this container, not a container of its own,
+# so a rename in deploy/ would otherwise surface here as a 300s timeout blaming
+# the watcher rather than as an error naming the container.
+variable "agent_container" {
+  type        = string
+  description = "Container inside agent_deployment that k8s-event-watcher runs alongside"
+  default     = "envoy-credential-proxy"
+}
+
 # ---------------------------------------------------------------------------
 # The planted incident. Every value below is also written into
 # bench/tasks/autoops-warning-event-triage/task.yaml -- in its prompt, which
