@@ -708,11 +708,21 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     f"{self.any_of_phrases}"
                 )
             return done(False, "; ".join(parts), raw=raw)
+        # Names every clause that ran, for the reason ReportContainsVerifier's
+        # success branch does: an any_of-only check that reported "all 0
+        # required phrase(s)" would read exactly like a check asserting nothing.
+        satisfied = [
+            f"all {len(self.required_phrases)} required phrase(s)",
+            f"none of {len(self.forbidden_phrases)} forbidden",
+        ]
+        if self.any_of_phrases:
+            satisfied.append(
+                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+            )
         return done(
             True,
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
-            f"contains all {len(self.required_phrases)} required phrase(s) and "
-            f"none of {len(self.forbidden_phrases)} forbidden",
+            "contains " + ", ".join(satisfied),
             raw=raw,
         )
 
