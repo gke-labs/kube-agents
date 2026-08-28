@@ -17,6 +17,26 @@ reviewable, and de-duplicated. This skill is that ending, in two tiers:
 The split is the point. A report is not a change, so a report is not a pull request — and a fix is
 not a report, so it carries a real diff a reviewer can read in one screen.
 
+## Mutation mode: report-only
+
+Before writing a single remediation manifest, check the environment: `echo $MUTATION_MODE`. The
+operator always sets it, from the CR's `spec.security.allowMutations`. When it prints `true`, **the
+audit runs report-only — Tier 1 only.** Update the ledger issue exactly as below, but open **no
+remediation pull requests**: omit the `remediation` block from every finding (keep `recommendation`
+— the operator still needs to know the fix), write no manifests into the workspace, and skip
+`pending_remediation_requests` (note in the ledger-bound finding that mutation mode is on instead).
+With nothing to promote, `finish` opens nothing.
+
+The reason is the persona's PR-only-when-asked rule (`SOUL.md` §1 "Mutation Mode"): under mutation
+mode, remediation is applied directly on request, and a PR is opened only when a user explicitly
+asks for one. A scheduled audit has no user in the loop to ask, so it must not decide to open PRs
+on its own — and it must not apply fixes either: an audit is an inspection, and mutation mode does
+not change that. Findings, evidence, and recommendations reach the human through the ledger; what
+happens next is the human's call.
+
+When `MUTATION_MODE` is empty or `false`, nothing here applies — both tiers run exactly as written
+below.
+
 `./skills/fleet-audit/scripts/audit_report.py` owns every deterministic operation: credential
 minting, label creation, issue creation and rewriting, branch handling, staging, committing,
 pushing, pull-request creation, closing, the run-over-run delta, and every timestamp. **Your job is
