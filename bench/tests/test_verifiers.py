@@ -144,6 +144,87 @@ def test_empty_stash_is_error_not_fail():
     assert "no transcript" in res.reason
 
 
+# ------------------------------------------- report_contains: normalization
+
+
+def test_phrase_matches_across_markdown_emphasis():
+    """The regression from gke-labs/kube-agents#982, verbatim.
+
+    A presubmit failed this check on a report the OutcomeValidity judge
+    scored 1.00, because the asterisks land between the two words.
+    """
+    _stash("Contrary to the report, the pods are **not** CrashLooping.")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["not crashlooping"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_phrase_matches_across_backticks_and_underscores():
+    _stash("The `checkout-gateway` Deployment reports _zero_ restarts.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        required_phrases=["checkout-gateway", "zero restarts"],
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_phrase_written_with_markdown_matches_plain_text():
+    """Normalization is applied to both sides, not just the report."""
+    _stash("the pods are not crashlooping")
+    v = ReportContainsVerifier(
+        type="report_contains", required_phrases=["**not** `crashlooping`"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_line_wrapped_phrase_matches():
+    _stash("both replicas are Ready with\n    no restarts recorded.")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["no restarts"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_leading_space_still_guards_against_a_longer_number():
+    """`" 0 restarts"` carries a deliberate leading space.
+
+    Collapsing whitespace must not drop it, or the phrase starts matching
+    the "10 restarts" it was written to exclude.
+    """
+    _stash("the pod had 10 restarts overnight")
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=[" 0 restarts"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+    _stash("the pod had **0** restarts overnight")
+    assert v.verify(5.0).status == "pass"
+
+
+def test_normalization_does_not_relax_negation():
+    """Emphasis is noise; wording is not.
+
+    The point of an objective phrase check is that a report claiming the
+    opposite cannot satisfy it.
+    """
+    _stash("The **checkout-gateway** pods ARE `CrashLooping`; I restarted it.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_phrases=["not crashlooping", "no restarts", " 0 restarts"],
+    )
+    assert v.verify(5.0).status == "fail"
+
+
+def test_forbidden_phrase_is_normalized_too():
+    """Emphasis must not be a way to smuggle a forbidden phrase past."""
+    _stash("the fix will cost **$40** a month")
+    v = ReportContainsVerifier(
+        type="report_contains", forbidden_phrases=["$40 a month"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
 # ----------------------------------------------------------- tool_called
 
 
@@ -218,6 +299,27 @@ def test_any_of_passes_on_either_spelling_and_fails_on_neither():
     res = v.verify(5.0)
     assert res.status == "fail"
     assert "alternative phrasings" in res.reason
+
+
+def test_an_any_of_only_pass_says_so_instead_of_all_0_required():
+    # A check built from any_of alone used to succeed with "all 0 required
+    # phrase(s), none of 0 forbidden" -- indistinguishable in a log from a
+    # check that asserted nothing. The clause that actually ran has to appear.
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["HPA", "HorizontalPodAutoscaler"]
+    )
+    transcript.set("the HPA hit max replicas", [])
+    res = v.verify(5.0)
+    assert res.status == "pass"
+    assert "at least one of 2 alternative phrasing(s)" in res.reason
+
+
+def test_a_pass_with_no_any_of_does_not_claim_an_any_of_clause():
+    v = ReportContainsVerifier(type="report_contains", required_phrases=["HPA"])
+    transcript.set("the HPA hit max replicas", [])
+    res = v.verify(5.0)
+    assert res.status == "pass"
+    assert "alternative phrasing" not in res.reason
 
 
 def test_scope_final_ignores_a_quoted_phrase_in_the_accumulated_output():
@@ -486,6 +588,17 @@ def test_ledger_any_of_accepts_either_spelling(token, github):
     res = _ledger_check(any_of_phrases=["StatefulSet", "DaemonSet"]).verify(5.0)
     assert res.status == "fail"
     assert "alternative phrasings" in res.reason
+
+
+def test_ledger_any_of_only_pass_says_so_instead_of_all_0_required(token, github):
+    # Same defect as the report_contains one above, one function away: an
+    # any_of-only ledger check passing with "all 0 required phrase(s)" reads
+    # like a check that asserted nothing.
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body(findings="no PodDisruptionBudget\n")))
+    res = _ledger_check(any_of_phrases=["PDB", "PodDisruptionBudget"]).verify(5.0)
+    assert res.status == "pass"
+    assert "at least one of 2 alternative phrasing(s)" in res.reason
 
 
 # --- staleness, which is the whole point ---------------------------------

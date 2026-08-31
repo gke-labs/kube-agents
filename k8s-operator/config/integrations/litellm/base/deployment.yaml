@@ -7,8 +7,12 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
+      # Kept in step with charts/kube-agents/templates/litellm.yaml, which owns
+      # the rationale: maxUnavailable is 1 rather than 0 so a namespace
+      # ResourceQuota with no room for a surge Pod cannot stall the rollout
+      # (#749).
       maxSurge: 1
-      maxUnavailable: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: litellm

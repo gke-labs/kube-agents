@@ -24,3 +24,11 @@ agents/*/skills/gke-*/**
 
 # Monolithic custom semgrep rules bundle
 .github/semgrep-security-audit.yml
+
+# Captured devops-bench run records. These are byte-for-byte what the harness
+# wrote on a live cluster, which is the whole reason the gate's tests can trust
+# them about which fields devops-bench actually emits — reformatting them makes
+# "verbatim capture" in their README untrue. CI's prettier job filters to
+# `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider local
+# invocation from rewriting them by accident.
+bench/tests/fixtures/runs/**/*.json

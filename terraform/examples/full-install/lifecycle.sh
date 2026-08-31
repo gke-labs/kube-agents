@@ -151,8 +151,9 @@ with_override() {
 # again. If you are reading this in a committed diff, something went wrong.
 provider "helm" {
   kubernetes = {
-    host  = "https://127.0.0.1"
-    token = "placeholder"
+    host                   = "https://127.0.0.1"
+    token                  = "placeholder"
+    cluster_ca_certificate = ""
   }
 }
 EOF

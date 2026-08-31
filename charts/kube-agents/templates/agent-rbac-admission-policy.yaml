@@ -1,0 +1,198 @@
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+# GENERATED from k8s-operator/config/admission/agent-rbac-policy.yaml — do not edit by hand; run `make chart-sync`.
+# See values.yaml (admissionPolicy) for the gate and when to turn it off.
+#
+# The semverCompare half is not the same switch as the values gate. ValidatingAdmissionPolicy
+# only reached v1 in Kubernetes 1.30, and Chart.yaml accepts >=1.29.0-0, so on a 1.29 cluster
+# a default install would fail the whole release (and, through Terraform, the whole apply) on
+# `no matches for kind`. Rendering nothing there is the only behaviour that keeps the chart
+# installable across the range it claims. It is a condition on this one template, not a
+# second delivery path.
+# Admission backstop for agent RBAC: two ValidatingAdmissionPolicies and their bindings.
+#
+# This file is the source of truth. charts/kube-agents/templates/agent-rbac-admission-policy.yaml
+# holds a generated copy (`make chart-sync`, verified by `make chart-check`), and the chart is what
+# the install engine applies. Edit it here.
+#
+# It is deliberately NOT in config/default's kustomization: namePrefix rewrites each policy's
+# metadata.name but not the spec.policyName its binding refers to, so a kustomize build yields
+# bindings pointing at policies that do not exist — accepted at apply time, and inert. That is
+# also why `make deploy` does not install these, and why the manual install path
+# (INSTALL.md Method 2) has to apply this file by hand.
+#
+# WHAT THESE DO AND DO NOT COVER — read before citing them as a control:
+#
+#   - Policy 1 governs the CONTENT of a Role/ClusterRole and selects by the `kube-agents/tier`
+#     label. A manifest that carries neither that label nor the `*-agent` naming convention is
+#     not selected at all, so policy 1 is evadable by whoever writes the manifest. That case is
+#     covered by pull-request review, not by this.
+#   - Policy 1 also matches nothing the operator creates. commonLabels() in
+#     manifest_helpers.go stamps the four app.kubernetes.io labels and never `kube-agents/tier`,
+#     so buildMinimalPlatformRole, buildPlatformLocalRole and buildPlatformLeaderRole are not
+#     selected. On a default install with no GitOps overlay, policy 1 governs zero objects. It
+#     is a backstop on the RBAC a customer's overlay writes, not on the RBAC the operator mints.
+#   - Policy 2 governs the SUBJECT of a (Cluster)RoleBinding, which the binding cannot forge
+#     away — the subject is the thing being privileged — and its one exemption keys on the
+#     authenticated user rather than on anything in the manifest, so within the subject kinds it
+#     selects there is nothing an author can put in the object to escape it. Two limits on that: it only selects `kind: ServiceAccount`, so a
+#     `kind: Group` subject such as `system:serviceaccounts:team-x` is not examined at all; and
+#     it denies exactly one hard-coded name, `developer-team-agent`. A cluster-scoped binding to
+#     any other agent ServiceAccount is admitted.
+#   - Consequence worth stating rather than leaving to be discovered: on a default install a
+#     hand-written unlabelled ClusterRole granting `*` on `*`, bound to the agent's own
+#     ServiceAccount, is admitted by both. Policy 1 does not select it (no tier label) and
+#     policy 2 permits the subject (not the one denied name). Pull-request review on the GitOps
+#     repository is the control for that, which is the point of the branch-protection guidance
+#     shipped alongside the example overlay.
+#   - NEITHER enforces "the Role this binding points at is actually read-only". CEL in a
+#     ValidatingAdmissionPolicy cannot read a referenced object, so an unlabelled write Role
+#     bound to an agent SA is admitted. Closing that needs the cross-object attenuation
+#     webhook, which is not built (docs/architecture/03-security-model.md §4, "Deferred
+#     hardening").
+#
+# Requires Kubernetes >= 1.30, where ValidatingAdmissionPolicy reached v1.
+#
+# The names are fixed rather than release-scoped: these are cluster singletons. `part-of` is
+# the label every documented cleanup and audit query selects on, so it is set here rather than
+# left to whichever tool applies the file.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-readonly
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["roles", "clusterroles"]
+  matchConditions:
+    # Only govern agent RBAC — objects carrying the tier label the render overlay stamps.
+    - name: is-agent-rbac
+      expression: "has(object.metadata.labels) && 'kube-agents/tier' in object.metadata.labels"
+  validations:
+    # 1) Read-only: every rule may grant ONLY read verbs (get/list/watch). This is an ALLOW-LIST, so
+    #    write verbs (create/update/patch/delete/deletecollection/*) AND privilege-escalation verbs
+    #    (impersonate/bind/escalate, CSR approve/sign, use, …) and any future non-read verb are all
+    #    denied. Agent render overlays only ever emit get/list/watch, so this rejects nothing legit.
+    #    (`impersonate` is standalone-exploitable — an agent SA with it could act as system:masters.)
+    - expression: >-
+        !has(object.rules) ||
+        object.rules.all(r,
+          !has(r.verbs) ||
+          r.verbs.all(v, v in ['get','list','watch']))
+      message: "agent RBAC may grant only read verbs (get/list/watch) — no write or privilege-escalation verbs (impersonate/bind/escalate/…); agents are read-only"
+      reason: Forbidden
+    # 2) No Secrets: a read verb on `secrets` (or a wildcard that includes it, in the core `""` group or
+    #    the `*` apiGroup) is still an exfiltration path — an agent could list ServiceAccount tokens /
+    #    app credentials and escalate to another identity. The read-only ceiling must also be a
+    #    least-privilege ceiling (mirrors the built-in `view` ClusterRole, which omits Secrets).
+    - expression: >-
+        !has(object.rules) ||
+        object.rules.all(r,
+          !((!has(r.apiGroups) || r.apiGroups.exists(g, g == '' || g == '*')) &&
+            (has(r.resources) && r.resources.exists(res, res == 'secrets' || res == '*'))))
+      message: "agent RBAC may not grant Secrets (token/credential exfiltration risk) — enumerate core resources and exclude secrets, like the built-in `view` role"
+      reason: Forbidden
+    # 3) Wrong-scope: the namespace tier (developer-team) must not get a cluster-scoped ClusterRole.
+    - expression: >-
+        !(object.kind == 'ClusterRole' &&
+          object.metadata.labels['kube-agents/tier'] == 'developer-team')
+      message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRole (wrong-scope)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-readonly
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  policyName: kube-agents-agent-readonly
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: applies to every namespace and the cluster scope.
+---
+# Binding-scope policy — keys on the bound SUBJECT (agent ServiceAccount name) rather than on an
+# author-applied label, so within the subject kinds it selects it cannot be evaded by omitting
+# labels. matchConstraints on roles/clusterroles alone never see (cluster)rolebindings, which is
+# why this is a second policy rather than another validation on the first.
+#
+# Read the coverage notes in the header above before citing it: it denies one hard-coded
+# ServiceAccount name, and a `kind: Group` subject is not selected at all.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-binding-scope
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["rolebindings", "clusterrolebindings"]
+  matchConditions:
+    # Only govern bindings that grant an agent ServiceAccount (naming convention: `<tier>-agent`).
+    # Within that subject kind this is the unforgeable selector — the subject is the thing being
+    # privileged, not a free label. It does not reach a `kind: Group` subject; see the header.
+    - name: binds-agent-sa
+      expression: >-
+        has(object.subjects) &&
+        object.subjects.exists(s, s.kind == 'ServiceAccount' && s.name.endsWith('-agent'))
+    # Exempt the operator's own reconcile. reconcileRBAC (platformagent_controller.go)
+    # unconditionally creates `kubeagents:minimal:<ns>:<name>` as a ClusterRoleBinding whose subject
+    # is spec.security.serviceAccountName — and the default, `kubeagents-platform-agent`, ends in
+    # `-agent`, so every reconcile on every install is evaluated by the rule below. There is no
+    # namespace-tier path in reconcileRBAC: the operator only ever binds the platform tier, which is
+    # cluster-scoped on purpose. Without this exemption an agent configured with the namespace-tier
+    # ServiceAccount name from examples/gitops-repo/policy/rbac-overlay/developer-team.yaml has its
+    # reconcile denied before the Deployment exists, with an admission error nobody would connect
+    # back to the example they copied.
+    #
+    # Keyed on the authenticated user the API server puts in the AdmissionReview, which no manifest
+    # can carry. An earlier revision keyed on a label the controller stamps; that was a hole rather
+    # than an exemption, because matchConditions are ANDed and a false one drops the object from the
+    # policy entirely — so anyone who set that label on their own ClusterRoleBinding walked straight
+    # past the rule below. request.userInfo.username cannot be set by the object being admitted.
+    #
+    # Two usernames because the two install paths run the controller as different ServiceAccounts:
+    # the kustomize path (INSTALL.md Method 2) applies config/default, whose `namePrefix:
+    # kubeagents-` and `namespace: kubeagents-system` give `kubeagents-controller`, while the chart
+    # runs it as `<release>-operator-sa` in the release namespace. The second entry below is
+    # rewritten to the rendered names by hack/sync-chart-manifests.sh, so the chart's copy names the
+    # identity that release actually reconciles as rather than a guess at it. Each artifact
+    # therefore exempts the reconciler of the install that applies it, and both are listed so an
+    # install that has been through both paths is covered either way.
+    - name: not-the-operator-reconciling
+      expression: >-
+        !(request.userInfo.username in [
+          'system:serviceaccount:kubeagents-system:kubeagents-controller',
+          'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'])
+  validations:
+    # A namespace-scoped tier (developer-team) must never receive a cluster-scoped binding — that would
+    # hand a namespace agent cluster-wide reach regardless of the referenced role's own rules.
+    - expression: >-
+        !(object.kind == 'ClusterRoleBinding' &&
+          object.subjects.exists(s, s.kind == 'ServiceAccount' && s.name == 'developer-team-agent'))
+      message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRoleBinding (wrong-scope)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-binding-scope
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  policyName: kube-agents-agent-binding-scope
+  validationActions: ["Deny"]
+{{- end }}

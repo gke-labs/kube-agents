@@ -422,7 +422,7 @@ func mergeAnnotations(defaults map[string]string, custom map[string]string) map[
 }
 
 // resolveDeploymentReplicasAndStrategy determines the replica count and deployment strategy
-// based on HighAvailability and ScaleToZero settings in the DeploymentSpec.
+// based on Availability and ScaleToZero settings in the DeploymentSpec.
 func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
 	replicas := int32(1)
 	strategy := appsv1.DeploymentStrategy{
@@ -441,11 +441,40 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 		}
 
 		if intendedReplicas > 1 {
+			// maxUnavailable is resolved here rather than handed to Kubernetes as a
+			// percentage, and it never lands below 1. Kubernetes rounds a maxSurge
+			// percentage up and a maxUnavailable percentage down, so
+			// defaultSurgePercent on both sides rendered maxSurge 1 /
+			// maxUnavailable 0 at 2 and 3 replicas — the shape that cannot roll at
+			// all under a namespace ResourceQuota with no room for one more gateway
+			// Pod. The old ReplicaSet may not shrink, the surge Pod is refused with
+			// FailedCreate, and the rollout stalls until progressDeadlineSeconds,
+			// including the rollout carrying the fix for whatever prompted it
+			// (#749).
+			//
+			// Scaling defaultSurgePercent rather than hard-coding its arithmetic
+			// keeps one source for the percentage: change the constant and both
+			// sides move together. roundUp=false is what Kubernetes itself would
+			// have applied; the floor is the only added behaviour, and it binds
+			// only at 2 and 3 replicas, where the percentage had no representable
+			// answer other than "make no progress".
+			// An error here means defaultSurgePercent is not a parseable
+			// percentage, which is a constant in this file rather than input; the
+			// floor below then supplies 1 and the rollout still makes progress.
+			scaled, err := intstr.GetScaledValueFromIntOrPercent(
+				ptr.To(intstr.FromString(defaultSurgePercent)), int(intendedReplicas), false)
+			if err != nil {
+				scaled = 0
+			}
+			maxUnavailable := int32(scaled) // #nosec G115 -- bounded by intendedReplicas
+			if maxUnavailable < 1 {
+				maxUnavailable = 1
+			}
 			strategy = appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDeployment{
 					MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
-					MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+					MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: maxUnavailable},
 				},
 			}
 		}

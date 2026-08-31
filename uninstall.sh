@@ -41,7 +41,7 @@ fi
 # state anywhere, so this engine has nothing to tear down. Expected against a
 # clean project, and the case an automated caller must be able to tell apart
 # from a teardown that tried and failed — scripts/release/
-# provision_rc_environment.sh branches on exactly this. Defined above on_error
+# provision_environment.sh branches on exactly this. Defined above on_error
 # because on_error reads it.
 EXIT_NOTHING_TO_TEAR_DOWN=3
 
@@ -62,6 +62,10 @@ on_error() {
   exit "$exit_code"
 }
 trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
+
+# Sourced/baked release version. On developer checkouts (main), this is empty.
+# Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
+BAKED_RELEASE_VERSION=""
 
 PARAM_NON_INTERACTIVE="false"
 PARAM_DRY_RUN="false"
@@ -230,7 +234,7 @@ resolve_state_location() {
   # means there is nothing to tear down. A bare `>/dev/null 2>&1` collapses 404,
   # 403, expired credentials, a network timeout and a missing gcloud into one
   # bit — and with exit 3 wired to "clean project", the 403 case would tell
-  # scripts/release/provision_rc_environment.sh to install over a live cluster.
+  # scripts/release/provision_environment.sh to install over a live cluster.
   #
   # `trap - ERR` inside the substitution: under bash 3.2 the inherited ERR trap
   # fires in this subshell even though the failure is the tested condition. The
@@ -318,8 +322,15 @@ main() {
   else
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
-    print_warning "No --source-ref given; fetching the teardown engine from main, which may be newer than your installed release."
-    git clone --depth=1 https://github.com/gke-labs/kube-agents.git "$repo_dir"
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+      print_info "Fetching the teardown engine for baked release '${BAKED_RELEASE_VERSION}'..."
+      git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
+      git -C "$repo_dir" fetch --depth=1 origin "$BAKED_RELEASE_VERSION"
+      git -C "$repo_dir" checkout --detach FETCH_HEAD
+    else
+      print_warning "No --source-ref given; fetching the teardown engine from main, which may be newer than your installed release."
+      git clone --depth=1 https://github.com/gke-labs/kube-agents.git "$repo_dir"
+    fi
   fi
   # Defaults, validators, and the terraform.tfvars generator shared with
   # install.sh. Print helpers are already defined above, as the file expects.

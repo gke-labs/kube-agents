@@ -42,7 +42,7 @@ EXCLUDED = {
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
     # Live GKE cluster E2E test suite; pytest-native, requires live cluster, Workload Identity,
-    # and KMS. Runs under `make test-e2e` in e2e-nightly-matrix.yml and e2e-manual-runner.yml.
+    # and KMS. Runs under `make test-e2e` in e2e-run.yml and e2e-manual-runner.yml.
     "tests/e2e": "live cluster E2E suite, runs under make test-e2e",
     # Live black-box CUJ journeys against a provisioned kube-agents install;
     # they open an admin portal and talk to a deployed agent, so they are

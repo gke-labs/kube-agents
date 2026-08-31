@@ -38,6 +38,7 @@ agents/cluster/skills/*/SKILL.md
 agents/platform/governance/*.md
   agents/platform/governance/ai_security_audit_sop.md
   agents/platform/governance/blueprint_sync_sop.md
+  agents/platform/governance/cluster_inventory_audit_sop.md
   agents/platform/governance/compliance_audit_sop.md
   agents/platform/governance/eod_event_watcher_daily_report_sop.md
   agents/platform/governance/fleet_consistency_drift_sop.md

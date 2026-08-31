@@ -3,7 +3,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
 
 COMMIT_SHA="${1:-${COMMIT_SHA:-}}"
 RC_TAG="${2:-${RC_TAG:-}}"
@@ -15,11 +14,7 @@ fi
 
 VALIDATED_TAG="${RC_TAG}_validated"
 
-echo "======================================================================"
-echo "🏷️ MARKING RELEASE CANDIDATE COMMIT AS VALIDATED"
-echo "Commit SHA:     ${COMMIT_SHA}"
-echo "Original Tag:   ${RC_TAG}"
-echo "Validated Tag:  ${VALIDATED_TAG}"
-echo "======================================================================"
-
-ensure_git_tag "${VALIDATED_TAG}" "${COMMIT_SHA}" "Validated RC ${RC_TAG} for commit ${COMMIT_SHA}"
+exec "${SCRIPT_DIR}/tag_commit.sh" \
+  --title "MARKING RELEASE CANDIDATE COMMIT AS VALIDATED" \
+  --detail "Original Tag: ${RC_TAG}" \
+  "${VALIDATED_TAG}" "${COMMIT_SHA}" "Validated RC ${RC_TAG} for commit ${COMMIT_SHA}"

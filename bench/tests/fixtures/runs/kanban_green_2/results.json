@@ -1,0 +1,122 @@
+[
+  {
+    "input": "Create a kanban task titled exactly \"devops-bench smoke probe\". Then, in one sentence, state both the exact title you used and the id that was assigned to it.",
+    "output": "\ud83d\udd00 Delegated to the platform agent\n\nI created the task with the exact title \"devops-bench smoke probe\" and it was assigned id t_d6cc6ff7.\n\nt_d6cc6ff7 (\"devops-bench smoke probe\", platform) is done. Its full result:\n\nCard `t_d6cc6ff7` was received and executed by the `platform` profile \u2014 the board/dispatch path is working end-to-end.\n\n## Detail\n- Dispatch: claimed by run `427` on `platform-agent-gateway-7457d6458f-l5xkz`, workspace `/opt/data/kanban/workspaces/t_d6cc6ff7`.\n- Actions taken: read the card, wrote this completion. No cluster, GitOps, or IAM changes of any kind.",
+    "latency": 47.00481715425849,
+    "tokens": {
+      "input": 10,
+      "cached": 126432,
+      "cache_write": 8092,
+      "reasoning": 0,
+      "output": 661,
+      "total": 135195
+    },
+    "tools": [
+      "kanban_create"
+    ],
+    "trajectory": [
+      {
+        "name": "kanban_create",
+        "args": {
+          "title": "devops-bench smoke probe",
+          "assignee": "platform",
+          "body": "Smoke probe card requested by the user to verify the board/dispatch path end-to-end.\n\nGoal:\n- Confirm you picked this card up and can report back.\n\nAcceptance criteria:\n- Reply with a one-line confirmation that the card was received and executed.\n- No infrastructure changes of any kind; this is a no-op probe."
+        },
+        "result": "{\"ok\": true, \"task_id\": \"t_d6cc6ff7\", \"status\": \"ready\", \"workspace_kind\": \"scratch\", \"workspace_path\": null, \"project_id\": null, \"subscribed\": true}",
+        "status": "completed"
+      }
+    ],
+    "skills": [],
+    "name": "Agent kanban smoke test (green variant)",
+    "folder": "agent-kanban-smoke-green",
+    "status": "success",
+    "error": null,
+    "errors": [],
+    "scores": {
+      "OutcomeValidity": {
+        "score": 1.0,
+        "success": true,
+        "reason": "[x] A kanban task titled 'devops-bench smoke probe' is created and the final message states both that title and the id assigned to it: The actual output successfully fulfills the goal by confirming the creation of the task and stating the exact title along with the assigned ID (t_d6cc6ff7) in a single sentence. The semantic integrity aligns perfectly with the expected output, and no live execution was required to validate this generation task."
+      },
+      "ToolInvocation": {
+        "score": 0.5,
+        "success": false,
+        "reason": "The agent successfully used the kanban_create tool with the exact title requested ('devops-bench smoke probe') and retrieved the assigned task ID. However, it failed to provide the required final message stating the title and the ID in a single sentence, missing a key component of the expected output."
+      },
+      "VerificationCorrectness": 1.0,
+      "VerificationCoverage": 1.0,
+      "OutcomeScore": {
+        "score": 1.0,
+        "version": "v1",
+        "reason": "c=1.000, rec_v=n/a, cat_v=1"
+      }
+    },
+    "expected_output": "A kanban task titled \"devops-bench smoke probe\" is created via the kanban tooling, and the final message states both that title and the id assigned to it.",
+    "expected_output_raw": "A kanban task titled \"devops-bench smoke probe\" is created via the kanban tooling, and the final message states both that title and the id assigned to it.",
+    "retrieval_context": [],
+    "chaos_spec": null,
+    "verification_spec": [
+      {
+        "name": "report-states-the-probe-title",
+        "role": "objective",
+        "mode": "assert",
+        "check": {
+          "type": "report_contains",
+          "required_phrases": [
+            "devops-bench smoke probe"
+          ]
+        }
+      },
+      {
+        "name": "the-kanban-card-was-actually-filed",
+        "role": "objective",
+        "mode": "assert",
+        "check": {
+          "type": "tool_called",
+          "tool_names": [
+            "kanban_create"
+          ],
+          "require_success": true
+        }
+      }
+    ],
+    "recoverable_safety": [],
+    "chaos_report": {},
+    "perf_report": {},
+    "documentation": [],
+    "capabilities_granted": {
+      "use_mcp": true,
+      "skills": []
+    },
+    "verification_parse_errors": [],
+    "verification_report": [
+      {
+        "name": "report-states-the-probe-title",
+        "role": "objective",
+        "severity": null,
+        "weight": 1.0,
+        "mode": "assert",
+        "success": true,
+        "status": "pass",
+        "reason": "report contains all 1 required phrase(s) and none of 0 forbidden",
+        "elapsed_time": 1.5231315046548843e-05,
+        "children": []
+      },
+      {
+        "name": "the-kanban-card-was-actually-filed",
+        "role": "objective",
+        "severity": null,
+        "weight": 1.0,
+        "mode": "assert",
+        "success": true,
+        "status": "pass",
+        "reason": "1 call(s) to ['kanban_create'] in the trajectory (minimum 1)",
+        "elapsed_time": 6.029848009347916e-06,
+        "children": []
+      }
+    ],
+    "verification_status": "evaluated",
+    "generation_only": true,
+    "validated": false
+  }
+]

@@ -44,6 +44,128 @@ class RunCmdTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], checker.DEFAULT_TIMEOUT_SECONDS)
 
 
+class DenialClassifierTest(unittest.TestCase):
+    """_denial_reason separates "I was refused" from "it is not there".
+
+    Every string below is what the tool actually prints, because the whole
+    classifier is a claim about the wording of messages written elsewhere. A
+    hand-invented denial string would only prove the regex matches itself.
+
+    _unread_reason adds a third category between the two: TRANSIENTS are not
+    refusals, and the resource was not read, so they must fail the first test
+    and pass the third.
+    """
+
+    REFUSALS = (
+        "ERROR: (gcloud.artifacts.repositories.describe) PERMISSION_DENIED: Permission "
+        "'artifactregistry.repositories.get' denied on resource '...' (or it may not exist).",
+        "ERROR: (gcloud.container.clusters.list) ResponseError: code=403, message=Required "
+        '"container.clusters.list" permission(s) for "projects/kube-agents-evals-6".',
+        "ERROR: (gcloud.storage.buckets.describe) HTTPError 403: x@google.com does not have "
+        "storage.buckets.get access to the Google Cloud Storage bucket.",
+        "ERROR: (gcloud.projects.describe) User [x] does not have permission to access projects "
+        "instance [y] (or it may not exist)",
+        # Observed on 2026-08-27 against an existing SA in kube-agents-evals-6.
+        "ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: Permission "
+        "'iam.serviceAccounts.getIamPolicy' denied on resource "
+        "'//iam.googleapis.com/projects/-/serviceAccounts/113405042032614536240' (or it may not exist).",
+        "gh: Resource not accessible by integration (HTTP 403)",
+        # gh wraps every API error as `gh: <message> (HTTP <code>)`; the entry
+        # above is an observed instance of that wrapper, and the message half
+        # varies with the endpoint and matches none of the other patterns. Both
+        # of these reach check_github_repo_and_app on a token that is scoped but
+        # not SSO-authorised for the org.
+        "gh: Must have admin rights to Repository. (HTTP 403)",
+        "gh: Resource protected by organization SAML enforcement. You must grant your OAuth "
+        "token access to this organization. (HTTP 403)",
+    )
+
+    ABSENCES = (
+        "ERROR: (gcloud.storage.buckets.describe) HTTPError 404: The specified bucket does not exist.",
+        "ERROR: (gcloud.artifacts.repositories.describe) NOT_FOUND: Repository does not exist",
+        "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey not found",
+        # Observed on 2026-08-27. An absent service account answers NOT_FOUND
+        # even when the caller cannot read the project it would live in, so the
+        # two SA checks may still report a genuinely missing GSA as missing.
+        "ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown service account.",
+        "boom",
+        "",
+    )
+
+    # Read did not happen, and permissions were not the reason.
+    TRANSIENTS = (
+        "timed out after 120s: gcloud projects describe p",
+        # Observed 2026-08-27 from a gcloud whose refresh token had lapsed. The
+        # account still printed as ACTIVE under `gcloud auth list`, which is the
+        # case check_toolchain's docstring says it cannot catch.
+        "ERROR: (gcloud.projects.describe) There was a problem refreshing your current auth "
+        "tokens: ('invalid_grant: Bad Request', {'error': 'invalid_grant', "
+        "'error_description': 'Bad Request'})",
+        "ERROR: (gcloud.container.clusters.list) Reauthentication required.",
+    )
+
+    def test_refusals_are_recognised(self):
+        for err in self.REFUSALS:
+            with self.subTest(err=err[:60]):
+                self.assertIsNotNone(checker._denial_reason(err), err)
+
+    def test_absences_are_not_mistaken_for_refusals(self):
+        for err in self.ABSENCES + self.TRANSIENTS:
+            with self.subTest(err=err[:60]):
+                self.assertIsNone(checker._denial_reason(err), err)
+
+    def test_a_read_that_did_not_happen_is_never_read_as_absence(self):
+        for err in self.REFUSALS + self.TRANSIENTS:
+            with self.subTest(err=err[:60]):
+                self.assertIsNotNone(checker._unread_reason(err), err)
+
+    def test_a_genuine_absence_stays_an_absence(self):
+        for err in self.ABSENCES:
+            with self.subTest(err=err[:60]):
+                self.assertIsNone(checker._unread_reason(err), err)
+
+    def test_a_timeout_does_not_report_the_resource_as_missing(self):
+        # A 120s stall on a bucket that exists used to append "Missing Terraform
+        # state bucket" and exit 1. A read that did not happen is not evidence.
+        details, warnings = [], []
+        self.assertTrue(
+            checker._record_unreadable(
+                "timed out after 120s: gcloud storage buckets describe gs://p-tf-state",
+                "Missing Terraform state bucket",
+                "state bucket not checked",
+                details,
+                warnings,
+            )
+        )
+        self.assertEqual(details, [])
+        self.assertEqual(len(warnings), 1)
+
+    def test_a_project_number_containing_403_is_not_a_denial(self):
+        # `403` as a bare substring appears in project numbers, bucket names and
+        # image digests. Matching it would turn arbitrary absences into
+        # "unverified" and quietly stop the script failing anything.
+        self.assertIsNone(checker._denial_reason("NOT_FOUND: project 403829105 has no such bucket"))
+
+    def test_record_routes_a_denial_to_warnings_and_keeps_the_check_passing(self):
+        details, warnings = [], []
+        denied = checker._record_unreadable(
+            "PERMISSION_DENIED: nope", "Missing thing", "Thing not checked", details, warnings
+        )
+        self.assertTrue(denied)
+        self.assertEqual([], details)
+        self.assertEqual(1, len(warnings))
+        self.assertIn("Thing not checked", warnings[0])
+
+    def test_record_routes_an_absence_to_details_and_fails_the_check(self):
+        details, warnings = [], []
+        denied = checker._record_unreadable(
+            "NOT_FOUND", "Missing thing", "Thing not checked", details, warnings
+        )
+        self.assertFalse(denied)
+        self.assertEqual(["Missing thing"], details)
+        self.assertEqual([], warnings)
+
+
 class RequiredApisTest(unittest.TestCase):
     def test_compute_api_is_required(self):
         # bench/tf/fleet declares google_compute_disk directly.
@@ -76,6 +198,59 @@ class RequiredApisTest(unittest.TestCase):
             number, result = checker.check_project_and_apis("kube-agents-evals-3")
         self.assertIsNone(number)
         self.assertFalse(result.passed)
+
+    def test_denied_project_describe_is_unverified_not_failed(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail("ERROR: (gcloud.projects.describe) User [x] does not have permission to access "
+                      "projects instance [kube-agents-evals-6] (or it may not exist)")
+            ]
+            number, result = checker.check_project_and_apis("kube-agents-evals-6")
+        self.assertIsNone(number)
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(result.warnings)
+
+    def test_absent_project_still_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("ERROR: (gcloud.projects.describe) NOT_FOUND: project not found")]
+            _, result = checker.check_project_and_apis("kube-agents-evals-99")
+        self.assertFalse(result.passed)
+
+    def test_denied_service_list_is_unverified_and_keeps_the_project_number(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"projectNumber": "123456"})),
+                _fail("ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission denied to list services"),
+            ]
+            number, result = checker.check_project_and_apis("kube-agents-evals-6")
+        self.assertEqual("123456", number)
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
+
+    def test_a_timed_out_project_describe_is_unverified_not_failed(self):
+        # A read that did not happen, filed the same way whatever stopped it.
+        # These two call sites classified with _denial_reason alone until the
+        # #1008 review, so a timeout or a mid-run credential expiry reported
+        # "Project describe failed" -- exit 1 for a project nothing was learned
+        # about, plus two derived checks skipped behind it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("timed out after 120s: gcloud projects describe p")]
+            number, result = checker.check_project_and_apis("kube-agents-evals-6")
+        self.assertIsNone(number)
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(result.warnings)
+
+    def test_a_lapsed_credential_on_the_service_list_is_unverified_not_failed(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"projectNumber": "123456"})),
+                _fail("ERROR: (gcloud.services.list) There was a problem refreshing your current "
+                      "auth tokens: ('invalid_grant: Bad Request', {'error': 'invalid_grant'})"),
+            ]
+            number, result = checker.check_project_and_apis("kube-agents-evals-6")
+        self.assertEqual("123456", number)
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
 
 
 class GkeAndCmekTest(unittest.TestCase):
@@ -128,10 +303,72 @@ class GkeAndCmekTest(unittest.TestCase):
 
     def test_missing_state_bucket_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(self._clusters("ENCRYPTED")), _fail("not found")]
+            run.side_effect = [
+                _ok(self._clusters("ENCRYPTED")),
+                _fail("ERROR: (gcloud.storage.buckets.describe) HTTPError 404: The specified bucket "
+                      "does not exist."),
+            ]
             result = checker.check_gke_and_state("kube-agents-evals-3")
         self.assertFalse(result.passed)
         self.assertTrue(any("state bucket" in d for d in result.details), result.details)
+
+    def test_denied_state_bucket_is_unverified_not_missing(self):
+        # The finding that opened #1004. `buckets describe` needs
+        # storage.buckets.get; `storage ls` does not. The account that produced
+        # this could list three prefixes inside the bucket the script had just
+        # called missing.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._clusters("ENCRYPTED")),
+                _fail("ERROR: (gcloud.storage.buckets.describe) HTTPError 403: x@google.com does not "
+                      "have storage.buckets.get access to the Google Cloud Storage bucket."),
+            ]
+            result = checker.check_gke_and_state("kube-agents-evals-6")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Missing Terraform state bucket" in d for d in result.details), result.details)
+        self.assertTrue(any("not checked" in w for w in result.warnings), result.warnings)
+        self.assertIn("not checked", result.message)
+        self.assertNotIn("state bucket present", result.message)
+
+    def test_denied_cluster_list_is_unverified_not_missing_clusters(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail('ERROR: (gcloud.container.clusters.list) ResponseError: code=403, message='
+                      'Required "container.clusters.list" permission(s) for "projects/p".'),
+                _ok("bucket"),
+            ]
+            result = checker.check_gke_and_state("kube-agents-evals-6")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Missing GKE cluster" in d for d in result.details), result.details)
+        self.assertIn("not checked", result.message)
+
+    def test_cluster_list_failing_for_another_reason_still_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail("ERROR: (gcloud.container.clusters.list) NOT_FOUND: Project "
+                      "'kube-agents-evals-3' not found or deleted."),
+                _ok("bucket"),
+            ]
+            result = checker.check_gke_and_state("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+
+    def test_a_disabled_container_api_reports_unchecked_and_the_api_check_fails_it(self):
+        # gcloud reports a disabled Kubernetes Engine API as `code=403`, so this
+        # check cannot tell it from a caller who may not list clusters and says
+        # "not checked" for both. That is the right answer here and the wrong
+        # verdict overall, which is why it is check_project_and_apis that fails
+        # the project: REQUIRED_APIS reads the enabled-services list directly.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail("ERROR: (gcloud.container.clusters.list) ResponseError: code=403, "
+                      "message=Kubernetes Engine API has not been used in project 12345 before "
+                      "or it is disabled."),
+                _ok("bucket"),
+            ]
+            result = checker.check_gke_and_state("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
+        self.assertIn("container.googleapis.com", checker.REQUIRED_APIS)
 
 
 class SeededFleetFixturesTest(unittest.TestCase):
@@ -185,11 +422,137 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("crashloop-workload" in d for d in result.details), result.details)
 
-    def test_unresolved_cluster_fails(self):
+    def test_unresolved_cluster_is_unverified_not_failed(self):
+        # Changed deliberately: this asserted that an unresolved cluster fails.
+        # The script's own two counts already separate "could not reach" from
+        # "looked and it was not there", and only the second is evidence about
+        # the project. A credential without container.clusters.get fails every
+        # resolve and arrives here as 0/7 written -- the exact shape a healthy
+        # kube-agents-evals-6 produced while it was passing a 13-task presubmit.
+        #
+        # The warning lines matter and are not decoration: the count alone no
+        # longer earns the excuse, because a count alone is also what a slot
+        # that lost its labels produces. See the test below.
+        stderr = "\n".join([
+            f"WARNING: no credentials for seeded cluster seeded-{slot} in kube-agents-evals-5: "
+            f'code=403, message=Required "container.clusters.get" permission(s).'
+            for slot in ("a", "b", "c")
+        ] + [self._summary(0, unresolved=self._roles())])
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(0, unresolved=self._roles()))]
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(result.warnings)
+        self.assertIn("not checked", result.message)
+
+    def test_unresolved_with_no_warning_at_all_still_fails(self):
+        # The hole the excuse opened, and the reason it now wants positive
+        # evidence rather than the absence of a contrary warning. A seeded
+        # cluster that keeps its name and loses its labels never enters the
+        # listing: no per-cluster warning names it (:215 fires only for a
+        # LABELLED cluster), `labelled` stays non-zero so :406 is silent, the
+        # other slots resolve so :411 is silent, and its roles increment
+        # `unresolved` with nothing printed. check_gke_and_state matches by
+        # name and passes it, so this check is the only one that can fail it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles() - 2, unresolved=2)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result.message)
+
+    def test_a_skipped_cluster_is_a_visibility_limit_too(self):
+        # hack/fleet-kubeconfigs.sh:386. Not a refusal, but the slot ends up
+        # with no kubeconfig for a reason that says nothing about the fleet.
+        stderr = "\n".join([
+            "WARNING: could not create a temporary file; skipping seeded cluster seeded-a",
+            self._summary(self._roles() - 1, unresolved=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+
+    def test_unlabelled_fleet_still_fails_though_every_role_is_unresolved(self):
+        # The absent/misconfigured fleet, which arrives in the same "unresolved"
+        # count as a refused one. check_gke_and_state cannot be the backstop
+        # here: it matches EXPECTED_CLUSTERS by NAME, while the fleet script
+        # discovers by the environment/managed-by labels, so a cluster that kept
+        # its name and lost its label passes there and is unresolved here.
+        stderr = "\n".join([
+            "WARNING: project kube-agents-evals-5 carries no clusters labelled "
+            "environment=seeded,managed-by=kube-agents-seeded-fleet.",
+            self._summary(0, unresolved=self._roles()),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result.message)
+
+    def test_a_cluster_matching_no_catalog_slot_still_fails(self):
+        stderr = "\n".join([
+            "WARNING: seeded cluster seeded-z in kube-agents-evals-5 matches no slot the "
+            "catalog declares; ignoring it",
+            self._summary(0, unresolved=self._roles()),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result.message)
+
+    def test_unreachable_clusters_are_one_unverified_item_not_one_per_cluster(self):
+        # report() counts warnings to fill in "N item(s) could not be checked".
+        # Three unreachable clusters are evidence for a single item -- this
+        # project's seeded fleet -- so folding them in keeps the banner honest.
+        stderr = "\n".join([
+            f"WARNING: no credentials for seeded cluster seeded-{slot} in kube-agents-evals-5: "
+            f'code=403, message=Required "container.clusters.get" permission(s).'
+            for slot in ("a", "b", "c")
+        ] + [self._summary(0, unresolved=self._roles())])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(1, len(result.warnings), result.warnings)
+        for slot in ("a", "b", "c"):
+            self.assertIn(f"seeded-{slot}", result.warnings[0])
+
+    def test_unplanted_alongside_unresolved_still_fails(self):
+        # One role looked at and absent is a finding, whatever else went
+        # unreached. The unverified path above must not swallow it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", self._summary(self._roles() - 2, unresolved=1, unplanted=1)),
+            ]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertFalse(result.passed)
+
+    def test_script_refused_is_unverified_not_failed(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (1, "", 'ERROR: Required "container.clusters.get" permission(s) for "projects/p".'),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("container.clusters.get" in w for w in result.warnings), result.warnings)
+
+    def test_script_timing_out_is_unverified_not_failed(self):
+        # A fleet script that never finished says nothing about the fleet, and
+        # it is the likeliest non-zero exit here: it walks every seeded cluster
+        # with a get-credentials each. Classified with _denial_reason alone it
+        # was a hard failure, which is the same wrong answer this file was
+        # opened to remove, arriving one exit code later.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (124, "", "timed out after 300s: hack/fleet-kubeconfigs.sh"),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("timed out" in w for w in result.warnings), result.warnings)
 
     def test_missing_kubectl_is_unverified_not_failed(self):
         # 127 is "could not look", and reporting it as an absent fleet would
@@ -227,6 +590,42 @@ class SeededFleetFixturesTest(unittest.TestCase):
         rendered = re.sub(r"\$\{[^}]+\}", "7", line.split('"', 1)[1].rsplit('"', 1)[0])
         match = checker._FLEET_SUMMARY.search(rendered)
         self.assertIsNotNone(match, rendered)
+
+    def test_the_fleet_warning_phrases_are_the_ones_the_script_prints(self):
+        # Same standard as the test above, for the three regexes that decide
+        # fail against unverified. A phrase reworded in hack/fleet-kubeconfigs.sh
+        # and not here stops matching in silence, and it breaks both ways now:
+        # a _FLEET_LOOKED_AND_FOUND_WRONG phrase that stops matching drops every
+        # genuinely absent fleet from exit 1 to exit 2, and a _FLEET_UNREACHABLE
+        # one that stops matching fails every project whose clusters were merely
+        # refused -- the bug this file exists to remove.
+        text = checker._FLEET_KUBECONFIGS.read_text(encoding="utf-8")
+        wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
+        unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
+        self.assertEqual(4, len(wrong))
+        self.assertEqual(2, len(unreachable))
+        for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
+            with self.subTest(phrase=phrase):
+                self.assertRegex(text, phrase)
+
+    def test_a_refused_cluster_listing_is_not_read_as_an_absent_fleet(self):
+        # A refused `clusters list` leaves hack/fleet-kubeconfigs.sh with an
+        # empty listing, so it goes on to print the same "carries no clusters
+        # labelled" warning it prints for a project that genuinely has none.
+        # Failing on that string alone reintroduces, in this check, the bug the
+        # rest of this file exists to remove. Only the first line separates them.
+        err = (
+            "WARNING: could not list clusters in kube-agents-evals-5; every fleet check will "
+            "report status=error\n"
+            "WARNING: project kube-agents-evals-5 carries no clusters labelled "
+            "environment=seeded,managed-by=kube-agents-seeded-fleet.\n"
+            + self._summary(0, unresolved=self._roles())
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", err)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
 
 
 class ArtifactRegistryTest(unittest.TestCase):
@@ -397,11 +796,143 @@ class ArtifactRegistryTest(unittest.TestCase):
         self.assertTrue(any("image push" in d for d in result.details), result.details)
 
     def test_unreadable_policies_fail_rather_than_pass_silently(self):
+        # A policy read that failed for a reason that is not permissions. There
+        # is nothing for an operator to go and confirm by hand, so this stays a
+        # failure -- the counterpart to the denial case below, which does not.
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(json.dumps(self._REPO)), _fail("denied"), _fail("denied")]
+            run.side_effect = [_ok(json.dumps(self._REPO)), _fail("boom"), _fail("boom")]
             result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
         self.assertTrue(any("Could not read any IAM policy" in d for d in result.details), result.details)
+
+    def test_one_policy_denied_and_the_other_empty_does_not_accuse(self):
+        # The half-read case. `policy_read` is True because the repo policy came
+        # back, but the grants provision_ci_pool_project.sh makes are
+        # project-level, so the refused half is the half that holds them. An
+        # empty repo policy plus a refused project policy looks exactly like a
+        # project with no push rights, and reporting it as one is the accusation
+        # this whole change exists to stop.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("ERROR: (gcloud.projects.get-iam-policy) PERMISSION_DENIED: Permission "
+                      "'resourcemanager.projects.getIamPolicy' denied on resource"),
+                _ok(self._EMPTY),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("image push" in d for d in result.details), result.details)
+        self.assertTrue(any("push rights were not checked" in w for w in result.warnings), result.warnings)
+
+    def test_one_policy_denied_still_passes_on_a_grant_the_other_holds(self):
+        # A binding found settles the question even from a partial read, so a
+        # refusal must not turn a conclusive pass into an unchecked item.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("ERROR: PERMISSION_DENIED: Permission 'resourcemanager.projects.getIamPolicy' denied"),
+                _ok(self._push_and_pull()),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("push rights" in w for w in result.warnings), result.warnings)
+
+    def test_one_policy_failing_for_another_reason_still_accuses(self):
+        # Not a denial, so there is nothing for an operator to confirm by hand
+        # and the absence stays a finding -- but the message says the read was
+        # partial rather than presenting it as a complete picture.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("boom"),
+                _ok(self._EMPTY),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("partial policy" in d for d in result.details), result.details)
+
+    def test_denied_policies_are_unverified_not_failed(self):
+        # Both reads refused. Nothing is known about push rights either way, and
+        # a caller who cannot read a project's IAM policy has learned nothing
+        # about whether Cloud Build can push to it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("ERROR: PERMISSION_DENIED: Permission 'resourcemanager.projects.getIamPolicy' denied"),
+                _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' denied"),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("not checked" in w for w in result.warnings), result.warnings)
+        self.assertIn("not checked", result.message)
+        self.assertNotIn("push rights, and node pull rights", result.message)
+
+    def test_timed_out_policies_are_unverified_not_failed(self):
+        # Same conclusion as the pair of refusals above, from the pair of reads
+        # that never happened. This is the site where the two classifiers had to
+        # stay apart -- policy_errors still feeds the "partial policy" wording --
+        # so the fix routes unreads into policy_denials rather than widening
+        # what "denied" means. Before it, two timeouts hit policy_errors and
+        # printed "Could not read any IAM policy" as a hard failure.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("timed out after 120s: gcloud projects get-iam-policy kube-agents-evals-3"),
+                _fail("ERROR: (gcloud.artifacts.repositories.get-iam-policy) There was a problem "
+                      "refreshing your current auth tokens: invalid_grant"),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Could not read any IAM policy" in d for d in result.details), result.details)
+        self.assertIn("not checked", result.message)
+
+    def test_a_timed_out_policy_read_is_not_reported_as_a_partial_read(self):
+        # The half-and-half case, and the reason the routing had to preserve the
+        # policy_denials/policy_errors split rather than merge the buckets: the
+        # "partial policy" wording is for a read that produced a usable answer
+        # alongside one that broke, and a timeout produced no answer at all.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps(self._REPO)),
+                _fail("timed out after 120s: gcloud projects get-iam-policy kube-agents-evals-3"),
+                _ok(self._EMPTY),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("image push" in d for d in result.details), result.details)
+        self.assertTrue(any("push rights were not checked" in w for w in result.warnings), result.warnings)
+
+    def test_denied_repository_describe_is_unverified_not_missing(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail(
+                    "ERROR: (gcloud.artifacts.repositories.describe) PERMISSION_DENIED: Permission "
+                    "'artifactregistry.repositories.get' denied on resource (or it may not exist)."
+                ),
+                _ok(self._push_and_pull()),
+                _ok(self._EMPTY),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Missing Artifact Registry" in d for d in result.details), result.details)
+        self.assertIn("not checked", result.message)
+
+    def test_absent_repository_still_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail("ERROR: (gcloud.artifacts.repositories.describe) NOT_FOUND: Repository does not exist"),
+                _ok(self._push_and_pull()),
+                _ok(self._EMPTY),
+                _ok(self._NODES),
+            ]
+            result = checker.check_artifact_registry("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Missing Artifact Registry" in d for d in result.details), result.details)
 
     # ── Pull rights ───────────────────────────────────────────────────────────
     # The gap these cover: push and pull are different verbs held by different
@@ -549,6 +1080,49 @@ class GithubAppInstallationTest(unittest.TestCase):
             result = checker.check_github_repo_and_app("kube-agents-evals-3", self._APP_ID)
         self.assertFalse(result.passed)
         self.assertTrue(any("not in GitHub App" in d for d in result.details), result.details)
+
+    def test_uninstalled_app_still_fails(self):
+        # An org with no installations answers 200 with an empty list, so this
+        # really is "the App is not installed" and must keep failing.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(""),
+            ]
+            result = checker.check_github_repo_and_app("kube-agents-evals-3", self._APP_ID)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("installation not found" in d for d in result.details), result.details)
+
+    def test_token_without_admin_org_is_unverified_not_an_uninstalled_app(self):
+        # GET /orgs/{org}/installations needs admin:org and answers 404 -- not
+        # 403 -- to a PAT carrying repo,workflow. Reading that as "not
+        # installed" names a correctly configured org as the defect.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra"})),
+                (1, "", "gh: Not Found (HTTP 404)"),
+            ]
+            result = checker.check_github_repo_and_app("kube-agents-evals-6", self._APP_ID)
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("installation not found" in d for d in result.details), result.details)
+        self.assertTrue(any("admin:org" in w for w in result.warnings), result.warnings)
+        self.assertIn("NOT verified", result.message)
+
+    def test_a_timed_out_installations_lookup_is_unverified_not_an_uninstalled_app(self):
+        # The same manufactured claim as the test above, reached by a different
+        # road: this call site classified with _denial_reason alone until the
+        # #1008 review, so a `gh api` that never answered produced the flat
+        # assertion "GitHub App <id> installation not found on org gke-agentic"
+        # about an org nothing had been read from.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra"})),
+                (124, "", "timed out after 120s: gh api /orgs/gke-agentic/installations"),
+            ]
+            result = checker.check_github_repo_and_app("kube-agents-evals-6", self._APP_ID)
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("installation not found" in d for d in result.details), result.details)
+        self.assertIn("NOT verified", result.message)
 
     def test_confirmation_flag_clears_the_warning_but_says_it_was_attested(self):
         with mock.patch.object(checker, "run_cmd") as run:
@@ -701,6 +1275,50 @@ class TokenMinterTest(unittest.TestCase):
     def test_fully_provisioned_minter_passes(self):
         result = self._run()
         self.assertTrue(result.passed, result.details)
+
+    def test_denied_kms_reads_are_unverified_not_an_unprovisioned_minter(self):
+        denied = _fail("ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission "
+                       "'cloudkms.cryptoKeyVersions.list' denied on resource")
+        result = self._run(versions=denied, key=denied, key_policy=denied, gsa_policy=denied)
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([], result.details)
+        self.assertEqual(4, len(result.warnings))
+        self.assertNotIn("ENABLED", result.message)
+        # Every partial summary in this file reads the same way: what was
+        # verified, then what was not, comma-separated within each half. Three
+        # checks used to phrase it three ways and the operator had to work out
+        # which of "verified", "present" and "partly verified" meant the same
+        # thing. Nothing was verified here, so the first half is absent.
+        self.assertEqual(
+            "the imported key versions, the key's purpose, algorithm and import-only setting, "
+            "the minter GSA's signing rights, the minter GSA's Workload Identity binding "
+            "not checked",
+            result.message,
+        )
+
+    def test_a_partial_summary_names_both_halves(self):
+        self.assertEqual(
+            "a, c verified; b not checked",
+            checker._partial_summary([("a", True), ("b", False), ("c", True)]),
+        )
+        # Empty means "everything was checked": the caller says so in its own
+        # words rather than printing a bare "verified" with nothing after it.
+        self.assertEqual("", checker._partial_summary([("a", True), ("b", True)]))
+
+    def test_absent_kms_key_still_fails(self):
+        result = self._run(versions=_fail("ERROR: (gcloud.kms.keys.versions.list) NOT_FOUND: CryptoKey "
+                                          "projects/p/locations/l/keyRings/r/cryptoKeys/k not found"))
+        self.assertFalse(result.passed)
+        self.assertTrue(any("not found or error" in d for d in result.details), result.details)
+
+    def test_one_denied_read_does_not_hide_a_real_failure_in_another(self):
+        # A partial denial must not turn a genuine finding into a pass.
+        result = self._run(
+            key_policy=_fail("PERMISSION_DENIED: cannot read key policy"),
+            gsa_policy=_ok(self._gsa_policy(member="serviceAccount:wrong@example.iam.gserviceaccount.com")),
+        )
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Workload Identity" in d for d in result.details), result.details)
 
     def test_empty_import_only_key_fails(self):
         # Terraform creates the key import-only and empty; an empty version list
@@ -993,18 +1611,45 @@ class IamGrantsTest(unittest.TestCase):
     def _reader_policy(self, members):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
 
+    def _project_policy(
+        self,
+        project_id="kube-agents-evals-3",
+        prow_roles=None,
+        platform_roles=None,
+        conditional_roles=(),
+        extra_bindings=(),
+    ):
+        """The project's own policy: both identities holding exactly what they should."""
+        prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
+        platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
+        platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+        bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(prow)]
+        bindings += [{"role": r, "members": [platform_member]} for r in sorted(platform)]
+        bindings += [
+            {
+                "role": r,
+                "members": [checker.PROW_RUNNER_MEMBER],
+                "condition": {"title": "expires", "expression": "request.time < timestamp('2020-01-01T00:00:00Z')"},
+            }
+            for r in sorted(conditional_roles)
+        ]
+        bindings += list(extra_bindings)
+        return json.dumps({"bindings": bindings})
+
+    def _both_build_identities(self):
+        return self._reader_policy(
+            [
+                "serviceAccount:123456@cloudbuild.gserviceaccount.com",
+                "serviceAccount:123456-compute@developer.gserviceaccount.com",
+            ]
+        )
+
     def test_both_build_identities_granted_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
-                _ok(
-                    self._reader_policy(
-                        [
-                            "serviceAccount:123456@cloudbuild.gserviceaccount.com",
-                            "serviceAccount:123456-compute@developer.gserviceaccount.com",
-                        ]
-                    )
-                ),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -1014,6 +1659,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-2")),
+                _ok(self._project_policy("kube-agents-evals-2")),
                 _ok(self._reader_policy(["serviceAccount:123456-compute@developer.gserviceaccount.com"])),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-2", "123456")
@@ -1024,6 +1670,19 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(json.dumps({"bindings": []})),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Workload Identity" in d for d in result.details), result.details)
+
+    def test_denied_gsa_policy_is_unverified_not_a_missing_gsa(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: Permission "
+                      "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
+                _ok(self._project_policy("kube-agents-evals-6")),
                 _ok(
                     self._reader_policy(
                         [
@@ -1033,9 +1692,245 @@ class IamGrantsTest(unittest.TestCase):
                     )
                 ),
             ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Missing GSA" in d for d in result.details), result.details)
+        self.assertIn("not checked", result.message)
+
+    def test_denied_project_policy_is_unverified_not_missing_roles(self):
+        # The read this PR adds is a third site for #1008's bug. An operator
+        # without resourcemanager.projects.getIamPolicy would otherwise be told
+        # both identities are missing every role and not to register the
+        # project, on the strength of a read that never happened.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _fail("ERROR: (gcloud.projects.get-iam-policy) PERMISSION_DENIED: Permission "
+                      "'resourcemanager.projects.getIamPolicy' denied on resource"),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("roles/" in d for d in result.details), result.details)
+        self.assertTrue(
+            any("were not checked" in w for w in result.warnings), result.warnings)
+        self.assertEqual(
+            "the Workload Identity binding, the cross-project AR reader grants verified; "
+            "the Prow runner and platform GSA project roles not checked",
+            result.message,
+        )
+
+    def test_denied_cross_project_prow_policy_is_unverified(self):
+        # kube-agents-prow is somebody else's project. Nobody outside Prow can
+        # read its Artifact Registry policy, and that says nothing about the
+        # pool project being onboarded.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._project_policy("kube-agents-evals-6")),
+                _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' "
+                      "denied on resource"),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertTrue(result.passed, result.details)
+        # Both halves, as check_artifact_registry does it. An operator reading
+        # only the skipped half cannot tell whether the other one passed or was
+        # skipped too, and goes and re-checks something this run already did.
+        self.assertEqual(
+            "the Workload Identity binding, the Prow runner and platform GSA project roles "
+            "verified; the cross-project AR reader grants not checked",
+            result.message,
+        )
+
+    def test_gsa_policy_failing_for_another_reason_still_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                # What IAM answers for an absent service account, observed
+                # 2026-08-27; it is NOT_FOUND rather than the anti-enumeration
+                # PERMISSION_DENIED, so a missing GSA is still reportable.
+                _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
+                      "service account."),
+                _ok(self._project_policy("kube-agents-evals-3")),
+                _ok(self._reader_policy(["serviceAccount:123456@cloudbuild.gserviceaccount.com"])),
+            ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
-        self.assertTrue(any("Workload Identity" in d for d in result.details), result.details)
+        self.assertTrue(any("Missing GSA" in d for d in result.details), result.details)
+
+    def test_prow_runner_missing_role_fails(self):
+        # kube-agents-evals-6 as it stood on 2026-08-26: fully provisioned,
+        # verified green, and its first lease died at get-credentials.
+        without_container_admin = checker.PROW_RUNNER_ROLES - {"roles/container.admin"}
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._project_policy("kube-agents-evals-6", prow_roles=without_container_admin)),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+    def test_prow_runner_conditional_binding_does_not_count(self):
+        # A condition the presubmit does not satisfy grants nothing, so counting
+        # the binding would pass a project the runner still cannot use.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(
+                    self._project_policy(
+                        "kube-agents-evals-6",
+                        prow_roles=checker.PROW_RUNNER_ROLES - {"roles/container.admin"},
+                        conditional_roles={"roles/container.admin"},
+                    )
+                ),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+    def test_prow_runner_extra_role_passes(self):
+        # The check reports absences only; a project holding more than the
+        # measured set is not a misconfiguration this script has an opinion on.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(prow_roles=checker.PROW_RUNNER_ROLES | {"roles/artifactregistry.writer"})),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+
+    def test_platform_gsa_missing_role_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    platform_roles=checker.PLATFORM_GSA_ROLES - {"roles/container.viewer"})),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.viewer" in d for d in result.details), result.details)
+
+    def test_platform_gsa_extra_admin_role_fails(self):
+        # The drift the swap on 2026-08-26 cleared: projects provisioned before
+        # the module narrowed kept container.admin, so the agent under test could
+        # write to the shared fleet on half the pool.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    platform_roles=checker.PLATFORM_GSA_ROLES | {"roles/container.admin"})),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
+
+    def test_a_public_binding_fails(self):
+        # Neither identity check would see this: both scan for one literal
+        # member, and allUsers is not either of them.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    extra_bindings=[{"role": "roles/storage.objectViewer", "members": ["allUsers"]}])),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("allUsers" in d for d in result.details), result.details)
+
+    def test_a_conditional_public_binding_still_fails(self):
+        # Unlike the two checks below it: a condition narrows when the grant
+        # applies, not who holds it, so the exposure is still there.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(extra_bindings=[{
+                    "role": "roles/storage.objectViewer",
+                    "members": ["allAuthenticatedUsers"],
+                    "condition": {"title": "t", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
+                }])),
+                _ok(self._both_build_identities()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("allAuthenticatedUsers" in d for d in result.details), result.details)
+
+
+class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
+    """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
+
+    Hardcoding the eight roles is what lets this check run without a Terraform
+    toolchain, and it is also how the two drift apart. Without this test,
+    narrowing the granted set would leave every correctly-provisioned project
+    failing verification weeks later, with nothing pointing at Terraform as the
+    cause.
+
+    The set is written in three places, and only one of them is applied. Pool
+    projects are installed through terraform/examples/full-install, whose
+    `local.agent_project_roles` passes `local.read_only_roles` into the module
+    (main.tf) -- so the module's own `project_roles` default is never read on
+    that path and pinning it alone would leave this test green through exactly
+    the drift it exists to catch. Both are asserted below: the composition
+    because it is what runs, the module default because it is live for a caller
+    invoking the module directly and nothing else joins the two.
+    """
+
+    def _roles(self, text, pattern, what):
+        block = re.search(pattern, text, re.S | re.M)
+        self.assertIsNotNone(block, f"could not find {what}")
+        return set(re.findall(r'"(roles/[^"]+)"', block.group(1)))
+
+    def test_matches_the_composition_the_install_applies(self):
+        main = (checker._ROOT / "terraform" / "examples" / "full-install" / "main.tf").read_text()
+        applied = self._roles(
+            main, r"^[ \t]*read_only_roles[ \t]*=[ \t]*\[(.*?)\]", "local.read_only_roles in full-install/main.tf"
+        )
+        self.assertEqual(applied, checker.PLATFORM_GSA_ROLES)
+
+    def test_the_module_default_matches_the_composition(self):
+        tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()
+        declared = self._roles(
+            tf,
+            r'variable\s+"project_roles".*?default\s*=\s*\[(.*?)\]',
+            "the project_roles default in variables.tf",
+        )
+        self.assertEqual(declared, checker.PLATFORM_GSA_ROLES)
+
+
+class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
+    """PROW_RUNNER_ROLES must equal what the two granting sites grant.
+
+    The twelve are written here, in the provisioning script's loop, and in the
+    repair block on the prerequisites page, and none reads another. Drift is
+    silent the worst way round: a role dropped from the script leaves a project
+    the verifier still passes, registered, dying on its first lease as #966 did.
+    """
+
+    def _loop_roles(self, text, what):
+        loops = [
+            m.group(1)
+            for m in re.finditer(r"for role in(.*?);\s*do(.*?)done", text, re.S)
+            if re.search(r"prowjob-default-sa|PROW_RUNNER_SA", m.group(2))
+        ]
+        self.assertEqual(len(loops), 1, f"expected exactly one Prow runner grant loop in {what}")
+        return set(re.findall(r"roles/[\w.]+", loops[0]))
+
+    def test_matches_the_loop_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        granted = self._loop_roles(script, "provision_ci_pool_project.sh")
+        self.assertEqual(granted, checker.PROW_RUNNER_ROLES)
+
+    def test_matches_the_repair_block_on_the_prerequisites_page(self):
+        page = (
+            checker._ROOT / "docs" / "site" / "src" / "content" / "docs" / "deploy" / "ci-pool-projects.md"
+        ).read_text()
+        documented = self._loop_roles(page, "deploy/ci-pool-projects.md")
+        self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
 
 
 class ExitStatusTest(unittest.TestCase):
@@ -1082,6 +1977,24 @@ class ExitStatusTest(unittest.TestCase):
         self.assertEqual(minter.warnings, [])
         status, _ = self._report([minter])
         self.assertEqual(status, checker.EXIT_FAILED)
+
+    def test_a_bad_command_line_exits_usage_not_unverified(self):
+        # argparse's own error() exits 2, which a caller would read as "nothing
+        # failed, go confirm these by hand" -- so a typo would look like a run
+        # that finished.
+        with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--no-such-flag"]), \
+             mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                checker.main()
+        self.assertEqual(raised.exception.code, checker.EXIT_USAGE)
+        self.assertNotEqual(checker.EXIT_USAGE, checker.EXIT_UNVERIFIED)
+
+    def test_a_missing_required_argument_exits_usage(self):
+        with mock.patch("sys.argv", ["verify_ci_pool_project.py"]), \
+             mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                checker.main()
+        self.assertEqual(raised.exception.code, checker.EXIT_USAGE)
 
 
 class ToolchainTest(unittest.TestCase):
@@ -1257,18 +2170,122 @@ class CodebaseMappingTest(unittest.TestCase):
         self.assertNotIn("dated", r.warnings[0])
         self.assertIn("not yet on gke-labs/main", r.message)
 
+    def test_a_longer_project_id_does_not_satisfy_a_shorter_one(self):
+        # Unanchored, `kube-agents-evals)` matches inside the -2 row, so
+        # onboarding project 2 would read as already mapped.
+        body = _ci_deploy_text("kube-agents-evals-2")
+        self.assertFalse(checker._mapping_row_present(body, "kube-agents-evals"))
+        self.assertTrue(checker._mapping_row_present(body, "kube-agents-evals-2"))
+
+    def test_a_commented_out_row_is_not_a_row(self):
+        # `case` ignores it, so the project deploys to whatever `*)` names.
+        commented = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            '    # kube-agents-evals-6) echo "gke-agentic/kube-agents-evals-6-infra" ;;\n'
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(commented, "kube-agents-evals-6"))
+
+    def test_a_row_pointing_at_an_archived_repo_is_not_the_row(self):
+        # `-infra` is a prefix of `-infra-old`.
+        stale = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            '    kube-agents-evals-6) echo "gke-agentic/kube-agents-evals-6-infra-old" ;;\n'
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(stale, "kube-agents-evals-6"))
+
+    def test_an_unquoted_row_is_still_a_row(self):
+        # Nothing forces the quotes, and an unquoted echo behaves identically.
+        unquoted = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            "    kube-agents-evals-6) echo gke-agentic/kube-agents-evals-6-infra ;;\n"
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertTrue(checker._mapping_row_present(unquoted, "kube-agents-evals-6"))
+
+    def test_an_unquoted_row_missing_its_space_is_not_a_row(self):
+        # `echogke-agentic/...` is a command no shell resolves, so the arm is
+        # dead and the project would fall through to `*)` at lease time.
+        jammed = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            "    kube-agents-evals-6) echogke-agentic/kube-agents-evals-6-infra ;;\n"
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(jammed, "kube-agents-evals-6"))
+
+    def test_a_quoted_row_missing_its_space_is_not_a_row(self):
+        # Quoting does not rescue it: word splitting runs before quote removal,
+        # so `echo"gke-agentic/..."` is the same single dead token.
+        jammed = (
+            'gitops_repo_for_project() {\n  case "$1" in\n'
+            '    kube-agents-evals-6) echo"gke-agentic/kube-agents-evals-6-infra" ;;\n'
+            "    *) return 1 ;;\n  esac\n}\n"
+        )
+        self.assertFalse(checker._mapping_row_present(jammed, "kube-agents-evals-6"))
+
+    def test_a_lookalike_owner_is_not_the_upstream_remote(self):
+        # `not-gke-labs` ends with the real slug, and is a name anyone can take.
+        impostor = "origin\tgit@github.com:not-gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=impostor):
+            self.assertIsNone(checker._upstream_remote())
+
+    def test_an_ssh_url_carrying_a_port_is_the_upstream_remote(self):
+        # `git clone` accepts it, and the port must not be read as path.
+        ported = "origin\tssh://git@github.com:22/gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=ported):
+            self.assertEqual(checker._upstream_remote(), "origin")
+
+    def test_the_owner_is_matched_case_insensitively(self):
+        # GitHub resolves `GKE-Labs`; rejecting it loses the upstream comparison
+        # silently, leaving the operator a warning instead of a verdict.
+        shouted = "origin\thttps://github.com/GKE-Labs/kube-agents.git (fetch)\n"
+        with _git(remotes=shouted):
+            self.assertEqual(checker._upstream_remote(), "origin")
+
+    def test_the_right_path_on_another_host_is_not_the_upstream_remote(self):
+        mirror = "mirror\tgit@example.com:gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=mirror):
+            self.assertIsNone(checker._upstream_remote())
+
+    def test_the_upstream_remote_may_be_named_anything(self):
+        archive = "archive\tgit@github.com:gke-labs/kube-agents.git (fetch)\n"
+        with _git(remotes=archive):
+            self.assertEqual(checker._upstream_remote(), "archive")
+
 
 class RunChecksTest(unittest.TestCase):
     def test_missing_project_number_skips_dependent_checks_without_raising(self):
         with mock.patch.object(checker, "check_codebase_mapping", return_value=checker.CheckResult("m", True)), \
              mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False))), \
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
         skipped = [c for c in results if c.message.startswith("Skipped")]
         self.assertEqual(len(skipped), 2)
         self.assertTrue(all(not c.passed for c in skipped))
+
+    def test_denied_project_read_does_not_fail_the_checks_that_needed_it(self):
+        # The project number is missing because the read was refused, not
+        # because the project is wrong. Failing the two dependent checks would
+        # put the conflation straight back one level up.
+        unverified = checker.CheckResult("p", True, "Not checked", warnings=["could not describe"])
+        with mock.patch.object(checker, "check_codebase_mapping", return_value=checker.CheckResult("m", True)), \
+             mock.patch.object(checker, "check_project_and_apis", return_value=(None, unverified)), \
+             mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
+             mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
+            results = checker.run_checks("kube-agents-evals-6")
+        dependent = [c for c in results if c.name in
+                     ("Service Accounts & IAM Grants", "Artifact Registry Repository")]
+        self.assertEqual(2, len(dependent))
+        self.assertTrue(all(c.passed for c in dependent), [c.message for c in dependent])
+        self.assertTrue(all(c.warnings for c in dependent))
+        with mock.patch("builtins.print"):
+            self.assertEqual(checker.EXIT_UNVERIFIED, checker.report("kube-agents-evals-6", results))
 
 
 if __name__ == "__main__":

@@ -520,6 +520,109 @@ exit {docker_exit}
         finally:
             temp_dir.cleanup()
 
+    def test_idempotent_skip_when_tag_on_detached_head_stamped_commit(self):
+        """Verifies idempotent skip when tag points to a detached HEAD child commit of the candidate."""
+        temp_dir, repo_dir, git, candidate_sha, bin_dir = self._create_mock_repo()
+        try:
+            # Create detached HEAD stamped release commit
+            git("checkout", "--detach", candidate_sha)
+            (pathlib.Path(repo_dir) / "version.txt").write_text("0.2.0\n")
+            git("add", "version.txt")
+            git("commit", "-m", "chore(release): stamp release version 0.2.0")
+            stamped_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", MOCK_TARGET_RELEASE_TAG, stamped_sha, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
+            git("checkout", "main")
+
+            create_mock_gh_binary(bin_dir, existing_releases=[MOCK_TARGET_RELEASE_TAG])
+            gh_out = pathlib.Path(repo_dir) / "gh_output.txt"
+
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, candidate_sha],
+                env={"GH_TOKEN": "mock-token", "GITHUB_OUTPUT": str(gh_out)},
+                bin_dir=bin_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("IDEMPOTENT SKIP", proc.stdout)
+
+            outputs = gh_out.read_text()
+            self.assertIn("eligible=false", outputs)
+            self.assertIn("already_released=true", outputs)
+            self.assertIn("skip_release=true", outputs)
+            self.assertIn(f"rc_candidate_commit={candidate_sha}", outputs)
+            self.assertIn(f"release_commit={stamped_sha}", outputs)
+        finally:
+            temp_dir.cleanup()
+
+    def test_collision_blocked_when_child_commit_tagged_with_different_version(self):
+        """Verifies collision detection when a detached HEAD child commit was tagged under another version."""
+        temp_dir, repo_dir, git, candidate_sha, bin_dir = self._create_mock_repo()
+        try:
+            git("checkout", "--detach", candidate_sha)
+            (pathlib.Path(repo_dir) / "version.txt").write_text("0.1.0\n")
+            git("add", "version.txt")
+            git("commit", "-m", "chore(release): stamp release version 0.1.0")
+            stamped_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", MOCK_COLLIDING_RELEASE_TAG, stamped_sha, "-m", f"Release {MOCK_COLLIDING_RELEASE_TAG}")
+            git("checkout", "main")
+
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, candidate_sha],
+                bin_dir=bin_dir,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Collision detected", proc.stderr)
+            self.assertIn(f"already published under release {MOCK_COLLIDING_RELEASE_TAG}", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_tag_collision_on_unrelated_commit_fails(self):
+        """Verifies error when target tag exists on an unrelated commit."""
+        temp_dir, repo_dir, git, candidate_sha, bin_dir = self._create_mock_repo()
+        try:
+            # Create a truly unrelated commit on an orphan branch
+            git("checkout", "--orphan", "unrelated-branch")
+            (pathlib.Path(repo_dir) / "other.txt").write_text("other\n")
+            git("add", "other.txt")
+            git("commit", "-m", "feat: other")
+            unrelated_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", MOCK_TARGET_RELEASE_TAG, unrelated_sha, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
+            git("checkout", "main")
+
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, candidate_sha],
+                bin_dir=bin_dir,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(f"Tag '{MOCK_TARGET_RELEASE_TAG}' already exists in git repository on a different commit", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_tag_collision_on_arbitrary_descendant_commit_fails(self):
+        """Verifies error when target tag exists on a descendant commit that is not a valid single-parent stamp."""
+        temp_dir, repo_dir, git, candidate_sha, bin_dir = self._create_mock_repo()
+        try:
+            # Create 3 subsequent commits on main past candidate_sha
+            for i in range(3):
+                (pathlib.Path(repo_dir) / f"file_{i}.txt").write_text(f"content {i}\n")
+                git("add", f"file_{i}.txt")
+                git("commit", "-m", f"feat: downstream change {i}")
+
+            descendant_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", MOCK_TARGET_RELEASE_TAG, descendant_sha, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
+
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, candidate_sha],
+                bin_dir=bin_dir,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(f"Tag '{MOCK_TARGET_RELEASE_TAG}' already exists in git repository on a different commit", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

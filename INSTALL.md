@@ -41,21 +41,20 @@ Run the interactive one-liner installer directly in **Google Cloud Shell** or an
 curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 ```
 
-When prompted for the image/source revision, enter a SemVer release tag or the full 40-character
-commit SHA behind a validated RC tag. The installer rejects mutable refs such as `latest` and `main`
-so the install sources and container images stay on the same revision. On the one-liner above
-there is no local checkout yet, so a value is required; running `./install.sh` from a kube-agents
-clone instead offers that clone's `HEAD` as the default — which only works if a container image was
-published for that commit (CI builds one per `main` commit and per release tag).
+_To pin to a specific official release, substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases):_
 
-_(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
+```
+
+When running the release-pinned installer (`<RELEASE_VERSION>/install.sh`), the baked release version is offered as the default, so pressing Enter accepts it; `--non-interactive` uses it without prompting at all. When running the generic installer (`gke-labs.github.io/kube-agents/install.sh`), the interactive prompt asks you to enter the target SemVer release tag or full 40-character commit SHA (from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)), and `--non-interactive` requires `--image-tag`. The installer rejects mutable refs such as `latest` and `main` to ensure install sources and container images stay strictly aligned.
 
 ### What `install.sh` Automatically Handles:
 
 - **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
 - **GCP Project & Region Selection**: Auto-detects the active project and prompts for confirmation; you can type a project ID that the discovered list does not show.
 - **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
-- **GKE Cluster Setup**: Provisions a Standard or Autopilot cluster (`--cluster-mode`, Standard by default) or connects to an existing one.
+- **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--region` with no explicit `--cluster-mode` builds Standard instead of failing; asking for `--cluster-mode=autopilot` at a zone is still an error.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
@@ -420,6 +419,22 @@ Install the Custom Resource Definitions (CRDs) and deploy the controller manager
 make install
 make deploy IMG=$IMG
 ```
+
+Then apply the agent-RBAC admission policies. `make deploy` does **not** include them — they are
+deliberately outside the kustomize overlay, because its `namePrefix` would rewrite each policy's
+name without rewriting the `spec.policyName` its binding refers to, leaving both bindings pointing
+at nothing and the policies silently inert:
+
+```bash
+# Kubernetes 1.30+ only (ValidatingAdmissionPolicy v1). Skip on older clusters -- unlike
+# the chart, which checks the version itself, this apply will fail there.
+kubectl apply -f config/admission/agent-rbac-policy.yaml
+```
+
+[Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
+such step. Skipping it here leaves agent RBAC without its admission backstop. Read that file's
+header for what the policies do and do not enforce — notably, they cannot check the rules of a role
+that a binding merely _references_.
 
 If the agent images are mirrored into a private registry, tell the operator where to find them.
 These two are the images it resolves at reconcile time rather than reading from a manifest — the

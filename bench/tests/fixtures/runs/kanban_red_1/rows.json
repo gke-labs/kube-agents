@@ -1,0 +1,30 @@
+[
+  {
+    "setupId": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "model": "gemini-3.1-pro-preview",
+    "harness": "kubeagents",
+    "augmentation": [
+      "mcp"
+    ],
+    "runId": "run_20260824_190758_251089",
+    "t": "2026-08-24T19:11:06Z",
+    "taskFolder": "agent-kanban-smoke",
+    "taskName": "Agent kanban smoke test",
+    "iteration": 0,
+    "outcomeScore": 0.5,
+    "correctnessScore": 0.5,
+    "recoverableSafetyScore": null,
+    "catastrophic": false,
+    "scoringVersion": "v1",
+    "toolScore": 0.6,
+    "latencySec": 133.12637670803815,
+    "inputTokens": 18,
+    "outputTokens": 1867,
+    "cachedTokens": 128562,
+    "reasoningTokens": 261,
+    "cacheWriteTokens": 144706,
+    "totalTokens": 275153,
+    "status": "success",
+    "validated": false
+  }
+]

@@ -1,0 +1,34 @@
+# actionlint configuration.
+#
+# actionlint types the `secrets` context of a reusable workflow from its
+# `on.workflow_call.secrets` block alone. It has no model of ENVIRONMENT
+# secrets, so it reports GH_APP_ID and GH_APP_PRIVATE_KEY — which
+# deploy-environment.yml's `deploy-environment` job reads from the
+# environment it declares — as undefined properties. These two patterns silence that.
+#
+# Suppressing a warning is not the same as answering it, and the real guard is
+# elsewhere: provision_environment.sh refuses to provision when
+# GITHUB_ORG/GITHUB_REPO/GITHUB_APP_ID are partially set, so an empty secret
+# stops the deploy with a named cause. tests/test_minter_secret_wiring.py
+# pins the wiring that keeps it non-empty. scripts/release/README.md, under
+# "Enabling the GitHub token minter on the RC", says what that wiring is.
+#
+# The patterns are matched unanchored against the whole message, so each one
+# names the secrets object's shape as well as the property. Without that tail a
+# pattern would also swallow the same property name raised against a different
+# object -- a future `inputs.gh_app_id` or `steps.x.outputs.gh_app_id` typo in
+# this file -- and silence a real error. `gemini_api_key` is the discriminator:
+# it is the only secret the workflow_call block declares, so it appears in the
+# rendered type of the secrets context and nowhere else.
+#
+# Scoped to this file, not to `deploy-environment` within it, because actionlint
+# has no job-level scoping. A second job added to deploy-environment.yml
+# WITHOUT an `environment:` would raise the same message and be silenced too, and
+# neither guard above would catch it: both concern that one job. A
+# new job reading these secrets needs its own `environment:` and its own
+# assertion; nothing here will tell you otherwise.
+paths:
+  .github/workflows/deploy-environment.yml:
+    ignore:
+      - 'property "gh_app_id" is not defined in object type \{.*gemini_api_key:'
+      - 'property "gh_app_private_key" is not defined in object type \{.*gemini_api_key:'

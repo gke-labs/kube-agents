@@ -41,6 +41,99 @@ is_ci_pipeline() {
   is_truthy "${CI:-}"
 }
 
+# ─── Cluster connection ───────────────────────────────────────────────────────
+# Two scripts in this directory point kubectl at the RC cluster before doing
+# anything to it — install_pubsub_platform.sh and wait_for_gke_readiness.sh — and
+# a workflow runs them as separate steps, so each starts from a fresh shell and
+# has to resolve the target itself. The pair lives here rather than being
+# duplicated, because the resolution order below is a contract with the
+# workflows: GKE_CLUSTER_NAME/GCP_REGION/GCP_PROJECT_ID are what the `env:` blocks
+# set, and CLUSTER_NAME/REGION/PROJECT_ID are the installer's own names, which a
+# developer running these by hand after install.sh already has exported.
+#
+# Assigns to globals rather than echoing: a caller reading an echo would need
+# command substitution, and a `set -u` abort inside a subshell would leave the
+# variable empty and the script running against an unnamed target.
+#
+# None of the four get a default in CI. A pipeline that reaches here with
+# GCP_PROJECT_ID unset has a misconfigured `env:` block or a variable missing
+# from its GitHub environment; defaulting PROJECT_ID to kube-agents-rc there
+# does not rescue the run, it points a real teardown-and-reinstall at a real
+# project nobody named. Failing names the variable instead, at the first script
+# that needs it rather than several steps later against a cluster that does not
+# exist. The defaults stay for the developer path, which is what the
+# CLUSTER_NAME/REGION/PROJECT_ID half of the contract above is for.
+#
+# AGENT_NAMESPACE is in the list because the `rc` and `nightly` environments
+# both define it. A workflow that binds neither environment reaches here with
+# all four empty and fails on the targeting trio regardless, so requiring the
+# namespace costs those callers nothing — and a job that sets the other three
+# but not this one is misconfigured in exactly the way silence used to hide,
+# since `vars.AGENT_NAMESPACE` expanding to empty is indistinguishable from the
+# default being correct.
+release_resolve_target() {
+  CLUSTER_NAME="${GKE_CLUSTER_NAME:-${CLUSTER_NAME:-}}"
+  REGION="${GCP_REGION:-${REGION:-}}"
+  PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-}}"
+  AGENT_NAMESPACE="${AGENT_NAMESPACE:-}"
+
+  if is_ci_pipeline; then
+    # A string rather than an array: `${#arr[@]}` on an empty array aborts under
+    # `set -u` on bash 3.2, which is what a developer on macOS runs these with.
+    local missing=""
+    [ -n "${CLUSTER_NAME}" ] || missing="${missing} GKE_CLUSTER_NAME"
+    [ -n "${REGION}" ] || missing="${missing} GCP_REGION"
+    [ -n "${PROJECT_ID}" ] || missing="${missing} GCP_PROJECT_ID"
+    [ -n "${AGENT_NAMESPACE}" ] || missing="${missing} AGENT_NAMESPACE"
+    if [ -n "${missing}" ]; then
+      echo "❌ Unset in CI:${missing}" >&2
+      echo "   These come from the job's \`env:\` block, which reads them from the" >&2
+      echo "   workflow's GitHub environment. Set them there rather than relying on" >&2
+      echo "   a default — a release script must not guess which project it targets." >&2
+      return 1
+    fi
+  else
+    CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
+    REGION="${REGION:-us-central1}"
+    PROJECT_ID="${PROJECT_ID:-kube-agents-rc}"
+    AGENT_NAMESPACE="${AGENT_NAMESPACE:-kubeagents-system}"
+  fi
+
+  export CLUSTER_NAME REGION PROJECT_ID AGENT_NAMESPACE
+}
+
+# Points kubectl at the resolved cluster, unless it is already there.
+#
+# The context test checks the cluster name AND the project: a developer with
+# several installs has more than one context whose name ends in the default
+# cluster name, and matching on the cluster alone would silently accept the
+# wrong one. Call release_resolve_target first.
+release_connect_kubectl() {
+  unset CLOUDSDK_PYTHON || true
+  unset CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE || true
+  export CLOUDSDK_PYTHON_SITEPACKAGES="0"
+  export PYTHONNOUSERSITE="1"
+  export USE_GKE_GCLOUD_AUTH_PLUGIN="True"
+  export CLOUDSDK_CONTAINER_USE_APPLICATION_DEFAULT_CREDENTIALS="false"
+  gcloud config set container/use_application_default_credentials false --quiet || true
+
+  if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${GOOGLE_APPLICATION_CREDENTIALS}" ]; then
+    gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" --quiet || true
+  fi
+
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || echo "")"
+  if ! kubectl cluster-info >/dev/null 2>&1 ||
+    [[ "${current_ctx}" != *"${CLUSTER_NAME}"* || "${current_ctx}" != *"${PROJECT_ID}"* ]]; then
+    echo "Connecting kubectl to target cluster '${CLUSTER_NAME}' in project '${PROJECT_ID}'..."
+    gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
+    # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" --project "${PROJECT_ID}" \
+      ${GKE_DNS_ENDPOINT_FLAG}
+  fi
+}
+
 # Validates that a string is a valid pure numeric SemVer (X.Y.Z without 'v' prefix)
 validate_pure_numeric_semver() {
   local ver="${1:-}"
@@ -148,12 +241,178 @@ is_commit_already_attempted() {
   [ -n "${rc_tag}" ]
 }
 
-# Checks if a commit SHA has already been validated in a previous RC run (*_validated tag)
-is_commit_already_validated() {
+# Checks if a commit SHA carries the RC pipeline's validation marker (rc_*_validated).
+#
+# Anchored to the rc_ family, and named for it: this gates resolve_rc_tag.sh's
+# skip decision and the nightly promotion, so a marker minted by some other tag
+# family must not read as an RC validation. verify_release_eligibility.sh and
+# get_latest_validated_rc_tag anchor the same way.
+is_rc_candidate_commit_already_validated() {
   local sha="$1"
   local validated_tags
-  validated_tags=$(git tag --points-at "${sha}" "*_validated" 2>/dev/null || echo "")
+  validated_tags=$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || echo "")
   [ -n "${validated_tags}" ]
+}
+
+# ─── Staging promotion tags ───────────────────────────────────────────────────
+# The nightly pipeline promotes a validated RC candidate by tagging its commit
+# staging_<ts>_<sha>, which is what staging-redeploy-*.yml triggers on.
+export STAGING_TAG_PREFIX="staging_"
+
+# Derives the staging promotion tag from a validated RC tag:
+#   rc_2608241820_b35543c_validated  ->  staging_2608241820_b35543c
+#
+# The timestamp stays first after the prefix so `git tag -l --sort=-v:refname
+# 'staging_*'` orders by time, and the transform is mechanical in both
+# directions, so a staging tag reads back to its candidate without a lookup. The
+# _validated suffix is dropped: it records that the RC gate passed, not that the
+# promotion did.
+#
+# Refuses anything outside the rc_ family rather than composing staging_<junk>,
+# because the result is a live deploy trigger.
+staging_tag_for_rc() {
+  local rc_tag="${1:-}"
+  if [ -z "${rc_tag}" ]; then
+    echo "❌ ERROR: an RC tag is required for staging_tag_for_rc." >&2
+    return 1
+  fi
+
+  local core="${rc_tag%_validated}"
+  case "${core}" in
+    rc_?*) core="${core#rc_}" ;;
+    *)
+      echo "❌ ERROR: '${rc_tag}' is not an rc_* candidate tag; refusing to derive a staging tag from it." >&2
+      return 1
+      ;;
+  esac
+
+  echo "${STAGING_TAG_PREFIX}${core}"
+}
+
+# Finds an existing staging promotion tag on a commit SHA, if any. Empty output
+# means the commit has not been promoted yet.
+get_existing_staging_tag() {
+  local sha="$1"
+  git tag --points-at "${sha}" "${STAGING_TAG_PREFIX}*" 2>/dev/null | head -n 1 || echo ""
+}
+
+# Reports whether a candidate commit's tree carries what the shared pipeline
+# workflows invoke against it.
+#
+# deploy-environment.yml, e2e-run.yml and teardown-environment.yml each check the
+# candidate out over the workspace and then run scripts from THAT tree, while the
+# workflow YAML comes from the caller's ref. A candidate validated before that
+# structure landed is therefore driven by workflows expecting scripts and a suite
+# selector it does not have — and two of those mismatches are silent rather than
+# loud, which is what makes this worth refusing over:
+#
+#   * e2e-run.yml names the suite in E2E_SUITE. A pre-rename runner reads only
+#     E2E_ENV, so it falls back to its own default and the blocking gate tests
+#     something other than what the run reports it gated on.
+#   * run_optional_e2e_suites.sh is absent there entirely, and its step is
+#     continue-on-error, so the optional suites contribute nothing and the run
+#     still goes green.
+#
+# Both markers are checked because they fail independently.
+#
+# This does not expire with the restructure. Once the RC pipeline validates a
+# post-restructure commit, `get_latest_validated_rc_tag` stops returning an old
+# one and the default path never reaches this check again — but
+# nightly-pipeline.yml takes an `rc_tag` dispatch input whose description offers
+# any validated candidate, and the tag graph keeps every candidate it ever
+# validated. Naming one by hand is a supported thing to do and stays wrong for
+# the same reason it is wrong today.
+#
+# The two markers probe one epoch boundary — the shared-pipeline restructure —
+# and not the general question of whether a tree can be driven by these
+# workflows. Nine scripts run out of the candidate's checkout; these sample two.
+# That is sound for the boundary they were chosen for, because both arrived in
+# the commit that created it. A later restructure that adds a seam needs its own
+# marker here; this function will not notice on its own.
+candidate_supports_shared_pipeline() {
+  local sha="${1:-}"
+
+  if [ -z "${sha}" ]; then
+    echo "❌ ERROR: a commit is required for candidate_supports_shared_pipeline." >&2
+    return 2
+  fi
+
+  git cat-file -e "${sha}:scripts/release/run_optional_e2e_suites.sh" 2>/dev/null || return 1
+
+  # `git grep`, not `git show | grep -q`. Under the `pipefail` this file sets,
+  # the pipeline reports whatever killed the producer: `grep -q` exits the moment
+  # it matches, `git show` then dies on SIGPIPE, and the pipeline fails with 141
+  # on a tree that does carry the marker. It needs a blob larger than the pipe
+  # buffer, so it would not fire today — execute_e2e_tests.py is around 16 KB —
+  # and it fails in the direction that skips a good candidate silently.
+  #
+  # Anything non-zero refuses, including an unreadable object. Refusing is the
+  # safe direction: the cost is a skipped night, and the alternative is testing a
+  # candidate whose tree we could not read.
+  git grep -q "E2E_SUITE" "${sha}" -- scripts/release/execute_e2e_tests.py 2>/dev/null || return 1
+
+  return 0
+}
+
+# Reports whether the staging redeploys AT A GIVEN COMMIT would start on a given
+# tag, by reading the `push: tags:` patterns out of that commit's own copy of
+# staging-redeploy-agent.yml.
+#
+# A push event runs the workflows in the pushed ref's tree, not the ones on the
+# default branch, and a promotion tag lands on a candidate commit that can be days
+# old. So the question of whether a tag deploys anything is answered by the
+# candidate, and a promotion pushed at a commit whose trigger does not match the
+# tag succeeds, deploys nothing, and reports green — after which
+# get_existing_staging_tag sees the tag and no later run retries that candidate.
+#
+# The three redeploys share one trigger, so agent stands for all three.
+staging_trigger_matches_at_commit() {
+  local commit="${1:-}" tag="${2:-}"
+  local workflow=".github/workflows/staging-redeploy-agent.yml"
+  local yaml patterns pattern
+
+  if [ -z "${commit}" ] || [ -z "${tag}" ]; then
+    echo "❌ ERROR: a commit and a tag are required for staging_trigger_matches_at_commit." >&2
+    return 2
+  fi
+
+  yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || return 1
+
+  # The list items under the single `tags:` key, unquoted. Stops at the first
+  # line that is neither a list item nor blank, so it cannot run on into the rest
+  # of the file if the key is ever absent.
+  patterns="$(printf '%s\n' "${yaml}" | awk '
+    /^[[:space:]]*tags:[[:space:]]*$/ { in_tags = 1; next }
+    in_tags && /^[[:space:]]*#/ { next }
+    in_tags && /^[[:space:]]*$/ { next }
+    in_tags && /^[[:space:]]*-[[:space:]]/ {
+      item = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+      sub(/[[:space:]]*$/, "", item)
+      gsub(/^"|"$/, "", item)
+      gsub(/^'"'"'|'"'"'$/, "", item)
+      print item
+      next
+    }
+    in_tags { in_tags = 0 }
+  ')"
+
+  [ -n "${patterns}" ] || return 1
+
+  while IFS= read -r pattern; do
+    [ -n "${pattern}" ] || continue
+    # Glob-matched rather than compared: the point is what GitHub would do with
+    # the pattern, not whether the file says what this branch expects. So the
+    # expansion is deliberately unquoted.
+    # shellcheck disable=SC2254
+    case "${tag}" in
+      ${pattern}) return 0 ;;
+    esac
+  done <<EOF
+${patterns}
+EOF
+
+  return 1
 }
 
 # Finds the latest commit on main whose required container images are already built in the registry
@@ -215,12 +474,33 @@ find_latest_built_commit() {
   return 1
 }
 
-# Configures Git bot user identity for automated tagging
+# Configures Git bot user identity for automated tagging and committing
 setup_git_bot_user() {
-  if is_ci_pipeline; then
-    git config user.name "github-actions[bot]"
-    git config user.email "github-actions[bot]@users.noreply.github.com"
-  fi
+  export GIT_AUTHOR_NAME="github-actions[bot]"
+  export GIT_AUTHOR_EMAIL="github-actions[bot]@users.noreply.github.com"
+  export GIT_COMMITTER_NAME="github-actions[bot]"
+  export GIT_COMMITTER_EMAIL="github-actions[bot]@users.noreply.github.com"
+}
+
+# Syncs remote tags into the local repository, in CI only.
+#
+# Every script that answers a question from the tag graph calls this first: a
+# shallow or tagless checkout otherwise resolves "no such tag" rather than
+# failing, which is the quiet way to skip a candidate or promote nothing.
+#
+# `|| true` throughout, deliberately. An unreachable network is not itself the
+# error; the caller's own lookup fails afterwards naming the tag it wanted, which
+# is the message worth printing.
+#
+# find_latest_built_commit does not use this — it fetches `main` too, handles a
+# shallow clone's --depth, and reports which remote answered.
+release_fetch_tags() {
+  is_ci_pipeline || return 0
+
+  local target_repo
+  target_repo="$(get_target_repo)"
+  git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 ||
+    git fetch origin --tags >/dev/null 2>&1 || true
 }
 
 # Ensures a Git tag exists for a given commit SHA idempotently and pushes to origin.
@@ -238,14 +518,7 @@ ensure_git_tag() {
   local target_repo
   target_repo="$(get_target_repo)"
 
-  # Synchronize remote tags only in CI environments
-  if is_ci_pipeline; then
-    if [ -n "${target_repo}" ]; then
-      git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || git fetch origin --tags >/dev/null 2>&1 || true
-    else
-      git fetch origin --tags >/dev/null 2>&1 || true
-    fi
-  fi
+  release_fetch_tags
 
   # Canonicalize commit SHA to full 40-character hash before comparison
   local target_full_sha
@@ -283,6 +556,154 @@ ensure_git_tag() {
   fi
 }
 
+# Stamps BAKED_RELEASE_VERSION into root installer scripts (install.sh, uninstall.sh, upgrade.sh)
+stamp_baked_release_version() {
+  local version="${1:-}"
+  local repo_dir="${2:-${REPO_ROOT}}"
+
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for stamp_baked_release_version." >&2
+    return 1
+  fi
+
+  for script_name in install.sh uninstall.sh upgrade.sh; do
+    local script_path="${repo_dir}/${script_name}"
+    if [ -f "${script_path}" ]; then
+      sed -i.bak -E "s/^BAKED_RELEASE_VERSION=[\"'].*[\"']/BAKED_RELEASE_VERSION=\"${version}\"/" "${script_path}" && rm -f "${script_path}.bak"
+      if ! grep -q "^BAKED_RELEASE_VERSION=\"${version}\"" "${script_path}"; then
+        echo "❌ ERROR: Failed to stamp BAKED_RELEASE_VERSION in ${script_name} (placeholder line '^BAKED_RELEASE_VERSION=...' not found)." >&2
+        git -C "${repo_dir}" checkout -- install.sh uninstall.sh upgrade.sh >/dev/null 2>&1 || true
+        return 1
+      fi
+    fi
+  done
+}
+
+# Validates if a release tag commit is either directly the candidate commit
+# or a single-parent stamped child commit derived from the candidate.
+is_valid_stamped_or_direct_release_commit() {
+  local candidate_sha="${1:-}"
+  local tag_commit="${2:-}"
+  local version="${3:-}"
+
+  if [ -z "${candidate_sha}" ] || [ -z "${tag_commit}" ] || [ -z "${version}" ]; then
+    echo "❌ ERROR: candidate_sha, tag_commit, and version are all required for is_valid_stamped_or_direct_release_commit." >&2
+    return 1
+  fi
+
+  # Case 1: Exact match (tag placed directly on candidate)
+  if [ "${candidate_sha}" = "${tag_commit}" ]; then
+    return 0
+  fi
+
+  # Case 2: Direct single-parent stamped child
+  local parent_sha
+  if ! parent_sha="$(git rev-parse --verify "${tag_commit}^1" 2>/dev/null)"; then
+    echo "⚠️ Tag commit ${tag_commit:0:7} has no resolvable parent commit in repository." >&2
+    return 1
+  fi
+
+  # Reject merge commits (must have no second parent)
+  if git rev-parse --verify "${tag_commit}^2" >/dev/null 2>&1; then
+    echo "⚠️ Tag commit ${tag_commit:0:7} is a merge commit; expected single-parent stamped release commit." >&2
+    return 1
+  fi
+
+  if [ "${parent_sha}" != "${candidate_sha}" ]; then
+    echo "⚠️ Tag commit ${tag_commit:0:7} parent (${parent_sha:0:7}) does not match candidate commit (${candidate_sha:0:7})." >&2
+    return 1
+  fi
+
+  local commit_subject
+  commit_subject="$(git log -1 --format=%s "${tag_commit}" 2>/dev/null || echo "")"
+  local expected_subject="chore(release): stamp release version ${version}"
+  if [ "${commit_subject}" != "${expected_subject}" ]; then
+    echo "⚠️ Tag commit ${tag_commit:0:7} subject '${commit_subject}' does not match expected stamped subject '${expected_subject}'." >&2
+    return 1
+  fi
+
+  return 0
+}
+
+# Creates a release commit on detached HEAD with stamped BAKED_RELEASE_VERSION
+create_stamped_release_commit() {
+  local version="${1:-}"
+  local target_sha="${2:-}"
+  local repo_dir="${3:-${REPO_ROOT}}"
+
+  if [ -z "${version}" ] || [ -z "${target_sha}" ]; then
+    echo "❌ ERROR: version and target_sha are required for create_stamped_release_commit." >&2
+    return 1
+  fi
+
+  # Preserve caller's current branch / ref and restore on function return
+  local orig_ref
+  orig_ref="$(git -C "${repo_dir}" symbolic-ref --short -q HEAD 2>/dev/null || git -C "${repo_dir}" rev-parse HEAD 2>/dev/null || echo "")"
+  if [ -n "${orig_ref}" ]; then
+    # shellcheck disable=SC2064
+    trap "git -C '${repo_dir}' checkout -- install.sh uninstall.sh upgrade.sh >/dev/null 2>&1 || true; git -C '${repo_dir}' checkout '${orig_ref}' >/dev/null 2>&1 || true" RETURN
+  fi
+
+  # Idempotency check: if release tag already exists and is a valid release commit for target_sha, reuse it
+  local existing_tag_sha
+  if existing_tag_sha="$(git -C "${repo_dir}" rev-parse --verify "refs/tags/${version}^{commit}" 2>/dev/null)"; then
+    if is_valid_stamped_or_direct_release_commit "${target_sha}" "${existing_tag_sha}" "${version}"; then
+      echo "ℹ️ Release tag '${version}' already exists on valid release commit ${existing_tag_sha:0:7}. Reusing existing release commit." >&2
+      echo "${existing_tag_sha}"
+      return 0
+    fi
+  fi
+
+  # 1. Checkout detached HEAD at candidate commit
+  if ! git -C "${repo_dir}" checkout --detach "${target_sha}"; then
+    echo "❌ ERROR: Failed to checkout candidate commit '${target_sha}' on detached HEAD." >&2
+    return 1
+  fi
+
+  # 2. Stamp BAKED_RELEASE_VERSION in root installer scripts
+  if ! stamp_baked_release_version "${version}" "${repo_dir}"; then
+    echo "❌ ERROR: Failed to stamp baked release version into installer scripts." >&2
+    return 1
+  fi
+
+  # 3. If files were modified, create release commit on detached HEAD (does NOT touch main branch)
+  local modified_files=()
+  for script_name in install.sh uninstall.sh upgrade.sh; do
+    if [ -f "${repo_dir}/${script_name}" ] && [ -n "$(git -C "${repo_dir}" status --porcelain "${script_name}" 2>/dev/null || true)" ]; then
+      modified_files+=("${script_name}")
+    fi
+  done
+
+  if [ ${#modified_files[@]} -gt 0 ]; then
+    echo "📝 Stamping baked release version '${version}' in release tag commit..." >&2
+    setup_git_bot_user
+    git -C "${repo_dir}" add "${modified_files[@]}"
+    git -C "${repo_dir}" commit -m "chore(release): stamp release version ${version}" >/dev/null
+    git -C "${repo_dir}" rev-parse HEAD
+  else
+    echo "${target_sha}"
+  fi
+}
+
+# Resolves the exact commit SHA for a release tag
+resolve_release_commit() {
+  local version="${1:-}"
+  local tag_sha=""
+
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for resolve_release_commit." >&2
+    return 1
+  fi
+
+  if tag_sha="$(git rev-parse --verify "refs/tags/${version}^{commit}" 2>/dev/null)"; then
+    echo "${tag_sha}"
+    return 0
+  fi
+
+  echo "❌ ERROR: Cannot resolve valid Git commit for release tag '${version}' (tag does not exist in repository)!" >&2
+  return 1
+}
+
 # Retrieves canonical manifest digest (sha256:...) for a remote container image
 get_image_manifest_digest() {
   local img="${1:-}"
@@ -318,6 +739,56 @@ get_image_manifest_digest() {
     fi
   fi
 
+  return 1
+}
+
+# Resolves the candidate commit SHA where CI built the container images.
+# If a SemVer version is provided, checks:
+# 1. Direct 40-character SHA if passed as argument
+# 2. Stamped release tag parent commit refs/tags/${version}^ (where images were built by CI prior to tag stamping)
+# 3. Direct tag commit refs/tags/${version}^{commit}
+resolve_source_image_commit() {
+  local version_or_commit="${1:-}"
+
+  if [ -z "${version_or_commit}" ]; then
+    echo "❌ ERROR: version_or_commit is required for resolve_source_image_commit." >&2
+    return 1
+  fi
+
+  # If version_or_commit is a 40-char SHA
+  if git rev-parse --verify "${version_or_commit}^{commit}" >/dev/null 2>&1 && [[ ! "${version_or_commit}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    git rev-parse --verify "${version_or_commit}^{commit}"
+    return 0
+  fi
+
+  local version="${version_or_commit}"
+  local tag_commit=""
+  if tag_commit="$(git rev-parse --verify "refs/tags/${version}^{commit}" 2>/dev/null)"; then
+    local parent_commit=""
+    if parent_commit="$(git rev-parse --verify "${tag_commit}^" 2>/dev/null)"; then
+      if is_ci_pipeline && command -v docker >/dev/null 2>&1; then
+        if check_commit_images_exist "${tag_commit}" 2>/dev/null; then
+          echo "${tag_commit}"
+          return 0
+        fi
+        if check_commit_images_exist "${parent_commit}" 2>/dev/null; then
+          echo "${parent_commit}"
+          return 0
+        fi
+      fi
+      # Fallback detection: if tag commit is a stamped release commit, return its parent
+      local commit_msg
+      commit_msg="$(git log -1 --format="%s" "${tag_commit}" 2>/dev/null || echo "")"
+      if [[ "${commit_msg}" =~ ^chore(\(release\))?:\ stamp ]]; then
+        echo "${parent_commit}"
+        return 0
+      fi
+    fi
+    echo "${tag_commit}"
+    return 0
+  fi
+
+  echo "❌ ERROR: Cannot resolve source image commit for version '${version}' (tag 'refs/tags/${version}' not found in repository)." >&2
   return 1
 }
 

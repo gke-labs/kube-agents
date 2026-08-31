@@ -28,9 +28,13 @@ The fastest, zero-friction way to install `kube-agents` in **Google Cloud Shell*
 curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 ```
 
-_(Or via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+_To pin to a specific official release, substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases):_
 
-This interactive installer guides you through GCP authentication, project selection, GKE cluster setup (Standard or Autopilot), chat integrations (Google Chat & Slack), and LLM model provider credentials.
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
+```
+
+This interactive installer guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials.
 
 ### 🤖 AI Agent & Automation Usage
 

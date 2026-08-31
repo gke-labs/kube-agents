@@ -1081,9 +1081,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
-COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
-     agents/platform/docs/gcp-console-links.md \
-     /opt/defaults/docs/
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
@@ -1142,6 +1139,12 @@ RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfi
     [ "$(find /opt/hermes -name '*.pyc' | head -5000 | wc -l)" -ge 5000 ] && \
     [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
 
+# Below 5.5-5.7 on purpose: those steps never read these files, and above
+# them every docs edit re-ran the plugin install, purge and bytecode pass.
+COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
+     agents/platform/docs/gcp-console-links.md \
+     /opt/defaults/docs/
+
 # 5.8. Copy custom agent startup script
 # --chmod on the COPY rather than a chmod in the RUN below: same result, and the
 # three destinations differ so these cannot be folded into one COPY. The layer
@@ -1179,6 +1182,18 @@ CMD ["hermes", "gateway", "run"]
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
 #                   /opt/cluster-template (see scripts/cluster_agent_profile.py).
 FROM agent-base AS platform
+
+# Base trees this stage never writes to normalize first — including the
+# plugin tree's root-ownership barrier — so the ~150MB copy-up layer caches
+# across template edits; the staged repo plugins arrive root-owned via the
+# final RUN's cp -a. Skills stay in the final RUN with their provenance
+# manifest. Not in agent-base: credential-proxy carries neither.
+RUN set -eu; \
+    for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
+        find "$d" -type d -exec chmod 755 {} + ; \
+        find "$d" -type f -exec chmod 644 {} + ; \
+    done; \
+    chown -R root:root /opt/hermes/plugins
 
 # --- Chat Agent (the `default` profile) ---
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
@@ -1298,14 +1313,20 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # only chat ingress carries, so it lives with the Chat Agent.
 # One COPY for the two: they share a destination, and the chain is bounded at
 # 128 layers — see the layer-budget note at the top of the file.
-COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
+# Staged, not copied straight into /opt/hermes/plugins: the late RUN installs
+# from here so the base's ~130MB plugin tree stays out of the layer every
+# agents/ edit rewrites. `cp -a` merges exactly as the direct COPY did.
+COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config
 # is copied verbatim above; the platform overlay is merged into
 # /opt/platform-template/config.yaml instead (see the RUN block above).
 
-# Normalize ownership and permissions at the end of build.
+# Normalize what THIS stage added, and install the staged repo plugins —
+# normalized before `cp -a` merges them, so they land with the same ownership
+# and modes the old combined pass produced. This RUN re-runs on every agents/
+# change; the base trees stay in the stage's first RUN, where they cache.
 #
 # `set -eu` rather than an `&&` chain ending in `|| true`: that trailing `|| true`
 # bound to the WHOLE chain, so a failure in any early command short-circuited
@@ -1313,61 +1334,211 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 # unnormalized permissions. Each command must now fail the build loudly.
 # Every path below is guaranteed to exist at this point: /opt/hermes/skills and
 # /opt/hermes/plugins come from the base image, the rest are COPYed above.
+#
+# The last steps close out the baked prompt material, and do two things rather
+# than one because neither is sufficient alone.
+#
+# `chown -R root:root` is the barrier. The pod runs the sandbox as uid 10000
+# (RunAsUser in the operator's buildDeployment), so up to this line the material
+# the agent reads was owned by the uid reading it: /opt/platform-template/skills/*/SKILL.md
+# — the agent's own instructions — was writable by the agent, and the entrypoint
+# would then propagate a rewrite to every profile on the next boot. It is the layer
+# BENEATH the container's read-only root filesystem rather than the only thing
+# standing there: hardenedSecurityContext in the operator sets
+# readOnlyRootFilesystem on every container it builds, which already turns that
+# write into EROFS. What ownership adds is everything that flag does not reach —
+# the image run outside this operator, a container someone gives a writable rootfs,
+# and the build itself. Root-owned 0644/0755 leaves all of it readable and
+# executable by the runtime user and writable by nobody it can reach. The MODE is
+# deliberately left as the loops above set it: `cp -a` in the entrypoint's
+# sync_profile_skills preserves mode but cannot preserve ownership as non-root, so
+# a 0444/0555 tree here would arrive on the PVC read-only and break both the
+# profile overlay and the swap's own `rm -rf` of the previous copy. Ownership does
+# not travel; mode does. That asymmetry is the whole reason this is a chown.
+#
+# What it covers is wider than the skill trees, because each of these reaches the
+# agent's prompt or its process and none of them is written at runtime:
+#
+#   - the two template ROOTS, not just their skills/ subdirectories. SOUL.md,
+#     AGENTS.md, CAPABILITIES.md, governance/, cron/ and config.yaml sit beside
+#     skills/ and are force-synced into the platform profile on every boot by
+#     entrypoint step 2.6, and the cluster template's personas are re-copied into
+#     every cluster-* profile by its continuation. A rewritten SOUL.md is more
+#     load-bearing than any single SKILL.md.
+#   - /opt/hermes/plugins (barriered by the stage's first RUN; listed for
+#     what it covers). It is the only path Hermes resolves plugins from, holding
+#     Python imported into the agent's own process — a strictly stronger capability
+#     than a SKILL.md. Precompiling does not protect it: a rewritten .py has a
+#     newer mtime, so the cached .pyc is invalidated and the modified source is
+#     what the next gateway start, MCP child or kanban worker imports.
+#   - /opt/defaults/scripts, which holds the shared scripts the entrypoint invokes
+#     by absolute path, the sitecustomize.py the operator puts on PYTHONPATH, and
+#     verify_skills_provenance.py — the checker for the manifest below. A checker
+#     that the checked party can rewrite reports whatever it is told to.
+#   - /opt/chat-template, the Chat Agent's config.yaml. It is the template the
+#     entrypoint seeds $TARGET_DIR/config.yaml from on a fresh or pristine-upstream
+#     volume, and back-fills every ABSENT key from on every boot thereafter (step
+#     2d). A key added to the image copy therefore installs itself into the live
+#     default-profile config on the next restart and persists — the same
+#     rewrite-the-image-copy-and-let-the-entrypoint-propagate-it route the two
+#     templates above are covered against, over a file that holds toolsets,
+#     plugins.enabled and mcp_servers.
+#
+# /opt/defaults itself stays hermes-owned, scripts/ aside. It is the Chat Agent's
+# own default profile, and while the entrypoint copies it onto the PVC at boot, the
+# image copy is still read back afterwards (cron/jobs.json as --image-jobs, plugins/
+# by profile scaffolding and by otel_config.py, onboarding/ by the
+# bootstrap_onboarding plugin). Root-owned 0644 would still be readable, so the
+# exclusion is caution about a directory with several live readers rather than a
+# requirement; that residue is recorded in the security reference as not covered
+# rather than papered over, and the read-only root filesystem is what closes it in
+# a pod.
+#
+# Nothing at runtime writes to any path in the chown — the entrypoint,
+# profile_scaffold.py and cluster_agent_profile.py only ever read from the
+# templates, every /opt/defaults/scripts reference in the tree is a read or a
+# copy OUT of it into $HERMES_HOME, and every CHAT_TEMPLATE_CONFIG reference is a
+# plain `cp` or a read to back-fill from. A plain `cp` gives the destination to
+# the copying uid, so the PVC copies stay writable — so root ownership costs
+# nothing.
+#
+# The hermes chown that opens this RUN therefore names only what STAYS
+# hermes-owned. The five roots below are COPYed --chown=hermes:hermes already and
+# end up root:root regardless, so listing them there too would be extra recursive
+# walks per build and two contradictory lines for the next reader.
+# /opt/defaults is the exception that has to appear in both: the directory stays
+# hermes-owned and only its scripts/ subtree is taken back.
+#
+# What this does NOT reach, and the security reference records the same way: the
+# rest of /opt/hermes — gateway/, tools/ and the venv interpreter this RUN invokes
+# — whose ownership comes from the Hermes base image and which nothing here
+# asserts. Those are a wider argument than this change, not an oversight it
+# covered.
+#
+# The manifest is the detection half, for what ownership cannot cover — a
+# corrupted layer, a bad build, or a code path that ran before the barrier did.
+# verify_skills_provenance.py checks it at boot, before anything is copied onto
+# the PVC (entrypoint step 1.55). It covers the three skill trees, which are the
+# part that grows a file per skill and is rewritten by contributors weekly; the
+# personas, plugins and shared scripts get the barrier but not the hash.
+#
+# A missing tree fails the build rather than being skipped. The boot check refuses
+# to start a pod whose tree exists with no manifest inside it, so skipping one here
+# would turn a silent ordering slip in this file — a later instruction that recreates
+# or restores one of these paths, in this stage or in one built FROM it — into a
+# green build and a fleet-wide crash-loop. Everything this loop names
+# is COPYed above or comes from the base image, so the failure branch is unreachable
+# today and exists to stay that way.
+#
+# The manifest keeps the 0644 the loops above give every other file, and must: it
+# sits INSIDE the tree it describes, so both mechanisms that put a tree on a profile
+# copy it too, and both preserve mode — `cp -a` in sync_profile_skills and
+# shutil.copytree/copy2 in profile_scaffold.overlay_template. A 0444 manifest
+# therefore lands on the PVC owned by uid 10000 with no write bit, and the NEXT
+# overlay of that profile reopens it for writing, raising shutil.Error out of
+# overlay_template and abandoning every item after `skills` — governance, hindsight
+# and the cron merge — behind a WARN. Ownership does not travel; mode does, and
+# read-only is the one mode this file must not have.
+#
+# Generated here rather than in a RUN of its own: agent-base -> platform is the
+# deepest chain that ships and it is bounded at 128 layers — see the layer-budget
+# note at the top of the file.
+#
+# Bytecode is INSIDE the manifest, and that is why the second compileall pass runs
+# a few lines above it rather than in the RUN it used to have of its own. CPython's
+# default invalidation is timestamp-based — source mtime plus size — not a content
+# hash, and nothing here passes `--invalidation-mode checked-hash` or sets
+# SOURCE_DATE_EPOCH. A .pyc is therefore an independent artifact rather than a
+# derivative of the .py beside it: rewrite one while keeping the source's size and
+# mtime and the interpreter runs the rewritten bytecode.
+# test_an_existing_cache_is_read_even_when_writes_are_suppressed in
+# deploy/docker/test_image_startup_contract.py demonstrates that on the host
+# interpreter running the suite, not inside this image — it is the CPython
+# premise that is pinned there, not this build. Excluding __pycache__ would have
+# left a hole in the middle of what the manifest claims to cover, so the order
+# is: compile everything, then hash everything.
+#
+# The entry count is asserted because the generating pipeline's exit status is
+# `sort`'s, not `find`'s, and no POSIX sh has pipefail: a find that failed
+# half-way would otherwise ship a short manifest and a build that exited 0.
+#
+# Symlinks abort the build rather than being recorded. `find -type f` tests the
+# link, not its target, so a symlink is never in the manifest; the boot check
+# treats that asymmetry as tamper evidence and refuses any symlink it finds,
+# because a link pointing at matching content hashes identically while what the
+# tree loads has moved somewhere the manifest says nothing about. Either the two
+# sides agree that a symlink is an anomaly or the check is defeated by one, so a
+# base image that starts shipping links has to be discovered here — in a red
+# build with the paths printed — rather than in a pod that will not start. No path
+# is carved out of that probe, for the same reason nothing is carved out of the
+# manifest: an exclusion is a name a link can be given.
+#
+# --- the compileall pass, folded in above ---
+#
+# Step 5.7 in `agent-base` compiled /opt/hermes and the stdlib, and states why that
+# has to happen at build time at all. It cannot cover what comes after it:
+# `agents/platform/plugins/` lands in /opt/hermes/plugins here, so without a second
+# pass those modules are the one part of the runtime still re-parsed from source by
+# every gateway start, every MCP child and every kanban worker. Everything already
+# compiled above is up to date and skipped, so the marginal cost is the handful of
+# files this stage introduced. No speedup figure is claimed for the pass on its
+# own; the 12.5s -> 6.0s in step 5.7 is the whole tree.
+#
+# Use the venv's own interpreter — the one that will import these modules. A .pyc
+# is only loaded by an interpreter whose magic tag matches the writer's.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# Setting PYTHONOPTIMIZE in the pod later without adding a matching `-o` here would
+# quietly put the runtime back to compiling from source. Likewise assumes
+# PYTHONPYCACHEPREFIX stays unset (it is), since that would redirect the lookup
+# away from the in-tree __pycache__ this writes.
+#
+# Deliberately NOT extended to /opt/defaults, /opt/platform-template or
+# /opt/cluster-template. The entrypoint copies all three onto the PVC at startup,
+# and `cp` rewrites the destination mtime, which invalidates a timestamp-validated
+# .pyc anyway — it would ship bytes that are guaranteed to be ignored.
+#
+# It sits after the chmod loops so the generated __pycache__ directories are not
+# swept up by the `*/scripts/*` chmod 755, and before the manifest loop so its
+# output is hashed. They land root-owned 0644/0755 from the build umask, which is
+# what the rest of /opt/hermes already is and is readable by the runtime uid.
+#
+# Its failure branch reports rather than aborting, which is not the `|| true` this
+# block warns against above: that one masked failures of unrelated commands in the
+# same chain. This is one command whose only effect is a cache. A module that will
+# not precompile — a py2 relic or a conditionally-invalid file, which large
+# vendored trees routinely carry — simply compiles at import as it does today.
+# `set -eu` still governs everything else. A file it fails to compile is a file the
+# manifest then records as source-only, which is correct: there is no bytecode to
+# account for.
 RUN set -eu; \
-    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template /opt/chat-template; \
-    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template /opt/chat-template; do \
+    chown -R hermes:hermes /opt/defaults; \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
     for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
-    done
-
-# Second bytecode pass, for the Python this stage added.
-#
-# Step 5.7 in `agent-base` compiled /opt/hermes and the stdlib, and states why
-# that has to happen at build time at all. It cannot cover what comes after it:
-# `agents/platform/plugins/` lands in /opt/hermes/plugins here, so without this
-# pass those modules are the one part of the runtime still re-parsed from source
-# by every gateway start, every MCP child and every kanban worker. Everything
-# already compiled above is up to date and skipped, so the marginal cost is the
-# handful of files this stage introduced.
-#
-# Use the venv's own interpreter — the one that will import these modules. A
-# .pyc is only loaded by an interpreter whose magic tag matches the writer's.
-#
-# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
-# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
-# Setting PYTHONOPTIMIZE in the pod later without adding a matching `-o` here
-# would quietly put the runtime back to compiling from source.
-#
-# Likewise assumes PYTHONPYCACHEPREFIX stays unset (it is), since that would
-# redirect the lookup away from the in-tree __pycache__ this writes.
-#
-# Deliberately NOT extended to /opt/defaults, /opt/platform-template or
-# /opt/cluster-template. The entrypoint copies all three onto the PVC at
-# startup, and `cp` rewrites the destination mtime, which invalidates a
-# timestamp-validated .pyc anyway — it would ship bytes that are guaranteed to
-# be ignored.
-#
-# Runs after the normalization above rather than before it, so the generated
-# __pycache__ directories are not swept up by the `*/scripts/*` chmod 755 there.
-# They land root-owned 0644/0755 from the build umask, which is what the rest of
-# /opt/hermes already is and is readable by the runtime uid.
-#
-# The failure branch reports rather than aborting, which is not the `|| true`
-# the block above warns against: that one masked failures of unrelated commands
-# in the same chain. This is one command whose only effect is a cache. A module
-# that will not precompile — a py2 relic or a conditionally-invalid file, which
-# large vendored trees routinely carry — simply compiles at import as it does
-# today. `set -eu` still governs everything else.
-#
-# No speedup figure is claimed for this pass on its own; the 12.5s -> 6.0s in
-# step 5.7 is the whole tree, of which the plugins here are a few modules.
-RUN set -eu; \
+    done; \
+    cp -a /tmp/repo-plugins/. /opt/hermes/plugins/; \
+    rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
-      || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
+      || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
+    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do \
+        [ -d "$d" ] \
+            || { echo "$d does not exist at manifest generation; the boot check refuses to start a pod whose skill tree has no manifest inside it, so shipping this image would crash-loop the fleet" >&2; exit 1; }; \
+        [ -z "$(find "$d" -type l -print -quit)" ] \
+            || { echo "$d contains a symlink; the manifest records -type f only and the boot check refuses any symlink it finds, so this would fail every pod: $(find "$d" -type l | head -n 3)" >&2; exit 1; }; \
+        n="$(cd "$d" && find . -type f ! -name skills_manifest.sha256 | wc -l)"; \
+        ( cd "$d" && find . -type f ! -name skills_manifest.sha256 \
+            -exec sha256sum {} + | LC_ALL=C sort -k 2 > skills_manifest.sha256 ); \
+        [ "$(wc -l < "$d/skills_manifest.sha256")" -eq "$n" ] \
+            || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
+        chmod 644 "$d/skills_manifest.sha256"; \
+    done; \
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
 
 USER 10000:10000
 
@@ -1492,7 +1663,14 @@ FROM proxy-tools AS credential-proxy
 # 755` the platform stage runs. Only github_token_refresh.py is executed
 # directly and it is already 0755 in git, so this is about the two images
 # agreeing rather than about that one file.
-COPY --chown=hermes:hermes --chmod=0755 \
+#
+# --chown=root:root reproduces the platform stage's closing barrier the same
+# way, and the sidecar is where it matters most: this is the container holding
+# the credentials, and credential_proxy.py, github_token_refresh.py and
+# gke_endpoint.py all run out of this directory as uid 10000. Nothing in the
+# tree writes here — every reference is a read or a copy out — so root
+# ownership costs the runtime nothing.
+COPY --chown=root:root --chmod=0755 \
      agents/chat/scripts/ \
      agents/platform/scripts/ \
      deploy/shared/profile_overlay.py \

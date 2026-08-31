@@ -204,7 +204,11 @@ class InstallerCommonTest(unittest.TestCase):
             # Exists but not in state (the stub serves no state object).
             self.assertIn("create_cluster             = false", content)
 
-    def test_tfvars_standard_cluster_and_unasked_fresh_create_stay_standard(self):
+    def test_tfvars_live_standard_survives_the_autopilot_default(self):
+        # The two halves are the whole point of the default flip: a cluster that
+        # exists keeps its own shape, and only a fresh create takes the default.
+        # If the first half ever reported "autopilot", regenerating tfvars
+        # against a live Standard install would plan its replacement.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             # An existing Standard cluster: describe succeeds, empty output.
@@ -215,29 +219,31 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('cluster_mode               = "standard"', dest.read_text())
-            # No cluster at all and no CLUSTER_MODE: the installer's default
-            # shape, unchanged by --cluster-mode existing.
+            # No cluster at all and no CLUSTER_MODE: DEFAULT_CLUSTER_MODE.
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k"},
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
-            self.assertIn('cluster_mode               = "standard"', content)
+            self.assertIn('cluster_mode               = "autopilot"', content)
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_honours_cluster_mode(self):
         # --cluster-mode reaches the generator through vars.sh. The probe found
         # nothing, so the interview's choice is the only shape on offer.
+        #
+        # Asks for "standard" specifically: autopilot is now DEFAULT_CLUSTER_MODE,
+        # so requesting it would pass whether or not CLUSTER_MODE were read at all.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopilot"},
+                env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "standard"},
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
-            self.assertIn('cluster_mode               = "autopilot"', content)
+            self.assertIn('cluster_mode               = "standard"', content)
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_rejects_an_unknown_cluster_mode(self):

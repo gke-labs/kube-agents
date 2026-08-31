@@ -262,6 +262,62 @@ else
     IS_BOOTSTRAP_PRIMARY=1
 fi
 
+# 1.55 Check the image's skill trees against the SHA-256 manifests the build wrote
+# beside them, before anything below propagates one of them.
+#
+# The trees are prompt material: a SKILL.md tells the agent what to do and a
+# skills/*/scripts/*.py runs with the agent's credentials. Until now nothing compared
+# what boots against what was built, so a tree that had been altered — by a previous
+# boot under an older image, by a corrupted layer, by a bad build — was copied to every
+# profile and loaded, indistinguishably from a good one.
+#
+# Here rather than anywhere later because everything that spreads these trees is below:
+# step 2 copies /opt/defaults onto the PVC and sync_profile_skills installs
+# $PLATFORM_TEMPLATE/skills and $CLUSTER_TEMPLATE/skills into each profile. Failing at
+# this line leaves the PVC exactly as the last good boot left it.
+#
+# It is the DETECTION half of the pair; the barrier is that these trees, and the two
+# templates around them, are root-owned in the image while the agent runs as uid 10000
+# (the ownership comment in deploy/docker/Dockerfile has the reasoning, including why
+# the modes are left writable-looking). Read it as "this image's skills are the ones it
+# was built with", not as a runtime sandbox.
+#
+# The manifest, not the script, decides whether the check is mandatory. Both sides are
+# root-owned in the image — the manifest inside the tree it describes, the verifier in
+# /opt/defaults/scripts — so neither is something the runtime user removes, and the
+# FATAL branch below reads as a corrupted or mis-built image rather than as the last
+# thing standing between an agent and a disabled check. It is kept because the
+# alternative to reporting a missing checker is skipping the tree it would have checked:
+# a tree that carries a manifest is verified or the container does not start. A tree
+# with no manifest beside it is one no manifesting build produced (agent-base ships
+# /opt/hermes/skills and never reaches the platform stage) and is skipped, which is also
+# what makes this a no-op on a developer host.
+#
+# Fail-closed, which is a deliberate departure from the WARN-and-continue that every
+# other step here uses. Those steps degrade to a stale file; this one degrades to
+# running instructions nobody can account for, which is the whole thing it exists to
+# report. The blast radius is bounded on the other side: the manifest ships in the same
+# image layer as the files it covers and the build asserts it is complete, so a mismatch
+# is never a version skew between the two — it is the image having changed since it was
+# built. There is deliberately no env-var override; a bypass switch would be readable to
+# exactly the caller this is meant to be honest with.
+SKILL_PROVENANCE_SCRIPT="/opt/defaults/scripts/verify_skills_provenance.py"
+for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do
+    [ -f "$_tree/skills_manifest.sha256" ] || continue
+    if [ ! -f "$SKILL_PROVENANCE_SCRIPT" ] || [ ! -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+        echo "FATAL: $_tree carries a build-time manifest but nothing here can check it ($SKILL_PROVENANCE_SCRIPT or $INSTALL_DIR/.venv/bin/python3 is missing); refusing to start" >&2
+        exit 1
+    fi
+    # The script names the specific difference on stderr; this only says what the
+    # container did about it.
+    if ! "$INSTALL_DIR/.venv/bin/python3" "$SKILL_PROVENANCE_SCRIPT" \
+        --manifest "$_tree/skills_manifest.sha256" --dir "$_tree"; then
+        echo "FATAL: $_tree does not match the manifest baked beside it at build time; refusing to start" >&2
+        exit 1
+    fi
+done
+unset _tree
+
 # 1.6 Serialise everything below that writes to $TARGET_DIR.
 #
 # The step-1.5 gate leaves at most one owner per POD, not one owner per VOLUME.
@@ -1360,6 +1416,19 @@ if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     flock -u 9 2>/dev/null || true
     exec 9>&-
 fi
+
+# 4.5 The scratch directory where scripts stage `gh --body-file` payloads for
+# the credential sidecar (audit_report._write_temp, github_scan_gate._post_body).
+# Created HERE, deterministically and under this script's umask-0002 discipline
+# (the header comment on the #955 UID split), rather than lazily by whichever
+# process reaches it first with whatever umask it happens to carry: the sandbox
+# (uid 10000) writes these files and the sidecar (uid 10001) reads them through
+# the shared fsGroup, which only works if the directory is group-accessible.
+# The chmod also repairs a long-lived PVC where a pre-#955 process already
+# created it too tight; guarded because an already-correct dir owned by the
+# peer uid may refuse the chmod, and that is fine.
+mkdir -p "$TARGET_DIR/scratch"
+chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
 
 # 5. Start background microservices (FastAPI proxy)
 #

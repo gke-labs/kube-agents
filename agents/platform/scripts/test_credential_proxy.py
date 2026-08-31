@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import logging
@@ -2944,6 +2945,239 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
         # Should report the denylist rule, not read-only
         self.assertEqual("kubernetes.token-disclosure", payload["rule"])
         self.assertEqual([], self.executed)
+
+
+class WorkspaceGitPathTest(unittest.TestCase):
+    """The broker's own git is a separate door from the agent's.
+
+    This is the property that decides how small the agent-facing git allowlist
+    can be. If broker-internal git shared `/v1/exec`, every subcommand the broker's
+    plumbing needs would have to be permitted to the agent as well. Each test
+    here pairs the refusal with the ordinary call it must not break.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def executor(self, enabled=True, **environment):
+        environment.setdefault(
+            "CREDENTIAL_PROXY_CONTENT_WORKSPACE", "1" if enabled else "0"
+        )
+        with mock.patch.dict(os.environ, environment):
+            return CommandExecutor(
+                timeout_seconds=10,
+                max_output_bytes=1 << 16,
+                state_dir=str(Path(self.temp_dir.name) / "state"),
+            )
+
+    def tree(self, executor, name="repo"):
+        path = executor.content_workspace_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
+        )
+        return path
+
+    def test_the_broker_root_is_not_inside_the_volume_the_agent_writes(self):
+        executor = self.executor()
+        self.assertFalse(
+            credential_proxy._within(
+                executor.workspace_dir, executor.content_workspace_root
+            ),
+            "the agent's volume must not contain the broker's trees",
+        )
+        self.assertFalse(
+            credential_proxy._within(
+                executor.content_workspace_root, executor.workspace_dir
+            )
+        )
+        # Paired: the root the broker does own is real and usable.
+        self.assertTrue(executor.content_workspace_root.parent.is_dir())
+
+    def test_only_the_subcommands_the_broker_issues_may_run(self):
+        executor = self.executor()
+        tree = self.tree(executor)
+        for argv in (
+            ["git", "bisect", "run", "/bin/sh"],
+            ["git", "config", "--get", "user.name"],
+            ["git", "submodule", "foreach", "id"],
+            ["git", "rebase", "-x", "id", "HEAD~1"],
+            ["git", "filter-branch", "--tree-filter", "id"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    executor.execute_workspace_git(argv, tree)
+
+        # Paired ordinary use: the eleven the product does issue still run, and
+        # produce git's real answer rather than a refusal.
+        result = executor.execute_workspace_git(["git", "rev-parse", "--is-inside-work-tree"], tree)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("true", result.stdout.strip())
+
+    def test_a_working_directory_redirect_is_refused(self):
+        executor = self.executor()
+        tree = self.tree(executor)
+        # `-C` is applied before the subcommand runs, so containment on `cwd`
+        # would be checking a directory the command does not use.
+        with self.assertRaises(ValueError):
+            executor.execute_workspace_git(
+                ["git", "-C", "/etc", "rev-parse", "--show-toplevel"], tree
+            )
+        # Paired: the same command with no redirect answers about the tree it
+        # was pointed at.
+        result = executor.execute_workspace_git(["git", "rev-parse", "--show-toplevel"], tree)
+        self.assertEqual(str(tree.resolve()), result.stdout.strip())
+
+    def test_the_broker_path_cannot_run_in_the_agents_volume(self):
+        executor = self.executor()
+        elsewhere = executor.workspace_dir / "gitops"
+        elsewhere.mkdir(parents=True, exist_ok=True)
+        for cwd in (elsewhere, Path("/etc"), executor.state_dir):
+            with self.subTest(cwd=cwd):
+                with self.assertRaises(ValueError):
+                    executor.execute_workspace_git(["git", "rev-parse", "HEAD"], cwd)
+
+        # Paired: inside the broker's own root it runs.
+        tree = self.tree(executor)
+        self.assertEqual(
+            0,
+            executor.execute_workspace_git(["git", "rev-parse", "--is-inside-work-tree"], tree).exit_code,
+        )
+
+    def test_the_agent_facing_path_cannot_reach_the_broker_root(self):
+        """Widening containment for the broker must not widen it for /v1/exec.
+
+        `_execute` grew a `containment_root` parameter for the workspace path.
+        If that parameter leaked into the agent-facing call, the agent could
+        name the broker's trees as a working directory and every property above
+        would be decoration.
+        """
+        executor = self.executor()
+        tree = self.tree(executor)
+        with self.assertRaises(ValueError):
+            executor.execute(["git", "status"], cwd=str(tree))
+        with self.assertRaises(ValueError):
+            executor.execute(["git", "status"], cwd=str(executor.content_workspace_root))
+
+        # Paired: the agent's own workspace is still accepted, unchanged.
+        inside = executor.workspace_dir / "gitops"
+        inside.mkdir(parents=True, exist_ok=True)
+        result = executor.execute(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(inside))
+        self.assertNotEqual(
+            0, result.exit_code, "not a repository, but it was allowed to try"
+        )
+
+    def test_the_path_does_not_exist_at_all_when_the_feature_is_off(self):
+        executor = self.executor(enabled=False)
+        self.assertIsNone(executor.content_workspace_root)
+        with self.assertRaises(RuntimeError):
+            executor.execute_workspace_git(["git", "rev-parse", "HEAD"], Path("/tmp"))
+        self.assertIsNone(credential_proxy.build_workspace_store(executor))
+
+        # Paired: with the flag on, the store is built and the routes exist.
+        armed = self.executor(enabled=True)
+        self.assertIsNotNone(credential_proxy.build_workspace_store(armed))
+
+    def test_the_routes_answer_over_a_socket_and_never_return_a_path(self):
+        """The protocol surface, end to end, not just the functions behind it.
+
+        Two properties that only exist at this layer: the routes are *absent*
+        when the feature is off -- indistinguishable from an older broker, which
+        is what lets a migrating client detect support by asking -- and no
+        response body carries a filesystem path. The second is the whole
+        invariant: a path handed back is a directory the agent can be told to
+        `cd` into, which is the arrangement content-passing replaces.
+        """
+        import content_workspace
+
+        executor = self.executor(enabled=True)
+        tree_root = executor.content_workspace_root
+        original = getattr(CredentialProxyHandler, "workspaces", None)
+        original_max = getattr(CredentialProxyHandler, "max_request_bytes", 1 << 20)
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def post(route, body):
+            request = urllib.request.Request(
+                f"{endpoint}/v1/workspace/{route}",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.load(exc)
+
+        # Off: the routes do not exist. Not "exist and refuse" -- absent, so a
+        # bug in a refusal cannot reach them.
+        CredentialProxyHandler.workspaces = None
+        self.addCleanup(setattr, CredentialProxyHandler, "workspaces", original)
+        self.addCleanup(setattr, CredentialProxyHandler, "max_request_bytes", original_max)
+        for route in ("open", "read", "list", "commit", "push", "close"):
+            with self.subTest(route=route, armed=False):
+                self.assertEqual(404, post(route, {})[0])
+
+        # On, with a store whose git is a local repository rather than GitHub.
+        seeded = tree_root / "seed"
+        seeded.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet", "--initial-branch=main", str(seeded)],
+            check=True,
+            capture_output=True,
+        )
+        (seeded / "manifests").mkdir(exist_ok=True)
+        (seeded / "manifests" / "app.yaml").write_text("kind: Service\n")
+        store = content_workspace.ContentWorkspaceStore(
+            tree_root, executor.workspace_dir, executor.execute_workspace_git
+        )
+        workspace = content_workspace.Workspace(
+            handle="c" * 32, repo="acme/fleet", tree=seeded, base="main", base_sha=""
+        )
+        store._workspaces[workspace.handle] = workspace
+        CredentialProxyHandler.workspaces = store
+
+        # Paired ordinary use: a read comes back as bytes.
+        status, body = post("read", {"handle": workspace.handle, "path": "manifests/app.yaml"})
+        self.assertEqual(200, status)
+        self.assertEqual(
+            b"kind: Service\n", base64.b64decode(body["contentBase64"])
+        )
+
+        status, listing = post("list", {"handle": workspace.handle})
+        self.assertEqual(200, status)
+        self.assertIn("manifests/app.yaml", [e["path"] for e in listing["entries"]])
+
+        # A refusal keeps its own code rather than reading as a proxy fault.
+        status, refused = post("read", {"handle": workspace.handle, "path": ".git/config"})
+        self.assertEqual(403, status)
+        self.assertEqual("workspace.path.refused", refused["code"])
+        self.assertEqual(404, post("read", {"handle": "z" * 32, "path": "a"})[0])
+        self.assertEqual(404, post("nonsense", {})[0])
+
+        # The invariant: nothing anywhere in a response is a path into the tree.
+        for payload in (body, listing, refused):
+            rendered = json.dumps(payload)
+            self.assertNotIn(str(tree_root), rendered)
+            self.assertNotIn(str(seeded), rendered)
+
+    def test_the_directory_path_keeps_working_while_the_flag_is_on(self):
+        """Land dark: the two mechanisms coexist, so neither blocks the other."""
+        executor = self.executor(enabled=True)
+        workspace = executor.workspace_dir / "gitops" / "lease"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / ".lease").write_text("{}", encoding="utf-8")
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "commit", "-m", "x"], str(workspace)),
+            "arming content-passing must not disturb the path the skills use today",
+        )
 
 
 class BackendSocketModeTest(unittest.TestCase):

@@ -10,7 +10,7 @@ source "${SCRIPT_DIR}/common.sh"
 
 EXPLICIT_RELEASE_VERSION="${EXPLICIT_RELEASE_VERSION:-${3:-}}"
 BASE_TAG_PARAM="${1:-${BASE_TAG_PARAM:-${BASE_TAG:-}}}"
-TARGET_REF_PARAM="${2:-${TARGET_REF_PARAM:-${TARGET_COMMIT:-${TARGET_REF:-${RELEASE_COMMIT:-}}}}}"
+TARGET_REF_PARAM="${2:-${TARGET_REF_PARAM:-${TARGET_COMMIT:-${TARGET_REF:-}}}}"
 SKIP_VALIDATION="${SKIP_RC_VALIDATION:-${4:-false}}"
 
 # 0. Protection against Shallow Checkout and Remote Tag Sync in CI
@@ -42,7 +42,7 @@ if [ -z "${TARGET_REF_PARAM}" ] || [ "${TARGET_REF_PARAM}" = "null" ]; then
 fi
 
 # Validate target ref exists in git repository and resolve 40-character SHA
-if ! RELEASE_COMMIT="$(git rev-parse --verify "${TARGET_REF_PARAM}^{commit}" 2>/dev/null)"; then
+if ! RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${TARGET_REF_PARAM}^{commit}" 2>/dev/null)"; then
   echo "❌ ERROR: Target ref '${TARGET_REF_PARAM}' does not exist in git repository!" >&2
   exit 1
 fi
@@ -75,8 +75,8 @@ if [ -n "${EXPLICIT_RELEASE_VERSION}" ]; then
 
   # 3.3 Protect against tag collisions on different commits
   if TAG_COMMIT="$(git rev-parse --verify "refs/tags/${EXPLICIT_RELEASE_VERSION}^{commit}" 2>/dev/null)"; then
-    REQ_COMMIT="$(git rev-parse --verify "${RELEASE_COMMIT}^{commit}" 2>/dev/null || echo "")"
-    if [ -n "${REQ_COMMIT}" ] && [ "${TAG_COMMIT}" != "${REQ_COMMIT}" ]; then
+    REQ_COMMIT="$(git rev-parse --verify "${RC_CANDIDATE_COMMIT}^{commit}" 2>/dev/null || echo "")"
+    if [ -n "${REQ_COMMIT}" ] && ! is_valid_stamped_or_direct_release_commit "${REQ_COMMIT}" "${TAG_COMMIT}" "${EXPLICIT_RELEASE_VERSION}"; then
       echo "❌ ERROR: Tag '${EXPLICIT_RELEASE_VERSION}' already exists in git repository on a different commit (${TAG_COMMIT:0:7}). Cannot re-assign existing release tag." >&2
       exit 1
     fi
@@ -86,7 +86,8 @@ if [ -n "${EXPLICIT_RELEASE_VERSION}" ]; then
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "release_version=${EXPLICIT_RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
     echo "version=${EXPLICIT_RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
-    echo "release_commit=${RELEASE_COMMIT}" >> "${GITHUB_OUTPUT}"
+    echo "rc_candidate_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
+    echo "release_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
     echo "previous_version=${LATEST_GA_TAG}" >> "${GITHUB_OUTPUT}"
     echo "has_changes=true" >> "${GITHUB_OUTPUT}"
     echo "bump_type=manual" >> "${GITHUB_OUTPUT}"
@@ -102,7 +103,8 @@ if [ -z "${LATEST_GA_TAG}" ]; then
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "release_version=${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
     echo "version=${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
-    echo "release_commit=${RELEASE_COMMIT}" >> "${GITHUB_OUTPUT}"
+    echo "rc_candidate_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
+    echo "release_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
     echo "previous_version=" >> "${GITHUB_OUTPUT}"
     echo "has_changes=true" >> "${GITHUB_OUTPUT}"
     echo "bump_type=initial" >> "${GITHUB_OUTPUT}"
@@ -115,7 +117,7 @@ echo "📌 Latest GA Tag: ${LATEST_GA_TAG}" >&2
 IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_GA_TAG}"
 
 # 5. Inspect commit range for subjects (%s) and bodies (%b)
-COMMITS_RANGE="${LATEST_GA_TAG}..${RELEASE_COMMIT}"
+COMMITS_RANGE="${LATEST_GA_TAG}..${RC_CANDIDATE_COMMIT}"
 if ! COMMITS_SUBJECTS="$(git log "${COMMITS_RANGE}" --format="%s" 2>&1)"; then
   echo "❌ ERROR: Failed to read commit log for range '${COMMITS_RANGE}': ${COMMITS_SUBJECTS}" >&2
   exit 1
@@ -127,7 +129,8 @@ if [ -z "${COMMITS_SUBJECTS}" ]; then
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "release_version=${LATEST_GA_TAG}" >> "${GITHUB_OUTPUT}"
     echo "version=${LATEST_GA_TAG}" >> "${GITHUB_OUTPUT}"
-    echo "release_commit=${RELEASE_COMMIT}" >> "${GITHUB_OUTPUT}"
+    echo "rc_candidate_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
+    echo "release_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
     echo "previous_version=${LATEST_GA_TAG}" >> "${GITHUB_OUTPUT}"
     echo "has_changes=false" >> "${GITHUB_OUTPUT}"
     echo "bump_type=none" >> "${GITHUB_OUTPUT}"
@@ -175,7 +178,8 @@ echo "📈 Calculated next version: ${NEXT_VERSION} (bump: ${BUMP_TYPE})" >&2
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "release_version=${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
   echo "version=${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
-  echo "release_commit=${RELEASE_COMMIT}" >> "${GITHUB_OUTPUT}"
+  echo "rc_candidate_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
+  echo "release_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
   echo "previous_version=${LATEST_GA_TAG}" >> "${GITHUB_OUTPUT}"
   echo "has_changes=true" >> "${GITHUB_OUTPUT}"
   echo "bump_type=${BUMP_TYPE}" >> "${GITHUB_OUTPUT}"

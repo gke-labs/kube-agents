@@ -256,7 +256,20 @@ def _issue_card(payload: dict, now: datetime | None = None) -> Card:
     """
     number = payload["issue_number"]
     repo = payload.get("repository", "")
-    title = payload.get("title", "") or f"issue #{number}"
+    # `title_plain`, not `title`: the resolver's `title` is the same text wrapped
+    # in `<untrusted_title>` boundary tags for the model's benefit, and putting
+    # that on a card leaves every board entry and card notification reading
+    # "Triage and resolve acme/toolkit#42: <untrusted_title>Pods crashlooping
+    # </untrusted_title>". The 35 characters of markup also come out of the
+    # 200-character budget below, so a long enough title loses its closing tag to
+    # the truncation and the card carries an *unclosed* boundary marker into the
+    # worker — the demarcation failure the tags were added to prevent. Falls back
+    # through `title` for a payload written before `title_plain` existed.
+    # `.get(k, default)` rather than `or`: `or` tests falsiness, so a title made
+    # entirely of zero-width or control characters — which GitHub accepts —
+    # sanitizes to "" and falls through to the tagged `title`, putting the
+    # markup back on the card this line exists to keep it off.
+    title = payload.get("title_plain", payload.get("title", "")) or f"issue #{number}"
     bucket = (now or datetime.now(timezone.utc)).strftime(CARD_BUCKET_FORMAT)
     return Card(
         title=f"Triage and resolve {repo}#{number}: {title}"[:200],
@@ -279,9 +292,10 @@ def _issue_card(payload: dict, now: datetime | None = None) -> Card:
         # therefore latches the key permanently — and the skill has an ordinary
         # path that does exactly that: Step 1 says to alert the room and
         # terminate on an `ERROR` status. The issue keeps no `status:` label, so
-        # `handle_poll` keeps returning it; because it returns only the
-        # lowest-numbered unaddressed issue, every higher-numbered one goes
-        # unseen too, and `file_card` cannot tell a create from a dedupe hit, so
+        # `handle_poll` keeps returning it; because it returns exactly one
+        # issue per tick — the highest-priority unaddressed one — every other
+        # issue goes unseen too, and `file_card` cannot tell a create from a
+        # dedupe hit, so
         # every subsequent tick looks like a clean run. The old `*/30` prompt
         # job had no cross-tick state to wedge; the key is what introduced it.
         #
@@ -397,18 +411,34 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     in its own filesystem; `/tmp` is a per-container emptyDir, so a
     `--body-file /tmp/…` path names a file the other container cannot open. The
     refusal then fails with "no such file" — observed live before this moved.
-    `audit_report._write_temp` documents the same trap. Falls back to the system
-    temp directory when the volume is absent, so tests still run off-cluster.
+    `audit_report._write_temp` documents the same trap, and a second one: since
+    #955 the sandbox (uid 10000) and the sidecar (uid 10001) are different
+    users, so the 0600 file `NamedTemporaryFile` creates must be `fchmod`ed
+    group-readable or the sidecar cannot open it even on the shared volume.
+
+    NO fallback to the system temp directory when the volume is absent: the
+    sidecar can never see this container's private tmp, so in-cluster that
+    fallback turned a fixable mount problem into a guaranteed failure that read
+    as a graceful degrade (#1030). Raise instead — the per-sweep try in `main`
+    turns it into a warning the room sees. Tests patch SCRATCH_DIR.
     """
-    directory: str | None = SCRATCH_DIR
     try:
         Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-    except OSError:
-        directory = None
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix=".md", delete=False, dir=directory
-    )
+        handle = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".md", delete=False, dir=SCRATCH_DIR
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "publish path broken: cannot stage a body file in the shared "
+            f"scratch directory {SCRATCH_DIR} (uid {os.getuid()}): {exc}. "
+            "The credential sidecar resolves body-file paths in its own "
+            "filesystem, so a container-private temp file can never work — "
+            "fix the shared mount/permissions (see gke-labs/kube-agents#1030)."
+        ) from exc
     try:
+        # Group-readable across the #955 uid split; owner-only is unreadable
+        # to the sidecar that actually runs `gh`.
+        os.fchmod(handle.fileno(), 0o664)
         handle.write(body)
         handle.close()
         provider.post_comment(repo, pr, handle.name)

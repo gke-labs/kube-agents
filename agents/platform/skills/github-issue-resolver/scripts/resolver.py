@@ -470,6 +470,217 @@ def sweep_stale_issues(repo: str):
             continue
 
 
+def _is_safe_char(ch: str) -> bool:
+    """Check whether a character is safe from control/zero-width/bidi smuggling."""
+    # Logically identical to `_is_safe_char` in
+    # agents/platform/scripts/platform_mcp_server.py, which is the canonical
+    # copy: both classify untrusted external text bound for the same model, and
+    # a class stripped in one place but not the other is a hole in whichever
+    # side forgot. Importing it is not an option — that module builds a FastMCP
+    # server at import time and pulls in `mcp`, `agent_common_server` and
+    # `gke_endpoint`, none of which this script has or needs. The mirror is held
+    # honest by test_resolver.py's drift test, which compares the two as parsed
+    # syntax — so this comment and the docstring may differ from the canonical
+    # copy's, and the logic may not.
+    code = ord(ch)
+    # Preserve newline (\n, 10) and tab (\t, 9)
+    if code in (9, 10):
+        return True
+    # Strip C0 control characters (< 32), DEL (127), and C1 control characters (128-159)
+    if code < 32 or 127 <= code <= 159:
+        return False
+    # Strip zero-width, bidi, and format control characters
+    # U+200B-U+200F (Zero-width space, non-joiner, joiner, LRM, RLM)
+    # U+202A-U+202E (Bidi embedding/override controls: LRE, RLE, PDF, LRO, RLO)
+    # U+2060-U+206F (Word joiner, invisible operators, bidi isolates)
+    # U+FEFF (Zero-width no-break space / BOM)
+    # U+00AD (Soft hyphen), U+034F (Combining grapheme joiner), U+061C (Arabic letter mark), U+180E (Mongolian vowel separator)
+    if (
+        0x200B <= code <= 0x200F
+        or 0x202A <= code <= 0x202E
+        or 0x2060 <= code <= 0x206F
+        or code in (0xFEFF, 0x00AD, 0x034F, 0x061C, 0x180E)
+    ):
+        return False
+    # Strip Unicode tag block and non-printable supplementary blocks (U+E0000 and above)
+    if code >= 0xE0000:
+        return False
+    return True
+
+
+def sanitize_untrusted_text(text: str, max_length: int = 8192) -> str:
+    """Sanitizes untrusted external input to neutralize prompt injection attacks."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    is_truncated = len(text) > max_length
+    if is_truncated:
+        text = text[:max_length]
+
+    # 1. Strip ANSI escape sequences (7-bit and 8-bit CSI) and carriage returns
+    cleaned = re.sub(r"\r", "", text)
+    cleaned = re.sub(
+        r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])",
+        "",
+        cleaned,
+    )
+
+    # 2. Strip C0/C1 control characters, DEL, zero-width/bidi characters, and Unicode tag blocks
+    cleaned = "".join(ch for ch in cleaned if _is_safe_char(ch))
+
+    # 3. Neutralize prompt injection delimiter tags, instruction markers, and fake system headers.
+    #    `[/\s]*` on both sides of the name, not just the front: `</untrusted_title>`,
+    #    `< /untrusted_title>` and `<untrusted_title/>` are the same trick, and the
+    #    self-closing spelling used to walk through and reach the model looking like
+    #    a boundary marker from inside the boundary.
+    #    One quantifier each side of the name, and `[^>]*` rather than a lazy
+    #    `\s+[^>]*?` followed by another `[/\s]*`. Two quantifiers that can both
+    #    match the same run of spaces make the failure case cubic: `<system`
+    #    followed by 3,200 spaces and no `>` took 11.7 seconds, 8x per doubling,
+    #    and the 8,192-character cap above is the only bound on it. Any GitHub
+    #    account can put that in an issue body, and `poll` sanitizes the title,
+    #    the body and every comment on every tick.
+    cleaned = re.sub(
+        r"<[/\s]*(system|instruction|prompt|context|admin|untrusted_[a-z0-9_-]+)\b[^>]*>",
+        r"[\1_tag_neutralized]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    #    `(?<!\`)` is what keeps this linear. Without it a match can start at
+    #    every backtick in a run, and each start consumes to the end of the run
+    #    and backtracks through it — quadratic, 1,039 ms on the 8,192 backticks
+    #    the cap allows. `poll` sanitizes every comment on the issue, so ~291 of
+    #    them crossed RESOLVER_TIMEOUT_S; the lookbehind lets only the first
+    #    backtick of a run start a match and brings the same input to 0.34 ms.
+    #    `[^\S\n]*` rather than `\s*` so a fence cannot be matched to a keyword
+    #    on a later line.
+    cleaned = re.sub(
+        r"(?<!`)`{3,}[^\S\n]*(system|instruction|prompt)\b",
+        r"```text",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    #    Kept in step with `_neutralize_tokens` in
+    #    agents/platform/scripts/platform_mcp_server.py. The same framing reaching
+    #    the same model by two routes must not be defused on one and passed through
+    #    on the other: `<TOOL_CALL>`, `<USER_REQUEST>`, `### Instruction:` and a
+    #    counterfeit `[SECURITY NOTICE:` were all neutralized on the pod-diagnostics
+    #    path and verbatim on this one.
+    cleaned = re.sub(
+        r"\[/?INST\]|<<SYS>>|<\|im_start\|>|<\|im_end\|>"
+        r"|###\s*(?:system|instruction):"
+        r"|</?(?:USER_REQUEST|TOOL_CALL)>"
+        r"|(?:===\s*)?\[SECURITY\s+NOTICE:",
+        "[instruction_marker_neutralized]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    if is_truncated:
+        cleaned += f"\n\n[TRUNCATED: Exceeded {max_length} character limit]"
+
+    return cleaned.strip()
+
+
+def _label_names(issue: dict) -> set[str]:
+    """Extracts a normalized lowercased set of label names from an issue dictionary."""
+    labels_raw = issue.get("labels") or []
+    label_names = set()
+    for l in labels_raw:
+        if isinstance(l, dict):
+            name = l.get("name", "")
+        elif isinstance(l, str):
+            name = l
+        else:
+            name = ""
+        if name:
+            label_names.add(name.lower())
+    return label_names
+
+
+def calculate_issue_priority(issue: dict) -> tuple[int, str]:
+    """Calculates multi-factor priority score and priority label for an issue.
+    Returns (score, priority_label).
+    """
+    label_names = _label_names(issue)
+
+    score = 0
+    priority_label = "UNLABELLED"
+
+    # Priority / Severity weighting
+    if any(
+        l in label_names
+        for l in [
+            "priority:critical",
+            "priority:p0",
+            "severity:critical",
+            "blocker",
+        ]
+    ):
+        score += 1000
+        priority_label = "P0"
+    elif any(
+        l in label_names
+        for l in ["priority:high", "priority:p1", "severity:high"]
+    ):
+        score += 500
+        priority_label = "P1"
+    elif any(
+        l in label_names for l in ["priority:medium", "priority:p2", "bug"]
+    ):
+        score += 100
+        priority_label = "P2"
+    elif any(
+        l in label_names
+        for l in [
+            "priority:low",
+            "priority:p3",
+            "enhancement",
+            "documentation",
+        ]
+    ):
+        score += 10
+        priority_label = "P3"
+
+    return score, priority_label
+
+
+def _fetch_comments(repo: str, number) -> list:
+    """Fetch one issue's comments, after the ranking has picked a winner.
+
+    Split out of the list query so that query can widen to 100 issues without
+    paying a GraphQL round trip per issue for a field only the selected issue
+    needs.
+
+    Returns [] rather than raising when the fetch fails. The comments are
+    context for the investigation, not the thing being investigated: an issue
+    the agent can still read the title and body of is worth reporting, and a
+    poll that died here would take the whole FOUND payload with it.
+
+    A failure is warned about on stderr, though, because the payload cannot
+    tell the two apart: `"comments": []` is what an issue with no comments
+    looks like too, so an investigation that silently lost the reporter's
+    follow-up context would read as a complete one.
+    """
+    res = run_gh(
+        ["issue", "view", str(number), "-R", repo, "--json", "comments"],
+        check=False,
+    )
+    if res.returncode != 0:
+        print(
+            f"Warning: could not fetch comments for issue #{number}; "
+            "continuing with title and body only.",
+            file=sys.stderr,
+        )
+        return []
+    try:
+        payload = json.loads(res.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    comments = payload.get("comments") if isinstance(payload, dict) else None
+    return comments if isinstance(comments, list) else []
+
+
 def handle_poll(args):
     # Nothing configured is not a fault: it is a supported deployment with no
     # work to do. Its own status, rather than NO_ISSUES, so the two cannot be
@@ -527,6 +738,23 @@ def handle_poll(args):
     # a token without scope for this repo — or a repo that 404s — only fails
     # here. With check=True that exits non-zero having printed no JSON at all,
     # which the skill has no branch for.
+    #
+    # `comments` is deliberately absent from this projection and `--limit` is
+    # 100 rather than 10, and the two go together. Ranking by priority only
+    # reorders the rows the query returned, and which rows those are is not
+    # something this query gets to decide: `--search` goes to the search API,
+    # whose ordering without a `sort:` qualifier is GitHub's relevance ranking
+    # rather than anything this code can predict. At a limit of 10 the ranking
+    # therefore re-sorted an arbitrary handful and a P0 outside it was never a
+    # candidate — the delay the ranking was added to remove. Widening the window
+    # is what makes the ranking mean anything, and 100 covers the whole
+    # unaddressed backlog of a repository this agent is plausibly pointed at.
+    # It is affordable only because `comments` is dropped — that field costs one
+    # GraphQL round trip per issue, so asking for it across 100 issues is what
+    # would blow `github_scan_gate`'s RESOLVER_TIMEOUT_S. The winner's comments
+    # are fetched on their own below, once there is exactly one issue to fetch
+    # them for; that is one list call plus one view call, against the ten
+    # issues' worth of comment round trips the old projection paid every tick.
     res = run_gh(
         [
             "issue",
@@ -536,9 +764,9 @@ def handle_poll(args):
             "--search",
             search_query,
             "--json",
-            "number,title,body,comments",
+            "number,title,body,labels,createdAt",
             "--limit",
-            "10",
+            "100",
         ],
         check=False,
     )
@@ -565,15 +793,36 @@ def handle_poll(args):
         print(json.dumps({"status": "NO_ISSUES", "repository": repo}))
         return
 
-    # Select lowest numbered open issue
-    issues.sort(key=lambda x: int(x["number"]))
-    target = issues[0]
+    # Select issue by highest priority score, then earliest creation date and lowest issue number (FIFO tie-breaker)
+    scored_issues = []
+    for x in issues:
+        score, label = calculate_issue_priority(x)
+        created_at = x.get("createdAt") or ""
+        scored_issues.append((score, created_at, int(x["number"]), label, x))
+
+    scored_issues.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    _, _, _, priority_label, target = scored_issues[0]
+
+    raw_title = target.get("title") or ""
+    sanitized_title = sanitize_untrusted_text(raw_title)
+    raw_body = target.get("body") or ""
+    sanitized_body = sanitize_untrusted_text(raw_body)
+
     comments = []
-    for c in target.get("comments", []):
-        author = c.get("author", {}).get("login", "unknown")
-        body = c.get("body", "")
-        created = c.get("createdAt", "")
-        comments.append({"author": author, "createdAt": created, "body": body})
+    for c in _fetch_comments(repo, target["number"]):
+        author = c.get("author") if isinstance(c.get("author"), dict) else {}
+        # A GitHub login is `[A-Za-z0-9-]` and at most 39 characters, so there
+        # is nothing here for a boundary tag to defend against; wrapping it only
+        # put markup in front of every reader of this field. Sanitized anyway,
+        # because the cost is nil and the assumption is GitHub's to break.
+        comments.append(
+            {
+                "author": sanitize_untrusted_text(author.get("login") or "unknown"),
+                "createdAt": c.get("createdAt", ""),
+                "body": f"<untrusted_comment>{sanitize_untrusted_text(c.get('body') or '')}</untrusted_comment>",
+            }
+        )
 
     print(
         json.dumps(
@@ -581,8 +830,10 @@ def handle_poll(args):
                 "status": "FOUND",
                 "repository": repo,
                 "issue_number": target["number"],
-                "title": target["title"],
-                "body": target.get("body", ""),
+                "priority": priority_label,
+                "title": f"<untrusted_title>{sanitized_title}</untrusted_title>",
+                "title_plain": sanitized_title,
+                "body": f"<untrusted_body>{sanitized_body}</untrusted_body>",
                 "comments": comments,
             },
             indent=2,

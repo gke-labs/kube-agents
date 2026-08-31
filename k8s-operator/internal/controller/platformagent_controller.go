@@ -62,7 +62,7 @@ const (
 	// Identity tokens. It is only ever the pre-DNAT destination.
 	metadataLinkLocalIP = "169.254.169.254"
 	// metadataDaemonIP is where GKE's node-local metadata daemon actually listens, on
-	// TCP 988. On the iptables datapath (Dataplane V1) the node rewrites
+	// TCP 988. On the iptables datapath (Dataplane V1) the node DNATs
 	// 169.254.169.254:80 to 169.254.169.252:988 in nat PREROUTING — before NetworkPolicy
 	// is evaluated — so a policy that permits only the link-local address drops every
 	// token fetch. Dataplane V2 (eBPF) evaluates policy pre-NAT at the socket layer,
@@ -333,6 +333,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
+	netpolProf := r.resolveNetpolProfile(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -351,7 +352,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	// Reconcile NetworkPolicy
-	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
@@ -359,7 +360,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 9. Update status phase to Ready
-	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource)
+	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -879,7 +880,8 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 // itself the harm.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason string) error {
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
-	if err := r.reconcileNetworkPolicy(ctx, agent, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
+	netpolProf := r.resolveNetpolProfile(ctx, agent)
+	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
 		return err
 	}
 	if !refusalStillRendersTheGuardrail(reason) {
@@ -1009,8 +1011,50 @@ func (r *PlatformAgentReconciler) clearForeignPDBBudgetField(ctx context.Context
 	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
-	profile := r.resolveNetpolProfile(ctx, agent)
+func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile, otlpEndpoint string, otlpDisabled bool) error {
+	if !profile.Generated {
+		var existingNetpol networkingv1.NetworkPolicy
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway-netpol"}, &existingNetpol); err == nil {
+			if metav1.IsControlledBy(&existingNetpol, agent) {
+				if err := r.Delete(ctx, &existingNetpol); err != nil && !errors.IsNotFound(err) {
+					return fmt.Errorf("failed to delete disabled NetworkPolicy %s/%s: %w", existingNetpol.Namespace, existingNetpol.Name, err)
+				}
+				logf.FromContext(ctx).Info("Deleted owner-referenced NetworkPolicy because spec.networkPolicy.enabled is false", "namespace", existingNetpol.Namespace, "name", existingNetpol.Name)
+			}
+		} else if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to get NetworkPolicy %s/%s: %w", agent.Namespace, agent.Name+"-gateway-netpol", err)
+		}
+
+		// Read before deleting, and check ownership, exactly as the NetworkPolicy
+		// above does. The name is agent-prefixed and namespaced, so a collision is
+		// unlikely -- but "enabled: false" is a request to stop managing policy, not
+		// a licence to delete a policy somebody else created under that name.
+		//
+		// The FQDN cleanup on the ENABLED path below (fqdnEnabled == false) deletes
+		// the same name unguarded, and deliberately still does: an operator old
+		// enough to have created that policy without an owner reference would leave
+		// it behind here, and FQDN filtering the user just switched off would keep
+		// applying. That risk is not worth taking on this path, where the whole
+		// point is to stop managing policy at all.
+		fqdnNetpol := &unstructured.Unstructured{}
+		fqdnNetpol.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "networking.gke.io",
+			Version: "v1alpha1",
+			Kind:    "FQDNNetworkPolicy",
+		})
+		fqdnName := agent.Name + "-fqdn-netpol"
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: fqdnName}, fqdnNetpol); err == nil {
+			if metav1.IsControlledBy(fqdnNetpol, agent) {
+				if err := r.Delete(ctx, fqdnNetpol); err != nil && !isCRDNotInstalledError(err) {
+					return fmt.Errorf("failed to clean up disabled FQDNNetworkPolicy %s/%s: %w", agent.Namespace, fqdnName, err)
+				}
+				logf.FromContext(ctx).Info("Deleted owner-referenced FQDNNetworkPolicy because spec.networkPolicy.enabled is false", "namespace", agent.Namespace, "name", fqdnName)
+			}
+		} else if !isCRDNotInstalledError(err) {
+			return fmt.Errorf("failed to get FQDNNetworkPolicy %s/%s: %w", agent.Namespace, fqdnName, err)
+		}
+		return nil
+	}
 
 	var apiTargets []string
 	if r.APIServerIP != "" {
@@ -1051,26 +1095,18 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 		if raw == "" {
 			return
 		}
-		if strings.Contains(raw, "/") {
-			_, ipNet, err := net.ParseCIDR(raw)
-			if err != nil {
-				logf.FromContext(ctx).Info("Ignoring malformed CIDR in annotation", "annotation", annotationName, "cidr", raw, "error", err)
-				return
-			}
-			ones, bits := ipNet.Mask.Size()
-			if (bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix) {
-				logf.FromContext(ctx).Info("Rejecting overly broad CIDR in annotation (must be >= /12 for IPv4, >= /48 for IPv6)", "annotation", annotationName, "cidr", raw)
-				return
-			}
-			apiTargets = append(apiTargets, ipNet.String())
+		// normalizeCIDRTarget, not a local parse: it takes the address family from
+		// the address rather than the mask width, so an IPv4-mapped IPv6 block is
+		// measured against the IPv4 floor it will actually print as.
+		// ::ffff:a00:0/104 used to clear the /48 IPv6 floor here and land in the
+		// list as 10.0.0.0/8; it is now rejected, while ::ffff:a00:0/108 still
+		// passes because /108 is the IPv4 /12 that is exactly the floor.
+		ipNet, ok := normalizeCIDRTarget(raw, true)
+		if !ok {
+			logf.FromContext(ctx).Info("Ignoring CIDR in annotation: unparseable, or broader than the /12 (IPv4) or /48 (IPv6) floor", "annotation", annotationName, "cidr", raw)
 			return
 		}
-		trimmed := strings.Trim(raw, "[]")
-		if ip := net.ParseIP(trimmed); ip == nil {
-			logf.FromContext(ctx).Info("Ignoring invalid IP address in annotation", "annotation", annotationName, "ip", raw)
-			return
-		}
-		apiTargets = append(apiTargets, trimmed)
+		apiTargets = append(apiTargets, ipNet.String())
 	}
 
 	appendCIDRs := func(sourceName, rawList string) {
@@ -1324,10 +1360,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging. otlpEndpoint and
-// otlpSource are the resolved telemetry wiring; they are reported rather than derived
-// because discovery is otherwise invisible to anyone reading the CR.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string) (string, error) {
+// the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
+// and netpolProfile are the resolved telemetry and network policy wiring; they are reported
+// rather than derived because discovery is otherwise invisible to anyone reading the CR.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -1443,6 +1479,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Address == newAddress &&
 		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
+		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
@@ -1458,6 +1495,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agent.Status.Address = newAddress
 	agent.Status.Telemetry.OTLPEndpoint = otlpEndpoint
 	agent.Status.Telemetry.OTLPEndpointSource = otlpSource
+	agent.Status.NetworkPolicy.Generated = netpolProfile.Generated
+	agent.Status.NetworkPolicy.DNSClusterIPs = append([]string(nil), netpolProfile.DNSClusterIPs...)
+	agent.Status.NetworkPolicy.DNSClusterIPsSource = netpolProfile.DNSSource
+	agent.Status.NetworkPolicy.MetadataDaemonIP = netpolProfile.MetadataDaemonIP
+	agent.Status.NetworkPolicy.MetadataDaemonIPSource = netpolProfile.MetadataDaemonSource
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -1497,6 +1539,30 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	return newPhase, r.Status().Update(ctx, agent)
+}
+
+func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, profile netpolProfile) bool {
+	if status.Generated != profile.Generated {
+		return false
+	}
+	if status.DNSClusterIPsSource != profile.DNSSource {
+		return false
+	}
+	if status.MetadataDaemonIP != profile.MetadataDaemonIP {
+		return false
+	}
+	if status.MetadataDaemonIPSource != profile.MetadataDaemonSource {
+		return false
+	}
+	if len(status.DNSClusterIPs) != len(profile.DNSClusterIPs) {
+		return false
+	}
+	for i := range status.DNSClusterIPs {
+		if status.DNSClusterIPs[i] != profile.DNSClusterIPs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (phase string, reason string, message string) {

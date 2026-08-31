@@ -39,9 +39,17 @@ locals {
 
   required_apis = toset(concat(local.base_apis, local.chat_apis))
 
-  # The agent's GCP IAM permission-set bundles, kept verbatim so the
-  # two install paths hand the agent the same authority. Kubernetes RBAC is
-  # read-only in both; see the security-and-iam reference.
+  # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
+  # paths hand the agent the same authority. Kubernetes RBAC is read-only
+  # alongside it; see the security-and-iam reference.
+  #
+  # There is deliberately one bundle and no admin one. GKE authorizes an action
+  # if either IAM or Kubernetes RBAC allows it, so a role like
+  # roles/container.admin authorizes the agent through IAM regardless of how
+  # narrow its KSA is, and the container.clusters.impersonate it carries applies
+  # to every cluster in the project. A deployment that needs broader roles names
+  # them in project_roles, which puts the grant in the caller's Terraform where
+  # it is reviewed.
   read_only_roles = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
@@ -52,26 +60,10 @@ locals {
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
   ]
-  gke_admin_roles = [
-    "roles/container.clusterAdmin",
-    "roles/container.admin",
-    "roles/compute.viewer",
-    "roles/monitoring.admin",
-    # The agent can query logs for diagnostics but must not administer the
-    # audit-log sink.
-    "roles/logging.viewer",
-    "roles/iam.serviceAccountUser",
-    "roles/iam.securityReviewer",
-    "roles/mcp.toolUser",
-  ]
 
   # An explicit project_roles list always wins, so an existing configuration
   # that set it keeps its roles regardless of permission_set.
-  agent_project_roles = (
-    var.project_roles != null
-    ? var.project_roles
-    : (var.permission_set == "gke-admin" ? local.gke_admin_roles : local.read_only_roles)
-  )
+  agent_project_roles = var.project_roles != null ? var.project_roles : local.read_only_roles
 
   # Only non-empty credential keys end up in the Secret, so an unset optional
   # provider key does not create an empty entry.

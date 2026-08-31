@@ -220,13 +220,10 @@ echo "Project Number: ${PROJECT_NUMBER}"
 # found on its first run. Projects 1-3 never showed it: their GSAs predate this
 # script and were already in state.
 
-# Which identity Cloud Build runs as is project-dependent: projects created
-# before the 2024 default change run builds as the legacy
-# <number>@cloudbuild.gserviceaccount.com, newer ones as the Compute Engine
-# default SA. Both are granted because the script cannot tell which applies --
-# add-iam-policy-binding accepts a member that does not exist, so a grant to the
-# absent one is an inert no-op rather than an error. kube-agents-evals-2 is the
-# live example of the drift this avoids: it carries only the compute-SA grant.
+# All six pool projects build as the Compute Engine default SA, measured
+# 2026-08-26 with `gcloud builds list --format='value(serviceAccount)'`. The
+# legacy <number>@cloudbuild.gserviceaccount.com is granted too, as an inert
+# no-op in case a project ever defaults the other way.
 CLOUDBUILD_SA="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
 COMPUTE_SA="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 
@@ -253,6 +250,37 @@ for member in "${CLOUDBUILD_SA}" "${COMPUTE_SA}"; do
     --location=us \
     --member="${member}" \
     --role="roles/artifactregistry.reader" \
+    --quiet >/dev/null
+done
+
+# The pull-kube-agents-smoke-test job runs on the build-kube-agents cluster, not
+# in this project. It leases this project from Boskos and reaches in as
+# prowjob-default-sa@kube-agents-prow for cluster credentials, the chart deploy
+# and the build. Without these it leases a fully provisioned project and dies on
+# the first gcloud call (gke-labs/kube-agents#966).
+#
+# The set kube-agents-evals holds, kept as measured rather than trimmed. No
+# Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
+# `gcloud builds submit` as substitutions, so Cloud Build does the push and the
+# GKE nodes do the pull. This account touches the registry at no point.
+PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
+echo "Granting the Prow runner access to ${PROJECT_ID}..."
+for role in \
+  roles/cloudbuild.builds.editor \
+  roles/cloudbuild.builds.viewer \
+  roles/container.admin \
+  roles/container.developer \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/logging.logWriter \
+  roles/logging.viewer \
+  roles/resourcemanager.projectIamAdmin \
+  roles/serviceusage.serviceUsageConsumer \
+  roles/storage.admin \
+  roles/viewer; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="${PROW_RUNNER_SA}" \
+    --role="${role}" \
     --quiet >/dev/null
 done
 
@@ -561,18 +589,56 @@ if [ "${VERIFY_RC}" -eq 2 ] && [ -t 0 ]; then
 fi
 
 echo -e "\n================================================================================"
-if [ "${VERIFY_RC}" -eq 0 ]; then
-  echo "🎉 ${PROJECT_ID} is provisioned and verified. Register it in Boskos last."
-else
-  echo "⚠ ${PROJECT_ID} is provisioned, but verification has not gone green."
-  echo "  Nothing failed; one or more items could not be checked. Clear them, then:"
-  # --app-id and --location are spelled out even though the verifier defaults to
-  # these same values: the operator may have passed --app-id or --region to this
-  # script, and a hint that omits them silently verifies a different App or
-  # region than the one just provisioned.
+if [ "${SKIP_FLEET}" != "true" ]; then
+  # Conditional because the fleet apply is idempotent: a re-run to clear one
+  # amber item replants nothing, and the unconditional wording had the operator
+  # push activation dates out over an apply that changed no fixture.
+  #
+  # No date printed on purpose: a gate date is the newest fleet's age measured
+  # against the cost SOP's windows, named in the echo below, and both terms move.
+  echo "NOTE: if the fleet apply above created or replaced fixtures, they are now"
+  echo "      the newest in the pool. Age-gated scenarios gate on the newest"
+  echo "      fleet, so their activation dates just moved pool-wide. The windows"
+  echo "      are in"
+  echo "      agents/platform/governance/fleet_wide_cost_analysis_sop.md"
+  echo "      (§3.4 unattached-disk 30d, §3.7 idle-nodepool 7d); add them to today."
+  echo ""
+fi
+# --app-id and --location are spelled out even though the verifier defaults to
+# these same values: the operator may have passed --app-id or --region to this
+# script, and a hint that omits them silently verifies a different App or region
+# than the one just provisioned.
+reverify_hint() {
   echo "    python3 scripts/verify_ci_pool_project.py --project-id ${PROJECT_ID} \\"
   echo "      --app-id ${APP_ID} --location ${REGION} \\"
   echo "      --confirmed-repo-in-app-installation"
+}
+
+# Four arms, because three codes reach here and they mean different things. The
+# catch-all is 2 and anything unrecognised; it is the only one that gets the
+# "nothing failed" wording, which is a lie on the other two.
+if [ "${VERIFY_RC}" -eq 0 ]; then
+  echo "🎉 ${PROJECT_ID} is provisioned and verified. Register it in Boskos last."
+elif [ "${VERIFY_RC}" -eq 1 ]; then
+  # Only from the re-run: the first call's exit 1 already left at the guard
+  # above. The installation was confirmed and a check still failed, so this is a
+  # real failure rather than something the operator can clear by confirming.
+  echo "✗ ${PROJECT_ID} is provisioned, but verification FAILED."
+  echo "  Do not register it in Boskos. Clear what the report above lists, then:"
+  reverify_hint
+  exit 1
+elif [ "${VERIFY_RC}" -eq 64 ]; then
+  # The verifier's usage code. This script builds that command line, so a bad
+  # one is a defect here; the operator has nothing to clear and the project is
+  # neither verified nor known to be broken.
+  echo "✗ this script called the verifier with a bad command line (exit 64)."
+  echo "  ${PROJECT_ID} is provisioned but unverified. Report the argument error"
+  echo "  above against scripts/provision_ci_pool_project.sh."
+  exit 1
+else
+  echo "⚠ ${PROJECT_ID} is provisioned, but verification has not gone green."
+  echo "  Nothing failed; one or more items could not be checked. Clear them, then:"
+  reverify_hint
   echo "  Boskos registration waits on that exiting 0."
 fi
 echo "================================================================================"

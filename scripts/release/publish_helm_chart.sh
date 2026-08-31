@@ -8,12 +8,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=scripts/release/common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-RELEASE_VERSION="${1:-${RELEASE_VERSION:-}}"
-RELEASE_COMMIT="${2:-${RELEASE_COMMIT:-}}"
+RELEASE_VERSION="${1:-${RELEASE_VERSION:-${TARGET_VERSION:-${TARGET_TAG:-}}}}"
 
 if [ -z "${RELEASE_VERSION}" ]; then
   echo "❌ ERROR: RELEASE_VERSION is required as first argument or environment variable." >&2
-  echo "Usage: $0 (with RELEASE_VERSION in env) or $0 <RELEASE_VERSION> [RELEASE_COMMIT]" >&2
+  echo "Usage: $0 <RELEASE_VERSION>" >&2
   exit 1
 fi
 
@@ -36,23 +35,16 @@ if ! command -v cosign >/dev/null 2>&1; then
   fi
 fi
 
-CHART_DIR="${REPO_ROOT}/charts/kube-agents"
-TMP_EXTRACT_DIR=""
+# Resolve release commit directly from Git tag (using shared common helper)
+RELEASE_COMMIT="$(resolve_release_commit "${RELEASE_VERSION}")"
 
-if [ -n "${RELEASE_COMMIT}" ]; then
-  if RESOLVED_COMMIT="$(git rev-parse --verify "${RELEASE_COMMIT}^{commit}" 2>/dev/null)"; then
-    echo "🔍 Extracting Helm chart from release commit ${RESOLVED_COMMIT:0:7}..."
-    TMP_EXTRACT_DIR="$(mktemp -d)"
-    if ! git archive "${RESOLVED_COMMIT}" charts/kube-agents | tar -x -C "${TMP_EXTRACT_DIR}"; then
-      echo "❌ ERROR: Failed to extract charts/kube-agents from commit ${RESOLVED_COMMIT:0:7}!" >&2
-      exit 1
-    fi
-    CHART_DIR="${TMP_EXTRACT_DIR}/charts/kube-agents"
-  else
-    echo "❌ ERROR: Cannot resolve valid Git commit for Helm chart packaging: ${RELEASE_COMMIT}" >&2
-    exit 1
-  fi
+echo "🔍 Extracting Helm chart from release tag '${RELEASE_VERSION}' (commit ${RELEASE_COMMIT:0:7})..."
+TMP_EXTRACT_DIR="$(mktemp -d)"
+if ! git archive "${RELEASE_COMMIT}" charts/kube-agents | tar -x -C "${TMP_EXTRACT_DIR}"; then
+  echo "❌ ERROR: Failed to extract charts/kube-agents from commit ${RELEASE_COMMIT:0:7}!" >&2
+  exit 1
 fi
+CHART_DIR="${TMP_EXTRACT_DIR}/charts/kube-agents"
 
 if [ ! -d "${CHART_DIR}" ]; then
   echo "❌ ERROR: Helm chart directory '${CHART_DIR}' not found!" >&2

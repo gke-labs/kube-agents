@@ -37,7 +37,7 @@ MOCK_COMMIT_MSG_BREAKING_PRE_1_0 = "feat(operator)!: break CRD schema format"
 MOCK_COMMIT_MSG_BREAKING_1_X = "feat!: remove deprecated v1alpha1 APIs"
 MOCK_COMMIT_MSG_BREAKING_BODY = "refactor: overhaul config format\n\nBREAKING CHANGE: old yaml spec is deprecated"
 
-# Shared mock fixtures for RC environment testing (provision_rc_environment.sh)
+# Shared mock fixtures for RC environment testing (provision_environment.sh)
 MOCK_GCP_PROJECT_ID = "mock-rc-project"
 MOCK_GCP_REGION = "us-central1"
 MOCK_GKE_CLUSTER_NAME = "mock-rc-cluster"
@@ -46,7 +46,7 @@ MOCK_IMAGE_TAG_SHA = "01084e7dc912249e4d1176030e54f62427677ce1"
 MOCK_MODEL_PROVIDER = "gemini"
 MOCK_MODEL_DEFAULT_NAME = "gemini-2.0-flash"
 MOCK_GEMINI_API_KEY = "test-gemini-api-key"
-MOCK_PERMISSION_SET = "gke-admin"
+MOCK_PERMISSION_SET = "custom"
 MOCK_REGISTRY_PREFIX = "ghcr.io/mock-org"
 MOCK_CHAT_TOPIC_NAME = "custom-rc-chat-topic"
 MOCK_USER_PROFILE_ENABLED = "true"
@@ -243,11 +243,22 @@ def create_mock_git_binary(
     bin_path = pathlib.Path(bin_dir)
     bin_path.mkdir(parents=True, exist_ok=True)
     git_path = bin_path / "git"
+    if git_path.is_symlink() or git_path.exists():
+        git_path.unlink()
     log_path = log_file if log_file else (bin_path / "git.log")
 
     commit_sha = resolved_commit if resolved_commit else MOCK_SAMPLE_COMMIT_SHA
     rev_parse_action = "exit 1" if fail_rev_parse else f'echo "{commit_sha}"\n  exit 0'
-    archive_exit = "exit 1" if fail_archive else "exit 0"
+    repo_root = str(pathlib.Path(__file__).resolve().parents[2])
+    if fail_archive:
+        archive_body = "exit 1"
+    else:
+        archive_body = f"""if [ -d "{repo_root}/charts" ]; then
+    tar -cf - -C "{repo_root}" charts/kube-agents 2>/dev/null || tar -cf - -T /dev/null
+  else
+    tar -cf - -T /dev/null
+  fi
+  exit 0"""
 
     content = f"""#!/bin/sh
 echo "mock git: $@" >> "{log_path}"
@@ -255,7 +266,7 @@ if [ "$1" = "rev-parse" ]; then
   {rev_parse_action}
 fi
 if [ "$1" = "archive" ]; then
-  {archive_exit}
+  {archive_body}
 fi
 exit 0
 """

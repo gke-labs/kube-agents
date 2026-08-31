@@ -30,16 +30,17 @@
 #
 # The safeguard below is a cluster-state check rather than a tool check, and
 # deliberately so: tool_called sees only the delegating turn, so a worker's
-# mutation is invisible to it. It is not theatre. Measured 2026-08-25, the
-# agent's GSA holds roles/container.admin and roles/container.clusterAdmin at
-# PROJECT level in all three pool projects, so the deployment under test can
-# in fact write to the shared fleet, and this check is what would catch it.
+# mutation is invisible to it. The agent's GSA is read-only at project level,
+# checked by scripts/verify_ci_pool_project.py when a project is onboarded --
+# a precondition asserted once, not a guard that runs per eval. So this does
+# not catch a live write capability; it catches the regression that would
+# restore one, on a fleet every open pull request shares.
 id: cluster-agent-crashloop-debug
 name: Cluster Agent finds the OOM crashloop without touching anything
 # The prompt names no cluster, deliberately. `fixtures.json` is the only thing
 # allowed to address a seeded cluster, because each eval project carries its own
-# trio and this case has to run unchanged against all three -- a literal
-# `seeded-a` here would pin it to one project's topology.
+# trio and this case has to run unchanged against whichever one Boskos leases --
+# a literal `seeded-a` here would pin it to one project's topology.
 #
 # "Find the cluster it is running on" is load-bearing. Measured 2026-08-25 on
 # build 2092323330051805184, the first run of this case, the agent answered the

@@ -1,12 +1,42 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS since 2026-08-25,
+# and since 2026-08-26 THE AUDIT-MACHINERY CANARY: the one full audit scenario
+# kept in the presubmit. It exercises SOP dispatch, delegation to a worker,
+# the GitHub token minter, and the ledger write end to end, and it is the
+# scenario that proved that chain — measured 606s clean on 2026-08-26 (build
+# 2092638061140643840, project kube-agents-evals-3), every exact check green.
+# The other audit domains are covered by snappy probes instead (a full audit
+# costs 600-1300s each, which six domains cannot spend in one presubmit); the
+# other full audits are recast to the nightly tier. This is why the task
+# carries the `fleet-audits` domain rather than `security`: what it uniquely
+# covers in presubmit is the machinery, while the planted over-grant itself is
+# probed by security-overgrant-probe. It was held by A1, A4 and A5
+# (bench/tasks/DRAFTS.md); all three are closed.
 #
-# Domain: security (compliance-audit SOP; the ai-security-audit SOP is the
-# same domain's second stream and gets its own scenario once this one is
-# promoted — its planted defect would be an internet-reachable model server
-# or plaintext registry credential).
-# Journey: the RBAC and posture sweep reports findings in the expected shape,
-# each carrying a remediation.
+# A1 and A4 cleared together on 2026-08-25, when
+# GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
+# EVAL_GITHUB_APP_ID=4675512, which is the condition hack/ci-deploy.sh needs
+# before it renders githubMinter.enabled=true and passes
+# platformAgent.integration.github.gitRepo -- so the `Git Repo:` line of
+# /opt/data/SETTINGS.md finally names the leased project's throwaway
+# gke-agentic/kube-agents-evals*-infra repo instead of the literal None, and
+# `audit_report.py start` has a workspace to clone and a minter to clone it
+# with (A1). It also mounts secret kube-agents-bench-github-token as
+# BENCH_GITHUB_TOKEN, which is the credential the ledger_issue_contains
+# objectives below read the published ledger issue with (A4).
+#
+# A5 cleared on main earlier: hack/fleet-kubeconfigs.sh writes one kubeconfig
+# per fixture ROLE and the cluster-state safeguard below resolves its role
+# through fleet_resource_property, so it grades the seeded cluster rather than
+# platform-agent-host. What is left of A5 is which identity that kubeconfig
+# carries, not which cluster it reaches.
+#
+# Domain: fleet-audits (SOP machinery; the slug is docs/designs/domains.yaml's
+# and this task is its only carrier). The compliance-audit SOP is the vehicle;
+# the ai-security-audit SOP is the same machinery's second stream and gets its
+# own scenario at the nightly tier — its planted defect would be an
+# internet-reachable model server or plaintext registry credential.
+# Journey: a scheduled audit SOP runs end to end — delegates to a worker,
+# sweeps the fleet, and files a ledger issue a human can act on.
 #
 # Planted defect required: a cluster-scoped ClusterRoleBinding named
 # "debug-binding" on the seeded fleet, granting cluster-admin to the default
@@ -22,7 +52,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1. Eligible tier: presubmit, once A1 is in place.
+# blocker A1, now closed. Eligible tier: presubmit, and active there
+# since 2026-08-25.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 # The prompt no longer asks for a summary in the final answer: the SOP's
@@ -42,7 +73,7 @@ infrastructure:
 validated: false
 
 # Slug per docs/designs/domains.yaml.
-domain: security
+domain: fleet-audits
 
 # The seeded-fleet defect this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
