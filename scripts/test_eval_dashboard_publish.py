@@ -168,6 +168,29 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 )
                 self.assert_skipped_once(result, code, "does not exist")
 
+    def test_partial_siblings_skip_before_any_stage_runs(self):
+        """collect.py merged first (#1044): with render.py/publish.py still
+        absent the guard must skip CHEAPLY -- the collector's GCS sweep must
+        not run just to die at the missing render stage."""
+        marker = (
+            "import pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "hack").mkdir()
+            dash = root / "scripts" / "eval_dashboard"
+            dash.mkdir(parents=True)
+            (dash / "collect.py").write_text(marker)
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    root / "hack",
+                    target="gs://kube-agents-dashboards/evals/",
+                )
+                self.assert_skipped_once(result, code, "render.py does not exist")
+            self.assertEqual(list(dash.glob("*.ran")), [])
+
     def test_a_crashing_collector_skips_and_preserves_the_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack = dashboard_stubs(

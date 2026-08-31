@@ -198,21 +198,33 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # "eval-dashboard publish skipped: <reason>" line and never changes the job's
 # exit code.
 #
-# MAIN-BRANCH RUNS ONLY, same structural boundary as the baseline store
-# below: a presubmit runs branch-authored code, so publishing from one would
-# let any pull request rewrite the dashboard everyone reads -- both through
-# the bucket credential and through collect.py, which reads TASKS and the
-# domain metadata out of THIS checkout. The gate is the baseline recorder's
+# MAIN-BRANCH RUNS ONLY, the baseline store's trust boundary: a presubmit
+# runs branch-authored code, so publishing from one would let any pull
+# request rewrite the dashboard everyone reads -- both through the bucket
+# credential and through collect.py, which reads TASKS and the domain
+# metadata out of THIS checkout. The gate is the baseline recorder's
 # (JOB_TYPE postsubmit/periodic, no PULL_NUMBER), re-derived here because the
-# trap can fire from a set -e death long before that code runs.
+# trap can fire from a set -e death long before that code runs. The gate
+# alone is conventional -- a branch can edit this file -- which is why
+# prerequisite 2 below puts the credential itself out of the presubmit's
+# reach; that split is what makes the boundary structural, exactly as
+# docs/designs/eval-scorer.md#the-two-service-accounts argues for the
+# baseline store.
 #
 # Nothing publishes until BOTH prerequisites exist:
 #   1. the nightly periodic (NEVER the presubmit) exports
 #      EVAL_DASHBOARD_TARGET (gs://kube-agents-dashboards/evals/, a dedicated
 #      bucket in the team's own project) -- an oss-test-infra change;
-#   2. prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com holds
-#      roles/storage.objectAdmin on the kube-agents-dashboards bucket (an IAM
-#      grant in the team's project, not the OSS Prow infra project).
+#   2. a DEDICATED publisher identity bound to that periodic alone --
+#      eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com via
+#      Workload Identity, the eval-baseline-recorder pattern from
+#      docs/designs/eval-scorer.md#provisioning-it, NEVER the shared
+#      prowjob-default-sa every presubmit also runs as -- holding
+#      roles/storage.objectUser on the kube-agents-dashboards bucket (a grant
+#      in the team's project, not the OSS Prow infra project). Republishing
+#      overwrites the same object paths, so any workable role carries
+#      storage.objects.delete; the boundary is the identity, not the role:
+#      no account a presubmit can run as ever holds a write on this bucket.
 # Until both land this costs one log line per run.
 # scripts/test_eval_dashboard_publish.py runs this function out of this file
 # and asserts the fail-safe AND the main-branch gate hold.
@@ -233,10 +245,17 @@ publish_eval_dashboard() {
     return 0
   fi
   local dash_src="${SCRIPT_DIR}/../scripts/eval_dashboard"
-  if [ ! -f "${dash_src}/collect.py" ]; then
-    echo "eval-dashboard publish skipped: ${dash_src}/collect.py does not exist (sibling dashboard PRs not merged yet)"
-    return 0
-  fi
+  # All three stages, not just the first: the siblings land one file each
+  # (collect.py merged in #1044; render.py and publish.py are still open), and
+  # gating on collect.py alone would run its full GCS sweep only to die at
+  # render.py -- the guard must keep the hook CHEAP while any stage is absent.
+  local dash_stage
+  for dash_stage in collect.py render.py publish.py; do
+    if [ ! -f "${dash_src}/${dash_stage}" ]; then
+      echo "eval-dashboard publish skipped: ${dash_src}/${dash_stage} does not exist (sibling dashboard PRs not merged yet)"
+      return 0
+    fi
+  done
   local dash_tmp dash_rc=0
   dash_tmp="$(mktemp -d)" || { echo "eval-dashboard publish skipped: mktemp -d failed"; return 0; }
   # One timeout over the whole collect -> render -> publish pipeline so a hung
