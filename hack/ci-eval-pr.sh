@@ -189,23 +189,45 @@ profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
 
 # ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
-# Re-renders and republishes the eval dashboard at the very end of every run,
-# red or green, from the EXIT trap below. FAIL-SAFE BY CONTRACT: the dashboard
-# must never break the job it observes, so every failure mode -- the sibling
-# dashboard PRs not merged yet (no scripts/eval_dashboard/), the IAM grant not
-# applied, a gsutil error, a python crash, a hung upload -- logs exactly ONE
+# Re-renders and republishes the eval dashboard at the very end of every
+# MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
+# CONTRACT: the dashboard must never break the job it observes, so every
+# failure mode -- the sibling dashboard PRs not merged yet (no
+# scripts/eval_dashboard/), the IAM grant not applied, a gsutil error, a
+# python crash, a hung upload -- logs exactly ONE
 # "eval-dashboard publish skipped: <reason>" line and never changes the job's
-# exit code. Nothing publishes until BOTH prerequisites exist:
-#   1. the Prow job exports EVAL_DASHBOARD_TARGET
-#      (gs://kube-agents-dashboards/evals/, a dedicated bucket in the team's
-#      own project) -- an oss-test-infra change;
+# exit code.
+#
+# MAIN-BRANCH RUNS ONLY, same structural boundary as the baseline store
+# below: a presubmit runs branch-authored code, so publishing from one would
+# let any pull request rewrite the dashboard everyone reads -- both through
+# the bucket credential and through collect.py, which reads TASKS and the
+# domain metadata out of THIS checkout. The gate is the baseline recorder's
+# (JOB_TYPE postsubmit/periodic, no PULL_NUMBER), re-derived here because the
+# trap can fire from a set -e death long before that code runs.
+#
+# Nothing publishes until BOTH prerequisites exist:
+#   1. the nightly periodic (NEVER the presubmit) exports
+#      EVAL_DASHBOARD_TARGET (gs://kube-agents-dashboards/evals/, a dedicated
+#      bucket in the team's own project) -- an oss-test-infra change;
 #   2. prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com holds
 #      roles/storage.objectAdmin on the kube-agents-dashboards bucket (an IAM
 #      grant in the team's project, not the OSS Prow infra project).
 # Until both land this costs one log line per run.
 # scripts/test_eval_dashboard_publish.py runs this function out of this file
-# and asserts the fail-safe holds.
+# and asserts the fail-safe AND the main-branch gate hold.
 publish_eval_dashboard() {
+  case "${JOB_TYPE:-}" in
+    postsubmit | periodic) ;;
+    *)
+      echo "eval-dashboard publish skipped: not a main-branch run (JOB_TYPE=${JOB_TYPE:-unset}): a pull request never writes the dashboard"
+      return 0
+      ;;
+  esac
+  if [ -n "${PULL_NUMBER:-}" ]; then
+    echo "eval-dashboard publish skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request never writes the dashboard"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0

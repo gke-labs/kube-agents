@@ -9,6 +9,12 @@ sibling PRs have not merged, a crashing collector, a broken publisher) prints
 exactly one "eval-dashboard publish skipped: <reason>" line and leaves the
 job's exit code exactly what it was.
 
+A second contract rides on the first: ONLY MAIN-BRANCH RUNS PUBLISH. The
+presubmit runs branch-authored code, so a publish from one would let any pull
+request rewrite the dashboard everyone reads; the hook re-derives the baseline
+recorder's gate (JOB_TYPE postsubmit/periodic, no PULL_NUMBER) and anything
+else is one more loud skip.
+
 Like scripts/test_ci_eval_trap.py, this runs the real function -- and the real
 trap body around it -- lifted out of the real file, rather than grepping for
 guards, so it fails if the fail-safe is weakened by any future edit.
@@ -36,19 +42,26 @@ def lifted(name: str) -> str:
 
 
 def run_hook(
-    exit_code: int, script_dir: pathlib.Path, target: str
+    exit_code: int,
+    script_dir: pathlib.Path,
+    target: str,
+    job_type: str = "periodic",
+    pull_number: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
     The trap body is the script's own (its other three callees stubbed, as in
     test_ci_eval_trap.py); publish_eval_dashboard is the real thing, pointed
     at `script_dir` so a test controls whether collect.py exists and what the
-    pipeline stubs do.
+    pipeline stubs do. Defaults to a main-branch shape (periodic, no
+    PULL_NUMBER) because everything else is gated off before it can publish.
     """
     script = "\n".join(
         [
             "set -euo pipefail",
             f'SCRIPT_DIR="{script_dir}"',
+            f'export JOB_TYPE="{job_type}"',
+            f'export PULL_NUMBER="{pull_number}"',
             f'export EVAL_DASHBOARD_TARGET="{target}"',
             "collect_bench_results() { :; }",
             "profile_report() { :; }",
@@ -96,6 +109,53 @@ class PublishHookFailSafeTest(unittest.TestCase):
             for code in (0, 7):
                 result = run_hook(code, pathlib.Path(tmp), target="")
                 self.assert_skipped_once(result, code, "EVAL_DASHBOARD_TARGET")
+
+    def test_a_presubmit_never_publishes_even_fully_armed(self):
+        """The trust boundary: a presubmit runs branch-authored code, so the
+        hook skips even with the target set and a working pipeline on disk --
+        nothing in scripts/eval_dashboard/ executes at all."""
+        marker = "import pathlib, sys\npathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    job_type="presubmit",
+                    pull_number="1043",
+                )
+                self.assert_skipped_once(result, code, "not a main-branch run")
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            self.assertEqual(list(dash.glob("*.ran")), [])
+
+    def test_an_unset_job_type_never_publishes(self):
+        """No JOB_TYPE means no proof this is main: skip, do not publish."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), "pass\n")
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    job_type="",
+                )
+                self.assert_skipped_once(result, code, "not a main-branch run")
+
+    def test_a_pull_number_never_publishes_whatever_job_type_claims(self):
+        """PULL_NUMBER present means pull-request content, as for the
+        baseline recorder; the job type label alone is not trusted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), "pass\n")
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    job_type="periodic",
+                    pull_number="1043",
+                )
+                self.assert_skipped_once(result, code, "PULL_NUMBER=1043")
 
     def test_missing_collect_py_skips_fast_and_preserves_the_exit_code(self):
         """This PR may merge before the siblings that add scripts/eval_dashboard/."""
@@ -164,6 +224,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 [
                     "set -euo pipefail",
                     f'SCRIPT_DIR="{fake_hack}"',
+                    'export JOB_TYPE="periodic" PULL_NUMBER=""',
                     'export EVAL_DASHBOARD_TARGET="gs://x/"',
                     lifted("publish_eval_dashboard"),
                     "publish_eval_dashboard",
