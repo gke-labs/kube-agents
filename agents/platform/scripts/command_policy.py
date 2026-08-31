@@ -409,6 +409,9 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--instance-selection-machine-types", "--size", "--types", "--zones",
         "--machine-type", "--provisioning-model", "--target-distribution-shape",
         "--instance-selection",
+        # gke-obtainability's Flex-Start capacity probe adds a run duration.
+        # Without the arity entry the allowlisted command is unreachable.
+        "--max-run-duration",
         # `compute routers list` scopes by --regions (plural), the router
         # analogue of the --zones trap above.
         "--regions",
@@ -882,6 +885,21 @@ def evaluate(argv: list[str]) -> Decision:
                 verb_tuple=verb,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
+            return _ALLOWED
+        # `apply` with an explicit `--dry-run=server|client` validates a
+        # manifest without persisting anything; the obtainability skill
+        # mandates it before attaching a generated ComputeClass as evidence.
+        # Unlike `diff` — excluded above because its server-side dry-run is
+        # implicit and its failure under a read-only grant reads as breakage —
+        # this form names its intent in the argv, and when RBAC refuses the
+        # dry-run the kubectl error itself is the recorded finding. Only the
+        # `=`-attached spelling counts: a bare `--dry-run` (client by
+        # default in some releases, none in others) stays refused.
+        if verb[:1] == ("apply",) and any(
+            token.partition("=")[0] == "--dry-run"
+            and token.partition("=")[2] in {"server", "client"}
+            for token in argv[1:]
+        ):
             return _ALLOWED
         return Decision(
             allowed=False,
