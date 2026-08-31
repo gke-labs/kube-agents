@@ -37,7 +37,7 @@ MOCK_COMMIT_MSG_BREAKING_PRE_1_0 = "feat(operator)!: break CRD schema format"
 MOCK_COMMIT_MSG_BREAKING_1_X = "feat!: remove deprecated v1alpha1 APIs"
 MOCK_COMMIT_MSG_BREAKING_BODY = "refactor: overhaul config format\n\nBREAKING CHANGE: old yaml spec is deprecated"
 
-# Shared mock fixtures for RC environment testing (provision_rc_environment.sh)
+# Shared mock fixtures for RC environment testing (provision_environment.sh)
 MOCK_GCP_PROJECT_ID = "mock-rc-project"
 MOCK_GCP_REGION = "us-central1"
 MOCK_GKE_CLUSTER_NAME = "mock-rc-cluster"

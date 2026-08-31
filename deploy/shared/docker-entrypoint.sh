@@ -1417,6 +1417,19 @@ if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     exec 9>&-
 fi
 
+# 4.5 The scratch directory where scripts stage `gh --body-file` payloads for
+# the credential sidecar (audit_report._write_temp, github_scan_gate._post_body).
+# Created HERE, deterministically and under this script's umask-0002 discipline
+# (the header comment on the #955 UID split), rather than lazily by whichever
+# process reaches it first with whatever umask it happens to carry: the sandbox
+# (uid 10000) writes these files and the sidecar (uid 10001) reads them through
+# the shared fsGroup, which only works if the directory is group-accessible.
+# The chmod also repairs a long-lived PVC where a pre-#955 process already
+# created it too tight; guarded because an already-correct dir owned by the
+# peer uid may refuse the chmod, and that is fine.
+mkdir -p "$TARGET_DIR/scratch"
+chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
+
 # 5. Start background microservices (FastAPI proxy)
 #
 # Primary only: this binds a fixed port in the pod's shared network namespace,

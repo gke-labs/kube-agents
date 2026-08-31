@@ -41,7 +41,7 @@ fi
 # state anywhere, so this engine has nothing to tear down. Expected against a
 # clean project, and the case an automated caller must be able to tell apart
 # from a teardown that tried and failed — scripts/release/
-# provision_rc_environment.sh branches on exactly this. Defined above on_error
+# provision_environment.sh branches on exactly this. Defined above on_error
 # because on_error reads it.
 EXIT_NOTHING_TO_TEAR_DOWN=3
 
@@ -234,7 +234,7 @@ resolve_state_location() {
   # means there is nothing to tear down. A bare `>/dev/null 2>&1` collapses 404,
   # 403, expired credentials, a network timeout and a missing gcloud into one
   # bit — and with exit 3 wired to "clean project", the 403 case would tell
-  # scripts/release/provision_rc_environment.sh to install over a live cluster.
+  # scripts/release/provision_environment.sh to install over a live cluster.
   #
   # `trap - ERR` inside the substitution: under bash 3.2 the inherited ERR trap
   # fires in this subshell even though the failure is the tested condition. The

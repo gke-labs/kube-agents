@@ -114,7 +114,12 @@ dump_prow_artifacts_on_failure() {
     kubectl logs deployment/platform-agent-gateway -n "${ns}" --tail=2000 > "${artifact_dir}/platform-agent-gateway.log" 2>&1 || true
     kubectl logs deployment/platform-agent-gateway -n "${ns}" --previous --tail=1000 > "${artifact_dir}/platform-agent-gateway-previous-crash.log" 2>&1 || true
     kubectl logs deployment/kube-agents-controller-manager -n "${ns}" --tail=1000 > "${artifact_dir}/controller-manager.log" 2>&1 || true
-    
+    # The gateway capture above reads the pod's default container (platform-agent);
+    # a dropped port-forward stream is only visible from the envoy sidecar's side.
+    kubectl logs deployment/platform-agent-gateway -c envoy-credential-proxy -n "${ns}" --tail=2000 > "${artifact_dir}/envoy-credential-proxy.log" 2>&1 || true
+    # Konnectivity/tunnel churn shows up as kube-system events, not in "${ns}".
+    kubectl get events -n kube-system --sort-by=.lastTimestamp 2>&1 | tail -100 > "${artifact_dir}/kube-system-events.txt" 2>&1 || true
+
     # 3. Detailed Pod Descriptions & K8s Events (explains image pull errors, scheduling blocks, OOMKilled, probe failures)
     kubectl describe pods -n "${ns}" > "${artifact_dir}/k8s-pod-descriptions.txt" 2>&1 || true
     kubectl get pods,svc,events -n "${ns}" -o wide > "${artifact_dir}/k8s-cluster-status.txt" 2>&1 || true

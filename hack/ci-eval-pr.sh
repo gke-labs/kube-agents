@@ -319,6 +319,17 @@ export BENCH_TF_ROOT="./tf"
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
 
+# The cluster the agent install runs on, for the one stack that needs it.
+# Every other stack under bench/tf builds its own cluster or reuses the seeded
+# slot-c one; prebuilt/autoops-incident can use neither, because the incident
+# it plants has to be seen by k8s-event-watcher, which runs as a peer process
+# inside the Platform Agent pod and reads events --in-cluster. An incident on
+# any other cluster is never detected, and the case waits out its timeout for
+# a card nobody filed. A stack that does not declare these ignores them.
+export TF_VAR_host_cluster_name="${HOST_CLUSTER_NAME}"
+export TF_VAR_host_cluster_location="${REGION}"
+export TF_VAR_agent_namespace="${TARGET_NAMESPACE}"
+
 # Per-run task-cluster name, derived from the Prow run identity. Within a
 # project, two runs can never race on one cluster because they never share a
 # name, and a "409 Already Exists" between runs is impossible by construction.
@@ -554,8 +565,8 @@ TASKS=(
   # TAIL; these three are measured -- 190s, 142s and 220s on build
   # 2092719124550520832 -- so ordering them first would protect the known at
   # the expense of the unknown, which is backwards. What they do need is to
-  # stay AHEAD of gpu-stress-test-diagnosis below, the array's only
-  # `deployer: tofu` entry, which spends minutes provisioning a cluster
+  # stay AHEAD of gpu-stress-test-diagnosis below, the first of the array's two
+  # `deployer: tofu` entries, which spends minutes provisioning a cluster
   # before it scores anything. All three are `deployer: noop`.
   #
   # A fourth is commented out beneath them, and why is worth reading before
@@ -596,7 +607,18 @@ TASKS=(
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # Twelve registered scenarios stay commented out. The task-registration lint
+  # Last, because it is the only entry that pays twice. Its stack plants an
+  # OOM-killed workload on the host cluster and blocks until the event
+  # watcher's leading-edge debounce clears and the incident opens (~1 minute,
+  # bounded at 12), and then the agent turn itself waits on the AutoOps card,
+  # which ran a median of ~7 minutes across 83 completed k8s-evt-* cards on
+  # the live install. Everything above it has scored by the time that starts.
+  #
+  # It provisions no cluster despite being deployer: tofu -- see the header of
+  # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
+  # is the host cluster and not the per-run one that gets the incident.
+  "./tasks/autoops-warning-event-triage/task.yaml"
+  # Eleven registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
   # an UNCOMMENTED one, so activating a scenario also deletes its domain from
@@ -690,14 +712,10 @@ TASKS=(
   #       objective on a correct system until the harness can target an agent
   #       per task. It costs no domain coverage: the two kanban probes already
   #       cover chat-and-routing.
-  #   --  autoops-warning-event-triage is not activatable by uncommenting at
-  #       all. Its prompt is a meta-note and nothing applies its incident
-  #       workload; it needs a scenario driver, tracked as #954.
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/fleet-cost-idle-pool/task.yaml"
-  # "./tasks/autoops-warning-event-triage/task.yaml"
   #
-  # Refusal variant of cluster debugging, and not one of the ten above. Its
+  # Refusal variant of cluster debugging, and not one of the nine above. Its
   # compliant answer is a pull request on the eval GitOps repo, so it was A1's
   # until A1 closed; A5's residual is the same privilege gap every fleet case
   # carries. It is graded as a platform-agent case rather than a cluster-agent

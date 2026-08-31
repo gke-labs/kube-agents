@@ -1,0 +1,102 @@
+✓ boskosctl v0.0.0-20260730151943-11fb0c84248b restored from GCS
+=== [2026-08-27T17:39:08Z] Leasing GCP Project from Boskos ===
+✓ Successfully leased project: kube-agents-evals-5
+Installed helm v3.21.4 (amd64) to /tmp/kube-agents-helm-v3.21.4-amd64
+=== Target Cluster Context ===
+Project:   kube-agents-evals-5
+=== [2026-08-27T17:39:15Z] Step 2: Deleting CRDs ===
+✓ CRD deletion finished in 1s
+=== [2026-08-27T17:39:16Z] Cleanup Complete (Total Duration: 3s) ===
+=== [2026-08-27T17:39:16Z] Running GKE Cluster Connectivity Verification ===
+=== [2026-08-27T17:39:16Z] Sourcing GKE Cluster Credentials ===
+Fetching cluster endpoint and auth data.
+kube-system                         Active   26h
+kubeagents-system                   Active   26h
+=== [2026-08-27T17:39:21Z] Connectivity Smoke Test Passed (Duration: 5s) ===
+Installed helm v3.21.4 (amd64) to /tmp/kube-agents-helm-v3.21.4-amd64
+GitOps repo: gke-agentic/kube-agents-evals-5-infra (mapped from PROJECT_ID=kube-agents-evals-5)
+GitHub token minter: enabled for gke-agentic/kube-agents-evals-5-infra (app 4675512)
+heartbeat sent for resource "kube-agents-evals-5"
+✓ Agent API Server responded successfully in 43s!
+=== [2026-08-27T17:56:47Z] Deployment Ready in Namespace: kubeagents-system (Total Duration: 1046s) ===
+--- [PROFILE 2026-08-27T17:56:47Z] step: bootstrap: source ci-env.sh ---
+=== [2026-08-27T17:56:47Z] Running PR Smoke Test Evaluation for PR #998 in Namespace: kubeagents-system ===
+--- [PROFILE 2026-08-27T17:56:47Z] step: cluster-auth: gcloud get-credentials ---
+=== [2026-08-27T17:56:47Z] Authenticating to GKE Cluster ===
+Fetching cluster endpoint and auth data.
+    (agent latency from results.json: 109.5s)
+Task reliability-pdb-probe ChecklistScore: n/a
+Task reliability-pdb-probe Result: [PASSED] exact checks green; OutcomeValidity recorded: 1.0 (Duration: 168s)
+--- [PROFILE 2026-08-27T17:59:59Z] step: task capacity-pinned-pool-probe: devops-bench run ---
+>>> [2026-08-27T17:59:59Z] Running Task: capacity-pinned-pool-probe (./tasks/capacity-pinned-pool-probe/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 130.7s)
+Task capacity-pinned-pool-probe ChecklistScore: n/a
+Task capacity-pinned-pool-probe Result: [PASSED] exact checks green; OutcomeValidity recorded: 1.0 (Duration: 175s)
+--- [PROFILE 2026-08-27T18:02:54Z] step: task security-overgrant-probe: devops-bench run ---
+>>> [2026-08-27T18:02:54Z] Running Task: security-overgrant-probe (./tasks/security-overgrant-probe/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 126.8s)
+Task security-overgrant-probe ChecklistScore: n/a
+Task security-overgrant-probe Result: [PASSED] exact checks green; OutcomeValidity recorded: 0.6 (Duration: 166s)
+--- [PROFILE 2026-08-27T18:05:40Z] step: task upgrades-lagging-master-probe: devops-bench run ---
+>>> [2026-08-27T18:05:40Z] Running Task: upgrades-lagging-master-probe (./tasks/upgrades-lagging-master-probe/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 95.6s)
+Task upgrades-lagging-master-probe ChecklistScore: n/a
+Task upgrades-lagging-master-probe Result: [PASSED] exact checks green; OutcomeValidity recorded: 0.9 (Duration: 136s)
+--- [PROFILE 2026-08-27T18:07:56Z] step: task consistency-authorized-networks-probe: devops-bench run ---
+>>> [2026-08-27T18:07:56Z] Running Task: consistency-authorized-networks-probe (./tasks/consistency-authorized-networks-probe/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 257.0s)
+Task consistency-authorized-networks-probe ChecklistScore: n/a
+Task consistency-authorized-networks-probe Result: [PASSED] exact checks green; OutcomeValidity recorded: 1.0 (Duration: 301s)
+--- [PROFILE 2026-08-27T18:12:57Z] step: task cost-idle-pool-probe: devops-bench run ---
+>>> [2026-08-27T18:12:57Z] Running Task: cost-idle-pool-probe (./tasks/cost-idle-pool-probe/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 167.3s)
+Task cost-idle-pool-probe ChecklistScore: n/a
+Task cost-idle-pool-probe Result: [PASSED] exact checks green; OutcomeValidity recorded: 0.8 (Duration: 215s)
+--- [PROFILE 2026-08-27T18:16:32Z] step: task rca-remediation-pr: devops-bench run ---
+>>> [2026-08-27T18:16:32Z] Running Task: rca-remediation-pr (./tasks/rca-remediation-pr/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 201.4s)
+Task rca-remediation-pr ChecklistScore: n/a
+Task rca-remediation-pr Result: [FAILED] VerificationCorrectness=0.0 (floor 1.0) | OutcomeValidity recorded: 0.0 (Duration: 243s)
+--- [PROFILE 2026-08-27T18:20:35Z] step: task compliance-rbac-overgrant: devops-bench run ---
+>>> [2026-08-27T18:20:35Z] Running Task: compliance-rbac-overgrant (./tasks/compliance-rbac-overgrant/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+         41.2s  100.0%  total devops-bench run
+    (agent latency from results.json: 3.4s)
+⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task compliance-rbac-overgrant resource creation, teardown, or agent transport failed! (The evaluation is skipped)
+Saved resource preparation log to artifact: /logs/artifacts/resource_prep_failure_compliance-rbac-overgrant.log
+Task compliance-rbac-overgrant Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown or agent transport error (Duration: 41s)
+--- [PROFILE 2026-08-27T18:21:16Z] step: task cluster-agent-crashloop-debug: devops-bench run ---
+>>> [2026-08-27T18:21:16Z] Running Task: cluster-agent-crashloop-debug (./tasks/cluster-agent-crashloop-debug/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 220.8s)
+Task cluster-agent-crashloop-debug ChecklistScore: n/a
+Task cluster-agent-crashloop-debug Result: [FAILED] VerificationCorrectness=0.0 (floor 1.0) | OutcomeValidity recorded: 0.0 (Duration: 260s)
+--- [PROFILE 2026-08-27T18:25:36Z] step: task gpu-stress-test-diagnosis: devops-bench run ---
+>>> [2026-08-27T18:25:37Z] Running Task: gpu-stress-test-diagnosis (./tasks/gpu-stress-test-diagnosis/task.yaml) <<<
+Executing with deployer=tofu BENCH_NO_INFRA=false
+    (agent latency from results.json: 109.2s)
+Task gpu-stress-test-diagnosis ChecklistScore: 0.5 (Passed 2 out of 4 checks.)
+Task gpu-stress-test-diagnosis Result: [PASSED] exact checks green; OutcomeValidity recorded: 1.0 (Duration: 270s)
+--- [PROFILE 2026-08-27T18:30:06Z] step: task agent-kanban-smoke: devops-bench run ---
+>>> [2026-08-27T18:30:06Z] Running Task: agent-kanban-smoke (./tasks/agent-kanban-smoke/task.yaml) <<<
+Executing with deployer=noop BENCH_NO_INFRA=false
+    (agent latency from results.json: 99.4s)
+Task agent-kanban-smoke ChecklistScore: n/a
+Task agent-kanban-smoke Result: [PASSED] exact checks green; OutcomeValidity recorded: 1.0 (Duration: 144s)
+--- [PROFILE 2026-08-27T18:32:30Z] step: final gate + summary ---
+⚠️ [2026-08-27T18:32:30Z] Infrastructure failed for tasks (not counted against the PR): compliance-rbac-overgrant
+❌ [2026-08-27T18:32:30Z] PR Smoke Test Evaluation Failed for tasks: rca-remediation-pr cluster-agent-crashloop-debug (Total Duration: 2143s)
+
+=== Step timing profile (exit code 1) ===
+  start(s)     dur(s)       %  step
+customresourcedefinition.apiextensions.k8s.io "platformagents.kubeagents.x-k8s.io" deleted
+✓ CRD deletion finished in 1s
+=== [2026-08-27T18:33:12Z] Cleanup Complete (Total Duration: 38s) ===
+=== [2026-08-27T18:33:12Z] Releasing Boskos Project: kube-agents-evals-5 ===
+released resource "kube-agents-evals-5"

@@ -1,4 +1,4 @@
-"""Unit tests for scripts/release/teardown_rc_environment.sh.
+"""Unit tests for scripts/release/teardown_environment.sh.
 
 The post-run teardown is the only thing that removes the RC cluster on a run
 that passed, so its failure handling is the opposite of the pre-install
@@ -26,10 +26,10 @@ from tests.testing.release import (
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_TEARDOWN_RC_SCRIPT = _REPO_ROOT / "scripts" / "release" / "teardown_rc_environment.sh"
+_TEARDOWN_SCRIPT = _REPO_ROOT / "scripts" / "release" / "teardown_environment.sh"
 
 
-class TeardownRcEnvironmentTest(unittest.TestCase):
+class TeardownEnvironmentTest(unittest.TestCase):
     def _run(self, uninstall_exit, extra_env=None, uninstall_stdout=""):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -64,7 +64,7 @@ exit {uninstall_exit}
             }
         )
         proc = subprocess.run(
-            ["bash", str(_TEARDOWN_RC_SCRIPT)],
+            ["bash", str(_TEARDOWN_SCRIPT)],
             capture_output=True,
             text=True,
             env=env,
@@ -76,7 +76,7 @@ exit {uninstall_exit}
     def test_fails_when_required_env_vars_missing(self):
         """set -u aborts before the script creates a temp file or calls out."""
         proc = subprocess.run(
-            ["bash", str(_TEARDOWN_RC_SCRIPT)],
+            ["bash", str(_TEARDOWN_SCRIPT)],
             capture_output=True,
             text=True,
             env={},
@@ -125,7 +125,7 @@ exit {uninstall_exit}
             uninstall_exit=1, uninstall_stdout="destroy blew up here"
         )
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("::error title=RC teardown failed::", proc.stderr)
+        self.assertIn("::error title=Environment teardown failed::", proc.stderr)
         self.assertIn("STILL RUNNING", proc.stderr)
         self.assertIn("still running (exit 1)", summary)
         self.assertIn("destroy blew up here", summary)

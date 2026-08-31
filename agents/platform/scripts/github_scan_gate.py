@@ -411,18 +411,34 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     in its own filesystem; `/tmp` is a per-container emptyDir, so a
     `--body-file /tmp/…` path names a file the other container cannot open. The
     refusal then fails with "no such file" — observed live before this moved.
-    `audit_report._write_temp` documents the same trap. Falls back to the system
-    temp directory when the volume is absent, so tests still run off-cluster.
+    `audit_report._write_temp` documents the same trap, and a second one: since
+    #955 the sandbox (uid 10000) and the sidecar (uid 10001) are different
+    users, so the 0600 file `NamedTemporaryFile` creates must be `fchmod`ed
+    group-readable or the sidecar cannot open it even on the shared volume.
+
+    NO fallback to the system temp directory when the volume is absent: the
+    sidecar can never see this container's private tmp, so in-cluster that
+    fallback turned a fixable mount problem into a guaranteed failure that read
+    as a graceful degrade (#1030). Raise instead — the per-sweep try in `main`
+    turns it into a warning the room sees. Tests patch SCRATCH_DIR.
     """
-    directory: str | None = SCRATCH_DIR
     try:
         Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-    except OSError:
-        directory = None
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix=".md", delete=False, dir=directory
-    )
+        handle = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".md", delete=False, dir=SCRATCH_DIR
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "publish path broken: cannot stage a body file in the shared "
+            f"scratch directory {SCRATCH_DIR} (uid {os.getuid()}): {exc}. "
+            "The credential sidecar resolves body-file paths in its own "
+            "filesystem, so a container-private temp file can never work — "
+            "fix the shared mount/permissions (see gke-labs/kube-agents#1030)."
+        ) from exc
     try:
+        # Group-readable across the #955 uid split; owner-only is unreadable
+        # to the sidecar that actually runs `gh`.
+        os.fchmod(handle.fileno(), 0o664)
         handle.write(body)
         handle.close()
         provider.post_comment(repo, pr, handle.name)

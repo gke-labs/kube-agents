@@ -230,7 +230,7 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   an `always()` added later removes the implicit `success()` and the job runs anyway. Two classes
   need no guard: a workflow reachable only through `workflow_call` is gated by its caller
   (`reusable-deploy-*.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
-  starts it (`rc-create-tag.yml`, `rc-deploy-environment.yml`, `rc-tag-validated.yml`,
+  starts it (`rc-create-tag.yml`, `deploy-environment.yml`, `rc-tag-validated.yml`,
   `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
   can publish its own Pages site.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of

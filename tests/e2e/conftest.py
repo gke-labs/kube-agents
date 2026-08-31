@@ -44,8 +44,12 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
-    """Fallback parser for simple environments list and env_vars in e2e_config.yaml."""
-    result: Dict[str, Any] = {"defaults": {}, "environments": []}
+    """Fallback parser for a simple suites list and env_vars in e2e_config.yaml.
+
+    Keys off `- name:` blocks rather than the top-level key, so `suites:` and the
+    legacy `environments:` spelling both parse.
+    """
+    result: Dict[str, Any] = {"defaults": {}, "suites": []}
     current_env: Optional[Dict[str, Any]] = None
     in_env_vars = False
     for line in content.splitlines():
@@ -55,7 +59,7 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
         if stripped.startswith("- name:"):
             in_env_vars = False
             if current_env:
-                result["environments"].append(current_env)
+                result["suites"].append(current_env)
             name = stripped.split(":", 1)[1].strip().strip('"\'')
             current_env = {"name": name, "tests": [], "env_vars": {}}
         elif current_env and stripped.startswith("- ") and "tests/" in stripped:
@@ -80,7 +84,7 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
             if key in ("project_id", "cluster_name", "region", "namespace", "description"):
                 current_env[key] = val
     if current_env:
-        result["environments"].append(current_env)
+        result["suites"].append(current_env)
     return result
 
 
@@ -95,8 +99,17 @@ def _get_default_config_env() -> Dict[str, Any]:
         cfg = _parse_yaml_fallback(content)
 
     defaults = (cfg or {}).get("defaults", {})
-    envs = (cfg or {}).get("environments", [])
-    default_env_name = os.environ.get("E2E_ENV") or defaults.get("default_environment", "investigations-e2e")
+    # `suites:`/`E2E_SUITE`/`default_suite` are the names; the `environment`
+    # spellings beside each are the pre-rename ones, read for one release so a
+    # checkout mid-migration still resolves fixtures. execute_e2e_tests.py exports
+    # both variables, so this fallback only matters when pytest is driven directly.
+    envs = (cfg or {}).get("suites") or (cfg or {}).get("environments", [])
+    default_env_name = (
+        os.environ.get("E2E_SUITE")
+        or os.environ.get("E2E_ENV")
+        or defaults.get("default_suite")
+        or defaults.get("default_environment", "investigations")
+    )
     default_env = next((e for e in envs if e.get("name") == default_env_name), {})
     return {
         "env_vars": default_env.get("env_vars", {}),
@@ -199,9 +212,9 @@ def _qualify_repo(repo: Optional[str]) -> Optional[str]:
 
     The owner comes from GITHUB_ORG or, failing that, e2e_config.yaml. Most environments
     hard-code it there, and a bare name is composed against that default whenever nothing
-    more specific is set. `rc-e2e` is the exception: it sets neither, because the same
-    pair scopes the token minter at install time and a value written in two places
-    drifts, so rc-release-pipeline.yml passes the `rc` environment's GITOPS_ORG and
+    more specific is set. `rc` and `nightly` are the exceptions: they set neither,
+    because the same pair scopes the token minter at install time and a value written in
+    two places drifts, so e2e-run.yml passes the bound environment's GITOPS_ORG and
     GITOPS_REPO instead. With those unset there is no owner to compose against and a bare
     name is returned unqualified, which github_repo's caller then reports as a structure
     failure rather than resolving to the wrong repository.

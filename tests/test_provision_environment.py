@@ -1,4 +1,4 @@
-"""Unit tests for scripts/release/provision_rc_environment.sh.
+"""Unit tests for scripts/release/provision_environment.sh.
 
 Tests parameter forwarding to uninstall.sh and install.sh, error handling,
 and strict environment variable validation.
@@ -36,14 +36,14 @@ from tests.testing.release import (
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_PROVISION_RC_SCRIPT = _REPO_ROOT / "scripts" / "release" / "provision_rc_environment.sh"
+_PROVISION_SCRIPT = _REPO_ROOT / "scripts" / "release" / "provision_environment.sh"
 
 
-class ProvisionRcEnvironmentTest(unittest.TestCase):
+class ProvisionEnvironmentTest(unittest.TestCase):
     def test_fails_when_required_env_vars_missing(self):
         """Ensures set -u aborts execution if required environment variables are absent."""
         proc = subprocess.run(
-            ["bash", str(_PROVISION_RC_SCRIPT)],
+            ["bash", str(_PROVISION_SCRIPT)],
             capture_output=True,
             text=True,
             env={},  # Empty environment
@@ -93,7 +93,7 @@ exit 0
             )
 
             proc = subprocess.run(
-                ["bash", str(_PROVISION_RC_SCRIPT)],
+                ["bash", str(_PROVISION_SCRIPT)],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -169,7 +169,7 @@ exit 0
                     )
 
                     proc = subprocess.run(
-                        ["bash", str(_PROVISION_RC_SCRIPT)],
+                        ["bash", str(_PROVISION_SCRIPT)],
                         capture_output=True,
                         text=True,
                         env=env,
@@ -210,7 +210,7 @@ exit 0
             )
 
             proc = subprocess.run(
-                ["bash", str(_PROVISION_RC_SCRIPT)],
+                ["bash", str(_PROVISION_SCRIPT)],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -280,7 +280,7 @@ exit 0
             }
         )
         proc = subprocess.run(
-            ["bash", str(_PROVISION_RC_SCRIPT)],
+            ["bash", str(_PROVISION_SCRIPT)],
             capture_output=True,
             text=True,
             env=env,
@@ -304,9 +304,9 @@ exit 0
         # Still not fatal by default — see the comment on the case arm — but
         # the run carries an annotation and the job summary carries the output.
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("::error title=RC teardown failed::", proc.stderr)
+        self.assertIn("::error title=Environment teardown failed::", proc.stderr)
         self.assertIn("exited 1", proc.stderr)
-        self.assertIn("RC teardown failed (exit 1)", summary)
+        self.assertIn("Environment teardown failed (exit 1)", summary)
         self.assertIn("teardown blew up here", summary)
         self.assertEqual(calls[-1], MOCK_INSTALL_SUCCESS_SIGNAL)
 
@@ -315,7 +315,7 @@ exit 0
             uninstall_exit=1, extra_env={"RC_TEARDOWN_STRICT": "true"}
         )
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("RC teardown failed (exit 1)", summary)
+        self.assertIn("Environment teardown failed (exit 1)", summary)
         self.assertNotIn(MOCK_INSTALL_SUCCESS_SIGNAL, calls)
 
     def test_strict_mode_accepts_what_the_installer_calls_truthy(self):
@@ -335,6 +335,36 @@ exit 0
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC_TEARDOWN_STRICT not understood", proc.stderr)
+        self.assertEqual(calls[-1], MOCK_INSTALL_SUCCESS_SIGNAL)
+
+    def test_the_unprefixed_strict_name_works_on_its_own(self):
+        """TEARDOWN_STRICT is the name; the RC_-prefixed one is the legacy spelling.
+
+        The rename is only safe because both are read. Dropping the fallback
+        before the GitHub environment settings are updated turns strict teardown
+        off with no error, so each half is pinned separately.
+        """
+        proc, calls, _ = self._run(
+            uninstall_exit=1, extra_env={"TEARDOWN_STRICT": "true"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertNotIn(MOCK_INSTALL_SUCCESS_SIGNAL, calls)
+
+    def test_the_legacy_strict_name_still_works_on_its_own(self):
+        """An environment nobody has migrated yet keeps strict teardown."""
+        proc, calls, _ = self._run(
+            uninstall_exit=1, extra_env={"RC_TEARDOWN_STRICT": "true"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertNotIn(MOCK_INSTALL_SUCCESS_SIGNAL, calls)
+
+    def test_the_new_strict_name_wins_over_a_stale_legacy_one(self):
+        """A migrated environment must not be overridden by a copy nobody deleted."""
+        proc, calls, _ = self._run(
+            uninstall_exit=1,
+            extra_env={"TEARDOWN_STRICT": "false", "RC_TEARDOWN_STRICT": "true"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls[-1], MOCK_INSTALL_SUCCESS_SIGNAL)
 
     def test_teardown_output_cannot_break_out_of_the_summary_fence(self):
@@ -399,7 +429,7 @@ exit {install_exit}
         base.update(overrides)
 
         proc = subprocess.run(
-            ["bash", str(_PROVISION_RC_SCRIPT)],
+            ["bash", str(_PROVISION_SCRIPT)],
             capture_output=True,
             text=True,
             env=get_isolated_test_env(overrides=base),
@@ -479,7 +509,7 @@ exit {install_exit}
         self.assertIn("::error", combined)
 
     def test_a_partial_minter_config_refuses_before_the_teardown(self):
-        """The guard has to sit above `rc_teardown_run`, not merely above install.sh.
+        """The guard has to sit above `teardown_run`, not merely above install.sh.
 
         This script is uninstall.sh followed by install.sh. A guard placed after the
         teardown refuses an environment it has already destroyed and leaves the RC

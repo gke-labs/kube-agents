@@ -1,4 +1,4 @@
-name: RC Step 1 - Create Candidate Tag
+name: "RC: Create Candidate Tag"
 
 permissions:
   contents: read

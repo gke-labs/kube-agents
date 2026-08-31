@@ -45,6 +45,7 @@ class SpecToolRegistryTest(unittest.TestCase):
     # (deploy/docker/patches/*kanban*); a name added here needs the same.
     HERMES_BUILTIN_TOOLS = {
         "kanban_create",
+        "kanban_list",
         "kanban_show",
         "kanban_complete",
         "kanban_block",
