@@ -152,13 +152,13 @@ Against the credential requirements this mechanism is short-lived, audience-boun
 
 ### This blocks nothing today
 
-**Turning this on does not take any egress away from the agent Pod. It cannot.** Adding a NetworkPolicy is a monotone operation: policies selecting one Pod are unioned, the Pod may send whatever any of them permits, and the API has no deny rule at all. The agent Pod is already selected for egress by `<name>-gateway-netpol`, which the operator renders on every reconcile whether or not you set this field, so with the flag on the Pod's permitted egress is a strict _superset_ of what it was with the flag off. In the default shape it adds the credential broker on TCP 8765, and — when the agent is not exporting telemetry — the collector namespace on 4317/4318, because the gateway policy renders its own OTel rule only while there is an endpoint to export to and this one is rendered unconditionally. This branch's own golden fixture is that case: `gke-managed-otel` appears in the new policy and not in the gateway one.
+**Turning this on does not take any egress away from the agent Pod. It cannot.** Adding a NetworkPolicy is a monotone operation: policies selecting one Pod are unioned, the Pod may send whatever any of them permits, and the API has no deny rule at all. The agent Pod is already selected for egress by `<name>-gateway-netpol`, which the operator renders on every reconcile whether or not you set this field, so with the flag on the Pod's permitted egress is a strict _superset_ of what it was with the flag off. In the default shape it adds the credential broker on TCP 8765, and — when the agent is not exporting telemetry — the collector namespace on 4317/4318, because the gateway policy renders its own OTel rule only while there is an endpoint to export to and this one is rendered unconditionally. The `platformagent-egress-allowlist` golden fixture is that case: `gke-managed-otel` appears in the new policy and not in the gateway one.
 
-That holds in every install shape, on every CNI, enforcing or not. It is a property of the API, not of a particular cluster.
+That holds wherever the gateway policy is rendered, which is every install shape but one: `spec.networkPolicy.enabled: false` stops the operator rendering `<name>-gateway-netpol` at all and deletes one it owns. On that install this policy is the only one selecting the agent Pod, and on an enforcing CNI it then default-denies for real — the metadata server, but also GitHub, web search, external 443 and everything else not on the six-rule allowlist. Everywhere else it is a property of the API, not of a particular cluster.
 
 What `<name>-gateway-netpol` already permits, and this therefore cannot remove:
 
-- `169.254.169.254/32` on TCP 80 and 8080, and `169.254.169.252/32` on TCP 988 — the pre- and post-DNAT forms of a metadata request. The metadata path stays open.
+- `169.254.169.254/32` on TCP 80, plus TCP 988 to both link-local metadata addresses — the pre- and post-DNAT forms of a metadata request. The metadata path stays open.
 - TCP 443 to `0.0.0.0/0` minus the private ranges, unless FQDNNetworkPolicy is enabled. Every HTTPS destination on the public internet stays open, and with it the exfiltration half of what this is meant to be.
 
 `platform-agent-core-egress` from [`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) permits the same metadata path and selects the agent Pod by `app.kubernetes.io/name`. Kustomize installs have it; Helm installs do not. It changes nothing either way — the gateway policy alone settles the point.
@@ -167,7 +167,7 @@ The overlap is deliberate rather than an accident. Workload Identity needs that 
 
 **So what is it for today?** Two things, neither of them enforcement. It renders an auditable statement of the destinations the agent is supposed to need, as an object you can diff and a reviewer can read. And it settles the field, the refusal rules and the reconcile behaviour now, so that narrowing the gateway policy later is a one-policy change rather than a new feature. If you were planning a capability-impact review before enabling this, you do not need one yet; [what it will cost](#what-it-will-cost-once-it-does-block-something) says when you will.
 
-The complementary control is removing the `iam.gke.io/gcp-service-account` annotation from the agent Pod's ServiceAccount once the broker has one of its own — deny the route versus remove the identity. That one does not depend on the CNI at all, and unlike this it would take something away immediately. It is separate work and is not in this change.
+The complementary control is removing the `iam.gke.io/gcp-service-account` annotation from the agent Pod's ServiceAccount once the broker has one of its own — deny the route versus remove the identity. That one does not depend on the CNI at all, and unlike this it would take something away immediately. It is separate, planned work.
 
 ### The other conditions, plainly
 
@@ -191,7 +191,7 @@ The two refusal reasons differ in one way that matters:
 
 **Setting `egressPolicy: None` does not delete the policy.** The operator will not remove a guardrail it may not have created, so `<name>-sandbox-metadata-deny` stays in the namespace after the field goes off. On its own that is fail-closed and fine: the Pod it selects keeps a door shut that nothing is asking to open.
 
-It stops being fine the moment `splitCredentialBrokerPod` goes off too, and the tempting way to get there is exactly the wrong one. Reverting the split alone is refused — the agent goes `Degraded` with `EgressPolicyRequiresSplitBroker` — so the obvious next move is to clear `egressPolicy` in the same edit and unstick it. Do that and the broker comes back into the agent Pod, where the leftover policy is still selecting it.
+It stops being fine the moment `splitCredentialBrokerPod` goes off too, and the tempting way to get there is exactly the wrong one. Reverting the split alone is refused — the agent goes `Degraded` with `EgressPolicyRequiresSplitBroker`, while the broker and the running agent are left untouched — so the obvious next move is to clear `egressPolicy` in the same edit and unstick it. Do that and the broker comes back into the agent Pod, where the leftover policy is still selecting it. Today the gateway policy's union hides that, by this page's own argument above; the moment the gateway policy is narrowed or withheld, the same two-field edit is a broker with no metadata server. Treat the order as required rather than leaning on the union.
 
 Revert in three steps instead, which never leaves the broker inside a policy written for the sandbox:
 
@@ -208,7 +208,7 @@ Two things to verify on the cluster, neither of which the operator can check for
 
 ### What it will cost, once it does block something
 
-**None of this happens today.** Every destination below is one `<name>-gateway-netpol` still permits to the same Pod, so on a current install you can enable the flag and observe no behaviour change in either direction. This is the bill that falls due once the gateway policy is narrowed, and it is here so that the narrowing is not a surprise.
+**None of this happens today** — with the one exception above: an install running `spec.networkPolicy.enabled: false` on an enforcing CNI pays this whole bill the moment the flag goes on. Everywhere else, every destination below is one `<name>-gateway-netpol` still permits to the same Pod, so you can enable the flag and observe no behaviour change in either direction. This is the bill that falls due once the gateway policy is narrowed, and it is here so that the narrowing is not a surprise.
 
 At that point the allowlist covers DNS, the broker, LiteLLM and the OTel collector, and everything the agent container reaches on its own would go away:
 

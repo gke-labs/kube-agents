@@ -70,9 +70,9 @@ package controller
 //   - It can be undone from outside, and today it is. Policies selecting one
 //     Pod are additive, and two others select this one and permit the metadata
 //     path: <name>-gateway-netpol, which this same operator renders on every
-//     reconcile (buildNetworkPolicy — 169.254.169.254/32 on TCP 80 and 8080,
-//     169.254.169.252/32 on TCP 988, and TCP 443 to 0.0.0.0/0 minus the
-//     private ranges), and platform-agent-core-egress from
+//     reconcile (buildNetworkPolicy — 169.254.169.254/32 on TCP 80, TCP 988
+//     to both link-local metadata addresses, and TCP 443 to 0.0.0.0/0 minus
+//     the private ranges), and platform-agent-core-egress from
 //     deploy/kustomize/platform, on installs that apply it. So the policy
 //     below denies the metadata server, and the Pod it selects can still
 //     reach it. Narrowing the gateway policy is not done here: Workload

@@ -147,7 +147,8 @@ identifier appears, add its source here.
 | Shared agent defaults (`approvals.*`, `security.*`) | `deploy/shared/defaults/config.yaml` and `renderConfigYAML()` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go` |
 | OTLP endpoint default, discovery candidates, and `otlpEndpointSource` values | `k8s-operator/internal/controller/telemetry.go` |
-| DNS/metadata-daemon defaults, the `dnsClusterIPsSource` / `metadataDaemonIPSource` values, and the egress prefix floors | `k8s-operator/internal/controller/netpolprofile.go` and `platformagent_controller.go` |
+| DNS/metadata-daemon defaults, the `dnsClusterIPsSource` / `metadataDaemonIPSource` values, and the `additionalEgress` prefix floors (`/12`, `/48`) | `k8s-operator/internal/controller/netpolprofile.go` and `platformagent_controller.go` |
+| Agent egress-allowlist policy: metadata addresses, the `-sandbox-metadata-deny` name, the `controlPlaneCIDRs` floors (`/16`, `/32`), and the `EgressPolicyRequiresSplitBroker` / `EgressAllowlistRefused` reasons | `k8s-operator/internal/controller/platformagent_egress_policy.go` and `platformagent_controller.go` |
 | Image inventory: every image an install pulls, and its upstream pin | `images.json` |
 | Registry prefix defaults (`REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`) | `k8s-operator/scripts/common.sh` |
 | Provisioning image-tag attachment (`qualify_image_ref`) | `k8s-operator/scripts/common.sh` |
@@ -359,7 +360,7 @@ only what the title does not say.
 | `reference/glossary.md` | Site page | Human-facing glossary of kube-agents and ecosystem terminology. | Terminology | Distinct from the runtime `agents/platform/docs/glossary.md` |
 | `reference/attribution.md` | Site page | Operator-facing runbook for connecting an agent action back to the requesting human; query recipes. | Attribution contract, trust boundary | Summarizes `docs/designs/audit-logging-user-attribution.md` |
 | `reference/security-and-iam.md` | Site page | What the agent is and is not permitted to do: Workload Identity model, IAM permission sets, read-only Kubernetes RBAC, auditing posture. | Identity, permission sets, read-only mode | Canonical home for agent permissions per `AGENTS.md` |
-| `reference/credential-isolation.md` | Site page | How the operator keeps credentials out of the agent sandbox via the Envoy sidecar. | Pod anatomy, request paths, limitation, troubleshooting | Defers to `docs/credential-isolation-design.md`; owns troubleshooting |
+| `reference/credential-isolation.md` | Site page | How the operator keeps credentials out of the agent sandbox via the Envoy sidecar. | Pod anatomy, request paths, limitation, troubleshooting, broker split, egress allowlist | Defers to `docs/credential-isolation-design.md`; owns troubleshooting and the `egressPolicy` topic |
 | `reference/resource-labels.md` | Site page | The `app.kubernetes.io` labels stamped on every object the project installs, and how to select on them. | Label contract, selector immutability, query recipes | Canonical home for the label contract; complements `reference/attribution.md` |
 | `skills/index.mdx` | Site page | The skill catalog; the grouped table is a **generated region** sourced from every skill's `SKILL.md` frontmatter. | Skill roster by area | Do not hand-edit the table; `make docs-generate` |
 

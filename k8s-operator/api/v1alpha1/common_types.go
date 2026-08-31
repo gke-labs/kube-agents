@@ -568,7 +568,11 @@ type SecuritySpec struct {
 	// them permits — and the API has no deny rule, so an added policy is a
 	// monotone operation. It cannot subtract. The agent Pod is already selected
 	// for egress by <name>-gateway-netpol, which the operator renders on every
-	// reconcile whether this field is set or not, so turning this on leaves the
+	// reconcile whether this field is set or not — unless
+	// spec.networkPolicy.enabled is false, which withholds the gateway policy
+	// and makes this the Pod's only policy: the one shape where this field
+	// enforces for real on an enforcing CNI, denying everything off its list.
+	// Everywhere else, turning this on leaves the
 	// Pod's permitted egress a strict superset of what it was. In the default
 	// shape the only destination it adds is the credential broker on TCP 8765
 	// — plus, when the agent is not exporting telemetry, the collector
@@ -579,9 +583,10 @@ type SecuritySpec struct {
 	// What the gateway policy already permits, and therefore what this cannot
 	// take away:
 	//
-	//   - 169.254.169.254/32 on TCP 80 and 8080, and 169.254.169.252/32 on TCP
-	//     988 — the pre- and post-DNAT forms of a metadata request. So the
-	//     metadata path stays open.
+	//   - 169.254.169.254/32 on TCP 80, plus TCP 988 to both link-local
+	//     metadata addresses — the pre- and post-DNAT forms of a metadata
+	//     request (the 988 rule is suppressed when the resolved metadata
+	//     daemon IP is empty). So the metadata path stays open.
 	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
@@ -667,13 +672,17 @@ type SecuritySpec struct {
 	// Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
 	// that call the broker, and the broker is on the allowlist.
 	//
-	// TURNING THIS OFF DOES NOT DELETE THE POLICY, and reverting both flags
-	// together will break the agent. An egress policy is a guardrail, and the
-	// operator will not remove a guardrail it may not have created, so setting
-	// this back to "None" leaves <name>-sandbox-metadata-deny in place. That
-	// is fail-closed and harmless on its own — but it is not harmless
-	// alongside splitCredentialBrokerPod: false, because the broker returns to
-	// the Pod the leftover policy selects.
+	// TURNING THIS OFF DOES NOT DELETE THE POLICY. An egress policy is a
+	// guardrail, and the operator will not remove a guardrail it may not have
+	// created, so setting this back to "None" leaves
+	// <name>-sandbox-metadata-deny in place. That is fail-closed and harmless
+	// on its own. Reverting both flags together leaves the returned broker
+	// inside the leftover policy's selection — which the gateway policy's
+	// union papers over today, by the same argument as above, but which
+	// becomes a broker cut off from the metadata server the moment the
+	// gateway policy is narrowed or absent (networkPolicy.enabled: false).
+	// Treat the order below as required rather than relying on the union to
+	// keep saving it.
 	//
 	// Revert in three steps, which never leaves a broker inside a policy that
 	// denies it:
