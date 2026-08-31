@@ -172,6 +172,7 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 | `kube-agents-evals-8` | `gke-agentic/kube-agents-evals-8-infra` |
 | `kube-agents-evals-9` | `gke-agentic/kube-agents-evals-9-infra` |
 | `kube-agents-evals-10` | `gke-agentic/kube-agents-evals-10-infra` |
+| `kube-agents-evals-11` | `gke-agentic/kube-agents-evals-11-infra` |
 
 The repository is kept private: it is throwaway state a bot rewrites on every run. [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) is the layout an audit expects to find, not a required seed — the current pool repositories carry only a LICENSE and a README, because an audit works against an empty tree and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
 

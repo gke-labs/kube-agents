@@ -89,6 +89,7 @@ gitops_repo_for_project() {
     kube-agents-evals-8) echo "gke-agentic/kube-agents-evals-8-infra" ;;
     kube-agents-evals-9) echo "gke-agentic/kube-agents-evals-9-infra" ;;
     kube-agents-evals-10) echo "gke-agentic/kube-agents-evals-10-infra" ;;
+    kube-agents-evals-11) echo "gke-agentic/kube-agents-evals-11-infra" ;;
     *) return 1 ;;
   esac
 }
