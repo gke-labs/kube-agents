@@ -83,11 +83,13 @@ package controller
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -600,12 +602,27 @@ func egressRuleAPIServerRejection(rule networkingv1.NetworkPolicyEgressRule) str
 					"SCTP, case-sensitively", string(*port.Protocol))
 			}
 		}
+		if port.Port != nil {
+			if port.Port.Type == intstr.Int {
+				if msgs := utilvalidation.IsValidPortNum(int(port.Port.IntVal)); len(msgs) > 0 {
+					return fmt.Sprintf("port %d is rejected by the API server: %s",
+						port.Port.IntVal, strings.Join(msgs, "; "))
+				}
+			} else if msgs := utilvalidation.IsValidPortName(port.Port.StrVal); len(msgs) > 0 {
+				return fmt.Sprintf("port name %q is rejected by the API server: %s",
+					port.Port.StrVal, strings.Join(msgs, "; "))
+			}
+		}
 		if port.EndPort != nil {
 			if port.Port == nil {
 				return "endPort without port is rejected by the API server"
 			}
 			if port.Port.Type != intstr.Int {
 				return "endPort alongside a named port is rejected by the API server"
+			}
+			if msgs := utilvalidation.IsValidPortNum(int(*port.EndPort)); len(msgs) > 0 {
+				return fmt.Sprintf("endPort %d is rejected by the API server: %s",
+					*port.EndPort, strings.Join(msgs, "; "))
 			}
 			if *port.EndPort < port.Port.IntVal {
 				return fmt.Sprintf("endPort %d below port %d is rejected by the API server",

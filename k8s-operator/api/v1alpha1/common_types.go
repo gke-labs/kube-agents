@@ -569,10 +569,12 @@ type SecuritySpec struct {
 	// monotone operation. It cannot subtract. The agent Pod is already selected
 	// for egress by <name>-gateway-netpol, which the operator renders on every
 	// reconcile whether this field is set or not — unless
-	// spec.networkPolicy.enabled is false, which withholds the gateway policy
-	// and makes this the Pod's only policy: the one shape where this field
-	// enforces for real on an enforcing CNI, denying everything off its list.
-	// Everywhere else, turning this on leaves the
+	// spec.networkPolicy.enabled is false, which withholds the gateway policy.
+	// On a Helm install that makes this the Pod's only policy: the one shape
+	// where this field enforces for real on an enforcing CNI, denying
+	// everything off its list. A Kustomize install still carries the static
+	// platform-agent-core-egress set over the same Pod, so the union resumes
+	// there. Everywhere else, turning this on leaves the
 	// Pod's permitted egress a strict superset of what it was. In the default
 	// shape the only destination it adds is the credential broker on TCP 8765
 	// — plus, when the agent is not exporting telemetry, the collector

@@ -117,8 +117,9 @@ refused outright without the first. Neither closes the path yet. Adding a
 NetworkPolicy is monotone — policies selecting one Pod are unioned and the API
 has no deny rule — and the agent Pod is already selected for egress by the
 `<agent>-gateway-netpol` this same operator renders (unless
-`spec.networkPolicy.enabled: false` withholds it, the one shape where the
-allowlist stands alone and enforces), which permits the metadata
+`spec.networkPolicy.enabled: false` withholds it — on a Helm install the one
+shape where the allowlist stands alone and enforces; a Kustomize install's
+static `platform-agent-core-egress` still selects the same Pod), which permits the metadata
 path. So enabling the allowlist widens what the Pod may send and narrows
 nothing; it is an auditable object rather than a control until that gateway
 policy is narrowed to the broker Pod. It would in any case do nothing on a

@@ -531,6 +531,46 @@ func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
 			refused: false,
 		},
 		{
+			name: "a zero port",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolTCP), Port: ptr.To(intstr.FromInt32(0))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: true,
+		},
+		{
+			name: "an endPort past 65535",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptr.To(intstr.FromInt32(443)), EndPort: ptr.To(int32(70000))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: true,
+		},
+		{
+			name: "an invalid port name",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptr.To(intstr.FromString("Not_A_Port!"))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: true,
+		},
+		{
+			name: "a valid named port",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptr.To(intstr.FromString("https"))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: false,
+		},
+		{
 			name: "a well-formed port range",
 			rule: networkingv1.NetworkPolicyEgressRule{
 				Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolTCP), Port: ptr.To(intstr.FromInt32(443)), EndPort: ptr.To(int32(8443))}},
