@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -1001,5 +1002,107 @@ func TestTheFlagAddedToARunningAgentIsHandledBothWays(t *testing.T) {
 				t.Errorf("the refusal must be visible in status, got phase %q", stored.Status.Phase)
 			}
 		})
+	}
+}
+
+// TestRevertingTheSplitUnderAnEgressPolicyDoesNotTearDownTheBroker is the
+// review finding on this change: the refusal has to fire before
+// reconcileCredentialBroker mutates, not after.
+//
+// The state is one field-flip away from a working install, and the operator's
+// own guidance points at it: warnSplitNeedsSharedFilesystem tells an
+// administrator whose broker Pod is stuck to "Turn the split off". With
+// egressPolicy still Allowlist, an order that validates after the broker
+// reconcile deletes the broker Deployment and Service first and refuses
+// second — and the refusal withholds the workload, so the agent Deployment
+// stays in its split shape, wired to a Service that no longer exists, with
+// every proxied command failing and nothing on the requeue path that puts the
+// broker back. A refusal exists to prevent an outage, not to narrate one.
+func TestRevertingTheSplitUnderAnEgressPolicyDoesNotTearDownTheBroker(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	broker := types.NamespacedName{Name: credentialBrokerName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, broker, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the broker was not running before the flip, so this test proves nothing: %v", err)
+	}
+	workload := types.NamespacedName{Name: agent.Name + "-gateway", Namespace: agent.Namespace}
+	if err := cl.Get(ctx, workload, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the agent was not running before the flip, so this test proves nothing: %v", err)
+	}
+
+	// The single-field edit warnSplitNeedsSharedFilesystem suggests: the split
+	// goes off, the egress policy stays on.
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		t.Fatalf("failed to re-read the agent: %v", err)
+	}
+	live.Spec.Security.SplitCredentialBrokerPod = ptr.To(false)
+	if err := cl.Update(ctx, live); err != nil {
+		t.Fatalf("failed to flip the split off: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("second Reconcile failed: %v", err)
+	}
+
+	// The refusal must have fired — a pass that reconciled everything would
+	// also keep the broker, and prove nothing about the order.
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("failed to re-read the agent: %v", err)
+	}
+	if stored.Status.Phase != "Degraded" {
+		t.Fatalf("flipping the split off under egressPolicy: Allowlist must refuse, got phase %q", stored.Status.Phase)
+	}
+	var reason string
+	for _, condition := range stored.Status.Conditions {
+		if condition.Type == "Ready" {
+			reason = condition.Reason
+		}
+	}
+	if reason != reasonEgressPolicyRequiresSplitBroker {
+		t.Fatalf("the refusal must name the layout, got reason %q", reason)
+	}
+
+	// The property under test: the refusal came before the teardown. The
+	// running agent's shims still point at this Deployment and Service.
+	if err := cl.Get(ctx, broker, &appsv1.Deployment{}); err != nil {
+		t.Errorf("the refusal ran after the broker teardown: the broker Deployment is gone while the "+
+			"agent Deployment is still wired to it, and nothing on the requeue path puts it back: %v", err)
+	}
+	if err := cl.Get(ctx, broker, &corev1.Service{}); err != nil {
+		t.Errorf("the broker Service is gone while the agent's CREDENTIAL_PROXY_URL still names it: %v", err)
+	}
+	if err := cl.Get(ctx, workload, &appsv1.Deployment{}); err != nil {
+		t.Errorf("the refusal deleted the running workload: %v", err)
+	}
+
+	// The guardrail property holds on this refusal path too: the gateway
+	// policy is still maintained while the CR is parked Degraded.
+	gateway := types.NamespacedName{Name: agent.Name + "-gateway-netpol", Namespace: agent.Namespace}
+	victim := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, gateway, victim); err != nil {
+		t.Fatalf("the gateway policy was not there to delete: %v", err)
+	}
+	if err := cl.Delete(ctx, victim); err != nil {
+		t.Fatalf("failed to delete the gateway policy: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("third Reconcile failed: %v", err)
+	}
+	if err := cl.Get(ctx, gateway, &networkingv1.NetworkPolicy{}); err != nil {
+		t.Errorf("the gateway policy was not restored while the layout refusal is live: %v", err)
 	}
 }

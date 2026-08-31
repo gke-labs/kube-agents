@@ -281,25 +281,56 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// 10c. Reconcile the credential broker's own Pod, if it has one.
+	// 10c. Refuse an egress policy whose layout the broker reconcile below
+	// would otherwise dismantle.
+	//
+	// Before reconcileCredentialBroker, deliberately, and the order is the
+	// finding this step answers: on the reconcile that flips
+	// splitCredentialBrokerPod off while egressPolicy is still Allowlist —
+	// the single-field edit warnSplitNeedsSharedFilesystem itself suggests —
+	// validating after the broker reconcile deletes the broker Deployment and
+	// Service first and refuses second. The refusal then withholds the
+	// workload, so the agent Deployment keeps its split shape, wired to a
+	// Service that no longer exists, every proxied command failing, and the
+	// 30-second requeue repeating the same refusal without ever putting the
+	// broker back. Refusing here leaves the broker running instead: the CR
+	// parks Degraded, the agent keeps working, and the message names the two
+	// ways out.
+	//
+	// The guardrail note on the allowlist refusal below applies here too, so
+	// this path reconciles the same two policies before returning.
+	if reason, msg := validateEgressPolicyLayout(instance); reason != "" {
+		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
+			return ctrl.Result{}, err
+		}
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// 10d. Reconcile the credential broker's own Pod, if it has one.
 	//
 	// Before the agent's workload, not after. On the reconcile that first turns
 	// the split on, the agent Deployment is re-rendered pointing at the broker
 	// Service; creating that Service afterwards leaves the restarted agent
 	// failing every proxied command with a connection refused until the next
 	// pass. The other direction is safe either way, because turning the split
-	// off deletes a broker the re-rendered agent has already stopped using.
+	// off deletes a broker the re-rendered agent has already stopped using —
+	// step 10c has already refused the one shape where it has not.
 	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 10d. Refuse an egress policy that cannot do what it claims.
+	// 10e. Refuse an allowlist destination the policy will not render.
 	//
 	// Immediately before the workload, deliberately: an operator who asked for
 	// the agent Pod to be denied the metadata server must not get a running
-	// agent that silently is not. The two refusable configurations are named
-	// in validateEgressPolicy.
-	if reason, msg := validateEgressPolicy(instance); reason != "" {
+	// agent that silently is not. Below the broker reconcile, also
+	// deliberately: this refusal is about one destination, and it should not
+	// stop the broker being reconciled the way the layout refusal at 10c must.
+	if reason, msg := validateEgressAllowlist(instance); reason != "" {
 		log.Info(msg)
 		// Returning here withholds the workload, the Service, the
 		// PodDisruptionBudget, the legacy cleanup and updateStatusReady. What
@@ -316,11 +347,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// This closes the hazard at this refusal only. The two refusals above —
-		// step 10's RuntimeClassNotFound and step 10b's
-		// SplitBrokerStrandsEventWatcher — return without reconciling the
-		// gateway policy and still have it. Issue #964 tracks that; do not read
-		// the rule stated here as one the whole function keeps yet.
+		// This closes the hazard at the two egress refusals only — this one
+		// and step 10c's. The two refusals above them — step 10's
+		// RuntimeClassNotFound and step 10b's SplitBrokerStrandsEventWatcher —
+		// return without reconciling the gateway policy and still have it.
+		// Issue #964 tracks that; do not read the rule stated here as one the
+		// whole function keeps yet.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -840,6 +872,21 @@ func refusalStillRendersTheGuardrail(reason string) bool {
 // The second is worse than doing nothing: it is a control that appears on
 // kubectl get netpol and protects nothing.
 func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if reason, msg := validateEgressPolicyLayout(agent); reason != "" {
+		return reason, msg
+	}
+	return validateEgressAllowlist(agent)
+}
+
+// validateEgressPolicyLayout is the first case alone. Reconcile checks it
+// before reconcileCredentialBroker rather than with the allowlist check below,
+// because on the reconcile that flips splitCredentialBrokerPod off under a
+// live egressPolicy the broker teardown is the mutation this refusal exists to
+// stop — validated afterwards, the refusal arrives one step too late: the
+// broker Deployment and Service are already deleted, the refusal withholds the
+// workload, and the running agent is left wired to a Service that no longer
+// exists with nothing on the requeue path that puts it back.
+func validateEgressPolicyLayout(agent *agentv1alpha1.PlatformAgent) (string, string) {
 	if !agentEgressPolicyEnabled(agent) {
 		return "", ""
 	}
@@ -850,6 +897,16 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 			"credential broker still a sidecar it would lose the metadata server too, and minting the cloud " +
 			"token there is what the broker is for. Enable the split or set egressPolicy: None and accept " +
 			"that the agent can reach the metadata server."
+	}
+	return "", ""
+}
+
+// validateEgressAllowlist is the second case alone. It stays below
+// reconcileCredentialBroker in Reconcile, deliberately: a refusal about one
+// destination should not stop the broker being reconciled.
+func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if !agentEgressPolicyEnabled(agent) {
+		return "", ""
 	}
 	if refusals := egressAllowlistRefusals(agent); len(refusals) > 0 {
 		return reasonEgressAllowlistRefused, "spec.security.egressAllowlist names destinations the operator " +
