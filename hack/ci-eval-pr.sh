@@ -323,9 +323,12 @@ export TF_VAR_infra_provider="gcp"
 # Every other stack under bench/tf builds its own cluster or reuses the seeded
 # slot-c one; prebuilt/autoops-incident can use neither, because the incident
 # it plants has to be seen by k8s-event-watcher, which runs as a peer process
-# inside the Platform Agent pod and reads events --in-cluster. An incident on
-# any other cluster is never detected, and the case waits out its timeout for
-# a card nobody filed. A stack that does not declare these ignores them.
+# inside the Platform Agent pod. The watcher does fan in over the Cluster Agent
+# profile clusters as well as its own, but a per-run cluster reaches that watch
+# set too late to be watched inside the run -- see the header of
+# bench/tf/prebuilt/autoops-incident/main.tf. An incident there goes
+# undetected and the case waits out its timeout for a card nobody filed. A
+# stack that does not declare these ignores them.
 export TF_VAR_host_cluster_name="${HOST_CLUSTER_NAME}"
 export TF_VAR_host_cluster_location="${REGION}"
 export TF_VAR_agent_namespace="${TARGET_NAMESPACE}"

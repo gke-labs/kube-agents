@@ -325,8 +325,10 @@ rows above to appear alongside the planted finding in their respective audits.
 
 The chat-routing and incident-triage scenarios need no defect planted in the
 fleet — incident triage plants its own, an OOM-killed workload applied to the
-host cluster by `bench/tf/prebuilt/autoops-incident`, because the only cluster
-`k8s-event-watcher` sees is the one it runs in; the
+host cluster by `bench/tf/prebuilt/autoops-incident`, because a per-run cluster
+joins `k8s-event-watcher`'s watch set too late to be watched inside the run
+(the watcher does fan in over the Cluster Agent profile clusters; that stack's
+header has the timing argument); the
 silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
 decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
