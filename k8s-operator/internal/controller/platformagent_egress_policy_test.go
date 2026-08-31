@@ -561,6 +561,29 @@ func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
 			refused: true,
 		},
 		{
+			name: "an In expression with no values",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				PodSelector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+					Key: "app", Operator: metav1.LabelSelectorOpIn, Values: nil,
+				}}},
+			}}},
+			refused: true,
+		},
+		{
+			name: "a matchLabels key with a space",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"my app": "x"}},
+			}}},
+			refused: true,
+		},
+		{
+			name: "a valid selector-only peer",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "example"}},
+			}}},
+			refused: false,
+		},
+		{
 			name: "a valid named port",
 			rule: networkingv1.NetworkPolicyEgressRule{
 				Ports: []networkingv1.NetworkPolicyPort{{Port: ptr.To(intstr.FromString("https"))}},
@@ -594,6 +617,9 @@ func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
 			for _, rule := range policy.Spec.Egress {
 				for _, peer := range rule.To {
 					if peer.IPBlock != nil && peer.IPBlock.CIDR == "140.82.112.0/20" {
+						rendered = true
+					}
+					if peer.PodSelector != nil && peer.PodSelector.MatchLabels["app"] == "example" {
 						rendered = true
 					}
 				}

@@ -88,8 +88,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -635,6 +637,19 @@ func egressRuleAPIServerRejection(rule networkingv1.NetworkPolicyEgressRule) str
 			return "a \"to\" peer with no ipBlock, podSelector or namespaceSelector is rejected by the " +
 				"API server (\"must specify a peer\"), and the rejection would freeze this agent's whole " +
 				"reconcile at the apply"
+		}
+		// The same validator the API server runs, because the CRD schema
+		// constrains neither: matchExpressions[].operator is a bare string
+		// and matchLabels keys are unvalidated map keys.
+		for _, selector := range []*metav1.LabelSelector{peer.PodSelector, peer.NamespaceSelector} {
+			if selector == nil {
+				continue
+			}
+			if errs := metav1validation.ValidateLabelSelector(selector,
+				metav1validation.LabelSelectorValidationOptions{}, field.NewPath("selector")); len(errs) > 0 {
+				return fmt.Sprintf("a \"to\" peer's label selector is rejected by the API server: %s",
+					errs.ToAggregate().Error())
+			}
 		}
 		if peer.IPBlock == nil {
 			continue
