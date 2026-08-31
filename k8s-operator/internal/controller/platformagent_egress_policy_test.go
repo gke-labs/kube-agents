@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -475,10 +476,68 @@ func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
 			refused: true,
 		},
 		{
+			// Upstream ValidateIPBlock rejects an except of equal mask length
+			// too — "strict subset" — the same reading toEgressRules applies
+			// to additionalEgress one file over.
+			name: "an except equal to its cidr",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20", Except: []string{"140.82.112.0/20"}},
+			}}},
+			refused: true,
+		},
+		{
+			name: "a peer carrying both an ipBlock and a selector",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock:     &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+			}}},
+			refused: true,
+		},
+		{
+			name: "a lowercase protocol",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.Protocol("tcp")), Port: ptr.To(intstr.FromInt32(443))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: true,
+		},
+		{
+			name: "an endPort below its port",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Port: ptr.To(intstr.FromInt32(443)), EndPort: ptr.To(int32(80))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: true,
+		},
+		{
+			name: "an endPort with no port",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{EndPort: ptr.To(int32(443))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
+			refused: true,
+		},
+		{
 			name: "an except inside its cidr",
 			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
 				IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20", Except: []string{"140.82.113.0/24"}},
 			}}},
+			refused: false,
+		},
+		{
+			name: "a well-formed port range",
+			rule: networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolTCP), Port: ptr.To(intstr.FromInt32(443)), EndPort: ptr.To(int32(8443))}},
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20"},
+				}},
+			},
 			refused: false,
 		},
 	}
@@ -1357,5 +1416,50 @@ func TestABareControlPlaneAddressIsWidenedNotRefused(t *testing.T) {
 	})
 	if refusals := egressAllowlistRefusals(poisoned); len(refusals) == 0 {
 		t.Error("a bare metadata address must still be refused after widening")
+	}
+}
+
+// TestTheDNSLadderRunsEvenWithTheGatewayPolicyDisabled is the re-review's
+// sharpest point turned into a test. spec.networkPolicy.enabled: false makes
+// resolveNetpolProfile return before the DNS ladder runs, and that flag
+// creates the only shape where this policy stands alone and enforces — so a
+// nil ladder result there meant the hard-coded default VIP on exactly the
+// install where a wrong VIP is a total egress block, and the documented
+// dnsClusterIPs override was unreachable. The egress policy's DNS resolution
+// must not be gated by the flag that withholds the other policy.
+func TestTheDNSLadderRunsEvenWithTheGatewayPolicyDisabled(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.NetworkPolicy = &agentv1alpha1.NetworkPolicySpec{
+			Enabled:       ptr.To(false),
+			DNSClusterIPs: []string{"34.118.230.7"},
+		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// The shape is real: no gateway policy to union with.
+	gateway := types.NamespacedName{Name: agent.Name + "-gateway-netpol", Namespace: agent.Namespace}
+	if err := cl.Get(ctx, gateway, &networkingv1.NetworkPolicy{}); err == nil {
+		t.Fatal("networkPolicy.enabled: false must withhold the gateway policy, or this test proves nothing")
+	}
+
+	rendered := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}, rendered); err != nil {
+		t.Fatalf("the egress policy must still render in this shape: %v", err)
+	}
+	if !permits(rendered, "34.118.230.7") {
+		t.Error("the dnsClusterIPs override did not reach the egress policy's DNS rule in the one shape " +
+			"where that rule is the Pod's only route to DNS")
 	}
 }

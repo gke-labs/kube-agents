@@ -591,6 +591,28 @@ func admissibleExtraEgressRules(agent *agentv1alpha1.PlatformAgent) ([]networkin
 // server refuses are turned into an EgressAllowlistRefused here, where the
 // operator parks Degraded with the rule named.
 func egressRuleAPIServerRejection(rule networkingv1.NetworkPolicyEgressRule) string {
+	for _, port := range rule.Ports {
+		if port.Protocol != nil {
+			switch *port.Protocol {
+			case corev1.ProtocolTCP, corev1.ProtocolUDP, corev1.ProtocolSCTP:
+			default:
+				return fmt.Sprintf("port protocol %q is rejected by the API server; it must be TCP, UDP or "+
+					"SCTP, case-sensitively", string(*port.Protocol))
+			}
+		}
+		if port.EndPort != nil {
+			if port.Port == nil {
+				return "endPort without port is rejected by the API server"
+			}
+			if port.Port.Type != intstr.Int {
+				return "endPort alongside a named port is rejected by the API server"
+			}
+			if *port.EndPort < port.Port.IntVal {
+				return fmt.Sprintf("endPort %d below port %d is rejected by the API server",
+					*port.EndPort, port.Port.IntVal)
+			}
+		}
+	}
 	for _, peer := range rule.To {
 		if peer.IPBlock == nil && peer.PodSelector == nil && peer.NamespaceSelector == nil {
 			return "a \"to\" peer with no ipBlock, podSelector or namespaceSelector is rejected by the " +
@@ -599,6 +621,10 @@ func egressRuleAPIServerRejection(rule networkingv1.NetworkPolicyEgressRule) str
 		}
 		if peer.IPBlock == nil {
 			continue
+		}
+		if peer.PodSelector != nil || peer.NamespaceSelector != nil {
+			return "a \"to\" peer carrying both an ipBlock and a selector is rejected by the API server " +
+				"(\"may not specify both ipBlock and another peer\")"
 		}
 		prefix, err := netip.ParsePrefix(peer.IPBlock.CIDR)
 		if err != nil {
@@ -610,9 +636,12 @@ func egressRuleAPIServerRejection(rule networkingv1.NetworkPolicyEgressRule) str
 			if exceptErr != nil {
 				return fmt.Sprintf("ipBlock except %q is not a valid CIDR", except)
 			}
-			if exceptPrefix.Bits() < prefix.Bits() || !prefix.Contains(exceptPrefix.Masked().Addr()) {
-				return fmt.Sprintf("ipBlock except %q is not within cidr %q; the API server rejects the "+
-					"whole policy over it (\"must be a strict subset of the cidr\")", except, peer.IPBlock.CIDR)
+			// Strict subset, as upstream ValidateIPBlock enforces it: an
+			// except of equal mask length is rejected too, the same reading
+			// toEgressRules already applies to additionalEgress.
+			if exceptPrefix.Bits() <= prefix.Bits() || !prefix.Contains(exceptPrefix.Masked().Addr()) {
+				return fmt.Sprintf("ipBlock except %q is not a strict subset of cidr %q; the API server "+
+					"rejects the whole policy over it", except, peer.IPBlock.CIDR)
 			}
 		}
 	}

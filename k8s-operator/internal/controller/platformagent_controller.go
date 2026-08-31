@@ -371,7 +371,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 11b. Reconcile the agent Pod's default-deny egress policy, if it has one.
-	if err := r.reconcileAgentEgressPolicy(ctx, instance, netpolProf.DNSClusterIPs); err != nil {
+	if err := r.reconcileAgentEgressPolicy(ctx, instance, r.agentEgressDNSClusterIPs(ctx, instance, netpolProf)); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -944,7 +944,32 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 	if !refusalStillRendersTheGuardrail(reason) {
 		return nil
 	}
-	return r.reconcileAgentEgressPolicy(ctx, agent, netpolProf.DNSClusterIPs)
+	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf))
+}
+
+// agentEgressDNSClusterIPs is the resolved cluster DNS VIP list for the agent
+// egress policy's DNS rule.
+//
+// In the ordinary shape it is the profile's own answer. When
+// spec.networkPolicy.enabled is false, resolveNetpolProfile returns before the
+// DNS ladder runs — correct for the gateway policy, which that flag withholds,
+// and exactly wrong for this one: that flag creates the only shape where the
+// egress policy stands alone and enforces, so it is where a hard-coded
+// fallback VIP is a total egress block on a VIP-matching dataplane and where
+// the documented dnsClusterIPs override must still work. Re-run the ladder
+// with the gate lifted; the flag gates the gateway policy, not DNS
+// resolution.
+func (r *PlatformAgentReconciler) agentEgressDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile) []string {
+	if profile.Generated {
+		return profile.DNSClusterIPs
+	}
+	if !agentEgressPolicyEnabled(agent) {
+		// Nothing will render, so skip the discovery round-trip.
+		return nil
+	}
+	ungated := agent.DeepCopy()
+	ungated.Spec.NetworkPolicy.Enabled = nil
+	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
 // reconcileAgentEgressPolicy renders the agent Pod's default-deny egress policy.
