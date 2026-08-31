@@ -301,6 +301,27 @@ def test_any_of_passes_on_either_spelling_and_fails_on_neither():
     assert "alternative phrasings" in res.reason
 
 
+def test_an_any_of_only_pass_says_so_instead_of_all_0_required():
+    # A check built from any_of alone used to succeed with "all 0 required
+    # phrase(s), none of 0 forbidden" -- indistinguishable in a log from a
+    # check that asserted nothing. The clause that actually ran has to appear.
+    v = ReportContainsVerifier(
+        type="report_contains", any_of_phrases=["HPA", "HorizontalPodAutoscaler"]
+    )
+    transcript.set("the HPA hit max replicas", [])
+    res = v.verify(5.0)
+    assert res.status == "pass"
+    assert "at least one of 2 alternative phrasing(s)" in res.reason
+
+
+def test_a_pass_with_no_any_of_does_not_claim_an_any_of_clause():
+    v = ReportContainsVerifier(type="report_contains", required_phrases=["HPA"])
+    transcript.set("the HPA hit max replicas", [])
+    res = v.verify(5.0)
+    assert res.status == "pass"
+    assert "alternative phrasing" not in res.reason
+
+
 def test_scope_final_ignores_a_quoted_phrase_in_the_accumulated_output():
     # The accumulated output quotes the planted log line; the actual answer
     # names something else. Default scope must not pass on the quotation.
@@ -567,6 +588,17 @@ def test_ledger_any_of_accepts_either_spelling(token, github):
     res = _ledger_check(any_of_phrases=["StatefulSet", "DaemonSet"]).verify(5.0)
     assert res.status == "fail"
     assert "alternative phrasings" in res.reason
+
+
+def test_ledger_any_of_only_pass_says_so_instead_of_all_0_required(token, github):
+    # Same defect as the report_contains one above, one function away: an
+    # any_of-only ledger check passing with "all 0 required phrase(s)" reads
+    # like a check that asserted nothing.
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body(findings="no PodDisruptionBudget\n")))
+    res = _ledger_check(any_of_phrases=["PDB", "PodDisruptionBudget"]).verify(5.0)
+    assert res.status == "pass"
+    assert "at least one of 2 alternative phrasing(s)" in res.reason
 
 
 # --- staleness, which is the whole point ---------------------------------

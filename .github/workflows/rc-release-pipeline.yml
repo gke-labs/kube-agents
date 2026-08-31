@@ -1,11 +1,14 @@
-name: RC Release E2E Pipeline
+name: "RC: Release Pipeline"
 
 permissions:
   contents: read
 
+# No `schedule:` — rc-scheduler.yml owns the cron and dispatches this workflow
+# only when there is a new candidate. That is what makes a run of this pipeline
+# mean something: with no quiet-tick path that concludes success having done
+# nothing, its last conclusion is the last real result. Putting the cron back
+# here undoes that; rc-scheduler.yml's header has the argument.
 on:
-  schedule:
-    - cron: "17 */3 * * *"
   #checkov:skip=CKV_GHA_7:Manual release candidate pipeline requires target commit sha and tag inputs
   workflow_dispatch:
     inputs:
@@ -25,10 +28,10 @@ concurrency:
 jobs:
   step-1-create-tag:
     name: Step 1 - Create Release Candidate Tag
-    # A fork inherits the cron but none of the release credentials, so every
-    # scheduled run there fails and mails the fork owner. The guard repeats on
-    # each job rather than relying on the skip cascading through `needs`: an
-    # `always()` added to a later job would silently un-guard the pipeline.
+    # A fork can dispatch this by hand with none of the release credentials, and
+    # the guard is what a re-added `schedule:` would need. It repeats per job
+    # rather than relying on the skip cascading through `needs`: an `always()`
+    # added to a later job would silently un-guard the pipeline.
     if: github.repository == 'gke-labs/kube-agents'
     uses: ./.github/workflows/rc-create-tag.yml
     permissions:
@@ -36,6 +39,14 @@ jobs:
     with:
       commit_sha: ${{ inputs.commit_sha }}
       rc_tag: ${{ inputs.rc_tag }}
+      # Always false while rc-scheduler.yml owns the cron: this workflow is only
+      # dispatched, and always with a commit_sha the scheduler resolved. Wired
+      # rather than hardcoded so re-adding a `schedule:` restores the
+      # self-resolving path in one edit, instead of running with is_scheduled
+      # false — the branch of resolve_rc_tag.sh that errors on a missing commit.
+      #
+      # It also means a run never sets skip_rc, so the `skip_rc` guards below
+      # never fire today. They stay because a re-added cron would need them.
       is_scheduled: ${{ github.event_name == 'schedule' }}
     secrets:
       RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
@@ -46,23 +57,22 @@ jobs:
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-create-tag.outputs.skip_rc != 'true'
-    # inherit, not an explicit mapping — the same reason
-    # staging-redeploy-integrations.yml already records. The called deploy-rc
-    # job reads GH_APP_ID and GH_APP_PRIVATE_KEY, which are `rc` ENVIRONMENT
-    # secrets, and a `uses:` job cannot declare an environment, so any
-    # `secrets:` mapping written here resolves against nothing and forwards
-    # empties. Observed, not assumed: with the mapping in place, deploy-rc
-    # logged GITHUB_APP_ID as empty on a run five hours after the secret was
-    # created on the rc environment.
+    # inherit, not an explicit mapping. The called deploy-environment job reads
+    # GH_APP_ID and GH_APP_PRIVATE_KEY, which are `rc` ENVIRONMENT secrets, and a
+    # `uses:` job cannot declare an environment — so a `secrets:` mapping written
+    # here resolves at repository scope and forwards empties. Observed: with the
+    # mapping in place that job logged GITHUB_APP_ID as empty five hours after the
+    # secret was created on the rc environment.
     #
-    # scripts/release/README.md, "Enabling the GitHub token minter on the RC",
-    # is the single home for what the wiring requires and why; this comment is
-    # here because the mistake is made at this line.
-    uses: ./.github/workflows/rc-deploy-environment.yml # zizmor: ignore[secrets-inherit]
+    # scripts/release/README.md, "Enabling the GitHub token minter on the RC", is
+    # the single home for the wiring; this comment is here because the mistake is
+    # made at this line.
+    uses: ./.github/workflows/deploy-environment.yml # zizmor: ignore[secrets-inherit]
     permissions:
       contents: read
       id-token: write
     with:
+      github_environment: "rc"
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
     secrets: inherit
 
@@ -72,118 +82,25 @@ jobs:
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-create-tag.outputs.skip_rc != 'true'
-    runs-on: ubuntu-latest
-    environment: rc
-    concurrency:
-      group: rc-environment
-      cancel-in-progress: false
-    # Roughly 40 of these 60 minutes can be spent before the first test runs,
-    # which is what a fresh Autopilot cluster costs when it has to scale nodes
-    # from zero and pull every image. wait_for_gke_readiness.sh gates litellm at
-    # 420s and the gateway at 900s, and pays each of those twice — once for
-    # `rollout status`, once for the paired `wait --for=condition=Available` —
-    # on top of a 300s image-tag verification loop. The adapter step ahead of it
-    # adds an image build and push plus up to 300s plugin-ready and 180s settle.
-    # At 30 the job timeout would fire first and report a broken deploy rather
-    # than a slow one. Re-derive this sum before lowering it; the readiness
-    # constants are in wait_for_gke_readiness.sh, not here.
-    timeout-minutes: 60
+    # `inherit` for the reason step 2 records above and for nothing more: the
+    # called job renders `environment:` from the github_environment passed
+    # below, and the E2E_CHAT_* secrets it reads live on `rc`. A `uses:` job
+    # cannot declare an environment, so an explicit mapping written here would
+    # resolve at repository scope and forward empties to the mandatory Chat
+    # gate.
+    uses: ./.github/workflows/e2e-run.yml # zizmor: ignore[secrets-inherit]
     permissions:
       contents: read
       id-token: write
-    env:
-      CLOUDSDK_PYTHON: "/usr/bin/python3"
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.step-1-create-tag.outputs.commit_sha }}
-          persist-credentials: false
-
-      - name: Set up Python Environment
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version-file: ".python-version"
-          cache: "pip"
-
-      - name: Install Python Dependencies
-        run: ./scripts/release/install_e2e_deps.sh
-
-      - name: Authenticate to Google Cloud via Workload Identity Federation (WIF)
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-        with:
-          version: "579.0.0"
-          install_components: "beta,gke-gcloud-auth-plugin"
-
-      - name: Authenticate to GKE
-        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
-        with:
-          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
-          location: ${{ vars.GCP_REGION }}
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-
-      # continue-on-error, deliberately: alert ingress is a dependency of the
-      # optional cluster/audit suite below and of nothing else, so a stockout-only
-      # problem must not sink the Google Chat gate that was made the blocking one.
-      # The script itself exits non-zero on failure; the decision to tolerate that
-      # is this workflow's, and lives here rather than inside the script.
-      # Runs before readiness so the gateway re-template the adapter triggers is
-      # already in flight when the rollout waits start.
-      - name: Install Pub/Sub Alert Ingress
-        continue-on-error: true
-        env:
-          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-        run: ./scripts/release/install_pubsub_platform.sh
-
-      - name: Connect to GKE & Wait for Pod Readiness
-        env:
-          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
-          COMMIT_SHA: ${{ needs.step-1-create-tag.outputs.commit_sha }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-        run: ./scripts/release/wait_for_gke_readiness.sh
-
-      - name: Execute Mandatory Google Chat E2E Gate
-        env:
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-          E2E_ENV: "gchat-e2e"
-          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
-          CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
-          E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
-          E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
-          E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
-        run: make test-e2e
-
-      - name: Execute Optional Cluster & Fleet Audit E2E Tests
-        continue-on-error: true
-        env:
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-          E2E_ENV: "rc-e2e"
-          STOCKOUT_SCENARIOS: "04"
-          FLEET_AUDIT_STREAMS: "all"
-          # The same pair rc-deploy-environment.yml gives the installer, so the
-          # repository the suite probes is the one the minter was scoped to. Read from
-          # the environment rather than pinned in e2e_config.yaml because a value
-          # written in both places drifts, and a token minted for one repository does
-          # not authenticate against another. Bare: the conftest github_repo fixture
-          # composes owner/repo from GITHUB_ORG when GITHUB_REPO carries no slash.
-          GITHUB_ORG: ${{ vars.GITOPS_ORG }}
-          GITHUB_REPO: ${{ vars.GITOPS_REPO }}
-        run: make test-e2e
+    with:
+      github_environment: "rc"
+      commit_sha: ${{ needs.step-1-create-tag.outputs.commit_sha }}
+      # The Chat gate blocks the candidate; the cluster and fleet-audit suite is
+      # coverage that must not. Their scenario and stream filters are declared in
+      # the `rc` suite's `env_vars` in e2e_config.yaml.
+      blocking_suite: "gchat"
+      optional_suites: "rc"
+    secrets: inherit
 
   step-4-tag-validated:
     name: Step 4 - Tag Validated Release
@@ -223,11 +140,10 @@ jobs:
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-create-tag.outputs.skip_rc != 'true'
-    uses: ./.github/workflows/rc-teardown-environment.yml
+    uses: ./.github/workflows/teardown-environment.yml
     permissions:
       contents: read
       id-token: write
     with:
+      github_environment: "rc"
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
-    secrets:
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}

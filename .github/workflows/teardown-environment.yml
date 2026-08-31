@@ -1,35 +1,49 @@
-name: RC Step 5 - Tear Down Environment
+name: "Shared: Tear Down Environment"
 
 permissions:
   contents: read
 
 on:
-  #checkov:skip=CKV_GHA_7:Standalone launch requires the release candidate tag or commit SHA to pick the teardown engine
+  #checkov:skip=CKV_GHA_7:Standalone launch requires the candidate tag or commit SHA to pick the teardown engine, and the environment to destroy
   workflow_dispatch:
     inputs:
+      github_environment:
+        description: "GitHub environment naming the GCP project, region and cluster to destroy"
+        required: true
+        type: choice
+        options:
+          - "rc"
+          - "nightly"
       rc_tag:
-        description: "Release Candidate Tag or Commit SHA (Mandatory for Step 5 standalone launch)"
+        description: "Release Candidate Tag or Commit SHA (Mandatory for standalone launch)"
         required: true
         type: string
   workflow_call:
     inputs:
+      # See deploy-environment.yml for why this is named github_environment
+      # and why it has no default. Here the missing default matters more: a
+      # nightly caller that omitted it would destroy the RC environment.
+      github_environment:
+        description: "GitHub environment naming the GCP project, region and cluster to destroy"
+        required: true
+        type: string
       rc_tag:
         description: "Release Candidate Tag or Commit SHA"
         required: true
         type: string
-    secrets:
-      GCP_SA_KEY:
-        description: "Google Cloud Service Account JSON key"
-        required: false
+    # No `secrets:` block: this workflow authenticates with Workload Identity
+    # Federation off the bound environment's GCP_WORKLOAD_IDENTITY_PROVIDER and
+    # GCP_SERVICE_ACCOUNT variables, and needs nothing else.
 
 jobs:
-  teardown-rc:
+  teardown-environment:
     runs-on: ubuntu-latest
-    environment: rc
-    # Same group as the deploy and E2E jobs: this destroys the environment both
-    # of those operate on, so it must never overlap a run that is still using it.
+    environment: ${{ inputs.github_environment }}
+    # Same group as the deploy and E2E jobs for the same environment: this
+    # destroys what both of those operate on, so it must never overlap a run
+    # that is still using it.
     concurrency:
-      group: rc-environment
+      group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
     # A GKE cluster destroy is slower than its create — node pools drain before
     # the control plane goes, and lifecycle.sh clears the PlatformAgent
@@ -71,7 +85,6 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
 
       # kubectl and gke-gcloud-auth-plugin, because lifecycle.sh fetches cluster
       # credentials itself and clears the PlatformAgent finalizers with kubectl
@@ -100,4 +113,19 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-        run: ./scripts/release/teardown_rc_environment.sh
+        # Same rename fallback as deploy-environment.yml, and for the same
+        # reason: the workspace is the candidate's tree, and every candidate up
+        # to rc_2608310656_cf038a2_validated carries this script as
+        # teardown_rc_environment.sh. It matters here beyond the nightly's first
+        # run — this workflow's standalone dispatch is the documented way to
+        # reclaim an environment stranded by a failed pipeline, and such an
+        # environment was installed from a pre-rename candidate by definition.
+        #
+        # Delete this fallback once no rc_*_validated tag predates the rename.
+        run: |
+          if [ -f ./scripts/release/teardown_environment.sh ]; then
+            ./scripts/release/teardown_environment.sh
+          else
+            echo "==> Candidate predates the teardown_environment.sh rename; running teardown_rc_environment.sh."
+            ./scripts/release/teardown_rc_environment.sh
+          fi

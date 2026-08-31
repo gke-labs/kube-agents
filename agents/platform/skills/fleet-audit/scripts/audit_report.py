@@ -4346,19 +4346,40 @@ def _write_temp(text: str, suffix: str = ".md") -> str:
     with "no such file". The shared PersistentVolumeClaim at /opt/data is the
     only filesystem both containers can see.
 
-    Falls back to the system temp directory when the PVC is absent, so the unit
-    tests and a local `--dry-run` still work off-cluster.
+    Being on the shared volume is necessary but not sufficient. Since #955 the
+    sandbox (uid 10000) and the credential sidecar (uid 10001) are different
+    users who share files only through the pod's fsGroup, and
+    `NamedTemporaryFile` creates 0600, owner-only — a file the sidecar's `gh`
+    cannot open even on the PVC. Hence the `fchmod` to group-readable below.
+
+    NO fallback to the container-private temp directory. There used to be one,
+    for the PVC-less off-cluster case, and in-cluster it converted a fixable
+    mount or permission problem into a guaranteed publish failure that *looked*
+    like a graceful degrade: the sidecar can never see this container's private
+    tmp, so every `gh` write died locally while the audit itself reported
+    nothing wrong (#1030). Off-cluster, point FLEET_AUDIT_SCRATCH_DIR at any
+    writable directory; the unit tests patch SCRATCH_DIR.
     """
-    directory: str | None = SCRATCH_DIR
     try:
         Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-    except OSError:
-        directory = None
-    handle = tempfile.NamedTemporaryFile(
-        "w", suffix=suffix, delete=False, encoding="utf-8", dir=directory
-    )
-    with handle:
-        handle.write(text)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=suffix, delete=False, encoding="utf-8", dir=SCRATCH_DIR
+        )
+        with handle:
+            # Group-readable across the #955 uid split: the sidecar running the
+            # real `gh` is not the owner of this file.
+            os.fchmod(handle.fileno(), 0o664)
+            handle.write(text)
+    except OSError as exc:
+        raise RuntimeError(
+            "publish path broken: cannot stage a gh body file in the shared "
+            f"scratch directory {SCRATCH_DIR} (uid {os.getuid()}): {exc}. "
+            "The credential sidecar resolves --body-file paths in its own "
+            "filesystem, so a container-private temp file can never work — "
+            "fix the shared mount/permissions (see "
+            "gke-labs/kube-agents#1030), or set FLEET_AUDIT_SCRATCH_DIR when "
+            "running off-cluster."
+        ) from exc
     return handle.name
 
 

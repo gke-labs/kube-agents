@@ -105,7 +105,7 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
-  {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled }}
+  {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
   integration:
     {{- with $integ.github.gitRepo }}
     github:
@@ -146,6 +146,35 @@ spec:
       {{- end }}
       {{- with $integ.slack.homeChannelName }}
       homeChannelName: {{ . | quote }}
+      {{- end }}
+    {{- end }}
+    {{- if $integ.teams.enabled }}
+    teams:
+      enabled: true
+      appIdSecretRef:
+        name: {{ .Values.platformAgent.credentials.secretName | quote }}
+        key: TEAMS_APP_ID
+      appPasswordSecretRef:
+        name: {{ .Values.platformAgent.credentials.secretName | quote }}
+        key: TEAMS_APP_PASSWORD
+      {{- with $integ.teams.tenantId }}
+      tenantId: {{ . | quote }}
+      {{- end }}
+      {{- with $integ.teams.allowedUsers }}
+      allowedUsers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $integ.teams.allowAllUsers }}
+      allowAllUsers: {{ $integ.teams.allowAllUsers }}
+      {{- end }}
+      {{- with $integ.teams.homeChannel }}
+      homeChannel: {{ . | quote }}
+      {{- end }}
+      {{- with $integ.teams.serviceUrl }}
+      serviceUrl: {{ . | quote }}
+      {{- end }}
+      {{- if hasKey $integ.teams "adaptiveCards" }}
+      adaptiveCards: {{ $integ.teams.adaptiveCards }}
       {{- end }}
     {{- end }}
   {{- end }}

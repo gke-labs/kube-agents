@@ -12,7 +12,7 @@ Execution Modes:
    the operator or mutating deployed images.
    Usage:
        pytest tests/e2e/operator/agentplugins_e2e_test.py
-       python3 scripts/release/execute_e2e_tests.py --env agent-plugin-e2e
+       python3 scripts/release/execute_e2e_tests.py --suite agent-plugin
 
 2. Operator Rebuild & Deployment Test (Opt-in Manual / Dev Run):
    Rebuilds the operator binary from source, pushes a new operator image to $REGISTRY,

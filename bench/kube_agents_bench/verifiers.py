@@ -178,13 +178,23 @@ class ReportContainsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason="; ".join(parts),
             )
+        # The success reason has to name every clause that ran, including
+        # any_of_phrases. Counting only required and forbidden made a check
+        # built from any_of alone report "all 0 required phrase(s)", which
+        # reads exactly like a check that asserted nothing -- and the failure
+        # branch above is the only thing that would have said otherwise.
+        satisfied = [
+            f"all {len(self.required_phrases)} required phrase(s)",
+            f"none of {len(self.forbidden_phrases)} forbidden",
+        ]
+        if self.any_of_phrases:
+            satisfied.append(
+                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+            )
         return VerificationResult(
             success=True,
             elapsed_time=time.monotonic() - start,
-            reason=(
-                f"report contains all {len(self.required_phrases)} required "
-                f"phrase(s) and none of {len(self.forbidden_phrases)} forbidden"
-            ),
+            reason="report contains " + ", ".join(satisfied),
         )
 
 
@@ -698,11 +708,21 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     f"{self.any_of_phrases}"
                 )
             return done(False, "; ".join(parts), raw=raw)
+        # Names every clause that ran, for the reason ReportContainsVerifier's
+        # success branch does: an any_of-only check that reported "all 0
+        # required phrase(s)" would read exactly like a check asserting nothing.
+        satisfied = [
+            f"all {len(self.required_phrases)} required phrase(s)",
+            f"none of {len(self.forbidden_phrases)} forbidden",
+        ]
+        if self.any_of_phrases:
+            satisfied.append(
+                f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+            )
         return done(
             True,
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
-            f"contains all {len(self.required_phrases)} required phrase(s) and "
-            f"none of {len(self.forbidden_phrases)} forbidden",
+            "contains " + ", ".join(satisfied),
             raw=raw,
         )
 

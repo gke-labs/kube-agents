@@ -1,0 +1,30 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platform-agent-teams
+  namespace: kube-agents-system
+spec:
+  credentialsSecretRef:
+    name: platform-agent-credentials
+  integration:
+    teams:
+      enabled: true
+      appIdSecretRef:
+        name: platform-agent-credentials
+        key: TEAMS_APP_ID
+      appPasswordSecretRef:
+        name: platform-agent-credentials
+        key: TEAMS_APP_PASSWORD
+      tenantId: "11111111-1111-1111-1111-111111111111"
+      allowedUsers:
+        - "sre-lead@example.com"
+        - "cluster-admin@example.com"
+      allowAllUsers: false
+      homeChannel: "19:sample-conversation-id@thread.v2"
+      serviceUrl: "https://smba.trafficmanager.net/teams/"
+      adaptiveCards: true
+  harness:
+    projectId: "demo-gcp-project"
+  deployment:
+    availability:
+      replicas: 1
