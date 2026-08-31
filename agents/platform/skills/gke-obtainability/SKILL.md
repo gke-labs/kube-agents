@@ -21,7 +21,11 @@ When this skill is loaded for a **design, planning, or capacity-check request**
 (for example from the [gke-cluster-creation](../gke-cluster-creation/SKILL.md)
 workflow) rather than a stockout alert:
 
-- Execute **only Step 4** (Diagnose Capacity, Quotas, and Resource Usage):
+- Execute **only Step 4's diagnostic subsections A-D** (quota, reservations,
+  usage, and capacity advice). Step 4's Efficiency Directive and CRITICAL
+  MANDATE belong to the alert-driven remediation flow below and do not
+  apply here: in design-time mode there is no notification to send and no
+  Pull Request to open.
   quota verification, reservations, and capacity obtainability advice.
 - Run the capacity advice for **Spot and Flex-Start** — the two provisioning
   models `gcloud beta compute advice capacity` accepts
@@ -239,7 +243,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
 ### 4. Diagnose Capacity, Quotas, and Resource Usage
 
-**Efficiency Directive**: Execute diagnostic commands efficiently. Combine checks into a single step where possible. Do not spend excessive turns on repetitive queries. Once diagnostics are gathered, proceed immediately to self-review and PR creation using `submit_suggestion.py`.
+**Efficiency Directive** *(alert-driven flow only — in design-time mode, record evidence and report; never create a PR)*: Execute diagnostic commands efficiently. Combine checks into a single step where possible. Do not spend excessive turns on repetitive queries. Once diagnostics are gathered, proceed immediately to self-review and PR creation using `submit_suggestion.py`.
 
 Before proposing any configuration changes (e.g., adding fallbacks, shrinking VM shapes, or reserving resources), execute the following diagnostic commands to check GCP quotas, reservations, actual workload resource utilization, and Spot VM availability advice.
 
@@ -301,7 +305,7 @@ If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot
        --format="json"
    ```
 
-_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
+_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`). In the alert-driven flow, report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description; in design-time mode, record them as typed evidence and list them in your report instead — no notification, no Pull Request.
 
 ### 5. Diagnose Using ComputeClass Debugging Guidelines
 
