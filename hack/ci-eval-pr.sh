@@ -268,7 +268,17 @@ publish_eval_dashboard() {
   # here any failure becomes the one skip line. The array idiom is the
   # PROFILE_ROWS one above: no `timeout` binary (a laptop) must degrade to
   # running unbounded, not to breaking the trap.
-  local dash_timeout=(timeout 120)
+  #
+  # The budget must be LARGER than the 300s collect.py grants each individual
+  # gsutil call, or the one hung call the collector is willing to wait out
+  # kills the whole pipeline instead -- and the sweep is serial over every
+  # archived build (1 + 3N gsutil processes), so it needs real headroom on
+  # top. 900s covers both and only ever taxes the nightly's tail (the gate
+  # above keeps presubmits out entirely); EVAL_DASHBOARD_TIMEOUT overrides it
+  # from the job config without a code change. Bounding the sweep itself
+  # (--since/--limit) is collect.py's follow-up, not this hook's.
+  local dash_budget="${EVAL_DASHBOARD_TIMEOUT:-900}"
+  local dash_timeout=(timeout "${dash_budget}")
   command -v timeout >/dev/null 2>&1 || dash_timeout=()
   # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
   # The zero-runs floor between collect and render is the evidence_store
@@ -293,7 +303,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   if [ "${dash_rc}" -eq 0 ]; then
     echo "eval-dashboard: published to ${EVAL_DASHBOARD_TARGET}"
   else
-    echo "eval-dashboard publish skipped: pipeline exited ${dash_rc} (124 means the 120s timeout): $(tail -n 3 "${dash_tmp}/publish.log" 2>/dev/null | tr '\n' ' ')"
+    echo "eval-dashboard publish skipped: pipeline exited ${dash_rc} (124 means the ${dash_budget}s timeout): $(tail -n 3 "${dash_tmp}/publish.log" 2>/dev/null | tr '\n' ' ')"
   fi
   # The full pipeline log rides to Prow on success AND failure: collect.py's
   # per-build fetch errors are warnings, not failures, and those warnings are

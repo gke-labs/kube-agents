@@ -48,6 +48,7 @@ def run_hook(
     job_type: str = "periodic",
     pull_number: str = "",
     artifacts: str = "",
+    timeout_s: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -66,6 +67,7 @@ def run_hook(
             # Always pinned: the suite itself runs under Prow, where a real
             # $ARTIFACTS is set, and the hook copies its log there.
             f'export ARTIFACTS="{artifacts}"',
+            f'export EVAL_DASHBOARD_TIMEOUT="{timeout_s}"',
             f'export EVAL_DASHBOARD_TARGET="{target}"',
             "collect_bench_results() { :; }",
             "profile_report() { :; }",
@@ -272,6 +274,27 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 )
                 log = artifacts / "eval-dashboard-publish.log"
                 self.assertTrue(log.is_file(), list(artifacts.iterdir()))
+
+    def test_a_hung_pipeline_times_out_into_the_skip_line(self):
+        """The timeout path for real, not a stub of it: a collector that
+        sleeps past the budget becomes one skip line naming 124 and the
+        budget, exit code intact. EVAL_DASHBOARD_TIMEOUT is honoured so the
+        job config can size the budget to the sweep without a code change."""
+        if subprocess.run(
+            ["bash", "-c", "command -v timeout"], capture_output=True, check=False
+        ).returncode:
+            self.skipTest("no `timeout` binary; the hook degrades to unbounded")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp), "import time; time.sleep(30)\n"
+            )
+            result = run_hook(
+                7,
+                fake_hack,
+                target="gs://kube-agents-dashboards/evals/",
+                timeout_s="1",
+            )
+            self.assert_skipped_once(result, 7, "exited 124 (124 means the 1s timeout)")
 
     def test_the_pipeline_stops_at_the_first_failing_stage(self):
         """collect crashing means render/publish never run -- errexit lives
