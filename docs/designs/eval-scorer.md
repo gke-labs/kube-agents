@@ -1062,13 +1062,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   An invocation therefore averages **3.6min**, not the 4.7min extrapolated from #956's and #982's
   builds — those over-read it, which is why every estimate before this one was pessimistic:
 
-  | reps | invocations | expected   | 150m  | 240m      |
-  | ---- | ----------- | ---------- | ----- | --------- |
-  | 1    | 14          | 67min      | 2.24× | 3.58×     |
-  | 3    | 42          | **168min** | 0.89× | **1.43×** |
+  | reps | invocations | expected   | 150m  | 240m      | 360m      |
+  | ---- | ----------- | ---------- | ----- | --------- | --------- |
+  | 1    | 17          | 61min      | 2.45× | 3.93×     | 5.90×     |
+  | 3    | 51          | **184min** | 0.82× | **1.30×** | **1.96×** |
 
   `150m` would still have been a guaranteed timeout, which is what made #2669 a prerequisite rather
-  than a follow-up.
+  than a follow-up. The rows count the matrix at seventeen active tasks; recount the uncommented
+  entries in `TASKS` rather than trusting the number here, which has fallen behind the matrix three
+  times.
 
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
@@ -1079,12 +1081,14 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   to model 429s, parallelism 2 in 2512s with one. The serial figures in this section are the
   fan-out's baseline; the first parallel Prow run replaces them.
 
-  **One term in that is still a substitution rather than a measurement, and 1.26× is the honest
+  **One term in that is still a substitution rather than a measurement, and 1.61× is the honest
   figure.** #998 activated `rca-remediation-pr` precisely so its own smoke run would be the first
   measurement of it, so the table prices it at the fleet average. It is one of the two active tasks
   that **write**, so `compliance-rbac-overgrant` is the better comparable at a measured 681s per
-  repetition — at that cost the total is ~191min and **1.26×**. Read 1.43× as the optimistic bound
-  and 1.26× as the working number until the first fourteen-task run lands.
+  repetition — at that cost the invocations total ~207min, or ~223min once the 16.4min fixed term is
+  added back, and **1.61×** against `360m`. Read 1.80× as the optimistic bound and 1.61× as the
+  working number until the first seventeen-task run lands. Both are counted on the whole job; the
+  table's ratios leave the fixed term out, which is why they read higher.
 
   **The variance that was flagged as the thing to watch has resolved in the good direction.**
   `consistency-authorized-networks-probe` took 1039s on the one earlier run that existed, against
@@ -1093,10 +1097,17 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `compliance-rbac-overgrant` at 2042s for three repetitions, 24% of the whole task budget on its
   own.
 
-  **It is not being raised a third time, and that is a decision rather than an oversight.** The
-  fan-out above is the runtime cut that was awaited: if it realises even half its parallelism in a
-  pool project, the serial 1.26×–1.43× drops below 1× and the headroom returns without another pull
-  request against another repository. `300m` stays a follow-up rather than a blocker.
+  **The third raise landed on 2026-08-31:**
+  [`oss-test-infra#2676`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2676) took the
+  deadline `240m` → `360m`, keeping three repetitions. It is why the seventeenth activation needed no
+  companion change of its own. At `240m` that case would have run at 1.07× honest — thin rather than
+  broken, since 0.89× was a guaranteed timeout and 1.07× is not, but under half the 2× this job was
+  historically sized at. At `360m` it is 1.61×, and twenty tasks would still be 1.41×. One caveat for
+  anyone reading the Prow file: #2676 moved the number without touching the comment block above it,
+  so that prose still argues from `240m`. The raise and the fan-out above are redundant on purpose
+  rather than by accident: the raise is measured against serial arithmetic that still holds if the
+  fan-out realises no parallelism at all in a pool project, and it is what makes `300m` a
+  follow-up rather than a blocker if it realises some.
 
   The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
   in another repository**, so activating a case here spends headroom that only a separate pull

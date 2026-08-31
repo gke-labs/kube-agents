@@ -520,9 +520,11 @@ TASKS=(
   # machinery canary: compliance-rbac-overgrant, the measured-clean one,
   # which exercises SOP dispatch, delegation, the token minter and the
   # ledger write end to end under the fleet-audits domain. Budget: canary
-  # 606s + six probes and one reliability variation at ~150-350s each +
-  # crashloop 142s + the two incumbents, against the deadline the
-  # 2026-08-26 run blew with full audits.
+  # 606s + the probes and prompt variations at ~150-350s each + crashloop
+  # 142s + the incumbents, against the deadline the 2026-08-26 run blew with
+  # full audits. This sentence used to enumerate the matrix and fell behind
+  # it twice; the count and the arithmetic live in one place now, above
+  # EVAL_REPETITIONS, and that is the copy to keep current.
   #
   # This list is the gate's REPORTING order. Execution order is the
   # fan-out's cost-hinted queue below (longest units first), so a Prow
@@ -534,6 +536,20 @@ TASKS=(
   "./tasks/upgrades-lagging-master-probe/task.yaml"
   "./tasks/consistency-authorized-networks-probe/task.yaml"
   "./tasks/cost-idle-pool-probe/task.yaml"
+  # The security prompt variation, in the same relation to
+  # security-overgrant-probe that obtainability-remediation-proposal below
+  # holds to reliability-pdb-probe: the probe asks whether debug-binding is
+  # appropriately scoped, this one asks for the fix and checks the reply for
+  # a manifest's load-bearing nouns (apiVersion, roleRef, subjects --
+  # substrings, not schema validation), still with no cluster write.
+  # Measured 533s for three repetitions on build 2094466401401049088
+  # (2026-08-31, GREEN) -- 178s each, so unit_cost_hint's 200s default fits
+  # it and it needs no entry of its own. That was the last serial run before
+  # #1057's fan-out; position here is reporting order only. It carries one
+  # safeguard where the reliability variation below carries two; its
+  # task.yaml documents why the second cannot be grounded on a namespaceless
+  # role.
+  "./tasks/security-overgrant-remediation-proposal/task.yaml"
   # The reliability prompt variation that grades what the probe does not
   # ask for: reliability-pdb-probe asks whether checkout-gateway survives a
   # drain; this one asks for a remediation manifest and checks the reply
@@ -741,9 +757,9 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # that is issue #902's lane. The serial measurements kept below predate the
 # fan-out and are its baseline.
 #
-# FOURTEEN tasks at three repetitions is FORTY-TWO devops-bench invocations,
-# where the presubmit's budget was sized for two. This number is no longer an
-# extrapolation from other builds: THIS matrix has now run end to end, at
+# SEVENTEEN tasks at three repetitions is FIFTY-ONE devops-bench invocations,
+# where the presubmit's budget was sized for two. The per-invocation cost is no
+# longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
 # (2026-08-27, GREEN).
 #
@@ -753,26 +769,36 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #       teardown)                                                16.4min
 #
 # So an invocation averages 3.6min, not the 4.7min extrapolated from #956's and
-# #982's builds -- those over-read it. Fourteen tasks x three is 42 invocations
-# and ~168min, or 1.43x against 240m.
+# #982's builds -- those over-read it. Seventeen tasks x three is 51 invocations
+# and ~184min, ~200min once the fixed term is added back, or 1.80x against the
+# 360m deadline.
 #
 # One term in that is still a substitution rather than a measurement:
 # rca-remediation-pr, activated by #998 so that its own smoke run would BE the
 # first measurement, is priced at the fleet average. It is one of the two active
 # tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
-# measured 681s per repetition -- at that cost the total is ~191min and 1.26x.
-# Treat 1.26x as the honest figure and 1.43x as the optimistic one until the
-# first fourteen-task run lands.
+# measured 681s per repetition -- at that cost the total is ~207min of
+# invocations, ~223min with the fixed term, and 1.61x. Treat 1.61x as the honest
+# figure and 1.80x as the optimistic one until the first seventeen-task run
+# lands.
 #
-# The budget has been raised twice to get here, both merged: oss-test-infra
-# #2667 took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off
-# a ten-task measurement. 150m would still have been a guaranteed timeout, which
-# is what made #2669 a prerequisite rather than a follow-up.
+# Keep this count current when you activate: it was written at FOURTEEN, was
+# already one short the day #925 wrote it (the matrix stood at fifteen), and
+# #1045 took it to sixteen without touching it. Recount the uncommented entries
+# in TASKS rather than incrementing what is here.
 #
-# It is deliberately NOT being raised a third time here: work to cut the eval's
-# runtime is in flight separately, and if it lands the headroom returns without
-# another pull request against another repository. At 1.26x-1.43x measured there
-# is real room, so 300m stays a follow-up rather than a blocker.
+# The budget has been raised three times to get here, all merged: oss-test-infra
+# #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
+# ten-task measurement, and #2676 took it 240m -> 360m on 2026-08-31. 150m would
+# still have been a guaranteed timeout, which is what made #2669 a prerequisite
+# rather than a follow-up.
+#
+# #2676 is why this activation needs no companion raise, and it changes the
+# picture rather than trimming it: at 240m the seventeenth case would have run
+# at 1.07x honest -- not a guaranteed timeout the way 0.89x was, but under half
+# the 2x this job was historically sized at. At 360m it is 1.61x. Note that
+# #2676 moved the number without touching the comment block above it, so the
+# Prow file's own prose still argues from 240m.
 #
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
@@ -783,9 +809,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # canary-cost case ~34min -- divided by however much of EVAL_TASK_PARALLELISM
 # the fan-out below actually realises against the pool's model quota, which the
 # first parallel Prow run will measure. Until it has, budget serially: a case
-# that fits at parallelism 1 cannot be the thing that blows the deadline.
-# Activating a case and raising the budget are one change in two repositories,
-# not a change and a follow-up.
+# that fits at parallelism 1 cannot be the thing that blows the deadline. At
+# 360m and seventeen tasks that leaves ~137-160min of serial headroom, which is
+# real room again -- exactly when this stops being watched, so recount before
+# you trust it. Activating a case and raising the budget are one change in two
+# repositories, not a change and a follow-up.
 #
 # The variance that was flagged as the thing to watch has resolved in the good
 # direction: consistency-authorized-networks-probe took 1039s on the one earlier
