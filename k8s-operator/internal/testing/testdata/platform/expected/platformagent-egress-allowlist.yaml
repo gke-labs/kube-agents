@@ -1223,6 +1223,8 @@ spec:
       protocol: TCP
     - port: 4000
       protocol: TCP
+    - port: 8080
+      protocol: TCP
     to:
     - namespaceSelector:
         matchLabels:

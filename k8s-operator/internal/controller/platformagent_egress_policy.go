@@ -231,14 +231,18 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*network
 
 	// The model gateway. buildAgentConfig pins the agent's model base_url to
 	// http://litellm.<namespace>.svc.cluster.local/v1 unconditionally, so the
-	// agent cannot think for a living without this rule. Both ports are named
-	// deliberately: the Service is 80 -> targetPort 4000
-	// (charts/kube-agents/templates/litellm.yaml), and whether a dataplane
-	// evaluates policy before or after that translation is not something the
-	// operator can know. The peer is a Pod selector that matches only LiteLLM,
-	// which listens on 4000 alone, so naming 80 as well permits nothing extra.
+	// agent cannot think for a living without this rule. The port set matches
+	// buildNetworkPolicy's LiteLLM rule exactly, so the two policies cannot
+	// disagree about the model gateway: 8080 is what this repository's chart
+	// and kustomize deployments actually listen on (Service 80 -> targetPort
+	// 8080), and it is the port a Pod-selector peer sees after the ClusterIP
+	// translation, which is the only point such a peer matches; 4000 is
+	// LiteLLM's upstream default, kept because the gateway rule keeps it for
+	// deployments this repository's manifests did not render; 80 covers a
+	// dataplane evaluating before the translation. Extra ports on a peer that matches only LiteLLM permit
+	// nothing beyond LiteLLM.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-		Ports: []networkingv1.NetworkPolicyPort{tcpPort(80), tcpPort(4000)},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(80), tcpPort(4000), tcpPort(8080)},
 		To: []networkingv1.NetworkPolicyPeer{
 			namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
 		},
@@ -447,6 +451,10 @@ func egressAllowlistRefusals(agent *agentv1alpha1.PlatformAgent) []string {
 	for index, rule := range agent.Spec.Security.EgressAllowlist.ExtraRules {
 		if reason := egressRuleReachesMetadata(rule); reason != "" {
 			refusals = append(refusals, fmt.Sprintf("extraRules[%d]: %s", index, reason))
+			continue
+		}
+		if reason := egressRuleAPIServerRejection(rule); reason != "" {
+			refusals = append(refusals, fmt.Sprintf("extraRules[%d]: %s", index, reason))
 		}
 	}
 	return refusals
@@ -473,9 +481,56 @@ func admissibleExtraEgressRules(agent *agentv1alpha1.PlatformAgent) ([]networkin
 			dropped = append(dropped, fmt.Sprintf("extraRules[%d]: %s", index, reason))
 			continue
 		}
+		if reason := egressRuleAPIServerRejection(rule); reason != "" {
+			dropped = append(dropped, fmt.Sprintf("extraRules[%d]: %s", index, reason))
+			continue
+		}
 		kept = append(kept, *rule.DeepCopy())
 	}
 	return kept, dropped
+}
+
+// egressRuleAPIServerRejection returns why the API server would reject the
+// whole NetworkPolicy over this rule, or "" if it would store it.
+//
+// ExtraRules is the raw upstream type, so the CRD schema stores shapes
+// networking.k8s.io/v1 refuses at apply time. Left unscreened, the rejection
+// arrives as an applyManaged error at reconcile step 11b, which returns from
+// Reconcile above the Service, the PodDisruptionBudget, the gateway guardrail
+// and the status update — the CR keeps its last phase while nothing behind it
+// is being maintained, and the reason sits in a log line rather than on the
+// resource. That is the same wedge toEgressRules defends
+// spec.networkPolicy.additionalEgress against by canonicalising its own
+// narrowed type; this field keeps the raw type, so the two shapes the API
+// server refuses are turned into an EgressAllowlistRefused here, where the
+// operator parks Degraded with the rule named.
+func egressRuleAPIServerRejection(rule networkingv1.NetworkPolicyEgressRule) string {
+	for _, peer := range rule.To {
+		if peer.IPBlock == nil && peer.PodSelector == nil && peer.NamespaceSelector == nil {
+			return "a \"to\" peer with no ipBlock, podSelector or namespaceSelector is rejected by the " +
+				"API server (\"must specify a peer\"), and the rejection would freeze this agent's whole " +
+				"reconcile at the apply"
+		}
+		if peer.IPBlock == nil {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(peer.IPBlock.CIDR)
+		if err != nil {
+			// Already refused by egressRuleReachesMetadata; nothing to add.
+			continue
+		}
+		for _, except := range peer.IPBlock.Except {
+			exceptPrefix, exceptErr := netip.ParsePrefix(except)
+			if exceptErr != nil {
+				return fmt.Sprintf("ipBlock except %q is not a valid CIDR", except)
+			}
+			if exceptPrefix.Bits() < prefix.Bits() || !prefix.Contains(exceptPrefix.Masked().Addr()) {
+				return fmt.Sprintf("ipBlock except %q is not within cidr %q; the API server rejects the "+
+					"whole policy over it (\"must be a strict subset of the cidr\")", except, peer.IPBlock.CIDR)
+			}
+		}
+	}
+	return ""
 }
 
 // egressRuleReachesMetadata returns why a rule could reach the metadata server,

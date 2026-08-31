@@ -256,8 +256,18 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 			why: "CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all address it (credentialProxyBaseURL)",
 		},
 		{
-			name: "litellm", ns: agent.Namespace, labels: map[string]string{"app": "litellm"}, port: 4000,
-			why: "buildAgentConfig pins model base_url to http://litellm.<ns>.svc.cluster.local/v1 unconditionally",
+			name: "litellm on the port this repository's deployments listen on", ns: agent.Namespace,
+			labels: map[string]string{"app": "litellm"}, port: 8080,
+			why: "buildAgentConfig pins model base_url to http://litellm.<ns>.svc.cluster.local/v1 unconditionally, " +
+				"and the chart, kustomize and example deployments all start LiteLLM with --port 8080 — a " +
+				"Pod-selector peer matches after the ClusterIP translation, so 8080 is the port that carries " +
+				"every model call",
+		},
+		{
+			name: "litellm on the upstream default port", ns: agent.Namespace,
+			labels: map[string]string{"app": "litellm"}, port: 4000,
+			why: "the gateway policy names it for deployments these manifests did not render, and the two " +
+				"policies must not disagree about the model gateway",
 		},
 	}
 
@@ -411,6 +421,128 @@ func TestARefusedAllowlistEntryIsReportedNotJustLogged(t *testing.T) {
 	}
 	if !strings.Contains(message, "extraRules[0]") {
 		t.Errorf("the message must name which entry was refused so it can be found and fixed, got %q", message)
+	}
+}
+
+// TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied covers the shapes
+// the CRD stores and networking.k8s.io/v1 refuses. ExtraRules is the raw
+// upstream type, so without this screen the rejection arrives as an apply
+// error at step 11b and returns from Reconcile above the Service, the gateway
+// guardrail and the status update — a wedged reconcile whose reason lives in a
+// log line. The property under test is that the reconcile parks Degraded with
+// the rule named instead of erroring, and that a valid except survives the
+// screen: the guard must refuse what the API server refuses and nothing more.
+func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    networkingv1.NetworkPolicyEgressRule
+		refused bool
+	}{
+		{
+			name:    "a peer naming nothing",
+			rule:    networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{}}},
+			refused: true,
+		},
+		{
+			name: "an except outside its cidr",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20", Except: []string{"10.0.0.0/8"}},
+			}}},
+			refused: true,
+		},
+		{
+			name: "an unparseable except",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20", Except: []string{"not-a-cidr"}},
+			}}},
+			refused: true,
+		},
+		{
+			name: "an except inside its cidr",
+			rule: networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20", Except: []string{"140.82.113.0/24"}},
+			}}},
+			refused: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ExtraRules: []networkingv1.NetworkPolicyEgressRule{tc.rule},
+				}
+			})
+			refusals := egressAllowlistRefusals(agent)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent)
+			rendered := false
+			for _, rule := range policy.Spec.Egress {
+				for _, peer := range rule.To {
+					if peer.IPBlock != nil && peer.IPBlock.CIDR == "140.82.112.0/20" {
+						rendered = true
+					}
+				}
+			}
+			if tc.refused {
+				if len(refusals) == 0 {
+					t.Error("a rule the API server would reject must be refused at validation, not passed to the apply")
+				}
+				if len(dropped) == 0 {
+					t.Error("the builder must drop the rule too; validation and the builder are separate layers on purpose")
+				}
+				if rendered {
+					t.Error("the refused rule was rendered anyway")
+				}
+				return
+			}
+			if len(refusals) != 0 {
+				t.Errorf("a valid except was refused; the screen must refuse only what the API server refuses: %v", refusals)
+			}
+			if !rendered {
+				t.Error("the valid rule was not rendered")
+			}
+		})
+	}
+
+	// The whole point is that the reconcile parks rather than wedges: run one
+	// rejected shape through a full Reconcile and require no error and a
+	// Degraded status naming the rule.
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ExtraRules: []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "140.82.112.0/20", Except: []string{"10.0.0.0/8"}},
+				}},
+			}},
+		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("a rejectable extraRules entry must park the CR Degraded, not error the reconcile: %v", err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("failed to re-read the agent: %v", err)
+	}
+	if stored.Status.Phase != "Degraded" {
+		t.Errorf("expected Degraded, got %q", stored.Status.Phase)
+	}
+	var reason, message string
+	for _, condition := range stored.Status.Conditions {
+		if condition.Type == "Ready" {
+			reason, message = condition.Reason, condition.Message
+		}
+	}
+	if reason != "EgressAllowlistRefused" || !strings.Contains(message, "extraRules[0]") {
+		t.Errorf("the refusal must name the entry: reason=%q message=%q", reason, message)
 	}
 }
 
