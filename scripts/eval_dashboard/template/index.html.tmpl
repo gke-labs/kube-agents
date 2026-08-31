@@ -222,6 +222,11 @@ function sortedRuns(data) {
   return runs;
 }
 const runTasks = (run) => (run ? (run.tasks || []).filter((t) => t && typeof t === "object") : []);
+// Runs that measured anything: at least one task row. An aborted build
+// parses to zero tasks; anchoring the tiles or the suite table to one
+// would render vacuous 0/0 states. Trends and the header sha stay on
+// sortedRuns. Mirrors render.py's measured_runs.
+const measuredRuns = (data) => sortedRuns(data).filter((r) => runTasks(r).length);
 
 function countedResults(run) {
   let passed = 0, failed = 0, infra = 0;
@@ -296,20 +301,23 @@ function ratioChip(currentValue, previousValue, unit, havePreviousRun) {
 }
 
 function tilesHtml(data) {
-  const runs = sortedRuns(data);
+  const runs = measuredRuns(data);
   const latest = runs[runs.length - 1] || null;
   const previous = runs.length > 1 ? runs[runs.length - 2] : null;
   const tiles = [];
 
   if (latest) {
     const [passed, failed, infra] = countedResults(latest);
+    // "all passed" must never be claimed by a run that measured nothing.
     const chip = failed ? deltaChip("flat", `${failed} failed`)
-      : infra ? deltaChip("flat", `${infra} infra`) : deltaChip("up", "all passed");
+      : infra ? deltaChip("flat", `${infra} infra`)
+      : passed ? deltaChip("up", "all passed") : "";
     const buildId = String(latest.build_id || "?");
     tiles.push(tile("Latest run", `${passed}<small>/ ${passed + failed} passed</small>`, chip,
       `build ${buildId.slice(0, 8)}… · ${latest.project || "?"}`));
   } else {
-    tiles.push(tile("Latest run", "—", "", "no runs on record"));
+    tiles.push(tile("Latest run", "—", "",
+      sortedRuns(data).length ? "no measured runs yet" : "no runs on record"));
   }
 
   const coverage = data.coverage || {};
@@ -399,7 +407,7 @@ function caseRow(kase, latestRun) {
 }
 
 function suiteHtml(data) {
-  const runs = sortedRuns(data);
+  const runs = measuredRuns(data);
   const latest = runs[runs.length - 1] || null;
   const rows = (data.cases || []).map((c) => caseRow(c, latest)).join("")
     || '<tr><td colspan="6"><span class="cap">no cases on record yet</span></td></tr>';

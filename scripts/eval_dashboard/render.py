@@ -126,6 +126,15 @@ def run_tasks(run: dict | None) -> list[dict]:
     return [t for t in run.get("tasks") or [] if isinstance(t, dict)]
 
 
+def measured_runs(data: dict) -> list[dict]:
+    """Runs that measured anything: at least one task row. An aborted or
+    deadline-truncated build parses to zero tasks; anchoring the header
+    tiles or the suite table to one would render vacuous 0/0 states
+    ("0 / 0 passed · all passed" on a run that measured nothing). The
+    trend charts and the header sha deliberately stay on sorted_runs."""
+    return [r for r in sorted_runs(data) if run_tasks(r)]
+
+
 def counted_results(run: dict | None) -> tuple[int, int, int]:
     """(passed, failed, infra) for one run. Only pass+fail gate."""
     passed = failed = infra = 0
@@ -261,7 +270,7 @@ def ratio_chip(
 
 
 def tiles_html(data: dict) -> str:
-    runs = sorted_runs(data)
+    runs = measured_runs(data)
     latest = runs[-1] if runs else None
     previous = runs[-2] if len(runs) > 1 else None
     tiles = []
@@ -274,8 +283,12 @@ def tiles_html(data: dict) -> str:
             chip = delta_chip("flat", f"{failed} failed")
         elif infra:
             chip = delta_chip("flat", f"{infra} infra")
-        else:
+        elif passed:
             chip = delta_chip("up", "all passed")
+        else:
+            # Unreachable for a measured run, but "all passed" must never
+            # be claimed by a run that measured nothing.
+            chip = ""
         build_id = str(latest.get("build_id") or "?")
         detail = f"build {build_id[:8]}… · {latest.get('project') or '?'}"
         tiles.append(
@@ -287,7 +300,8 @@ def tiles_html(data: dict) -> str:
             )
         )
     else:
-        tiles.append(tile("Latest run", "—", "", "no runs on record"))
+        detail = "no measured runs yet" if sorted_runs(data) else "no runs on record"
+        tiles.append(tile("Latest run", "—", "", detail))
 
     # Domain coverage
     coverage = data.get("coverage") or {}
@@ -389,7 +403,7 @@ def case_row(case: dict, latest_run: dict | None, notes: dict) -> str:
 
 
 def suite_html(data: dict, notes: dict) -> str:
-    runs = sorted_runs(data)
+    runs = measured_runs(data)
     latest = runs[-1] if runs else None
     rows = "".join(case_row(c, latest, notes) for c in data.get("cases") or [])
     if not rows:

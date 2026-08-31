@@ -319,6 +319,44 @@ class RenderToleranceTest(unittest.TestCase):
         # the words "first run" as a string literal either way).
         self.assertNotIn('<span class="delta flat">first run</span>', html)
 
+    def test_zero_task_newest_run_does_not_anchor_the_tiles(self):
+        # A build aborted before any task parses to zero task rows. The
+        # tiles and the suite table anchor to the newest *measured* run
+        # instead of rendering "0 / 0 passed · all passed", and the wall
+        # clock does not inherit the aborted run's short duration.
+        data = fixture_data()
+        data["runs"].append({
+            "build_id": "2094501900000000000",
+            "project": None,
+            "started": "2026-08-29T09:00:00Z",
+            "finished": "2026-08-29T09:09:00Z",
+            "result": "ABORTED",
+            "duration_s": 540,
+            "tasks": [],
+        })
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        app = baked_app(html)
+        self.assertNotIn("0<small>/ 0 passed</small>", app)
+        self.assertNotIn("all passed", app)
+        self.assertIn("1<small>/ 2 passed</small>", app)  # newest measured run
+        self.assertIn("72<small>min</small>", app)  # 4320 s, not the 9-min abort
+        self.assertNotIn("9<small>min</small>", app)
+
+    def test_all_runs_unmeasured_says_so(self):
+        data = {
+            "schema_version": 1,
+            "generated_at": "2026-08-28T14:02:11Z",
+            "source": "logs",
+            "runs": [{"build_id": "b1", "result": "ABORTED", "tasks": []}],
+            "cases": [{"name": "x"}],
+        }
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        app = baked_app(html)
+        self.assertIn("no measured runs yet", app)
+        self.assertNotIn("all passed", app)
+
     def test_rounding_matches_the_js_rerender(self):
         # Python rounds half to even, JS Math.round/toFixed round half up;
         # the baked HTML must agree with what the on-load re-render shows.
