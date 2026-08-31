@@ -1,8 +1,9 @@
 # ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS. Coverage of the
 # security domain is security-overgrant-probe's; this variation grades what
-# the probe does not ask for: an RBAC remediation in the reply, checked on
-# the manifest's load-bearing nouns (roleRef, subjects, an apiVersion —
-# substring checks, not schema validation), still with no cluster write.
+# the probe does not ask for: an RBAC remediation in the reply, checked on the
+# manifest's load-bearing nouns (apiVersion, roleRef, subjects) plus a
+# `kind: RoleBinding` the planted cluster-scoped object cannot supply —
+# substring checks, not schema validation — still with no cluster write.
 # Same shape as obtainability-remediation-proposal, which measured
 # 126s/130s/124s across three presubmit runs. This one measured 533s for three
 # repetitions -- 178s each -- on build 2094466401401049088 (2026-08-31, GREEN),
@@ -65,15 +66,16 @@ name: Security remediation proposes a narrowed RBAC binding manifest
 prompt: >-
   A ClusterRoleBinding named debug-binding exists somewhere in the fleet and
   grants more access than it should. Find the cluster it is on and propose a
-  concrete replacement manifest that scopes the grant appropriately. Do not
-  apply anything to the cluster.
+  concrete replacement manifest that confines the grant to the one namespace
+  its subject already lives in. Do not apply anything to the cluster.
 expected_output: >-
   The agent reads debug-binding, establishes that it grants cluster-admin to
   the default ServiceAccount in the seeded-security namespace, and returns a
-  concrete replacement manifest — a binding narrowed in scope, in privilege,
-  or in both, naming the same subject — as a recommendation, without applying
-  it or altering the existing binding. Whether the narrowing it chooses is the
-  right one is the judge's to score; nothing here was planted for it.
+  concrete replacement manifest — a namespaced RoleBinding in that namespace,
+  naming the same subject, bound to something narrower than cluster-admin — as
+  a recommendation, without applying it or altering the existing binding.
+  Whether the role it binds to is the right one is the judge's to score;
+  nothing here was planted for it.
 infrastructure:
   deployer: noop
 validated: false
@@ -97,29 +99,45 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # Manifest-ness. roleRef and subjects are the load-bearing fields of a
-      # narrowed binding, but they are not sufficient on their own: they are
-      # ordinary vocabulary in RBAC ADVICE too, and a reply reading "replace
-      # it with a RoleBinding whose roleRef points at view, keeping the same
-      # subjects" passes both while proposing no manifest at all. apiVersion
-      # is what discriminates — prose does not say it, and a concrete
-      # manifest, which is what the prompt asks for, cannot omit it. The
-      # trade is that a bare fragment quoting only roleRef and subjects
-      # fails; that is the intended reading of "concrete". A kind would not
-      # discriminate at all: "ClusterRoleBinding" is in the prompt, and
-      # "RoleBinding" is a substring of it.
+      # Manifest-ness, and it has to be the PROPOSED manifest. apiVersion,
+      # roleRef and subjects are the load-bearing fields of a binding, and
+      # requiring all three does rule out bare prose advice — but every one of
+      # them is also in `kubectl get clusterrolebinding debug-binding -o yaml`,
+      # so a reply that pastes the live read as evidence and then gives prose
+      # advice satisfies them having proposed nothing. That is not a hypothetical
+      # for this fixture: the sibling security-overgrant-probe's expected_output
+      # asks for cited live reads outright.
+      #
+      # any_of is what closes it. The planted object is cluster-scoped, so
+      # `kind: RoleBinding` is a token the current state cannot produce —
+      # "kind: ClusterRoleBinding" does not contain it, because the space after
+      # the colon breaks the substring, and neither does roleRef's
+      # "kind: ClusterRole". It is only reachable by writing a namespaced
+      # binding, which is what the prompt now asks for. Two spellings because
+      # `-o json` output is a legitimate manifest and quotes survive
+      # normalization; a bare "RoleBinding" would be no discriminator at all,
+      # since it is a substring of ClusterRoleBinding and of the prompt.
+      #
+      # Residual: a final message that dumps OTHER, unrelated RoleBindings from
+      # the cluster carries the token without proposing anything. Narrower than
+      # the hole it replaces — that survey has to appear in the closing message,
+      # not in progress chatter (scope is `final`) — and not closable with the
+      # phrase checks available, which cannot require two tokens to co-occur.
       required_phrases: ["apiVersion", "roleRef", "subjects"]
+      any_of_phrases: ["kind: RoleBinding", '"kind": "RoleBinding"']
   - name: report-targets-the-planted-binding
     role: objective
     mode: assert
     check:
       type: report_contains
-      # debug-binding is in the prompt, so on its own it proves nothing; it is
-      # here because a replacement manifest for some OTHER binding is not the
-      # answer. seeded-security is what grounds the entry — it appears nowhere
-      # in the prompt, and a replacement that keeps the same subject cannot
-      # omit the ServiceAccount's namespace, so it can only come from a live
-      # read of the binding.
+      # Targeting, not proposal-ness — that is the check above, and this one
+      # deliberately does not repeat it. debug-binding is in the prompt, so on
+      # its own it proves nothing; it is here because a replacement manifest
+      # for some OTHER binding is not the answer. seeded-security appears
+      # nowhere in the prompt, so it can only come from a live read of the
+      # binding — which is all it claims. An echo of that read satisfies it,
+      # and should: the namespace is what a namespaced replacement has to be
+      # written in, and whether one was written is measured above.
       required_phrases: ["debug-binding", "seeded-security"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (the trajectory carries only the
