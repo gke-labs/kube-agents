@@ -78,10 +78,23 @@ updates:
     # resolved current version, and `mcp<2` is a bare range rather than an `==`
     # pin, so there is none. That is why #751 arrived titled "update mcp
     # requirement from <2 to <3" instead of as a version bump.
+    #
+    # admin_console/requirements.txt caps websockets below 17 because Streamlit
+    # does: 1.62.0, the newest release, still requires websockets<17,>=12.0.0.
+    # Raising the floor past that cap does not go merely untested -- it makes
+    # the file unresolvable. #830 hit it and restored the cap; #1002 proposed
+    # `websockets>=17.0.1,<18` anyway and pip answered ResolutionImpossible,
+    # taking the Python unit tests and the coverage job with it. `versions` for
+    # the same reason as mcp: the pin is a bare range, so there is no resolved
+    # version for `update-types` to compare against. Remove this rule and lift
+    # the pin in one change when Streamlit lifts its own.
     ignore:
       - dependency-name: "mcp"
         versions:
           - ">=2"
+      - dependency-name: "websockets"
+        versions:
+          - ">=17"
     groups:
       python:
         patterns:

@@ -137,6 +137,153 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_is_rc_candidate_commit_already_validated_is_anchored_to_the_rc_family(self):
+        """The glob has to be rc_*_validated, not *_validated.
+
+        This function gates resolve_rc_tag.sh's skip decision, so a validation
+        marker from another tag family matching it would make the RC pipeline
+        skip a candidate it never validated. staging_* is the family that made
+        this concrete, but the point is general.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            head = git("rev-parse", "HEAD").stdout.strip()
+
+            proc = self._run_common_func(f'is_rc_candidate_commit_already_validated "{head}"', cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+
+            git("tag", "-a", "someone_elses_validated", "-m", "Not an RC marker")
+            proc = self._run_common_func(f'is_rc_candidate_commit_already_validated "{head}"', cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0, "a non-rc_ tag ending _validated must not count")
+
+            git("tag", "-a", "rc_2608191200_2222222_validated", "-m", "RC marker")
+            proc = self._run_common_func(f'is_rc_candidate_commit_already_validated "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0)
+        finally:
+            temp_dir.cleanup()
+
+    def test_staging_tag_for_rc(self):
+        cases = [
+            ("rc_2608241820_b35543c_validated", "staging_2608241820_b35543c"),
+            # The suffix is optional: the unvalidated tag maps to the same name,
+            # which is what makes the transform reversible.
+            ("rc_2608241820_b35543c", "staging_2608241820_b35543c"),
+        ]
+        for rc_tag, expected in cases:
+            with self.subTest(rc_tag=rc_tag):
+                proc = self._run_common_func(f'staging_tag_for_rc "{rc_tag}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), expected)
+
+    def test_staging_tag_for_rc_refuses_anything_outside_the_rc_family(self):
+        """The output is a live deploy trigger, so a typo must not compose one."""
+        for bad in ("", "0.2.0", "staging_2608241820_b35543c", "rc_", "not-a-tag"):
+            with self.subTest(bad=bad):
+                proc = self._run_common_func(f'staging_tag_for_rc "{bad}"')
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout.strip(), "")
+
+    def test_get_existing_staging_tag(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            head = git("rev-parse", "HEAD").stdout.strip()
+
+            proc = self._run_common_func(f'get_existing_staging_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            # A staging tag on a DIFFERENT commit must not answer for this one.
+            (pathlib.Path(repo_dir) / "second.txt").write_text("second\n")
+            git("add", "second.txt")
+            git("commit", "-m", "chore: second commit")
+            other = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "staging_2608241820_b35543c", "-m", "Promoted elsewhere")
+
+            proc = self._run_common_func(f'get_existing_staging_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            proc = self._run_common_func(f'get_existing_staging_tag "{other}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "staging_2608241820_b35543c")
+        finally:
+            temp_dir.cleanup()
+
+    def _repo_with_staging_trigger(self, patterns):
+        """A mock repo whose HEAD carries staging-redeploy-agent.yml with `patterns`."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        workflow = pathlib.Path(repo_dir) / ".github" / "workflows"
+        workflow.mkdir(parents=True, exist_ok=True)
+        rendered = "\n".join(f'      - "{p}"' for p in patterns)
+        (workflow / "staging-redeploy-agent.yml").write_text(
+            "name: Staging Redeploy Agent\n\non:\n  push:\n    tags:\n" + rendered + "\n\njobs: {}\n"
+        )
+        git("add", "-A")
+        git("commit", "-m", "chore: staging trigger")
+        return repo_dir, git("rev-parse", "HEAD").stdout.strip()
+
+    def _trigger_matches(self, repo_dir, commit, tag):
+        proc = self._run_common_func(
+            f'staging_trigger_matches_at_commit "{commit}" "{tag}"', cwd=repo_dir
+        )
+        return proc.returncode
+
+    def test_staging_trigger_matches_the_tag_the_promotion_pushes(self):
+        repo_dir, head = self._repo_with_staging_trigger(["staging_*"])
+        self.assertEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
+
+    def test_staging_trigger_rejects_a_commit_that_predates_the_rename(self):
+        """The whole reason the helper exists.
+
+        A push event runs the workflows in the pushed ref's tree. A candidate
+        still declaring `staging/**` does not match a flat `staging_<ts>_<sha>`,
+        so the promotion would deploy nothing and report success.
+        """
+        repo_dir, head = self._repo_with_staging_trigger(["staging/**"])
+        self.assertNotEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
+        # The same tree does answer the tag shape it was written for.
+        self.assertEqual(self._trigger_matches(repo_dir, head, "staging/2026-07-23"), 0)
+
+    def test_staging_trigger_matches_when_any_listed_pattern_does(self):
+        repo_dir, head = self._repo_with_staging_trigger(["staging/**", "staging_*"])
+        self.assertEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
+
+    def test_staging_trigger_refuses_when_the_workflow_is_absent(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        head = git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
+
+    def test_staging_trigger_requires_both_arguments(self):
+        repo_dir, head = self._repo_with_staging_trigger(["staging_*"])
+        proc = self._run_common_func('staging_trigger_matches_at_commit "" ""', cwd=repo_dir)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("a commit and a tag are required", proc.stderr)
+
+    def test_release_fetch_tags_is_a_no_op_outside_ci(self):
+        """It must not reach the network on a developer machine.
+
+        The CI arm cannot be exercised hermetically — it fetches a real URL — so
+        what is pinned here is the guard in front of it. Without the guard, every
+        script that calls this would try to hit github.com from a unit test.
+        """
+        temp_dir, repo_dir, _ = create_mock_git_repo()
+        try:
+            proc = self._run_common_func("release_fetch_tags", env={"CI": ""}, cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            # And it stays quiet rather than failing when the fetch cannot work:
+            # a fetch that could not run is not itself the error, the caller's
+            # own lookup afterwards is.
+            proc = self._run_common_func(
+                "release_fetch_tags",
+                env={"CI": "true", "GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"},
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
     def test_get_target_repo(self):
         # Default
         proc = self._run_common_func('get_target_repo', env={"GH_ORG": "", "GH_REPO": "", "GITHUB_REPOSITORY": ""})

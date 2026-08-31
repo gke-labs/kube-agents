@@ -3,7 +3,9 @@ name: Staging Redeploy Agent
 on:
   push:
     tags:
-      - "staging/**"
+      # staging_<ts>_<sha>, which scripts/release/common.sh's staging_tag_for_rc
+      # derives from the validated rc_* candidate tag.
+      - "staging_*"
 
 # The payload here is a `helm upgrade` on the shared `kube-agents` release.
 # Cancelling one mid-flight strands the release in pending-upgrade and every
@@ -23,7 +25,28 @@ permissions:
   contents: read
 
 jobs:
+  # github.sha on a tag push is the new value of the ref, and the promotion tags
+  # are annotated, so it is the tag object's SHA rather than the commit's. The
+  # deploy below uses it as a container image tag and no image is published under
+  # a tag object's SHA. Peel it once here.
+  resolve-commit:
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.peel.outputs.commit_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Peel the promotion tag to its commit
+        id: peel
+        run: ./scripts/release/peel_tag_commit.sh
+
   call-deploy:
+    needs: resolve-commit
     permissions:
       contents: read
       id-token: write
@@ -31,5 +54,5 @@ jobs:
     uses: ./.github/workflows/reusable-deploy-agent.yml
     with:
       target_environment: "staging"
-      image_tag: ${{ github.sha }}
-      checkout_sha: ${{ github.sha }}
+      image_tag: ${{ needs.resolve-commit.outputs.commit_sha }}
+      checkout_sha: ${{ needs.resolve-commit.outputs.commit_sha }}

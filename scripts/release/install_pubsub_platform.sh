@@ -29,11 +29,9 @@
 # FAILURE POLICY LIVES IN THE WORKFLOW, NOT HERE
 #
 # This script exits non-zero when it cannot deliver working alert ingress. It
-# does NOT decide whether that should fail the run, because the answer differs
-# per caller: in rc-release-pipeline.yml the tests that read an alert are the
-# optional cluster/audit suite, so that step carries `continue-on-error: true`;
-# a workflow whose whole purpose is alert-driven testing should let it fail.
-# Expressing that in the workflow keeps it where a reader can see it.
+# does NOT decide whether that should fail the run: the answer differs per
+# caller, so e2e-run.yml takes it as the `alert_ingress_required` input and
+# renders it into the step's `continue-on-error`.
 #
 # What `continue-on-error` does and does not buy, precisely: it covers failures
 # THIS script detects and reports. It does not make the adapter harmless to the

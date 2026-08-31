@@ -323,7 +323,10 @@ assert the planted finding specifically — `debug-binding`, `cluster-admin` —
 never "the audit found something", and judged prose should expect the declared
 rows above to appear alongside the planted finding in their respective audits.
 
-The chat-routing and incident-triage scenarios need no planted defect; the
+The chat-routing and incident-triage scenarios need no defect planted in the
+fleet — incident triage plants its own, an OOM-killed workload applied to the
+host cluster by `bench/tf/prebuilt/autoops-incident`, because the only cluster
+`k8s-event-watcher` sees is the one it runs in; the
 silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
 decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.

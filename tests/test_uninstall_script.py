@@ -141,7 +141,7 @@ echo "rc=$rc bucket=${{KUBE_AGENTS_STATE_BUCKET:-<unset>}}"
     def test_an_unreadable_probe_is_not_reported_as_nothing_to_tear_down(self):
         # The failure this guards is specific: the RC pipeline's WIF principal
         # loses storage.objects.get, the probe fails, and a bare exit-code test
-        # calls that "clean project" — so provision_rc_environment.sh takes the
+        # calls that "clean project" — so provision_environment.sh takes the
         # benign arm, raises no annotation, ignores RC_TEARDOWN_STRICT, and
         # installs over the live cluster. Anything that is not a clean absent
         # must be a failure.
@@ -168,7 +168,7 @@ echo "rc=$rc bucket=${{KUBE_AGENTS_STATE_BUCKET:-<unset>}}"
         # both is a refusal that names the recovery path, never a destroy.
         #
         # rc=3, not 1: this is the one non-zero exit that is not a failure, and
-        # an automated caller (scripts/release/provision_rc_environment.sh) has
+        # an automated caller (scripts/release/provision_environment.sh) has
         # to tell "nothing was installed" from "the teardown broke".
         proc = self._run(remote_state_exists=False)
         self.assertIn("rc=3", proc.stdout, proc.stderr)
@@ -209,7 +209,7 @@ echo "stderr-survived-the-lock" >&2
         # on_error exits with the FAILING COMMAND's status, so without
         # normalisation any child that exits 3 — a gcloud wrapper, a nested
         # script under lifecycle.sh — would speak the "nothing to tear down"
-        # contract and tell provision_rc_environment.sh to install over a live
+        # contract and tell provision_environment.sh to install over a live
         # environment.
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"

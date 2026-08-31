@@ -1,6 +1,6 @@
 # kube-agents Testing Strategy
 
-> **STATUS: draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs two cases and blocks nothing; the release gate is one test. Nightly is **deferred** (§4.4). Everything else here is the plan.
+> **STATUS: draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs two cases and blocks nothing; the release gate is one test. Nightly is a merged pipeline that has never run: `nightly-pipeline.yml` exists, with the full E2E matrix and the staging promotion, and its GCP project and `nightly` GitHub environment now exist too, but it has no cron and no dispatch has been made against it. None of the eval tier §4.4 describes is built either. Everything else here is the plan.
 
 ## 1. What we are building
 
@@ -34,7 +34,7 @@ Those say **what** can go wrong, not **where**. Coverage is counted by domain: o
 
 ```mermaid
 flowchart LR
-    U["<b>Unit</b><br/>every PR<br/>no cluster"] --> I["<b>Integration</b><br/>every PR<br/>real seams, fake agent"] --> P["<b>Presubmit evals</b><br/>every PR<br/>standing seeded fleet"] --> G["<b>Release gate</b><br/>every 3h<br/>built images"] --> N["<b>Nightly</b><br/>deferred<br/>own clusters"]
+    U["<b>Unit</b><br/>every PR<br/>no cluster"] --> I["<b>Integration</b><br/>every PR<br/>real seams, fake agent"] --> P["<b>Presubmit evals</b><br/>every PR<br/>standing seeded fleet"] --> G["<b>Release gate</b><br/>every 3h<br/>built images"] --> N["<b>Nightly</b><br/>E2E matrix + staging promotion<br/>own project"]
 ```
 
 ### 4.1 Unit: have
@@ -181,15 +181,19 @@ A baseline is therefore valid for exactly one combination of five versions: flee
 
 ### 4.3 Release gate: have one test
 
-Every three hours, `rc-release-pipeline.yml` picks the newest built commit on `main`, rebuilds the RC environment from scratch with `install.sh`, runs one test, and tags the commit `*_validated`. That test posts _"what is 2 + 3?"_ to a Chat space and asserts the reply contains a 5. Install is covered; behaviour is not.
+Every three hours, `rc-scheduler.yml` picks the newest built commit on `main` and dispatches `rc-release-pipeline.yml` against it — or, when that commit has already been attempted, dispatches nothing, so a quiet tick leaves no pipeline run to be mistaken for a passing one. The pipeline rebuilds the RC environment from scratch with `install.sh`, runs one test, and tags the commit `rc_*_validated`. That test posts _"what is 2 + 3?"_ to a Chat space and asserts the reply contains a 5. Install is covered; behaviour is not.
 
 Proposed: run the presubmit suite again here, against the assembled release. Exact checks block, judged scores are recorded. Keep the chat test; it is the only thing proving the assembled release can receive a message at all. Add a maintainers dashboard: one row per domain per RC, stamped with the commit and the model, written to BigQuery by the pipeline that already authenticates to GCP. Not a test, and the only reason a trend exists.
 
-### 4.4 Nightly: deferred
+### 4.4 Nightly: the tier exists, the eval content does not
 
-> **Deferred, not cancelled.** Nothing here is being built this cycle. Two of its three jobs found other homes: the zero-cost landing tier for a new case is now the unadmitted state in §4.2, and the volume argument is answered by the standing fleet making cases cheap. The design stays on the record so it is not re-derived later.
+> **What is built, and what it is waiting on.** `nightly-pipeline.yml` takes the newest `rc_*_validated` candidate, builds a cluster from nothing in a GCP project of its own under its own concurrency group, runs the `nightly` matrix on it, tags the commit for staging when the matrix passes, and destroys the cluster. That is the "own project and concurrency group, so it never queues behind the release pipeline" sentence below, expressed as a workflow.
+>
+> It has not run yet. The `kube-agents-nightly` GCP project, the `nightly` GitHub environment that supplies its coordinates, and its variables and secrets all exist now, which is the part that used to be missing; what remains outside this repository is the token minter's GitHub App installed on the nightly GitOps repository with its private key in that project's KMS key, and the environment's own Chat refresh token. Both sit under the matrix's blocking half, so the first dispatch fails on a fleet-audit or Chat assertion rather than on anything it was meant to grade. `scripts/release/README.md`, "The nightly environment", is the checklist. After that it needs a cron. The pipeline ships `workflow_dispatch`-only on purpose, so the first run is a deliberate dispatch rather than a schedule firing on merge night, and the schedule is turned on as its own change once that dispatch is boring. **Until it is, nothing runs the full E2E matrix on any schedule.**
+>
+> **What is not.** None of the eval tier. The zero-cost landing tier for a new case is the unadmitted state in §4.2 and the volume argument is answered by the standing fleet making cases cheap, so neither came back. Upgrade-from-the-last-validated-release and hardware-specific cases are still unwritten.
 
-What would be nightly-only is anything needing a cluster built from nothing: creation, upgrade from the last validated release, hardware-specific cases, plus anything too slow for a three-hour cadence. Its own project and concurrency group, so it never queues behind the release pipeline. Infrastructure failure is not test failure: retry once, then call it _not run_ and page whoever owns the test infrastructure, not whoever owns the agent. It gates nothing until it has been green for weeks, after which the release gate could require the last nightly.
+What is nightly-only is anything needing a cluster built from nothing: creation, upgrade from the last validated release, hardware-specific cases, plus anything too slow for a three-hour cadence. Its own project and concurrency group, so it never queues behind the release pipeline. Infrastructure failure is not test failure: retry once, then call it _not run_ and page whoever owns the test infrastructure, not whoever owns the agent — the pipeline does not do this yet, and a red nightly today is a red nightly whatever caused it. It gates nothing on the release path; what it does gate is the staging promotion, which moves only on a green matrix.
 
 Promotion out of it: to the release gate once it is fast enough, or to presubmit once the screener admits it (§4.2). There is no per-domain ceiling, because the constraint on the blocking set is measured reliability, not slots. A domain whose only coverage is nightly is still reported uncovered (§3), and a case red for a week is fixed or deleted.
 
@@ -197,13 +201,15 @@ Promotion out of it: to the release gate once it is fast enough, or to presubmit
 
 Every cell either **blocks**, is **recorded**, or nothing looks at it.
 
-| Tier             | 1. Authority                                                                                            | 2. Correctness                                                          | 3. Drift                                           |
-| ---------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------- |
-| **Unit**         | **Blocks.** Generated RBAC diffed against a checked-in copy                                             | Not covered                                                             | Not covered                                        |
-| **Integration**  | **Blocks.** Delivery paths, credential proxy wiring, the spec↔tool-registry contract, all deterministic | Not covered (no model in the loop, by definition)                       | Not covered                                        |
-| **Presubmit**    | **Blocks.** Binary, so it cannot flake                                                                  | **Blocks.** Exact checks per run; judged scores as distributions (§4.2) | Not covered                                        |
-| **Release gate** | **Blocks.** Same checks, on the assembled release                                                       | **Blocks** the exact checks, **records** the judged ones                | **Records.** Every 3h, so the densest trend we get |
-| **Nightly**      | _Deferred_                                                                                              | _Deferred_                                                              | _Deferred_                                         |
+| Tier             | 1. Authority                                                                                                                                                                                             | 2. Correctness                                                          | 3. Drift                                           |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------- |
+| **Unit**         | **Blocks.** Generated RBAC diffed against a checked-in copy                                                                                                                                              | Not covered                                                             | Not covered                                        |
+| **Integration**  | **Blocks.** Delivery paths, credential proxy wiring, the spec↔tool-registry contract, all deterministic                                                                                                  | Not covered (no model in the loop, by definition)                       | Not covered                                        |
+| **Presubmit**    | **Blocks.** Binary, so it cannot flake                                                                                                                                                                   | **Blocks.** Exact checks per run; judged scores as distributions (§4.2) | Not covered                                        |
+| **Release gate** | **Blocks.** Same checks, on the assembled release                                                                                                                                                        | **Blocks** the exact checks, **records** the judged ones                | **Records.** Every 3h, so the densest trend we get |
+| **Nightly**      | **Blocks** the staging promotion — once it runs. Gates on `rc`, the suite the release gate only tolerates; runs the operator plugin lifecycle, Chat and the full stockout matrix alongside it, tolerated | **Blocks** the exact checks. No judged scores run here                  | **Nothing looks at it** — see below                |
+
+Nightly's Drift cell was the open one, and the answer is that nothing looks at it. It does run merged code on a schedule, which is the precondition this section names for feeding Drift, but the precondition is not the whole requirement: Drift needs the same thing measured the same way, and what nightly runs is the pass/fail E2E matrix rather than judged eval cases. There are no per-domain scores to record, so there is no row to write. This is a decision rather than an omission, and the thing that would reopen it is §4.4's eval content getting built — at which point the tier would have scores and this cell should say **records**.
 
 Authority blocks earliest because it is binary and cannot flake. Drift is the opposite: it needs the same thing measured the same way, so only tiers that run merged code on a schedule can feed it. Presubmit cannot, because a score that drops does not say whether the agent got worse or the branch did. Every cell is read per domain: "capability is fine" is not a claim this strategy lets anyone make.
 
@@ -232,6 +238,6 @@ Two things we learned building the first corpus:
 | Does not change what the agent says or does             | A unit test                                          | Nothing further. The eval suite still runs, and non-inferiority means noise on an unrelated change must not block you |
 | Changes behaviour in a domain we cover                  | The case first, expected-fail; your change flips it  | It reports on your pull request, and joins the blocking set once admitted (§4.2)                                      |
 | Adds a domain we do not cover                           | A case for the journey, plus its refusal case (§4.2) | Same, and until it is admitted the domain still reports uncovered (§3)                                                |
-| Needs a cluster created, upgraded, or specific hardware | A case                                               | Parked until nightly exists (§4.4); nowhere else can run it                                                           |
+| Needs a cluster created, upgraded, or specific hardware | A case                                               | Nightly builds a cluster from nothing, but runs the E2E matrix rather than eval cases, so this is still parked (§4.4) |
 
 When in doubt, write the case. Its score reports before it blocks, so there is no quality budget to negotiate. That is not a licence to land it unrun: rungs 1-3 and 5 apply to an unadmitted case too, so a case whose checks error rather than run reds the job for everyone until someone deletes it. Run yours before you land it.

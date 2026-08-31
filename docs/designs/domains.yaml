@@ -64,17 +64,23 @@ domains:
     journey: Debugs a workload; the Cluster Agent stays read-only and inside its own cluster
   - slug: incident-triage
     name: Incident triage (autoops)
-    journey: A warning event is triaged to a root cause and a pull request, never a cluster write
+    # Not "and a pull request". The pull request is real but downstream and
+    # someone else's: _triage_task_body in agents/platform/scripts/
+    # session_kv_server.py ends the triage card at a report whose last bullet
+    # asks a human to reply "apply", and says in as many words that the agent
+    # holding the GitOps write path opens the PR, "not you, and not from this
+    # card". Opening it is the remediation domain's journey, one row above.
+    journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
 
-# Known-uncovered. The two kanban probes cover chat-and-routing;
-# cluster-debugging came off first among the Phase 2 domains, in #939.
-# Reliability, capacity, security, upgrades, consistency and cost are covered
-# by the six domain probes, and fleet-audits by the compliance-audit canary --
-# see the header above for why probes rather than six full audits. Phase 2's
-# exit criterion is an empty list.
-allowlist:
-  # gpu-stress-test-diagnosis does NOT cover this: it is a chat-prompted
-  # post-incident RCA, and incident-triage means event-fired autoops triage.
-  # Real coverage needs autoops-warning-event-triage, which has no scenario
-  # driver to apply its incident workload -- tracked as #954.
-  - incident-triage
+# Known-uncovered. Empty, which is Phase 2's exit criterion. The two kanban
+# probes cover chat-and-routing; cluster-debugging came off first among the
+# Phase 2 domains, in #939. Reliability, capacity, security, upgrades,
+# consistency and cost are covered by the six domain probes, and fleet-audits
+# by the compliance-audit canary -- see the header above for why probes rather
+# than six full audits. incident-triage came off last, in #1045, once
+# bench/tf/prebuilt/autoops-incident gave autoops-warning-event-triage an
+# incident to triage; note that gpu-stress-test-diagnosis never covered it,
+# being a chat-prompted post-incident RCA rather than event-fired triage.
+#
+# An entry goes back on here only alongside a scenario that stopped running.
+allowlist: []

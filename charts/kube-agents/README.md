@@ -300,14 +300,22 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
   tokens are read from the credentials Secret's `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).
+- **Microsoft Teams** — `platformAgent.integration.teams.enabled=true`; the bot
+  credentials are read from the credentials Secret's `TEAMS_APP_ID` and
+  `TEAMS_APP_PASSWORD` keys. Optional single-tenant lock-down is set via
+  `tenantId`, and user authorization is configured via `allowedUsers` (or
+  `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
+  fallback.
 - **GitHub** — `platformAgent.integration.github.gitRepo` sets the agent's
   GitOps target repository.
 
-Chat and Slack each need a one-time manual registration that no install
+Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
-the Pub/Sub topic; Socket Mode + bot scopes in the Slack app console) —
-[INSTALL.md § Enable Google Chat & Slack Integrations](../../INSTALL.md#step-4-enable-google-chat--slack-integrations-manual-required-steps)
-is the canonical walkthrough, including the pairing-code approval.
+the Pub/Sub topic; Socket Mode + bot scopes in the Slack app console; Azure Bot
+registration & Teams App manifest) —
+[INSTALL.md § Enable Chat Integrations](../../INSTALL.md) and
+[Microsoft Teams ChatOps Guide](../../docs/chatops/microsoft-teams.md) are the
+canonical walkthroughs.
 
 ### Agent runtime knobs
 

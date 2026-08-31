@@ -241,12 +241,120 @@ is_commit_already_attempted() {
   [ -n "${rc_tag}" ]
 }
 
-# Checks if a commit SHA has already been validated in a previous RC run (*_validated tag)
-is_commit_already_validated() {
+# Checks if a commit SHA carries the RC pipeline's validation marker (rc_*_validated).
+#
+# Anchored to the rc_ family, and named for it: this gates resolve_rc_tag.sh's
+# skip decision and the nightly promotion, so a marker minted by some other tag
+# family must not read as an RC validation. verify_release_eligibility.sh and
+# get_latest_validated_rc_tag anchor the same way.
+is_rc_candidate_commit_already_validated() {
   local sha="$1"
   local validated_tags
-  validated_tags=$(git tag --points-at "${sha}" "*_validated" 2>/dev/null || echo "")
+  validated_tags=$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || echo "")
   [ -n "${validated_tags}" ]
+}
+
+# ─── Staging promotion tags ───────────────────────────────────────────────────
+# The nightly pipeline promotes a validated RC candidate by tagging its commit
+# staging_<ts>_<sha>, which is what staging-redeploy-*.yml triggers on.
+export STAGING_TAG_PREFIX="staging_"
+
+# Derives the staging promotion tag from a validated RC tag:
+#   rc_2608241820_b35543c_validated  ->  staging_2608241820_b35543c
+#
+# The timestamp stays first after the prefix so `git tag -l --sort=-v:refname
+# 'staging_*'` orders by time, and the transform is mechanical in both
+# directions, so a staging tag reads back to its candidate without a lookup. The
+# _validated suffix is dropped: it records that the RC gate passed, not that the
+# promotion did.
+#
+# Refuses anything outside the rc_ family rather than composing staging_<junk>,
+# because the result is a live deploy trigger.
+staging_tag_for_rc() {
+  local rc_tag="${1:-}"
+  if [ -z "${rc_tag}" ]; then
+    echo "❌ ERROR: an RC tag is required for staging_tag_for_rc." >&2
+    return 1
+  fi
+
+  local core="${rc_tag%_validated}"
+  case "${core}" in
+    rc_?*) core="${core#rc_}" ;;
+    *)
+      echo "❌ ERROR: '${rc_tag}' is not an rc_* candidate tag; refusing to derive a staging tag from it." >&2
+      return 1
+      ;;
+  esac
+
+  echo "${STAGING_TAG_PREFIX}${core}"
+}
+
+# Finds an existing staging promotion tag on a commit SHA, if any. Empty output
+# means the commit has not been promoted yet.
+get_existing_staging_tag() {
+  local sha="$1"
+  git tag --points-at "${sha}" "${STAGING_TAG_PREFIX}*" 2>/dev/null | head -n 1 || echo ""
+}
+
+# Reports whether the staging redeploys AT A GIVEN COMMIT would start on a given
+# tag, by reading the `push: tags:` patterns out of that commit's own copy of
+# staging-redeploy-agent.yml.
+#
+# A push event runs the workflows in the pushed ref's tree, not the ones on the
+# default branch, and a promotion tag lands on a candidate commit that can be days
+# old. So the question of whether a tag deploys anything is answered by the
+# candidate, and a promotion pushed at a commit whose trigger does not match the
+# tag succeeds, deploys nothing, and reports green — after which
+# get_existing_staging_tag sees the tag and no later run retries that candidate.
+#
+# The three redeploys share one trigger, so agent stands for all three.
+staging_trigger_matches_at_commit() {
+  local commit="${1:-}" tag="${2:-}"
+  local workflow=".github/workflows/staging-redeploy-agent.yml"
+  local yaml patterns pattern
+
+  if [ -z "${commit}" ] || [ -z "${tag}" ]; then
+    echo "❌ ERROR: a commit and a tag are required for staging_trigger_matches_at_commit." >&2
+    return 2
+  fi
+
+  yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || return 1
+
+  # The list items under the single `tags:` key, unquoted. Stops at the first
+  # line that is neither a list item nor blank, so it cannot run on into the rest
+  # of the file if the key is ever absent.
+  patterns="$(printf '%s\n' "${yaml}" | awk '
+    /^[[:space:]]*tags:[[:space:]]*$/ { in_tags = 1; next }
+    in_tags && /^[[:space:]]*#/ { next }
+    in_tags && /^[[:space:]]*$/ { next }
+    in_tags && /^[[:space:]]*-[[:space:]]/ {
+      item = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+      sub(/[[:space:]]*$/, "", item)
+      gsub(/^"|"$/, "", item)
+      gsub(/^'"'"'|'"'"'$/, "", item)
+      print item
+      next
+    }
+    in_tags { in_tags = 0 }
+  ')"
+
+  [ -n "${patterns}" ] || return 1
+
+  while IFS= read -r pattern; do
+    [ -n "${pattern}" ] || continue
+    # Glob-matched rather than compared: the point is what GitHub would do with
+    # the pattern, not whether the file says what this branch expects. So the
+    # expansion is deliberately unquoted.
+    # shellcheck disable=SC2254
+    case "${tag}" in
+      ${pattern}) return 0 ;;
+    esac
+  done <<EOF
+${patterns}
+EOF
+
+  return 1
 }
 
 # Finds the latest commit on main whose required container images are already built in the registry
@@ -316,6 +424,27 @@ setup_git_bot_user() {
   export GIT_COMMITTER_EMAIL="github-actions[bot]@users.noreply.github.com"
 }
 
+# Syncs remote tags into the local repository, in CI only.
+#
+# Every script that answers a question from the tag graph calls this first: a
+# shallow or tagless checkout otherwise resolves "no such tag" rather than
+# failing, which is the quiet way to skip a candidate or promote nothing.
+#
+# `|| true` throughout, deliberately. An unreachable network is not itself the
+# error; the caller's own lookup fails afterwards naming the tag it wanted, which
+# is the message worth printing.
+#
+# find_latest_built_commit does not use this — it fetches `main` too, handles a
+# shallow clone's --depth, and reports which remote answered.
+release_fetch_tags() {
+  is_ci_pipeline || return 0
+
+  local target_repo
+  target_repo="$(get_target_repo)"
+  git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 ||
+    git fetch origin --tags >/dev/null 2>&1 || true
+}
+
 # Ensures a Git tag exists for a given commit SHA idempotently and pushes to origin.
 # Arguments: $1 = rc_tag, $2 = commit_sha, $3 = tag_message
 ensure_git_tag() {
@@ -331,14 +460,7 @@ ensure_git_tag() {
   local target_repo
   target_repo="$(get_target_repo)"
 
-  # Synchronize remote tags only in CI environments
-  if is_ci_pipeline; then
-    if [ -n "${target_repo}" ]; then
-      git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || git fetch origin --tags >/dev/null 2>&1 || true
-    else
-      git fetch origin --tags >/dev/null 2>&1 || true
-    fi
-  fi
+  release_fetch_tags
 
   # Canonicalize commit SHA to full 40-character hash before comparison
   local target_full_sha
