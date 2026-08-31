@@ -941,9 +941,13 @@ done
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
 
-# mkdir is the mutex: atomic on every filesystem this runs on, and a crashed
-# holder is collected by `wait`, after which nothing contends. Two locks
-# serialize what genuinely cannot overlap while noop units fill the lanes:
+# mkdir is the mutex: atomic on every filesystem this runs on. A holder that
+# dies without releasing (an OOM-killed subshell releases nothing) would
+# otherwise strand every contender in a silent spin that `wait` can never
+# collect past, so acquisition carries a deadline: a unit that gives up fails
+# loudly and grades as MISSING, which is a diagnosis the gate already
+# reports. Two locks serialize what genuinely cannot overlap while noop
+# units fill the lanes:
 #   per task  -- repetitions of ONE task never overlap. Concurrent reps of a
 #                ledger-writing audit rewrite one shared ledger issue and
 #                grade each other's artifact; concurrent reps of the autoops
@@ -955,14 +959,36 @@ STATE_DIR="$(mktemp -d)"
 #                per-run isolation (own kubeconfig, gcloud config, tofu data
 #                dir) is off, and two concurrent tofu units would race the
 #                shared kubeconfig's current-context and their state locks.
-lock_acquire() { until mkdir "$1" 2>/dev/null; do sleep 3; done; }
+lock_acquire() { # <dir> [deadline-seconds]
+  local waited=0 limit="${2:-1800}"
+  until mkdir "$1" 2>/dev/null; do
+    sleep 3
+    waited=$((waited + 3))
+    if [ "${waited}" -ge "${limit}" ]; then
+      echo "ERROR: gave up on ${1} after ${limit}s; holder likely died without releasing" >&2
+      return 1
+    fi
+  done
+}
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
-run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty>
-  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5"
+run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq>
+  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6"
   local log="/tmp/eval_${name}_rep${rep}.log"
-  lock_acquire "${STATE_DIR}/lock-task-${name}"
-  [ -n "${has_stack}" ] && lock_acquire "${STATE_DIR}/lock-infra"
+  # A distinct local port per unit: the harness's port-forward is owned by
+  # the process that spawned it and its atexit teardown would drop a shared
+  # listener under every sibling mid-conversation. On its own port, each
+  # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
+  export AGENT_LOCAL_PORT=$((28642 + seq))
+  if ! lock_acquire "${STATE_DIR}/lock-task-${name}"; then
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
+    return 0
+  fi
+  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra"; then
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+    return 0
+  fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
     export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
@@ -992,28 +1018,31 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
 }
 
-# Cost-descending, then rep-ascending: repetitions of one task serialize on
-# the task lock, so adjacent same-task units would park a lane sleeping on
-# it -- rep-major interleaving keeps every lane doing work.
+# Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
+# serialize on the task lock, so a same-task unit launched early just parks a
+# lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
+# spent two of four lanes that way for its first twelve minutes under the
+# cost-first ordering this replaces.
 UNIT_QUEUE="$(
   for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
     i=0
     for TASK in "${TASKS[@]}"; do
-      printf '%s %s %s\n' "$(unit_cost_hint "${TASK_NAMES[i]}")" "${REP}" "$i"
+      printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
       i=$((i + 1))
     done
-  done | sort -k1,1rn -k2,2n
+  done | sort -k1,1n -k2,2rn
 )"
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c .)"
 
 profile_begin "task fan-out: ${UNIT_TOTAL} units, parallelism=${EVAL_TASK_PARALLELISM}"
-while read -r _COST REP IDX; do
+while read -r REP _COST IDX; do
   [ -n "${IDX:-}" ] || continue
   while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${EVAL_TASK_PARALLELISM}" ]; do
     sleep 3
   done
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
-  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" &
+  UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
+  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
   # Staggered, so N units do not open their first model call in the same
   # second -- burst 429s at the model quota are the fan-out's failure mode.
   sleep 5
