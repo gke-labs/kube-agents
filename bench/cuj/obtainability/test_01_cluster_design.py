@@ -219,10 +219,12 @@ def _completed_capacity_evidence(
 def _computeclass_artifact(
     artifacts: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
+    # Latest wins: a worker that attaches a corrected manifest supersedes its
+    # earlier attempt, exactly as a re-uploaded file would.
     return next(
         (
             artifact
-            for artifact in artifacts
+            for artifact in reversed(artifacts)
             if isinstance(artifact.get("manifest"), dict)
             and artifact["manifest"].get("kind") == "ComputeClass"
         ),
@@ -231,10 +233,11 @@ def _computeclass_artifact(
 
 
 def _nap_artifact(artifacts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    # Latest wins, matching the ComputeClass selector above.
     return next(
         (
             artifact
-            for artifact in artifacts
+            for artifact in reversed(artifacts)
             if artifact.get("type") == "node_auto_provisioning"
             and isinstance(artifact.get("manifest"), dict)
         ),
