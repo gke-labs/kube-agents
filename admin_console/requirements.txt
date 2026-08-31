@@ -8,4 +8,4 @@ uvicorn>=0.52.4,<1
 # websockets<17, so raising this pin makes the file unresolvable rather than
 # merely untested. api/streamlit_proxy.py imports websockets directly, which is
 # why the dependency is stated here at all. Lift the cap when Streamlit does.
-websockets>=15,<17
+websockets>=16.1.1,<17
