@@ -104,7 +104,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             fake_hack.mkdir()
             for code in (0, 7):
                 result = run_hook(
-                    code, fake_hack, target="gs://kube-agents-prow/dashboards/evals/"
+                    code, fake_hack, target="gs://kube-agents-dashboards/evals/"
                 )
                 self.assert_skipped_once(result, code, "does not exist")
 
@@ -115,7 +115,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             )
             for code in (0, 7):
                 result = run_hook(
-                    code, fake_hack, target="gs://kube-agents-prow/dashboards/evals/"
+                    code, fake_hack, target="gs://kube-agents-dashboards/evals/"
                 )
                 self.assert_skipped_once(result, code, "pipeline exited 3")
 
@@ -132,11 +132,11 @@ class PublishHookFailSafeTest(unittest.TestCase):
             )
             for code in (0, 7):
                 result = run_hook(
-                    code, fake_hack, target="gs://kube-agents-prow/dashboards/evals/"
+                    code, fake_hack, target="gs://kube-agents-dashboards/evals/"
                 )
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertIn(
-                    "eval-dashboard: published to gs://kube-agents-prow/dashboards/evals/",
+                    "eval-dashboard: published to gs://kube-agents-dashboards/evals/",
                     result.stdout,
                 )
                 self.assertNotIn(SKIP, result.stdout)

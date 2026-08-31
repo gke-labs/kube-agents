@@ -197,9 +197,11 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # "eval-dashboard publish skipped: <reason>" line and never changes the job's
 # exit code. Nothing publishes until BOTH prerequisites exist:
 #   1. the Prow job exports EVAL_DASHBOARD_TARGET
-#      (gs://kube-agents-prow/dashboards/evals/) -- an oss-test-infra change;
+#      (gs://kube-agents-dashboards/evals/, a dedicated bucket in the team's
+#      own project) -- an oss-test-infra change;
 #   2. prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com holds
-#      roles/storage.objectAdmin condition-scoped to the dashboards/ prefix.
+#      roles/storage.objectAdmin on the kube-agents-dashboards bucket (an IAM
+#      grant in the team's project, not the OSS Prow infra project).
 # Until both land this costs one log line per run.
 # scripts/test_eval_dashboard_publish.py runs this function out of this file
 # and asserts the fail-safe holds.
