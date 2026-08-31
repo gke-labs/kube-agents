@@ -1070,6 +1070,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `150m` would still have been a guaranteed timeout, which is what made #2669 a prerequisite rather
   than a follow-up.
 
+  **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
+  now runs the matrix as a bounded parallel fan-out of (task, repetition) units
+  (`EVAL_TASK_PARALLELISM`, default 4; tofu-stack units and repetitions of one task still serialize
+  among themselves). Wall clock is therefore fixed cost + roughly invocations ÷ realised
+  parallelism, where "realised" is capped by the leased project's model quota — measured on a
+  quota-constrained dev install: 16 units serial 3240s, parallelism 4 in 1022s with six units lost
+  to model 429s, parallelism 2 in 2512s with one. The serial figures in this section are the
+  fan-out's baseline; the first parallel Prow run replaces them.
+
   **One term in that is still a substitution rather than a measurement, and 1.26× is the honest
   figure.** #998 activated `rca-remediation-pr` precisely so its own smoke run would be the first
   measurement of it, so the table prices it at the fleet average. It is one of the two active tasks
@@ -1084,11 +1093,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `compliance-rbac-overgrant` at 2042s for three repetitions, 24% of the whole task budget on its
   own.
 
-  **It is not being raised a third time, and that is a decision rather than an oversight.** Work to
-  cut the eval's runtime is in flight separately; if it lands, the headroom returns without another
-  pull request against another repository, and a `300m` ceiling raised in the meantime would outlive
-  the reason for it. At a measured 1.26×–1.43× there is real room, so `300m` stays a follow-up
-  rather than a blocker.
+  **It is not being raised a third time, and that is a decision rather than an oversight.** The
+  fan-out above is the runtime cut that was awaited: if it realises even half its parallelism in a
+  pool project, the serial 1.26×–1.43× drops below 1× and the headroom returns without another pull
+  request against another repository. `300m` stays a follow-up rather than a blocker.
 
   The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
   in another repository**, so activating a case here spends headroom that only a separate pull

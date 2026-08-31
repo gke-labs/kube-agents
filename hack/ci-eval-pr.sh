@@ -217,6 +217,10 @@ profile_and_dump_on_exit() {
   dump_prow_artifacts_on_failure
 }
 trap profile_and_dump_on_exit EXIT
+# A Prow deadline delivers SIGTERM, which does not run the EXIT trap on its
+# own; converting it to an exit is what lets the artifact collection above
+# fire on a deadline kill.
+trap 'exit 143' TERM INT
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
@@ -517,12 +521,10 @@ TASKS=(
   # crashloop 142s + the two incumbents, against the deadline the
   # 2026-08-26 run blew with full audits.
   #
-  # The six probes sit ahead of the rest on purpose. The loop below is
-  # sequential (one task at a time, no BENCH_PARALLEL), so the Prow deadline
-  # truncates the TAIL of this list; none of the probes has ever executed, so
-  # their cost is unmeasured and their signal is what this change exists to
-  # produce. Ordering the unmeasured work first means a timeout loses a
-  # measured repeat, not the new signal.
+  # This list is the gate's REPORTING order. Execution order is the
+  # fan-out's cost-hinted queue below (longest units first), so a Prow
+  # deadline kills whatever is still in flight rather than truncating this
+  # list's tail.
   "./tasks/reliability-pdb-probe/task.yaml"
   "./tasks/capacity-pinned-pool-probe/task.yaml"
   "./tasks/security-overgrant-probe/task.yaml"
@@ -542,8 +544,8 @@ TASKS=(
   # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
   # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
   # the job deadline before reaching it), so this entry's first smoke IS the
-  # measurement. Placed after the six probes (proven, ~20 min together) and
-  # before the canary so a surprise here cannot starve the probes of budget.
+  # measurement. Launch priority lives in unit_cost_hint below, not in this
+  # list's position.
   # The one active task that WRITES: it files a remediation PR against the
   # leased project's throwaway GitOps repo via submit-suggestion.
   "./tasks/rca-remediation-pr/task.yaml"
@@ -559,15 +561,10 @@ TASKS=(
   # role to a kubeconfig. It is the cheapest task in this array (142s on the
   # 2026-08-25 run) and it proves the chain the probes above stand on.
   "./tasks/cluster-agent-crashloop-debug/task.yaml"
-  # Three more cluster-debugging cases in the same family, added by #982 and
-  # placed here rather than at the head of the array. The probes above go
-  # first because they are unmeasured and the sequential loop truncates the
-  # TAIL; these three are measured -- 190s, 142s and 220s on build
-  # 2092719124550520832 -- so ordering them first would protect the known at
-  # the expense of the unknown, which is backwards. What they do need is to
-  # stay AHEAD of gpu-stress-test-diagnosis below, the first of the array's two
-  # `deployer: tofu` entries, which spends minutes provisioning a cluster
-  # before it scores anything. All three are `deployer: noop`.
+  # Three more cluster-debugging cases in the same family, added by #982:
+  # measured 190s, 142s and 220s on build 2092719124550520832, all
+  # `deployer: noop`. Position here is reporting order only; execution
+  # order is unit_cost_hint's queue.
   #
   # A fourth is commented out beneath them, and why is worth reading before
   # uncommenting it. All four are read-only: no pull request, no ledger, so
@@ -735,9 +732,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 
 # Repetitions per task. Three is what the collapse rule needs: a case reds the
 # job alone only by failing ALL of them. Two-of-three would fire 1.45 times per
-# pull request by chance at suite scale; three-of-three fires 0.03 times. The
-# loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
-# -- how it scales past a handful of tasks is issue #902's lane, not this one.
+# pull request by chance at suite scale; three-of-three fires 0.03 times.
+# Each repetition is one unit of the parallel fan-out below, so at
+# parallelism P this multiplies wall-clock by roughly 3/P, not 3; scale past
+# that is issue #902's lane. The serial measurements kept below predate the
+# fan-out and are its baseline.
 #
 # FOURTEEN tasks at three repetitions is FORTY-TWO devops-bench invocations,
 # where the presubmit's budget was sized for two. This number is no longer an
@@ -777,9 +776,13 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # separate pull request can replace, and this number was invalidated FOUR times
 # by a matrix that grew after it was computed (#956, then #982, then #998)
 # before a real run finally replaced the arithmetic. At the measured 3.6min
-# average, each further average-cost case costs ~11min of the remaining ~49-72min
-# of headroom, and a canary-cost case costs ~34min. Activating a case and raising
-# the budget are one change in two repositories, not a change and a follow-up.
+# average, each further average-cost case adds ~11min of INVOCATION time and a
+# canary-cost case ~34min -- divided by however much of EVAL_TASK_PARALLELISM
+# the fan-out below actually realises against the pool's model quota, which the
+# first parallel Prow run will measure. Until it has, budget serially: a case
+# that fits at parallelism 1 cannot be the thing that blows the deadline.
+# Activating a case and raising the budget are one change in two repositories,
+# not a change and a follow-up.
 #
 # The variance that was flagged as the thing to watch has resolved in the good
 # direction: consistency-authorized-networks-probe took 1039s on the one earlier
@@ -879,91 +882,168 @@ ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
 mkdir -p "${ARTIFACT_DIR}"
 CASE_RESULTS=()
 
+# ─── Parallel fan-out ─────────────────────────────────────────────────────────
+# The schedulable unit is one (task, repetition): every invocation is an
+# independent agent conversation, and the agent span is ~98% of its wall clock
+# (profiled 2026-08-28), so the matrix is embarrassingly parallel. The cap
+# bounds concurrent load on the one gateway, LiteLLM and the judge quota;
+# 1 reproduces serial behaviour through the same code path.
+EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-4}"
+if ! [ "${EVAL_TASK_PARALLELISM}" -ge 1 ] 2>/dev/null; then
+  echo "ERROR: EVAL_TASK_PARALLELISM must be a positive integer, got '${EVAL_TASK_PARALLELISM}'." >&2
+  exit 1
+fi
+
+# Pre-warm the bench virtualenv once; N cold `uv run`s would sync it N times
+# concurrently.
+(cd "${BENCH_DIR}" && uv run python -c '' >/dev/null 2>&1) || true
+
+# Launch-order hints, longest first, from measured runs (2026-08-27/28).
+# A wrong hint costs packing efficiency, never correctness.
+unit_cost_hint() {
+  case "$1" in
+    gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    consistency-authorized-networks-probe) echo 300 ;;
+    *) echo 200 ;;
+  esac
+}
+
+# Per-task env is decided ONCE, before the fan-out, and handed to each unit:
+# the serial loop exported it globally per iteration, which two concurrent
+# units would trample. Per TASK, not per repetition, so repetitions stay
+# comparable. Seeded-cluster reuse is opted into by the task's own stack --
+# only a stack declaring `variable "reuse_existing_cluster"` knows to plan
+# nothing when handed an existing cluster's name.
+TASK_NAMES=()
+TASK_REUSE=()
+TASK_HAS_STACK=()
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
-  profile_begin "task ${TASK_NAME}: devops-bench run"
-  TASK_START=$SECONDS
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) x${EVAL_REPETITIONS} <<<"
-
-  # BENCH_NO_INFRA stays false for EVERY task, noop-deployer ones included.
-  # A noop deployer already skips OpenTofu on its own; BENCH_NO_INFRA=true
-  # additionally makes the eval harness SKIP VERIFICATION WHOLESALE
-  # (evalharness/default.py, verification_status "skipped_no_infra"), which
-  # silently un-gates any task whose checks read the transcript rather than a
-  # cluster -- the kanban probe's tool_called check would never evaluate.
-  #
-  # The deployer itself is no longer read here. bench-gate parses the task
-  # file with a real YAML parser (bench/kube_agents_bench/cases.py) and echoes
-  # what it found; the two greps this replaced could not tell a real
-  # `deployer:` from one inside a comment or a prompt block.
-  export BENCH_NO_INFRA="false"
-  echo "Executing with BENCH_NO_INFRA=${BENCH_NO_INFRA}"
-
-  # Seeded-cluster reuse is per task, opted into by the task's own stack:
-  # only a stack that declares `variable "reuse_existing_cluster"` knows to
-  # plan nothing when handed an existing cluster's name. Handing that name
-  # to any other tofu stack would make it try to CREATE the seeded cluster
-  # and 409 on every run in every fleet-carrying project -- so a task whose
-  # stack has not opted in gets the per-run name and location restored, and
-  # so do the {{GKE_CLUSTER_NAME}}/{{CLUSTER_NAME}} placeholders its prompt
-  # and checks resolve against.
-  #
-  # This is per TASK, not per repetition: every repetition of one task targets
-  # the same cluster, which is what makes the repetitions comparable.
+  TASK_NAMES+=("${TASK_NAME}")
   TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
+  if [ -n "${TASK_STACK}" ]; then TASK_HAS_STACK+=("true"); else TASK_HAS_STACK+=(""); fi
   if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
     && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
-    export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
-    export CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
-    export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}"
-    export GCP_LOCATION="${SEEDED_TASK_LOCATION}"
-    export TF_VAR_reuse_existing_cluster="true"
+    TASK_REUSE+=("true")
     echo "Task ${TASK_NAME}: reusing seeded cluster ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}); no per-run task cluster will be created"
   else
-    export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
-    export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
-    export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
-    export GCP_LOCATION="${EVAL_DEFAULT_LOCATION}"
+    TASK_REUSE+=("")
+  fi
+done
+
+# One unit, in a background subshell: its exports stay local, its output goes
+# only to its own log (kept as an artifact either way), and its run directory
+# is read back from that log's own `results:` line -- the directory-set diff
+# the serial loop used cannot tell concurrent siblings apart. BENCH_NO_INFRA
+# stays false for every unit, noop-deployer ones included: true would skip
+# verification wholesale (evalharness/default.py, "skipped_no_infra") and
+# silently un-gate transcript-read checks.
+STATE_DIR="$(mktemp -d)"
+
+# mkdir is the mutex: atomic on every filesystem this runs on, and a crashed
+# holder is collected by `wait`, after which nothing contends. Two locks
+# serialize what genuinely cannot overlap while noop units fill the lanes:
+#   per task  -- repetitions of ONE task never overlap. Concurrent reps of a
+#                ledger-writing audit rewrite one shared ledger issue and
+#                grade each other's artifact; concurrent reps of the autoops
+#                task plant simultaneous incidents with no card attribution;
+#                and same-task reps share a tofu stack directory and cluster
+#                name. Serial reps are also what keeps them comparable.
+#   infra     -- at most one stack-bearing (tofu) unit runs at a time,
+#                across tasks: BENCH_PARALLEL stays false, so devops-bench's
+#                per-run isolation (own kubeconfig, gcloud config, tofu data
+#                dir) is off, and two concurrent tofu units would race the
+#                shared kubeconfig's current-context and their state locks.
+lock_acquire() { until mkdir "$1" 2>/dev/null; do sleep 3; done; }
+lock_release() { rmdir "$1" 2>/dev/null || true; }
+
+run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty>
+  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5"
+  local log="/tmp/eval_${name}_rep${rep}.log"
+  lock_acquire "${STATE_DIR}/lock-task-${name}"
+  [ -n "${has_stack}" ] && lock_acquire "${STATE_DIR}/lock-infra"
+  if [ -n "${reuse}" ]; then
+    export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+    export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
+    export TF_VAR_reuse_existing_cluster="true"
+  else
+    export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}" CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+    export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}" GCP_LOCATION="${EVAL_DEFAULT_LOCATION}"
     unset TF_VAR_reuse_existing_cluster
   fi
+  export BENCH_NO_INFRA="false"
+  local start end dir
+  start="$(_now_ms)"
+  (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  end="$(_now_ms)"
+  [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  lock_release "${STATE_DIR}/lock-task-${name}"
+  # `|| true`: a run that never printed a `results:` line must still write
+  # its state files and reach the artifact copy -- it is exactly the crashed
+  # run someone will need the log for.
+  dir="$(grep -oE 'results: [^ ]*/results\.json' "${log}" | tail -1 | sed -e 's/^results: //' -e 's|/results\.json$||' || true)"
+  printf '%s\n' "${start}" > "${STATE_DIR}/${name}.rep${rep}.start"
+  printf '%s\n' "${end}" > "${STATE_DIR}/${name}.rep${rep}.end"
+  printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir"
+  # Copied here, not in the grading pass: a Prow deadline that kills the
+  # fan-out must still leave every completed unit's log in the artifacts.
+  cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
+  echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
+}
+
+# Cost-descending, then rep-ascending: repetitions of one task serialize on
+# the task lock, so adjacent same-task units would park a lane sleeping on
+# it -- rep-major interleaving keeps every lane doing work.
+UNIT_QUEUE="$(
+  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+    i=0
+    for TASK in "${TASKS[@]}"; do
+      printf '%s %s %s\n' "$(unit_cost_hint "${TASK_NAMES[i]}")" "${REP}" "$i"
+      i=$((i + 1))
+    done
+  done | sort -k1,1rn -k2,2n
+)"
+UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c .)"
+
+profile_begin "task fan-out: ${UNIT_TOTAL} units, parallelism=${EVAL_TASK_PARALLELISM}"
+while read -r _COST REP IDX; do
+  [ -n "${IDX:-}" ] || continue
+  while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${EVAL_TASK_PARALLELISM}" ]; do
+    sleep 3
+  done
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" &
+  # Staggered, so N units do not open their first model call in the same
+  # second -- burst 429s at the model quota are the fan-out's failure mode.
+  sleep 5
+done <<EOF_UNIT_QUEUE
+${UNIT_QUEUE}
+EOF_UNIT_QUEUE
+wait
+
+# ─── Per-case verdicts, in the order TASKS declares ───────────────────────────
+profile_begin "per-repetition breakdowns + case verdicts"
+i=0
+for TASK in "${TASKS[@]}"; do
+  TASK_NAME="${TASK_NAMES[i]}"
+  i=$((i + 1))
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${TASK_NAME} (${TASK}) x${EVAL_REPETITIONS} <<<"
 
   # One --result per repetition, positionally. A repetition that produced no
   # run directory contributes the literal MISSING, so the gate can tell "died
-  # before writing anything" from "wrote an unusable record" -- a different
-  # diagnosis with a different owner.
+  # before writing anything" from "wrote an unusable record". The harness log
+  # is kept for every repetition, green ones included: a green record is the
+  # raw material for the baseline store.
   RESULT_ARGS=()
   for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    echo "--- [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME} repetition ${REP}/${EVAL_REPETITIONS}"
-    # Snapshot existing result directories before running to prevent stale score leakage
-    PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
     EVAL_LOG="/tmp/eval_${TASK_NAME}_rep${REP}.log"
-
-    RUN_START_MS="$(_now_ms)"
-    (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | _ts_lines | tee "${EVAL_LOG}") || true
-    RUN_END_MS="$(_now_ms)"
-
-    # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS repetition.
-    # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
-    POST_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
-    NEW_RUN_DIR="$(comm -13 <(echo "${PRE_RUNS}") <(echo "${POST_RUNS}") | head -n 1)"
-
-    # The harness log is kept for every repetition, green ones included: a
-    # green record is the raw material for the baseline store, and its log is
-    # how anyone reconstructs what produced it.
-    cp "${EVAL_LOG}" "${ARTIFACT_DIR}/eval_${TASK_NAME}_rep${REP}.log" 2>/dev/null || true
-
-    # Phase breakdown per repetition rather than per task: with repetitions the
-    # per-task number would average away the thing the table exists to show,
-    # which is where one run's time went. Informational, never fatal.
+    NEW_RUN_DIR="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.dir" 2>/dev/null || true)"
+    RUN_START_MS="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.start" 2>/dev/null || echo 0)"
+    RUN_END_MS="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.end" 2>/dev/null || echo 0)"
     REP_RESULT=""
     [ -n "${NEW_RUN_DIR}" ] && REP_RESULT="${NEW_RUN_DIR}/results.json"
     analyze_eval_phases "${EVAL_LOG}" "${RUN_START_MS}" "${RUN_END_MS}" "${TASK_NAME} rep ${REP}" "${REP_RESULT}"
-
-    # No inline RUN_CLASS here any more. INFRA / BROKEN / OK classification --
-    # including the noop carve-out, the documented empty-list record and #959's
-    # KUBE_AGENTS_INFRA_FAILURE transport marker -- moved into `bench-gate
-    # case`, which has to make the same call per repetition and must not
-    # disagree with a second copy of the rule living in shell.
     if [ -n "${NEW_RUN_DIR}" ]; then
       RESULT_ARGS+=(--result "${NEW_RUN_DIR}")
       cp "${NEW_RUN_DIR}/results.json" "results_${TASK_NAME}_rep${REP}.json" 2>/dev/null || true
@@ -973,18 +1053,14 @@ for TASK in "${TASKS[@]}"; do
   done
 
   # The verdict. bench-gate exits 0 for ANY verdict it could reach, including a
-  # blocking one -- under `set -e` a non-zero here would abort the loop and
-  # silently drop every remaining task. It exits 2 only when it could not grade
-  # at all (an unreadable task file, a broken VERSIONS.json), which is a
-  # different failure and must stop the job.
+  # blocking one; it exits 2 only when it could not grade at all, which must
+  # stop the job.
   CASE_JSON="${ARTIFACT_DIR}/case-${TASK_NAME}.json"
   (cd "${BENCH_DIR}" && uv run bench-gate case \
     --task "${TASK}" \
     "${RESULT_ARGS[@]}" \
     --json-out "${CASE_JSON}")
   CASE_RESULTS+=(--case-result "${CASE_JSON}")
-
-  echo "Task ${TASK_NAME} finished in $((SECONDS - TASK_START))s"
 done
 
 profile_begin "record + final gate"
