@@ -192,7 +192,7 @@ class RenderGoldenTest(unittest.TestCase):
     def test_evidence_progress_toward_screening_window(self):
         self.assertIn("4 of 20", self.html)
         self.assertIn("0 of 20", self.html)
-        self.assertIn(">HAND-PICKED</span>", self.html)
+        self.assertIn(">IN PRESUBMIT</span>", self.html)
 
     def test_releases_empty_state_rendered(self):
         self.assertIn("No RC in the gate window", self.html)
@@ -257,6 +257,60 @@ class RenderToleranceTest(unittest.TestCase):
         html, _, tmp = render_fixture(data)
         self.addCleanup(tmp.cleanup)
         self.assertNotIn("<script>alert(1)</script>", html)
+
+    def test_token_shaped_data_does_not_expand_template_markers(self):
+        # A case *named* like a template marker must stay inert text.
+        # str.replace over the whole page would re-scan the substituted
+        # __APP__ fragment and expand it into the raw JSON bootstrap.
+        data = fixture_data()
+        data["cases"][0]["name"] = "__DATA_JSON__"
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        blob = render.bootstrap_json(data)
+        self.assertEqual(html.count(blob), 1)  # the <script> bootstrap only
+        self.assertIn('<div class="tname">__DATA_JSON__</div>', html)
+
+    def test_coverage_counts_must_be_whole_numbers(self):
+        # The coverage tile's value_html is raw (it carries <small>), so a
+        # non-integer domains_covered must fall back to "not reported"
+        # rather than being interpolated into markup.
+        data = fixture_data()
+        data["coverage"]["domains_covered"] = '<img src=x onerror=alert(2)>'
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        # The payload may appear exactly once: as an inert JSON string
+        # inside the <script> bootstrap. Never in the document body.
+        self.assertEqual(html.count("<img src=x"), 1)
+        self.assertIn(
+            '<div class="k">Domain coverage</div><div class="v">—</div>'
+            '<div class="d2">not reported</div>',
+            html,
+        )
+
+    def test_prior_run_without_metric_is_not_called_first_run(self):
+        # Two runs on record, but the earlier one reported no durations at
+        # all: the cost/wall-clock chips stay empty rather than claiming
+        # "first run" on run two.
+        data = fixture_data()
+        for task in data["runs"][0]["tasks"]:
+            task.pop("duration_s", None)
+        data["runs"][0].pop("duration_s", None)
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        # The rendered chip, not the template's JS source (which contains
+        # the words "first run" as a string literal either way).
+        self.assertNotIn('<span class="delta flat">first run</span>', html)
+
+    def test_rounding_matches_the_js_rerender(self):
+        # Python rounds half to even, JS Math.round/toFixed round half up;
+        # the baked HTML must agree with what the on-load re-render shows.
+        data = fixture_data()
+        data["cases"][1]["pass_rate"] = 0.125  # Math.round(12.5) === 13
+        data["runs"][-1]["tasks"][0]["outcome_validity"] = 0.25  # toFixed(1) === "0.3"
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        self.assertIn(">13%<", html)
+        self.assertIn('<span class="val">0.3</span>', html)
 
 
 class CaseNotesTest(unittest.TestCase):

@@ -280,9 +280,11 @@ const tile = (key, valueHtml, chipHtml, detail) =>
   `<div class="tile"><div class="k">${esc(key)}</div>` +
   `<div class="v">${valueHtml}${chipHtml}</div><div class="d2">${esc(detail)}</div></div>`;
 
-function ratioChip(currentValue, previousValue, unit) {
+function ratioChip(currentValue, previousValue, unit, havePreviousRun) {
+  // "first run" only when there is genuinely no prior run -- a prior run
+  // that just failed to report this metric gets no chip at all.
   if (currentValue == null || previousValue == null || !previousValue || !currentValue) {
-    return previousValue == null ? deltaChip("flat", "first run") : "";
+    return previousValue == null && !havePreviousRun ? deltaChip("flat", "first run") : "";
   }
   if (previousValue / currentValue >= 1.5) {
     return deltaChip("up", `▲ ${(previousValue / currentValue).toFixed(1)}× cheaper`);
@@ -311,7 +313,9 @@ function tilesHtml(data) {
   }
 
   const coverage = data.coverage || {};
-  if (coverage.domains_covered != null && coverage.domains_total != null) {
+  // Whole numbers only, mirroring render.py's is_count: value_html is raw
+  // (it carries <small>), so anything else must not be interpolated.
+  if (Number.isInteger(coverage.domains_covered) && Number.isInteger(coverage.domains_total)) {
     const uncovered = (coverage.uncovered || []).map(String);
     const chip = coverage.domains_covered >= coverage.domains_total
       ? deltaChip("up", "all covered")
@@ -326,7 +330,7 @@ function tilesHtml(data) {
   const med = medianTaskMinutes(latest);
   if (med != null) {
     tiles.push(tile("Median case cost", `${med.toFixed(1)}<small>min</small>`,
-      ratioChip(med, medianTaskMinutes(previous), "min"),
+      ratioChip(med, medianTaskMinutes(previous), "min", previous != null),
       `median across ${runTasks(latest).length} cases · latest run`));
   } else {
     tiles.push(tile("Median case cost", "—", "", "no task durations yet"));
@@ -338,7 +342,7 @@ function tilesHtml(data) {
       ? previous.duration_s / 60 : null;
     const finished = latest ? parseIso(latest.finished) : null;
     tiles.push(tile("Wall clock", `${(duration / 60).toFixed(0)}<small>min</small>`,
-      ratioChip(duration / 60, prevDuration, "min"),
+      ratioChip(duration / 60, prevDuration, "min", previous != null),
       finished != null ? `finished ${utcStamp(finished)} UTC` : "whole-run wall clock"));
   } else {
     tiles.push(tile("Wall clock", "—", "", "not reported"));
@@ -451,7 +455,9 @@ function judgeTrendCase(data) {
 }
 
 function trendsHtml(data) {
-  const rate = chartSvg(ratePoints(data), DASH.judgeThreshold)
+  // No threshold line here: 0.8 is the judge threshold, and drawing it on
+  // the pass-fraction chart would present it as a pass-rate target.
+  const rate = chartSvg(ratePoints(data))
     || '<div class="cap" style="margin-top:14px">not enough runs yet</div>';
 
   const labels = {};
@@ -489,14 +495,14 @@ function evidenceRow(kase) {
   const have = typeof kase.runs_on_record === "number" ? Math.trunc(kase.runs_on_record) : 0;
   const width = Math.min(100, (100 * have) / DASH.screeningWindow);
   const rateText = typeof kase.pass_rate === "number" ? `${Math.round(kase.pass_rate * 100)}%` : "—";
-  const blocking = kase.active
-    ? '<span class="pill p-pass">HAND-PICKED</span>'
-    : '<span class="pill p-fix">PENDING</span>';
+  const presubmit = kase.active
+    ? '<span class="pill p-pass">IN PRESUBMIT</span>'
+    : '<span class="pill p-fix">NOT IN PRESUBMIT</span>';
   return `<tr><td style="font-weight:650">${esc(name)}</td>` +
     `<td><div style="display:flex;align-items:center;gap:10px">` +
     `<div class="prog"><i style="width:${width.toFixed(0)}%"></i></div>` +
     `<span class="cap">${have} of ${DASH.screeningWindow}</span></div></td>` +
-    `<td class="num" style="text-align:left">${rateText}</td><td>${blocking}</td></tr>`;
+    `<td class="num" style="text-align:left">${rateText}</td><td>${presubmit}</td></tr>`;
 }
 
 function evidenceHtml(data) {
@@ -507,9 +513,9 @@ function evidenceHtml(data) {
     || '<tr><td colspan="4"><span class="cap">no cases on record yet</span></td></tr>';
   return `
   <h2 id="nightly">Nightly evidence</h2>
-  <div class="sub">Runs on record per case, toward the ${DASH.screeningWindow}-run screening window · a case blocks only while it is on the reviewed hand-picked list</div>
+  <div class="sub">Runs on record per case, toward the ${DASH.screeningWindow}-run screening window · a case can gate a PR only while it is on the presubmit TASKS list; the gate itself is rate-based (hack/ci-eval-pr.sh)</div>
   <div class="card"><table id="evidence">
-    <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>Blocking today</th></tr></thead>
+    <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>In presubmit</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }

@@ -39,6 +39,7 @@ import argparse
 import datetime
 import html
 import json
+import math
 import pathlib
 import re
 import shutil
@@ -55,13 +56,35 @@ ISSUE_RE = re.compile(r"^#(\d+)$")
 
 # Judge scores are advisory; the tick every score bar carries sits here.
 JUDGE_THRESHOLD = 0.8
-# A case graduates from hand-picked blocking only after a screening window of
-# this many recorded runs (docs/designs: nightly evidence policy).
+# The nightly-evidence screening window: docs/designs/testing-strategy.md
+# asks for this many recorded runs against main before a case is admitted
+# to the gate (admission rules: bench/baselines/README.md).
 SCREENING_WINDOW = 20
 # Trend charts stay readable; older runs fall off the left edge.
 MAX_TREND_POINTS = 10
 
 esc = html.escape
+
+
+def fmt(value: float, digits: int = 0) -> str:
+    """Format a non-negative number the way JS ``toFixed``/``Math.round``
+    does. Python's ``:.Nf`` rounds half to even (0.25 -> "0.2"), JS rounds
+    half away from zero (0.25 -> "0.3"); without this, numbers visibly
+    change when the template's on-load re-render replaces the baked HTML."""
+    factor = 10**digits
+    return f"{math.floor(value * factor + 0.5) / factor:.{digits}f}"
+
+
+def is_count(value) -> bool:
+    """A non-negative whole number. Mirrors the template's
+    ``Number.isInteger`` guard: bools and non-integral floats are data
+    errors, rendered as "not reported" rather than interpolated raw."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and float(value).is_integer()
+    )
 
 RESULT_PILLS = {
     "pass": '<span class="pill p-pass">PASSED</span>',
@@ -214,15 +237,24 @@ def tile(key: str, value_html: str, chip_html: str, detail: str) -> str:
     )
 
 
-def ratio_chip(current: float | None, previous: float | None, unit: str) -> str:
-    """Cheaper/slower chip vs the previous run; flat when nothing moved."""
+def ratio_chip(
+    current: float | None,
+    previous: float | None,
+    unit: str,
+    have_previous_run: bool = False,
+) -> str:
+    """Cheaper/slower chip vs the previous run; flat when nothing moved.
+    "first run" only when there is genuinely no prior run -- a prior run
+    that just failed to report this metric gets no chip at all."""
     if current is None or previous is None or not previous or not current:
-        return delta_chip("flat", "first run") if previous is None else ""
+        if previous is None and not have_previous_run:
+            return delta_chip("flat", "first run")
+        return ""
     if previous / current >= 1.5:
-        return delta_chip("up", f"▲ {previous / current:.1f}× cheaper")
+        return delta_chip("up", f"▲ {fmt(previous / current, 1)}× cheaper")
     if current / previous >= 1.5:
-        return delta_chip("flat", f"▼ {current / previous:.1f}× slower")
-    return delta_chip("flat", f"≈ prev {previous:.0f}{unit}")
+        return delta_chip("flat", f"▼ {fmt(current / previous, 1)}× slower")
+    return delta_chip("flat", f"≈ prev {fmt(previous)}{unit}")
 
 
 def tiles_html(data: dict) -> str:
@@ -257,7 +289,8 @@ def tiles_html(data: dict) -> str:
     # Domain coverage
     coverage = data.get("coverage") or {}
     covered, total = coverage.get("domains_covered"), coverage.get("domains_total")
-    if covered is not None and total is not None:
+    if is_count(covered) and is_count(total):
+        covered, total = int(covered), int(total)
         uncovered = [str(d) for d in coverage.get("uncovered") or []]
         chip = (
             delta_chip("up", "all covered")
@@ -274,9 +307,9 @@ def tiles_html(data: dict) -> str:
     # Median case cost
     med = median_task_minutes(latest)
     if med is not None:
-        chip = ratio_chip(med, median_task_minutes(previous), "min")
+        chip = ratio_chip(med, median_task_minutes(previous), "min", previous is not None)
         detail = f"median across {len(run_tasks(latest))} cases · latest run"
-        tiles.append(tile("Median case cost", f"{med:.1f}<small>min</small>", chip, detail))
+        tiles.append(tile("Median case cost", f"{fmt(med, 1)}<small>min</small>", chip, detail))
     else:
         tiles.append(tile("Median case cost", "—", "", "no task durations yet"))
 
@@ -285,12 +318,12 @@ def tiles_html(data: dict) -> str:
     if isinstance(duration, (int, float)):
         prev_duration = previous.get("duration_s") if previous else None
         prev_min = prev_duration / 60 if isinstance(prev_duration, (int, float)) else None
-        chip = ratio_chip(duration / 60, prev_min, "min")
+        chip = ratio_chip(duration / 60, prev_min, "min", previous is not None)
         finished = parse_iso(latest.get("finished"))
         detail = (
             f"finished {finished:%Y-%m-%d %H:%M} UTC" if finished else "whole-run wall clock"
         )
-        tiles.append(tile("Wall clock", f"{duration / 60:.0f}<small>min</small>", chip, detail))
+        tiles.append(tile("Wall clock", f"{fmt(duration / 60)}<small>min</small>", chip, detail))
     else:
         tiles.append(tile("Wall clock", "—", "", "not reported"))
 
@@ -303,9 +336,9 @@ def score_html(judge) -> str:
     judge = min(max(float(judge), 0.0), 1.0)
     return (
         f'<div class="score"><div class="bar">'
-        f'<div class="fill" style="width:{judge * 100:.0f}%"></div>'
+        f'<div class="fill" style="width:{fmt(judge * 100)}%"></div>'
         f'<div class="thr" style="left:{JUDGE_THRESHOLD * 100:.0f}%"></div></div>'
-        f'<span class="val">{judge:.1f}</span></div>'
+        f'<span class="val">{fmt(judge, 1)}</span></div>'
     )
 
 
@@ -337,7 +370,7 @@ def case_row(case: dict, latest_run: dict | None, notes: dict) -> str:
     duration = task.get("duration_s") if task else None
     if not isinstance(duration, (int, float)):
         duration = (case.get("durations") or {}).get("med")
-    duration_text = f"{duration:.0f}s" if isinstance(duration, (int, float)) else "—"
+    duration_text = f"{fmt(duration)}s" if isinstance(duration, (int, float)) else "—"
 
     domain = case.get("domain")
     domain_html = f'<span class="tdom">{esc(str(domain))}</span>' if domain else ""
@@ -384,26 +417,26 @@ def chart_svg(points: list[tuple[str, float]], threshold: float | None = None) -
     def ys(v: float) -> float:
         return height - py - (v / ymax) * (height - 2 * py)
 
-    poly = " ".join(f"{xs(i):.1f},{ys(v):.1f}" for i, (_, v) in enumerate(points))
+    poly = " ".join(f"{fmt(xs(i), 1)},{fmt(ys(v), 1)}" for i, (_, v) in enumerate(points))
     dots = "".join(
-        f'<circle cx="{xs(i):.1f}" cy="{ys(v):.1f}" r="5" fill="var(--accent)" '
-        f'stroke="var(--surface-1)" stroke-width="2" data-l="{esc(label)} · {v:.2f}"/>'
+        f'<circle cx="{fmt(xs(i), 1)}" cy="{fmt(ys(v), 1)}" r="5" fill="var(--accent)" '
+        f'stroke="var(--surface-1)" stroke-width="2" data-l="{esc(label)} · {fmt(v, 2)}"/>'
         for i, (label, v) in enumerate(points)
     )
     xlab = "".join(
-        f'<text x="{xs(i):.1f}" y="{height - 2}" text-anchor="middle" font-size="10.5" '
+        f'<text x="{fmt(xs(i), 1)}" y="{height - 2}" text-anchor="middle" font-size="10.5" '
         f'font-weight="600" fill="var(--text-muted)">{esc(label)}</text>'
         for i, (label, _) in enumerate(points)
     )
     thr_line = (
-        f'<line x1="{px}" y1="{ys(threshold):.1f}" x2="{width - px}" y2="{ys(threshold):.1f}" '
+        f'<line x1="{px}" y1="{fmt(ys(threshold), 1)}" x2="{width - px}" y2="{fmt(ys(threshold), 1)}" '
         f'stroke="var(--line-2)" stroke-dasharray="3 4"/>'
         if threshold is not None
         else ""
     )
     return (
         f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none">'
-        f'{thr_line}<line x1="{px}" y1="{ys(0):.1f}" x2="{width - px}" y2="{ys(0):.1f}" stroke="var(--line)"/>'
+        f'{thr_line}<line x1="{px}" y1="{fmt(ys(0), 1)}" x2="{width - px}" y2="{fmt(ys(0), 1)}" stroke="var(--line)"/>'
         f'<polyline points="{poly}" fill="none" stroke="var(--accent)" stroke-width="2.5" '
         f'stroke-linejoin="round" stroke-linecap="round"/>{dots}{xlab}</svg>'
     )
@@ -429,7 +462,9 @@ def judge_trend_case(data: dict) -> dict | None:
 
 
 def trends_html(data: dict) -> str:
-    rate = chart_svg(rate_points(data), threshold=JUDGE_THRESHOLD)
+    # No threshold line here: 0.8 is the judge threshold, and drawing it on
+    # the pass-fraction chart would present it as a pass-rate target.
+    rate = chart_svg(rate_points(data))
     rate = rate or '<div class="cap" style="margin-top:14px">not enough runs yet</div>'
 
     # ov_history entries carry build ids; label them with the matching run's
@@ -478,19 +513,19 @@ def evidence_row(case: dict) -> str:
     have = int(have) if isinstance(have, (int, float)) else 0
     width = min(100.0, 100.0 * have / SCREENING_WINDOW)
     rate = case.get("pass_rate")
-    rate_text = f"{round(rate * 100)}%" if isinstance(rate, (int, float)) else "—"
-    blocking = (
-        '<span class="pill p-pass">HAND-PICKED</span>'
+    rate_text = f"{fmt(rate * 100)}%" if isinstance(rate, (int, float)) else "—"
+    presubmit = (
+        '<span class="pill p-pass">IN PRESUBMIT</span>'
         if case.get("active")
-        else '<span class="pill p-fix">PENDING</span>'
+        else '<span class="pill p-fix">NOT IN PRESUBMIT</span>'
     )
     return (
         f'<tr><td style="font-weight:650">{esc(name)}</td>'
         f'<td><div style="display:flex;align-items:center;gap:10px">'
-        f'<div class="prog"><i style="width:{width:.0f}%"></i></div>'
+        f'<div class="prog"><i style="width:{fmt(width)}%"></i></div>'
         f'<span class="cap">{have} of {SCREENING_WINDOW}</span></div></td>'
         f'<td class="num" style="text-align:left">{rate_text}</td>'
-        f"<td>{blocking}</td></tr>"
+        f"<td>{presubmit}</td></tr>"
     )
 
 
@@ -504,9 +539,9 @@ def evidence_html(data: dict) -> str:
         rows = '<tr><td colspan="4"><span class="cap">no cases on record yet</span></td></tr>'
     return f"""
   <h2 id="nightly">Nightly evidence</h2>
-  <div class="sub">Runs on record per case, toward the {SCREENING_WINDOW}-run screening window · a case blocks only while it is on the reviewed hand-picked list</div>
+  <div class="sub">Runs on record per case, toward the {SCREENING_WINDOW}-run screening window · a case can gate a PR only while it is on the presubmit TASKS list; the gate itself is rate-based (hack/ci-eval-pr.sh)</div>
   <div class="card"><table id="evidence">
-    <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>Blocking today</th></tr></thead>
+    <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>In presubmit</th></tr></thead>
     <tbody>{rows}</tbody>
   </table></div>"""
 
@@ -593,19 +628,27 @@ def bootstrap_json(value) -> str:
 
 def render_page(data: dict, notes: dict) -> str:
     page = TEMPLATE.read_text()
-    for token, value in (
-        ("__META__", meta_html(data)),
-        ("__FRESHNESS__", freshness_html(data)),
-        ("__APP__", app_html(data, notes)),
+    values = {
+        "__META__": meta_html(data),
+        "__FRESHNESS__": freshness_html(data),
+        "__APP__": app_html(data, notes),
         # The live read side: the template's script re-renders from this
         # baked copy on load, then polls data.json every 60s.
-        ("__DATA_JSON__", bootstrap_json(data)),
-        ("__NOTES_JSON__", bootstrap_json(notes)),
-    ):
+        "__DATA_JSON__": bootstrap_json(data),
+        "__NOTES_JSON__": bootstrap_json(notes),
+    }
+    for token in values:
         if token not in page:
             raise SystemExit(f"ERROR: template is missing the {token} marker")
-        page = page.replace(token, value)
-    return page
+    # One pass over the template only: substituted values are never
+    # re-scanned, so data that happens to contain a marker string (a case
+    # *named* __DATA_JSON__, say) stays inert text instead of expanding
+    # into the raw JSON bootstrap inside the page body.
+    return re.sub(
+        "|".join(re.escape(token) for token in values),
+        lambda match: values[match.group(0)],
+        page,
+    )
 
 
 # --------------------------------------------------------------------------
