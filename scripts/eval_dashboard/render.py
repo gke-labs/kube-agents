@@ -621,9 +621,13 @@ def freshness_html(data: dict) -> str:
 
 
 def bootstrap_json(value) -> str:
-    """JSON safe to inline in a <script> block: '</' is escaped so no data
-    string can close the tag early."""
-    return json.dumps(value, separators=(",", ":")).replace("</", "<\\/")
+    """JSON safe to inline in a <script> block: every '<' is emitted as the
+    JSON escape \\u003c. Escaping only '</' is not enough -- the HTML
+    tokenizer leaves script-data state on '<!--' too, and '<!--<script'
+    puts it in the double-escaped state where the block's own '</script>'
+    no longer closes it, so a hostile data string would silently disable
+    the whole live read side."""
+    return json.dumps(value, separators=(",", ":")).replace("<", "\\u003c")
 
 
 def render_page(data: dict, notes: dict) -> str:

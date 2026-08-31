@@ -278,9 +278,9 @@ class RenderToleranceTest(unittest.TestCase):
         data["coverage"]["domains_covered"] = '<img src=x onerror=alert(2)>'
         html, _, tmp = render_fixture(data)
         self.addCleanup(tmp.cleanup)
-        # The payload may appear exactly once: as an inert JSON string
-        # inside the <script> bootstrap. Never in the document body.
-        self.assertEqual(html.count("<img src=x"), 1)
+        # The payload never appears raw: not in the document body, and the
+        # <script> bootstrap emits every '<' as the JSON escape \\u003c.
+        self.assertNotIn("<img src=x", html)
         self.assertIn(
             '<div class="k">Domain coverage</div><div class="v">—</div>'
             '<div class="d2">not reported</div>',
@@ -352,9 +352,12 @@ class LiveReadSideTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         data = fixture_data()
-        # A hostile string proves the inline-JSON escaping: without it this
-        # would close the <script> block early.
+        # Hostile strings prove the inline-JSON escaping: the first would
+        # close the <script> block early; the second would move the HTML
+        # tokenizer to the double-escaped script state, where the block's
+        # own closing </script> no longer closes it.
         data["cases"][0]["novel_field"] = "</script><b>boom</b>"
+        data["cases"][0]["other_field"] = "<!--<script>"
         data["stale_after_s"] = 600
         cls.html, _, cls._tmp = render_fixture(data)
 
@@ -364,8 +367,18 @@ class LiveReadSideTest(unittest.TestCase):
 
     def test_bootstrap_data_is_embedded_and_script_safe(self):
         self.assertIn('"generated_at":"2026-08-28T14:02:11Z"', self.html)
+        # No '<' from data survives into the script block: neither the
+        # tag-closing payload nor the comment-opener one.
         self.assertNotIn("</script><b>boom</b>", self.html)
-        self.assertIn("<\\/script><b>boom<\\/b>", self.html)
+        self.assertNotIn("<!--", self.html)
+        self.assertIn("\\u003c/script>\\u003cb>boom\\u003c/b>", self.html)
+        self.assertIn("\\u003c!--\\u003cscript>", self.html)
+        # And the escaping is JSON-transparent: parsing it back yields the
+        # original strings.
+        self.assertEqual(
+            json.loads(render.bootstrap_json("<!--<script></script>")),
+            "<!--<script></script>",
+        )
 
     def test_polls_data_json_every_60_seconds(self):
         self.assertIn("refreshMs: 60000", self.html)
