@@ -30,21 +30,26 @@ workflow) rather than a stockout alert:
   signal**: assess it through quota headroom and reservations, and say so.
   Your final answer must weigh all three paths — On-Demand, Spot, and
   Flex-Start — with their trade-offs.
-- Report quota and live obtainability **separately** and state the
-  distinction explicitly, e.g. "quota is separate from live capacity": quota
-  is a project limit; it does not prove hardware is obtainable, and
-  obtainability evidence does not raise quota. Never guarantee capacity.
+- Report quota and live obtainability **separately**, and include this
+  sentence verbatim in your final report: "Quota is separate from live
+  capacity." Quota is a project limit; it does not prove hardware is
+  obtainable, and obtainability evidence does not raise quota. Never
+  guarantee capacity.
 - **Record what you executed as typed evidence** with the `record_evidence`
   tool — one record per check, built from the real command output, never
   from memory:
   - after the quota check: `type: quota_check` with the metric, limit,
     usage, and whether the request fits in `analysis`;
   - after the capacity advice calls: `type: advice_service_capacity` with
-    `api_method: compute.beta.AdviceService.Capacity`, the request's
-    region, acceleratorType, and acceleratorCount, and an `analysis`
-    carrying `availableQuantity`, per-zone `zones` entries, and a
-    `provisioningModels` object with the SPOT and FLEX_START findings plus
-    the quota/reservation-based ON_DEMAND assessment;
+    `api_method: compute.beta.AdviceService.Capacity`. The `request` object
+    must carry exactly these canonical fields alongside anything else:
+    `region` (e.g. `us-central1`), `acceleratorType` (e.g. `nvidia-a100`),
+    and `acceleratorCount` (the requested GPU total, as a number). The
+    `analysis` must carry a numeric `availableQuantity`, a `zones` list
+    with one entry per zone you probed — **probe and list at least two
+    zones**, issuing per-zone advice queries if a single call returns only
+    one — and a `provisioningModels` object with the SPOT and FLEX_START
+    findings plus the quota/reservation-based ON_DEMAND assessment;
   - after a server-side dry run of a generated ComputeClass
     (`kubectl apply --dry-run=server`): `type: computeclass_server_dry_run`.
 - **Attach generated manifests as structured artifacts** with the
