@@ -207,7 +207,8 @@ class TestRepoDerivedFacts(unittest.TestCase):
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
         self.assertEqual(cov["domains_total"], 11)
-        self.assertEqual(cov["uncovered"], ["incident-triage"])
+        # #1045 activated incident-triage, emptying the allowlist.
+        self.assertEqual(cov["uncovered"], [])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_uncommented_entries(self):
