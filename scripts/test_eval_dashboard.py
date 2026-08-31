@@ -128,6 +128,21 @@ def render_fixture(data, notes_path=None):
     return (out_dir / "index.html").read_text(), out_dir, tmp
 
 
+def baked_app(html):
+    """The server-rendered fragment only: everything render.py substituted
+    for __APP__, and none of the template's own JS source. Assertions
+    against the whole page are toothless for any string the JS mirror
+    carries as a literal ("Test suite", "not enough runs yet", the pill
+    markup...), because the template ships that source verbatim in every
+    page."""
+    return html.split('<div id="app">', 1)[1].split("<script>", 1)[0]
+
+
+def script_source(html):
+    """The template's inline JS, for pinning the live-side contract."""
+    return "".join(part.split("</script>", 1)[0] for part in html.split("<script>")[1:])
+
+
 def row_for(html, case_name):
     rows = [r for r in html.split("<tr>") if case_name in r]
     if not rows:
@@ -189,13 +204,14 @@ class RenderGoldenTest(unittest.TestCase):
     def test_judge_trend_picks_deepest_history(self):
         self.assertIn("reliability-pdb-probe · judge score", self.html)
 
-    def test_evidence_progress_toward_screening_window(self):
-        self.assertIn("4 of 20", self.html)
-        self.assertIn("0 of 20", self.html)
-        self.assertIn(">IN PRESUBMIT</span>", self.html)
+    def test_evidence_depth_against_screening_yardstick(self):
+        app = baked_app(self.html)
+        self.assertIn("4 of 20", app)
+        self.assertIn("0 of 20", app)
+        self.assertIn(">IN PRESUBMIT</span>", app)
 
     def test_releases_empty_state_rendered(self):
-        self.assertIn("No RC in the gate window", self.html)
+        self.assertIn("No RC in the gate window", baked_app(self.html))
 
     def test_data_json_copied_next_to_index(self):
         copied = json.loads((self.out_dir / "data.json").read_text())
@@ -211,8 +227,9 @@ class RenderToleranceTest(unittest.TestCase):
                 "source": "logs", "runs": [], "cases": []}
         html, _, tmp = render_fixture(data)
         self.addCleanup(tmp.cleanup)
-        self.assertIn('id="empty-state"', html)
-        self.assertIn("No evaluation data yet", html)
+        app = baked_app(html)
+        self.assertIn('id="empty-state"', app)
+        self.assertIn("No evaluation data yet", app)
         self.assertNotIn("__APP__", html)
 
     def test_optional_fields_absent(self):
@@ -227,9 +244,10 @@ class RenderToleranceTest(unittest.TestCase):
         }
         html, _, tmp = render_fixture(data)
         self.addCleanup(tmp.cleanup)
-        self.assertIn('class="pill p-pass">PASSED</span>', html)
-        self.assertIn("not enough runs yet", html)
-        self.assertIn("no judge history yet", html)
+        app = baked_app(html)
+        self.assertIn('class="pill p-pass">PASSED</span>', app)
+        self.assertIn("not enough runs yet", app)
+        self.assertIn("no judge history yet", app)
 
     def test_null_project_renders_placeholder_not_none(self):
         # SCHEMA.md: project is null when the log never reached the lease
@@ -249,7 +267,7 @@ class RenderToleranceTest(unittest.TestCase):
         data["cases"][0]["novel"] = "yes"
         html, _, tmp = render_fixture(data)
         self.addCleanup(tmp.cleanup)
-        self.assertIn("Test suite", html)
+        self.assertIn("Test suite", baked_app(html))
 
     def test_html_in_data_is_escaped(self):
         data = fixture_data()
@@ -391,9 +409,14 @@ class LiveReadSideTest(unittest.TestCase):
         self.assertIn('"stale_after_s":600', self.html)
 
     def test_stale_and_unreachable_states_carry_text_labels(self):
-        # Not color alone: the amber badge always carries a written label.
-        self.assertIn("STALE · ", self.html)
-        self.assertIn("UNREACHABLE · ", self.html)
+        # A template-contract tripwire, deliberately: the baked page cannot
+        # reach these states server-side (they exist only after a poll), so
+        # this pins the *shipped script* -- the amber badge must always
+        # carry a written label, never color alone -- scoped to the script
+        # source so it fails if the labels leave the template.
+        js = script_source(self.html)
+        self.assertIn("`STALE · ${text}`", js)
+        self.assertIn("`UNREACHABLE · ${text}`", js)
         self.assertIn(".fresh.stale", self.html)
 
     def test_notes_travel_with_the_bootstrap(self):

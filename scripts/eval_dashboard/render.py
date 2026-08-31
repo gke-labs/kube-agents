@@ -56,9 +56,12 @@ ISSUE_RE = re.compile(r"^#(\d+)$")
 
 # Judge scores are advisory; the tick every score bar carries sits here.
 JUDGE_THRESHOLD = 0.8
-# The nightly-evidence screening window: docs/designs/testing-strategy.md
-# asks for this many recorded runs against main before a case is admitted
-# to the gate (admission rules: bench/baselines/README.md).
+# The 20-run yardstick the evidence bars are drawn against, borrowed from
+# the screening window in docs/designs/testing-strategy.md. The bars show
+# recorded history depth only -- admission to the gate is measured by the
+# baseline store, which fills from main-branch runs alone
+# (bench/baselines/README.md); the presubmit runs collected here never
+# advance it, so a full bar is not admission.
 SCREENING_WINDOW = 20
 # Trend charts stay readable; older runs fall off the left edge.
 MAX_TREND_POINTS = 10
@@ -538,8 +541,8 @@ def evidence_html(data: dict) -> str:
     if not rows:
         rows = '<tr><td colspan="4"><span class="cap">no cases on record yet</span></td></tr>'
     return f"""
-  <h2 id="nightly">Nightly evidence</h2>
-  <div class="sub">Runs on record per case, toward the {SCREENING_WINDOW}-run screening window · a case can gate a PR only while it is on the presubmit TASKS list; the gate itself is rate-based (hack/ci-eval-pr.sh)</div>
+  <h2 id="nightly">Evidence on record</h2>
+  <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the {SCREENING_WINDOW}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md)</div>
   <div class="card"><table id="evidence">
     <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>In presubmit</th></tr></thead>
     <tbody>{rows}</tbody>
