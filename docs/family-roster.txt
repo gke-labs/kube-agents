@@ -76,6 +76,7 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/gke-multitenancy/SKILL.md
   agents/platform/skills/gke-networking/SKILL.md
   agents/platform/skills/gke-observability/SKILL.md
+  agents/platform/skills/gke-obtainability/SKILL.md
   agents/platform/skills/gke-platform-security/SKILL.md
   agents/platform/skills/gke-productionize/SKILL.md
   agents/platform/skills/gke-reliability/SKILL.md
