@@ -105,6 +105,21 @@
       "deliver": "all"
     },
     {
+      "id": "findings-morning-nudge",
+      "name": "Findings Queue Morning Nudge",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 12 * * *",
+        "display": "0 12 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "findings_nudge.py",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "github-repo-watcher",
       "name": "GitHub Repo Watcher",
       "schedule": {

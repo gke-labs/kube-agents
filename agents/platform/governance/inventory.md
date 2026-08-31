@@ -93,6 +93,65 @@ Structure the file in this order:
 
    For each item, name the affected cluster/namespace/workload where applicable and state the recommended action concisely, so the reader can act on it directly.
 
+5. **Machine-Readable Findings Block:** the same findings again, one JSON object per line, inside a
+   fence whose info string is exactly `findings`:
+
+   ````
+   ```findings
+   {"check": "probes-readiness", "cluster": "prod-eu", "namespace": "payments", "object": "checkout", "title": "checkout Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "high"}
+   {"check": "workload-identity-off", "cluster": "prod-eu", "object": "prod-eu", "title": "Workload Identity is not enabled on the cluster", "severity_hint": "high"}
+   ```
+   ````
+
+   This block is what the prioritization stage registers, so **every problem in the prose plan above
+   needs a line here, and every line here needs to be a real finding.** The two are the same set said
+   twice: the prose for a person, the block for the next stage.
+
+   - `check`, `cluster`, `object` and `title` are required. `namespace` is omitted for a
+     cluster-scoped finding; `object` is then the cluster's own name.
+   - **One line per affected object, not per condition.** A missing `readinessProbe` on three
+     Deployments is three lines. Each has its own manifest to change and gets fixed on its own
+     schedule, and `check` + `cluster` + `namespace` + `object` is the finding's identity in the
+     queue — collapsing them here loses two of the three permanently. The report gathers them back
+     into one line.
+   - `check` is a lowercase hyphenated slug naming the condition, stable across sweeps. Use the
+     vocabulary below where one fits.
+   - Optional: `detail` (what was observed, including how you know — a command's output, an absent
+     field), `severity_hint` (`high`/`medium`/`low`, your judgement with the whole fleet in view),
+     `provider_managed` (`true` for an object in `kube-system`, `kube-public`, `kube-node-lease`,
+     `gke-*` or `gmp-*`). `provider_managed` is a JSON boolean, not the string `"true"`.
+   - Do not score anything. The rubric lives in the next stage and needs the whole fleet's findings
+     side by side.
+   - A clean fleet writes the fence with nothing between the lines. An absent block is not the same
+     thing, and the next stage treats it as a broken sweep.
+
+   Nothing else goes in the block: no rank, no severity word, no recommendation prose. A line the
+   next stage cannot parse stops registration for the whole file, so keep each one to a single line
+   of valid JSON.
+
+   **The check vocabulary.** These are the audit streams' own slugs. Using them means the same
+   problem carries one identity whichever source found it, and a finding promoted out of the queue
+   routes to the stream that owns the check.
+
+   | what you found                   | check slug                            |
+   | -------------------------------- | ------------------------------------- |
+   | liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
+   | missing `startupProbe`           | `probes-startup`                      |
+   | requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
+   | HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
+   | NetworkPolicy                    | `netpol-missing`                      |
+   | ResourceQuota and LimitRange     | `no-resourcequota`                    |
+   | Workload Identity                | `workload-identity-off`               |
+   | `runAsNonRoot` security context  | `podsecurity-gaps`                    |
+   | missing `readOnlyRootFilesystem` | `readonly-root-fs`                    |
+   | Shielded Nodes                   | `shielded-nodes`                      |
+   | Dataplane V2                     | `datapath-provider`                   |
+   | Managed Service for Prometheus   | `managed-prometheus`                  |
+   | node auto-upgrade                | `no-autoupgrade`                      |
+
+   For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it
+   is the row's identity across every later sweep.
+
 ---
 
 ## Step 5: Hand Off to Prioritization
