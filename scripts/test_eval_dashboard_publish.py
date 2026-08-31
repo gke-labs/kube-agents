@@ -47,6 +47,7 @@ def run_hook(
     target: str,
     job_type: str = "periodic",
     pull_number: str = "",
+    artifacts: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -62,6 +63,9 @@ def run_hook(
             f'SCRIPT_DIR="{script_dir}"',
             f'export JOB_TYPE="{job_type}"',
             f'export PULL_NUMBER="{pull_number}"',
+            # Always pinned: the suite itself runs under Prow, where a real
+            # $ARTIFACTS is set, and the hook copies its log there.
+            f'export ARTIFACTS="{artifacts}"',
             f'export EVAL_DASHBOARD_TARGET="{target}"',
             "collect_bench_results() { :; }",
             "profile_report() { :; }",
@@ -208,9 +212,9 @@ class PublishHookFailSafeTest(unittest.TestCase):
             fake_hack = dashboard_stubs(
                 pathlib.Path(tmp),
                 """\
-                import pathlib, sys
+                import json, pathlib, sys
                 out = sys.argv[sys.argv.index("--out") + 1]
-                pathlib.Path(out).write_text("{}")
+                pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
                 """,
             )
             for code in (0, 7):
@@ -223,6 +227,51 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     result.stdout,
                 )
                 self.assertNotIn(SKIP, result.stdout)
+
+    def test_zero_collected_runs_skip_instead_of_publishing_empty(self):
+        """The evidence_store lesson: an unreadable source is not an empty
+        one. collect.py warns-and-continues on gsutil failures and still
+        exits 0 with runs: [], so without the floor a 403 on the sweep would
+        overwrite a good dashboard with an empty one and log success."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp),
+                """\
+                import json, pathlib, sys
+                out = sys.argv[sys.argv.index("--out") + 1]
+                pathlib.Path(out).write_text(json.dumps({"runs": []}))
+                """,
+            )
+            for code in (0, 7):
+                result = run_hook(
+                    code, fake_hack, target="gs://kube-agents-dashboards/evals/"
+                )
+                self.assert_skipped_once(result, code, "collected zero runs")
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            self.assertEqual(list(dash.glob("*.ran")), [])
+
+    def test_the_pipeline_log_rides_to_artifacts_on_failure_and_success(self):
+        """rm -rf must not eat the only evidence: with $ARTIFACTS present the
+        publish log survives as eval-dashboard-publish.log, on the skip path
+        and the publish path both."""
+        collect_ok = """\
+            import json, pathlib, sys
+            out = sys.argv[sys.argv.index("--out") + 1]
+            pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+            """
+        for body in ("import sys; sys.exit(3)\n", collect_ok):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_hack = dashboard_stubs(pathlib.Path(tmp), body)
+                artifacts = pathlib.Path(tmp) / "artifacts"
+                artifacts.mkdir()
+                run_hook(
+                    7,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    artifacts=str(artifacts),
+                )
+                log = artifacts / "eval-dashboard-publish.log"
+                self.assertTrue(log.is_file(), list(artifacts.iterdir()))
 
     def test_the_pipeline_stops_at_the_first_failing_stage(self):
         """collect crashing means render/publish never run -- errexit lives
@@ -247,7 +296,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 [
                     "set -euo pipefail",
                     f'SCRIPT_DIR="{fake_hack}"',
-                    'export JOB_TYPE="periodic" PULL_NUMBER=""',
+                    'export JOB_TYPE="periodic" PULL_NUMBER="" ARTIFACTS=""',
                     'export EVAL_DASHBOARD_TARGET="gs://x/"',
                     lifted("publish_eval_dashboard"),
                     "publish_eval_dashboard",

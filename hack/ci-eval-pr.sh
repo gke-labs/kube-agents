@@ -225,6 +225,11 @@ source "${SCRIPT_DIR}/ci-env.sh"
 #      overwrites the same object paths, so any workable role carries
 #      storage.objects.delete; the boundary is the identity, not the role:
 #      no account a presubmit can run as ever holds a write on this bucket.
+#      The same identity also needs READ on the sweep's source --
+#      roles/storage.objectViewer on gs://kube-agents-prow -- unless that
+#      bucket's existing public read already covers it; without it the first
+#      armed run 403s, which the zero-runs floor below turns into a skip,
+#      never into publishing an empty dashboard over a good one.
 # Until both land this costs one log line per run.
 # scripts/test_eval_dashboard_publish.py runs this function out of this file
 # and asserts the fail-safe AND the main-branch gate hold.
@@ -266,10 +271,22 @@ publish_eval_dashboard() {
   local dash_timeout=(timeout 120)
   command -v timeout >/dev/null 2>&1 || dash_timeout=()
   # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
+  # The zero-runs floor between collect and render is the evidence_store
+  # lesson (StoreUnreachable vs "empty store"): collect.py WARNS and
+  # continues when a gsutil listing fails, so a total source outage -- a 403
+  # before the read grant lands, no gsutil on PATH -- still yields a
+  # well-formed document with runs: [] and exit 0. Publishing that would
+  # overwrite a good dashboard with an empty one and log success; the floor
+  # turns it into the skip line instead.
   # shellcheck disable=SC2016
   ${dash_timeout[@]+"${dash_timeout[@]}"} bash -c '
     set -euo pipefail
     python3 "$1/collect.py" --pr-glob "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --out "$2/data.json"
+    python3 -c "
+import json, sys
+if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
+    sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
+" "$2/data.json"
     python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
     python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
   ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?
@@ -277,6 +294,13 @@ publish_eval_dashboard() {
     echo "eval-dashboard: published to ${EVAL_DASHBOARD_TARGET}"
   else
     echo "eval-dashboard publish skipped: pipeline exited ${dash_rc} (124 means the 120s timeout): $(tail -n 3 "${dash_tmp}/publish.log" 2>/dev/null | tr '\n' ' ')"
+  fi
+  # The full pipeline log rides to Prow on success AND failure: collect.py's
+  # per-build fetch errors are warnings, not failures, and those warnings are
+  # the only after-the-fact evidence that a published dashboard came from a
+  # partial sweep.
+  if [ -n "${ARTIFACTS:-}" ] && [ -d "${ARTIFACTS}" ]; then
+    cp "${dash_tmp}/publish.log" "${ARTIFACTS}/eval-dashboard-publish.log" 2>/dev/null || true
   fi
   rm -rf "${dash_tmp}" || true
   return 0
