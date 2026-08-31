@@ -33,23 +33,44 @@ workflow) rather than a stockout alert:
 - Report quota and live obtainability **separately**, and include this
   sentence verbatim in your final report: "Quota is separate from live
   capacity." Quota is a project limit; it does not prove hardware is
-  obtainable, and obtainability evidence does not raise quota. Never
-  guarantee capacity.
+  obtainable, and obtainability evidence does not raise quota. **Never use
+  the word "guarantee" about capacity, allocations, or scheduling anywhere
+  in the report** — not even for reservations or ProvisioningRequests;
+  write "reserves", "holds", or "provides once scheduled" instead.
 - **Record what you executed as typed evidence** with the `record_evidence`
   tool — one record per check, built from the real command output, never
   from memory:
   - after the quota check: `type: quota_check` with the metric, limit,
     usage, and whether the request fits in `analysis`;
   - after the capacity advice calls: `type: advice_service_capacity` with
-    `api_method: compute.beta.AdviceService.Capacity`. The `request` object
-    must carry exactly these canonical fields alongside anything else:
-    `region` (e.g. `us-central1`), `acceleratorType` (e.g. `nvidia-a100`),
-    and `acceleratorCount` (the requested GPU total, as a number). The
-    `analysis` must carry a numeric `availableQuantity`, a `zones` list
-    with one entry per zone you probed — **probe and list at least two
-    zones**, issuing per-zone advice queries if a single call returns only
-    one — and a `provisioningModels` object with the SPOT and FLEX_START
-    findings plus the quota/reservation-based ON_DEMAND assessment;
+    `api_method: compute.beta.AdviceService.Capacity`. Use **exactly** these
+    key names and shapes for `request` and `analysis` — do not rename keys,
+    do not replace object entries with bare strings, fill the values from
+    the real responses (probe at least two zones, with per-zone queries if
+    one call returns fewer):
+
+    ```json
+    {
+      "request": {
+        "region": "us-central1",
+        "acceleratorType": "nvidia-a100",
+        "acceleratorCount": 32
+      },
+      "analysis": {
+        "availableQuantity": 32,
+        "zones": [
+          {"zone": "us-central1-f", "obtainability": 0.9},
+          {"zone": "us-central1-a", "obtainability": 0.5}
+        ],
+        "provisioningModels": {
+          "SPOT": {"obtainability": 0.9, "zone": "us-central1-f"},
+          "FLEX_START": {"status": "probed", "notes": "..."},
+          "ON_DEMAND": {"source": "quota+reservations", "notes": "..."}
+        }
+      }
+    }
+    ```
+
   - after a server-side dry run of a generated ComputeClass
     (`kubectl apply --dry-run=server`): `type: computeclass_server_dry_run`.
 - **Attach generated manifests as structured artifacts** with the
