@@ -976,6 +976,54 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_the_obtainability_skill_spellings_reach_their_allowlist_entries(self):
+        # gke-obtainability's design-time mode issues these exactly (SKILL.md
+        # design-time section): per-model capacity probes, the Flex-Start
+        # variant with a run duration, and the single-machine-type history
+        # read. Same failure class as the stockout SOP's spellings: an entry
+        # whose flags lack arity is unreachable.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--provisioning-model=SPOT",
+              "--instance-selection-machine-types=a2-highgpu-8g",
+              "--target-distribution-shape=ANY", "--size=4",
+              "--region=us-central1", "--format=json"],
+             "capacity probe, Spot"),
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--provisioning-model=FLEX_START",
+              "--instance-selection-machine-types=a2-highgpu-8g",
+              "--target-distribution-shape=ANY", "--size=4",
+              "--region=us-central1", "--max-run-duration=12h",
+              "--format=json"],
+             "capacity probe, Flex-Start"),
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--provisioning-model=SPOT", "--machine-type=a2-highgpu-8g",
+              "--types=PREEMPTION,PRICE", "--region=us-central1",
+              "--format=json"],
+             "capacity history, single machine type"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_apply_is_allowed_only_as_an_explicit_dry_run(self):
+        # The obtainability skill validates a generated ComputeClass with a
+        # server-side dry run before attaching it as evidence. The explicit
+        # =-attached spellings pass; anything that could persist stays refused,
+        # including the bare flag whose default varies by kubectl release.
+        for argv, allowed, desc in (
+            (["kubectl", "apply", "--dry-run=server", "-f", "cc.yaml"],
+             True, "server dry run"),
+            (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=client"],
+             True, "client dry run, flag last"),
+            (["kubectl", "apply", "-f", "cc.yaml"], False, "plain apply"),
+            (["kubectl", "apply", "--dry-run=none", "-f", "cc.yaml"],
+             False, "explicit none"),
+            (["kubectl", "apply", "--dry-run", "server", "-f", "cc.yaml"],
+             False, "space-separated value"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertEqual(evaluate(argv).allowed, allowed, desc)
+
     def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
         # Each new entry has a mutating sibling that shares all but the last
         # word. The entries are full paths, so the siblings must still refuse.

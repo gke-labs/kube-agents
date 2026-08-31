@@ -290,6 +290,10 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
         ("beta", "compute", "advice", "capacity-history"),
+        # The gke-obtainability skill's live capacity probe (design-time mode
+        # runs it per provisioning model). Read-only like its two siblings:
+        # the API advises, it never provisions.
+        ("beta", "compute", "advice", "capacity"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
         # the skills take the account id from configuration, not discovery.
@@ -392,6 +396,14 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # machine-types list uses --zones (plural; --zone alone was listed).
         # An allowlist entry whose flags are not here is unreachable.
         "--instance-selection-machine-types", "--size", "--types", "--zones",
+        # The spellings gke-obtainability passes to `advice capacity` and
+        # `advice capacity-history`: per-model probes carry
+        # --provisioning-model and --target-distribution-shape, Flex-Start
+        # probes add --max-run-duration, and capacity-history takes a single
+        # --machine-type. Without arity entries the allowlisted commands are
+        # unreachable.
+        "--provisioning-model", "--target-distribution-shape",
+        "--machine-type", "--max-run-duration",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud
@@ -862,6 +874,21 @@ def evaluate(argv: list[str]) -> Decision:
                 verb_tuple=verb,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
+            return _ALLOWED
+        # `apply` with an explicit `--dry-run=server|client` validates a
+        # manifest without persisting anything; the obtainability skill
+        # mandates it before attaching a generated ComputeClass as evidence.
+        # Unlike `diff` — excluded above because its server-side dry-run is
+        # implicit and its failure under a read-only grant reads as breakage —
+        # this form names its intent in the argv, and when RBAC refuses the
+        # dry-run the kubectl error itself is the recorded finding. Only the
+        # `=`-attached spelling counts: a bare `--dry-run` (client by
+        # default in some releases, none in others) stays refused.
+        if verb[:1] == ("apply",) and any(
+            token.partition("=")[0] == "--dry-run"
+            and token.partition("=")[2] in {"server", "client"}
+            for token in argv[1:]
+        ):
             return _ALLOWED
         return Decision(
             allowed=False,
