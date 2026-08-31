@@ -145,6 +145,22 @@ var metadataServerAddresses = []string{
 	"fd20:ce::254",
 }
 
+// isMetadataAddress reports whether ip parses to one of the metadata server
+// addresses, in canonical or IPv4-mapped form.
+func isMetadataAddress(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, m := range metadataServerAddresses {
+		if metadataAddr, mErr := netip.ParseAddr(m); mErr == nil && addr == metadataAddr {
+			return true
+		}
+	}
+	return false
+}
+
 // agentEgressPolicyEnabled reports whether the agent Pod gets a rendered
 // egress policy.
 func agentEgressPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
@@ -193,7 +209,15 @@ func ptrIntOrString(port int32) *intstr.IntOrString {
 //
 // The second return value carries the extraRules that were dropped for
 // re-permitting the metadata server, so the caller can report them.
-func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*networkingv1.NetworkPolicy, []string) {
+//
+// dnsClusterIPs is the resolved cluster DNS VIP list from
+// resolveNetpolProfile — the same four-rung ladder (annotation, spec,
+// operator flag, discovery) whose result buildNetworkPolicy renders, because
+// on a dataplane that matches the Service VIP rather than the backing Pods
+// the selector peers below never fire and the VIP peer is what keeps DNS
+// alive. Empty falls back to the documented default, exactly as the gateway
+// policy does.
+func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) (*networkingv1.NetworkPolicy, []string) {
 	labels := commonLabels(agent)
 	labels["kubeagents.x-k8s.io/component"] = "agent-egress"
 
@@ -204,14 +228,30 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*network
 	// CoreDNS Service in kube-system; node-local-dns is the NodeLocal DNSCache
 	// DaemonSet, which also answers on a link-local address of its own. The
 	// same two peers appear in charts/kube-agents/templates/litellm.yaml and in
-	// deploy/kustomize/platform/networkpolicy-core-egress.yaml.
+	// deploy/kustomize/platform/networkpolicy-core-egress.yaml, and the
+	// resolved ClusterIP peers join them for the VIP-matching dataplanes.
+	// A resolved IP that is a metadata address is dropped rather than
+	// rendered: the annotation rung of the ladder is operator input, and this
+	// policy's one invariant is that no rule permits those addresses.
+	dnsPeers := []networkingv1.NetworkPolicyPeer{
+		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "kube-dns"}),
+		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "node-local-dns"}),
+		{IPBlock: &networkingv1.IPBlock{CIDR: nodeLocalDNSCacheIP}},
+	}
+	safeDNSIPs := make([]string, 0, len(dnsClusterIPs))
+	for _, ip := range dnsClusterIPs {
+		if isMetadataAddress(ip) {
+			continue
+		}
+		safeDNSIPs = append(safeDNSIPs, ip)
+	}
+	dnsIPPeers := formatCIDRPeers(safeDNSIPs, false)
+	if len(dnsIPPeers) == 0 {
+		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
+	}
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{udpPort(53), tcpPort(53)},
-		To: []networkingv1.NetworkPolicyPeer{
-			namespacedPodPeer("kube-system", map[string]string{"k8s-app": "kube-dns"}),
-			namespacedPodPeer("kube-system", map[string]string{"k8s-app": "node-local-dns"}),
-			{IPBlock: &networkingv1.IPBlock{CIDR: nodeLocalDNSCacheIP}},
-		},
+		To:    append(dnsPeers, dnsIPPeers...),
 	})
 
 	// The credential broker. This is the agent's route to every credentialed
@@ -263,6 +303,34 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*network
 		}},
 	})
 
+	// The Hindsight memory API. buildPodEnv sets HINDSIGHT_API_URL to
+	// http://hindsight-api.<ns>.svc.cluster.local:8888 on every agent
+	// container, so on an install that chose a Hindsight-backed provider,
+	// every memory_retain and memory_recall goes here. Unconditional for the
+	// same reason buildNetworkPolicy's rule 10 is: the selector matches
+	// nothing on an install without Hindsight, and the install this rule saves
+	// is the one where the policy enforces. The component label keeps it off
+	// the Postgres Pod, which carries the same name label.
+	//
+	// Deliberately absent, and why: github-token-minter, because in the split
+	// layout this field requires, gh and git run in the broker Pod and the
+	// minter call is the broker's egress, not the agent's; gemma-server and
+	// standalone-replay, because buildAgentConfig pins the agent's model
+	// base_url to LiteLLM unconditionally, so those backends are LiteLLM's
+	// egress. The gateway policy names all three because it also serves the
+	// sidecar layout, where the broker's traffic is the agent Pod's.
+	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(8888)},
+		To: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app.kubernetes.io/name":      "hindsight",
+					"app.kubernetes.io/component": "api",
+				},
+			},
+		}},
+	})
+
 	// The Kubernetes API server, if and only if the operator was told where it
 	// is. There is no NetworkPolicy peer for "the API server": on GKE the
 	// control plane is not a Pod and not in the cluster, and the in-cluster
@@ -291,7 +359,7 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*network
 				dropped = append(dropped, fmt.Sprintf("controlPlaneCIDRs[%d]: %s", index, reason))
 				continue
 			}
-			peers = append(peers, networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}})
+			peers = append(peers, networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: normalizeControlPlaneCIDR(cidr)}})
 		}
 		if len(peers) > 0 {
 			rules = append(rules, networkingv1.NetworkPolicyEgressRule{
@@ -391,6 +459,24 @@ func ipv4MappedRefusal(prefix netip.Prefix, cidr string) string {
 		"Write IPv4 ranges in dotted-quad form", cidr, ipv4MappedSpace)
 }
 
+// normalizeControlPlaneCIDR widens a bare address to a single-host prefix and
+// leaves everything else alone.
+//
+// The gcloud command the field description gives —
+// `--format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'` —
+// emits a bare address for a cluster with a public endpoint, so pasting its
+// output is the documented workflow, and refusing the paste over a missing
+// "/32" would park the CR Degraded for a value the field's own docs produced.
+// formatCIDRPeers does the same widening for the gateway policy's
+// operator-resolved IPs.
+func normalizeControlPlaneCIDR(cidr string) string {
+	addr, err := netip.ParseAddr(cidr)
+	if err != nil {
+		return cidr
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()).String()
+}
+
 // controlPlaneCIDRRefusal returns why a control-plane range may not be
 // rendered, or "" if it may.
 //
@@ -405,7 +491,7 @@ func ipv4MappedRefusal(prefix netip.Prefix, cidr string) string {
 // as well as a metadata one, and a field named for the control plane is the
 // last place a reviewer would look for a hole in it.
 func controlPlaneCIDRRefusal(cidr string) string {
-	prefix, err := netip.ParsePrefix(cidr)
+	prefix, err := netip.ParsePrefix(normalizeControlPlaneCIDR(cidr))
 	if err != nil {
 		return fmt.Sprintf("%q is not a valid CIDR", cidr)
 	}

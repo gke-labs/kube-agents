@@ -725,6 +725,8 @@ type EgressAllowlistSpec struct {
 	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
 	// added that talks to the API. Find the range with
 	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+	// On a cluster with a public endpoint that command emits a bare address;
+	// paste it as-is and it is widened to a single-host prefix.
 	// +optional
 	ControlPlaneCIDRs []string `json:"controlPlaneCIDRs,omitempty"`
 

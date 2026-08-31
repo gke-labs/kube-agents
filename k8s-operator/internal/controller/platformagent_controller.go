@@ -371,7 +371,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 11b. Reconcile the agent Pod's default-deny egress policy, if it has one.
-	if err := r.reconcileAgentEgressPolicy(ctx, instance); err != nil {
+	if err := r.reconcileAgentEgressPolicy(ctx, instance, netpolProf.DNSClusterIPs); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -944,7 +944,7 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 	if !refusalStillRendersTheGuardrail(reason) {
 		return nil
 	}
-	return r.reconcileAgentEgressPolicy(ctx, agent)
+	return r.reconcileAgentEgressPolicy(ctx, agent, netpolProf.DNSClusterIPs)
 }
 
 // reconcileAgentEgressPolicy renders the agent Pod's default-deny egress policy.
@@ -965,7 +965,7 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 // Pod, and the broker loses the metadata server along with the sandbox. The
 // egressPolicy CRD field description carries the warning and the three-step
 // revert order, so it reaches kubectl explain.
-func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) error {
 	if !agentEgressPolicyEnabled(agent) {
 		return nil
 	}
@@ -976,7 +976,7 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 	// path that skipped validation. Log it rather than assume: the drop is what
 	// keeps the rendered object safe, and a silent drop is the failure mode
 	// this guard exists for.
-	policy, dropped := buildAgentEgressNetworkPolicy(agent)
+	policy, dropped := buildAgentEgressNetworkPolicy(agent, dnsClusterIPs)
 	for _, reason := range dropped {
 		log.Info("WARNING: dropped an egressAllowlist destination that would widen the policy onto the "+
 			"metadata server or the open internet. It was dropped, not narrowed: an ipBlock \"except\" "+

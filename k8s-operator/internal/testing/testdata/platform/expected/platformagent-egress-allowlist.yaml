@@ -1208,6 +1208,8 @@ spec:
           k8s-app: node-local-dns
     - ipBlock:
         cidr: 169.254.20.10/32
+    - ipBlock:
+        cidr: 10.96.0.10/32
   - ports:
     - port: 8765
       protocol: TCP
@@ -1241,6 +1243,14 @@ spec:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: gke-managed-otel
+  - ports:
+    - port: 8888
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/component: api
+          app.kubernetes.io/name: hindsight
   - ports:
     - port: 443
       protocol: TCP

@@ -125,12 +125,21 @@ func allowsPeerOnPort(policy *networkingv1.NetworkPolicy, namespace string, podL
 			continue
 		}
 		for _, peer := range rule.To {
-			if peer.PodSelector == nil || peer.NamespaceSelector == nil {
+			if peer.PodSelector == nil {
 				continue
 			}
-			nsSelector, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
-			if err != nil || !nsSelector.Matches(labelSet(map[string]string{"kubernetes.io/metadata.name": namespace})) {
-				continue
+			// A peer with no namespaceSelector selects the policy's own
+			// namespace, which is how the Hindsight peer (and the gateway
+			// policy's) is written.
+			if peer.NamespaceSelector == nil {
+				if namespace != policy.Namespace {
+					continue
+				}
+			} else {
+				nsSelector, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
+				if err != nil || !nsSelector.Matches(labelSet(map[string]string{"kubernetes.io/metadata.name": namespace})) {
+					continue
+				}
 			}
 			podSelector, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
 			if err != nil || !podSelector.Matches(labelSet(podLabels)) {
@@ -171,7 +180,7 @@ func labelSet(from map[string]string) labels.Set {
 // documented IPv6 metadata address, which a dual-stack Pod reaches without
 // touching either IPv4 one.
 func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
-	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent())
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
 
 	for _, address := range metadataServerAddresses {
 		if permits(policy, address) {
@@ -188,7 +197,7 @@ func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
 // permitted regardless of the other rules.
 func TestTheRenderedPolicyIsDefaultDeny(t *testing.T) {
 	agent := egressPolicyAgent()
-	policy, _ := buildAgentEgressNetworkPolicy(agent)
+	policy, _ := buildAgentEgressNetworkPolicy(agent, nil)
 
 	found := false
 	for _, policyType := range policy.Spec.PolicyTypes {
@@ -218,7 +227,7 @@ func TestTheRenderedPolicyIsDefaultDeny(t *testing.T) {
 // agent would lose its credentials rather than its escape route.
 func TestTheBrokerPodIsNotSelectedByTheEgressPolicy(t *testing.T) {
 	agent := egressPolicyAgent()
-	policy, _ := buildAgentEgressNetworkPolicy(agent)
+	policy, _ := buildAgentEgressNetworkPolicy(agent, nil)
 
 	brokerLabels := map[string]string{"app": credentialBrokerName(agent)}
 	selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
@@ -237,7 +246,7 @@ func TestTheBrokerPodIsNotSelectedByTheEgressPolicy(t *testing.T) {
 // rather than trust it.
 func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 	agent := egressPolicyAgent()
-	policy, _ := buildAgentEgressNetworkPolicy(agent)
+	policy, _ := buildAgentEgressNetworkPolicy(agent, nil)
 
 	cases := []struct {
 		name   string
@@ -269,6 +278,14 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 			why: "the gateway policy names it for deployments these manifests did not render, and the two " +
 				"policies must not disagree about the model gateway",
 		},
+		{
+			name: "the Hindsight memory API", ns: agent.Namespace,
+			labels: map[string]string{"app.kubernetes.io/name": "hindsight", "app.kubernetes.io/component": "api"},
+			port:  8888,
+			why: "buildPodEnv sets HINDSIGHT_API_URL on every agent container, and the install this rule " +
+				"saves is the one that enforces the policy — the same lesson buildNetworkPolicy's rule 10 " +
+				"records",
+		},
 	}
 
 	for _, tc := range cases {
@@ -287,7 +304,7 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 // with a guess. (Not the event watcher — the split this policy requires
 // already refuses to render while the watcher is enabled.)
 func TestTheControlPlaneRuleIsAbsentUntilAskedFor(t *testing.T) {
-	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent())
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
 	if permits(policy, "172.16.0.2") {
 		t.Error("a control-plane range was rendered without egressAllowlist.controlPlaneCIDRs asking for one")
 	}
@@ -296,7 +313,7 @@ func TestTheControlPlaneRuleIsAbsentUntilAskedFor(t *testing.T) {
 		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
 			ControlPlaneCIDRs: []string{"172.16.0.0/28"},
 		}
-	}))
+	}), nil)
 	if !permits(configured, "172.16.0.2") {
 		t.Error("egressAllowlist.controlPlaneCIDRs was supplied but the API server is still unreachable")
 	}
@@ -350,7 +367,7 @@ func TestAControlPlaneCIDRCannotBeTheWholeInternet(t *testing.T) {
 					ControlPlaneCIDRs: []string{tc.cidr},
 				}
 			})
-			policy, dropped := buildAgentEgressNetworkPolicy(agent)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
 			reason, _ := validateEgressPolicy(agent)
 
 			if !tc.refused {
@@ -473,7 +490,7 @@ func TestAnExtraRuleTheAPIServerWouldRejectIsRefusedNotApplied(t *testing.T) {
 				}
 			})
 			refusals := egressAllowlistRefusals(agent)
-			policy, dropped := buildAgentEgressNetworkPolicy(agent)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
 			rendered := false
 			for _, rule := range policy.Spec.Egress {
 				for _, peer := range rule.To {
@@ -683,7 +700,7 @@ func TestExtraRulesCannotReopenTheMetadataServer(t *testing.T) {
 					ExtraRules: []networkingv1.NetworkPolicyEgressRule{tc.rule},
 				}
 			})
-			policy, dropped := buildAgentEgressNetworkPolicy(agent)
+			policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
 
 			if tc.kept {
 				if len(dropped) != 0 {
@@ -1236,5 +1253,109 @@ func TestRevertingTheSplitUnderAnEgressPolicyDoesNotTearDownTheBroker(t *testing
 	}
 	if err := cl.Get(ctx, gateway, &networkingv1.NetworkPolicy{}); err != nil {
 		t.Errorf("the gateway policy was not restored while the layout refusal is live: %v", err)
+	}
+}
+
+// TestTheDNSRuleCarriesTheResolvedClusterIP pins the peer the review found
+// missing. On a dataplane that matches the Service VIP rather than the
+// backing Pods, the two selector peers never fire, so a rendered policy
+// without the resolved ClusterIP is a total egress block in the one shape
+// where this policy stands alone — and an operator's dnsClusterIPs override
+// applied to only one of the Pod's two policies is silently ignored by the
+// other.
+func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
+	resolved, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"34.118.224.10"})
+	if !permits(resolved, "34.118.224.10") {
+		t.Error("the resolved DNS ClusterIP is not on the rendered policy; on a VIP-matching dataplane " +
+			"every named destination becomes unreachable with it absent")
+	}
+
+	fallback, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
+	if !permits(fallback, defaultDNSClusterIP) {
+		t.Errorf("with no resolved IPs the rule must fall back to the documented default %s, as the "+
+			"gateway policy does", defaultDNSClusterIP)
+	}
+
+	// The annotation rung of the resolution ladder is operator input, so a
+	// metadata address arriving as a "DNS ClusterIP" must be dropped, and the
+	// invariant test above must keep holding. The fallback then applies: a
+	// policy whose DNS rule names no address at all is the total block this
+	// rule exists to prevent.
+	poisoned, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"169.254.169.254"})
+	for _, address := range metadataServerAddresses {
+		if permits(poisoned, address) {
+			t.Errorf("a metadata address supplied as a DNS ClusterIP was rendered: %s", address)
+		}
+	}
+	if !permits(poisoned, defaultDNSClusterIP) {
+		t.Error("dropping a poisoned DNS IP must fall back to the default, not render a rule with no address")
+	}
+
+	// The whole path: a spec-level dnsClusterIPs override must reach the
+	// rendered egress policy through a real Reconcile, not only the gateway
+	// policy.
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.NetworkPolicy = &agentv1alpha1.NetworkPolicySpec{DNSClusterIPs: []string{"34.118.230.7"}}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	rendered := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}, rendered); err != nil {
+		t.Fatalf("Reconcile did not render the egress policy: %v", err)
+	}
+	if !permits(rendered, "34.118.230.7") {
+		t.Error("spec.networkPolicy.dnsClusterIPs reached the gateway policy but not the egress policy; " +
+			"the override must apply to both policies over the same Pod")
+	}
+}
+
+// TestABareControlPlaneAddressIsWidenedNotRefused covers the paste the field
+// description itself produces: the documented gcloud command emits a bare
+// address for a cluster with a public endpoint, and refusing it parked the CR
+// Degraded for following the docs. The widening must not weaken the guards —
+// a bare metadata address is still refused.
+func TestABareControlPlaneAddressIsWidenedNotRefused(t *testing.T) {
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ControlPlaneCIDRs: []string{"34.1.2.3"},
+		}
+	})
+	if refusals := egressAllowlistRefusals(agent); len(refusals) != 0 {
+		t.Fatalf("a bare control-plane address must be widened to /32, not refused: %v", refusals)
+	}
+	policy, dropped := buildAgentEgressNetworkPolicy(agent, nil)
+	if len(dropped) != 0 {
+		t.Fatalf("the builder dropped the widened address: %v", dropped)
+	}
+	found := false
+	for _, rule := range policy.Spec.Egress {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "34.1.2.3/32" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("the bare address must render as its /32 — the API server rejects a bare address in an ipBlock")
+	}
+
+	poisoned := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ControlPlaneCIDRs: []string{"169.254.169.254"},
+		}
+	})
+	if refusals := egressAllowlistRefusals(poisoned); len(refusals) == 0 {
+		t.Error("a bare metadata address must still be refused after widening")
 	}
 }
