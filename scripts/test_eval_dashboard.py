@@ -231,6 +231,17 @@ class RenderToleranceTest(unittest.TestCase):
         self.assertIn("not enough runs yet", html)
         self.assertIn("no judge history yet", html)
 
+    def test_null_project_renders_placeholder_not_none(self):
+        # SCHEMA.md: project is null when the log never reached the lease
+        # line (aborted / deadline-truncated builds). The key is present,
+        # so a plain .get(key, "?") would leak the literal string "None".
+        data = fixture_data()
+        data["runs"][-1]["project"] = None
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        self.assertNotIn("· None", html)
+        self.assertIn("· ?", html)
+
     def test_unknown_additive_fields_ignored(self):
         data = fixture_data()
         data["a_future_field"] = {"x": 1}

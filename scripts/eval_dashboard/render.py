@@ -242,7 +242,7 @@ def tiles_html(data: dict) -> str:
         else:
             chip = delta_chip("up", "all passed")
         build_id = str(latest.get("build_id") or "?")
-        detail = f"build {build_id[:8]}… · {latest.get('project', '?')}"
+        detail = f"build {build_id[:8]}… · {latest.get('project') or '?'}"
         tiles.append(
             tile(
                 "Latest run",
