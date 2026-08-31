@@ -319,6 +319,184 @@ export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
+# ─── Ledger read credential ──────────────────────────────────────────────────
+# BENCH_GITHUB_TOKEN is what ledger_issue_contains reads a published ledger
+# issue back with. Prow mounts a fine-grained PAT under that name, and only its
+# owner can extend that PAT to a new pool repository -- so kube-agents-evals-6
+# passed every onboarding check, was registered, and 404'd on the first pull
+# request that leased it (gke-labs/kube-agents#994).
+#
+# EVAL_LEDGER_APP_KEY_FILE set: mint a read-only installation token from App
+# 4739812 instead, once per fan-out unit, because a token lasts an hour and
+# units launch across the whole run. Unset: the mounted PAT stands. A mint that
+# fails after its retries stops the run at preflight and costs a unit its
+# repetition inside the fan-out; it never falls back to the PAT, which would
+# let a smoke test pass while proving nothing about the credential it was added
+# to exercise.
+export EVAL_LEDGER_APP_ID="${EVAL_LEDGER_APP_ID:-4739812}"
+export EVAL_LEDGER_INSTALLATION_ID="${EVAL_LEDGER_INSTALLATION_ID:-157029058}"
+# Re-exported so the mint reads it however it was set: the Prow job exports it,
+# a shell that sourced this file may not have, and python reads it from the
+# environment rather than from an argument.
+export EVAL_LEDGER_APP_KEY_FILE="${EVAL_LEDGER_APP_KEY_FILE:-}"
+
+# Exit code _ledger_token_mint uses for a failure that another attempt could
+# survive, so mint_ledger_token retries those and no others. 75 is sysexits.h's
+# EX_TEMPFAIL, which is what it means here.
+LEDGER_MINT_RETRYABLE=75
+# Three attempts, 2s then 8s apart. api.github.com being briefly unreachable is
+# the case this covers, and it costs 10s to rule out; a longer ladder would sit
+# inside a unit that is holding both locks.
+LEDGER_MINT_ATTEMPTS=3
+
+# Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
+# any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
+# 1 when it could not. Its own function rather than inline in the command
+# substitution below: bash 3.2, which is what macOS ships and what a
+# contributor runs `bash -n` with, mis-parses a heredoc inside $( ).
+_ledger_token_mint() {
+  python3 - "${LEDGER_MINT_RETRYABLE}" <<'PY'
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# Passed in rather than duplicated, so the two halves of the contract cannot
+# drift: the shell decides what it retries, this decides what is retryable.
+retryable = int(sys.argv[1])
+
+
+def temporary(message):
+    sys.stderr.write(message + "\n")
+    sys.exit(retryable)
+
+
+key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
+app_id = os.environ["EVAL_LEDGER_APP_ID"]
+installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
+
+
+def b64(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+# GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
+# room for clock skew, and the backdated iat covers a runner that is slow.
+now = int(time.time())
+header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+payload = b64(
+    json.dumps(
+        {"iat": now - 60, "exp": now + 540, "iss": app_id}, separators=(",", ":")
+    ).encode()
+)
+signing_input = header + b"." + payload
+
+signed = subprocess.run(
+    ["openssl", "dgst", "-sha256", "-sign", key_file],
+    input=signing_input,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if signed.returncode != 0:
+    sys.exit(
+        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:300])
+    )
+jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
+
+request = urllib.request.Request(
+    "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
+    method="POST",
+    headers={
+        "Authorization": "Bearer " + jwt,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "kube-agents-ci-eval-pr",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = json.load(response)
+except urllib.error.HTTPError as exc:
+    # 401: the PEM is not App app_id's. 404: the installation id is wrong, or
+    # the App was uninstalled from the org. Neither survives another attempt,
+    # and a caller holding two locks should hear about them on the first.
+    # 403 stays terminal with them: on this endpoint it is a suspended
+    # installation as often as a secondary rate limit, and the two read alike
+    # from here.
+    message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
+        exc.code,
+        exc.reason,
+        app_id,
+        installation_id,
+    )
+    if exc.code >= 500 or exc.code == 429:
+        temporary(message)
+    sys.exit(message)
+except Exception as exc:
+    # A timeout, a reset connection, DNS: api.github.com was not reached, which
+    # says nothing about the credential.
+    temporary(
+        "could not reach api.github.com to mint for App %s (%s: %s)"
+        % (app_id, type(exc).__name__, exc)
+    )
+
+print(body["token"] + " " + body["expires_at"])
+PY
+}
+
+# Puts a fresh token in the CALLING shell's BENCH_GITHUB_TOKEN and prints where
+# it came from and when it expires, never the token itself. <label> names the
+# caller, because fan-out units print these lines interleaved.
+#
+# Returns non-zero rather than exiting: the unit call site holds two locks by
+# the time it mints, and exiting there would strand them. Each caller unwinds
+# its own scope. Never falls back to the mounted PAT -- that would let a smoke
+# test pass while proving nothing about the credential it exercises.
+mint_ledger_token() { # <label>
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    return 0
+  fi
+  # The token never reaches argv, where ps would show it: python writes it to
+  # stdout and command substitution keeps it in this shell.
+  #
+  # Retried because the alternative is worse than the wait. A unit that cannot
+  # mint releases its locks and returns, its repetition has no run directory,
+  # and the gate grades that MISSING -- rung CHECK_DID_NOT_RUN, which is
+  # blocking and whose reason line blames a harness or agent crash. So a single
+  # unreachable api.github.com reds the suite and points the reader at the
+  # agent. Retrying only what could survive one keeps a real credential fault
+  # arriving on the first attempt.
+  local minted rc attempt=1 delay=2
+  while :; do
+    minted="$(_ledger_token_mint)" && break
+    rc=$?
+    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
+      echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
+           "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
+      echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
+      return 1
+    fi
+    echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+    delay=$((delay * 4))
+  done
+  export BENCH_GITHUB_TOKEN="${minted%% *}"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
+}
+
+# Once here as well as once per unit: a key that cannot mint at all is a
+# run-wide fault, and it costs seconds to find out now instead of at the end of
+# the fan-out, where it would surface as every repetition grading MISSING.
+if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
+else
+  mint_ledger_token "preflight" || exit 1
+fi
+
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
@@ -987,6 +1165,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra"; then
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+    return 0
+  fi
+  # This unit's own token, minted rather than inherited, and minted after the
+  # waiting rather than before it: reps of one task serialize on the task lock,
+  # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
+  # lasts and reach devops-bench holding a dead one.
+  if ! mint_ledger_token "${name} rep ${rep}"; then
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
   fi
   if [ -n "${reuse}" ]; then
