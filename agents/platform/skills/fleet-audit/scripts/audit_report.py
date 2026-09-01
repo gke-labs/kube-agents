@@ -2424,9 +2424,8 @@ def parse_remediate_commands(
     requested_at: dict[str, str] = {}
 
     for comment in comments or []:
-        body = strip_block_quotes(
-            strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        )
+        unfenced = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(unfenced)
         matches = REMEDIATE_RE.findall(body)
         # Nothing at the start of a line, but the word is in there somewhere and
         # not inside a code span: an attempt at the command, not a discussion of
@@ -2434,7 +2433,10 @@ def parse_remediate_commands(
         mention_only = not matches and bool(
             REMEDIATE_MENTION_RE.search(strip_inline_code(body))
         )
-        if not matches and not mention_only:
+        blockquote_swallowed = not matches and not mention_only and bool(
+            REMEDIATE_MENTION_RE.search(strip_inline_code(unfenced))
+        )
+        if not matches and not mention_only and not blockquote_swallowed:
             continue
 
         # Before authorization, because this is not a question of standing. A
@@ -2450,7 +2452,7 @@ def parse_remediate_commands(
         reasons: list[str] = []
 
         if association not in WRITE_ASSOCIATIONS:
-            if mention_only:
+            if mention_only or blockquote_swallowed:
                 # Prose, from somebody whose correctly-typed command would have
                 # been refused anyway. Two refusals for one comment that was
                 # probably never a command is a bot picking an argument.
@@ -2470,6 +2472,23 @@ def parse_remediate_commands(
                         f"repository (`authorAssociation: {association or 'NONE'}`), "
                         "so this command was not acted on. A remediation pull "
                         "request may only be requested by someone who could merge it."
+                    ],
+                }
+            )
+            continue
+
+        if blockquote_swallowed:
+            refusals.append(
+                {
+                    "comment_id": node_id,
+                    "author": author,
+                    "reasons": [
+                        "`/remediate` is only read outside block quotes, and "
+                        "that comment has it inside a block quote or CommonMark "
+                        "lazy continuation line. Post it on a line of its own "
+                        "separated from any quote by a blank line: "
+                        "`/remediate <finding-id>`, or `/remediate all`"
+                        + _promotable_hint(promotable)
                     ],
                 }
             )
@@ -2578,21 +2597,24 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     Authorization is deliberately not consulted here. It decides whether a
     command is *acted on*, and on a clean run nothing is acted on for anybody —
     so "that finding no longer reproduces" is both the true answer and the more
-    useful one, for a writer and a non-writer alike. Mention-only comments are
-    included for the same reason: there is no pull request to open by mistake,
-    so the only cost of answering is a comment, and the cost of not answering is
-    a person waiting on a closed issue.
+    useful one, for a writer and a non-writer alike. Mention-only and
+    blockquote-swallowed comments are included for the same reason: there is no
+    pull request to open by mistake, so the only cost of answering is a comment,
+    and the cost of not answering is a person waiting on a closed issue.
 
     The guard is the same pair of hidden markers the findings path uses, so a
     ledger that stays open over a coverage gap does not re-answer every morning.
     """
     out: list[dict] = []
     for comment in comments or []:
-        body = strip_block_quotes(
-            strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
-        )
+        unfenced = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(unfenced)
         targets = [raw.strip().strip("`") for raw in REMEDIATE_RE.findall(body)]
-        if not targets and not REMEDIATE_MENTION_RE.search(strip_inline_code(body)):
+        if (
+            not targets
+            and not REMEDIATE_MENTION_RE.search(strip_inline_code(body))
+            and not REMEDIATE_MENTION_RE.search(strip_inline_code(unfenced))
+        ):
             continue
         # Authorization is deliberately not consulted here, as above — but
         # authorship is. "That finding no longer reproduces" is the useful

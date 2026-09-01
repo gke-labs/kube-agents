@@ -428,15 +428,15 @@ is indistinguishable from "3 requests silently dropped": opened with its URL, re
 open and deliberately not force-pushed over, `superseded` by a human close written after the request
 (§3.1), or not published this run and queued for a retry. A **refusal** is likewise never silence.
 Naming a `gcloud` or `manual` finding, naming an id that is not in the document, lacking write
-access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it, or
-writing it with no target at all each get exactly one reply.
+access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it,
+writing it inside a block quote or CommonMark lazy continuation line, or writing it with no target at all each get exactly one reply.
 
-Four of those five replies carry the ids that would have worked — capped at ten, then "and N more",
+Five of those six replies carry the ids that would have worked — capped at ten, then "and N more",
 since a refusal is help and not a second copy of the report. **The write-access refusal deliberately
 carries neither the id list nor the syntax.** Every other refusal is a correction to someone who may
 retry and succeed; that one is a "no" to someone who cannot, and handing them a menu of fixes they
 are not permitted to request reads as an invitation rather than an answer. It says what the rule is
-and stops. The one deliberate silence is a mid-sentence mention from someone without write access:
+and stops. The one deliberate silence is a mid-sentence or quoted mention from someone without write access:
 their correctly-typed command would have been refused anyway, and two replies to one comment that
 was probably never a command is a bot picking an argument. A `/remediate` the harness itself renders
 into a comment is always inside a code span, and inline code is stripped before the mention search

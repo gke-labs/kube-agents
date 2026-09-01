@@ -4150,6 +4150,16 @@ class TestRemediateCommands(BaseTestCase):
         body = "> /remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
+
+    def test_a_quoted_command_from_a_stranger_is_left_alone(self):
+        body = "> /remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse(
+            [comment(body, association="NONE", login="drive-by")]
+        )
+        self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
     def test_a_lazy_continuation_quoted_command_never_fires(self):
@@ -4157,7 +4167,9 @@ class TestRemediateCommands(BaseTestCase):
         body = "> Quoting a suggestion:\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
 
     def test_a_command_after_blank_line_following_a_quote_fires(self):
         body = "> Quoting context:\n\n/remediate netpol-missing\n"
@@ -4187,37 +4199,43 @@ class TestRemediateCommands(BaseTestCase):
         body = "> ```yaml\n> /remediate netpol-missing\n> ```\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
 
     def test_a_lazy_continuation_after_quoted_list_item_never_fires(self):
         body = "> Findings:\n> - netpol-missing\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
 
     def test_a_lazy_continuation_after_quoted_numbered_list_item_never_fires(self):
         body = "> Findings:\n> 1. netpol-missing\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
 
     def test_a_lazy_continuation_after_ordered_list_item_starting_above_one_never_fires(self):
         body = "> Quoting the checklist:\n2. Fix the netpol\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
 
     def test_a_lazy_continuation_after_quoted_and_unprefixed_continuation_list_never_fires(self):
         body = "> 1. netpol-missing\n2. rbac-broad\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
 
     def test_a_lazy_continuation_after_empty_ordered_marker_inside_quote_never_fires(self):
         body = "> Findings:\n> 2.\n/remediate netpol-missing\n"
         targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
-        self.assertEqual(refusals, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
 
     def test_a_command_after_unprefixed_numbered_list_item_starting_with_one_fires(self):
         body = "> Quoting context:\n1. Fix the netpol\n/remediate netpol-missing\n"
@@ -5431,9 +5449,21 @@ class TestUnansweredRemediateComments(unittest.TestCase):
     def comment(self, body, cid="IC_1"):
         return {"id": cid, "body": body, "author": {"login": "operator"}}
 
-    def test_a_quoted_command_is_not_a_command(self):
+    def test_a_fenced_command_is_not_a_command(self):
         fenced = self.comment("```\n/remediate a\n```")
         self.assertEqual(audit_report.unanswered_remediate_comments([fenced]), [])
+
+    def test_a_quoted_command_earns_an_answer_on_clean_run(self):
+        quoted = self.comment("> /remediate a")
+        got = audit_report.unanswered_remediate_comments([quoted])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
+
+    def test_a_lazy_continuation_quoted_command_earns_an_answer_on_clean_run(self):
+        lazy = self.comment("> Quoting:\n/remediate a")
+        got = audit_report.unanswered_remediate_comments([lazy])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
 
     def test_a_mention_still_earns_an_answer_when_nothing_can_be_opened(self):
         # Unlike the findings path, authorization is not consulted: nothing is
