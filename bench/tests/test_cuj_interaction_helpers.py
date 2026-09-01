@@ -58,6 +58,25 @@ def test_only_leading_paragraphs_are_treated_as_acknowledgment():
     assert substantive_output({"output": f"{ACK}\n\n{tail}"}) == tail
 
 
+def test_an_answer_sharing_the_acknowledgment_paragraph_survives():
+    # A coordinator that answers in the same breath as its hand-off must not
+    # be scored as silence.
+    output = (
+        "Delegated to the platform agent. Quota is separate from live "
+        "capacity, and the regional limit is 16."
+    )
+    assert substantive_output({"output": output}) == (
+        "Quota is separate from live capacity, and the regional limit is 16."
+    )
+
+
+def test_a_report_opening_with_its_task_id_is_not_boilerplate():
+    # "task t_..." alone is a reference, not a hand-off; only hand-off
+    # phrasing around it counts.
+    report = "Design report for task t_cbb05c69: the A100 quota is 16."
+    assert substantive_output({"output": report}) == report
+
+
 def test_missing_and_empty_outputs_degrade_to_empty():
     assert substantive_output({}) == ""
     assert substantive_output({"output": None}) == ""

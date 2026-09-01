@@ -8,6 +8,7 @@ from typing import Any
 
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
+    latest_artifact,
     projected_records,
     projected_tasks,
     substantive_output,
@@ -164,15 +165,7 @@ def _completed_records(
 def _artifact(
     artifacts: list[dict[str, Any]], kind: str
 ) -> dict[str, Any] | None:
-    return next(
-        (
-            item
-            for item in artifacts
-            if isinstance(item.get("manifest"), dict)
-            and item["manifest"].get("kind") == kind
-        ),
-        None,
-    )
+    return latest_artifact(artifacts, kind=kind)
 
 
 def _mapping(value: Any) -> dict[str, Any]:
