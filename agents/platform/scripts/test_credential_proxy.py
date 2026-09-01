@@ -4438,6 +4438,45 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         self.assertIn("gke-gcloud-auth-plugin", result.stdout)
         self.assertEqual([], self.minted)
 
+    def test_gcloud_with_a_forwarded_kubeconfig_stays_on_the_ambient_identity(self):
+        """The client forwards KUBECONFIG for gcloud too, and an agent always
+        has one exported -- so this is every gcloud call on a real install,
+        not an edge. Only kubectl changes identity: a forwarded kubeconfig
+        naming an unmapped cluster must not refuse a cloud-API read that has
+        nothing to do with Kubernetes objects, and one naming a mapped
+        cluster must not mint a token gcloud will never use.
+        """
+        executor = self.executor(self.pool())
+        for cluster in (self.UNMAPPED, self.MAPPED):
+            result = executor.execute(
+                ["gcloud", "logging", "read", "severity>=ERROR"],
+                kubeconfig=self.agent_kubeconfig(executor, cluster),
+            )
+            self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([], self.minted)
+
+    def test_a_kubeconfig_flag_on_a_non_kubectl_argv_does_not_reach_selection(self):
+        """git has no --kubeconfig flag of its own, so an agent-composed one
+        must not be the token that walks a git request into pool selection.
+        The real git would reject the flag; the property here is that the
+        broker neither minted nor refused before it got the chance to.
+        """
+        executor = self.executor(self.pool())
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        executor.execute(
+            [
+                "git",
+                "status",
+                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+            ]
+        )
+        self.assertEqual([], self.minted)
+
     def test_git_and_gh_do_not_mint_a_cloud_token(self):
         """They authenticate to GitHub. A GCP token for them would be pure blast radius."""
         executor = self.executor(self.pool())

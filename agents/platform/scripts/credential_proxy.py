@@ -2072,9 +2072,19 @@ class CommandExecutor:
         # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
         # over it in kubectl, so closing only the environment would leave the
         # flag as an open door.
-        command, flag_kubeconfig = self._reroute_kubeconfig_flags(command)
+        #
+        # Only kubectl reaches pool selection, and the gate is here rather
+        # than inside the pool: the client forwards KUBECONFIG for gcloud too
+        # (credential_proxy_client.KUBECONFIG_AWARE), and an agent always has
+        # one exported, so without the gate every gcloud read would be
+        # refused or would mint for a variable gcloud never reads. Non-kubectl
+        # requests still resolve a named kubeconfig the way they did before
+        # the pool existed -- regenerated on the ambient identity, never
+        # selected on.
+        scoped = executable == "kubectl"
+        command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
         if kubeconfig:
-            kubeconfig_path = self._resolve_kubeconfig(kubeconfig)
+            kubeconfig_path = self._resolve_kubeconfig(kubeconfig, scoped=scoped)
         elif flag_kubeconfig is not None:
             # argv already names a cluster and the reroute above has already put
             # it through selection. Falling into the branch below would select a
@@ -2086,7 +2096,9 @@ class CommandExecutor:
             # The environment follows the flag when the pool is armed so the two
             # cannot disagree, and is left alone otherwise, which is what the
             # flag path did before the pool existed.
-            kubeconfig_path = flag_kubeconfig if self.scoped_pool is not None else None
+            kubeconfig_path = (
+                flag_kubeconfig if self.scoped_pool is not None and scoped else None
+            )
         elif self.scoped_pool is not None and executable == "kubectl":
             # `KUBECONFIG` is in the base environment, so this branch is not
             # "no cluster" — it is "the sidecar's default cluster", and it has to
@@ -2257,7 +2269,7 @@ class CommandExecutor:
             raise ValueError("kubeconfig is outside the shared workspace")
         return candidate
 
-    def _resolve_kubeconfig(self, kubeconfig: str) -> Path:
+    def _resolve_kubeconfig(self, kubeconfig: str, *, scoped: bool = True) -> Path:
         """Turn a caller's kubeconfig path into one the proxy wrote itself.
 
         The caller's file is treated as a *name*, not as content. Exactly one
@@ -2278,9 +2290,9 @@ class CommandExecutor:
         runs under, so it can only name clusters this identity could reach anyway.
         """
         requested = self._workspace_kubeconfig(kubeconfig)
-        return self._kubeconfig_for(self._target_of(requested))
+        return self._kubeconfig_for(self._target_of(requested), scoped=scoped)
 
-    def _kubeconfig_for(self, target: ClusterTarget) -> Path:
+    def _kubeconfig_for(self, target: ClusterTarget, *, scoped: bool = True) -> Path:
         """Swap the ambient credential for the one that only reads this cluster.
 
         The managed kubeconfig authenticates with gke-gcloud-auth-plugin, which
@@ -2303,7 +2315,12 @@ class CommandExecutor:
         behind it rotates, and a file that outlives its token fails as an
         authentication error somewhere far from here.
         """
-        if self.scoped_pool is None:
+        if self.scoped_pool is None or not scoped:
+            # Not scoped: a non-kubectl request that named a kubeconfig. The
+            # file is still regenerated -- the name-not-content property does
+            # not depend on the pool -- but on the ambient identity, exactly
+            # as before the pool existed, because only kubectl reads the
+            # credential this file carries.
             return self._ensure_managed_kubeconfig(target)
         token = self.scoped_pool.token_for(target.project, target.location, target.cluster)
         managed = self._ensure_managed_kubeconfig(target)
@@ -2361,7 +2378,7 @@ class CommandExecutor:
         return self._kubeconfig_for(target)
 
     def _reroute_kubeconfig_flags(
-        self, command: list[str]
+        self, command: list[str], *, scoped: bool = True
     ) -> tuple[list[str], Path | None]:
         """Point any `--kubeconfig` in argv at the regenerated file.
 
@@ -2382,12 +2399,14 @@ class CommandExecutor:
         while index < len(rewritten):
             argument = rewritten[index]
             if argument == "--kubeconfig" and index + 1 < len(rewritten):
-                resolved_path = self._resolve_kubeconfig(rewritten[index + 1])
+                resolved_path = self._resolve_kubeconfig(rewritten[index + 1], scoped=scoped)
                 rewritten[index + 1] = str(resolved_path)
                 index += 2
                 continue
             if argument.startswith("--kubeconfig="):
-                resolved_path = self._resolve_kubeconfig(argument.split("=", 1)[1])
+                resolved_path = self._resolve_kubeconfig(
+                    argument.split("=", 1)[1], scoped=scoped
+                )
                 rewritten[index] = f"--kubeconfig={resolved_path}"
             index += 1
         return rewritten, resolved_path
