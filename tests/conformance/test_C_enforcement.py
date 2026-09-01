@@ -856,6 +856,10 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
 
     def test_C4_precondition_the_chart_still_names_images(self) -> None:
         self.assertIn("repository:", h.text("chart_values"))
+        # The operator-default half of the violation below reads a second
+        # artifact; assert it through the registry here, where a KeyError or
+        # a moved file is a loud red rather than an absorbed expected failure.
+        self.assertIn("DefaultPlatformAgentVersion", h.text("manifest_helpers_go"))
 
     @h.known_violation("C4", "04_major_requirements.md C4")
     def test_C4_every_shipped_image_is_pinned_by_digest(self) -> None:

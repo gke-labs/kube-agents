@@ -130,6 +130,10 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_broker_split.go",
         ("buildCredentialBrokerTokenReviewRole", "tokenreviews"),
     ),
+    "manifest_helpers_go": Source(
+        "k8s-operator/internal/controller/manifest_helpers.go",
+        ("DefaultPlatformAgentVersion",),
+    ),
     "operator_clusterrole": Source(
         # The second anchor was "resourceNames", proving the bind-to-view
         # restriction. #387 removed the bind rule outright — the operator no
