@@ -319,13 +319,17 @@ MUTATIONS: list[Mutation] = [
         "verb allowlist, with no resource-aware layer between them",
     ),
     Mutation(
-        "B4-fourth-contents-write-holder",
-        ".github/workflows/chart-release.yml",
+        # Originally aimed at chart-release.yml, which main has since deleted;
+        # the ghcr publisher has the identical permissions shape and the same
+        # story -- an image pusher quietly gaining the credential that can
+        # push to this repository.
+        "B4-extra-contents-write-holder",
+        ".github/workflows/docker-publish-ghcr.yml",
         ("      contents: read\n      packages: write\n",
          "      contents: write\n      packages: write\n"),
         "test_B4_contents_write_is_confined_to_the_release_path",
-        "give the chart publisher contents: write so it can cut a GitHub "
-        "release alongside the OCI push -- a fourth holder of the credential "
+        "give the ghcr image publisher contents: write so it can cut a GitHub "
+        "release alongside the OCI push -- an extra holder of the credential "
         "that can push to this repository, added in a one-word diff",
     ),
     Mutation(
