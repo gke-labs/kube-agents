@@ -561,6 +561,39 @@ def _gcloud_is_read_only(words: list[str]) -> bool:
                for length in range(1, longest + 1))
 
 
+def _dry_run_mode(argv: list[str]) -> str | None:
+    """The dry-run mode kubectl would actually use, or None if unreadable.
+
+    kubectl (pflag) resolves a repeated flag last-wins, so the value that
+    decides whether a command writes is the last ``--dry-run`` occurrence,
+    not the first or any. Two spellings are deliberately unreadable rather
+    than parsed: a bare ``--dry-run`` (whose default has differed across
+    releases) and the space-separated ``--dry-run server`` (whose value is a
+    separate token that a caller can reorder). A token that is being consumed
+    as some other flag's value is not a flag at all — ``--field-manager
+    --dry-run=server`` runs a real apply whose field manager is oddly named.
+    """
+    mode: str | None = None
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        name, separator, value = token.partition("=")
+        if name == "--dry-run":
+            if not separator:
+                return None
+            mode = value
+        elif token.startswith("-"):
+            # Any other bare flag is assumed to consume the next token. That
+            # over-consumes for booleans (`--server-side --dry-run=server`
+            # reads as unreadable rather than allowed), which is the safe
+            # direction: the alternative is enumerating every apply flag's
+            # arity and allowing a real write whenever the table falls behind
+            # a kubectl release.
+            index += 1
+        index += 1
+    return mode
+
+
 def _kubectl_verb_and_flag(argv: list[str]) -> tuple[tuple[str, ...] | None, str | None]:
     """The kubectl verb sequence, and the offending unknown flag if any.
 
@@ -881,14 +914,14 @@ def evaluate(argv: list[str]) -> Decision:
         # Unlike `diff` — excluded above because its server-side dry-run is
         # implicit and its failure under a read-only grant reads as breakage —
         # this form names its intent in the argv, and when RBAC refuses the
-        # dry-run the kubectl error itself is the recorded finding. Only the
-        # `=`-attached spelling counts: a bare `--dry-run` (client by
-        # default in some releases, none in others) stays refused.
-        if verb[:1] == ("apply",) and any(
-            token.partition("=")[0] == "--dry-run"
-            and token.partition("=")[2] in {"server", "client"}
-            for token in argv[1:]
-        ):
+        # dry-run the kubectl error itself is the recorded finding.
+        #
+        # `_dry_run_mode` is where the care lives: kubectl resolves repeated
+        # flags last-wins, so scanning for *any* allowed spelling would let
+        # `--dry-run=server --dry-run=none` write to the cluster through this
+        # branch. Exactly ("apply",) too: `apply set-last-applied` and
+        # `apply edit-last-applied` are writes that share the first word.
+        if verb == ("apply",) and _dry_run_mode(argv) in {"server", "client"}:
             return _ALLOWED
         return Decision(
             allowed=False,

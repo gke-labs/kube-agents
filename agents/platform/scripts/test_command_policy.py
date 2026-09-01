@@ -1020,6 +1020,20 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
              False, "explicit none"),
             (["kubectl", "apply", "--dry-run", "server", "-f", "cc.yaml"],
              False, "space-separated value"),
+            # kubectl resolves repeated flags last-wins: the trailing token is
+            # the one that decides whether the command writes.
+            (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=server",
+              "--dry-run=none"], False, "server then none"),
+            (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=none",
+              "--dry-run=server"], True, "none then server"),
+            # The allowed spelling is being consumed as --field-manager's
+            # value here, so the apply itself has no dry-run at all.
+            (["kubectl", "apply", "-f", "cc.yaml", "--field-manager",
+              "--dry-run=server"], False, "swallowed by a value flag"),
+            # Writes that share apply's first word must not inherit the
+            # carve-out.
+            (["kubectl", "apply", "set-last-applied", "--dry-run=server",
+              "-f", "cc.yaml"], False, "apply set-last-applied"),
         ):
             with self.subTest(desc=desc):
                 self.assertEqual(evaluate(argv).allowed, allowed, desc)
