@@ -495,6 +495,50 @@ type SecuritySpec struct {
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
 
+	// ScopedServiceAccounts maps each GKE cluster the agent may read to the
+	// Google service account that reads it. The credential broker mints a
+	// short-lived token for the account a request's cluster maps to, instead of
+	// using the agent's own identity — which, holding a project-level
+	// roles/container.viewer, can read objects in every cluster in the project.
+	//
+	// Each account is provisioned by Terraform, never by this operator. A
+	// controller must not grant authority beyond its requester's, and minting
+	// cloud principals inside the loop that is supposed to bound the agent
+	// would put the grant on the wrong side of that boundary.
+	//
+	// As of 2026-08-12 the accounts hold no IAM grant. They were scoped by an
+	// IAM Condition on the cluster's resource.name, and that was measured to
+	// grant nothing for Kubernetes object operations; removing the condition
+	// without removing the grant would have given every account project-wide
+	// container.viewer. Authority arrives with per-cluster RBAC, and until it
+	// does the pool is off by default.
+	//
+	// A cluster absent from this list is REFUSED, not served by a wider
+	// credential. That is the point of the field, and it is also the first thing
+	// an operator will hit: adding a cluster to the fleet without adding it here
+	// produces a refusal naming the missing scope.
+	//
+	// Leaving the list empty keeps the previous behaviour — one identity for
+	// every cluster — and renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the
+	// mode a deployment is in can be read off the Deployment rather than
+	// inferred from what is absent.
+	//
+	// Keyed on the cluster tuple by the API server, so a repeated cluster is
+	// rejected at admission. Without that a copy-pasted entry whose clusterName
+	// was never changed is admitted, reconciles, changes the ConfigMap hash and
+	// rolls the broker — which then refuses to start, because the broker will
+	// not resolve one cluster to two accounts by taking whichever came last.
+	// The failure is a crashloop with the cause several layers away, so it is
+	// worth catching in `kubectl apply`. Terraform's scoped_clusters already
+	// validates the same thing on its own path.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	ScopedServiceAccounts []ScopedServiceAccount `json:"scopedServiceAccounts,omitempty"`
+
 	// SplitCredentialBrokerPod moves the credential broker out of the agent Pod
 	// into a Deployment and Service of its own, so that a compromised agent no
 	// longer shares a network namespace with the process holding the cloud
@@ -547,6 +591,44 @@ type SecuritySpec struct {
 	// network in cleartext.
 	// +optional
 	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+}
+
+// ScopedServiceAccount binds one GKE cluster to the Google service account
+// permitted to read it.
+//
+// The three cluster fields are a tuple rather than a name because they compose
+// into the GKE resource name — projects/P/locations/L/clusters/C — which is the
+// key the credential broker looks the account up by, and the key Terraform
+// files the account under. Keying on the cluster name alone would let a second
+// project reusing a name be served by the first project's account.
+//
+// The patterns are the broker's own component regexes, which is the property
+// that matters: they are narrower than GKE's naming rules in places, and being
+// identical to what the broker will accept is what stops the API server
+// admitting an entry the broker then refuses. They are enforced here as well as
+// there because a separator or a quote in one of them would produce a key that
+// silently matches nothing.
+type ScopedServiceAccount struct {
+	// ProjectID is the project the cluster lives in, which need not be the
+	// project the agent runs in.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ProjectID string `json:"projectId"`
+
+	// Location is the cluster's region or zone.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	Location string `json:"location"`
+
+	// ClusterName is the GKE cluster's name.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ClusterName string `json:"clusterName"`
+
+	// ServiceAccountEmail is the account scoped to this cluster. Terraform's
+	// `scoped_service_accounts` output is the source of these values.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$`
+	ServiceAccountEmail string `json:"serviceAccountEmail"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

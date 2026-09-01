@@ -463,6 +463,7 @@ data:
         {"id":"github.repo-administration","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:secret|variable)\\b(?:\\s+\\S+)*?\\s+(?:set|delete|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+repo\\b(?:\\s+\\S+)*?\\s+(?:delete|archive|edit)\\b"}
       ]
     }
+  scoped-sa-pool.json: '{"version":1,"serviceAccounts":[{"projectId":"example-project","location":"us-central1-a","clusterName":"cluster-a","serviceAccountEmail":"ka-cluster-a-1a2b3c4d@example-project.iam.gserviceaccount.com"},{"projectId":"example-project","location":"us-central1-a","clusterName":"cluster-b","serviceAccountEmail":"ka-cluster-b-7d2f91a0@example-project.iam.gserviceaccount.com"},{"projectId":"other-project","location":"europe-west1","clusterName":"cluster-a","serviceAccountEmail":"ka-cluster-a-3e8b04c5@other-project.iam.gserviceaccount.com"}]}'
 kind: ConfigMap
 metadata:
   labels:
@@ -813,7 +814,9 @@ spec:
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
             - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
-              value: "0"
+              value: "1"
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE
+              value: /etc/credential-proxy/scoped-sa-pool.json
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
@@ -874,7 +877,6 @@ spec:
                 - http://127.0.0.1:8765/healthz
             initialDelaySeconds: 5
             periodSeconds: 15
-          restartPolicy: Always
           resources:
             limits:
               cpu: "2"
@@ -883,6 +885,7 @@ spec:
             requests:
               cpu: 150m
               memory: 384Mi
+          restartPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -912,6 +915,10 @@ spec:
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /etc/credential-proxy/scoped-sa-pool.json
+              name: credential-proxy-policy
+              readOnly: true
+              subPath: scoped-sa-pool.json
       securityContext:
         fsGroup: 10000
         runAsGroup: 10000
