@@ -844,9 +844,21 @@ print(m.group(1).strip('\'\"') if m else '')
 # measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
 # nothing to main's side of the aggregate. Screening replaces it.
 #
-# agent-kanban-smoke is deliberately NOT named: it has redded pull requests it
-# has nothing to do with, and un-arming it is half the point of the change.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
+# This roster is what blocks a pull request once the Prow job stops being
+# optional, so membership is earned, not aspirational: a case is named here
+# when its recent record shows failures only on its own regressions or on
+# infra classes the harness already excludes from the verdict. Cases left
+# off (compliance-rbac-overgrant, capacity-pinned-pool-probe,
+# cluster-agent-crashloop-debug, cluster-agent-healthy-workload-no-finding,
+# rca-remediation-pr, autoops-warning-event-triage) still run and report;
+# they just cannot red the PR while their known issues are open. Demoting a
+# case that turns flaky is a one-line edit to this list -- this file, not
+# the Prow config, is deliberately the fast lever.
+#
+# agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
+# SRE question graded on kanban_create plus cluster names); the reds that
+# once argued for un-arming it belonged to the old vocabulary check.
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis,reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
