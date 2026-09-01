@@ -156,6 +156,24 @@ class TestReadOnlyProfile(unittest.TestCase):
         # No write guidance leaks in from the writable prompt.
         self.assertNotIn("memory_retain", block, block)
 
+    def test_the_prompt_names_the_nomination_channel(self):
+        """A read-only specialist is still the agent that discovers durable facts.
+        The prompt has to say where one goes, or "you cannot write" reads as "throw
+        it away" — and the corpus stays empty of anything a card ever learned."""
+        p, _ = provider(read_only=True)
+        block = p.system_prompt_block()
+        self.assertIn("memory_candidates", block, block)
+        # A nomination, not a write. The person on the other end of the card decides.
+        self.assertIn("does not record", block, block)
+        # The two exclusions travel with it, or the channel becomes a pipe for stale
+        # cluster state — see SHARED_SCOPE_TEST for the same pair.
+        self.assertIn("live state", block, block)
+        self.assertIn("conclusion about the task in hand", block, block)
+        # A run with no card still has the result block; the prompt must not make
+        # the card the only route, or a cron finding has nowhere to go.
+        self.assertIn("Worth remembering", block, block)
+        self.assertIn("no card", block, block)
+
     def test_read_only_defaults_off_and_is_read_from_the_profile_config(self):
         """A profile that says nothing keeps its write tools; a broken config too."""
         read = kube_agents_memory.memory_is_read_only

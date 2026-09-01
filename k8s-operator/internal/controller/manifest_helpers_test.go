@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 
@@ -213,6 +215,101 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 			}
 			if strategy.Type != tt.expectedStrategy {
 				t.Errorf("expected strategy %s, got %s", tt.expectedStrategy, strategy.Type)
+			}
+		})
+	}
+}
+
+// TestRollingUpdateAlwaysAllowsProgressUnderAQuota pins the invariant #749 is
+// about: a RollingUpdate whose maxUnavailable resolves to 0 makes the surge Pod
+// mandatory, so under a namespace ResourceQuota with no room for one more
+// gateway Pod the old ReplicaSet cannot shrink, the surge Pod is refused with
+// FailedCreate, and the rollout stalls until progressDeadlineSeconds.
+//
+// The regression this stops is subtle enough to be worth a test of its own: a
+// maxUnavailable expressed as a percentage is rounded DOWN by Kubernetes while
+// maxSurge is rounded up, so the obvious-looking "25%" on both sides resolved to
+// maxSurge 1 / maxUnavailable 0 at 2 and 3 replicas and rolled at no replica
+// count a user is likely to pick first.
+func TestRollingUpdateAlwaysAllowsProgressUnderAQuota(t *testing.T) {
+	// 8 is the row that checks neither fencepost was flattened to a constant:
+	// it is the only one where both expectations (2 and 2) differ from what a
+	// hard-coded 1 would give. 4 is kept as the boundary where the percentage
+	// first resolves on its own, but it cannot tell the two implementations
+	// apart.
+	for _, tc := range []struct {
+		replicas               int32
+		expectedMaxUnavailable int32
+		expectedMaxSurge       int32
+	}{
+		{replicas: 2, expectedMaxUnavailable: 1, expectedMaxSurge: 1},
+		{replicas: 3, expectedMaxUnavailable: 1, expectedMaxSurge: 1},
+		{replicas: 4, expectedMaxUnavailable: 1, expectedMaxSurge: 1},
+		{replicas: 8, expectedMaxUnavailable: 2, expectedMaxSurge: 2},
+	} {
+		t.Run(fmt.Sprintf("replicas=%d", tc.replicas), func(t *testing.T) {
+			_, strategy := resolveDeploymentReplicasAndStrategy(&agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(tc.replicas)},
+			})
+
+			if strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+				t.Fatalf("expected RollingUpdate at %d replicas, got %s", tc.replicas, strategy.Type)
+			}
+			// Checked rather than assumed: a RollingUpdate strategy with a nil
+			// RollingUpdate block would otherwise panic the whole package here
+			// instead of failing this one subtest.
+			if strategy.RollingUpdate == nil {
+				t.Fatalf("RollingUpdate strategy at %d replicas carries no RollingUpdate block", tc.replicas)
+			}
+			maxUnavailable := strategy.RollingUpdate.MaxUnavailable
+
+			// The other half of the invariant, and the half the rounding
+			// asymmetry rests on: maxSurge stays a percentage because
+			// Kubernetes rounds it UP, so it is never 0 and never needs a
+			// floor. Asserting only maxUnavailable would leave the claim in
+			// this test's own doc comment unverified on the side that makes it
+			// safe to leave alone.
+			maxSurge := strategy.RollingUpdate.MaxSurge
+			if maxSurge == nil {
+				t.Fatalf("maxSurge is unset at %d replicas", tc.replicas)
+			}
+			// The percentage itself, not just what it resolves to. Swapping
+			// maxSurge to an absolute count still satisfies the arithmetic
+			// below at every row in this table while silently flattening the
+			// surge at replica counts the table does not reach.
+			if maxSurge.Type != intstr.String {
+				t.Errorf("maxSurge must stay a percentage, got the absolute count %d — "+
+					"rounding up is what keeps it off 0, so it needs no floor and "+
+					"should not be pinned (#749)", maxSurge.IntVal)
+			}
+			scaledSurge, err := intstr.GetScaledValueFromIntOrPercent(maxSurge, int(tc.replicas), true)
+			if err != nil {
+				t.Fatalf("maxSurge %q at %d replicas does not scale: %v", maxSurge.String(), tc.replicas, err)
+			}
+			if scaledSurge < 1 {
+				t.Errorf("maxSurge %q resolved to %d at %d replicas; with maxUnavailable floored at 1 "+
+					"this is still progress, but the surge Pod the quota argument assumes is gone (#749)",
+					maxSurge.String(), scaledSurge, tc.replicas)
+			}
+			if int32(scaledSurge) != tc.expectedMaxSurge { // #nosec G115 -- bounded by replicas
+				t.Errorf("expected maxSurge to resolve to %d at %d replicas, got %d",
+					tc.expectedMaxSurge, tc.replicas, scaledSurge)
+			}
+
+			// An absolute count, not a percentage. A percentage here is the bug:
+			// it reintroduces the rounding this test exists to prevent.
+			if maxUnavailable.Type != intstr.Int {
+				t.Fatalf("maxUnavailable must be an absolute count, not %q — a percentage "+
+					"rounds down and can resolve to 0 (#749)", maxUnavailable.StrVal)
+			}
+			if maxUnavailable.IntVal < 1 {
+				t.Errorf("maxUnavailable resolved to %d at %d replicas; a rollout cannot "+
+					"make progress under a full namespace quota (#749)",
+					maxUnavailable.IntVal, tc.replicas)
+			}
+			if maxUnavailable.IntVal != tc.expectedMaxUnavailable {
+				t.Errorf("expected maxUnavailable %d at %d replicas, got %d",
+					tc.expectedMaxUnavailable, tc.replicas, maxUnavailable.IntVal)
 			}
 		})
 	}

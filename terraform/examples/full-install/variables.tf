@@ -90,14 +90,21 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+# With one bundle left, this no longer selects between bundles: `read-only` takes
+# local.read_only_roles and `custom` requires project_roles, which wins on its own.
+# It stays because it is still load-bearing in two places — installer_common.sh
+# writes it into every generated terraform.tfvars, so removing the variable would
+# fail every installer-driven apply on an unsupported argument, and outputs.tf
+# preconditions on it to catch `custom` with no roles named. It is also the gate
+# that refuses a configuration still asking for the removed admin bundle.
 variable "permission_set" {
-  description = "Which GCP IAM role bundle the agent's service account gets: read-only, gke-admin, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
+  description = "Which GCP IAM role bundle the agent's service account gets: read-only, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
   type        = string
   default     = "read-only"
 
   validation {
-    condition     = contains(["read-only", "gke-admin", "custom"], var.permission_set)
-    error_message = "permission_set must be one of read-only, gke-admin, or custom."
+    condition     = contains(["read-only", "custom"], var.permission_set)
+    error_message = "permission_set must be one of read-only or custom. The gke-admin bundle was removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and the container.clusters.impersonate it carries applies to every cluster in the project. Name the roles you need in project_roles instead."
   }
 }
 

@@ -1,0 +1,217 @@
+name: "Shared: Deploy Environment"
+
+permissions:
+  contents: read
+
+on:
+  #checkov:skip=CKV_GHA_7:Standalone launch requires the candidate tag or commit SHA and the environment to build
+  workflow_dispatch:
+    inputs:
+      github_environment:
+        description: "GitHub environment supplying the GCP project, region and cluster"
+        required: true
+        type: choice
+        options:
+          - "rc"
+          - "nightly"
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA (Mandatory for standalone launch)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      # The GitHub Actions environment, and nothing else: it renders straight
+      # into the job's `environment:` key below, and its values are `rc` and
+      # `nightly`. Named for what it is rather than `target_environment`, because
+      # the E2E workflows select a set of test files with a value drawn from the
+      # same two words — that input is `test_suite` for the same reason.
+      #
+      # required, with NO default. A `default: rc` would mean a nightly caller
+      # that omits the input silently tears down and rebuilds the RC
+      # environment, which is the one failure mode worth making impossible. The
+      # cost is an explicit argument at each call site.
+      github_environment:
+        description: "GitHub environment supplying the GCP project, region and cluster"
+        required: true
+        type: string
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA"
+        required: true
+        type: string
+    secrets:
+      GEMINI_API_KEY:
+        description: "Gemini API Key"
+        required: true
+
+jobs:
+  deploy-environment:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    # One lock per environment, derived from the same input. `rc` still yields
+    # `rc-environment`, so the RC pipeline's serialisation is unchanged, and the
+    # nightly pipeline takes `nightly-environment` instead of contending for a
+    # cluster it does not deploy to.
+    concurrency:
+      group: ${{ inputs.github_environment }}-environment
+      cancel-in-progress: false
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CLOUDSDK_PYTHON: "/usr/bin/python3"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Commit SHA from Release Tag
+        id: resolve_target
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      # This replaces the workspace with the candidate's tree, so every script
+      # below runs the candidate's copy rather than this workflow's. The workflow
+      # YAML itself still comes from the caller's ref — a local `uses:` resolves
+      # there — which is why the provisioning step has to cope with a candidate
+      # whose scripts predate a rename.
+      - name: Checkout repository at exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve_target.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Validate & Log Deployment Configuration Summary
+        env:
+          RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}
+          COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
+          IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
+          GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
+          MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
+          USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+        run: ./scripts/release/validate_and_log_deploy_summary.sh
+
+      - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-operator/go.mod"
+          cache-dependency-path: "k8s-operator/go.sum"
+
+      # The teardown half of the step below needs this. install.sh auto-installs
+      # terraform, but only once it is already running — uninstall.sh installs
+      # nothing and refuses without it, so before this step existed the RC
+      # teardown failed on every run and the pipeline reinstalled over the
+      # surviving environment.
+      #
+      # terraform_wrapper: false is load-bearing. The wrapper replaces terraform
+      # with a script that re-prints stdout and stderr for its outputs, and
+      # lifecycle.sh reads terraform's stdout directly — `terraform console` for
+      # resolved variables and `terraform state list` for what exists. Left on,
+      # those captures pick up the wrapper's copy as well as the real output.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Provision Environment in GCP
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
+          GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
+          MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
+          USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+          # The GitOps repository the agent targets, and the one the token minter
+          # scopes its tokens to. Deliberately NOT vars.GH_ORG/vars.GH_REPO: that
+          # pair names the RELEASE repository, so reusing it here would scope a
+          # live GitHub App token at this repository. GITOPS_REPO is bare —
+          # installer_common.sh composes "${GITHUB_ORG}/${GITHUB_REPO}".
+          #
+          # These three and GITHUB_APP_ID must all be set before the minter is
+          # provisioned at all (write_tfvars_from_state's three-way guard); with
+          # any empty, the install is byte-identical to one without a minter. The
+          # pair must also match what the E2E suite probes, since a token minted
+          # for one repository does not authenticate against another — which is
+          # why e2e-run.yml reads the same two variables rather than
+          # tests/e2e/e2e_config.yaml pinning them.
+          GITHUB_ORG: ${{ vars.GITOPS_ORG }}
+          GITHUB_REPO: ${{ vars.GITOPS_REPO }}
+          GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
+          # Optional, and the lesser of the two routes. Importing the App's private
+          # key into the minter's KMS key by hand is the better one: the key ring
+          # survives every teardown, so the import is a one-off and the signing
+          # material never enters Actions. This is the bootstrap path — set it and
+          # provision_environment.sh writes it to a private temporary file,
+          # because install.sh takes a path (GITHUB_PEM_PATH) and never a value.
+          # Either way the import is skipped once the key has an enabled version.
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          # Unset (the default) reports a failed teardown as an annotation and a
+          # job-summary entry and provisions on top of whatever survived; truthy
+          # makes it a hard stop. Whether a candidate validated against stale
+          # state or a blocked release is the worse outcome changes week to week,
+          # so it is a variable rather than a constant.
+          #
+          # Set it on each GitHub environment this workflow is called with,
+          # alongside GCP_PROJECT_ID and the rest. `vars` resolves environment
+          # over repository over organization, so a repository-level one also
+          # works and is the easier of the two to set by accident.
+          TEARDOWN_STRICT: ${{ vars.TEARDOWN_STRICT }}
+        # provision_environment.sh is this change's name for what candidates up
+        # to and including rc_2608310656_cf038a2_validated carry as
+        # provision_rc_environment.sh. get_latest_validated_rc_tag has no recency
+        # window, so the nightly pipeline resolves one of those until the RC
+        # pipeline validates a post-merge commit — and calling the new name in
+        # that tree aborts with "No such file or directory". The old script reads
+        # strictness under the old variable name only.
+        #
+        # Delete this fallback once no rc_*_validated tag predates the rename.
+        run: |
+          if [ -f ./scripts/release/provision_environment.sh ]; then
+            ./scripts/release/provision_environment.sh
+          else
+            echo "==> Candidate predates the provision_environment.sh rename; running provision_rc_environment.sh."
+            RC_TEARDOWN_STRICT="${TEARDOWN_STRICT}" ./scripts/release/provision_rc_environment.sh
+          fi

@@ -24,6 +24,10 @@ C_RED="\033[1;31m"
 C_BOLD="\033[1m"
 C_RESET="\033[0m"
 
+# Sourced/baked release version. On developer checkouts (main), this is empty.
+# Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
+BAKED_RELEASE_VERSION=""
+
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
 PARAM_NON_INTERACTIVE="false"
@@ -31,7 +35,7 @@ PARAM_DRY_RUN="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
-PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
+PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
 TEMP_REPO_DIR=""
 
 cleanup() {
@@ -208,6 +212,12 @@ verify_local_source_ref() {
   local expected_ref="$2"
 
   if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # In official stamped release archives (unpacked tarball/zip outside Git),
+    # BAKED_RELEASE_VERSION is stamped during release automation.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      print_success "Verified upgrade sources match baked official release ${BAKED_RELEASE_VERSION}."
+      return 0
+    fi
     if [ "$PARAM_DRY_RUN" = "true" ]; then
       print_warning "Dry-run cannot verify source/image alignment because '$repo_dir' is not a Git worktree."
       return 0

@@ -1,0 +1,91 @@
+name: "RC: Scheduler"
+
+# Holds the RC pipeline's cron one level up, so a three-hourly tick with nothing
+# to do produces no pipeline run at all.
+#
+# The pipeline used to make that decision itself, and a run that skipped every
+# job concluded success — skipped jobs do not fail a run. Since skips are the
+# common case, three quiet hours after a genuine failure painted the pipeline
+# green while the last run that did anything was still red. Gating at the trigger
+# leaves the pipeline with no skip path, so its conclusion means what it says.
+#
+# This job's own conclusion does not: it is green when it dispatched and green
+# when it decided not to. What it decided is in the job summary.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  # Dispatchable so the decision can be exercised by hand without waiting for a
+  # tick. It takes no inputs: the whole job is "work out whether there is
+  # anything to do", and a manual run that overrode that would be testing
+  # something else. To force a specific candidate through, dispatch
+  # rc-release-pipeline.yml directly — it still accepts commit_sha and rc_tag.
+  workflow_dispatch:
+
+concurrency:
+  group: rc-scheduler
+  cancel-in-progress: false
+
+jobs:
+  dispatch-if-there-is-work:
+    name: Dispatch the RC pipeline if a new candidate exists
+    # A fork inherits the cron but none of the credentials. The guard is on the
+    # job rather than trusted to cascade, matching every other scheduled
+    # workflow here.
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    # `rc` for GH_ORG, GH_REPO and REGISTRY_PREFIX, which is what decides where
+    # find_latest_built_commit looks for prebuilt images. Reading them from a
+    # different scope than the pipeline does would let this job resolve a
+    # candidate against one registry and the pipeline install from another.
+    environment: rc
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # For the dispatch step below. `workflow_dispatch` is one of the two events
+      # GitHub exempts from the recursion suppression that would otherwise stop
+      # the default token starting another run.
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The resolver reads the tag graph to decide whether this commit has
+          # already been attempted or validated, so a shallow clone would answer
+          # "no such tag" and re-run a candidate every three hours.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The same script, with the same inputs, that rc-create-tag.yml runs. That
+      # is the point: the skip decision has one implementation, so the gate that
+      # starts the pipeline and the gate inside it cannot drift into disagreeing
+      # about what a new candidate is.
+      - name: Resolve the newest candidate and decide whether to run
+        id: resolve
+        env:
+          IS_SCHEDULED: "true"
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      - name: Record that there is nothing to do
+        if: steps.resolve.outputs.skip_rc == 'true'
+        env:
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+        run: ./scripts/release/record_rc_scheduler_skip.sh
+
+      # GITHUB_TOKEN rather than the PAT nightly-pipeline.yml's step 4 needs.
+      # This step is the only thing that starts the RC pipeline, so whatever it
+      # depends on is a single point of failure, and the default token needs no
+      # secret to be present and cannot expire.
+      - name: Dispatch the release pipeline
+        if: steps.resolve.outputs.skip_rc != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+          RC_TAG: ${{ steps.resolve.outputs.rc_tag }}
+        run: ./scripts/release/dispatch_rc_pipeline.sh

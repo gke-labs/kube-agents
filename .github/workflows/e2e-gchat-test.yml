@@ -1,4 +1,4 @@
-name: Google Chat Agent E2E Test
+name: "E2E: Google Chat Agent"
 
 on:
   #checkov:skip=CKV_GHA_7:Manual E2E test dispatch requires target GCP project and chat space parameters
@@ -62,7 +62,8 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
+          # No credentials_json fallback: GCP_SA_KEY is set at no scope, so it
+          # only ever resolved to an empty string. WIF is the auth path.
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER || inputs.workload_identity_provider || 'projects/1020703904916/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider' }}
           service_account: ${{ secrets.GCP_WIF_SA_EMAIL || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
 

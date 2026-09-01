@@ -3,7 +3,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
 
 COMMIT_SHA="${1:-${COMMIT_SHA:-}}"
 RC_TAG="${2:-${RC_TAG:-}}"
@@ -13,10 +12,6 @@ if [ -z "${COMMIT_SHA}" ] || [ -z "${RC_TAG}" ]; then
   exit 1
 fi
 
-echo "======================================================================"
-echo "🏷️ CREATING AND PUSHING RELEASE CANDIDATE GIT TAG"
-echo "Commit SHA:   ${COMMIT_SHA}"
-echo "Release Tag:  ${RC_TAG}"
-echo "======================================================================"
-
-ensure_git_tag "${RC_TAG}" "${COMMIT_SHA}" "Release Candidate ${RC_TAG} for commit ${COMMIT_SHA}"
+exec "${SCRIPT_DIR}/tag_commit.sh" \
+  --title "CREATING AND PUSHING RELEASE CANDIDATE GIT TAG" \
+  "${RC_TAG}" "${COMMIT_SHA}" "Release Candidate ${RC_TAG} for commit ${COMMIT_SHA}"

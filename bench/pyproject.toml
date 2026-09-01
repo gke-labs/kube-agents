@@ -16,7 +16,19 @@ dependencies = [
     # this harness requires, plus #47's deterministic verification -- the
     # `resource_property` verifier the upstream tasks score with.
     "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@4670d76dcc497e8f515d51c2bb6bad6ced7100b6",
+    # Runtime, not test-only, since `bench-gate` landed: the gate parses
+    # task.yaml itself (kube_agents_bench/cases.py) to decide a case's
+    # deployer, whether it declares checks, and whether it is expected-fail.
+    # The HARNESS still never parses one -- devops-bench has already done that
+    # by the time it is called -- so the `dev` group's note below still holds
+    # for the reason it was written.
+    "pyyaml>=6.0",
 ]
+
+# The presubmit's verdict, so `hack/ci-eval-pr.sh` can call a tested module
+# instead of an inline `python3 -c` heredoc.
+[project.scripts]
+bench-gate = "kube_agents_bench.gate:main"
 
 # The sole registration path. devops-bench scans this group lazily on the first
 # unresolved agent lookup, so `devops-bench --agent-type kubeagents` works with

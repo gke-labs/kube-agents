@@ -877,7 +877,6 @@ spec:
                 - http://127.0.0.1:8765/healthz
             initialDelaySeconds: 5
             periodSeconds: 15
-          restartPolicy: Always
           resources:
             limits:
               cpu: "2"
@@ -886,6 +885,7 @@ spec:
             requests:
               cpu: 150m
               memory: 384Mi
+          restartPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1108,8 +1108,6 @@ spec:
     - ports:
         - port: 80
           protocol: TCP
-        - port: 8080
-          protocol: TCP
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
@@ -1179,6 +1177,14 @@ spec:
         - podSelector:
             matchLabels:
               app: github-token-minter
+    - ports:
+        - port: 8888
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+              app.kubernetes.io/name: hindsight
   ingress:
     - from:
         - podSelector: {}

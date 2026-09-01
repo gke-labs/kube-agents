@@ -78,8 +78,10 @@ same PVC, and has no scheduler of its own — never reaches the step that calls 
 ``getDefaultStorageConfig`` switches the data PVC to ReadWriteMany on
 ``standard-rwx``, and ``useStatefulSet`` stays false without custom ReadWriteOnce
 storage, so it is several pods against one PVC rather than one volume each. A
-rolling update then runs this in a new pod while old pods are still up
-(``maxUnavailable`` is 25%, which rounds down to 0 of 2).
+rolling update then runs this in a new pod while an old pod is still up
+(``maxSurge`` is 25%, which rounds up to 1 of 2, so a new pod is admitted
+before the last old one is gone; ``maxUnavailable`` is an absolute 1, so one
+old pod also stays while it starts).
 
 What that costs is bounded but real, and stating it precisely matters more than
 naming a mechanism:

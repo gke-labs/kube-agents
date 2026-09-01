@@ -27,9 +27,15 @@ documentation and governance playbooks around them.
    avoiding a separate module-registry backend.
 3. **RC pipeline feeds SemVer promotion.** Pre-release validation keeps using RC tags
    (`rc_YYMMDDHHMM_<short_sha>`, `*_validated` on success — see `scripts/release/README.md`).
-   The validated commit is then promoted and tagged `MAJOR.MINOR.PATCH` via `release-publish.yml`,
-   which orchestrates clean image promotion and chart publication.
-4. **The operator defaults to its own release version.** When a `PlatformAgent` CR omits
+4. **GA release pipeline creates stamped release child commit.** When promoting a validated
+   candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD
+   (baking `BAKED_RELEASE_VERSION` into installer scripts), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`),
+   and orchestrates clean image promotion and chart publication. Because the GA tag points at this
+   stamped child commit outside `main`, `git log main` does not show the release commit and
+   `git describe --tags` on `main` does not resolve to the GA tag (which is why `default_image_tag`
+   matches numeric SemVer tags explicitly). Git tag resolution for Terraform module consumption
+   (`?ref=X.Y.Z`) remains unaffected.
+5. **The operator defaults to its own release version.** When a `PlatformAgent` CR omits
    `spec.deployment.image`, the operator dynamically derives the matching versioned agent image
    from its own container image at runtime (or via `OPERATOR_IMAGE` env var). Precedence:
    CR spec > `PLATFORM_AGENT_IMAGE` env > `OPERATOR_IMAGE` (dynamic runtime derivation) > `latest` fallback.

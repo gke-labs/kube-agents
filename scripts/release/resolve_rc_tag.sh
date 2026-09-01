@@ -18,15 +18,7 @@ if [ -n "${COMMIT_INPUT}" ]; then
     exit 1
   fi
 elif [ -n "${RC_TAG}" ]; then
-  target_repo="$(get_target_repo)"
-
-  if is_ci_pipeline; then
-    if [ -n "${target_repo}" ]; then
-      git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || true
-    else
-      git fetch --tags >/dev/null 2>&1 || true
-    fi
-  fi
+  release_fetch_tags
 
   if ! COMMIT_SHA=$(git rev-parse --verify "${RC_TAG}^{commit}" 2>/dev/null); then
     echo "❌ ERROR: Cannot resolve valid Git commit SHA from release tag '${RC_TAG}'!" >&2
@@ -38,8 +30,8 @@ elif [ "${IS_SCHEDULED}" = "true" ]; then
     exit 1
   fi
 
-  if is_commit_already_validated "${COMMIT_SHA}"; then
-    echo "ℹ️ Latest built commit ${COMMIT_SHA:0:7} is already validated (*_validated). Skipping redundant RC run." >&2
+  if is_rc_candidate_commit_already_validated "${COMMIT_SHA}"; then
+    echo "ℹ️ Latest built commit ${COMMIT_SHA:0:7} is already validated (rc_*_validated). Skipping redundant RC run." >&2
     SKIP_RC="true"
   elif is_commit_already_attempted "${COMMIT_SHA}"; then
     echo "ℹ️ Latest built commit ${COMMIT_SHA:0:7} has already been evaluated in a previous RC pipeline run. Skipping redundant RC run." >&2

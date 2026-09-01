@@ -71,6 +71,41 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         self.assertEqual(proc.returncode, 0, f"Piped execution failed: {proc.stderr}")
         self.assertIn(UPGRADER_HELP_BANNER, proc.stdout)
 
+    def test_verify_local_source_ref_accepts_baked_release_in_non_git_dir(self):
+        """Verifies verify_local_source_ref succeeds for unpacked release archive without Git repository."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="unpacked-upgrade-") as outer_dir:
+            archive_dir = pathlib.Path(outer_dir) / "kube-agents-0.2.0"
+            archive_dir.mkdir(parents=True)
+
+            cmd = f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{archive_dir}" "0.2.0"'
+            proc = self._run_upgrade_func(cmd, cwd=archive_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Verified upgrade sources match baked official release 0.2.0", proc.stdout)
+
+    def test_verify_local_source_ref_in_git_worktree_enforces_git_alignment(self):
+        """Verifies verify_local_source_ref in upgrade.sh enforces clean git status in real git checkouts."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="git-upgrade-repo-") as repo_dir:
+            repo_path = pathlib.Path(repo_dir)
+            subprocess.run(["git", "init"], cwd=str(repo_path), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_path), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_path), check=True)
+            (repo_path / "file.txt").write_text("initial\n")
+            subprocess.run(["git", "add", "file.txt"], cwd=str(repo_path), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_path), check=True)
+            subprocess.run(["git", "tag", "0.2.0"], cwd=str(repo_path), check=True)
+
+            # Make checkout dirty
+            (repo_path / "file.txt").write_text("dirty uncommitted change\n")
+
+            cmd = f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"'
+            proc = self._run_upgrade_func(cmd, cwd=repo_path)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("dirty checkout", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

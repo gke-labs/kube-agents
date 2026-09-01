@@ -59,15 +59,23 @@ jobs:
         id: verify-eligibility
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
+          RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
           SKIP_RC_VALIDATION: ${{ inputs.skip_rc_validation }}
           EMERGENCY_OVERRIDE_REASON: ${{ inputs.emergency_override_reason }}
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: ./scripts/release/verify_release_eligibility.sh
 
+      - name: Create Git Tag
+        if: steps.verify-eligibility.outputs.skip_release != 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
+          RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: ./scripts/release/tag_ga_release.sh
+
       - name: Set up Docker Buildx
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GitHub Container Registry
         if: steps.verify-eligibility.outputs.skip_release != 'true'
@@ -80,7 +88,6 @@ jobs:
       - name: Promote Release Container Images
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
         run: ./scripts/release/promote_release_images.sh
 
@@ -104,23 +111,13 @@ jobs:
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           GH_USER: ${{ github.actor }}
         run: ./scripts/release/publish_helm_chart.sh
-
-      - name: Create Git Tag
-        if: steps.verify-eligibility.outputs.skip_release != 'true'
-        env:
-          RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: ./scripts/release/tag_ga_release.sh
 
       - name: Publish GitHub Release
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: ./scripts/release/publish_github_release.sh

@@ -1,5 +1,32 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
+# commented entry in hack/ci-eval-pr.sh TASKS). Its one run FAILED on
+# agent-endpoint HTTP 502s while its DELEGATED WORKER completed the sweep and
+# filed ledger issue #3 in gke-agentic/kube-agents-evals-3-infra — the
+# harness was deaf, the SOP worked, which is what pins the failure on
+# transport rather than this scenario. The audit shape budgets at 600-1300s
+# (bench/tasks/DRAFTS.md, the 2026-08-26 smoke run), so the upgrades domain
+# is covered in presubmit by upgrades-lagging-master-probe; this full sweep
+# is the SOP-fidelity version and activates with the nightly tier. It was
+# held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else -- its checks
+# read GKE control-plane versions through the ledger, so A5's
+# ambient-kubeconfig problem never touched it.
+#
+# A1 and A4 cleared together on 2026-08-25, when
+# GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
+# EVAL_GITHUB_APP_ID=4675512, which is the condition hack/ci-deploy.sh needs
+# before it renders githubMinter.enabled=true and passes
+# platformAgent.integration.github.gitRepo -- so the `Git Repo:` line of
+# /opt/data/SETTINGS.md finally names the leased project's throwaway
+# gke-agentic/kube-agents-evals*-infra repo instead of the literal None, and
+# `audit_report.py start` has a workspace to clone and a minter to clone it
+# with (A1). It also mounts secret kube-agents-bench-github-token as
+# BENCH_GITHUB_TOKEN, which is the credential the ledger_issue_contains
+# objectives below read the published ledger issue with (A4).
+#
+# The write path is proven for this very stream: the 2026-08-26 worker
+# minted, cloned and published issue #3. What has never happened is a run
+# where the harness heard the answer back — that is the transport failure
+# above, not a gap in this spec.
 #
 # Domain: upgrades (security-patch-orchestrator SOP). Journey: upgrade
 # readiness reports the versions and blockers it actually read.
@@ -17,7 +44,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1. Eligible tier: presubmit, once A1 is in place.
+# blocker A1, now closed. Eligible tier: presubmit, and active there
+# since 2026-08-25.
 #
 # The SOP has no vulnerability feed and forbids naming CVEs; a CVE id in the
 # report is an invention. That rule becomes an exact forbidden-phrase check.

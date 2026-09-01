@@ -308,11 +308,18 @@ vocabulary the installer's `--permission-set` flag uses):
 | `permission_set`      | Roles granted                                           |
 | --------------------- | ------------------------------------------------------- |
 | `read-only` (default) | `local.read_only_roles` in [`main.tf`](main.tf)         |
-| `gke-admin`           | `local.gke_admin_roles` in [`main.tf`](main.tf)         |
 | `custom`              | whatever `project_roles` lists — setting it is required |
 
-Both lists live in [`main.tf`](main.tf); read them there rather than from
-this page.
+There is no admin bundle. `roles/container.admin` authorizes the agent
+through IAM regardless of its Kubernetes RBAC, and the
+`container.clusters.impersonate` it carries applies to every cluster in the
+project, so it is not something a one-word setting should hand out; see
+[Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md).
+Widening access means naming the roles in `project_roles`, where the grant
+is explicit and reviewed.
+
+The list lives in [`main.tf`](main.tf); read it there rather than from this
+page.
 
 `project_roles` still wins when set, whatever `permission_set` says, so an
 existing configuration keeps the roles it had. `project_roles = []` grants

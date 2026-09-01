@@ -53,6 +53,10 @@ on_error() {
 }
 trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 
+# Sourced/baked release version. On developer checkouts (main), this is empty.
+# Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
+BAKED_RELEASE_VERSION=""
+
 # ─── Agentic & Automation Parameter States ────────────────────────────────────
 PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
 PARAM_DRY_RUN="${DRY_RUN:-false}"
@@ -62,8 +66,9 @@ PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
 # Only consulted when this run creates the cluster. Against one that already
 # exists the tfvars generator's live probe decides the shape; see
 # write_tfvars_from_state in k8s-operator/scripts/installer_common.sh. Empty
-# means "not chosen yet" — the interview asks, and settles on standard when
-# there is nobody to ask.
+# means "not chosen yet" — the interview asks, and falls back to
+# installer_common.sh's DEFAULT_CLUSTER_MODE when there is nobody to ask. The
+# shape is deliberately not named here: that table is the one home for it.
 PARAM_CLUSTER_MODE="${CLUSTER_MODE:-}"
 # Left empty on purpose: resolved from installer_common.sh's DEFAULT_* once
 # the installer helpers are sourced, so no default is spelled twice.
@@ -108,9 +113,12 @@ Flags for AI Agents & Automation:
   --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
   --cluster-mode=MODE           Shape of a cluster this run creates: autopilot | standard
-                                (default: standard). Autopilot clusters are regional, so
-                                --region must be a region. Ignored when installing onto a
-                                cluster that already exists — its live shape wins.
+                                (default: DEFAULT_CLUSTER_MODE, currently autopilot).
+                                Autopilot clusters are regional. Passing this flag with
+                                autopilot and a zonal --region is an error; leaving it
+                                unset at a zonal --region builds Standard instead.
+                                Ignored when installing onto a cluster that already
+                                exists — its live shape wins.
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
                                 (default: gemini)
   --model-default-name=NAME     Default model name for the provider
@@ -122,7 +130,7 @@ Flags for AI Agents & Automation:
   --anthropic-api-key=KEY       Anthropic API Key
   --gitops-org=ORG              GitHub Org/Username for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: gke-fleet-iac)
-  --permission-set=SET          Agent GCP IAM permission set: read-only | gke-admin | custom
+  --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
@@ -294,6 +302,33 @@ validate_immutable_ref() {
   fi
 }
 
+# Resolves the shape a run that CREATES a cluster will build, given what the
+# caller asked for ($1, may be empty) and the location ($2). Echoes the mode
+# and nothing else, so the caller can compare and explain.
+#
+# A function rather than an inline `:-` because this one line is what a bare
+# ./install.sh actually builds, and the inline form was untestable: install.sh
+# writes CLUSTER_MODE into vars.sh before the generator ever reads it, so
+# installer_common.sh's own fallback never decides anything for this front
+# door, and a test of that fallback proves nothing about this.
+resolve_creatable_cluster_mode() {
+  local requested="${1:-}" location="${2:-}"
+  if [ -n "$requested" ]; then
+    echo "$requested"
+    return 0
+  fi
+  # A defaulted Autopilot steps aside at a zonal location rather than failing:
+  # nobody asked for Autopilot here, and the alternative is an abort blaming
+  # --region for a shape the installer chose itself. An explicit
+  # --cluster-mode=autopilot still fails in require_creatable_cluster_mode —
+  # that request is impossible, not merely inconvenient.
+  if [ "${DEFAULT_CLUSTER_MODE}" = "autopilot" ] && ! location_is_region "$location"; then
+    echo "standard"
+    return 0
+  fi
+  echo "${DEFAULT_CLUSTER_MODE}"
+}
+
 # A cluster shape this install can create in this location. is_valid_cluster_mode
 # comes from installer_common.sh, so this runs after the workspace step.
 #
@@ -307,8 +342,9 @@ require_creatable_cluster_mode() {
     print_error "--cluster-mode must be either autopilot or standard (got '${mode}')."
     exit 1
   fi
-  if [ "$mode" = "autopilot" ] && [[ ! "$location" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]; then
+  if [ "$mode" = "autopilot" ] && ! location_is_region "$location"; then
     print_error "GKE Autopilot clusters are regional: --region must be a region such as us-central1, not '${location}'."
+    print_info "For a zonal cluster, pass --cluster-mode=standard."
     exit 1
   fi
 }
@@ -345,11 +381,16 @@ cluster_mode_label() {
 }
 
 # The image tag doubles as the source ref that verify_local_source_ref checks the
-# checkout against, so HEAD is the natural default: it is an immutable 40-character
-# SHA and it is exactly the revision of the scripts about to run. Empty when the
-# installer runs outside a Git worktree (curl | bash), where the caller must supply one.
+# checkout against. When downloaded as an official release via curl | bash, the baked
+# release tag takes precedence. In local Git checkouts, an exact SemVer release tag or
+# HEAD commit SHA is used as the default.
 default_image_tag() {
   local repo_dir="${1:-.}"
+  # 1. Baked release version takes precedence (for curl | bash from official release URLs)
+  if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+    echo "$BAKED_RELEASE_VERSION"
+    return 0
+  fi
   # Only a kube-agents checkout may supply the default. Without this guard,
   # running the curl | bash one-liner from inside any unrelated Git repository
   # would offer that repository's HEAD, which then fails at `git fetch` for a
@@ -357,6 +398,21 @@ default_image_tag() {
   if [ ! -f "${repo_dir}/k8s-operator/scripts/installer_common.sh" ]; then
     return 0
   fi
+  # 2. Check if local git repo is checked out at an exact SemVer release tag
+  local exact_tag=""
+  exact_tag="$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")"
+  if [[ "$exact_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    echo "$exact_tag"
+    return 0
+  fi
+  # 3. Check if running inside an unpacked release archive directory (e.g. kube-agents-0.1.0 or kube-agents-0.2.0)
+  local base_dir=""
+  base_dir="$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")"
+  if [[ "$base_dir" =~ ^kube-agents-([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  # 4. Fall back to local HEAD commit SHA for developer iterations
   git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo ""
 }
 
@@ -364,13 +420,20 @@ default_image_tag() {
 # it the way git does and say where it came from. Empty outside a Git worktree.
 default_image_tag_label() {
   local repo_dir="${1:-.}"
-  if [ ! -f "${repo_dir}/k8s-operator/scripts/installer_common.sh" ]; then
+  local tag
+  tag="$(default_image_tag "$repo_dir")"
+  if [ -z "$tag" ]; then
     return 0
   fi
-  local short=""
-  short="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo "")"
-  if [ -n "$short" ]; then
-    printf 'local HEAD checkout %s' "$short"
+
+  if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "$tag" = "$BAKED_RELEASE_VERSION" ]; then
+    printf 'official release %s' "$tag"
+  elif [ "$tag" = "$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")" ]; then
+    printf 'release tag %s' "$tag"
+  elif [[ "$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")" =~ ^kube-agents-${tag}$ ]]; then
+    printf 'release archive %s' "$tag"
+  else
+    printf 'local HEAD checkout %s' "${tag:0:7}"
   fi
 }
 
@@ -423,6 +486,13 @@ verify_local_source_ref() {
   fi
 
   if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # In official stamped release archives (unpacked tarball/zip outside Git),
+    # BAKED_RELEASE_VERSION is stamped during release automation.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
+      print_success "Verified install sources match baked official release ${BAKED_RELEASE_VERSION}."
+      return 0
+    fi
     if [ "$lenient" = "true" ]; then
       print_warning "Cannot verify source/image alignment because '$repo_dir' is not a Git worktree."
       SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
@@ -499,7 +569,11 @@ acquire_source_repo() {
     else
       print_info "Cloning kube-agents install sources at '$expected_ref' into $resolved_dir..."
       git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$resolved_dir"
-      git -C "$resolved_dir" fetch --depth=1 origin "$expected_ref"
+      if [[ "$expected_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        git -C "$resolved_dir" fetch --depth=1 https://github.com/gke-labs/kube-agents.git "$expected_ref"
+      else
+        git -C "$resolved_dir" fetch --depth=1 https://github.com/gke-labs/kube-agents.git "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
+      fi
       git -C "$resolved_dir" checkout --detach FETCH_HEAD
     fi
     cd "$resolved_dir"
@@ -511,8 +585,8 @@ acquire_source_repo() {
 # k8s-operator/scripts/installer_common.sh is the source of truth for install
 # defaults, validation rules, and the terraform.tfvars generator. The installer
 # sources it rather than keeping its own copies, which is how the two drifted
-# apart before (an installer menu defaulting to gke-admin against a read-only
-# default, a us-central1 default against us-east4, a second copy of
+# apart before (an installer menu whose permission-set default disagreed with
+# the provisioner's, a us-central1 default against us-east4, a second copy of
 # derive_kms_location).
 source_provisioning_helpers() {
   local repo_dir="$1"
@@ -947,7 +1021,16 @@ ensure_existing_cluster_cmek() {
 # postcondition backstops installs driven through bare Terraform.
 ensure_existing_cluster_workload_identity() {
   local project_id="$1" cluster_name="$2" region="$3"
-  local pool
+  local pool is_autopilot
+
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null) || is_autopilot="false"
+  if [ "$is_autopilot" = "True" ]; then
+    print_success "Existing cluster '$cluster_name' is GKE Autopilot (Workload Identity enabled natively)."
+    return 0
+  fi
+
   # `trap - ERR` inside the substitution: bash 3.2 (macOS's default, the
   # curl|bash audience) runs the inherited ERR trap in the subshell even
   # though the outer failure is handled, printing a spurious abort banner
@@ -975,10 +1058,10 @@ ensure_existing_cluster_workload_identity() {
     gcloud container node-pools update "$legacy_pool" \
       --cluster="$cluster_name" --location="$region" --project="$project_id" \
       --workload-metadata=GKE_METADATA --quiet
-  done < <(gcloud container node-pools list --cluster="$cluster_name" \
+  done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
       --location="$region" --project="$project_id" \
       --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
-    | awk -F',' '$2 != "GKE_METADATA" {print $1}')
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
 }
 
 # NetworkPolicy enforcement on a pre-existing cluster is the third such
@@ -1104,10 +1187,56 @@ import_github_pem() {
   # after a destroy.
   print_info "Ensuring the minter's KMS keyring and import-only signing key exist..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+
+  # Both creates keep their errors instead of discarding them. Re-running the
+  # installer is the common case and "already exists" is the expected answer to
+  # it, so the output is only surfaced when the resource is missing afterwards —
+  # which is the check that actually matters. Discarding stderr outright is what
+  # hid the bug below; tolerating one specific error would still have hidden a
+  # permission denial, a disabled API or a quota refusal, all of which end the
+  # same way: no key, and an import that fails against something that is not there.
+  #
+  # `trap - ERR` inside each substitution, for the reason spelled out at the
+  # Workload Identity probe above: bash 3.2 runs the inherited ERR trap in the
+  # subshell even though `|| true` handles the failure, so a re-run — where
+  # "already exists" is the expected answer — would print two fatal-looking
+  # abort banners and leave a FAILED install report behind mid-run.
+  local kms_ring_err="" kms_key_err=""
+  kms_ring_err="$(trap - ERR; gcloud kms keyrings create "$keyring" --location="$kms_location" \
+    --project="$project_id" 2>&1)" || true
+
+  # --skip-initial-version-creation is required, not optional: KMS answers
+  # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
+  # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
+  # which is where the key normally comes from.
+  kms_key_err="$(trap - ERR; gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
     --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --import-only --protection-level=software --project="$project_id" 2>/dev/null || true
+    --import-only --skip-initial-version-creation \
+    --protection-level=software --project="$project_id" 2>&1)" || true
+
+  # The assertion, not the create, is what makes a failure visible. Whatever went
+  # wrong above, the import cannot work without this key, and saying so here names
+  # the cause instead of leaving a confusing failure two steps later.
+  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
+    --project="$project_id" >/dev/null 2>&1; then
+    # Deliberately says "could not be confirmed" rather than "does not exist":
+    # describe also fails on an IAM denial for cloudkms.cryptoKeys.get or an API
+    # blip, and asserting absence from that would be stating more than was
+    # established. Whatever the cause, the import cannot safely proceed.
+    print_warning "The minter's KMS signing key ${kms_location}/${keyring}/${key} could not be confirmed to exist."
+    [ -n "$kms_ring_err" ] && print_info "Keyring create said: ${kms_ring_err}"
+    [ -n "$kms_key_err" ] && print_info "Key create said: ${kms_key_err}"
+    print_info "The PEM import needs the keyring and the key, so it is being skipped; the minter deployment stays unready until both exist."
+    # Not the README's import recipe: that one presupposes the key and only covers
+    # loading a PEM into it. What failed here is the creation, so print the two
+    # commands that create it. --skip-initial-version-creation is the one that is
+    # easy to lose and the one KMS refuses an import-only key without.
+    print_info "Create them by hand with:"
+    print_info "  gcloud kms keyrings create ${keyring} --location=${kms_location} --project=${project_id}"
+    print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+    print_info "Then import the PEM with the recipe in k8s-operator/config/integrations/github/README.md."
+    return 0
+  fi
 
   print_info "Importing the GitHub App private key into KMS via the Minty CLI..."
   local minty_dir pem_abs
@@ -1285,19 +1414,18 @@ run_menu_system() {
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
           "read-only — auditing and observability, no GCP write capability (Default)" \
-          "gke-admin — the agent manages GKE lifecycle and node pools directly" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
           1) permission_set="read-only" ;;
-          2) permission_set="gke-admin" ;;
-          3)
+          2)
             permission_set="custom"
             while true; do
               prompt_read "Custom GCP IAM Roles (space- or comma-separated)" custom_roles "$custom_roles"
               [ -n "$custom_roles" ] && break
               print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
             done
+            warn_on_overreaching_custom_roles "$custom_roles"
             ;;
         esac
         ;;
@@ -1402,7 +1530,7 @@ main() {
         exit 1
       fi
       image_tag="$head_sha"
-      print_info "Defaulting image tag to the checkout's HEAD: ${C_BOLD}${image_tag}${C_RESET}"
+      print_info "Defaulting image tag to $(default_image_tag_label): ${C_BOLD}${image_tag}${C_RESET}"
     else
       prompt_read "Container image tag (validated release tag or full commit SHA)" \
         image_tag "$head_sha" false "$(default_image_tag_label)"
@@ -1578,22 +1706,68 @@ main() {
   fi
   # Only when --cluster-mode said nothing: a flag the caller passed is an
   # answer already, and re-asking would let a mis-keyed menu choice override
-  # it. Standard leads because it is the installer's default and the shape
-  # every install has been getting.
+  # it.
+  #
+  # The order comes from resolve_creatable_cluster_mode rather than being
+  # hardcoded, because prompt_menu's enter default is option 1. A fixed
+  # Autopilot-first order makes pressing enter an *explicit* autopilot
+  # request, which the resolver is then right to refuse to demote — so a
+  # zonal interactive install would abort here rather than build Standard,
+  # which is what it did before this default changed. Deriving the order
+  # keeps the "(Default)" label, the enter key and the resolver saying the
+  # same thing at both kinds of location.
   if [ -z "$cluster_mode" ] && [ "$ask_cluster_shape" = "true" ] &&
     [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
-    local mode_choice=""
-    prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
-      "Standard — you size and pay for the node pool; carries the GKE Sandbox pool for --gvisor (Default)" \
-      "Autopilot — Google manages the nodes and you pay per Pod; regional only" \
-      mode_choice
-    case "$mode_choice" in
-      1) cluster_mode="standard" ;;
-      2) cluster_mode="autopilot" ;;
-    esac
+    local mode_choice="" menu_default=""
+    local autopilot_option="Autopilot — Google manages the nodes and you pay per Pod; regional only, and gVisor comes from its built-in RuntimeClass"
+    local standard_option="Standard — you size and pay for the node pool; carries the GKE Sandbox pool for --gvisor, and is the only shape that can be zonal"
+    menu_default="$(resolve_creatable_cluster_mode "" "$region")"
+    if [ "$menu_default" = "autopilot" ]; then
+      prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
+        "${autopilot_option} (Default)" \
+        "${standard_option}" \
+        mode_choice
+      case "$mode_choice" in
+        1) cluster_mode="autopilot" ;;
+        2) cluster_mode="standard" ;;
+      esac
+    else
+      # Zonal location. Autopilot stays on the menu so picking it is still an
+      # explicit request that require_creatable_cluster_mode rejects by name,
+      # rather than a shape that silently turns into something else.
+      prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
+        "${standard_option} (Default)" \
+        "${autopilot_option} — not available at a zonal location" \
+        mode_choice
+      case "$mode_choice" in
+        1) cluster_mode="standard" ;;
+        2) cluster_mode="autopilot" ;;
+      esac
+    fi
   fi
-  # Nothing asked, nothing passed: the shape every install has been getting.
-  cluster_mode="${cluster_mode:-standard}"
+  # Nothing asked, nothing passed: installer_common.sh owns the default, and
+  # resolve_creatable_cluster_mode applies it. Explaining the demotion is the
+  # caller's job so the resolver can echo the mode and nothing else.
+  #
+  # This matters most on the --cluster-name path, where ask_cluster_shape is
+  # false and the check below therefore never runs: a named cluster that does
+  # not exist yet would otherwise be written as autopilot at a zone and
+  # rejected by the module's precondition at terraform validate, after the
+  # whole interview had already been collected.
+  local cluster_mode_requested="$cluster_mode"
+  cluster_mode="$(resolve_creatable_cluster_mode "$cluster_mode" "$region")"
+  # ask_cluster_shape gates the message for the same reason it gates the check
+  # below: on both adoption paths no cluster is created by this run, so the
+  # advice to "pass --region with a region" would point at a location the
+  # target cluster does not live at. On --cluster-name that is not merely
+  # noise — write_tfvars_from_state probes with --location "$REGION", so
+  # re-running with the suggested region misses the live cluster, takes the
+  # confirmed-NOT_FOUND branch, and creates a second one under -auto-approve.
+  if [ "$ask_cluster_shape" = "true" ] && [ -z "$cluster_mode_requested" ] &&
+    [ "$cluster_mode" != "$DEFAULT_CLUSTER_MODE" ]; then
+    print_info "Location '${region}' is a zone and Autopilot clusters are regional, so a cluster created by this run will be Standard. Pass --region with a region to get the default Autopilot shape."
+  fi
+
   # Only where a cluster is about to be created. Adopting a discovered cluster
   # replaced $region with that cluster's own location, which may be a zone —
   # and failing an adoption over a location the installer chose itself, for a
@@ -1850,17 +2024,30 @@ main() {
   # 9. Agent Permissions & Sandbox Isolation Boundary
   print_step "9. Agent Security & Runtime Isolation Boundary"
   local permission_set="${PARAM_PERMISSION_SET:-read-only}"
-  if ! is_valid_permission_set "$permission_set"; then
-    print_error "Unsupported permission set '$permission_set'. Use read-only, gke-admin, or custom."
-    exit 1
-  fi
+  # Normalise and keep the normalised value, the way common.sh does. The gate
+  # below normalises its own argument so that every spelling reaches the right
+  # message, but it cannot fix the caller's variable -- and everything
+  # downstream compares against the lowercase literal: the custom-roles check
+  # and the over-reach warning just below, write_state_var's PLATFORM_AGENT_*
+  # pair, and terraform's case-sensitive contains() on permission_set. Passing
+  # `Custom` through raw would clear the gate and then miss all four.
+  permission_set=$(printf '%s' "$permission_set" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  # require_supported_permission_set (installer_common.sh) is the one home for
+  # the accepted vocabulary and for the explanation the removed admin bundle
+  # gets -- a PLATFORM_AGENT_PERMISSION_SET inherited from a vars.sh or a CI
+  # environment variable written before the removal lands here.
+  require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
-  # init_var_platform_agent_permission_set in k8s-operator/scripts/common.sh owns
-  # this rule; repeated here only so the run fails at the prompt instead of
-  # partway through the apply.
+  # This rule is also written in init_var_platform_agent_permission_set
+  # (k8s-operator/scripts/common.sh), which has no caller left in the repository
+  # -- the numbered provision scripts that used to invoke it went with #797. So
+  # this is the only place it runs, not a duplicate of somewhere it also runs.
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
+  fi
+  if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
+    warn_on_overreaching_custom_roles "$custom_roles"
   fi
   local enable_gvisor="${PARAM_ENABLE_GVISOR:-false}"
   if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
@@ -1895,14 +2082,12 @@ main() {
     local perm_choice=""
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
       "read-only — auditing and observability, no GCP write capability (Default)" \
-      "gke-admin — the agent manages GKE lifecycle and node pools directly" \
       "custom — exactly the roles you list, no built-in bundle" \
       perm_choice
 
     case "$perm_choice" in
       1) permission_set="read-only" ;;
-      2) permission_set="gke-admin" ;;
-      3) permission_set="custom" ;;
+      2) permission_set="custom" ;;
     esac
 
     while [ "$permission_set" = "custom" ] && [ -z "$custom_roles" ]; do
@@ -1913,6 +2098,12 @@ main() {
         print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
       fi
     done
+    # Repeated rather than moved: the call above runs on the --custom-roles flag
+    # path, which is decided before this prompt exists. An operator who runs
+    # ./install.sh and types the roles in reaches only this one.
+    if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
+      warn_on_overreaching_custom_roles "$custom_roles"
+    fi
 
     local gvisor_choice=""
     prompt_menu "Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?" \
@@ -2269,7 +2460,7 @@ main() {
 
   echo -e "${C_BOLD}Component Status Summary:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Project:${C_RESET} ${project_id} (Project Number: ${project_number})"
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-${cluster_mode:-standard}}"))"
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"

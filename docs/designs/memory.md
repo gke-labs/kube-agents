@@ -470,6 +470,26 @@ It adds exactly two workloads to `kubeagents-system`.
   model `model-default`), so routing and cost attribution stay in one place. The
   API key is the literal string `none`, matching how the agents authenticate;
   it is a placeholder the client library insists on, not a credential.
+  `HINDSIGHT_API_LLM_TEMPERATURE=none` omits `temperature` from those calls.
+  Hindsight would otherwise send one, and a model that refuses an explicit
+  temperature answers 400 — which reaches the agent as
+  `500 Fact extraction failed`, so memory records nothing at all rather than
+  recording it badly. Which models refuse it is not knowable here, since the
+  model is whatever the installer chose. It applies to all four operations,
+  which is deliberate — any of them sending a temperature draws the same 400 —
+  and each therefore falls back from a tuned value to the model's default:
+  retain from 0.1, reflect from 0.9, consolidation and verification from 0.0.
+  Consolidation writes the observations recall reads, so its dedup and delta
+  passes stop being pinned; `HINDSIGHT_API_LLM_TEMPERATURE_RETAIN` narrows the
+  omission to fact extraction where a model tolerates the rest.
+  The gateway is the wrong place to fix this. `litellm_settings` is the only
+  gateway-wide place to put it, and neither switch there does the job:
+  `drop_params` drops what LiteLLM believes the provider rejects, and it
+  believes Vertex Claude accepts `temperature`; `additional_drop_params` set
+  there was measured against a live install and the retain still returned 400,
+  because LiteLLM honours it in a model entry's `litellm_params` rather than
+  globally. Per-model it would work, at the price of editing a config every
+  agent request passes through in order to accommodate one caller.
 - Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root, no privilege escalation, all
   capabilities dropped. The CPU numbers are sized for model inference rather than for
   serving HTTP, though measurement says the headroom goes unused —
@@ -1106,12 +1126,12 @@ front door.
 
 When it is on, four things change, because one of them failing open would be silent:
 
-| Surface            | Behaviour under `read_only`                                                                         |
-| ------------------ | --------------------------------------------------------------------------------------------------- |
-| Tool schemas       | `memory_retain` is not advertised at all                                                            |
-| `handle_tool_call` | A `memory_retain` call is refused with `status: read_only`, worded so it does not read as retryable |
-| Automatic capture  | `sync_turn` and `on_session_end` do not fire, and `_auto_retain` is cleared on the stock provider   |
-| System prompt      | `SYSTEM_PROMPT_READ_ONLY` — says there is no write path, and not to cache what was read             |
+| Surface            | Behaviour under `read_only`                                                                                                  |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| Tool schemas       | `memory_retain` is not advertised at all                                                                                     |
+| `handle_tool_call` | A `memory_retain` call is refused with `status: read_only`, worded so it does not read as retryable                          |
+| Automatic capture  | `sync_turn` and `on_session_end` do not fire, and `_auto_retain` is cleared on the stock provider                            |
+| System prompt      | `SYSTEM_PROMPT_READ_ONLY` — says there is no write path, where to nominate a finding instead, and not to cache what was read |
 
 Omitting the schema is the primary control; advertising the tool and refusing the
 call would spend a turn and read as a transient failure worth retrying. The refusal
@@ -1119,7 +1139,11 @@ is the backstop for an invented call or a schema cached across a config change.
 
 **Not `memory_retain`, in any form.** A specialist that could write shared memory
 could launder its own derived-from-prior-runs conclusions into the corpus as facts.
-What it works out during a task is a finding for its result, not a recorded fact.
+What it works out during a task is a finding for its result, not a recorded fact —
+which leaves the question of how a finding that _should_ be recorded ever gets
+there. [Nominating a finding](#nominating-a-finding-the-card-is-the-write-path)
+below is the answer, and it keeps this objection intact by putting a person between
+the finding and the write.
 
 The prompt's "do not cache what you read" is a partial, prose-only mitigation for
 the skill-file fork; the durable control — making the specialist's own skill
@@ -1128,6 +1152,65 @@ directory unwritable — is tracked separately.
 [`tests/memory/test_read_only_profile.py`](../../tests/memory/test_read_only_profile.py)
 locks down all four surfaces, that reads are untouched, and that the setting
 defaults off.
+
+##### Nominating a finding: the card is the write path
+
+Read-only closes the write and leaves a gap it does not close: the agent best placed
+to discover a durable operational fact is the one that cannot record one. A
+specialist works out that an image crash-loops until a particular environment
+variable is set; the next card to deploy that image works it out again, at the same
+cost. Nothing in the shared corpus could have come from a card, because a discovery
+had no route out of the run it happened in.
+
+The route is the card, and what travels along it is a nomination rather than a
+write:
+
+1. The worker puts the fact in `result`, in a short `**Worth remembering**` block,
+   and repeats the same sentences in
+   `kanban_complete(metadata={"memory_candidates": [...]})` as a flat list of
+   strings. `result` is what the gateway posts into the user's thread verbatim, so
+   the person sees it with no extra turn spent; `metadata` is the machine-readable
+   copy `kanban_show` hands back later.
+2. A Platform Agent that fanned the work out carries its sub-workers'
+   `memory_candidates` onto its own card — every prerequisite's `metadata` is
+   already in the fan-in context — so a nomination survives a hop of delegation
+   instead of dying with the sub-card.
+3. If the user asks to keep it, the Chat Agent reads the card with `kanban_show`,
+   takes the sentence verbatim rather than from the thread it never saw, and writes
+   it with `memory_retain(scope: "shared")`.
+
+The person in step 3 is the control, not a formality: it is what keeps **Not
+`memory_retain`, in any form** true. Nothing a specialist concluded enters the
+corpus because the specialist thought it should. The bar the Chat Agent applies is
+`SHARED_SCOPE_TEST` unchanged, and the worker prompts state the same bar, so the
+filtering happens twice and the second time with someone watching.
+
+Why the user has to ask, rather than the harness offering: a completed card does not
+wake the Chat Agent. `completed` is deliberately absent from `wake_on_events` in
+[`agents/chat/config.yaml`](../../agents/chat/config.yaml), because the woken turn
+would re-read a card whose full result the user is already looking at — measured at
+5.9 s and 32,460 input tokens on one card, for nothing. Auto-triaging nominations
+would mean buying that turn back. Putting the nomination in `result` instead spends
+no turn at all: it is sitting in the message the user is reading, and "keep that" is
+a turn that was going to happen anyway.
+
+None of this is new machinery. `memory_candidates` is an ordinary key in an
+already free-form `metadata` dict, alongside `pr_url` and `proposed_patch`; what
+changed is prose — the three personas and `SYSTEM_PROMPT_READ_ONLY`.
+
+Three limits follow from that, and prose cannot lift any of them. A fan-in card is
+created by the Platform Agent, not the Chat Agent, and nothing links it back to the
+card the user is looking at, so a nomination collected there is reachable only if
+someone names the fan-in card — a `kanban_show` on the id the Chat Agent knows
+returns nothing, which is indistinguishable from nobody having nominated anything.
+The fan-in context serialises each prerequisite's `metadata` with a per-field cap
+and sorted keys, so `memory_candidates` sorts after a large `findings` payload and
+can be truncated away silently. And a nomination copied **verbatim** is a faithful
+relay of text the specialist read somewhere — a pod annotation, an issue comment —
+which the person approving "remember that" is reading as a fact rather than
+auditing as a string. The control is a person, and a person is the right control
+for whether something is worth keeping, not for whether it was authored in good
+faith.
 
 ### Where the connection settings come from
 

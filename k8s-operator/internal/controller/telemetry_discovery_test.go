@@ -585,7 +585,7 @@ func TestUpdateStatusReadyReportsTelemetry(t *testing.T) {
 
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	const endpoint = "http://otel-collector.otel-collector.svc.cluster.local:4318"
-	if _, err := r.updateStatusReady(context.Background(), agent, endpoint, otlpSourceDiscovered); err != nil {
+	if _, err := r.updateStatusReady(context.Background(), agent, endpoint, otlpSourceDiscovered, r.resolveNetpolProfile(context.Background(), agent)); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 
@@ -603,7 +603,7 @@ func TestUpdateStatusReadyReportsTelemetry(t *testing.T) {
 	// A moved endpoint must be written back: leaving it out of the change detection
 	// would freeze status at the first value it ever saw.
 	const moved = "http://otel-collector.observability.svc.cluster.local:4318"
-	if _, err := r.updateStatusReady(context.Background(), stored, moved, otlpSourceSpec); err != nil {
+	if _, err := r.updateStatusReady(context.Background(), stored, moved, otlpSourceSpec, r.resolveNetpolProfile(context.Background(), stored)); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
@@ -618,7 +618,7 @@ func TestUpdateStatusReadyReportsTelemetry(t *testing.T) {
 	// description, the telemetry docs and the observability skill all tell an operator to
 	// read, and it is also what carries None across an operator restart — see
 	// resolveOTLPEndpoint. An empty endpoint is easy to mistake for "no change".
-	if _, err := r.updateStatusReady(context.Background(), stored, "", otlpSourceNone); err != nil {
+	if _, err := r.updateStatusReady(context.Background(), stored, "", otlpSourceNone, r.resolveNetpolProfile(context.Background(), stored)); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {

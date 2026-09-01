@@ -1,63 +1,87 @@
 # Smoke task: exercises the eval pipeline end to end without provisioning
-# infrastructure, using only capability the deployed agent actually ships
-# with. The platform agent's config (both the image default and the
-# operator-rendered production ConfigMap) denylists terminal/file/shell
-# toolsets and enables kanban, so the probe must be a kanban action — a task
-# that asks for shell access scores 0 against any real deployment.
+# infrastructure. The endpoint the harness POSTs to serves the front-door
+# (default) profile, whose platform_toolsets are mcp-router, kanban and
+# memory and nothing else (agents/chat/config.yaml), so a question about
+# live fleet state cannot be answered at the front door: it has to be filed
+# as a kanban card, dispatched to a specialist worker, worked, and delivered
+# back into the thread. One realistic question therefore smokes every stage
+# this probe exists to cover — card creation, worker dispatch, the harness's
+# delegation-wait, and result folding — which is the whole chat-and-routing
+# journey through the kanban pipeline.
+#
+# REDESIGNED after the 2026-08-26 smoke failure (build 2092688354838581248).
+# The previous prompt ordered a card titled exactly "devops-bench smoke
+# probe" and graded the CHAT PROSE for that title with report_contains. On
+# that run the board-side artifact was perfect — kanban_create succeeded
+# with the exact title — but the router's receipt read "I've started this as
+# task t_c30d5f68" instead of quoting the title back, and the substring gate
+# failed a healthy pipeline on phrasing. The card body ("Perform
+# devops-bench smoke probe.") was also a meaningless work order the worker
+# could only improvise on: across five observed runs the task's agent time
+# swung 50s to 1618s, and on the 1618s run the improvisation went as far as
+# filing a REAL pull request against the eval GitOps repository. Grading
+# chat prose for a fact that lived on the board, on top of a work order with
+# no defined deliverable, was the flake. The board write is still asserted
+# below; the title and the receipt's wording are not, anywhere.
+#
+# The deliverable is deterministic because the fleet is planted: every eval
+# project carries the seeded trio (bench/tf/fleet/), and "seeded-a",
+# "seeded-b" and "seeded-c" are renderings of slots a/b/c under
+# var.cluster_prefix's default — the same contract the domain probes'
+# seeded-name assertions carry (docs/designs/bench-fleet-catalog.md, "The
+# rule is about where a check points"): it survives the default prefix and
+# breaks loudly and correctly if the prefix ever changes. No `fixtures:`
+# list, deliberately: both checks read the run's transcript, not a cluster,
+# and no catalog role means "the trio exists" — the dependency is on the
+# fleet stack itself and on the prefix rendering, stated here.
+#
+# Expected cost bracket: ~100-300s — one delegation round trip plus a single
+# fleet read, the shape the six domain probes budget at 150-350s, instead of
+# an open-ended work order.
 id: agent-kanban-smoke
 name: Agent kanban smoke test
 prompt: >-
-  Create a kanban task titled exactly "devops-bench smoke probe", then reply
-  with one sentence that quotes that exact title and states the id the kanban
-  tooling assigned to it.
+  Which GKE clusters are we running in this project right now? Give me the
+  list.
 expected_output: >-
-  A kanban task titled "devops-bench smoke probe" is created via the kanban
-  tooling, and the final sentence quotes that exact title and states the id
-  assigned to it.
+  The front door files a kanban card for the question rather than guessing,
+  and the specialist's answer is delivered back into the thread: a list of
+  the project's GKE clusters read from the live fleet, naming the three
+  seeded clusters (seeded-a, seeded-b and seeded-c) from observed evidence.
+  Extra clusters in the list are expected — the agent's own host cluster is
+  in the same project — and invented ones are not.
 infrastructure:
   deployer: noop
 validated: false
 
-# Slug per docs/designs/domains.yaml (in review): the probe exercises the chat
-# front door's delegation plumbing -- receive, plan, file a kanban card.
+# Slug per docs/designs/domains.yaml: the probe exercises the chat front
+# door's delegation plumbing -- receive, plan, file a kanban card, and fold
+# the worker's delivered answer back into the thread.
 domain: chat-and-routing
 
-# We chose the title, so an exact match is fair. The kanban_create call is the
-# whole point of the probe: a green judge score with no kanban call would mean
-# the agent talked about creating a task instead of creating it.
+# The answer is graded, not the receipt. The three seeded names are planted
+# facts we chose (see the header's rendering contract), so an exact match is
+# fair, and required_phrases is substring-AND: extra clusters in the answer
+# (the host cluster will usually appear) pass through it naturally. The
+# default scope, final, is what the user ultimately receives — the closing
+# message plus the delivered card results (see ReportContainsVerifier in
+# bench/kube_agents_bench/verifiers.py) — so the worker's delivered answer
+# is exactly the text under test.
 #
-# The prompt asks the closing sentence for the title AND the id on purpose, and
-# it has to keep asking for both. It used to ask for the id alone, which left
-# the title check below punishing the very answer the prompt requested: on
-# PR 890 (build 2091367133568045056) the agent filed the card with the exact
-# title and closed with "The id assigned is `t_faecff25`." -- kanban_create
-# succeeded, so the second objective passed, and the first failed for want of a
-# phrase nothing had asked the agent to repeat. VerificationCorrectness 0.5 at
-# VerificationCoverage 1.0, against the presubmit's floor of 1.0: a clean
-# single-objective miss, not an error. Shorten the prompt and you must delete
-# the check with it.
-#
-# The id itself is deliberately NOT checked here. It is minted per run
-# (t_faecff25 was that run's), so no literal phrase can match it, and
-# report_contains matches substrings only -- required_phrases, any_of_phrases,
-# forbidden_phrases, and a scope selector, with no regex or pattern field to
-# borrow. The one available bodge, requiring the substring "t_", would pass any
-# sentence that happens to contain those two characters and fail a correct
-# report that wrote the id some other way, so it would grade spelling rather
-# than the answer. The id stays a judged requirement via expected_output above;
-# turn it into an objective the day the verifier grows a pattern matcher.
+# Deliberately NOT asserted: any card title, and any phrasing of the
+# router's acknowledgement. Both are the model's to write, and gating them
+# is the retired design this header describes. The card id stays a judged
+# concern via expected_output; it is minted per run, and report_contains
+# matches substrings only, so no literal phrase can check it.
 verification_spec:
-  # Named for what it proves and no more: the closing sentence carries the
-  # title we chose. That the same sentence carries the id is asked for in the
-  # prompt but graded only by the judge -- see the note above.
-  - name: report-states-the-probe-title
+  - name: the-answer-names-the-planted-fleet
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["devops-bench smoke probe"]
+      required_phrases: ["seeded-a", "seeded-b", "seeded-c"]
   - name: the-kanban-card-was-actually-filed
     role: objective
     # assert, not the converge default: the transcript is immutable once the

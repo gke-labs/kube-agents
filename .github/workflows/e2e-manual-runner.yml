@@ -1,26 +1,79 @@
-name: Manual E2E Runner
+name: "E2E: Manual Runner"
+
+# Runs an E2E suite against a cluster that ALREADY EXISTS. It provisions
+# nothing, and with no cluster standing it fails at get-gke-credentials.
+#
+# WHEN YOU CAN USE THIS
+#
+# Only against `rc` or `nightly`, and only while one of them has a cluster up.
+# Both are ephemeral: a pipeline that passes destroys its own cluster in its last
+# step, so what leaves one standing is a FAILED run — every pipeline's teardown
+# job hangs off the implicit success() of the ones before it, and a red run keeps
+# its cluster for diagnosis. That is the case this workflow exists for.
+#
+# So the window is narrow, and it closes on its own. On the RC the next scheduled
+# run is three hours away and tears the environment down before it reinstalls, so
+# a surviving cluster lasts until then at most. The nightly pipeline has no cron
+# yet, so nothing reclaims a nightly cluster at all today — it stands and bills
+# until someone dispatches the pipeline again or runs uninstall.sh by hand. Once
+# the nightly cron lands the window there becomes a day.
+#
+# What the window buys: a fix has just merged and you want to know whether it
+# clears the failure, without waiting out a fresh provision. Point this at the
+# cluster the failed run left behind and re-run the suite in minutes rather than
+# rebuilding a GKE cluster to learn the same thing.
+#
+# To build a cluster on purpose instead, dispatch the same three workflows the
+# pipelines chain: deploy-environment.yml (github_environment plus a tag or commit
+# SHA), then this, then teardown-environment.yml. Nothing reclaims a cluster you
+# create that way, so run the third.
+#
+# Extending this beyond the two ephemeral environments — to autopush, staging, or
+# any long-lived environment, so a suite can be run wherever a cluster already
+# stands — is tracked in https://github.com/gke-labs/kube-agents/issues/1072.
 
 on:
   #checkov:skip=CKV_GHA_7:Manual E2E test runner requires environment and scenario filter parameters
   workflow_dispatch:
     inputs:
-      test_environment:
-        description: "Target test environment (rc-e2e, nightly-e2e, investigations-e2e, audit-e2e, agent-plugin-e2e, gchat-e2e, all)"
-        required: false
-        default: "rc-e2e"
+      # Required, because the job binds this as its `environment:` and every
+      # `vars.*` below comes from it — the repository scope holds none of them,
+      # so an unbound job fails at google-github-actions/auth with "must specify
+      # exactly one of workload_identity_provider or credentials_json".
+      #
+      # An input rather than a hardcoded `rc`: whichever cluster is standing is
+      # the one worth attaching to, and either pipeline can be the one that left
+      # theirs behind.
+      github_environment:
+        description: "GitHub environment whose cluster to run against"
+        required: true
         type: choice
         options:
-          - "rc-e2e"
-          - "nightly-e2e"
-          - "investigations-e2e"
-          - "audit-e2e"
-          - "agent-plugin-e2e"
-          - "gchat-e2e"
+          - "rc"
+          - "nightly"
+      # `test_suite`, not `test_environment`: this names a list of test files in
+      # e2e_config.yaml, while `github_environment` above names the GitHub
+      # environment supplying the cluster.
+      test_suite:
+        description: "Target test suite from e2e_config.yaml, or 'all' to run every suite"
+        required: false
+        default: "rc"
+        type: choice
+        options:
+          - "rc"
+          - "nightly"
+          - "investigations"
+          - "audit"
+          - "agent-plugin"
+          - "gchat"
+          - "stockout-full"
           - "all"
       stockout_scenarios:
-        description: "Stockout scenarios ('04' for fast smoke, 'all' for full matrix)"
+        # Matched by prefix or exact slug, so '04' still selects the same
+        # scenario; the slug is the default because it says which one.
+        description: "Stockout scenarios (a slug such as '04-missing-zone-fallback', or 'all')"
         required: false
-        default: "04"
+        default: "04-missing-zone-fallback"
         type: string
       fleet_audit_streams:
         description: "Fleet audit stream filter ('all', 'stockout-prevention', or specific stream)"
@@ -38,8 +91,10 @@ on:
         default: "false"
         type: string
 
+# Follows the environment it was dispatched against, so a run pointed at
+# `nightly` holds the nightly lock rather than queueing behind the RC pipeline.
 concurrency:
-  group: rc-environment
+  group: ${{ inputs.github_environment }}-environment
   cancel-in-progress: false
 
 permissions:
@@ -48,8 +103,9 @@ permissions:
 
 jobs:
   run-e2e:
-    name: Run E2E (${{ inputs.test_environment || 'rc-e2e' }})
+    name: Run E2E (${{ inputs.test_suite }} on ${{ inputs.github_environment }})
     runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
     timeout-minutes: 45
 
     env:
@@ -74,9 +130,8 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || '' }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT || '' }}
-          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
@@ -88,31 +143,47 @@ jobs:
         uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
         with:
           cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
-          location: ${{ vars.GCP_REGION || 'us-east4' }}
+          location: ${{ vars.GCP_REGION }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Connect to GKE & Configure Docker
         env:
+          # All four, not the three coordinates. wait_for_gke_readiness.sh calls
+          # release_resolve_target, which in CI refuses rather than defaulting and
+          # counts AGENT_NAMESPACE among what it requires — so omitting it fails
+          # this step outright. e2e-run.yml's equivalent step passes the same four.
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
         run: |
           ./scripts/release/wait_for_gke_readiness.sh
-          REGION="${GCP_REGION:-us-east4}"
-          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet || true
 
       - name: Execute E2E Tests
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE || 'kubeagents-system' }}
-          REGISTRY: ${{ vars.REGISTRY || vars.REGISTRY_PREFIX || (vars.GCP_PROJECT_ID && format('{0}-docker.pkg.dev/{1}/kube-agents', vars.GCP_REGION || 'us-east4', vars.GCP_PROJECT_ID)) || '' }}
-          GITHUB_ORG: ${{ vars.GH_ORG || 'test-org-kube-agent' }}
-          GITHUB_REPO: ${{ vars.GH_REPO || 'test-org-kube-agent/agents-repo' }}
-          TEST_ENVIRONMENT: ${{ inputs.test_environment }}
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
+          # Forwarded raw, not resolved here: execute_e2e_tests.py already picks
+          # REGISTRY, then REGISTRY_PREFIX, then
+          # <region>-docker.pkg.dev/<project>/kube-agents, and a second copy of
+          # that chain in the workflow is a second thing to keep in step. Both
+          # still have to reach it — unset here, a `rebuild_operator` run would
+          # push to the derived path whatever the environment configures.
+          REGISTRY: ${{ vars.REGISTRY }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          # GITOPS_*, not GH_*. On both environments the GH_ORG/GH_REPO pair
+          # names the RELEASE repository, so handing it to a suite that mints a
+          # GitHub App token would scope a live token at this repository.
+          # GITOPS_REPO is bare; conftest's github_repo fixture composes
+          # owner/repo against GITHUB_ORG.
+          GITHUB_ORG: ${{ vars.GITOPS_ORG }}
+          GITHUB_REPO: ${{ vars.GITOPS_REPO }}
+          TEST_SUITE: ${{ inputs.test_suite }}
           STOCKOUT_SCENARIOS: ${{ inputs.stockout_scenarios }}
-          FLEET_AUDIT_STREAMS: ${{ inputs.fleet_audit_streams || 'all' }}
+          FLEET_AUDIT_STREAMS: ${{ inputs.fleet_audit_streams }}
           REBUILD_OPERATOR: ${{ inputs.rebuild_operator }}
           TEST_DESTRUCTIVE_CRD: ${{ inputs.test_destructive_crd }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
@@ -120,10 +191,7 @@ jobs:
           E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
           E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
           CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
-        run: |
-          TARGET_ENV="$TEST_ENVIRONMENT"
-          if [ "$TARGET_ENV" = "all" ]; then
-            python3 scripts/release/execute_e2e_tests.py --env all
-          else
-            python3 scripts/release/execute_e2e_tests.py --env "$TARGET_ENV"
-          fi
+        # The wrapper rather than the .py, so this goes through the same entry
+        # point as e2e-run.yml and `make test-e2e`. `--suite all` needs no special
+        # case: execute_e2e_tests.py expands it into one child process per suite.
+        run: ./scripts/release/execute_e2e_tests.sh --suite "${TEST_SUITE}"

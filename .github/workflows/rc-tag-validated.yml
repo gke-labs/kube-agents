@@ -1,4 +1,4 @@
-name: RC Step 4 - Validate Candidate Commit
+name: "RC: Validate Candidate Commit"
 
 permissions:
   contents: read

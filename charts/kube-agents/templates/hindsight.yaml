@@ -103,6 +103,13 @@ spec:
             # non-empty value, so this is a placeholder rather than a credential.
             - name: HINDSIGHT_API_LLM_API_KEY
               value: none
+            # Omit `temperature` rather than send a value: a model that refuses
+            # an explicit one answers 400, and the retain surfaces it as
+            # "500 Fact extraction failed" having stored nothing. See the
+            # canonical account in
+            # k8s-operator/config/integrations/hindsight/api.yaml.
+            - name: HINDSIGHT_API_LLM_TEMPERATURE
+              value: none
             # Passwordless by design; see POSTGRES_HOST_AUTH_METHOD below.
             # Nothing here is a secret, so nothing here needs a Secret.
             - name: HINDSIGHT_API_DATABASE_URL

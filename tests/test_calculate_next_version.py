@@ -25,6 +25,7 @@ from tests.testing.release import (
     MOCK_NONEXISTENT_REF,
     MOCK_NONEXISTENT_TAG,
     MOCK_RC_VALIDATED_TAG,
+    MOCK_TARGET_RELEASE_TAG,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -299,6 +300,33 @@ class CalculateNextVersionTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout.strip(), "0.2.0")
+        finally:
+            temp_dir.cleanup()
+
+    def test_explicit_version_resumption_allowed_when_tag_on_detached_head_stamped_commit(self):
+        """Verifies explicit version calculation allows resumption when tag is on a detached HEAD child commit."""
+        temp_dir, repo_dir, git = self._create_mock_repo()
+        try:
+            candidate_commit = git("rev-parse", "HEAD").stdout.strip()
+            # Attach validated tag on candidate commit
+            git("tag", "-a", MOCK_RC_VALIDATED_TAG, candidate_commit, "-m", "validated")
+
+            # Create detached HEAD child commit stamped with release version
+            git("checkout", "--detach", candidate_commit)
+            (pathlib.Path(repo_dir) / "version.txt").write_text(f"{MOCK_TARGET_RELEASE_TAG}\n")
+            git("add", "version.txt")
+            git("commit", "-m", f"chore(release): stamp release version {MOCK_TARGET_RELEASE_TAG}")
+            stamped_commit = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", MOCK_TARGET_RELEASE_TAG, stamped_commit, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
+            git("checkout", "main")
+
+            # Run with explicit release version on candidate commit
+            proc = self._run_calc_script(
+                repo_dir,
+                env={"EXPLICIT_RELEASE_VERSION": MOCK_TARGET_RELEASE_TAG, "TARGET_COMMIT": candidate_commit},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), MOCK_TARGET_RELEASE_TAG)
         finally:
             temp_dir.cleanup()
 

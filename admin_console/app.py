@@ -83,6 +83,13 @@ pages = {
             url_path="scheduled-cron",
         ),
     ],
+    "Integration": [
+        st.Page(
+            APP_DIRECTORY / "pages" / "google_chat.py",
+            title="Google Chat",
+            icon=":material/chat:",
+        ),
+    ],
 }
 
 connection_is_current = current_connection() is not None
@@ -93,6 +100,6 @@ with st.sidebar:
     maintain_connection()
     st.caption(f"Signed in as {authenticated_user}")
     if not connection_is_current:
-        st.caption("Connect a project and cluster to enable Observability")
+        st.caption("Connect a project and cluster to enable live pages")
 
 navigation.run()

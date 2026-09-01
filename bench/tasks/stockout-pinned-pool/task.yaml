@@ -1,5 +1,34 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
+# commented entry in hack/ci-eval-pr.sh TASKS). Its one run failed on
+# agent-endpoint HTTP 502s — transport, not a scenario bug — and the audit
+# shape budgets at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
+# run), which six domains cannot spend in one presubmit. The capacity domain
+# is covered there by capacity-pinned-pool-probe; this full sweep is the
+# SOP-fidelity version and activates with the nightly tier. It was held by
+# A1, A4 and A5 (bench/tasks/DRAFTS.md); all three are closed.
+#
+# A1 and A4 cleared together on 2026-08-25, when
+# GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
+# EVAL_GITHUB_APP_ID=4675512, which is the condition hack/ci-deploy.sh needs
+# before it renders githubMinter.enabled=true and passes
+# platformAgent.integration.github.gitRepo -- so the `Git Repo:` line of
+# /opt/data/SETTINGS.md finally names the leased project's throwaway
+# gke-agentic/kube-agents-evals*-infra repo instead of the literal None, and
+# `audit_report.py start` has a workspace to clone and a minter to clone it
+# with (A1). It also mounts secret kube-agents-bench-github-token as
+# BENCH_GITHUB_TOKEN, which is the credential the ledger_issue_contains
+# objectives below read the published ledger issue with (A4).
+#
+# A5 cleared on main earlier: hack/fleet-kubeconfigs.sh writes one kubeconfig
+# per fixture ROLE and the cluster-state safeguard below resolves its role
+# through fleet_resource_property, so it grades the seeded cluster rather than
+# platform-agent-host. What is left of A5 is which identity that kubeconfig
+# carries, not which cluster it reaches.
+#
+# The A1/A4 path itself is proven — the 2026-08-26 run minted tokens, cloned
+# *-infra workspaces and published ledgers for the sibling audits — but THIS
+# stream has never completed a run: its one attempt died on endpoint 502s
+# before any ledger was written.
 #
 # Domain: capacity (stockout-prevention SOP). Journey: the stockout and
 # capacity audit names the pool at risk and the shortfall, not a generic
@@ -19,7 +48,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1. Eligible tier: presubmit, once A1 is in place.
+# blocker A1, now closed. Eligible tier: presubmit, and active there
+# since 2026-08-25.
 id: stockout-pinned-pool
 name: Capacity audit names the pool that cannot scale
 # The prompt no longer asks for a summary in the final answer: the SOP's
