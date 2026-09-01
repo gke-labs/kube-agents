@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import urllib.parse
@@ -37,6 +38,12 @@ class InteractionRunner:
         portal = Portal(self.config.endpoint, token=portal_token())
         interaction = portal.post("interactions", request)
         self.log.record("interaction", {"poll": 0, "value": interaction})
+        # Polling repeats the whole projection every couple of seconds, and
+        # an unchanged repeat says nothing a reader needs: a 15-minute run
+        # wrote 275 KB of near-identical payloads and buried the four moments
+        # that mattered. Only transitions are recorded from here, plus the
+        # terminal state, which the summary and every evaluator read.
+        previous = json.dumps(interaction, sort_keys=True, default=str)
         interaction_id = str(interaction.get("interactionId") or "")
         if not interaction_id:
             raise PortalError("portal response did not include interactionId")
@@ -63,11 +70,15 @@ class InteractionRunner:
                     f"interactions/{urllib.parse.quote(interaction_id, safe='')}"
                 )
             poll += 1
-            self.log.record(
-                "interaction",
-                {"poll": poll, "value": interaction},
-            )
+            current = json.dumps(interaction, sort_keys=True, default=str)
+            if current != previous:
+                self.log.record(
+                    "interaction",
+                    {"poll": poll, "value": interaction},
+                )
+                previous = current
 
+        self.log.record("interaction_final", {"poll": poll, "value": interaction})
         return interaction
 
 

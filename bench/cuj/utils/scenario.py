@@ -100,6 +100,7 @@ class Scenario:
                 log.record("milestone", result.to_dict())
             for result in acceptance.results:
                 log.record("acceptance_criterion", result.to_dict())
+            transcript = log.write_transcript(prompt, interaction)
             log.record(
                 "summary",
                 {
@@ -131,6 +132,7 @@ class Scenario:
         for line in acceptance.report_lines():
             print(line)
         print(f"Evidence: {log.path}")
+        print(f"Conversation: {transcript}")
         interaction_failure = (
             f"interaction {status}"
             + (f": {error}" if error else "")
