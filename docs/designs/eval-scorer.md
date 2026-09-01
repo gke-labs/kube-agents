@@ -1042,13 +1042,17 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
 ## Open items
 
-- **The presubmit's timeout — at `240m`, held there on purpose, and the thinnest number here.**
+- **The presubmit's timeout — at `360m`, and no longer the thinnest number here.**
   `85m` was sized when the job made two `devops-bench` invocations and averaged ~43min.
   [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) took it to
-  `150m` off an estimate and
+  `150m` off an estimate,
   [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) took it to
-  `240m` off a ten-task measurement; both have merged and the Prow `job-config` has rolled, which is
-  what unblocked this pull request.
+  `240m` off a ten-task measurement, and
+  [oss-test-infra#2676](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2676) took it to
+  `360m` on 2026-08-31; all three have merged and the Prow `job-config` has rolled. The first two are
+  what unblocked this pull request. At seventeen tasks the job runs at 1.61× honest, so the headroom
+  that made this the tightest constraint on the page has come back — which is precisely when it stops
+  being watched, and the recount warning below is there for that reason.
 
   **This is no longer an extrapolation.** The matrix has run end to end at thirteen tasks × three
   repetitions, GREEN, on build `2093054834931404800` (2026-08-27):
@@ -1086,9 +1090,16 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   measurement of it, so the table prices it at the fleet average. It is one of the two active tasks
   that **write**, so `compliance-rbac-overgrant` is the better comparable at a measured 681s per
   repetition — at that cost the invocations total ~207min, or ~223min once the 16.4min fixed term is
-  added back, and **1.61×** against `360m`. Read 1.80× as the optimistic bound and 1.61× as the
-  working number until the first seventeen-task run lands. Both are counted on the whole job; the
-  table's ratios leave the fixed term out, which is why they read higher.
+  added back, and **1.61×** against `360m`. 1.80× was the optimistic bound and 1.61× the working
+  number. Both are counted on the whole job; the table's ratios leave the fixed term out, which is
+  why they read higher.
+
+  **The seventeen-task run has since landed and the honest figure was the right one to lead with.**
+  Build `2094466401401049088` (2026-08-31, GREEN) took **221.7min** whole-job against the predicted
+  223.2min — 1.5min apart, with the optimistic 200min a long way off. That was the last serial run
+  before the fan-out, so it prices the baseline rather than what the job costs now; what it settles
+  is that the 3.6min average and the 16.4min fixed term extrapolate honestly across a growing
+  matrix, which is what four earlier estimates failed to do.
 
   **The variance that was flagged as the thing to watch has resolved in the good direction.**
   `consistency-authorized-networks-probe` took 1039s on the one earlier run that existed, against
@@ -1106,8 +1117,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   anyone reading the Prow file: #2676 moved the number without touching the comment block above it,
   so that prose still argues from `240m`. The raise and the fan-out above are redundant on purpose
   rather than by accident: the raise is measured against serial arithmetic that still holds if the
-  fan-out realises no parallelism at all in a pool project, and it is what makes `300m` a
-  follow-up rather than a blocker if it realises some.
+  fan-out realises no parallelism at all against a pool project's model quota. `300m`, which this
+  section previously carried as the next raise to ask for, is moot: the deadline is above it.
 
   The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
   in another repository**, so activating a case here spends headroom that only a separate pull
@@ -1117,8 +1128,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `hack/ci-eval-pr.sh` says so where someone about to uncomment a line will read it.
 
   **Retry-on-failure — one repetition, two more only if the first fails — is the obvious way to buy
-  that runtime back, and it is deliberately not taken.** On a green run it would cost 14
-  invocations instead of 42 and land the job near 67min, which is real money. It is declined
+  that runtime back, and it is deliberately not taken.** On a green run it would cost 17
+  invocations instead of 51 and land the job near 61min, which is real money. It is declined
   because it is not verdict-identical to three unconditional repetitions, in four ways, and the
   cheap version of a gate that quietly grades differently is worse than an expensive one:
 

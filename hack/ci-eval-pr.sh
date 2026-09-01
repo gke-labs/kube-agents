@@ -778,9 +778,16 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # first measurement, is priced at the fleet average. It is one of the two active
 # tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
 # measured 681s per repetition -- at that cost the total is ~207min of
-# invocations, ~223min with the fixed term, and 1.61x. Treat 1.61x as the honest
-# figure and 1.80x as the optimistic one until the first seventeen-task run
-# lands.
+# invocations, ~223min with the fixed term, and 1.61x. 1.61x was the honest
+# figure and 1.80x the optimistic one.
+#
+# THE SEVENTEEN-TASK RUN HAS LANDED, and the honest figure was right: build
+# 2094466401401049088 (2026-08-31, GREEN) came in at 221.7min whole-job against
+# the 223.2min predicted, 1.5min apart, with the optimistic 200min nowhere near.
+# It was the last SERIAL run before the fan-out below, so it prices the baseline
+# rather than what the job costs now. What it settles is that the 3.6min average
+# and the 16.4min fixed term extrapolate honestly, which is what the four
+# estimates before them did not.
 #
 # Keep this count current when you activate: it was written at FOURTEEN, was
 # already one short the day #925 wrote it (the matrix stood at fifteen), and
