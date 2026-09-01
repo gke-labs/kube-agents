@@ -1,11 +1,11 @@
-streamlit>=1.61.1,<2
+streamlit>=1.62.0,<2
 plotly>=6.9.0,<7
 fastapi>=0.141.1,<1
 httpx>=0.28.1,<1
 pydantic>=2.13.4,<3
-uvicorn>=0.52.2,<1
+uvicorn>=0.52.4,<1
 # The upper bound is Streamlit's, not ours: streamlit 1.62.0 still requires
 # websockets<17, so raising this pin makes the file unresolvable rather than
 # merely untested. api/streamlit_proxy.py imports websockets directly, which is
 # why the dependency is stated here at all. Lift the cap when Streamlit does.
-websockets>=15,<17
+websockets>=16.1.1,<17

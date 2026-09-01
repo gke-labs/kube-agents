@@ -8,36 +8,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 RELEASE_VERSION="${1:-${RELEASE_VERSION:-${TARGET_VERSION:-${TARGET_TAG:-}}}}"
-RELEASE_COMMIT="${2:-${RELEASE_COMMIT:-${TARGET_COMMIT:-}}}"
 TARGET_REPO="$(get_target_repo)"
 
-# Sibling symmetry: support swapped arguments
-if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
-  if [[ ! "${1}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "${2}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    local_tmp="${RELEASE_VERSION}"
-    RELEASE_VERSION="${RELEASE_COMMIT}"
-    RELEASE_COMMIT="${local_tmp}"
-  fi
-fi
-
-if [ -z "${RELEASE_VERSION}" ] || [ -z "${RELEASE_COMMIT}" ]; then
-  echo "❌ ERROR: RELEASE_VERSION and RELEASE_COMMIT are required as arguments or environment variables." >&2
-  echo "Usage: $0 (with RELEASE_VERSION and RELEASE_COMMIT in env) or $0 <RELEASE_VERSION> <RELEASE_COMMIT>" >&2
+if [ -z "${RELEASE_VERSION}" ]; then
+  echo "❌ ERROR: RELEASE_VERSION is required as first argument or environment variable." >&2
+  echo "Usage: $0 <RELEASE_VERSION>" >&2
   exit 1
 fi
 
 validate_pure_numeric_semver "${RELEASE_VERSION}" "Release version" || exit 1
 
-# Canonicalize commit SHA to full 40-character hash
-if ! RESOLVED_COMMIT="$(git rev-parse --verify "${RELEASE_COMMIT}^{commit}" 2>/dev/null)"; then
-  echo "❌ ERROR: Cannot resolve valid Git commit from '${RELEASE_COMMIT}'!" >&2
-  exit 1
-fi
+# Single Source of Truth: Resolve commit directly from the Git tag created by tag_ga_release.sh
+RELEASE_COMMIT="$(resolve_release_commit "${RELEASE_VERSION}")"
 
 echo "======================================================================"
 echo "🚀 PUBLISHING GITHUB RELEASE"
 echo "Release Version:   ${RELEASE_VERSION}"
-echo "Resolved Commit:   ${RESOLVED_COMMIT:0:7}"
+echo "Release Commit:     ${RELEASE_COMMIT}"
 echo "Target Repository: ${TARGET_REPO}"
 echo "======================================================================"
 
@@ -65,8 +52,8 @@ fi
 
 gh release create "${RELEASE_VERSION}" \
   --repo "${TARGET_REPO}" \
-  --target "${RESOLVED_COMMIT}" \
+  --target "${RELEASE_COMMIT}" \
   --title "Release ${RELEASE_VERSION}" \
   --generate-notes
 
-echo "✅ Successfully published GitHub Release '${RELEASE_VERSION}' for commit ${RESOLVED_COMMIT:0:7}."
+echo "✅ Successfully published GitHub Release '${RELEASE_VERSION}' for commit ${RELEASE_COMMIT:0:7}."

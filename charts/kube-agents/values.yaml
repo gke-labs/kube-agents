@@ -1,3 +1,25 @@
+# Cluster-wide ValidatingAdmissionPolicies that backstop agent RBAC at apply
+# time: read verbs only, no Secrets, and no cluster-scoped binding to a
+# namespace-tier agent ServiceAccount. Read the header of
+# templates/agent-rbac-admission-policy.yaml before relying on them — notably,
+# they cannot check the rules of a *referenced* Role, and the content policy is
+# evadable by a manifest that carries neither the `kube-agents/tier` label nor
+# the `*-agent` naming convention.
+#
+# You do not need to turn this off for an old cluster: the template also checks
+# `.Capabilities.KubeVersion` and renders nothing below Kubernetes 1.30, where
+# the policy API is not yet v1 and the objects would fail to apply. Turn it off
+# for a second kube-agents release in a cluster that already has these — they
+# are cluster singletons with fixed names, so Helm refuses the second install on
+# ownership rather than duplicating them.
+#
+# What the policies do and do not enforce is in the header of
+# templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
+# on a default install with no GitOps overlay, the content policy matches
+# nothing the operator creates.
+admissionPolicy:
+  enabled: true
+
 global:
   # Registry prefix for the images built from this repo (operator, agent,
   # credential proxy). Empty leaves them on the public defaults below.
@@ -198,6 +220,40 @@ litellm:
     tag: v1.96.2
     pullPolicy: IfNotPresent
   replicaCount: 2
+  # Rollout strategy — the canonical home for this argument. The chart template
+  # and examples/litellm-gemini defer here directly; the kustomize base defers
+  # to the template, which defers on to this. Unlike
+  # podDisruptionBudget below this one is configurable, because the right answer
+  # depends on something the chart cannot see: whether a namespace ResourceQuota
+  # has room for a surge Pod.
+  #
+  # maxUnavailable: 0 is the zero-downtime shape, and it makes the surge Pod
+  # mandatory — under a full quota the old ReplicaSet may not shrink, the surge
+  # Pod is refused with FailedCreate, and the rollout stalls rather than
+  # completing (#749).
+  #
+  # The default of 1 lets the Deployment replace in place, and that trade is
+  # taken on every install rather than only quota-constrained ones: at 0 a
+  # rollout cost no serving capacity at all, and at 1 the old ReplicaSet gives up
+  # a slot as soon as it starts. At the default replicaCount of 2 one replica
+  # keeps serving throughout. At replicaCount 1 there is no second replica, so a
+  # rollout becomes a real gap for as long as the new Pod takes to pass its
+  # startupProbe — up to the 3 minutes that probe sanctions.
+  #
+  # Set maxUnavailable to 0 on an install with quota headroom that would rather a
+  # rollout stall than drop a request; keep 1 anywhere a baseline quota is applied
+  # as policy. Both at 0 is rejected in any spelling — 0, "0", 0%, 0.0 — and the
+  # template fails the render rather than letting it reach the cluster, where the
+  # API server would reject it anyway.
+  #
+  # Emptying a fencepost rather than setting it (`--set …maxUnavailable=`, or
+  # `maxUnavailable: ""`, or removing the key) resolves to the 1 below, not to
+  # nothing. Rendering it empty would hand Kubernetes its own 25% default, which
+  # rounds down to 0 at replicaCount 2 — the stall above, reached silently. Keep
+  # these two literals in step with that fallback in templates/litellm.yaml.
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 1
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
     # not configurable: minAvailable is the shape that deadlocks node drains,
@@ -376,11 +432,27 @@ platformAgent:
     availability:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
       replicas: null
-      # RuntimeClass for the agent pod. Set to "gvisor" for GKE Sandbox kernel
-      # isolation — on a Standard cluster that needs the sandbox node pool the
-      # gke-cluster module's enable_gvisor_node_pool creates; Autopilot ships
-      # the RuntimeClass natively. Empty omits the field.
-      runtimeClassName: ""
+      # RuntimeClass for the agent pod. "gvisor" asks for GKE Sandbox kernel
+      # isolation, and is the default because the agent executes model-authored
+      # commands and an unsandboxed pod shares the node kernel with everything
+      # else scheduled there.
+      #
+      # Autopilot ships the RuntimeClass natively (GKE 1.27.4-gke.800 and
+      # later). A Standard cluster needs the sandbox node pool that the
+      # gke-cluster module's enable_gvisor_node_pool creates; without it the
+      # operator refuses to write the agent Deployment and reports
+      # RuntimeClassNotFound on the PlatformAgent. Set "" to omit the field and
+      # run on the standard container runtime.
+      #
+      # The Terraform composition always passes this explicitly (from
+      # agent_runtime_class, which install.sh derives from --gvisor), so this
+      # default is what a direct `helm install` gets -- and what a `helm
+      # upgrade` of a release that never set the key adopts, since Helm merges
+      # the new chart's defaults. That upgrade path fails quietly where the
+      # RuntimeClass is missing: the operator stops before reconciling the
+      # workload, so the previous unsandboxed Deployment keeps running while
+      # .status says Degraded. See the chart README's Usage section.
+      runtimeClassName: "gvisor"
     # Extra environment for the agent container, applied after the operator's own
     # values so it overrides them. Telemetry is the case this exists for, though
     # a cluster with no collector no longer needs it: when discovery completes
@@ -435,6 +507,34 @@ platformAgent:
     # Annotations applied to that KSA, e.g. for Workload Identity:
     #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
     serviceAccountAnnotations: {}
+    # One Google service account per GKE cluster the agent may read, each
+    # provisioned by Terraform. The credential broker mints a short-lived token
+    # for the account a request's cluster maps to, instead of using the agent's
+    # own identity -- which, with a project-level roles/container.viewer, reads
+    # objects in every cluster in the project.
+    #
+    # Empty by default, and it should stay empty until per-cluster RBAC lands.
+    # A pool member holds no IAM grant: the IAM Condition that scoped it grants
+    # nothing for Kubernetes object operations (measured 2026-08-12) and the
+    # un-conditioned binding is project-wide roles/container.viewer, so both
+    # were removed. A non-empty list here arms the broker, which would then
+    # select a powerless identity for every request.
+    #
+    # The terraform/examples/full-install composition fills this in from its
+    # `scoped_service_accounts` output; take the values from there rather than
+    # deriving the account names, since the broker matches them exactly.
+    #
+    # A cluster that is not listed is REFUSED, not served by a wider credential.
+    # Leaving the list empty keeps the previous single-identity behaviour and
+    # renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on the broker container, so the
+    # mode an install is in is readable from the Deployment.
+    #
+    #   scopedServiceAccounts:
+    #     - projectId: my-project
+    #       location: us-east4
+    #       clusterName: my-cluster
+    #       serviceAccountEmail: ka-my-cluster-1a2b3c4d@my-project.iam.gserviceaccount.com
+    scopedServiceAccounts: []
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /
@@ -463,6 +563,25 @@ platformAgent:
     # add them to the existing Secret (upgrade.sh backfills them additively).
     create: false
     data: {}
+  # spec.networkPolicy on the PlatformAgent CR, passed through verbatim. Empty
+  # omits the field, which is what leaves the operator to discover the cluster
+  # DNS ClusterIPs and use the default metadata-daemon address. Not to be
+  # confused with the `networkPolicy: true` booleans under litellm, hindsight
+  # and githubMinter above, which toggle those components' own policies.
+  #
+  #   networkPolicy:
+  #     enabled: true              # false stops generation and deletes the
+  #                                # operator-owned <name>-gateway-netpol and
+  #                                # <name>-fqdn-netpol
+  #     dnsClusterIPs: ["10.96.0.10"]
+  #     metadataDaemon:
+  #       endpoint: "169.254.169.252"  # "" suppresses the post-NAT rule
+  #     additionalEgress:
+  #       - to: [{ cidr: "10.200.0.0/16" }]
+  #         ports: [{ protocol: TCP, port: 5432 }]
+  #
+  # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
+  networkPolicy: {}
   integration:
     github:
       # Target GitOps repository for the GitHub integration (owner/repo or
@@ -487,3 +606,21 @@ platformAgent:
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""
+    teams:
+      # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
+      # App ID and App Password are read from credentials.secretName under
+      # TEAMS_APP_ID and TEAMS_APP_PASSWORD.
+      enabled: false
+      # Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
+      tenantId: ""
+      # Restrict bot interactions to specific Entra ID Object IDs or UPN emails.
+      # When empty and allowAllUsers is false, interactions are rejected.
+      allowedUsers: []
+      # Set to true to allow any authenticated user in the tenant to interact with the bot.
+      allowAllUsers: false
+      # Default conversation ID / channel for asynchronous alerts and reports.
+      homeChannel: ""
+      # Bot Framework Service URL (defaults to Microsoft public cloud endpoint).
+      serviceUrl: "https://smba.trafficmanager.net/teams/"
+      # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
+      adaptiveCards: true

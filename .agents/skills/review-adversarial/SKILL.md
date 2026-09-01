@@ -155,13 +155,16 @@ prefer generalizing the underlying mechanism.
 
 **Angle H — conventions and docs.** Read the `AGENTS.md` / `CLAUDE.md` files that govern the
 changed code: the repo root, plus any in a directory that is an ancestor of a changed file (a
-directory's file only applies at or below it). Flag a violation only when you can quote the exact
-rule and the exact line that breaks it — no style preferences, no "spirit of the doc" inferences.
-Name the file and quote the rule so the report can cite it. This is also where docs drift belongs:
-one canonical home per fact, generated `<!-- BEGIN GENERATED -->` regions regenerated rather than
-hand-edited, identifiers verified against source rather than against other docs. `review-docs-drift`
-is the exhaustive form of that check and the author is required to have run it before opening —
-which is a reason to read what they reported, not a reason to skip this angle.
+directory's file only applies at or below it). Read `.agents/rules/` alongside them — the root
+`AGENTS.md` states each rule in a line and that file holds the form it takes and the cases exempt
+from it, so the one-liner alone will have you flagging exempt code. Flag a violation only when you
+can quote the exact rule and the exact line that breaks it — no style preferences, no "spirit of
+the doc" inferences. Name the file and quote the rule so the report can cite it. This is also
+where docs drift belongs: one canonical home per fact, generated `<!-- BEGIN GENERATED -->` regions
+regenerated rather than hand-edited, identifiers verified against source rather than against other
+docs. `review-docs-drift` is the exhaustive form of that check and the author is required to have
+run it before opening — which is a reason to read what they reported, not a reason to skip this
+angle.
 
 **Angle I — scope and test coverage.** Hold the diff against the intent sentence from step 3. Flag
 changes that do not serve it: an unrelated refactor riding along, a dependency bump nobody asked

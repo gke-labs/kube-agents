@@ -1,6 +1,6 @@
 # GitHub token minter for a CI evaluation-pool project
 
-Root composition that provisions the [GitHub token minter](../../modules/github-minter/README.md)'s GCP half in **one** project of the Prow evaluation pool (`kube-agents-evals-project`), so that the presubmit eval's GitHub-writing scenarios — the fleet-audit streams and `rca-remediation-pr` — can mint a token scoped to that project's GitOps repository and no other.
+Root composition that provisions the [GitHub token minter](../../modules/github-minter/README.md)'s GCP half in **one** project of the Prow evaluation pool (`kube-agents-evals-project`), so that the presubmit eval's GitHub-writing scenarios — the six fleet-audit streams and both remediation cases — can mint a token scoped to that project's GitOps repository and no other.
 
 This is not an installer. The pool projects already have their `platform-agent-host` cluster, their agent GSA, and their Artifact Registry repository; those were provisioned before this composition existed and stay outside its state. It adds only the three things the minter needs and nothing else:
 
@@ -55,7 +55,7 @@ terraform output manual_steps
 
 `terraform plan` before every apply is the check that matters. Onboarding a project that has not been onboarded yet is a create-only plan; **any `destroy` line means the wrong state is loaded** — stop and fix the workspace or the backend prefix rather than confirming.
 
-**Applied for all three pool projects as of 2026-08-24** — `kube-agents-evals`, `kube-agents-evals-2` and `kube-agents-evals-3`, each in its own workspace, each with the App PEM imported (`gcloud kms keys versions list --location us-central1 --keyring github-token-minter-keyring --key github-token-minter-key --project <project>` shows one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each). A fourth pool project is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
+**Applied for `kube-agents-evals` through `kube-agents-evals-10` as of 2026-08-27**, each in its own workspace, each with the App PEM imported — `gcloud kms keys versions list --location us-central1 --keyring github-token-minter-keyring --key github-token-minter-key --project <project>` shows one `ENABLED` `RSA_SIGN_PKCS1_2048_SHA256` version in each. Applied is not the same as leasable: which projects a presubmit can draw is the Boskos roster in `gke-internal/test-infra`, which a project joins after this apply rather than before. The next project onboarded is the create-only case above, in a workspace of its own, and step 2 below has no key to import into until that apply lands.
 
 `location` and `namespace` default to the values `hack/ci-env.sh` uses (`us-central1`, `kubeagents-system`) and should only be overridden if that file changes: the chart derives the KMS key path from `platformAgent.harness.location`, which `hack/ci-deploy.sh` sets from `REGION`.
 
@@ -67,7 +67,7 @@ Two steps are human-only, and the minter does not work until both are done. `ter
 
 **1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on `gke-agentic`. Grant `contents: write`, `pull_requests: write` and `issues: write` on that repository only.
 
-**This is already done for all three current pool projects.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on `gke-agentic/kube-agents-evals-infra`, `gke-agentic/kube-agents-evals-2-infra`, and `gke-agentic/kube-agents-evals-3-infra`. Verify before an apply:
+**This is already done for every project onboarded so far.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on each project's `gke-agentic/<project>-infra` repository and nothing else. The query below is the list, rather than a copy of it kept here to go stale:
 
 ```bash
 gh api /orgs/gke-agentic/installations \

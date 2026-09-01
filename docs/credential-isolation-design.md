@@ -56,18 +56,36 @@ The credential sidecar receives secret environment variables, credential state,
 and its identity token. It also receives a second, separately-audienced
 Kubernetes-API token, CA, and namespace projection, which the event watcher it
 hosts uses to reach the management cluster. Neither token is mounted in the
-agent or dashboard containers. The credential sidecar also authenticates callers of the
+agent or dashboard containers. (`spec.security.splitCredentialBrokerPod: true`
+is the exception, and the only one: it mounts a third, audience-bound token
+into the agent container so the agent can authenticate to the broker across
+the network. Every unqualified "the sandbox holds no token" claim below
+describes the sidecar layout.) The credential sidecar also authenticates callers of the
 PlatformAgent API before forwarding requests with a non-secret internal
 sentinel. Pod-wide automatic KSA token mounting is disabled.
 
 ### Guarantee
 
-The operator does not place managed credentials in the sandbox container's:
+In the sidecar layout the operator does not place managed credentials in the
+sandbox container's:
 
 - environment;
 - root filesystem;
 - persistent agent volume; or
 - mounted ServiceAccount token path.
+
+The last of those four is given up under
+`spec.security.splitCredentialBrokerPod: true`, which mounts a projected
+ServiceAccount token in the sandbox deliberately; the other three hold in both
+layouts.
+
+The shared agent volume is outside all four, and it is the live gap in both
+layouts. A repository's own `.git/config` is read by every `git` invocation, so
+a `core.fsmonitor` entry the sandbox writes under the workspace root runs in the
+credential holder on the next `git status` — with no lease taken and no
+mutating verb, which is why neither the workspace-lease floor nor the
+argument-level deny policy reaches it. Closing it means the broker owning its
+workspace rather than operating in the agent's.
 
 `spec.deployment.env` is applied to the credential sidecar because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
@@ -215,6 +233,10 @@ to a per-process random salt with one warning.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential sidecar.
+The table above describes the sidecar layout; under
+`spec.security.splitCredentialBrokerPod: true` a token with the same audience
+is also mounted read-only in the sandbox, because that is how the agent
+authenticates to a broker that is no longer on loopback.
 The event watcher has a separate one-hour token with the Kubernetes API's
 default audience, plus the cluster CA and Pod namespace, mounted at the
 conventional in-cluster path in the same credential sidecar. Two differently
@@ -507,9 +529,85 @@ add another. Allowlisting the subcommands the product issues, and failing closed
 on the rest, is the structurally correct form and is the recommended follow-up.
 
 Reducing both is the motivation for having the runtime receive file content from
-the sandbox rather than operate inside a directory the sandbox controls; until
-that lands, a cloned working tree is sandbox-controlled input and not a trust
-boundary.
+the sandbox rather than operate inside a directory the sandbox controls. The
+mechanism for that is described below; until the skills are moved onto it, a
+cloned working tree is sandbox-controlled input and not a trust boundary.
+
+### Broker-owned working trees
+
+The controls above all work on the argument vector, and every one of them shares
+a premise: the runtime executes inside a directory the sandbox owns. That premise
+is what makes repository-local configuration reachable at all, and it is the
+reason enumeration cannot finish — the dangerous keys carry an arbitrary name
+inside the key, so there is no finite set to deny.
+
+The alternative is to stop passing a directory. The sandbox sends `{path, bytes}`
+pairs, a branch and a message; the runtime writes them into a tree on its own
+volume, commits and pushes; the sandbox never names a path and never sees one
+come back. `CREDENTIAL_PROXY_CONTENT_WORKSPACE` arms it and it is off by default.
+While it is off the `/v1/workspace/*` routes do not exist — they answer 404, which
+is also what an older runtime answers, so a client can detect support by asking.
+
+Four things hold it together, and they are not equally strong:
+
+- **Disjoint roots, checked.** The tree root is under the runtime's own state
+  directory and the check that it does not overlap the shared workspace runs at
+  construction. A mount rearrangement that collapses the two is a runtime that
+  refuses to start rather than one that starts without the property.
+- **One path validator.** The same function decides what a path may name on
+  reads and on writes, refuses rather than normalises, and refuses every spelling
+  of `.git` that a filesystem treats as `.git`. A checker that disagrees with
+  itself about what `manifests/../.git/config` means is the defect class this
+  document keeps describing.
+- **A separate door for the runtime's own git.** Broker-internal git does not go
+  through `/v1/exec`. It accepts a literal allowlist of the subcommands this
+  mechanism issues (`WORKSPACE_GIT_SUBCOMMANDS` in
+  `agents/platform/scripts/content_workspace.py`), refuses `-C`, and is contained
+  to the tree root. Keeping the two apart is what lets the sandbox-facing
+  answer stay "git is not reachable" rather than "git is reachable, narrowly".
+- **Geometry, not checked here.** In the sidecar deployment the tree root is on
+  the runtime's own volume, which the sandbox container does not mount. Nothing in
+  the process can verify that; it is the same argument this document already makes
+  about `$HOME/.gitconfig` and `KUBECTL_KUBERC`, and it is exactly as weak. The
+  structural form of it is the separate broker Pod, where there is no shared mount
+  to name.
+
+Resource notes, because the trees are on the runtime's own emptyDir and that is
+node ephemeral storage rather than a disk of its own.
+
+The number of open workspaces is capped, and a clone that comes in over
+`CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB by default) is removed rather than
+kept, so a repository the runtime cannot afford does not sit half-cloned on the
+node. Read those two together rather than separately: the ceiling is **per
+clone**, so the two defaults multiply out to about 2 GiB retained across eight
+open workspaces, by design. Size the node's ephemeral storage against the
+product, not against either number.
+
+The ceiling is also measured after the clone finishes, so it bounds what is
+_retained_ and not the peak: a repository far over the limit still lands on the
+disk before it is removed, and the only thing bounding that is the runtime's
+per-invocation timeout. A shallow clone plus the ceiling would bound both and is
+the right follow-up; neither alone does.
+
+Separately, the content routes raise the request-body cap to twice the
+total-payload limit, and the listener is threaded with no connection cap, so peak
+heap is roughly concurrency times that figure. None of this is reachable from
+outside the Pod, but it is worth knowing before the flag is armed anywhere it
+matters.
+
+Every verb takes a lock for its whole duration. The handler is threaded, so two
+requests naming one handle genuinely interleave, and each verb is a read-then-act
+on a working tree the other is entitled to delete or reset underneath it. Without
+it a `close` landing inside a `commit` leaves the commit re-creating the tree the
+close just removed, with no handle pointing at it.
+
+Be precise about what arming this does and does not do. It does not change what
+`git` executes: a repository-local `.git/config` planted in the runtime's own tree
+still runs what it names, measured both ways. What changes is who can write that
+file. And `/v1/exec` is unchanged while the flag is on — both mechanisms run side
+by side deliberately, so that landing this does not have to be reverted to fix the
+migration. The finding class above therefore closes for work that goes through the
+content routes and stays open for work that does not, which today is all of it.
 
 ### Agent-supplied kubeconfigs
 
@@ -615,7 +713,9 @@ only command output, never a mounted Git credential file.
 - `automountServiceAccountToken: false` applies to the Pod.
 - Two separately projected ServiceAccount token volumes are mounted only by the
   credential sidecar — its own, and the event watcher's; neither is mounted by
-  the agent or dashboard containers.
+  the agent or dashboard containers. Under `spec.security.splitCredentialBrokerPod: true`
+  the agent container does mount one — the broker-audience token it presents
+  to the broker Service.
 - Secret and credential-state volumes are mounted only by the credential
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
@@ -651,21 +751,27 @@ only command output, never a mounted Git credential file.
 
 ## Deployment and Migration
 
-The operator always creates the sandbox and Envoy credential sidecar together
-in the existing `<agent>-gateway` Deployment and retains the existing
-`<agent>-data` PVC. Before the sandbox starts, a managed init container removes
-legacy gcloud, GitHub, Git, Kubernetes, AWS, Azure, Docker, npm, and Python
-credential files from that PVC. This preserves agent state without carrying
-credentials forward from an older deployment. It deletes operator-owned
-resources from the abandoned two-Pod design:
+The operator creates the sandbox and Envoy credential sidecar together in the
+existing `<agent>-gateway` Deployment and retains the existing `<agent>-data`
+PVC — unless `spec.security.splitCredentialBrokerPod` is enabled, in which case
+the credential runtime is rendered as its own `<agent>-credential-proxy`
+Deployment and Service instead of as a sidecar. Before the sandbox starts, a
+managed init container removes legacy gcloud, GitHub, Git, Kubernetes, AWS,
+Azure, Docker, npm, and Python credential files from that PVC. This preserves
+agent state without carrying credentials forward from an older deployment. It
+deletes operator-owned resources from the abandoned two-Pod design:
 
-- `<agent>-credential-proxy` Deployment;
 - `<agent>-sandbox` Deployment;
-- `<agent>-credential-proxy` Service;
 - `<agent>-sandbox` ServiceAccount; and
 - `<agent>-sandbox-metadata-deny` NetworkPolicy.
 
 Deletion refuses to remove resources not owned by the PlatformAgent.
+
+Two names that used to be on that list are no longer deleted, and the
+difference is load-bearing. The `<agent>-credential-proxy` Deployment and
+Service are not legacy any more: they are exactly what the operator renders
+under `splitCredentialBrokerPod: true`, and it owns them in both directions —
+applied while the flag is on, deleted when it goes off.
 
 The credential-sidecar image contains Envoy, the real credential-aware CLIs,
 and the credential runtime. The sandbox image contains only the wrappers for
@@ -700,13 +806,18 @@ per-container network identity.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
-   volume, or ServiceAccount token mount, and no Secret-backed env other than
-   the two pod-scoped Session KV values named above — the assertion enumerates
-   them, so a third one cannot be added without amending this list;
+   volume, and no Secret-backed env other than the two pod-scoped Session KV
+   values named above — the assertion enumerates them, so a third one cannot
+   be added without amending this list. In the sidecar layout it also has no
+   ServiceAccount token mount; under `splitCredentialBrokerPod: true` it
+   mounts exactly one token, the broker-audience projection, and still none
+   of the rest;
 2. only the credential sidecar mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;
-4. wrapper URLs resolve to `127.0.0.1:8765`;
+4. wrapper URLs resolve to `127.0.0.1:8765` in the sidecar layout, and to
+   `http://<agent>-credential-proxy.<namespace>.svc.cluster.local:8765` when
+   `splitCredentialBrokerPod` is enabled;
 5. Envoy can reach the Unix-socket backend and `/healthz` reflects both;
 6. unsupported executables, raw shell requests, and blocked disclosure commands
    fail closed;
@@ -714,7 +825,11 @@ CI and deployment tests should assert that:
    with no `exec`, `server`, `proxy-url`, or `tokenFile` value from the supplied
    document reaching it, whether it arrives through `KUBECONFIG` or
    `--kubeconfig`;
-8. the old proxy Deployment and Service are absent after reconciliation;
+8. the `<agent>-credential-proxy` Deployment and Service are absent after
+   reconciliation in the sidecar layout, and present under
+   `splitCredentialBrokerPod: true` — the name is reconciled in both
+   directions, not unconditionally removed. The `<agent>-sandbox`
+   Deployment and ServiceAccount are absent in every configuration;
 9. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
 10. Pod readiness fails when either Envoy or the credential runtime fails.

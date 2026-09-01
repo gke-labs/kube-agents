@@ -21,7 +21,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path"
 	"reflect"
@@ -357,7 +356,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	platformStart := len(lines)
 
 	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
-		add("GOOGLE_CHAT_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
+		add("GOOGLE_CHAT_RELAY_URL", credentialProxyBaseURL(agent))
 		add("GOOGLE_CHAT_PROJECT_ID", gchat.ProjectID)
 		add("GOOGLE_CHAT_SUBSCRIPTION_NAME", fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName))
 		add("GOOGLE_CHAT_ALLOWED_USERS", strings.Join(gchat.AllowedUsers, ","))
@@ -365,7 +364,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	}
 
 	if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
-		add("SLACK_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
+		add("SLACK_RELAY_URL", credentialProxyBaseURL(agent))
 		add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
 		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
 	}
@@ -1643,10 +1642,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := agentServiceAccountName(agent)
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
@@ -1805,7 +1801,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "GOOGLE_CHAT_RELAY_URL",
-					Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+					Value: credentialProxyBaseURL(agent),
 				},
 				{
 					Name:  "GOOGLE_CHAT_PROJECT_ID",
@@ -1836,7 +1832,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "SLACK_RELAY_URL",
-					Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+					Value: credentialProxyBaseURL(agent),
 				},
 				{
 					Name:  "SLACK_ALLOWED_USERS",
@@ -1905,8 +1901,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
-		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+		Value: credentialProxyBaseURL(agent),
 	})
+	if credentialBrokerIsSplit(agent) {
+		// Only meaningful once the broker is off the Pod's loopback. In the
+		// sidecar layout the client sends no credential at all, because the
+		// socket it reaches is the credential.
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
+			Value: credentialProxyTokenMountPath + "/token",
+		})
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1991,7 +1996,21 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// where the proxy is running without sidecar semantics.
 	// charts/kube-agents/Chart.yaml pins the same floor, so Helm refuses the
 	// install before it gets that far.
-	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
+	//
+	// None of that applies once spec.security.splitCredentialBrokerPod moves the
+	// broker into a Pod of its own: there is no shared network namespace and so
+	// no bind to race for. What stays behind in the agent Pod is the front door
+	// for the agent's own API, which cannot follow the broker across the Pod
+	// boundary — see buildAgentAPIProxyContainer — plus the projected token the
+	// agent presents to the broker over the network.
+	if credentialBrokerIsSplit(agent) {
+		containers = append(containers, buildAgentAPIProxyContainer(agent))
+		mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
+			Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
+		})
+	} else {
+		initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2028,7 +2047,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
-	volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
+	if credentialBrokerIsSplit(agent) {
+		// The broker's volumes all go with the broker, including the
+		// event-watcher pair: the watcher is hosted inside the credential
+		// container, so it leaves the agent Pod too and nothing here mounts
+		// either volume. What stays is the token the agent presents to the
+		// broker across the network.
+		volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	} else {
+		volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
+	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -2328,14 +2356,83 @@ func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) c
 	}
 }
 
+// scopedSAPoolKey is the ConfigMap key, and the basename the broker mounts it
+// under. It rides in the credential-proxy policy ConfigMap rather than one of
+// its own, for a reason worth keeping: that ConfigMap is already hashed into
+// the Pod template annotation, so a change to the mapping rolls the broker.
+// The broker reads this file once at startup and refuses to serve if it is
+// unusable, so a mapping change that did not restart it would take effect at
+// the next unrelated restart — which is the kind of delay nobody debugs.
+const scopedSAPoolKey = "scoped-sa-pool.json"
+
+const scopedSAPoolMountPath = "/etc/credential-proxy/" + scopedSAPoolKey
+
+// scopedSAPoolJSON renders the mapping the broker consumes, or "" when the
+// agent has none configured.
+//
+// Sorted by the scope key. The CR is a list and Kubernetes preserves its order,
+// so an operator reordering two entries would otherwise rewrite the ConfigMap,
+// change its hash and roll the broker for no change in meaning.
+//
+// No error return, because there is no failure to report: the document is a
+// struct of strings and ints, which json.Marshal cannot fail on. An error
+// return here would have to be either swallowed or propagated through a builder
+// that has nowhere to put it, and a swallowed one would leave the broker armed
+// by its environment variable with no mapping file to read.
+func scopedSAPoolJSON(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Security == nil || len(agent.Spec.Security.ScopedServiceAccounts) == 0 {
+		return ""
+	}
+	type entry struct {
+		ProjectID           string `json:"projectId"`
+		Location            string `json:"location"`
+		ClusterName         string `json:"clusterName"`
+		ServiceAccountEmail string `json:"serviceAccountEmail"`
+	}
+	entries := make([]entry, 0, len(agent.Spec.Security.ScopedServiceAccounts))
+	for _, account := range agent.Spec.Security.ScopedServiceAccounts {
+		entries = append(entries, entry{
+			ProjectID:           account.ProjectID,
+			Location:            account.Location,
+			ClusterName:         account.ClusterName,
+			ServiceAccountEmail: account.ServiceAccountEmail,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return scopedSAPoolScopeKey(entries[i].ProjectID, entries[i].Location, entries[i].ClusterName) <
+			scopedSAPoolScopeKey(entries[j].ProjectID, entries[j].Location, entries[j].ClusterName)
+	})
+	document, _ := json.Marshal(struct {
+		Version         int     `json:"version"`
+		ServiceAccounts []entry `json:"serviceAccounts"`
+	}{Version: 1, ServiceAccounts: entries})
+	return string(document)
+}
+
+// scopedSAPoolScopeKey is the GKE resource name. Written here as well as in the
+// broker and in Terraform because all three have to agree; the broker's
+// `scoped_sa_pool.scope_key` and the key the Terraform module files each pool
+// member under are the other two, and tests compare them.
+func scopedSAPoolScopeKey(project, location, cluster string) string {
+	return fmt.Sprintf("projects/%s/locations/%s/clusters/%s", project, location, cluster)
+}
+
+func scopedSAPoolEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return agent.Spec.Security != nil && len(agent.Spec.Security.ScopedServiceAccounts) > 0
+}
+
 func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	data := map[string]string{"policy.json": credentialProxyPolicyJSON}
+	if pool := scopedSAPoolJSON(agent); pool != "" {
+		data[scopedSAPoolKey] = pool
+	}
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      agent.Name + "-credential-proxy-policy",
 			Namespace: agent.Namespace,
 		},
-		Data: map[string]string{"policy.json": credentialProxyPolicyJSON},
+		Data: data,
 	}
 }
 
@@ -2419,6 +2516,19 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	securityContext := hardenedSecurityContext()
 	securityContext.RunAsUser = ptr.To(credentialProxyUID)
 	securityContext.RunAsGroup = ptr.To(agentFSGroup)
+
+	// Conditional because it is a SubPath mount: naming a key the ConfigMap
+	// does not carry leaves the container unable to start, so the mount and the
+	// key have to appear and disappear together.
+	scopedPoolMounts := []corev1.VolumeMount{}
+	if scopedSAPoolEnabled(agent) {
+		scopedPoolMounts = append(scopedPoolMounts, corev1.VolumeMount{
+			Name:      "credential-proxy-policy",
+			MountPath: scopedSAPoolMountPath,
+			SubPath:   scopedSAPoolKey,
+			ReadOnly:  true,
+		})
+	}
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
@@ -2446,7 +2556,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
 		},
-		VolumeMounts: []corev1.VolumeMount{
+		VolumeMounts: append([]corev1.VolumeMount{
 			{Name: "credential-proxy-policy", MountPath: "/etc/credential-proxy/policy.json", SubPath: "policy.json", ReadOnly: true},
 			{Name: "credential-proxy-tmp", MountPath: "/tmp"},
 			{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
@@ -2458,7 +2568,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			// the management cluster, which never gets a Cluster Agent profile.
 			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
-		},
+		}, scopedPoolMounts...),
 		SecurityContext: securityContext,
 	}
 }
@@ -2493,8 +2603,6 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
-		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-		{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
 		// Read by the k8s-event-watcher this container hosts, via --token-env.
 		// A non-secret loopback sentinel, not a credential; the real secret is
 		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
@@ -2504,23 +2612,57 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// incidental and would not hold for a name not on that list.
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
-	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
-	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
-		apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+	// Set in both directions, deliberately. The broker's own default is off, so
+	// the "0" changes nothing on its own — what it buys is that the credential
+	// mode an install is in can be read off the Deployment rather than inferred
+	// from an absent variable. Same reason the mapping is a ConfigMap rather
+	// than something the broker derives.
+	if scopedSAPoolEnabled(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "1"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE", Value: scopedSAPoolMountPath},
+		)
+	} else {
+		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"})
 	}
-	envVars = append(envVars, corev1.EnvVar{
-		Name: "API_SERVER_EXTERNAL_KEY",
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: apiServerSecretRef,
-		},
-	})
-	// The k8s-event-watcher hosted here posts events to the Session KV server
-	// in the sandbox container over the shared pod loopback, and that server
-	// now authenticates. start-services.sh passes this name to --token-env.
-	envVars = append(envVars, corev1.EnvVar{
-		Name:      "SESSION_KV_API_KEY",
-		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
-	})
+	if credentialBrokerIsSplit(agent) {
+		// Everything the split changes about the broker's own configuration.
+		// The agent-API front door is gone (it stayed in the agent Pod, so none
+		// of its three variables are set here), Envoy listens on the Pod IP
+		// rather than loopback, and the loopback that used to be the access
+		// control is replaced by a verified caller.
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUTH_MODE", Value: "serviceaccount"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
+		)
+	} else {
+		apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
+		if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
+			apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+		}
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
+			corev1.EnvVar{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
+			corev1.EnvVar{
+				Name:      "API_SERVER_EXTERNAL_KEY",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: apiServerSecretRef},
+			},
+			// The k8s-event-watcher hosted here posts events to the Session KV
+			// server in the sandbox container over the shared pod loopback, and
+			// that server now authenticates. start-services.sh passes this name
+			// to --token-env. Sidecar mode only: in the split there is no shared
+			// loopback for it to cross.
+			corev1.EnvVar{
+				Name:      "SESSION_KV_API_KEY",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
+			},
+		)
+	}
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
@@ -2581,7 +2723,17 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		reserved[name] = struct{}{}
 	}
 	for _, name := range []string{
+		// The authentication settings are reserved for the same reason the
+		// bootstrap command is: a plugin that could set CREDENTIAL_PROXY_AUTH_MODE
+		// could turn the caller check off, and one that could set
+		// CREDENTIAL_PROXY_ALLOWED_CALLERS could add itself to it.
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS",
+		"CREDENTIAL_PROXY_AUDIENCE",
+		"CREDENTIAL_PROXY_AUTH_MODE",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		"CREDENTIAL_PROXY_ENVOY_ADDRESS",
+		"CREDENTIAL_PROXY_KUBE_CA_FILE",
+		"CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
 		// The read-only kill switch. Unreserved, a one-line
 		// `CREDENTIAL_PROXY_ENFORCE_READ_ONLY: "false"` under
 		// spec.deployment.env turns off every refusal the policy makes --
@@ -2600,6 +2752,19 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
 		"CREDENTIAL_PROXY_PORT",
+		"CREDENTIAL_PROXY_ROLE",
+		// Same argument as the authentication settings above, one layer over.
+		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch
+		// the broker back onto the agent's own project-wide identity, and one
+		// that could set the FILE variable would point it at a mapping of its
+		// own choosing — naming, for instance, an account it would rather be.
+		//
+		// The flag is in `managed` on every render, so the loop above already
+		// reserves it and this line is belt and braces. The FILE variable is
+		// only in `managed` when a pool is configured, so on an install with no
+		// pool this line is the only thing reserving it.
+		"CREDENTIAL_PROXY_SCOPED_SA_POOL",
+		"CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE",
 		"CREDENTIAL_PROXY_STATE_DIR",
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
@@ -2683,32 +2848,61 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	return result
 }
 
+// buildEventWatcherKubeconfigVolume is the kubeconfig the broker writes for the
+// event-watcher. It belongs to the event-watcher container, so when the broker
+// moves to its own Pod this stays here as well as going there.
+func buildEventWatcherKubeconfigVolume() corev1.Volume {
+	return corev1.Volume{Name: "event-watcher-kubeconfig", VolumeSource: corev1.VolumeSource{
+		EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("1Mi"))},
+	}}
+}
+
+// buildEventWatcherTokenVolume is a default-audience ServiceAccount token with
+// the cluster CA and namespace beside it — the conventional in-cluster client
+// bundle. The event-watcher authenticates to the API server with it, and when
+// the broker is split it makes the broker's TokenReview call with it too.
+func buildEventWatcherTokenVolume() corev1.Volume {
+	return corev1.Volume{Name: "event-watcher-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		DefaultMode: ptr.To(int32(0400)),
+		Sources: []corev1.VolumeProjection{
+			{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}},
+			{ConfigMap: &corev1.ConfigMapProjection{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+				Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+			}},
+			{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
+				Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
+			}}}},
+		},
+	}}}
+}
+
 func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	return []corev1.Volume{
 		{Name: "credential-proxy-policy", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-credential-proxy-policy"}}}},
 		{Name: "credential-proxy-tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
 		{Name: "credential-proxy-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("5Gi"))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
-		{Name: "event-watcher-kubeconfig", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("1Mi"))}}},
+		buildEventWatcherKubeconfigVolume(),
 		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-				Audience: "kubeagents-credential-proxy", ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
+				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
 			}}},
 		}}},
-		{Name: "event-watcher-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-			DefaultMode: ptr.To(int32(0400)),
-			Sources: []corev1.VolumeProjection{
-				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}},
-				{ConfigMap: &corev1.ConfigMapProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
-					Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
-				}},
-				{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
-					Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
-				}}}},
-			},
-		}}},
+		buildEventWatcherTokenVolume(),
+	}
+}
+
+// mountIntoContainer adds a mount to the named container, by name rather than
+// by index: the container list is assembled from several builders and the
+// indices move.
+func mountIntoContainer(containers []corev1.Container, name string, mount corev1.VolumeMount) {
+	for index := range containers {
+		if containers[index].Name == name {
+			containers[index].VolumeMounts = append(containers[index].VolumeMounts, mount)
+			return
+		}
 	}
 }
 
@@ -3375,10 +3569,7 @@ func buildPlatformLocalRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 
 // buildClusterRoleBinding generates a ClusterRoleBinding manifest
 func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.ClusterRoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := agentServiceAccountName(agent)
 
 	return &rbacv1.ClusterRoleBinding{
 		TypeMeta: metav1.TypeMeta{
@@ -3776,12 +3967,16 @@ func otlpCollectorNamespace(endpoint string) string {
 }
 
 // formatCIDRPeers normalises a mix of bare IPs and CIDRs into sorted, deduplicated
-// NetworkPolicyPeers. A bare IP becomes a single-host /32 or /128; a CIDR is kept as
-// written. Anything unparseable is dropped.
+// NetworkPolicyPeers. A bare IP becomes a single-host /32 or /128. Anything unparseable
+// is dropped.
 //
 // enforceMinPrefix rejects CIDRs broader than /12 (IPv4) or /48 (IPv6), which stops a
 // caller-supplied range from being weaponised into an unrestricted egress bypass. Pass
 // false only where the input cannot come from outside the operator.
+//
+// normalizeCIDRTarget does the per-entry work, shared with toEgressRules -- including
+// the address-family rule that keeps an IPv4-mapped IPv6 block from clearing the IPv6
+// floor and then printing as 0.0.0.0/0.
 func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.NetworkPolicyPeer {
 	seen := make(map[string]bool, len(raw))
 	var cidrs []string
@@ -3793,33 +3988,8 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 	}
 
 	for _, entry := range raw {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		if strings.Contains(entry, "/") {
-			_, ipNet, err := net.ParseCIDR(entry)
-			if err != nil {
-				continue
-			}
-			if enforceMinPrefix {
-				ones, bits := ipNet.Mask.Size()
-				if (bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix) {
-					continue
-				}
-			}
+		if ipNet, ok := normalizeCIDRTarget(entry, enforceMinPrefix); ok {
 			add(ipNet.String())
-			continue
-		}
-		bare := strings.Trim(entry, "[]")
-		ip := net.ParseIP(bare)
-		if ip == nil {
-			continue
-		}
-		if ip.To4() != nil {
-			add(bare + "/32")
-		} else {
-			add(bare + "/128")
 		}
 	}
 
@@ -3842,13 +4012,9 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
-	dnsClusterIP := strings.Trim(profile.DNSClusterIP, "[]")
-	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
-		dnsClusterIP = defaultDNSClusterIP
-	}
-	dnsCidr := dnsClusterIP + "/32"
-	if strings.Contains(dnsClusterIP, ":") {
-		dnsCidr = dnsClusterIP + "/128"
+	dnsIPs := profile.DNSClusterIPs
+	if len(dnsIPs) == 0 {
+		dnsIPs = []string{defaultDNSClusterIP}
 	}
 
 	apiPeers := formatCIDRPeers(apiCIDRs, true)
@@ -3856,14 +4022,10 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		apiPeers = formatCIDRPeers([]string{"10.96.0.1"}, true)
 	}
 
-	// The link-local address a workload actually connects to. Every datapath rewrites
-	// it before the policy is evaluated, so it only ever matches on the pre-DNAT ports.
+	// The link-local address a workload actually connects to. Dataplane V2 (eBPF)
+	// evaluates policy pre-NAT, so this peer matches there on the pre-DNAT ports;
+	// Dataplane V1 DNATs first, so its token fetches are matched by rule 3 instead.
 	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
-	// Everything the rewritten packet can be addressed to, all of it on port 988:
-	// the metadata daemon's own link-local address on the iptables datapath.
-	// See metadataDaemonIP.
-	metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
 
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
@@ -3927,12 +4089,19 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 				CIDR: "169.254.20.10/32",
 			},
 		},
-		{
-			IPBlock: &networkingv1.IPBlock{
-				CIDR: dnsCidr,
-			},
-		},
 	}
+
+	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
+	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
+	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
+	// operator, which always widen to a single host. The default is the fallback for
+	// nothing surviving, not for each entry that does not parse -- two bad entries
+	// used to emit the default twice.
+	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
+	if len(dnsIPPeers) == 0 {
+		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
+	}
+	dnsPeers = append(dnsPeers, dnsIPPeers...)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
@@ -3943,27 +4112,52 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: dnsPeers,
 		},
-		// 2. GCP Metadata Server, link-local address only. Nothing rewrites a request to
-		//    these ports onto another address, so widening this rule would grant the
-		//    sandbox reach it never uses.
+		// 2. GCP Metadata Server (pre-NAT link-local address). Workloads dial 169.254.169.254
+		//    on port 80 for HTTP metadata / OAuth2 token fetches. On Dataplane V2 (eBPF),
+		//    policy evaluates pre-NAT and this rule admits token fetches directly. Port 8080,
+		//    the pre-NAT ALTS handshaker port, is deliberately absent — rule 3 says why.
 		{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
 			},
 			To: linkLocalPeers,
 		},
-		// 3. GKE Workload Identity host-network daemon (port 988). This is where a
-		//    metadata request lands after the node DNATs it, so it has to permit every
-		//    rewrite target the datapath can pick.
-		{
+	}
+
+	// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+	//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
+	//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+	//    policy is evaluated pre-NAT at the socket layer and matched by rule 2. If
+	//    profile.MetadataDaemonIP == "", rule 3 is suppressed.
+	//
+	//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
+	//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
+	//    because kube-agents components use standard OAuth2/REST token fetches and no client
+	//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
+	//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
+	//
+	//    That is a deviation from the guidance, which warns that workloads omitting these
+	//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
+	//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
+	//    check: capture the drop's destination port and reopen 987/8080 here if it is one
+	//    of them.
+	if profile.MetadataDaemonIP != "" {
+		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
+		port := profile.MetadataDaemonPort
+		if port == 0 {
+			port = metadataDaemonDefaultPort
+		}
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(988))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(port))},
 			},
 			To: metadataDaemonPeers,
-		},
+		})
+	}
+
+	egressRules = append(egressRules,
 		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
@@ -3987,7 +4181,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 		// 5. vLLM Gemma Server in the agent namespace (Service port 80 and container port 8000)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8000))},
@@ -4003,7 +4197,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 		// 6. Kubernetes API Server (Control Plane Endpoints and ClusterIP VIP)
-		{
+		networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(6443))},
@@ -4011,7 +4205,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: apiPeers,
 		},
-	}
+	)
 
 	// 7. External HTTPS (Google APIs, GitHub, etc.)
 	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
@@ -4077,6 +4271,34 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 	})
+
+	// 10. Hindsight memory API in the agent namespace (Service and container port 8888).
+	//     Unconditional, like rules 4, 5 and 9: the selector matches nothing on an
+	//     install without --memory=hindsight. Without it every memory_retain and
+	//     memory_recall from the gateway times out. A cluster that does not enforce
+	//     NetworkPolicy at all connects anyway, which is why the missing rule went
+	//     unnoticed: the install it breaks is the one that enforces the policy.
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8888))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app.kubernetes.io/name":      "hindsight",
+						"app.kubernetes.io/component": "api",
+					},
+				},
+			},
+		},
+	})
+
+	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
+	// addition to the operator's own set rather than being interleaved with it.
+	if len(profile.AdditionalEgress) > 0 {
+		egressRules = append(egressRules, profile.AdditionalEgress...)
+	}
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{

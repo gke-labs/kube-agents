@@ -79,6 +79,26 @@ jobs:
           )
           helm lint charts/kube-agents "${SET_FLAGS[@]}"
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" > /dev/null
+          # A default render must carry the agent-RBAC admission policies. The
+          # Python suite checks the template and the values gate; only a real
+          # render proves the two combine into installable objects.
+          for name in kube-agents-agent-readonly kube-agents-agent-binding-scope; do
+            count=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              | grep -c "^  name: $name$" || true)
+            if [ "$count" -ne 2 ]; then
+              echo "expected the policy and its binding for $name in a default render, found $count" >&2
+              exit 1
+            fi
+          done
+          # And must render none of them on 1.29, which Chart.yaml still accepts:
+          # ValidatingAdmissionPolicy is only v1 from 1.30, so without the version
+          # guard a default install there fails the whole release on `no matches
+          # for kind` -- and through Terraform, the whole apply.
+          if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" --kube-version 1.29.0 \
+            | grep -q "ValidatingAdmissionPolicy"; then
+            echo "the admission policies rendered on 1.29, where the API is not v1" >&2
+            exit 1
+          fi
           # Render again with explicit image tags to cover the override path.
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --set operator.image.tag=v9.9.9 \
@@ -114,12 +134,71 @@ jobs:
           # what lets callers write `{{- with (include ...) }}`. hermes is not in
           # this list: it carries a mandatory apiServerSecretRef and so always
           # renders — only the optional fields inside it are compacted.
+          # availability needs runtimeClassName emptied to qualify: it defaults
+          # to "gvisor", so the block is not all-unset by default. Setting it
+          # back to "" is also the documented way to run on the standard
+          # container runtime, so this doubles as the check that opting out
+          # removes the field rather than rendering an empty one.
           if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --show-only templates/platform-agent-cr.yaml \
+            --set platformAgent.deployment.availability.runtimeClassName="" \
             | grep -qE "^\s+(memory|availability):"; then
             echo "an all-unset parent block still rendered" >&2
             exit 1
           fi
+
+          # litellm.rollingUpdate: the both-zero guard has to reject a
+          # Deployment that cannot make progress, and only that. maxSurge and
+          # maxUnavailable are IntOrString, so a percentage is legal on both
+          # and must still render — a guard using Helm's `int` reads "25%" as 0
+          # and refuses a valid install (#749).
+          # "0.0" is here because it is the spelling a list of literal zeroes
+          # misses: `--set x=0.0` reaches the template as the string "0.0".
+          # "abc" is the other side: it must NOT be refused as a zero, because
+          # `float64` reports anything unparseable as 0 and the message would
+          # then name the wrong problem.
+          for pair in "0 0" "0% 0%" "0.0 0.0" "0 0%"; do
+            set -- $pair
+            if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              --set-string litellm.rollingUpdate.maxSurge="$1" \
+              --set-string litellm.rollingUpdate.maxUnavailable="$2" > /dev/null 2>&1; then
+              echo "litellm.rollingUpdate $1/$2 rendered; it cannot make progress" >&2
+              exit 1
+            fi
+          done
+          for pair in "25% 25%" "1 0" "0 1" "abc abc"; do
+            set -- $pair
+            if ! helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              --set-string litellm.rollingUpdate.maxSurge="$1" \
+              --set-string litellm.rollingUpdate.maxUnavailable="$2" > /dev/null 2>&1; then
+              echo "litellm.rollingUpdate $1/$2 is valid but was refused" >&2
+              exit 1
+            fi
+          done
+          # A fencepost with no usable value must render the chart default
+          # explicitly, never empty: empty means Kubernetes applies its own 25%
+          # default, which rounds down to 0 at replicaCount 2 and reinstates the
+          # stall with nothing to see in the diff. `--set x=` and `--set x=null`
+          # are different inputs — the first is the empty string, which is a
+          # perfectly good kind and survives a nil test.
+          #
+          # --show-only isolates the LiteLLM Deployment: github-minter.yaml
+          # renders a maxUnavailable at the same indent, so an unanchored count
+          # both false-passes and false-fails depending on what else is on.
+          # `|| true` keeps grep's exit 1 on zero matches from aborting the step
+          # under `bash -e` before the message below can print.
+          for empty_flag in "litellm.rollingUpdate=null" \
+                            "litellm.rollingUpdate.maxUnavailable=null" \
+                            "litellm.rollingUpdate.maxUnavailable=" \
+                            "litellm.rollingUpdate.maxSurge="; do
+            rendered=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+              --set "$empty_flag" --show-only templates/litellm.yaml \
+              | grep -cE '^      maxUnavailable: 1$' || true)
+            if [ "$rendered" -ne 1 ]; then
+              echo "--set $empty_flag did not render an explicit maxUnavailable: 1" >&2
+              exit 1
+            fi
+          done
 
           # Webhooks: off by default, fully wired when on.
           if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \

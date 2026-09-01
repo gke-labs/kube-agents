@@ -24,9 +24,9 @@ _PLUGIN_SKILL_NAME = "gke-stockout-investigator"
 # takes it from AGENT_REF or this default without consulting the cluster.
 _DEFAULT_AGENT_REF = "platform-agent"
 
-# Everything this fixture does has to finish inside step 3's `timeout-minutes`
-# (.github/workflows/rc-release-pipeline.yml), which also has to cover runner setup, the
-# other two e2e modules, and scenario 04's own 360s watch. A wait that outlives the job
+# Everything this fixture does has to finish inside the E2E job's `timeout-minutes`
+# (.github/workflows/e2e-run.yml, whose default is what the RC pipeline gets), which also
+# has to cover runner setup, the other e2e modules, and scenario 04's own 360s watch. A wait that outlives the job
 # is worse than no wait: GitHub cancels the runner and pytest never prints the message
 # this fixture exists to print, so the diagnosis is lost in exactly the case it was
 # written for. Each wait below is clamped to whatever is left of this budget, so the

@@ -39,9 +39,17 @@ locals {
 
   required_apis = toset(concat(local.base_apis, local.chat_apis))
 
-  # The agent's GCP IAM permission-set bundles, kept verbatim so the
-  # two install paths hand the agent the same authority. Kubernetes RBAC is
-  # read-only in both; see the security-and-iam reference.
+  # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
+  # paths hand the agent the same authority. Kubernetes RBAC is read-only
+  # alongside it; see the security-and-iam reference.
+  #
+  # There is deliberately one bundle and no admin one. GKE authorizes an action
+  # if either IAM or Kubernetes RBAC allows it, so a role like
+  # roles/container.admin authorizes the agent through IAM regardless of how
+  # narrow its KSA is, and the container.clusters.impersonate it carries applies
+  # to every cluster in the project. A deployment that needs broader roles names
+  # them in project_roles, which puts the grant in the caller's Terraform where
+  # it is reviewed.
   read_only_roles = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
@@ -52,26 +60,10 @@ locals {
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
   ]
-  gke_admin_roles = [
-    "roles/container.clusterAdmin",
-    "roles/container.admin",
-    "roles/compute.viewer",
-    "roles/monitoring.admin",
-    # The agent can query logs for diagnostics but must not administer the
-    # audit-log sink.
-    "roles/logging.viewer",
-    "roles/iam.serviceAccountUser",
-    "roles/iam.securityReviewer",
-    "roles/mcp.toolUser",
-  ]
 
   # An explicit project_roles list always wins, so an existing configuration
   # that set it keeps its roles regardless of permission_set.
-  agent_project_roles = (
-    var.project_roles != null
-    ? var.project_roles
-    : (var.permission_set == "gke-admin" ? local.gke_admin_roles : local.read_only_roles)
-  )
+  agent_project_roles = var.project_roles != null ? var.project_roles : local.read_only_roles
 
   # Only non-empty credential keys end up in the Secret, so an unset optional
   # provider key does not create an empty entry.
@@ -220,14 +212,35 @@ module "gke_backup_plan" {
   encryption_key      = var.backup_encryption_key
 }
 
+locals {
+  # Indexed by the same key the kube-agents-iam module uses, so the emails
+  # coming back out of the module can be rejoined with the tuple that produced
+  # them without re-deriving anything.
+  scoped_pool_entries = {
+    for cluster in var.scoped_clusters :
+    "projects/${cluster.project_id}/locations/${cluster.location}/clusters/${cluster.cluster_name}" => cluster
+  }
+}
+
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id    = var.project_id
-  namespace     = var.namespace
-  project_roles = local.agent_project_roles
+  project_id      = var.project_id
+  namespace       = var.namespace
+  project_roles   = local.agent_project_roles
+  scoped_clusters = var.scoped_clusters
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster, and not only the API enablements, because the module's
+  # workload_identity binding names the pool as an interpolated string
+  # ("serviceAccount:${var.project_id}.svc.id.goog[...]") rather than as a
+  # reference to the cluster. Terraform therefore sees no edge between them and
+  # starts the binding as soon as the service account exists, roughly nine
+  # minutes before an Autopilot cluster finishes. The pool does not exist until
+  # the project's first Workload-Identity-enabled cluster does, so on a project
+  # that has never had one the apply fails with "Identity Pool does not exist".
+  # It survived this long because a pool outlives the cluster that created it:
+  # every project the composition had been applied to already had one.
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 # ─── Vertex AI gateway identity (model_provider = "vertex_ai") ────────────────
@@ -452,6 +465,19 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        # The mapping the credential broker selects from. It has to reach the
+        # cluster as data rather than being recomputed there: the broker refuses
+        # a scope it has no entry for, so a second implementation of the naming
+        # rule would turn a mismatch into a refusal at request time instead of a
+        # diff at plan time.
+        scopedServiceAccounts = [
+          for key in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
+            projectId           = local.scoped_pool_entries[key].project_id
+            location            = local.scoped_pool_entries[key].location
+            clusterName         = local.scoped_pool_entries[key].cluster_name
+            serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
+          }
+        ]
       }
       credentials = {
         create = true

@@ -41,21 +41,20 @@ Run the interactive one-liner installer directly in **Google Cloud Shell** or an
 curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 ```
 
-When prompted for the image/source revision, enter a SemVer release tag or the full 40-character
-commit SHA behind a validated RC tag. The installer rejects mutable refs such as `latest` and `main`
-so the install sources and container images stay on the same revision. On the one-liner above
-there is no local checkout yet, so a value is required; running `./install.sh` from a kube-agents
-clone instead offers that clone's `HEAD` as the default — which only works if a container image was
-published for that commit (CI builds one per `main` commit and per release tag).
+_To pin to a specific official release, substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases):_
 
-_(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
+```
+
+When running the release-pinned installer (`<RELEASE_VERSION>/install.sh`), the baked release version is offered as the default, so pressing Enter accepts it; `--non-interactive` uses it without prompting at all. When running the generic installer (`gke-labs.github.io/kube-agents/install.sh`), the interactive prompt asks you to enter the target SemVer release tag or full 40-character commit SHA (from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)), and `--non-interactive` requires `--image-tag`. The installer rejects mutable refs such as `latest` and `main` to ensure install sources and container images stay strictly aligned.
 
 ### What `install.sh` Automatically Handles:
 
 - **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
 - **GCP Project & Region Selection**: Auto-detects the active project and prompts for confirmation; you can type a project ID that the discovered list does not show.
 - **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
-- **GKE Cluster Setup**: Provisions a Standard or Autopilot cluster (`--cluster-mode`, Standard by default) or connects to an existing one.
+- **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--region` with no explicit `--cluster-mode` builds Standard instead of failing; asking for `--cluster-mode=autopilot` at a zone is still an error.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
@@ -71,7 +70,7 @@ into KMS (the PEM must not enter Terraform state). The installer sources
 registry prefix) and its accepted values live in exactly one place; see
 [Shared defaults live in `installer_common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-installer_commonsh).
 
-Two behaviours worth knowing before the first run:
+Three behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the checkout's `HEAD`** and must be a SemVer release tag or a
   full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so
@@ -81,6 +80,12 @@ Two behaviours worth knowing before the first run:
   controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
   pull-request path works in every set. See the site's
   [security and IAM reference](docs/site/src/content/docs/reference/security-and-iam.md).
+- **The agent runs sandboxed under gVisor**, because it executes model-authored commands and an
+  unsandboxed pod shares the node kernel with everything else on the node. Autopilot, the shape a
+  fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
+  on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
+  node pool of one `e2-standard-4` per zone. Pass `--gvisor=false` to run on the standard
+  container runtime.
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -190,10 +195,18 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   for local state — fine for a hand-driven evaluation, wrong for anything `uninstall.sh` or
   `upgrade.sh` should later find. The state contains every secret the install was given; the
   bucket's IAM is its protection.
-- `install.sh` re-runs are idempotent: it reuses `k8s-operator/scripts/vars.sh` from the first run,
-  regenerates `terraform.tfvars` from it, and `terraform apply` reconciles whatever changed. To
-  change configuration, use `./install.sh --menu` (Save & Apply re-applies through the same
-  engine), edit `vars.sh` and re-run, or edit your hand-written tfvars and re-apply.
+- `install.sh` re-runs rebuild `k8s-operator/scripts/vars.sh` from that run's flags and environment
+  rather than reading the previous one, then regenerate `terraform.tfvars` from it and let
+  `terraform apply` reconcile whatever changed. Anything you do not re-supply falls back to its
+  default — including `--gvisor`, which defaults to `true`, so a bare re-run moves an unsandboxed
+  install onto the sandbox. `./install.sh --menu` is the re-run that carries the previous choices:
+  it reads the existing state, and Save & Apply re-applies through the same engine. Sourcing
+  `k8s-operator/scripts/vars.sh` before a flag-driven re-run gets most of the way — its entries are
+  `export`ed, so a child `./install.sh` sees them — but not all of it. The file records the memory
+  choice as `MEMORY_PROVIDER` and the dashboard as `HERMES_DASHBOARD_ENABLED`, while `install.sh`
+  reads `MEMORY` and `ENABLE_WEBUI`, so both revert to their defaults (file-backed memory, dashboard
+  off) unless you also pass `--memory` and `--enable-web-ui`. For a hand-driven install, edit your
+  tfvars and re-apply.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
@@ -420,6 +433,22 @@ Install the Custom Resource Definitions (CRDs) and deploy the controller manager
 make install
 make deploy IMG=$IMG
 ```
+
+Then apply the agent-RBAC admission policies. `make deploy` does **not** include them — they are
+deliberately outside the kustomize overlay, because its `namePrefix` would rewrite each policy's
+name without rewriting the `spec.policyName` its binding refers to, leaving both bindings pointing
+at nothing and the policies silently inert:
+
+```bash
+# Kubernetes 1.30+ only (ValidatingAdmissionPolicy v1). Skip on older clusters -- unlike
+# the chart, which checks the version itself, this apply will fail there.
+kubectl apply -f config/admission/agent-rbac-policy.yaml
+```
+
+[Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
+such step. Skipping it here leaves agent RBAC without its admission backstop. Read that file's
+header for what the policies do and do not enforce — notably, they cannot check the rules of a role
+that a binding merely _references_.
 
 If the agent images are mirrored into a private registry, tell the operator where to find them.
 These two are the images it resolves at reconcile time rather than reading from a manifest — the

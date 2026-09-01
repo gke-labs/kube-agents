@@ -10,11 +10,18 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import (
+    create_minimal_tools_bin,
+    create_mock_git_repo,
+    get_isolated_test_env,
+)
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_GH_TOKEN,
+    MOCK_NONEXISTENT_TAG,
     MOCK_TARGET_RELEASE_TAG,
     create_mock_gh_binary,
+    create_mock_git_binary,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,37 +29,33 @@ _PUBLISH_GITHUB_RELEASE_SH = _REPO_ROOT / "scripts" / "release" / "publish_githu
 
 
 class PublishGithubReleaseScriptTest(unittest.TestCase):
-    def _run_script(self, args, env=None, bin_dir=None):
+    def _run_script(self, args, env=None, bin_dir=None, cwd=None):
         full_env = get_isolated_test_env(overrides=env, bin_dir=bin_dir)
         return subprocess.run(
             ["bash", str(_PUBLISH_GITHUB_RELEASE_SH)] + args,
             capture_output=True,
             text=True,
             env=full_env,
-            cwd=str(_REPO_ROOT),
+            cwd=cwd or str(_REPO_ROOT),
         )
 
     def test_missing_arguments(self):
         proc = self._run_script([])
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("RELEASE_VERSION and RELEASE_COMMIT are required", proc.stderr)
+        self.assertIn("RELEASE_VERSION is required as first argument or environment variable", proc.stderr)
 
     def test_invalid_tag_format(self):
         for bad_tag in INVALID_GA_RELEASE_TAGS:
             with self.subTest(bad_tag=bad_tag):
-                proc = self._run_script([bad_tag, "HEAD"])
+                proc = self._run_script([bad_tag])
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("not a valid pure numeric SemVer", proc.stderr)
-
-    def test_invalid_commit_sha(self):
-        proc = self._run_script([MOCK_TARGET_RELEASE_TAG, "invalid-sha-nonexistent-12345"])
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Cannot resolve valid Git commit", proc.stderr)
 
     def test_missing_gh_cli_in_ci(self):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         try:
             bin_dir = create_minimal_tools_bin(temp_dir.name, exclude=("gh",))
+            create_mock_git_binary(bin_dir)
             proc = self._run_script(
                 [MOCK_TARGET_RELEASE_TAG, "HEAD"],
                 env={"CI": "true", "PATH": str(bin_dir)},
@@ -66,6 +69,7 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         try:
             bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_git_binary(bin_dir)
             create_mock_gh_binary(bin_dir, existing_releases=[MOCK_TARGET_RELEASE_TAG])
 
             proc = self._run_script(
@@ -82,6 +86,7 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         try:
             bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_git_binary(bin_dir)
             create_mock_gh_binary(bin_dir)
 
             proc = self._run_script(
@@ -98,6 +103,7 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         try:
             bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_git_binary(bin_dir)
             create_mock_gh_binary(bin_dir)
 
             proc = self._run_script(
@@ -117,6 +123,7 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         try:
             bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_git_binary(bin_dir)
             create_mock_gh_binary(bin_dir)
 
             proc = self._run_script(
@@ -134,13 +141,13 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         try:
             bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_git_binary(bin_dir)
             create_mock_gh_binary(bin_dir)
 
             proc = self._run_script(
                 [],
                 env={
                     "RELEASE_VERSION": MOCK_TARGET_RELEASE_TAG,
-                    "RELEASE_COMMIT": "HEAD",
                     "CI": "true",
                     "GH_TOKEN": "mock-token-123",
                 },
@@ -152,20 +159,71 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_swapped_arguments_symmetry(self):
+    def test_publish_with_version_only_resolves_commit_from_git_tag(self):
+        """Verifies publish_github_release resolves commit directly from tag when only version is passed."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_gh_binary(bin_dir)
+
+            # Create a tag pointing to a specific commit
+            dummy_file = pathlib.Path(repo_dir) / "version.txt"
+            dummy_file.write_text("v0.2.0\n")
+            git("add", "version.txt")
+            git("commit", "-m", "chore: release 0.2.0")
+            expected_tag_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", MOCK_TARGET_RELEASE_TAG, expected_tag_sha)
+
+            # Run with only the version argument (no commit argument)
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true", "GH_TOKEN": "mock-token-123"},
+                bin_dir=str(bin_dir),
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("PUBLISHING GITHUB RELEASE", proc.stdout)
+            self.assertIn(f"Release Commit:     {expected_tag_sha}", proc.stdout)
+            self.assertIn(f"Successfully published GitHub Release '{MOCK_TARGET_RELEASE_TAG}'", proc.stdout)
+        finally:
+            temp_dir.cleanup()
+
+    def test_publish_fails_if_tag_does_not_exist_and_no_commit_provided(self):
+        """Verifies publish_github_release errors clearly if tag does not exist and no HEAD commit exists."""
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        try:
+            repo_dir = pathlib.Path(temp_dir.name) / "empty_repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+            bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_gh_binary(bin_dir)
+
+            proc = self._run_script(
+                [MOCK_NONEXISTENT_TAG],
+                env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN},
+                bin_dir=str(bin_dir),
+                cwd=str(repo_dir),
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn(f"Cannot resolve valid Git commit for release tag '{MOCK_NONEXISTENT_TAG}'", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_publish_fails_if_tag_does_not_exist_even_when_head_commit_present(self):
+        """Verifies publish_github_release fails and does NOT fall back to HEAD commit when tag is absent."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
         try:
             bin_dir = pathlib.Path(temp_dir.name) / "bin"
             create_mock_gh_binary(bin_dir)
 
             proc = self._run_script(
-                ["HEAD", MOCK_TARGET_RELEASE_TAG],
-                env={"CI": "true", "GH_TOKEN": "mock-token-123"},
+                [MOCK_NONEXISTENT_TAG],
+                env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN},
                 bin_dir=str(bin_dir),
+                cwd=repo_dir,
             )
-            self.assertEqual(proc.returncode, 0)
-            self.assertIn("PUBLISHING GITHUB RELEASE", proc.stdout)
-            self.assertIn(f"Successfully published GitHub Release '{MOCK_TARGET_RELEASE_TAG}'", proc.stdout)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn(f"Cannot resolve valid Git commit for release tag '{MOCK_NONEXISTENT_TAG}'", proc.stderr)
         finally:
             temp_dir.cleanup()
 

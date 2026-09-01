@@ -428,15 +428,15 @@ is indistinguishable from "3 requests silently dropped": opened with its URL, re
 open and deliberately not force-pushed over, `superseded` by a human close written after the request
 (§3.1), or not published this run and queued for a retry. A **refusal** is likewise never silence.
 Naming a `gcloud` or `manual` finding, naming an id that is not in the document, lacking write
-access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it, or
-writing it with no target at all each get exactly one reply.
+access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it,
+writing it inside a block quote or CommonMark lazy continuation line, or writing it with no target at all each get exactly one reply.
 
-Four of those five replies carry the ids that would have worked — capped at ten, then "and N more",
+Five of those six replies carry the ids that would have worked — capped at ten, then "and N more",
 since a refusal is help and not a second copy of the report. **The write-access refusal deliberately
 carries neither the id list nor the syntax.** Every other refusal is a correction to someone who may
 retry and succeed; that one is a "no" to someone who cannot, and handing them a menu of fixes they
 are not permitted to request reads as an invitation rather than an answer. It says what the rule is
-and stops. The one deliberate silence is a mid-sentence mention from someone without write access:
+and stops. The one deliberate silence is a mid-sentence or quoted mention from someone without write access:
 their correctly-typed command would have been refused anyway, and two replies to one comment that
 was probably never a command is a bot picking an argument. A `/remediate` the harness itself renders
 into a comment is always inside a code span, and inline code is stripped before the mention search
@@ -722,6 +722,11 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
   likewise indented at most three, nothing else on the line, unterminated fences run to the end.
   Dropping the indentation bound — stripping each line before comparing — makes four-space
   ` ``` `, which CommonMark and GitHub both render as literal text, read as a closer.
+- **Block quotes and lazy continuations are stripped.** `strip_block_quotes` drops blockquote
+  lines starting with `>` (indented 0-3 spaces) and consumes subsequent lazy continuation lines
+  that CommonMark (§5.1) includes in the block quote until a paragraph break (such as an empty quote line,
+  blank line, code fence, heading, or thematic break) is encountered, preserving lazy continuations
+  for both quoted paragraphs and list items inside the quote to prevent quoted `/remediate` suggestions from firing.
 - **Table cells escape `|` and flatten newlines**; identifiers additionally replace a backtick,
   because one backtick closes the inline code span they sit in and the rest of the value renders as
   live Markdown.

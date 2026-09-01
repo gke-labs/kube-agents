@@ -19,11 +19,16 @@ package controller
 import (
 	"context"
 	"net"
+	"sort"
 	"strings"
 
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -38,72 +43,381 @@ const (
 
 	// defaultDNSClusterIP is the standard fallback DNS VIP when kube-dns cannot be discovered.
 	defaultDNSClusterIP = "10.96.0.10"
+
+	// metadataDaemonNamespace and metadataDaemonDaemonSet locate the GKE metadata daemon
+	// DaemonSet whose declared container port is discovery's only reliable signal — see
+	// discoverMetadataDaemonPort's doc comment for why the IP itself isn't read from it.
+	metadataDaemonNamespace   = "kube-system"
+	metadataDaemonDaemonSet   = "gke-metadata-server"
+	metadataDaemonPortName    = "metadata-server"
+	metadataDaemonDefaultPort int32 = 988
+
+	// Source constants reporting how the network policy values were chosen.
+	netpolSourceSpec        = "Spec"
+	netpolSourceAnnotation  = "Annotation"
+	netpolSourceOperatorEnv = "OperatorEnv"
+	netpolSourceDiscovered  = "Discovered"
+	netpolSourceDefault     = "Default"
+	netpolSourceSuppressed  = "Suppressed"
 )
 
-// netpolProfile holds resolved network policy cluster targets.
+// netpolProfile holds resolved network policy cluster targets and provenance.
 type netpolProfile struct {
-	DNSClusterIP     string
-	MetadataDaemonIP string
+	Generated            bool
+	DNSClusterIPs        []string
+	DNSSource            string
+	MetadataDaemonIP     string // "" == suppress rule 3
+	MetadataDaemonPort   int32
+	MetadataDaemonSource string
+	AdditionalEgress     []networkingv1.NetworkPolicyEgressRule
 }
 
 // resolveNetpolProfile mirrors resolveOTLPEndpoint's ladder: per-agent
-// annotation, operator flag/env field, kube-dns discovery, documented default.
+// annotation, typed CR spec, operator flag/env field, kube-dns discovery, documented default.
 // The operator override sits above discovery deliberately, matching telemetry.go:
 // an explicit operator value is authoritative even when kube-dns is discoverable.
 func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agent *agentv1alpha1.PlatformAgent) netpolProfile {
 	log := logf.FromContext(ctx).WithName("netpol-profile")
-	var p netpolProfile
+	p := netpolProfile{
+		Generated: true,
+	}
 
-	// --- DNS cluster IP ---
+	// If NetworkPolicy is explicitly disabled in spec, skip generation and discovery.
+	if agent != nil && agent.Spec.NetworkPolicy != nil && agent.Spec.NetworkPolicy.Enabled != nil && !*agent.Spec.NetworkPolicy.Enabled {
+		p.Generated = false
+		return p
+	}
+
+	// --- DNS cluster IPs ---
+	// 1. Annotation escape hatch (highest precedence)
 	if ip := trimmedAnnotation(agent, AnnotationDNSClusterIP); ip != "" {
 		if net.ParseIP(ip) != nil {
-			p.DNSClusterIP = ip
+			p.DNSClusterIPs = []string{ip}
+			p.DNSSource = netpolSourceAnnotation
 		} else {
 			log.Info("Ignoring invalid annotation IP", "annotation", AnnotationDNSClusterIP, "value", ip)
 		}
 	}
-	if p.DNSClusterIP == "" && r.DNSClusterIPOverride != "" {
+
+	// 2. Typed spec in CRD
+	if len(p.DNSClusterIPs) == 0 && agent != nil && agent.Spec.NetworkPolicy != nil && len(agent.Spec.NetworkPolicy.DNSClusterIPs) > 0 {
+		var validIPs []string
+		for _, rawIP := range agent.Spec.NetworkPolicy.DNSClusterIPs {
+			trimmed := strings.TrimSpace(rawIP)
+			if net.ParseIP(trimmed) != nil {
+				validIPs = append(validIPs, trimmed)
+			} else {
+				log.Info("Ignoring invalid IP in spec.networkPolicy.dnsClusterIPs", "value", rawIP)
+			}
+		}
+		if len(validIPs) > 0 {
+			p.DNSClusterIPs = validIPs
+			p.DNSSource = netpolSourceSpec
+		}
+	}
+
+	// 3. Operator flag / env override
+	if len(p.DNSClusterIPs) == 0 && r.DNSClusterIPOverride != "" {
 		if net.ParseIP(r.DNSClusterIPOverride) != nil {
-			p.DNSClusterIP = r.DNSClusterIPOverride
+			p.DNSClusterIPs = []string{r.DNSClusterIPOverride}
+			p.DNSSource = netpolSourceOperatorEnv
 		} else {
 			log.Info("Ignoring invalid operator override IP", "flag", "kubernetes-dns-cluster-ip", "value", r.DNSClusterIPOverride)
 		}
 	}
-	if p.DNSClusterIP == "" {
-		// Preserves the exact cached Get reconcileNetworkPolicy uses today.
+
+	// 4. In-cluster discovery from kube-system/kube-dns Service
+	if len(p.DNSClusterIPs) == 0 {
 		var svc corev1.Service
 		if err := r.Get(ctx, types.NamespacedName{Namespace: "kube-system", Name: "kube-dns"}, &svc); err == nil {
-			if ip := strings.TrimSpace(svc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
-				p.DNSClusterIP = ip
+			var discovered []string
+			if len(svc.Spec.ClusterIPs) > 0 {
+				for _, ip := range svc.Spec.ClusterIPs {
+					trimmed := strings.TrimSpace(ip)
+					if trimmed != "" && trimmed != "None" && net.ParseIP(trimmed) != nil {
+						discovered = append(discovered, trimmed)
+					}
+				}
+			} else if ip := strings.TrimSpace(svc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+				discovered = append(discovered, ip)
+			}
+
+			if len(discovered) > 0 {
+				p.DNSClusterIPs = discovered
+				p.DNSSource = netpolSourceDiscovered
 			}
 		} else if !apierrors.IsNotFound(err) {
-			log.Info("Failed to discover kube-dns ClusterIP; falling back to default", "error", err)
+			log.Info("Failed to discover kube-dns ClusterIP", "error", err)
+			// Anti-flap: on transient error, preserve previously discovered status if present
+			if agent != nil && agent.Status.NetworkPolicy.DNSClusterIPsSource == netpolSourceDiscovered && len(agent.Status.NetworkPolicy.DNSClusterIPs) > 0 {
+				p.DNSClusterIPs = append([]string(nil), agent.Status.NetworkPolicy.DNSClusterIPs...)
+				p.DNSSource = netpolSourceDiscovered
+			}
 		}
 	}
-	if p.DNSClusterIP == "" {
-		p.DNSClusterIP = defaultDNSClusterIP
+
+	// 5. Documented fallback default
+	if len(p.DNSClusterIPs) == 0 {
+		p.DNSClusterIPs = []string{defaultDNSClusterIP}
+		p.DNSSource = netpolSourceDefault
 	}
 
-	// --- Metadata daemon IP (always present; overridable IP, never omitted in B2) ---
+	// Sort and deduplicate DNSClusterIPs for deterministic spec/status comparisons
+	p.DNSClusterIPs = deduplicateAndSortIPs(p.DNSClusterIPs)
+
+	// --- Metadata daemon IP ---
+	// 1. Annotation escape hatch
 	if ip := trimmedAnnotation(agent, AnnotationMetadataDaemonIP); ip != "" {
 		if net.ParseIP(ip) != nil {
 			p.MetadataDaemonIP = ip
+			p.MetadataDaemonPort = metadataDaemonDefaultPort
+			p.MetadataDaemonSource = netpolSourceAnnotation
 		} else {
 			log.Info("Ignoring invalid annotation IP", "annotation", AnnotationMetadataDaemonIP, "value", ip)
 		}
 	}
-	if p.MetadataDaemonIP == "" && r.MetadataDaemonIPOverride != "" {
+
+	// 2. Typed spec in CRD
+	if p.MetadataDaemonSource == "" && agent != nil && agent.Spec.NetworkPolicy != nil && agent.Spec.NetworkPolicy.MetadataDaemon != nil {
+		ep := strings.TrimSpace(agent.Spec.NetworkPolicy.MetadataDaemon.Endpoint)
+		if ep == "" {
+			// Explicit empty string suppresses rule 3 entirely
+			p.MetadataDaemonIP = ""
+			p.MetadataDaemonPort = 0
+			p.MetadataDaemonSource = netpolSourceSuppressed
+		} else if net.ParseIP(ep) != nil {
+			p.MetadataDaemonIP = ep
+			p.MetadataDaemonPort = metadataDaemonDefaultPort
+			p.MetadataDaemonSource = netpolSourceSpec
+		} else {
+			log.Info("Ignoring invalid IP in spec.networkPolicy.metadataDaemon.endpoint", "value", ep)
+		}
+	}
+
+	// 3. Operator flag / env override
+	if p.MetadataDaemonSource == "" && r.MetadataDaemonIPOverride != "" {
 		if net.ParseIP(r.MetadataDaemonIPOverride) != nil {
 			p.MetadataDaemonIP = r.MetadataDaemonIPOverride
+			p.MetadataDaemonPort = metadataDaemonDefaultPort
+			p.MetadataDaemonSource = netpolSourceOperatorEnv
 		} else {
 			log.Info("Ignoring invalid operator override IP", "flag", "kubernetes-metadata-daemon-ip", "value", r.MetadataDaemonIPOverride)
 		}
 	}
-	if p.MetadataDaemonIP == "" {
-		p.MetadataDaemonIP = metadataDaemonIP // existing const, 169.254.169.252
+
+	// 4. In-cluster discovery from kube-system/gke-metadata-server DaemonSet
+	if p.MetadataDaemonSource == "" {
+		port, err := r.discoverMetadataDaemonPort(ctx)
+		switch {
+		case err == nil && port > 0:
+			if port != metadataDaemonDefaultPort {
+				log.Info("Discovered non-default metadata daemon container port from DaemonSet",
+					"daemonset", metadataDaemonDaemonSet,
+					"namespace", metadataDaemonNamespace,
+					"port", port,
+					"default", metadataDaemonDefaultPort)
+			}
+			p.MetadataDaemonIP = metadataDaemonIP
+			p.MetadataDaemonPort = port
+			p.MetadataDaemonSource = netpolSourceDiscovered
+		case err != nil && !apierrors.IsNotFound(err):
+			log.Info("Failed to discover gke-metadata-server DaemonSet", "error", err)
+			// Anti-flap on transient error (timeout/forbidden): preserve last discovered port from status
+			if agent != nil &&
+				agent.Status.NetworkPolicy.MetadataDaemonIPSource == netpolSourceDiscovered &&
+				agent.Status.NetworkPolicy.MetadataDaemonPort > 0 {
+				p.MetadataDaemonIP = metadataDaemonIP
+				p.MetadataDaemonPort = agent.Status.NetworkPolicy.MetadataDaemonPort
+				p.MetadataDaemonSource = netpolSourceDiscovered
+			}
+		}
+	}
+
+	// 5. Documented fallback default
+	if p.MetadataDaemonSource == "" {
+		p.MetadataDaemonIP = metadataDaemonIP // 169.254.169.252
+		p.MetadataDaemonPort = metadataDaemonDefaultPort
+		p.MetadataDaemonSource = netpolSourceDefault
+	}
+
+	// --- Additional egress rules ---
+	if agent != nil && agent.Spec.NetworkPolicy != nil && len(agent.Spec.NetworkPolicy.AdditionalEgress) > 0 {
+		p.AdditionalEgress = toEgressRules(log, agent.Spec.NetworkPolicy.AdditionalEgress)
 	}
 
 	return p
+}
+
+func deduplicateAndSortIPs(raw []string) []string {
+	seen := make(map[string]bool, len(raw))
+	var out []string
+	for _, ip := range raw {
+		trimmed := strings.TrimSpace(ip)
+		if trimmed != "" && !seen[trimmed] {
+			seen[trimmed] = true
+			out = append(out, trimmed)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// normalizeCIDRTarget canonicalises one CIDR or bare-IP string into the *net.IPNet a
+// NetworkPolicy ipBlock is built from, and reports whether it is usable at all. Three
+// callers share it -- toEgressRules, formatCIDRPeers, and the API-server annotation
+// parser in reconcileNetworkPolicy -- so the address-family rule below is stated once
+// instead of three times.
+//
+// enforceMinPrefix applies the /12 (IPv4) and /48 (IPv6) floors that stop a
+// caller-supplied range from being widened into an unrestricted egress bypass. Pass
+// false only where the input cannot come from outside the operator.
+//
+// The address family is taken from the ADDRESS, never from the parsed mask width. For
+// an IPv4-mapped IPv6 block the two disagree, and the disagreement is exploitable:
+// net.ParseCIDR("::ffff:0:0/96") returns a 16-byte address with a 128-bit mask, so
+// Mask.Size() reports ones=96/bits=128 and the value clears the IPv6 floor -- but
+// net.IPNet.String() re-reads the address, finds To4() != nil, truncates the mask to its
+// low four bytes (all zero at /96) and prints "0.0.0.0/0". A spec.networkPolicy
+// .additionalEgress peer of "::ffff:0:0/96" therefore passed every guard this package
+// has and emitted allow-all IPv4 egress from a pod holding the agent's Workload Identity
+// credentials. Collapsing to the 4-byte form here measures the floor against the same
+// value String() will print.
+func normalizeCIDRTarget(entry string, enforceMinPrefix bool) (*net.IPNet, bool) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return nil, false
+	}
+
+	var ipNet *net.IPNet
+	if strings.Contains(entry, "/") {
+		_, parsed, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, false
+		}
+		ipNet = parsed
+	} else {
+		ip := net.ParseIP(strings.Trim(entry, "[]"))
+		if ip == nil {
+			return nil, false
+		}
+		if v4 := ip.To4(); v4 != nil {
+			ipNet = &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)}
+		} else {
+			ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+		}
+	}
+
+	if v4 := ipNet.IP.To4(); v4 != nil && len(ipNet.Mask) == net.IPv6len {
+		ipNet = &net.IPNet{IP: v4, Mask: ipNet.Mask[12:]}
+	}
+
+	ones, bits := ipNet.Mask.Size()
+	if bits == 0 {
+		// A non-contiguous mask. net.IPNet.String() cannot render one either, so
+		// there is no string to put in an ipBlock.
+		return nil, false
+	}
+	if enforceMinPrefix && ((bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix)) {
+		return nil, false
+	}
+	return ipNet, true
+}
+
+// toEgressRules projects spec.networkPolicy.additionalEgress onto the NetworkPolicy API.
+//
+// Everything it drops is logged. The CRD admits a rule that this function then discards
+// -- a peer past the prefix floor, an except outside its peer -- and without a log line
+// the CR reads exactly as it did when the rule was working, so the first symptom is a
+// connection timeout inside the agent with no thread leading back to the spec.
+func toEgressRules(log logr.Logger, rules []agentv1alpha1.EgressRule) []networkingv1.NetworkPolicyEgressRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]networkingv1.NetworkPolicyEgressRule, 0, len(rules))
+	for i, r := range rules {
+		var peers []networkingv1.NetworkPolicyPeer
+		for _, p := range r.To {
+			ipNet, ok := normalizeCIDRTarget(p.CIDR, true)
+			if !ok {
+				log.Info("Dropping peer in spec.networkPolicy.additionalEgress: not a usable CIDR, or broader than the /12 (IPv4) or /48 (IPv6) floor",
+					"rule", i, "cidr", p.CIDR)
+				continue
+			}
+			peerOnes, peerBits := ipNet.Mask.Size()
+
+			var validExcept []string
+			for _, ex := range p.Except {
+				// The API server rejects the whole NetworkPolicy when an except
+				// is not a STRICT subset of its peer's CIDR -- ValidateIPBlock in
+				// pkg/apis/networking/validation fails on
+				// `cidrMaskLen >= exceptMaskLen` as well as on non-containment, so
+				// an except equal to its peer is rejected too. That rejection
+				// freezes every other egress rule at its previous revision,
+				// including the DNS ClusterIP rediscovery, so the same condition is
+				// applied here and one bad except costs its own peer and nothing
+				// else.
+				exNet, exOK := normalizeCIDRTarget(ex, false)
+				if !exOK {
+					log.Info("Dropping unparseable except block in spec.networkPolicy.additionalEgress",
+						"rule", i, "cidr", ipNet.String(), "except", ex)
+					continue
+				}
+				exOnes, exBits := exNet.Mask.Size()
+				if exBits != peerBits || exOnes <= peerOnes || !ipNet.Contains(exNet.IP) {
+					log.Info("Dropping except block outside its peer CIDR in spec.networkPolicy.additionalEgress",
+						"rule", i, "cidr", ipNet.String(), "except", ex)
+					continue
+				}
+				validExcept = append(validExcept, exNet.String())
+			}
+
+			peers = append(peers, networkingv1.NetworkPolicyPeer{
+				IPBlock: &networkingv1.IPBlock{
+					CIDR:   ipNet.String(),
+					Except: validExcept,
+				},
+			})
+		}
+
+		var ports []networkingv1.NetworkPolicyPort
+		for _, port := range r.Ports {
+			if port.Port < 1 || port.Port > 65535 {
+				log.Info("Dropping out-of-range port in spec.networkPolicy.additionalEgress", "rule", i, "port", port.Port)
+				continue
+			}
+			protocol := corev1.ProtocolTCP
+			switch strings.ToUpper(port.Protocol) {
+			case "UDP":
+				protocol = corev1.ProtocolUDP
+			case "SCTP":
+				protocol = corev1.ProtocolSCTP
+			case "TCP":
+				protocol = corev1.ProtocolTCP
+			default:
+				log.Info("Dropping unknown protocol in spec.networkPolicy.additionalEgress", "rule", i, "protocol", port.Protocol)
+				continue
+			}
+			portVal := intstr.FromInt32(port.Port)
+			ports = append(ports, networkingv1.NetworkPolicyPort{
+				Protocol: &protocol,
+				Port:     &portVal,
+			})
+		}
+
+		// In NetworkPolicy semantics, an egress rule with Ports but To: nil allows egress
+		// to ALL destinations (0.0.0.0/0). To prevent unintentional egress widening,
+		// require at least one valid peer before emitting an additional egress rule.
+		if len(peers) == 0 {
+			log.Info("Dropping egress rule in spec.networkPolicy.additionalEgress: no peer survived validation, and a rule with ports but no peer would permit egress to every destination",
+				"rule", i)
+			continue
+		}
+		out = append(out, networkingv1.NetworkPolicyEgressRule{
+			Ports: ports,
+			To:    peers,
+		})
+	}
+	return out
 }
 
 func trimmedAnnotation(agent *agentv1alpha1.PlatformAgent, key string) string {
@@ -111,4 +425,37 @@ func trimmedAnnotation(agent *agentv1alpha1.PlatformAgent, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(agent.Annotations[key])
+}
+
+// discoverMetadataDaemonPort reads the live kube-system/gke-metadata-server DaemonSet and
+// returns the containerPort named "metadata-server", confirming Workload-Identity-on-GKE
+// as a side effect. It deliberately does not parse --addr: flag formats change across node
+// images, a named port is the DaemonSet's API surface, and the IP itself (169.254.169.252)
+// appears in no structured field at all, so this only ever confirms the port.
+// Uses r.APIReader to bypass the Informer cache, ensuring zero cluster-wide cache overhead.
+// A cluster-wide TTL cache (like telemetry) is unnecessary here because PlatformAgent is a
+// cluster singleton, so this single point-lookup generates negligible API server load.
+// Every failure mode (Forbidden, NotFound, no matching port) returns 0 and an error or nil,
+// and is non-fatal by contract with the caller.
+func (r *PlatformAgentReconciler) discoverMetadataDaemonPort(ctx context.Context) (int32, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if reader == nil {
+		return 0, nil
+	}
+	var ds appsv1.DaemonSet
+	key := types.NamespacedName{Namespace: metadataDaemonNamespace, Name: metadataDaemonDaemonSet}
+	if err := reader.Get(ctx, key, &ds); err != nil {
+		return 0, err
+	}
+	for _, c := range ds.Spec.Template.Spec.Containers {
+		for _, p := range c.Ports {
+			if p.Name == metadataDaemonPortName && p.ContainerPort > 0 {
+				return p.ContainerPort, nil
+			}
+		}
+	}
+	return 0, nil
 }

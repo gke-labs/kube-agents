@@ -105,18 +105,18 @@ The Planning Agent profile's own job file — [`agents/chat/defaults/cron/jobs.j
 Everything except the LLM (and, for hosted providers, the LLM API endpoint) runs inside your Kubernetes cluster:
 
 - **Namespace**: `kubeagents-system`.
-- **Node pools**: default node pool is enough for the operator, Platform Agent, LiteLLM, and Minty. If you use vLLM, provision a GPU node pool separately.
-- **Optional gVisor node pool** for sandboxed skill execution, opt-in via the installer's `--gvisor=true`. Standard only (the `gke-cluster` module's `enable_gvisor_node_pool`); Autopilot ships the `gvisor` RuntimeClass and needs no pool.
-- **Workload Identity** bindings are pre-provisioned by the [`kube-agents-iam` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) — the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`). See [Security & IAM](/kube-agents/reference/security-and-iam/).
+- **Node pools**: Autopilot, the shape a fresh install creates, has none to size — Google schedules the operator, Platform Agent, LiteLLM, and Minty, and the sandbox costs no extra nodes. On Standard the default node pool runs everything except the Platform Agent, which runs on the gVisor pool below; `--gvisor=false` puts it back with the others. If you use vLLM, provision a GPU node pool separately.
+- **gVisor node pool** for sandboxed skill execution, Standard only (the `gke-cluster` module's `enable_gvisor_node_pool`). The sandbox is on unless the installer's `--gvisor=false` turns it off, so a Standard install gets this pool; Autopilot ships the `gvisor` RuntimeClass and needs no pool.
+- **Workload Identity** bindings are pre-provisioned by the [`kube-agents-iam` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) — the Platform Agent gets a configurable permission set (`read-only` or `custom`). See [Security & IAM](/kube-agents/reference/security-and-iam/).
 
 ### Capacity and isolation
 
 The hub footprint (operator, Platform Agent, LiteLLM, Minty) is small and roughly fixed — it doesn't grow with the number of clusters the agent manages, since those are read remotely through the GKE MCP server. What actually drives node capacity:
 
 - **vLLM.** Local inference needs a GPU node pool; hosted LiteLLM does not.
-- **gVisor.** Sandboxed skill execution puts the agent pod under the `gvisor` RuntimeClass (the installer's `--gvisor=true`). On Standard that means a `gvisor-pool` to run it on; on Autopilot it costs no extra capacity.
+- **gVisor.** Sandboxed skill execution puts the agent pod under the `gvisor` RuntimeClass, which is the default (`--gvisor=false` turns it off). On Autopilot, the default cluster shape, it costs no extra capacity. On Standard it means a `gvisor-pool` to run the pod on: one `e2-standard-4` per zone, so three nodes on a regional cluster, with no autoscaling.
 
-For production, prefer a **dedicated cluster** for the harness. The agent GSA can hold broad GKE permissions in the `gke-admin` set, so a hard cluster boundary limits blast radius if the execution sandbox is ever compromised. A shared cluster (with the `kubeagents-system` namespace for logical isolation) is fine for development.
+For production, prefer a **dedicated cluster** for the harness. The agent GSA can still be given broad GKE permissions through the `custom` permission set, so a hard cluster boundary limits blast radius if the execution sandbox is ever compromised. A shared cluster (with the `kubeagents-system` namespace for logical isolation) is fine for development.
 
 ## Failure modes worth knowing
 

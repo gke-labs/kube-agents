@@ -767,11 +767,13 @@ spec:
               value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
+              value: "0"
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
-              value: cluster-internal-trusted
-            - name: API_SERVER_KEY
               value: cluster-internal-trusted
             - name: API_SERVER_EXTERNAL_KEY
               valueFrom:
@@ -1053,8 +1055,6 @@ spec:
     - ports:
         - port: 80
           protocol: TCP
-        - port: 8080
-          protocol: TCP
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
@@ -1133,6 +1133,14 @@ spec:
         - podSelector:
             matchLabels:
               app: github-token-minter
+    - ports:
+        - port: 8888
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+              app.kubernetes.io/name: hindsight
   ingress:
     - from:
         - podSelector: {}

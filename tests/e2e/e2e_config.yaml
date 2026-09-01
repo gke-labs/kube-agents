@@ -7,34 +7,48 @@
 
 version: "1.0"
 
+# Only `region`, `namespace` and `default_suite` are read — execute_e2e_tests.py's
+# run_suite_tests and conftest's settings fixture are the two readers. A key added
+# here that nothing looks up is inert and reads as configuration, which is how a
+# `timeout_seconds: 600` sat here being tuned by nobody and believed by readers.
 defaults:
-  region: "us-east4"
+  region: "us-central1"
   namespace: "kubeagents-system"
-  timeout_seconds: 600
-  default_environment: "investigations-e2e"
+  # The fallback when nothing sets E2E_SUITE. No CI path reaches it — e2e-run.yml
+  # and e2e-manual-runner.yml both export the suite they picked — so this is the
+  # local-developer default and conftest's fixture fallback. `gchat` because it is
+  # the only suite with an unbroken record of passing on a real cluster; it needs
+  # the E2E_CHAT_* credentials, and failing on a missing credential is a clearer
+  # answer than a suite that half-runs.
+  default_suite: "gchat"
 
-environments:
+# A suite is a named list of test files plus the env vars those files need. It is
+# not an environment: it provisions nothing and names no cluster. The key was
+# `environments:` and the selector `E2E_ENV`, one word away from the
+# `github_environment` input that names a GitHub Actions environment and one
+# letter from the `test_environment` input that named this. execute_e2e_tests.py
+# still reads the old key and the old variable for one release.
+suites:
   # ----------------------------------------------------------------------------
   # 1. Google Chat Agent E2E Environment
   # ----------------------------------------------------------------------------
-  - name: "gchat-e2e"
+  - name: "gchat"
     description: "Google Chat ingress and messaging E2E test suite"
-    region: "us-east4"
-    namespace: "kubeagents-system"
-    env_vars:
-      CHAT_TOPIC_NAME: "platform-agent-chat-events"
     tests:
       - "tests/e2e/gchat_agent_test.py"
 
   # ----------------------------------------------------------------------------
   # 2. In-Cluster Incident & Stockout Investigation E2E Environment
   # ----------------------------------------------------------------------------
-  - name: "investigations-e2e"
+  - name: "investigations"
     description: "In-cluster Agent API health and Stockout alert investigation scenarios"
-    region: "us-east4"
+    region: "us-central1"
     namespace: "kubeagents-system"
     env_vars:
-      STOCKOUT_SCENARIOS: "04"
+      # The full slug rather than the bare "04". test_stockout_investigation.py
+      # matches by prefix or exact slug, so both select the same scenario, and
+      # the slug says which one without a lookup.
+      STOCKOUT_SCENARIOS: "04-missing-zone-fallback"
     tests:
       - "tests/e2e/test_agent_api_health.py"
       - "tests/e2e/test_stockout_investigation.py"
@@ -42,9 +56,9 @@ environments:
   # ----------------------------------------------------------------------------
   # 3. Fleet SRE Audit E2E Environment
   # ----------------------------------------------------------------------------
-  - name: "audit-e2e"
+  - name: "audit"
     description: "Fleet SRE Audit, Token isolation, and Dry-run ledger suites across all streams"
-    region: "us-east4"
+    region: "us-central1"
     namespace: "kubeagents-system"
     env_vars:
       GITHUB_ORG: "test-org-kube-agent"
@@ -57,9 +71,9 @@ environments:
   # ----------------------------------------------------------------------------
   # 4. Operator AgentPlugin Reconciliation E2E Environment
   # ----------------------------------------------------------------------------
-  - name: "agent-plugin-e2e"
+  - name: "agent-plugin"
     description: "Operator AgentPlugin CR reconciliation and Hermes overlay lifecycle suite"
-    region: "us-east4"
+    region: "us-central1"
     namespace: "kubeagents-system"
     tests:
       - "tests/e2e/operator/agentplugins_e2e_test.py"
@@ -67,15 +81,27 @@ environments:
   # ----------------------------------------------------------------------------
   # 5. Release Candidate (RC) Promotion Gate Environment
   # ----------------------------------------------------------------------------
-  - name: "rc-e2e"
+  - name: "rc"
     description: "Release Candidate promotion gate: Agent API health, Fleet SRE Audit ledger validation, and fast stockout RCA (Scenario 04)"
-    region: "us-east4"
+    region: "us-central1"
     namespace: "kubeagents-system"
+    # No GITHUB_ORG/GITHUB_REPO here, deliberately. They used to name
+    # test-org-kube-agent/agents-repo, a placeholder no GitHub App is installed on, so
+    # test_github_token_minting_and_connectivity asked the minter for a token scoped to
+    # a repository the RC does not own. Pinning the real one here would only move the
+    # problem: the same pair configures the minter at install time, and a value written
+    # in two places drifts. e2e-run.yml passes the bound environment's GITOPS_ORG
+    # and GITOPS_REPO to the suite and deploy-environment.yml passes them to the
+    # installer, so there is one source of truth —
+    # scripts/release/README.md says how to set them.
+    #
+    # os.environ wins over these defaults (execute_e2e_tests.py), and with the variables
+    # unset the conftest github_repo fixture reads the repository the cluster was
+    # actually installed with out of platform-agent-settings.
     env_vars:
-      GITHUB_ORG: "test-org-kube-agent"
-      GITHUB_REPO: "test-org-kube-agent/agents-repo"
       FLEET_AUDIT_STREAMS: "all"
-      STOCKOUT_SCENARIOS: "04"
+      # See `investigations` above for why this is the slug and not "04".
+      STOCKOUT_SCENARIOS: "04-missing-zone-fallback"
     tests:
       - "tests/e2e/test_agent_api_health.py"
       - "tests/e2e/test_agent_fleet_audit.py"
@@ -84,19 +110,59 @@ environments:
   # ----------------------------------------------------------------------------
   # 6. Full Nightly E2E Matrix Environment
   # ----------------------------------------------------------------------------
-  - name: "nightly-e2e"
+  # Every nightly test file in one unit, for a hand-dispatched "run the lot".
+  # nightly-pipeline.yml does NOT run it as a single suite: it gates the staging
+  # promotion on `rc` — the subset with a green run on a real cluster behind it —
+  # and runs `agent-plugin`, `gchat` and `stockout-full` alongside as optional
+  # coverage. Those three cover the files this suite adds on top of `rc`, so the
+  # pipeline still executes everything here; what it does not do is let a file
+  # that has never passed decide whether staging moves. Fold one back into the
+  # gate as it earns it.
+  - name: "nightly"
     description: "Full Nightly E2E Matrix: all audit streams, all stockout scenarios, operator plugin lifecycle, and chat integration"
-    region: "us-east4"
+    region: "us-central1"
     namespace: "kubeagents-system"
+    # No GITHUB_ORG/GITHUB_REPO here, for the reason spelled out under `rc`
+    # above: this suite runs test_github_token_minting_and_connectivity, the
+    # placeholder pair names a repository no GitHub App is installed on, and the
+    # same pair configures the minter at install time. e2e-run.yml passes the
+    # bound environment's GITOPS_ORG and GITOPS_REPO to the suite and
+    # deploy-environment.yml passes them to the installer, so there is one
+    # source of truth.
+    # No CHAT_TOPIC_NAME either, and for a mechanical reason rather than a
+    # policy one: it could never take effect here. e2e-run.yml exports
+    # `CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}` unconditionally, an Actions
+    # `env:` key is defined even when its expression is empty, and
+    # execute_e2e_tests.py merges `**os.environ` after these `env_vars` — so the
+    # exported value wins whatever it is, and an environment that has not set
+    # the variable would override this line with an empty string rather than
+    # falling back to it. The GitHub environment owns the value outright: there
+    # is no working fallback anywhere, because gchat_agent_test.py's
+    # `os.environ.get(..., default)` only fires when the key is absent and the
+    # workflow always defines it.
     env_vars:
-      GITHUB_ORG: "test-org-kube-agent"
-      GITHUB_REPO: "test-org-kube-agent/agents-repo"
       FLEET_AUDIT_STREAMS: "all"
       STOCKOUT_SCENARIOS: "all"
-      CHAT_TOPIC_NAME: "platform-agent-chat-events"
     tests:
       - "tests/e2e/test_agent_api_health.py"
       - "tests/e2e/test_agent_fleet_audit.py"
       - "tests/e2e/test_stockout_investigation.py"
       - "tests/e2e/operator/agentplugins_e2e_test.py"
       - "tests/e2e/gchat_agent_test.py"
+
+  # ----------------------------------------------------------------------------
+  # 7. Full Stockout Scenario Matrix
+  # ----------------------------------------------------------------------------
+  # The one thing `nightly` adds over `rc` that no existing suite covers: the
+  # stockout file across every scenario rather than the single one the promotion
+  # gate runs. Split out so the nightly pipeline can run it as optional coverage
+  # while gating on `rc`, and so the wide run is selectable by hand without
+  # pulling in the other four files.
+  - name: "stockout-full"
+    description: "Stockout investigation across every scenario in STOCKOUT_SCENARIO_DEFINITIONS"
+    region: "us-central1"
+    namespace: "kubeagents-system"
+    env_vars:
+      STOCKOUT_SCENARIOS: "all"
+    tests:
+      - "tests/e2e/test_stockout_investigation.py"

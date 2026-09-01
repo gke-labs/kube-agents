@@ -27,9 +27,11 @@ instead, which only the gated steps below create.
 """
 
 import ast
+import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -114,6 +116,37 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run(["hermes", "gateway", "run"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup, "the gateway container must build the shared tree")
+
+    def test_the_setup_creates_a_group_accessible_scratch_dir(self):
+        """Step 4.5: the `gh --body-file` handoff directory must exist,
+        group-accessible, before any script lazily creates it with whatever
+        umask that process happens to carry. The sandbox (uid 10000) stages
+        body files there and the credential sidecar (uid 10001) reads them
+        through the shared fsGroup — group bits are the whole bridge since the
+        #955 uid split; #1030 is what their absence looks like."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "gateway", "run"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_WAIT_SECS": "0",
+                },
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            scratch = home / "scratch"
+            self.assertTrue(scratch.is_dir(), "the setup must create scratch/")
+            mode = scratch.stat().st_mode
+            self.assertEqual(
+                mode & 0o070,
+                0o070,
+                f"scratch/ is {oct(mode & 0o777)}: the sidecar reaches it only "
+                "through the group bits",
+            )
 
     def test_dashboard_sidecar_skips_the_setup(self):
         proc, ran_setup = self._run(["hermes", "dashboard"])
@@ -1348,6 +1381,51 @@ class PlatformFrontDoorTest(unittest.TestCase):
         proc = self._run("platform_sync_items >/dev/null\necho SURVIVED\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SURVIVED", proc.stdout)
+
+    def test_step_2c_invalidates_local_mcp_schema_cache(self):
+        """Step 2c drops local MCP server cache entries on startup so new tools appear."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            defaults = root / "defaults" / "scripts"
+            defaults.mkdir(parents=True)
+            invalidate_src = pathlib.Path(__file__).resolve().parent.parent / "agents" / "platform" / "scripts" / "invalidate_mcp_cache.py"
+            shutil.copy(invalidate_src, defaults / "invalidate_mcp_cache.py")
+
+            data = root / "data"
+            (data / "scripts").mkdir(parents=True)
+            shutil.copy(invalidate_src, data / "scripts" / "invalidate_mcp_cache.py")
+            cache_dir = data / "profiles" / "platform" / "cache"
+            cache_dir.mkdir(parents=True)
+            cache_file = cache_dir / "mcp_schema_cache.json"
+            cache_file.write_text(
+                json.dumps({
+                    "platform_control": {"fingerprint": "abc", "tools": [{"name": "verify_gke_cluster"}]},
+                    "developer_knowledge": {"fingerprint": "def", "tools": [{"name": "search_docs"}]},
+                }),
+                encoding="utf-8",
+            )
+
+            lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+            start = next(i for i, line in enumerate(lines) if line.startswith('# 2c. Invalidate locally-hosted MCP server schemas'))
+            end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+            block = "\n".join(lines[start : end + 1])
+
+            proc = subprocess.run(
+                ["sh", "-c", "set -e\n" + block],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TARGET_DIR": str(data),
+                    "PYTHONPATH": str(defaults),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            updated = json.loads(cache_file.read_text(encoding="utf-8"))
+            self.assertNotIn("platform_control", updated)
+            self.assertIn("developer_knowledge", updated)
 
 
 class ApiKeyPinCheckTest(unittest.TestCase):

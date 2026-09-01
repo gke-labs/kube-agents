@@ -1,0 +1,131 @@
+name: "Shared: Tear Down Environment"
+
+permissions:
+  contents: read
+
+on:
+  #checkov:skip=CKV_GHA_7:Standalone launch requires the candidate tag or commit SHA to pick the teardown engine, and the environment to destroy
+  workflow_dispatch:
+    inputs:
+      github_environment:
+        description: "GitHub environment naming the GCP project, region and cluster to destroy"
+        required: true
+        type: choice
+        options:
+          - "rc"
+          - "nightly"
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA (Mandatory for standalone launch)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      # See deploy-environment.yml for why this is named github_environment
+      # and why it has no default. Here the missing default matters more: a
+      # nightly caller that omitted it would destroy the RC environment.
+      github_environment:
+        description: "GitHub environment naming the GCP project, region and cluster to destroy"
+        required: true
+        type: string
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA"
+        required: true
+        type: string
+    # No `secrets:` block: this workflow authenticates with Workload Identity
+    # Federation off the bound environment's GCP_WORKLOAD_IDENTITY_PROVIDER and
+    # GCP_SERVICE_ACCOUNT variables, and needs nothing else.
+
+jobs:
+  teardown-environment:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    # Same group as the deploy and E2E jobs for the same environment: this
+    # destroys what both of those operate on, so it must never overlap a run
+    # that is still using it.
+    concurrency:
+      group: ${{ inputs.github_environment }}-environment
+      cancel-in-progress: false
+    # A GKE cluster destroy is slower than its create — node pools drain before
+    # the control plane goes, and lifecycle.sh clears the PlatformAgent
+    # finalizers first. Below step 2's 60 because there is no image build here.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CLOUDSDK_PYTHON: "/usr/bin/python3"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Commit SHA from Release Tag
+        id: resolve_target
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      # The teardown engine has to be the candidate's own, not main's. The four
+      # asymmetric resources lifecycle.sh handles before `terraform destroy` are
+      # the ones the candidate's composition created, and a newer lifecycle.sh
+      # can expect state layouts this environment was never installed with.
+      - name: Checkout repository at exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve_target.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      # kubectl and gke-gcloud-auth-plugin, because lifecycle.sh fetches cluster
+      # credentials itself and clears the PlatformAgent finalizers with kubectl
+      # before terraform runs. kubectl is named explicitly rather than left to
+      # the runner image: that cleanup is written `kubectl ... 2>/dev/null ||
+      # true`, so a missing binary skips it in silence and `terraform destroy`
+      # then blocks on the finalizers it was supposed to have removed. install.sh
+      # would auto-install it; uninstall.sh installs nothing.
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin,kubectl"
+
+      # No Go step, unlike the deploy job: nothing is built here. See the deploy
+      # job for why terraform_wrapper must stay off.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Tear Down Environment in GCP
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+        # Same rename fallback as deploy-environment.yml, and for the same
+        # reason: the workspace is the candidate's tree, and every candidate up
+        # to rc_2608310656_cf038a2_validated carries this script as
+        # teardown_rc_environment.sh. It matters here beyond the nightly's first
+        # run — this workflow's standalone dispatch is the documented way to
+        # reclaim an environment stranded by a failed pipeline, and such an
+        # environment was installed from a pre-rename candidate by definition.
+        #
+        # Delete this fallback once no rc_*_validated tag predates the rename.
+        run: |
+          if [ -f ./scripts/release/teardown_environment.sh ]; then
+            ./scripts/release/teardown_environment.sh
+          else
+            echo "==> Candidate predates the teardown_environment.sh rename; running teardown_rc_environment.sh."
+            ./scripts/release/teardown_rc_environment.sh
+          fi

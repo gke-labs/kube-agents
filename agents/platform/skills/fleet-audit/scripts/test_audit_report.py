@@ -613,6 +613,61 @@ class HarnessTestCase(BaseTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# The body-file handoff to the credential sidecar
+# --------------------------------------------------------------------------- #
+
+
+class WriteTempTest(BaseTestCase):
+    """The #955 uid split: the sandbox writes the body file, the sidecar's
+    `gh` — a different user — reads it. Group permissions are the only bridge,
+    and a fallback into this container's private tmp is a file the sidecar can
+    never see at all (#1030)."""
+
+    def test_the_body_file_is_group_readable_across_the_uid_split(self):
+        scratch = self.tmp_path / "scratch"
+        self.patch_attr("SCRATCH_DIR", str(scratch))
+        path = audit_report._write_temp("the report body")
+        self.addCleanup(audit_report._unlink, path)
+        self.assertTrue(
+            Path(path).is_relative_to(scratch),
+            f"{path} is not in the shared scratch directory {scratch}",
+        )
+        mode = os.stat(path).st_mode
+        self.assertEqual(
+            mode & 0o060,
+            0o060,
+            f"body file is {oct(mode & 0o777)}: the sidecar (a different uid "
+            "since #955) can only read it through the group bits",
+        )
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "the report body")
+
+    def test_an_unusable_scratch_dir_fails_loudly_with_no_private_tmp_file(self):
+        # The uid split simulated by permissions: a parent the test cannot
+        # write through stands in for a scratch mount the sandbox uid cannot
+        # create files in.
+        parent = self.tmp_path / "readonly"
+        parent.mkdir()
+        parent.chmod(0o500)
+        self.addCleanup(parent.chmod, 0o700)
+        self.patch_attr("SCRATCH_DIR", str(parent / "scratch"))
+        private = self.tmp_path / "private-tmp"
+        private.mkdir()
+        with patch.object(tempfile, "tempdir", str(private)):
+            with self.assertRaises(RuntimeError) as ctx:
+                audit_report._write_temp("body")
+        message = str(ctx.exception)
+        self.assertIn("publish path broken", message)
+        self.assertIn(str(parent / "scratch"), message)
+        self.assertIn("#1030", message)
+        self.assertEqual(
+            list(private.iterdir()),
+            [],
+            "a body file landed in the container-private temp dir, which the "
+            "sidecar can never read — the silent-fallback failure of #1030",
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
 
@@ -4091,6 +4146,109 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_quoted_command_never_fires(self):
+        body = "> /remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
+
+    def test_a_quoted_command_from_a_stranger_is_left_alone(self):
+        body = "> /remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse(
+            [comment(body, association="NONE", login="drive-by")]
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_lazy_continuation_quoted_command_never_fires(self):
+        """CommonMark lazy continuation includes following lines in the blockquote."""
+        body = "> Quoting a suggestion:\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
+
+    def test_a_command_after_blank_line_following_a_quote_fires(self):
+        body = "> Quoting context:\n\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_empty_quote_line_fires(self):
+        body = "> The audit flagged netpol-missing.\n>\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_fenced_block_outside_quote_fires(self):
+        body = "> Quoting the report:\n```yaml\nreplicas: 2\n```\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_fenced_block_inside_quote_fires(self):
+        body = "> ```yaml\n> replicas: 2\n> ```\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_inside_fenced_block_inside_quote_never_fires(self):
+        body = "> ```yaml\n> /remediate netpol-missing\n> ```\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_quoted_list_item_never_fires(self):
+        body = "> Findings:\n> - netpol-missing\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_quoted_numbered_list_item_never_fires(self):
+        body = "> Findings:\n> 1. netpol-missing\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_ordered_list_item_starting_above_one_never_fires(self):
+        body = "> Quoting the checklist:\n2. Fix the netpol\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_quoted_and_unprefixed_continuation_list_never_fires(self):
+        body = "> 1. netpol-missing\n2. rbac-broad\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_empty_ordered_marker_inside_quote_never_fires(self):
+        body = "> Findings:\n> 2.\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_command_after_unprefixed_numbered_list_item_starting_with_one_fires(self):
+        body = "> Quoting context:\n1. Fix the netpol\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_blank_quote_line_following_quoted_list_item_fires(self):
+        body = "> Findings:\n> - netpol-missing\n>\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -5291,9 +5449,21 @@ class TestUnansweredRemediateComments(unittest.TestCase):
     def comment(self, body, cid="IC_1"):
         return {"id": cid, "body": body, "author": {"login": "operator"}}
 
-    def test_a_quoted_command_is_not_a_command(self):
+    def test_a_fenced_command_is_not_a_command(self):
         fenced = self.comment("```\n/remediate a\n```")
         self.assertEqual(audit_report.unanswered_remediate_comments([fenced]), [])
+
+    def test_a_quoted_command_earns_an_answer_on_clean_run(self):
+        quoted = self.comment("> /remediate a")
+        got = audit_report.unanswered_remediate_comments([quoted])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
+
+    def test_a_lazy_continuation_quoted_command_earns_an_answer_on_clean_run(self):
+        lazy = self.comment("> Quoting:\n/remediate a")
+        got = audit_report.unanswered_remediate_comments([lazy])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
 
     def test_a_mention_still_earns_an_answer_when_nothing_can_be_opened(self):
         # Unlike the findings path, authorization is not consulted: nothing is
@@ -6236,6 +6406,113 @@ class TestFenceScanning(unittest.TestCase):
 
     def test_a_closer_may_carry_trailing_whitespace(self):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
+
+
+class TestBlockQuoteScanning(unittest.TestCase):
+    def strip(self, text):
+        return audit_report.strip_block_quotes(text)
+
+    def test_a_single_line_blockquote_is_stripped(self):
+        out = self.strip("> /remediate x\n\nrest")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("rest", out)
+
+    def test_a_lazy_continuation_line_is_stripped(self):
+        out = self.strip("> Quote header:\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_blank_line_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_quote_line_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n>\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_quote_line_with_spaces_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n>   \n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_fence_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n```yaml\nfoo: bar\n```\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_fence_inside_quote_terminates_lazy_continuation(self):
+        out = self.strip("> ```yaml\n> foo: bar\n> ```\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_heading_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n# Heading\n/remediate real")
+        self.assertIn("# Heading", out)
+        self.assertIn("/remediate real", out)
+
+    def test_a_thematic_break_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n---\n/remediate real")
+        self.assertIn("---", out)
+        self.assertIn("/remediate real", out)
+
+    def test_a_list_item_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n- list item\n/remediate real")
+        self.assertIn("- list item", out)
+        self.assertIn("/remediate real", out)
+
+    def test_an_ordered_list_item_starting_with_one_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n1. list item\n/remediate real")
+        self.assertIn("1. list item", out)
+        self.assertIn("/remediate real", out)
+
+    def test_an_ordered_list_item_starting_above_one_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Quote header:\n2. list item\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_an_ordered_list_unprefixed_continuation_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> 1. netpol-missing\n2. rbac-broad\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_content_free_ordered_marker_inside_quote_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Findings:\n> 2.\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_an_empty_list_item_without_content_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Quoting context:\n- \n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_lazy_continuation_under_quoted_bullet_list_item_is_stripped(self):
+        out = self.strip("> Findings:\n> - netpol-missing\n/remediate netpol-missing\n\nreal text")
+        self.assertNotIn("/remediate netpol-missing", out)
+        self.assertIn("real text", out)
+
+    def test_a_lazy_continuation_under_quoted_numbered_list_item_is_stripped(self):
+        out = self.strip("> 1. netpol-missing\n/remediate netpol-missing\n\nreal text")
+        self.assertNotIn("/remediate netpol-missing", out)
+        self.assertIn("real text", out)
+
+    def test_an_empty_quote_line_after_quoted_list_item_terminates_lazy_continuation(self):
+        out = self.strip("> - netpol-missing\n>\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_list_item_inside_quote_terminates_lazy_continuation(self):
+        out = self.strip("> -\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_nested_quote_with_list_item_lazy_continuation_is_stripped(self):
+        out = self.strip("> > - item\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_three_spaces_indent_is_a_blockquote(self):
+        out = self.strip("   > /remediate x\n\nrest")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("rest", out)
+
+    def test_empty_string_returns_empty(self):
+        self.assertEqual(self.strip(""), "")
+        self.assertEqual(self.strip(None), "")
 
 
 class TestPathContainment(unittest.TestCase):

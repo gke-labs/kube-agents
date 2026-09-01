@@ -123,6 +123,10 @@ def default_settings_path() -> str:
 # which is only when there is no clone to ask yet. See `resolve_base_branch`.
 DEFAULT_BASE_BRANCH = "main"
 
+
+class GitOpsRepoEmpty(RuntimeError):
+    """Raised when a GitOps repository has no commits on any branch."""
+
 # Tolerates the operator's Markdown bullet and bold markers, and the literal
 # `None` when the CR leaves it unset.
 SETTINGS_REPO_RE = re.compile(r"^\s*[-*]?\s*\**Git Repo:\**\s*(\S+)\s*$", re.M)
@@ -511,6 +515,9 @@ def ensure_workspace(
     until the remediation branch stages them, so a `git clean -fd` on the way
     into `finish` deletes every fix the audit just produced and the run reports
     them all as "the file was never written".
+
+    Raises `GitOpsRepoEmpty` if the target repository has zero commits on any
+    branch, preventing dispatch runs from crashing on raw git fatal errors.
     """
     root = Path(root if root is not None else default_root())
     lease = sanitize_lease(lease)
@@ -543,6 +550,28 @@ def ensure_workspace(
     # Resolved here rather than defaulted in the signature: it takes a `git` in
     # the clone, and the clone is what the lines above just established.
     base_branch = base_branch or resolve_base_branch(target, runner)
+
+    # An empty repository has no commits on any branch, so origin/<base_branch>
+    # cannot exist. Probe before checkout rather than dying on raw git fatal output.
+    ref_check = runner(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base_branch}"],
+        cwd=str(target),
+        check=False,
+    )
+    if getattr(ref_check, "returncode", 1) != 0:
+        all_commits = runner(
+            ["git", "rev-list", "-n", "1", "--all"],
+            cwd=str(target),
+            check=False,
+        )
+        if (
+            getattr(all_commits, "returncode", 1) != 0
+            or not (getattr(all_commits, "stdout", "") or "").strip()
+        ):
+            raise GitOpsRepoEmpty(
+                f"{repo} has no commits on any branch; the audit cannot open a remediation branch"
+            )
+        raise RuntimeError(f"{repo} has no remote branch origin/{base_branch}")
 
     runner(["git", "reset", "--hard", "--quiet"], cwd=str(target), check=False)
     runner(["git", "clean", "-fdq"], cwd=str(target), check=False)

@@ -55,7 +55,11 @@ echo "----------------------------------------------------------------------"
 echo "Model Provider:             ${MODEL_PROVIDER:-gemini}"
 echo "Model Default Name:         ${MODEL_DEFAULT_NAME:-<NOT SET>}"
 echo "Gemini API Key:             ${API_KEY_STATUS}"
-echo "Enable gVisor Isolation:    ${ENABLE_GVISOR:-<NOT SET>}"
+# Unset does not mean off here: provision_rc_environment.sh omits --gvisor when
+# this is empty, and install.sh then applies its own default, which is the
+# sandbox. Say so rather than logging a bare <NOT SET> beside a run that
+# provisions a gvisor node pool.
+echo "Enable gVisor Isolation:    ${ENABLE_GVISOR:-<NOT SET — install.sh default applies>}"
 echo "Enable GKE Backup Plan:     ${ENABLE_GKE_BACKUP_PLAN:-<NOT SET>}"
 echo "Agent K8s Permission Set:   ${PLATFORM_AGENT_PERMISSION_SET:-<NOT SET>}"
 echo "Memory Provider:            ${MEMORY_PROVIDER:-<NOT SET>}"

@@ -1,7 +1,9 @@
 """Tests for the platform-agent-gateway rollout budgets.
 
 The companion to test_hindsight_probes.py, for the Deployment the redeploy
-workflows actually gate on. The same three numbers have to stay in the same
+workflows actually gate on -- and for scripts/release/wait_for_gke_readiness.sh,
+which waits on the same Deployments after the RC environment is provisioned and
+is bound by the same rule. The same three numbers have to stay in the same
 order:
 
     startupProbe budget  <  rollout gate  <  progressDeadlineSeconds
@@ -30,6 +32,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MANIFESTS_GO = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
 _INTEGRATIONS_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-integrations.yml"
+_READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
 
 # What the gate must have over the startupProbe budget, in seconds, for the
 # node scale-up and image pull that precede the container starting at all.
@@ -120,6 +123,88 @@ class GatewayRolloutBudgetTest(unittest.TestCase):
             self.startup,
             f"agentAPIProbe sanctions a {self.startup}s cold boot the Deployment abandons "
             f"at {self.deadline}s",
+        )
+
+
+def _readiness_gate_seconds(deployment, variable):
+    """The gate wait_for_gke_readiness.sh applies to one Deployment.
+
+    Two halves, because the script gates through a shell constant rather than a
+    literal: the constant's value, and the fact that this Deployment's `rollout
+    status` is the line that reads it. Asserting only the value would keep
+    passing if the two Deployments were pointed at the same constant again,
+    which is the state this split exists to leave behind.
+    """
+    text = _READINESS_SCRIPT.read_text()
+
+    declared = re.search(rf'readonly {re.escape(variable)}="(\d+)s"', text)
+    assert declared, f"could not find readonly {variable} in {_READINESS_SCRIPT.name}"
+
+    used = re.search(
+        rf"kubectl rollout status deployment/{re.escape(deployment)}\b[^\n]*?"
+        rf'--timeout="\$\{{{re.escape(variable)}\}}"',
+        text,
+    )
+    assert used, f"{deployment}'s rollout status in {_READINESS_SCRIPT.name} does not use {variable}"
+
+    return int(declared.group(1))
+
+
+class ReleaseReadinessGateTest(unittest.TestCase):
+    """The RC pipeline's own gates, which are not the deploy workflows'.
+
+    wait_for_gke_readiness.sh waits on the same two Deployments after the RC
+    environment is provisioned, so it is bound by the same ordering -- but it
+    sat outside this file's scope and ran a single 300s gate for both. That was
+    under the gateway's 605s startupProbe budget, and went unnoticed while the
+    RC provisioned Standard clusters: a fresh Autopilot cluster pays node
+    scale-up and a first image pull before the container starts.
+    """
+
+    def setUp(self):
+        self.startup = _gateway_startup_budget_seconds()
+        self.deadline = _gateway_progress_deadline_seconds()
+        self.gateway_gate = _readiness_gate_seconds(
+            "platform-agent-gateway", "GATEWAY_READINESS_TIMEOUT"
+        )
+        self.litellm_gate = _readiness_gate_seconds("litellm", "LITELLM_READINESS_TIMEOUT")
+
+    def test_the_gateway_gate_covers_the_startup_budget_and_the_image_pull(self):
+        self.assertGreaterEqual(
+            self.gateway_gate,
+            self.startup + _PULL_ALLOWANCE_SECONDS,
+            f"a {self.gateway_gate}s gate leaves "
+            f"{self.gateway_gate - self.startup}s for node scale-up and an image pull on "
+            f"top of a {self.startup}s startupProbe budget; on a fresh Autopilot cluster "
+            "this reds an RC that was still coming up",
+        )
+
+    def test_the_gateway_gate_stays_under_the_progress_deadline(self):
+        self.assertLess(
+            self.gateway_gate,
+            self.deadline,
+            f"a {self.gateway_gate}s gate against a {self.deadline}s progressDeadlineSeconds "
+            "cannot run its full length",
+        )
+
+    def test_the_litellm_gate_stays_under_the_default_progress_deadline(self):
+        # litellm sets no progressDeadlineSeconds of its own, so unlike the
+        # gateway it has the 600s default as its ceiling, not 1200s.
+        self.assertLess(
+            self.litellm_gate,
+            _DEFAULT_PROGRESS_DEADLINE_SECONDS,
+            f"litellm runs on the {_DEFAULT_PROGRESS_DEADLINE_SECONDS}s default deadline; a "
+            f"{self.litellm_gate}s gate cannot run its full length. Set an explicit deadline "
+            "first, as the gateway does",
+        )
+
+    def test_the_two_deployments_do_not_share_one_gate(self):
+        """The ceilings differ by 600s, so one number cannot respect both."""
+        self.assertNotEqual(
+            self.gateway_gate,
+            self.litellm_gate,
+            "a single readiness gate for both Deployments is either under the gateway's "
+            "cold-start cost or over litellm's default progress deadline",
         )
 
 

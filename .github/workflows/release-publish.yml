@@ -1,24 +1,52 @@
 name: Release & Publish (GA)
 
+# Promotes a gate-passing commit to a GA release: SemVer from Conventional
+# Commits, a tag, promoted and signed images, a Helm chart, a GitHub Release.
+#
+# Whether to release is decided in `evaluate-schedule`; what to publish is
+# decided in `publish-release`. An unattended run needs that split: it adds the
+# halt on a breaking change, which the publishing path has no counterpart for,
+# and it keeps the two shapes that exit 1 with nothing to ship — no staging tag
+# at all, and a GA tag left by an emergency release on a commit that is not the
+# candidate's stamped child — from being a red run nobody reads.
+#
+# `scripts/release/README.md`, "The weekly GA release", is canonical for the cron
+# value and the reasoning behind it — do not restate either here.
+
 on:
-  #checkov:skip=CKV_GHA_7:GA release publish workflow requires explicit version override, target commit, and emergency bypass parameters
+  # No `schedule:` yet, and the reason is upstream of this workflow: the gate now
+  # reads the staging tag, and nightly-pipeline.yml — the only thing that pushes
+  # one — is itself dispatch-only. A weekly cron over a tag family nothing
+  # produces on a schedule would skip green every Thursday and prove nothing.
+  # Turn the nightly cron on first; scripts/release/README.md has the value and
+  # the ordering.
+  #checkov:skip=CKV_GHA_7:GA release publish workflow requires explicit version override, target commit, emergency bypass and schedule-gate parameters
   workflow_dispatch:
     inputs:
+      schedule_gate:
+        description: "bypass = publish (a human decided) · dry-run = report the scheduled verdict, publish nothing · evaluate = act on it, exactly as the cron would"
+        required: false
+        type: choice
+        default: bypass
+        options:
+          - bypass
+          - dry-run
+          - evaluate
       explicit_release_version:
         description: "Explicit release version override (e.g. 0.2.0). If omitted, automatically calculated via Conventional Commits."
         required: false
         type: string
       target_commit:
-        description: "Target commit SHA. If omitted, automatically resolved from the latest commit with an 'rc_*_validated' tag."
+        description: "Target commit SHA. If omitted, automatically resolved from the newest commit carrying a 'staging_<ts>_<sha>' tag."
         required: false
         type: string
-      skip_rc_validation:
-        description: "Emergency override: bypass live RC GKE validation check."
+      skip_staging_validation:
+        description: "Emergency override: bypass the staging promotion gate (the full nightly E2E matrix)."
         required: false
         type: boolean
         default: false
       emergency_override_reason:
-        description: "Required audit justification when skip_rc_validation is enabled."
+        description: "Required audit justification when skip_staging_validation is enabled."
         required: false
         type: string
 
@@ -31,10 +59,71 @@ permissions:
   contents: read
 
 jobs:
+  # Everything that decides *whether* to release lives here, and nothing that
+  # decides *what* to publish does. Keeping it in its own job rather than as a
+  # first step of publish-release makes the verdict one `if:` on the job below,
+  # instead of a condition repeated on every publishing step that whoever
+  # appends the next step has to remember to repeat again.
+  evaluate-schedule:
+    name: Decide Whether To Release
+    runs-on: ubuntu-latest
+    # A fork inherits workflow_dispatch — and will inherit the cron — but none
+    # of the release credentials. The guard repeats on both jobs rather than
+    # relying on the skip cascading through `needs`: an `always()` added to the
+    # publish job later would silently un-guard it.
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    # No `permissions:` block: this job only reads tags, and write access
+    # belongs to the job that publishes. The workflow-level `contents: read`
+    # applies.
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      release_commit: ${{ steps.decide.outputs.release_commit }}
+      # Nothing consumes these two, deliberately: they are what a reader gets
+      # when `publish-release` is skipped and the question is why. The step
+      # summary says the same thing in prose; this is the machine-readable copy,
+      # available from the API without opening the log.
+      gate_tag: ${{ steps.decide.outputs.gate_tag }}
+      skip_reason: ${{ steps.decide.outputs.skip_reason }}
+    steps:
+      # `fetch-depth: 0` because the decision is made entirely out of the tag
+      # graph and the commit range behind it. `persist-credentials: false`
+      # because nothing here pushes.
+      #
+      # Unconditional, though the `bypass` mode reads no git state at all. The
+      # step below runs a script out of the checkout, so skipping it on the
+      # cheapest path would leave that step invoking a file that is not on disk.
+      # The cost is one clone on a manual release that then spends minutes
+      # promoting and signing images from a second `fetch-depth: 0` checkout.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_GATE: ${{ inputs.schedule_gate }}
+          # Read only to refuse the combination, never to release: a named commit
+          # and a gate that picks its own are two different requests, and the
+          # publish job below prefers the input. See the script.
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+        run: ./scripts/release/decide_release_gate.sh
+
   publish-release:
     name: Publish GA Release
     runs-on: ubuntu-latest
-    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
+    needs: evaluate-schedule
+    # The same repository and branch guard as the gate job, plus its verdict.
+    # On a `schedule` event `github.ref` is the default branch, so the second
+    # clause holds for a cron tick and pins a manual dispatch to `main`.
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      github.ref == 'refs/heads/main' &&
+      needs.evaluate-schedule.outputs.should_release == 'true'
     permissions:
       contents: write
       packages: write
@@ -51,23 +140,43 @@ jobs:
         id: calculate-version
         env:
           EXPLICIT_RELEASE_VERSION: ${{ inputs.explicit_release_version }}
-          TARGET_COMMIT: ${{ inputs.target_commit }}
-          SKIP_RC_VALIDATION: ${{ inputs.skip_rc_validation }}
+          # An unattended run releases the exact commit the gate passed, not
+          # whatever the scripts would auto-resolve. `inputs.target_commit` is
+          # empty on a schedule event, so the gate's answer is what is left; on a
+          # bypassing dispatch the gate returns empty and a named commit — or the
+          # scripts' own resolution — wins.
+          #
+          # The order matters and the fallback is load-bearing. Both the gate and
+          # calculate_next_version.sh resolve the newest staging tag today, so
+          # they agree — but nothing forces them to keep agreeing, and a candidate
+          # promoted between the two jobs would already split them. Drop the
+          # fallback and the gate becomes decorative without anything looking
+          # wrong.
+          TARGET_COMMIT: ${{ inputs.target_commit || needs.evaluate-schedule.outputs.release_commit }}
+          SKIP_STAGING_VALIDATION: ${{ inputs.skip_staging_validation }}
         run: ./scripts/release/calculate_next_version.sh
 
       - name: Verify Release Eligibility
         id: verify-eligibility
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
-          SKIP_RC_VALIDATION: ${{ inputs.skip_rc_validation }}
+          RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
+          SKIP_STAGING_VALIDATION: ${{ inputs.skip_staging_validation }}
           EMERGENCY_OVERRIDE_REASON: ${{ inputs.emergency_override_reason }}
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: ./scripts/release/verify_release_eligibility.sh
 
+      - name: Create Git Tag
+        if: steps.verify-eligibility.outputs.skip_release != 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
+          RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: ./scripts/release/tag_ga_release.sh
+
       - name: Set up Docker Buildx
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GitHub Container Registry
         if: steps.verify-eligibility.outputs.skip_release != 'true'
@@ -80,7 +189,6 @@ jobs:
       - name: Promote Release Container Images
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
         run: ./scripts/release/promote_release_images.sh
 
@@ -104,23 +212,13 @@ jobs:
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           GH_USER: ${{ github.actor }}
         run: ./scripts/release/publish_helm_chart.sh
-
-      - name: Create Git Tag
-        if: steps.verify-eligibility.outputs.skip_release != 'true'
-        env:
-          RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: ./scripts/release/tag_ga_release.sh
 
       - name: Publish GitHub Release
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          RELEASE_COMMIT: ${{ steps.calculate-version.outputs.release_commit }}
           GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: ./scripts/release/publish_github_release.sh

@@ -19,6 +19,7 @@ engine it does not carry.
 """
 
 import pathlib
+import re
 import shlex
 import shutil
 import stat
@@ -141,7 +142,7 @@ echo "rc=$rc bucket=${{KUBE_AGENTS_STATE_BUCKET:-<unset>}}"
     def test_an_unreadable_probe_is_not_reported_as_nothing_to_tear_down(self):
         # The failure this guards is specific: the RC pipeline's WIF principal
         # loses storage.objects.get, the probe fails, and a bare exit-code test
-        # calls that "clean project" — so provision_rc_environment.sh takes the
+        # calls that "clean project" — so provision_environment.sh takes the
         # benign arm, raises no annotation, ignores RC_TEARDOWN_STRICT, and
         # installs over the live cluster. Anything that is not a clean absent
         # must be a failure.
@@ -168,7 +169,7 @@ echo "rc=$rc bucket=${{KUBE_AGENTS_STATE_BUCKET:-<unset>}}"
         # both is a refusal that names the recovery path, never a destroy.
         #
         # rc=3, not 1: this is the one non-zero exit that is not a failure, and
-        # an automated caller (scripts/release/provision_rc_environment.sh) has
+        # an automated caller (scripts/release/provision_environment.sh) has
         # to tell "nothing was installed" from "the teardown broke".
         proc = self._run(remote_state_exists=False)
         self.assertIn("rc=3", proc.stdout, proc.stderr)
@@ -209,7 +210,7 @@ echo "stderr-survived-the-lock" >&2
         # on_error exits with the FAILING COMMAND's status, so without
         # normalisation any child that exits 3 — a gcloud wrapper, a nested
         # script under lifecycle.sh — would speak the "nothing to tear down"
-        # contract and tell provision_rc_environment.sh to install over a live
+        # contract and tell provision_environment.sh to install over a live
         # environment.
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -387,6 +388,68 @@ class SourceRefDispatchTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("carries no uninstall.sh", proc.stdout)
         self.assertIsNone(log)
+
+    def test_baked_release_version_does_not_trigger_recursive_source_ref_dispatch(self):
+        """Verifies a stamped uninstall.sh (BAKED_RELEASE_VERSION set) does not trigger handover dispatch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = pathlib.Path(tmp) / "uninstall.sh"
+            content = _UNINSTALL_SH.read_text().replace(
+                'BAKED_RELEASE_VERSION=""',
+                'BAKED_RELEASE_VERSION="0.2.0"',
+            )
+            script_path.write_text(content)
+            script_path.chmod(0o755)
+
+            # Sourcing the script should leave PARAM_SOURCE_REF empty
+            check_cmd = f'KUBE_AGENTS_SOURCE_ONLY=true source "{script_path}"; echo "REF=$PARAM_SOURCE_REF"'
+            proc = subprocess.run(
+                ["bash", "-c", check_cmd],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("REF=", proc.stdout)
+            self.assertNotIn("REF=0.2.0", proc.stdout)
+
+
+class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
+    """A destroy is not refusable on the sandbox's account.
+
+    `write_tfvars_from_state` runs the Autopilot version-floor check whenever
+    ENABLE_GVISOR is truthy, and returns 1 below the floor. uninstall.sh sources
+    vars.sh whenever the checkout has one, and since the installer default
+    flipped that file says "true" on every new install -- so the ordinary
+    teardown, from the checkout that installed, is the case the floor can abort.
+    The `false` fallback inside write_tfvars_from_state does not cover it; only
+    the export in uninstall.sh does.
+
+    Asserted against the script's text rather than by running it, because the
+    call sits inside the teardown's confirmation and lock machinery. What makes
+    the assertion meaningful is the ordering: an export placed after the call
+    would read as a fix and change nothing.
+    """
+
+    def test_uninstall_forces_gvisor_off_before_generating_tfvars(self):
+        text = _UNINSTALL_SH.read_text()
+        export_at = text.find('export ENABLE_GVISOR="false"')
+        self.assertNotEqual(
+            export_at,
+            -1,
+            "uninstall.sh must export ENABLE_GVISOR=false; without it a "
+            "sub-floor Autopilot cluster cannot be torn down from the checkout "
+            "that installed it.",
+        )
+        # The invocation, not the two comments that name the function.
+        call = re.search(r"^\s*write_tfvars_from_state \"", text, re.MULTILINE)
+        self.assertIsNotNone(call, "write_tfvars_from_state call not found")
+        call_at = call.start()
+        self.assertLess(
+            export_at,
+            call_at,
+            "the ENABLE_GVISOR export must come before write_tfvars_from_state, "
+            "which is what runs the floor check.",
+        )
 
 
 if __name__ == "__main__":

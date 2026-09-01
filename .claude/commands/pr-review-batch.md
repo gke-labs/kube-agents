@@ -512,10 +512,12 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
 
 One thing the skill has no way to know about:
 
-- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"`. If
-  `mergeStateStatus` is `BLOCKED` or `DIRTY`, determine _why_ — failing required checks, merely
-  `REVIEW_REQUIRED`, missing labels, or the merge conflict you already found. The `tide` check
-  usually states its reason outright. Report which it is; they mean very different things.
+- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"` and read the
+  `tide` status on the head commit, which states its reason outright. Do not read
+  `mergeStateStatus`: every open pull request in this repository reads `BLOCKED` or `DIRTY` and
+  none reads `CLEAN`, so it distinguishes nothing —
+  `docs/pull-request-workflow.md`, "How a change merges", says why. `DIRTY` is the one signal it
+  does carry, and it means the conflict you have probably already found.
 
 The skill's step 6 does not apply: dispositions belong to the author, and you fix nothing here. Its
 "single confident first pass" constraint does, and it covers the saved file, the PR comment, and
@@ -532,8 +534,8 @@ the files already in that directory:
   read, so a narrowed pass that records only the SHA reads exactly like a full one and cancels it;
 - **Intent** — the one-sentence claim from Phase 2b, so the next reader knows what the findings were
   measured against;
-- **Verdict** — can this merge as is, yes or no, with the blocking items named, and what the
-  `mergeStateStatus` actually reflects. When the PR conflicts with its base, say so here and state
+- **Verdict** — can this merge as is, yes or no, with the blocking items named, and what `tide`
+  says it is waiting for. When the PR conflicts with its base, say so here and state
   that the review covers the PR as authored, not as merged. In `since` mode say that too: the
   verdict speaks for the commits you read, not for the pull request;
 - **Checks run** — commands executed and what they showed;
@@ -594,6 +596,13 @@ The rules that decide whether it lands:
 
 - `event` is `COMMENT`. Never `APPROVE`, never `REQUEST_CHANGES` — that is the human's signature,
   not yours.
+- **`/lgtm` is the same signature by another route, and here it is the merge itself.** Tide merges
+  on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from any account Prow
+  counts as a collaborator. `/approve` sets the other label. Neither goes out on my behalf unless I
+  asked for it,
+  and nor does `/hold`, which blocks somebody else's change in public. A review that concludes the
+  change is good says so to me; a person signs it. `docs/pull-request-workflow.md`,
+  "How a change merges", is what each label does.
 - `line` must be a RIGHT-side line the diff actually shows; use `start_line` with `line` for a
   range. A finding that anchors to no changed line goes in the summary body under a **Findings
   outside this diff** heading — never forced onto a nearby unrelated line, which is how a reviewer

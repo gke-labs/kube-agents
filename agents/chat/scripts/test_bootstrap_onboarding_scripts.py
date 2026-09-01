@@ -18,8 +18,10 @@ again.
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -259,6 +261,17 @@ class ScanGateTest(unittest.TestCase):
             self.assertIn(path, body)
         self.assertIn("Do not rank the findings yourself", body)
 
+    def test_child_cards_are_pointed_at_the_per_cluster_audit_sop(self):
+        """Without the SOP path the child body is written freehand.
+
+        Observed: four per-cluster cards completed in under two minutes each,
+        every one with no `metadata` at all, and the fleet report that followed
+        named zero problems on a fleet that had them.
+        """
+        body = bootstrap_scan_gate._task_body()
+        for path in bootstrap_scan_gate.CLUSTER_AUDIT_INSTRUCTIONS_PATHS:
+            self.assertIn(path, body)
+
     def test_raw_and_delivered_paths_are_distinct(self):
         # Same file for both would make the delivery job fire on the unranked
         # sweep output — the pre-prioritization behaviour, silently restored.
@@ -276,16 +289,16 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate.INVENTORY_PATH, "/opt/data/INVENTORY.md")
         self.assertIn("/opt/data/INVENTORY.md", bootstrap_scan_gate._task_body())
 
-    def test_body_drives_per_cluster_fan_out_and_covers_management(self):
-        """The sweep must scale per cluster and must not leave a management-cluster hole.
+    def test_body_drives_per_cluster_fan_out_and_leaves_no_cluster_uncovered(self):
+        """The sweep must scale per cluster and must not leave a hole.
 
-        Cluster Agents are pinned read-only to one cluster each, and reconcile
-        deliberately creates none for the cluster the pod itself runs on — so the
-        management cluster is only covered if platform scans it directly.
+        Cluster Agents are pinned read-only to one cluster each. Which clusters
+        get one is reconcile's decision, not this body's, so the body delegates
+        every cluster on the roster and audits only what the roster missed.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT, body)  # roster first
-        self.assertIn("management cluster", body)  # platform covers it itself
+        self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
+        self.assertIn("did not cover yourself", body)  # no silent hole
         self.assertIn("kanban_create", body)  # one child per cluster
         self.assertIn("parents=", body)  # fan-in collects the results
         self.assertIn("metadata", body)  # structured child results
@@ -339,6 +352,163 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("do not improvise", body.lower())
         self.assertIn("exactly once", body)
 
+    def test_reconcile_runs_before_the_sweep_is_filed(self):
+        """A sweep filed against a not-yet-reconciled roster fans out to nobody.
+
+        `cluster-agent-reconcile` is on `11 * * * *` and this gate is on
+        `* * * * *`, so on a fresh install the gate reaches an empty roster up to
+        59 minutes before anything populates it — and the marker it writes makes
+        that solo sweep the only one that ever runs.
+        """
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(len(calls), 1)
+        # Resolved under the data dir, not a hardcoded /opt/data: `agentHome`
+        # moves the tree, and a path that misses silently files a solo sweep.
+        self.assertIn(str(self.d / "scripts" / bootstrap_scan_gate.RECONCILE_SCRIPT_NAME), calls[0])
+
+    def test_the_gate_asks_the_reconcile_for_an_exit_code_that_means_something(self):
+        """Without `--require-create-pass` the exit code is always 0.
+
+        The script is a cron producer and swallows every failure — a `gcloud
+        container clusters list` that 403s is logged and the run exits 0. The gate
+        would then reset the attempt count and file a solo sweep that
+        `.bootstrap_scan_filed` makes permanent, which is the failure this whole
+        arm exists to prevent.
+        """
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            bootstrap_scan_gate.ensure_cluster_agents(self.d)
+        self.assertIn("--require-create-pass", calls[0])
+
+    def test_a_failed_reconcile_defers_the_sweep_without_marking_it(self):
+        # EXIT_CREATE_PASS_SKIPPED: the CREATE direction did not run, so the roster
+        # is not reconciled and the sweep must not be filed against it.
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 3, "", "boom")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_reconcile_stops_blocking_onboarding_after_repeated_failure(self):
+        """A reconcile that can never succeed must not hold onboarding shut.
+
+        No IAM to list clusters is a permanent condition on some installs. A
+        solo sweep is a worse report; no report at all is none.
+        """
+        stale = time.time() - bootstrap_scan_gate.RECONCILE_GIVE_UP_SECONDS - 1
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
+            f"{bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS}\n{stale}\n"
+        )
+        with mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_the_attempt_ceiling_alone_does_not_give_up_in_the_first_minutes(self):
+        """The count is exhausted but the streak is young: keep waiting.
+
+        The gate ticks every minute with no backoff, so five attempts is five
+        minutes — and IAM propagation on a fresh install routinely takes longer
+        than that. Giving up there files the solo sweep that
+        ``.bootstrap_scan_filed`` makes permanent.
+        """
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
+            f"{bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS}\n{time.time()}\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 3, "", "no IAM to list clusters")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_a_counter_written_before_the_clock_existed_still_gives_up(self):
+        # An install upgraded mid-streak carries a single-line marker. It must not
+        # win another 30 minutes of waiting from the upgrade alone.
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text(
+            f"{bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS}\n"
+        )
+        with mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_the_first_failure_stamps_the_streak_start(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 3, "", "boom")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            bootstrap_scan_gate.ensure_cluster_agents(self.d)
+            first = bootstrap_scan_gate._reconcile_since(self.d)
+            self.assertIsNotNone(first)
+            # A later tick extends the streak rather than restarting its clock.
+            bootstrap_scan_gate.ensure_cluster_agents(self.d)
+        self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), first)
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
+
+    def test_a_reconcile_that_times_out_defers_the_sweep(self):
+        # subprocess.run raising is the timeout path; it must read as "not yet",
+        # not as "no Cluster Agents exist".
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 1)
+
+    def test_a_successful_reconcile_clears_the_attempt_count(self):
+        (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text("3")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertTrue(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
+    def test_a_concurrent_reconcile_defers_the_sweep(self):
+        # The gate fires every minute and a reconcile takes tens of seconds, so overlap
+        # is the normal case. Mutual exclusion lives in the reconcile script, which the
+        # hourly cron job also runs; the gate only has to read its refusal.
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_ALREADY_RUNNING, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+
+    def test_losing_the_race_does_not_spend_an_attempt(self):
+        # Contention says nothing about the roster. Counting it would spend the ceiling
+        # that exists for a reconcile which genuinely cannot succeed.
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_ALREADY_RUNNING, "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
+        self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
+
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
 
@@ -352,17 +522,38 @@ class ScanGateTest(unittest.TestCase):
         shell calls against arm 1a's 65.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn("do not create, repair, or delete a profile yourself", body)
-        self.assertIn("An empty roster is a supported state", body)
-        self.assertIn("created=0 pruned=0 kept=0", body)
+        self.assertIn("do not repair or delete a profile", body)
+        self.assertIn("may immediately prune", body)
+        self.assertIn("not yours to fix", body)
+
+    def test_the_body_does_not_promise_the_roster_was_reconciled(self):
+        # The gate files the card on the give-up path too, after MAX_RECONCILE_ATTEMPTS
+        # failures over RECONCILE_GIVE_UP_SECONDS. A body asserting the roster is current
+        # is false there, and it tells the worker to trust a roster that may be empty —
+        # then `.bootstrap_scan_filed` makes the thin report permanent.
+        body = bootstrap_scan_gate._task_body()
+        self.assertNotIn("already reconciled", body)
+        self.assertNotIn("exited 0", body)
+        self.assertIn("may be empty or incomplete", body)
+        # The degradation has to reach the user: the report is delivered verbatim.
+        self.assertIn("names each one as lacking an agent", body)
+        self.assertIn("file it anyway", body)
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
-        # Cluster Agents ship now, but the script is still absent wherever an older
-        # image is running or no cluster has an agent yet. The same card must produce a
-        # report there rather than fanning out to an empty roster and writing nothing.
+        # A single-cluster install reconciles to an empty roster, and that is the
+        # supported answer. The same card must still produce a report there rather
+        # than fanning out to an empty roster and writing nothing.
         body = bootstrap_scan_gate._task_body()
-        self.assertIn("If the script is absent", body)
-        self.assertIn("no Cluster Agents", body)
+        self.assertIn("there are no Cluster Agents", body)
+        self.assertIn("do the whole sweep yourself", body)
+        # The workload checks live only in the single-cluster SOP now, so the solo
+        # walk has to be sent there or it produces a topology table with empty
+        # workload columns — the empty report this card exists to prevent.
+        self.assertIn("single-cluster audit SOP", body)
+        # Topology is that SOP's Step 2, so a range starting at 3 leaves the fleet
+        # table's K8s version, node pool and Workload Identity columns unsourced on
+        # the one path where no Cluster Agent supplies them.
+        self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
     def test_body_propagates_idempotency_keys_to_the_fan_out(self):
         # The root card is guarded by a marker and a key; the cards it spawns

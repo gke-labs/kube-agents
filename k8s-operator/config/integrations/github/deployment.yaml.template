@@ -158,16 +158,20 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Allow GCP Workload Identity / Metadata Server (port 988).
-    # On Dataplane V1 (iptables), the node rewrites 169.254.169.254:80 to 169.254.169.252:988
-    # before NetworkPolicy is evaluated, so this rule admits the post-DNAT token fetch.
-    # On Dataplane V2 (eBPF), policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
+    # GCP Metadata Server (pre-NAT link-local address, port 80). The minter dials
+    # 169.254.169.254:80 for OAuth2 token fetches. On Dataplane V2 (eBPF), policy is
+    # evaluated pre-NAT at the socket layer, so this rule admits those fetches directly.
     - to:
         - ipBlock:
             cidr: 169.254.169.254/32
       ports:
         - protocol: TCP
           port: 80
+    # GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+    # the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    # is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+    # policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
+    # Port 987 (ALTS) is deliberately omitted because standard OAuth2/REST token fetches do not use DirectPath.
     - to:
         - ipBlock:
             cidr: 169.254.169.252/32

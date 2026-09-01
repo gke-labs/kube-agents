@@ -49,10 +49,11 @@ import subprocess
 import sys
 
 AGENT_CONTAINER = "platform-agent"
-# The operator renders the broker as a sidecar, so agent and broker share a Pod.
-# That is the only layout where a shared process namespace is even expressible,
-# and it is the one this suite targets -- so if the broker is ever moved to a Pod
-# of its own, this says so rather than passing vacuously against it.
+# The broker is a sidecar in the default layout and a Pod of its own behind
+# spec.security.splitCredentialBrokerPod. Only the sidecar layout puts the two
+# in one Pod, which is the only layout where a shared process namespace is even
+# expressible -- so this suite targets it, and says so rather than passing
+# vacuously against a split install.
 BROKER_CONTAINER = "envoy-credential-proxy"
 # From the operator: sandboxUID and credentialProxyUID.
 EXPECTED_AGENT_UID = "10000"
@@ -142,7 +143,7 @@ def assert_the_sidecar_layout() -> None:
         sys.exit(
             f"Pod {POD} has no {BROKER_CONTAINER} container (containers: {names}).\n"
             "This suite asserts the sidecar layout, where agent and broker share a Pod.\n"
-            "With the broker in a Pod of its own there is no shared process namespace to\n"
+            "With splitCredentialBrokerPod enabled there is no shared process namespace to\n"
             "check, and passing here would mean nothing. Nothing was verified."
         )
 

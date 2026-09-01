@@ -26,6 +26,7 @@ from admin_console.chat.backend import persisted_backend_factory
 from admin_console.chat.service import ChatService
 from admin_console.chat.store import SQLiteInteractionStore, interaction_state_path
 from admin_console.connection_persistence import load_connection
+from admin_console.google_chat_integration import GoogleChatIntegrationService
 from admin_console.llm_gateway import LlmGatewayService
 from admin_console.project_config import (
     TARGET_SCOPE_HEADERS,
@@ -35,6 +36,7 @@ from admin_console.project_config import (
 
 RuntimeProviderFactory = Callable[[], agent_runtime.AgentRuntimeProvider]
 LlmGatewayFactory = Callable[[DeploymentTarget], LlmGatewayService]
+GoogleChatFactory = Callable[[DeploymentTarget], GoogleChatIntegrationService]
 
 
 def _error(code: str, message: str, *, retryable: bool = False) -> dict:
@@ -65,6 +67,7 @@ def create_app(
     *,
     runtime_provider_factory: RuntimeProviderFactory | None = None,
     llm_gateway_factory: LlmGatewayFactory | None = None,
+    google_chat_factory: GoogleChatFactory | None = None,
     bound_target: DeploymentTarget | None = None,
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager] | None = None,
 ) -> FastAPI:
@@ -77,6 +80,7 @@ def create_app(
         account
     )
     llm_gateway_factory = llm_gateway_factory or LlmGatewayService
+    google_chat_factory = google_chat_factory or GoogleChatIntegrationService
     app = FastAPI(
         title="kube-agents admin portal",
         version="1.0.0",
@@ -202,6 +206,20 @@ def create_app(
             raise HTTPException(
                 status_code=503,
                 detail=_error("llm_gateway_unavailable", str(exc), retryable=True),
+            ) from exc
+
+    @app.get("/api/v1/integrations/google-chat")
+    def inspect_google_chat(request: Request) -> dict:
+        try:
+            return google_chat_factory(request_target(request)).inspect()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error(
+                    "google_chat_integration_unavailable",
+                    str(exc),
+                    retryable=True,
+                ),
             ) from exc
 
     @app.get("/api/v1/llm-gateway/device-status")

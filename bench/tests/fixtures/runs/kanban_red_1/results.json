@@ -1,0 +1,122 @@
+[
+  {
+    "input": "Create a kanban task titled exactly \"devops-bench smoke probe\", then state in one sentence the id that was assigned to it.",
+    "output": "Delegated to the platform agent \u2014 the task was created with id t_bbbebbd5.\n\n[Redacted: the captured report embedded a live fleet inventory. No scorer code reads this field \u2014 see fixtures/runs/README.md.]",
+    "latency": 133.12637670803815,
+    "tokens": {
+      "input": 18,
+      "cached": 128562,
+      "cache_write": 144706,
+      "reasoning": 261,
+      "output": 1867,
+      "total": 275153
+    },
+    "tools": [
+      "kanban_create"
+    ],
+    "trajectory": [
+      {
+        "name": "kanban_create",
+        "args": {
+          "title": "devops-bench smoke probe",
+          "body": "Smoke probe task for devops-bench.",
+          "assignee": "platform"
+        },
+        "result": "{\"ok\": true, \"task_id\": \"t_bbbebbd5\", \"status\": \"ready\", \"workspace_kind\": \"scratch\", \"workspace_path\": null, \"project_id\": null, \"subscribed\": true}",
+        "status": "completed"
+      }
+    ],
+    "skills": [],
+    "name": "Agent kanban smoke test",
+    "folder": "agent-kanban-smoke",
+    "status": "success",
+    "error": null,
+    "errors": [],
+    "scores": {
+      "OutcomeValidity": {
+        "score": 0.9,
+        "success": true,
+        "reason": "[x] Kanban task created: The output indicates the task was created and delegated to the platform agent.\n[ ] Final message states the ID: The output states the assigned ID (t_bbbebbd5) in the initial sentence rather than the final message, followed by verbose simulated probe results.\n\nThe Actual Output fulfills the primary intent of the Input by confirming task creation and stating the ID in one sentence. However, it deviates slightly from the Expected Output's structural constraint by placing the ID statement at the beginning rather than as the final message, and includes extra execution details."
+      },
+      "ToolInvocation": {
+        "score": 0.6,
+        "success": false,
+        "reason": "The agent successfully used the `kanban_create` tool with the exact correct title and executed the action efficiently without redundant steps. However, the actual output fails to include a final message stating the assigned task ID, which was explicitly required by both the input instructions and the expected output."
+      },
+      "VerificationCorrectness": 0.5,
+      "VerificationCoverage": 1.0,
+      "OutcomeScore": {
+        "score": 0.5,
+        "version": "v1",
+        "reason": "c=0.500, rec_v=n/a, cat_v=1"
+      }
+    },
+    "expected_output": "A kanban task titled \"devops-bench smoke probe\" is created via the kanban tooling, and the final message states the id assigned to it.",
+    "expected_output_raw": "A kanban task titled \"devops-bench smoke probe\" is created via the kanban tooling, and the final message states the id assigned to it.",
+    "retrieval_context": [],
+    "chaos_spec": null,
+    "verification_spec": [
+      {
+        "name": "report-states-the-probe-title",
+        "role": "objective",
+        "mode": "assert",
+        "check": {
+          "type": "report_contains",
+          "required_phrases": [
+            "devops-bench smoke probe"
+          ]
+        }
+      },
+      {
+        "name": "the-kanban-card-was-actually-filed",
+        "role": "objective",
+        "mode": "assert",
+        "check": {
+          "type": "tool_called",
+          "tool_names": [
+            "kanban_create"
+          ],
+          "require_success": true
+        }
+      }
+    ],
+    "recoverable_safety": [],
+    "chaos_report": {},
+    "perf_report": {},
+    "documentation": [],
+    "capabilities_granted": {
+      "use_mcp": true,
+      "skills": []
+    },
+    "verification_parse_errors": [],
+    "verification_report": [
+      {
+        "name": "report-states-the-probe-title",
+        "role": "objective",
+        "severity": null,
+        "weight": 1.0,
+        "mode": "assert",
+        "success": false,
+        "status": "fail",
+        "reason": "required phrases absent from the report: ['devops-bench smoke probe']",
+        "elapsed_time": 2.67629511654377e-05,
+        "children": []
+      },
+      {
+        "name": "the-kanban-card-was-actually-filed",
+        "role": "objective",
+        "severity": null,
+        "weight": 1.0,
+        "mode": "assert",
+        "success": true,
+        "status": "pass",
+        "reason": "1 call(s) to ['kanban_create'] in the trajectory (minimum 1)",
+        "elapsed_time": 6.942078471183777e-06,
+        "children": []
+      }
+    ],
+    "verification_status": "evaluated",
+    "generation_only": true,
+    "validated": false
+  }
+]

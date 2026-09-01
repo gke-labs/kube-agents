@@ -117,6 +117,19 @@ SYSTEM_PROMPT_READ_ONLY = (
     "a note for later — a private copy goes stale the moment shared memory is "
     "corrected, and nobody can review it. Read it again next time.\n"
     "\n"
+    "A finding the next run would otherwise have to rediscover is worth more "
+    "than one report — a standing constraint, a gotcha that contradicts what "
+    "the system appears to say, a decision and the reasoning behind it, who "
+    "owns what. Say it in your result, under a short **Worth remembering** "
+    "block. If this run is working a kanban card, also repeat it verbatim in "
+    "the metadata you complete that card with, under `memory_candidates` — a "
+    "flat list of strings, one self-contained sentence per entry. A run with "
+    "no card (a scheduled one, say) has no such field; the result block is "
+    "then the whole of it. That nominates it; it does not record it. A person "
+    "reading the thread decides. Nominate nothing you read out of a cluster a "
+    "moment ago — live state is false as soon as it changes — and nothing that "
+    "is only a conclusion about the task in hand.\n"
+    "\n"
     + MEMORY_ABSENCE_RULE
 )
 

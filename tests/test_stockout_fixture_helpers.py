@@ -35,7 +35,7 @@ from test_gateway_rollout_budgets import _rollout_gate_seconds
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _FIXTURE = _ROOT / "tests" / "e2e" / "test_stockout_investigation.py"
 _AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
-_RC_PIPELINE = _ROOT / ".github" / "workflows" / "rc-release-pipeline.yml"
+_E2E_RUN_WORKFLOW = _ROOT / ".github" / "workflows" / "e2e-run.yml"
 
 
 class _StubFailure(Exception):
@@ -438,17 +438,22 @@ class BudgetTest(unittest.TestCase):
     def test_fixture_budget_fits_inside_the_pipeline_step(self):
         # Parsed rather than split on the job key and regexed for the next timeout-minutes:
         # that reads a step-level timeout, or the wrong job's, without saying so.
-        jobs = yaml.safe_load(_RC_PIPELINE.read_text())["jobs"]
-        self.assertIn("step-3-run-e2e-tests", jobs, "the RC pipeline's e2e job was renamed")
-        minutes = jobs["step-3-run-e2e-tests"].get("timeout-minutes")
-        self.assertIsNotNone(minutes, "step 3 has no job-level timeout-minutes")
+        #
+        # The budget is the reusable E2E job's, which the RC pipeline and the nightly
+        # pipeline both call. Its `timeout-minutes` is an input expression, so what is
+        # asserted here is the DEFAULT — the smaller of the two, and the RC pipeline's,
+        # since the nightly caller raises it. A fixture that fits the default fits both.
+        doc = yaml.safe_load(_E2E_RUN_WORKFLOW.read_text())
+        self.assertIn("run-e2e", doc["jobs"], "the shared e2e job was renamed")
+        minutes = doc[True]["workflow_call"]["inputs"]["timeout_minutes"].get("default")
+        self.assertIsNotNone(minutes, "e2e-run.yml's timeout_minutes input has no default")
         job_seconds = int(minutes) * 60
-        # The fixture is one part of the step, which also runs setup, two other e2e modules
+        # The fixture is one part of the job, which also runs setup, two other e2e modules
         # and the scenarios. Half the job is the loosest bound worth asserting; the precise
         # arithmetic lives in the workflow comment, where it can be read next to the number.
         self.assertLess(
             sof._FIXTURE_BUDGET_SECONDS, job_seconds / 2,
-            "the stockout fixture may not claim half of step 3's budget",
+            "the stockout fixture may not claim half of the E2E job's budget",
         )
 
     def test_every_wait_is_capped_by_the_budget(self):

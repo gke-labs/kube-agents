@@ -25,6 +25,7 @@ from tests.testing.release import (
     MOCK_NONEXISTENT_REF,
     MOCK_NONEXISTENT_TAG,
     MOCK_RC_VALIDATED_TAG,
+    MOCK_TARGET_RELEASE_TAG,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -302,6 +303,33 @@ class CalculateNextVersionTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_explicit_version_resumption_allowed_when_tag_on_detached_head_stamped_commit(self):
+        """Verifies explicit version calculation allows resumption when tag is on a detached HEAD child commit."""
+        temp_dir, repo_dir, git = self._create_mock_repo()
+        try:
+            candidate_commit = git("rev-parse", "HEAD").stdout.strip()
+            # Attach validated tag on candidate commit
+            git("tag", "-a", MOCK_RC_VALIDATED_TAG, candidate_commit, "-m", "validated")
+
+            # Create detached HEAD child commit stamped with release version
+            git("checkout", "--detach", candidate_commit)
+            (pathlib.Path(repo_dir) / "version.txt").write_text(f"{MOCK_TARGET_RELEASE_TAG}\n")
+            git("add", "version.txt")
+            git("commit", "-m", f"chore(release): stamp release version {MOCK_TARGET_RELEASE_TAG}")
+            stamped_commit = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", MOCK_TARGET_RELEASE_TAG, stamped_commit, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
+            git("checkout", "main")
+
+            # Run with explicit release version on candidate commit
+            proc = self._run_calc_script(
+                repo_dir,
+                env={"EXPLICIT_RELEASE_VERSION": MOCK_TARGET_RELEASE_TAG, "TARGET_COMMIT": candidate_commit},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), MOCK_TARGET_RELEASE_TAG)
+        finally:
+            temp_dir.cleanup()
+
     def test_explicit_version_refs_tags_namespace_disambiguation(self):
         temp_dir, repo_dir, git = self._create_mock_repo()
         try:
@@ -320,19 +348,24 @@ class CalculateNextVersionTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_auto_resolve_target_commit_from_validated_rc_tag(self):
+    def test_auto_resolve_target_commit_from_staging_promotion_tag(self):
+        """The same tag the release gate reads.
+
+        Resolving a different candidate here would compute the version for one
+        commit and let the gate publish another.
+        """
         temp_dir, repo_dir, git = self._create_mock_repo()
         try:
             # Initial commit tagged 0.1.0
             git("tag", "-a", "0.1.0", "-m", "Release 0.1.0")
 
-            # Second commit: fix commit with validated RC tag
+            # Second commit: fix commit promoted to staging
             (pathlib.Path(repo_dir) / "fix.txt").write_text("fix")
             git("add", "fix.txt")
             git("commit", "-m", "fix: resolve bug")
             fix_sha = git("rev-parse", "HEAD").stdout.strip()
-            rc_tag = "rc_2608191200_2222222_validated"
-            git("tag", "-a", rc_tag, fix_sha, "-m", f"Validated {rc_tag}")
+            staging_tag = "staging_2608191200_2222222"
+            git("tag", "-a", staging_tag, fix_sha, "-m", f"Promoted {staging_tag}")
 
             # Third commit on main: unvalidated feat commit
             (pathlib.Path(repo_dir) / "feat.txt").write_text("feat")
@@ -393,11 +426,27 @@ class CalculateNextVersionTest(unittest.TestCase):
             temp_dir.cleanup()
 
     def test_emergency_override_calculates_from_head(self):
+        """A promoted commit must exist, or the override is indistinguishable from the default.
+
+        With no staging tag in the repository the auto-resolve branch also falls
+        through to HEAD, so every assertion below passes whether or not the
+        override is honoured — and did, while the test was still setting the
+        pre-rename `SKIP_RC_VALIDATION`. The staging tag on an older commit is
+        what makes the two branches produce different answers.
+        """
         temp_dir, repo_dir, git = self._create_mock_repo()
         try:
             git("tag", "-a", "0.1.0", "-m", "Release 0.1.0")
 
-            # Commit on main without RC tag
+            # A promoted commit the auto-resolve branch would pick instead of HEAD,
+            # and a patch bump rather than HEAD's minor, so the two cannot be confused.
+            (pathlib.Path(repo_dir) / "promoted.txt").write_text("promoted")
+            git("add", "promoted.txt")
+            git("commit", "-m", "fix: promoted candidate")
+            promoted_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "staging_2608191200_2222222", promoted_sha, "-m", "Promoted")
+
+            # Commit on main that was never promoted
             (pathlib.Path(repo_dir) / "emergency.txt").write_text("hotfix")
             git("add", "emergency.txt")
             git("commit", "-m", "feat: emergency hotfix")
@@ -407,15 +456,45 @@ class CalculateNextVersionTest(unittest.TestCase):
             proc = self._run_calc_script(
                 repo_dir,
                 args=["", ""],
-                env={"SKIP_RC_VALIDATION": "true", "GITHUB_OUTPUT": str(gh_out)},
+                env={"SKIP_STAGING_VALIDATION": "true", "GITHUB_OUTPUT": str(gh_out)},
             )
             self.assertEqual(proc.returncode, 0)
+            self.assertIn("Emergency override", proc.stderr)
             self.assertEqual(proc.stdout.strip(), "0.2.0")
 
             outputs = gh_out.read_text()
             self.assertIn("release_version=0.2.0", outputs)
             self.assertIn("version=0.2.0", outputs)
             self.assertIn(f"release_commit={head_sha}", outputs)
+            self.assertNotIn(promoted_sha, outputs)
+        finally:
+            temp_dir.cleanup()
+
+    def test_without_the_override_the_promoted_commit_wins_over_head(self):
+        """The other side of the branch above, so neither can pass by coincidence."""
+        temp_dir, repo_dir, git = self._create_mock_repo()
+        try:
+            git("tag", "-a", "0.1.0", "-m", "Release 0.1.0")
+
+            (pathlib.Path(repo_dir) / "promoted.txt").write_text("promoted")
+            git("add", "promoted.txt")
+            git("commit", "-m", "fix: promoted candidate")
+            promoted_sha = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "staging_2608191200_2222222", promoted_sha, "-m", "Promoted")
+
+            (pathlib.Path(repo_dir) / "emergency.txt").write_text("hotfix")
+            git("add", "emergency.txt")
+            git("commit", "-m", "feat: unpromoted commit")
+
+            gh_out = pathlib.Path(repo_dir) / "gh_out.txt"
+            proc = self._run_calc_script(
+                repo_dir,
+                args=["", ""],
+                env={"GITHUB_OUTPUT": str(gh_out)},
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "0.1.1")
+            self.assertIn(f"release_commit={promoted_sha}", gh_out.read_text())
         finally:
             temp_dir.cleanup()
 

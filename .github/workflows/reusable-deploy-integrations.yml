@@ -126,9 +126,7 @@ jobs:
           CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
-          # Allow deployments on pre-existing CI evaluation / environment clusters
-          # created without Cloud KMS CMEK encryption until they are upgraded.
-          ALLOW_UNENCRYPTED_SECRETS: ${{ vars.ALLOW_UNENCRYPTED_SECRETS || 'true' }}
+          ALLOW_UNENCRYPTED_SECRETS: ${{ vars.ALLOW_UNENCRYPTED_SECRETS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

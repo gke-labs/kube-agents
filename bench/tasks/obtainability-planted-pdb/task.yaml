@@ -1,5 +1,35 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
+# commented entry in hack/ci-eval-pr.sh TASKS). Its one measured run PASSED
+# clean — every exact check green, OutcomeValidity 0.7 recorded — in 962s
+# (build 2092638061140643840, kube-agents-evals-3), and 962s is the reason it
+# moved: six full audits at that price do not fit one presubmit. The
+# reliability domain is covered there by reliability-pdb-probe; this full
+# sweep is the SOP-fidelity version and activates with the nightly tier.
+# It was held by A1, A4 and A5 (bench/tasks/DRAFTS.md); all three are closed.
+#
+# A1 and A4 cleared together on 2026-08-25, when
+# GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
+# EVAL_GITHUB_APP_ID=4675512, which is the condition hack/ci-deploy.sh needs
+# before it renders githubMinter.enabled=true and passes
+# platformAgent.integration.github.gitRepo -- so the `Git Repo:` line of
+# /opt/data/SETTINGS.md finally names the leased project's throwaway
+# gke-agentic/kube-agents-evals*-infra repo instead of the literal None, and
+# `audit_report.py start` has a workspace to clone and a minter to clone it
+# with (A1). It also mounts secret kube-agents-bench-github-token as
+# BENCH_GITHUB_TOKEN, which is the credential the ledger_issue_contains
+# objectives below read the published ledger issue with (A4).
+#
+# A5 cleared on main earlier: hack/fleet-kubeconfigs.sh writes one kubeconfig
+# per fixture ROLE and both cluster-state safeguards below resolve their role
+# through fleet_resource_property, so they grade the seeded cluster rather
+# than platform-agent-host. That matters most here: the second safeguard is a
+# pathless `op: absent`, a LIST, which on the wrong cluster exits zero with an
+# empty result and would have read as a clean PASS forever. What is left of A5
+# is which identity those kubeconfigs carry, not which cluster they reach.
+#
+# Executed once, 2026-08-26: the run minted a token, cloned the *-infra
+# workspace, published the obtainability ledger and passed every exact check.
+# The path this spec grades is proven, not merely unblocked.
 #
 # Domain: reliability (obtainability-audit SOP). Journey: the daily
 # reliability sweep names the workload that breaks on a drain or an upgrade,
@@ -19,7 +49,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1. Eligible tier: presubmit, once A1 is in place.
+# blocker A1, now closed. Eligible tier: presubmit, and active there
+# since 2026-08-25.
 #
 # The SOP (agents/platform/governance/obtainability_audit_sop.md) forbids any
 # write path outside the audit helper: the agent never runs git/gh itself and

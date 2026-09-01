@@ -40,7 +40,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
     def test_missing_arguments(self):
         proc = self._run_script([])
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("RELEASE_VERSION and RELEASE_COMMIT are required", proc.stderr)
+        self.assertIn("RELEASE_VERSION and RC candidate commit are required", proc.stderr)
 
     def test_invalid_tag_format(self):
         for bad_tag in INVALID_GA_RELEASE_TAGS:
@@ -77,16 +77,17 @@ class TagGAReleaseScriptTest(unittest.TestCase):
 
             proc = self._run_script(
                 [],
-                env={"RELEASE_VERSION": MOCK_EXPLICIT_RELEASE_VERSION_NEXT, "RELEASE_COMMIT": head_commit},
+                env={"RELEASE_VERSION": MOCK_EXPLICIT_RELEASE_VERSION_NEXT, "RC_CANDIDATE_COMMIT": head_commit},
                 cwd=repo_dir,
             )
-            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
             tag_commit = git("rev-parse", f"{MOCK_EXPLICIT_RELEASE_VERSION_NEXT}^{{commit}}").stdout.strip()
             self.assertEqual(tag_commit, head_commit)
         finally:
             temp_dir.cleanup()
 
-    def test_swapped_args_symmetry(self):
+    def test_strict_argument_order_rejects_swapped_args(self):
+        """Verifies tag_ga_release.sh strictly requires SemVer as first argument."""
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
             head_commit = git("rev-parse", "HEAD").stdout.strip()
@@ -95,9 +96,78 @@ class TagGAReleaseScriptTest(unittest.TestCase):
                 [head_commit, MOCK_TARGET_RELEASE_TAG],
                 cwd=repo_dir,
             )
-            self.assertEqual(proc.returncode, 0)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("not a valid pure numeric SemVer", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_stamps_baked_release_version_on_detached_head(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            # Create root installer script with empty baked version placeholder
+            install_sh = pathlib.Path(repo_dir) / "install.sh"
+            install_sh.write_text('#!/bin/bash\nBAKED_RELEASE_VERSION=""\necho "tag=$BAKED_RELEASE_VERSION"\n')
+            git("add", "install.sh")
+            git("commit", "-m", "feat: add installer")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG, main_commit],
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            # 1. Main branch is untouched (still points to main_commit and HEAD remains on main)
+            current_main = git("rev-parse", "main").stdout.strip()
+            self.assertEqual(current_main, main_commit)
+            current_branch = git("symbolic-ref", "--short", "HEAD").stdout.strip()
+            self.assertEqual(current_branch, "main")
+
+            # 2. Release tag exists and points to stamped commit (different from main)
             tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
-            self.assertEqual(tag_commit, head_commit)
+            self.assertNotEqual(tag_commit, main_commit)
+
+            # 3. Content at tag has BAKED_RELEASE_VERSION stamped with release tag
+            tag_install_content = git("show", f"{MOCK_TARGET_RELEASE_TAG}:install.sh").stdout
+            self.assertIn(f'BAKED_RELEASE_VERSION="{MOCK_TARGET_RELEASE_TAG}"', tag_install_content)
+        finally:
+            temp_dir.cleanup()
+
+    def test_fails_loudly_if_candidate_commit_unresolvable(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            # Pass a nonexistent SHA as candidate commit
+            bad_sha = "0123456789abcdef0123456789abcdef01234567"
+            proc = self._run_script([MOCK_TARGET_RELEASE_TAG, bad_sha], cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Failed to checkout candidate commit", proc.stderr)
+
+            # Ensure main branch is untouched and no tag was created
+            current_main = git("rev-parse", "main").stdout.strip()
+            self.assertEqual(current_main, main_commit)
+            tag_check = git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip()
+            self.assertEqual(tag_check, "")
+        finally:
+            temp_dir.cleanup()
+
+    def test_fails_loudly_when_installer_lacks_baked_version_placeholder(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            # Create installer script WITHOUT BAKED_RELEASE_VERSION placeholder
+            install_sh = pathlib.Path(repo_dir) / "install.sh"
+            install_sh.write_text('#!/bin/bash\necho "no baked placeholder here"\n')
+            git("add", "install.sh")
+            git("commit", "-m", "feat: legacy installer without placeholder")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+
+            proc = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Failed to stamp BAKED_RELEASE_VERSION in install.sh", proc.stderr)
+
+            # Ensure no tag was created
+            tag_check = git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip()
+            self.assertEqual(tag_check, "")
         finally:
             temp_dir.cleanup()
 

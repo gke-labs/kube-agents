@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "runId": "run_20260824_192454_771682",
+  "t": "2026-08-24T19:26:25Z",
+  "setupId": "gemini-3-1-pro-preview-kubeagents-mcp",
+  "model": "gemini-3.1-pro-preview",
+  "harness": "kubeagents",
+  "augmentation": [
+    "mcp"
+  ]
+}
