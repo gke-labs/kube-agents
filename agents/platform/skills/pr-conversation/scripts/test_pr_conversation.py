@@ -1207,6 +1207,36 @@ class TrustGateTest(_Harness):
         self.assertEqual(payload["status"], "FOUND")
         self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_1"])
 
+    def test_poll_past_refusal_budget_leaves_buried_untrusted_requests_unflagged_in_transcript(self):
+        """Once refusal budget is spent, dropped untrusted requests must not show is_request: True."""
+        already = [
+            make_comment(
+                f"IC_old{n}",
+                f"Refused.\n\n{pr_triggers.marker('IC_them%d' % n, pr_triggers.REFUSED_MARKER)}",
+                author=SELF,
+            )
+            for n in range(2)
+        ]
+        untrusted = make_comment("IC_UNTRUSTED", "/agent spam request", author="stranger", can_write=False, can_write_known=True)
+        trusted = make_comment("IC_MAINTAINER", "/agent maintainer task", author="maintainer", can_write=True, can_write_known=True)
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: already + [untrusted, trusted]},
+        )
+        err = StringIO()
+        with (
+            mock.patch.dict(os.environ, {pr_triggers.MAX_REFUSALS_ENV: "2"}),
+            redirect_stderr(err),
+        ):
+            _rc, out = self.run_helper(["poll", "--pr", "12"], provider)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_MAINTAINER"])
+        conv_comments = {c["comment_id"]: c for c in payload["conversations"][0]["comments"]}
+        self.assertTrue(conv_comments["IC_MAINTAINER"]["is_request"])
+        self.assertFalse(conv_comments["IC_UNTRUSTED"]["is_request"])
+        self.assertIn("1 untrusted request(s) not offered", err.getvalue())
+
     def test_a_trusted_out_of_scope_request_can_be_refused(self):
         """The other reason to refuse: a maintainer asking for something the
         agent will not do. Gating refusal on `can_write` would block it."""

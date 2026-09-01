@@ -338,7 +338,6 @@ def handle_poll(args) -> int:
         deferred_requests = 0
         for repo, pr in prs:
             comments, pr_requests = _requests_on(provider, repo, pr, viewer)
-            all_unanswered_ids = {row["comment_id"] for row in pr_requests}
             # Untrusted requests past this pull request's refusal budget are not
             # offered at all. The sweep already stopped refusing them, on
             # purpose, and handing them to the worker is how that bound got
@@ -356,6 +355,10 @@ def handle_poll(args) -> int:
                 ]
                 over_budget += len(pr_requests) - len(kept)
                 pr_requests = kept
+
+            # After the budget filter: cap-deferred rows keep is_request,
+            # budget-buried rows stay unflagged.
+            all_unanswered_ids = {row["comment_id"] for row in pr_requests}
 
             # Prioritize trusted requests over untrusted ones so an untrusted burst
             # before refusal budget exhaustion cannot starve maintainer requests.
