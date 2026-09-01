@@ -567,7 +567,17 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
     _MEMBER_SCOPED_RESOURCE = re.compile(
         r'^\s*resource\s+"google_service_account_iam_member"'
     )
-    _POOL_MEMBER_TARGET = re.compile(r"google_service_account\.scoped\b")
+    # The attribute assignment itself, not any mention: a comment naming the
+    # pool, or a member= line, must not be what waives the block. Comments are
+    # stripped before matching for the same reason.
+    _POOL_MEMBER_TARGET = re.compile(
+        r"\bservice_account_id\s*=\s*google_service_account\.scoped\b"
+    )
+
+    @classmethod
+    def _binds_on_pool_member(cls, line: str) -> bool:
+        code = re.split(r"#|//", line, 1)[0]
+        return cls._POOL_MEMBER_TARGET.search(code) is not None
 
     @classmethod
     def _member_scoped_lines(cls, text: str) -> set[int]:
@@ -591,7 +601,7 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
             depth += line.count("{") - line.count("}")
             if depth <= 0:
                 inside = False
-                if any(cls._POOL_MEMBER_TARGET.search(text) for _, text in block):
+                if any(cls._binds_on_pool_member(text) for _, text in block):
                     lines.update(number for number, _ in block)
                 block = []
         return lines
@@ -649,6 +659,16 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(set(), self._member_scoped_lines(project_scoped))
+        # A mention is not a binding: a comment naming the pool, or a member=
+        # line referencing it, must not waive a block that binds elsewhere.
+        commented = (
+            'resource "google_service_account_iam_member" "x" {\n'
+            "  # narrower than google_service_account.scoped would be\n"
+            "  service_account_id = google_service_account.agent.name\n"
+            '  role               = "roles/iam.serviceAccountTokenCreator"\n'
+            "}\n"
+        )
+        self.assertEqual(set(), self._member_scoped_lines(commented))
         # The waiver ends with the block: the same role one line after the
         # closing brace is not waived.
         trailing = pool_member + 'role = "roles/iam.serviceAccountTokenCreator"\n'

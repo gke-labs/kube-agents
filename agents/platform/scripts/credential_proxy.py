@@ -2083,22 +2083,25 @@ class CommandExecutor:
         # selected on.
         scoped = executable == "kubectl"
         command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
-        if kubeconfig:
-            kubeconfig_path = self._resolve_kubeconfig(kubeconfig, scoped=scoped)
-        elif flag_kubeconfig is not None:
-            # argv already names a cluster and the reroute above has already put
-            # it through selection. Falling into the branch below would select a
-            # *second* cluster -- the sidecar's own -- for a request that never
-            # asked for it. With the ambient cluster unmapped that is a refusal
-            # of a request pinned to a cluster the pool covers; with it mapped it
-            # is a second token minted and thrown away. Neither is a control.
+        if flag_kubeconfig is not None:
+            # The flag beats the environment, because that is the precedence
+            # kubectl itself applies -- and the reroute above has already put
+            # the flag's cluster through selection. Resolving the forwarded
+            # environment kubeconfig as well would select a *second* cluster
+            # for a request the flag has pinned: with the environment's
+            # cluster unmapped that is a refusal of a request naming a cluster
+            # the pool covers, and with it mapped it is a second token minted
+            # and thrown away. Neither is a control, so the environment file
+            # is not resolved at all when a flag is present.
             #
-            # The environment follows the flag when the pool is armed so the two
-            # cannot disagree, and is left alone otherwise, which is what the
-            # flag path did before the pool existed.
+            # The environment follows the flag when the pool is armed so the
+            # two cannot disagree, and is left alone otherwise, which is what
+            # the flag path did before the pool existed.
             kubeconfig_path = (
                 flag_kubeconfig if self.scoped_pool is not None and scoped else None
             )
+        elif kubeconfig:
+            kubeconfig_path = self._resolve_kubeconfig(kubeconfig, scoped=scoped)
         elif self.scoped_pool is not None and executable == "kubectl":
             # `KUBECONFIG` is in the base environment, so this branch is not
             # "no cluster" — it is "the sidecar's default cluster", and it has to

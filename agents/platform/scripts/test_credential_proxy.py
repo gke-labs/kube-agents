@@ -4405,6 +4405,34 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
             f"one request minted {len(self.minted)} tokens: {self.minted}",
         )
 
+    def test_the_flag_beats_the_forwarded_environment(self):
+        """kubectl prefers --kubeconfig over KUBECONFIG, so selection must too.
+
+        The common shape on a real install: the profile exports KUBECONFIG,
+        the client forwards it as the request field, and argv also carries a
+        flag. The flag's cluster is the one kubectl reads, so a request whose
+        flag names a mapped cluster must not be refused because the
+        *environment's* cluster is unmapped -- and must not mint twice when
+        both are mapped.
+        """
+        executor = self.executor(self.pool())
+        result = executor.execute(
+            [
+                "kubectl",
+                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                "get",
+                "pods",
+            ],
+            kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual(
+            [self.EMAIL],
+            self.minted,
+            "the flag named a mapped cluster; the environment's unmapped one "
+            "must neither refuse the request nor mint a token of its own",
+        )
+
     def test_the_scoped_kubeconfig_is_not_readable_by_the_agent(self):
         """It holds a bearer token for a cloud identity.
 

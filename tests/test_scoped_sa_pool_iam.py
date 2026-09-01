@@ -209,8 +209,27 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         )
 
     def _pool_grants_anything(self) -> bool:
-        """Does a pool member hold any project-level IAM grant of its own?"""
-        return 'resource "google_project_iam_member"' in self._pool_declarations()
+        """Does a pool member hold any authority of its own? Deliberately False.
+
+        There is nothing in this tree this can point at, and the first version
+        pretended otherwise: it searched scoped_pool.tf for
+        `resource "google_project_iam_member"`, a literal the test two methods
+        down *forbids* -- so the predicate was statically False in any tree
+        where the suite passes, which is a different thing from being False on
+        purpose. Worse, it made the coupled test below unpassable for the
+        change it exists to permit: the pool's replacement authority is
+        per-cluster Kubernetes RBAC, which adds no Terraform grant at all, so
+        the restoration would have been told to add exactly the resource the
+        sibling test refuses.
+
+        So this is now an explicit tripwire. The change that restores the
+        pool's authority (per-cluster RBAC bindings, by the accounts' numeric
+        unique IDs -- see scoped_pool.tf on why not the email) must repoint
+        this method at that authority's real source in the same change. Until
+        then it returns False, and the guard below reads: the agent is never
+        narrowed.
+        """
+        return False
 
     def _agent_is_narrowed(self) -> bool:
         """Has roles/container.viewer come off the set the module actually binds?
@@ -266,7 +285,10 @@ class ScopedPoolCeilingTest(unittest.TestCase):
                 "object, and CREDENTIAL_PROXY_SCOPED_SA_POOL=0 does not help -- "
                 "it falls back to the credential that was just stripped. Restore "
                 "the pool's authority (per-cluster RBAC) in the same change that "
-                "restores the narrowing.",
+                "restores the narrowing, and repoint _pool_grants_anything at "
+                "that authority's source -- it is deliberately False until the "
+                "source exists, so this arm fails by construction for a "
+                "narrowing that arrives without it.",
             )
         else:
             self.assertFalse(
