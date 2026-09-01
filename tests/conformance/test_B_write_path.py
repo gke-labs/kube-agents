@@ -239,27 +239,45 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         self.assertIn("github.credential-replacement", rule_ids)
         self.assertIn("gh", h.credential_proxy.CommandExecutor.ALLOWED_EXECUTABLES)
 
-    @h.known_violation("B1", "04_major_requirements.md B1")
-    def test_B1_the_agent_cannot_merge_or_approve(self) -> None:
-        """KNOWN VIOLATION. `gh pr merge` works today.
+    def test_B1_the_denylist_refuses_merge_and_approve(self) -> None:
+        """The half of B1 that holds today, pinned so it cannot quietly stop.
 
-        `gh` is in ALLOWED_EXECUTABLES and every denial rule matches only
-        `gh auth` or `gh extension`, so nothing stops the agent merging its own
-        pull request, approving one, or force-pushing a branch a GitOps
-        Application watches. `command_policy` puts `gh` out of scope on
-        purpose -- writing to the artifact plane is how the agent is meant to
-        act -- and the git workspace lease is a concurrency control that says
-        so in its own docstring.
-
-        B1 is not "cannot mutate a cluster", it is "cannot cause a production
-        change". Holding a credential that can merge is causing one. The repo's
-        own code agrees: the App "does have write access - it opens pull
-        requests on this repository and merges them."
+        github.merge and github.assent ship in the rendered denylist and are
+        the only thing standing between the agent's credential and completing
+        its own pull request. The first spelling of this file recorded all of
+        B1 as one known violation whose cause said "every denial rule matches
+        only gh auth or gh extension" -- true when written, closed since --
+        and expectedFailure absorbs any subset, so the two live rules were
+        covered by nothing: deleting either from the shipped policy left the
+        whole suite green.
         """
         for argv in (
             ["gh", "pr", "merge", "1", "--squash"],
             ["gh", "pr", "review", "1", "--approve"],
             ["gh", "pr", "merge", "--auto", "1"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(
+                    h.policy_blocks(argv),
+                    f"{argv} is permitted by the shipped denylist",
+                )
+
+    @h.known_violation("B1", "04_major_requirements.md B1")
+    def test_B1_the_agent_cannot_merge_or_approve(self) -> None:
+        """KNOWN VIOLATION, narrowed to what still holds: force-push.
+
+        The merge and approve halves closed -- github.merge and github.assent
+        ship in the denylist now, pinned by the passing test above. What
+        remains open is `git push --force`: the denylist has no rule for it
+        (the git verb and lease machinery in the broker constrain *where* git
+        may write, not this force flag), so the credential that can rewrite a
+        branch a GitOps Application watches is still a production-change
+        credential.
+
+        B1 is not "cannot mutate a cluster", it is "cannot cause a production
+        change". Rewriting a watched branch is causing one.
+        """
+        for argv in (
             ["git", "push", "--force", "origin", "main"],
         ):
             with self.subTest(argv=argv):
@@ -428,7 +446,13 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         for path, document in consumers:
             for job_name, job in (document.get("jobs") or {}).items():
                 condition = str((job or {}).get("if", ""))
-                permissions = (job or {}).get("permissions") or {}
+                # Effective permissions: a job with no permissions block
+                # inherits the workflow-level block wholesale, so reading
+                # only the job's would let id-token: write hoisted to the top
+                # of the file mint the deploy credential past the strict gate.
+                permissions = (job or {}).get("permissions")
+                if permissions is None:
+                    permissions = document.get("permissions") or {}
                 with self.subTest(workflow=path.name, job=job_name):
                     # Every workflow_run job gates on the repository — the
                     # AGENTS.md fork rule, and the credential half of it.

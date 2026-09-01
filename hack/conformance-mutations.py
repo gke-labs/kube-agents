@@ -253,7 +253,27 @@ MUTATIONS: list[Mutation] = [
         "shorten the gate's binary list, the plausible edit when one of them "
         "is legitimately needed at build time",
     ),
-        Mutation(
+            Mutation(
+        # The merge rule is one of the two the wide review found covered by
+        # nothing: the original B1 known violation absorbed every subset of
+        # its corpus, so deleting this rule left the suite green.
+        "B1-merge-rule-weakened",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("pr\\\\b(?:\\\\s+\\\\S+)*?\\\\s+merge\\\\b",
+         "pr\\\\b(?:\\\\s+\\\\S+)*?\\\\s+mergeonly\\\\b"),
+        "test_B1_the_denylist_refuses_merge_and_approve",
+        "tighten github.merge to a spelling gh never emits; the agent merges "
+        "its own pull request while every eyeball diff reads as a refactor",
+    ),
+    Mutation(
+        "B1-assent-rule-weakened",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("review\\\\b(?:\\\\s+\\\\S+)*?\\\\s+(?:--approve|-a)\\\\b",
+         "review\\\\b(?:\\\\s+\\\\S+)*?\\\\s+(?:--approveonly)\\\\b"),
+        "test_B1_the_denylist_refuses_merge_and_approve",
+        "tighten github.assent the same way; the approval half goes with it",
+    ),
+Mutation(
         # The genuine attack for the disclosure assertion. policy_blocks reads
         # the rendered policy out of the default golden fixture, so the
         # weakening that matters is there: one character appended to the

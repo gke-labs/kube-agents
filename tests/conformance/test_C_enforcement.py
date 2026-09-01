@@ -177,10 +177,33 @@ class C1IsolationIsStructural(unittest.TestCase):
         pre-flight check builds a string and runs it with `shell=True`: a
         compound command whose first verb is a read, and a `#` that neutralises
         appended flags. Neither reaches this broker, because it takes a list
-        and never interposes a shell -- so this asserts the property those two
-        attacks are the absence of.
+        and never interposes a shell on anything a request supplies -- so this
+        asserts the property those two attacks are the absence of, in both
+        spellings: a `shell=` keyword, and a shell interposed through argv
+        (`subprocess.run(["/bin/bash", "-c", command])` is a shell over a
+        string as surely as `shell=True`, and the first spelling of this test
+        could not see it). The one exemption is `bootstrap`, whose command
+        string is operator-set Deployment env rather than request data.
         """
-        tree = ast.parse(h.text("credential_proxy"))
+        source = h.text("credential_proxy")
+        tree = ast.parse(source)
+        exempt_functions = {"bootstrap"}
+        shell_names = {"sh", "bash", "dash", "zsh"}
+
+        functions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+
+        def enclosing_function(call):
+            best = None
+            for candidate in functions:
+                if candidate.lineno <= call.lineno <= (candidate.end_lineno or candidate.lineno):
+                    if best is None or candidate.lineno > best.lineno:
+                        best = candidate
+            return best.name if best else None
+
         offences = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -196,6 +219,15 @@ class C1IsolationIsStructural(unittest.TestCase):
                     isinstance(keyword.value, ast.Constant) and keyword.value.value is False
                 ):
                     offences.append(f"{target}(shell=...) at line {node.lineno}")
+            if node.args and isinstance(node.args[0], (ast.List, ast.Tuple)):
+                elements = node.args[0].elts
+                first = elements[0] if elements else None
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    binary = first.value.rsplit("/", 1)[-1]
+                    if binary in shell_names and enclosing_function(node) not in exempt_functions:
+                        offences.append(
+                            f"{target}([{first.value!r}, ...]) at line {node.lineno}"
+                        )
         self.assertEqual([], offences)
 
     def test_C1_the_executor_refuses_an_executable_it_does_not_ship(self) -> None:
@@ -846,10 +878,11 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         # half is reachable and the unexpected success fires only when both
         # halves are actually done.
         offenders = [tag for tag in tags if "@sha256:" not in tag]
-        if (
-            'DefaultPlatformAgentVersion = "latest"'
-            in (h.REPO_ROOT / "k8s-operator/internal/controller/manifest_helpers.go").read_text()
-        ):
+        # Through the registry, not a bare read_text(): inside an
+        # expectedFailure a FileNotFoundError from a moved file counts as the
+        # expected failure, which is the silent mode SOURCES exists to make
+        # loud -- the same defect C2 had one class over.
+        if 'DefaultPlatformAgentVersion = "latest"' in h.text("manifest_helpers_go"):
             offenders.append('DefaultPlatformAgentVersion = "latest"')
         self.assertEqual(
             [], offenders, f"mutable image references still shipped: {offenders}"
