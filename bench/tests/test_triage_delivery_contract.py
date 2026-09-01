@@ -120,7 +120,8 @@ LETTERED_END_ANCHOR = "\U0001f517"  # the console-links line that follows the se
 
 #: A report the front door might deliver instead of the card's own: true about
 #: the incident, actionable by nobody. Both gates must reject it, and the eval
-#: check rejecting it is the coverage #1103's sibling case chose to give up.
+#: check rejecting it is the coverage a case carrying no delivery objective
+#: gives up.
 SUMMARY_ONLY_REPORT = (
     "The eval-incident-workload deployment is OOMKilled: it allocates 96MiB "
     "against a 64Mi limit."
