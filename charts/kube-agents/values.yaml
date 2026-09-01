@@ -292,7 +292,7 @@ hindsight:
     # tag, because that is what mirror-images pushes.
     image:
       repository: ghcr.io/vectorize-io/hindsight-api
-      tag: "0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab"
+      tag: "0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812"
       pullPolicy: IfNotPresent
     # Recall is CPU-bound on the in-process cross-encoder reranker; see the
     # template before raising these — more CPU has been measured to buy
