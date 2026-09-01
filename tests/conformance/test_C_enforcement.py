@@ -311,14 +311,16 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         for policy in policies:
             spec = policy["spec"]
-            with self.subTest(policy=policy["metadata"]["name"]):
-                self.assertEqual(["Egress"], spec.get("policyTypes"))
+            name = policy["metadata"]["name"]
+            # The whole-internet check is the recorded violation, and it runs
+            # in its own subTest so a shape failure cannot mask it — the first
+            # spelling asserted policyTypes first inside one subTest, which
+            # abandoned the block before the cidr loop ever saw the gateway
+            # policy (the only one carrying 0.0.0.0/0), so dropping #676's
+            # rule could never have fired the unexpected-success signal.
+            with self.subTest(policy=name, property="no whole-internet block"):
                 for rule in spec.get("egress") or []:
-                    self.assertTrue(
-                        rule.get("to"),
-                        "an egress rule with no `to` allows every destination",
-                    )
-                    for peer in rule["to"]:
+                    for peer in rule.get("to") or []:
                         block = peer.get("ipBlock")
                         if not block:
                             continue
@@ -328,6 +330,16 @@ class C1IsolationIsStructural(unittest.TestCase):
                             "an `except` clause does not subtract a destination "
                             "from an additive policy",
                         )
+            with self.subTest(policy=name, property="shape"):
+                if name.endswith("-sandbox-metadata-deny"):
+                    # Egress-only is this slice's own policy's property; the
+                    # gateway policy legitimately carries Ingress too.
+                    self.assertEqual(["Egress"], spec.get("policyTypes"))
+                for rule in spec.get("egress") or []:
+                    self.assertTrue(
+                        rule.get("to"),
+                        "an egress rule with no `to` allows every destination",
+                    )
 
     @h.known_violation("C1", "slice-2b/findings.md 1.4 (see gke-labs/kube-agents#676)")
     def test_C1_the_rendered_egress_policy_reaches_no_metadata_address(self) -> None:
@@ -339,7 +351,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         nearly missed:
 
         - Operator-rendered: platformagent-gateway-netpol allows
-          169.254.169.254/32 on TCP 80 and 8080 -- the metadata server's own
+          169.254.169.254/32 on TCP 80 -- the metadata server's own
           ports -- and 169.254.169.252/32 on 988, selecting the same
           `app: platformagent-gateway` pods that
           platformagent-sandbox-metadata-deny selects.
@@ -570,6 +582,12 @@ class C2FailClosed(unittest.TestCase):
     def test_C2_precondition_the_inject_handler_still_forwards_a_bearer_token(self) -> None:
         self.assertIn("Authorization", h.text("session_kv_server"))
 
+    def test_C2_precondition_the_gateway_token_read_is_still_there(self) -> None:
+        """Guards the expected failure below against its anchor moving again."""
+        source = h.text("session_kv_server")
+        self.assertIn("def _gateway_api_token", source)
+        self.assertIn("token = _gateway_api_token()", source)
+
     @h.known_violation("C2", "overnight-b/findings.md 2.2")
     def test_C2_the_session_server_fails_closed_on_a_missing_api_key(self) -> None:
         """KNOWN VIOLATION. A missing key sends the request unauthenticated.
@@ -585,14 +603,22 @@ class C2FailClosed(unittest.TestCase):
         reflex, in the same file, and C2 covers it.
         """
         source = h.text("session_kv_server")
-        token_read = source.index('os.environ.get("API_SERVER_KEY"')
-        window = source[token_read : token_read + 600]
-        self.assertNotIn(
-            "if token:",
-            window,
-            "the Authorization header is conditional on the token being "
-            "present, so a missing key degrades to an unauthenticated request",
-        )
+        # Anchored on the token *reads*, not on one environ spelling — the
+        # first anchor was os.environ.get("API_SERVER_KEY", which the file
+        # refactored into a constant; str.index then raised, expectedFailure
+        # swallowed the ValueError, and this test counted among the twelve
+        # while never running its assertion. The precondition below and the
+        # SOURCES anchor now make that move loud instead of silent.
+        reads = [m.start() for m in re.finditer(r"token = _gateway_api_token\(\)", source)]
+        self.assertTrue(reads, "the gateway token read moved; re-anchor this test")
+        for read in reads:
+            window = source[read : read + 300]
+            self.assertNotIn(
+                "if token:",
+                window,
+                "the Authorization header is conditional on the token being "
+                "present, so a missing key degrades to an unauthenticated request",
+            )
 
 
 class C3UntrustedByDefault(unittest.TestCase):
@@ -811,13 +837,22 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         """
         values = h.text("chart_values")
         tags = re.findall(r"^\s*tag:\s*(\S+)", values, re.MULTILINE)
-        floating = [tag for tag in tags if not tag.startswith('""')]
+        # A digest-pinned tag is the closed state; anything else — a version,
+        # "latest", or the empty placeholder — is a mutable pointer. The first
+        # spelling of this filter tested for the empty-string placeholder, so
+        # the two tags the chart has since digest-pinned counted as floating
+        # and the violation could never close by the route this docstring
+        # describes. One offender list, one assertion, so the operator-default
+        # half is reachable and the unexpected success fires only when both
+        # halves are actually done.
+        offenders = [tag for tag in tags if "@sha256:" not in tag]
+        if (
+            'DefaultPlatformAgentVersion = "latest"'
+            in (h.REPO_ROOT / "k8s-operator/internal/controller/manifest_helpers.go").read_text()
+        ):
+            offenders.append('DefaultPlatformAgentVersion = "latest"')
         self.assertEqual(
-            [], floating, f"chart values pin mutable tags: {floating}"
-        )
-        self.assertNotIn(
-            'DefaultPlatformAgentVersion = "latest"',
-            (h.REPO_ROOT / "k8s-operator/internal/controller/manifest_helpers.go").read_text(),
+            [], offenders, f"mutable image references still shipped: {offenders}"
         )
 
 

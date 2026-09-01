@@ -253,7 +253,21 @@ MUTATIONS: list[Mutation] = [
         "shorten the gate's binary list, the plausible edit when one of them "
         "is legitimately needed at build time",
     ),
-    Mutation(
+        Mutation(
+        # The genuine attack for the disclosure assertion. policy_blocks reads
+        # the rendered policy out of the default golden fixture, so the
+        # weakening that matters is there: one character appended to the
+        # pattern and `gcloud auth print-access-token` no longer matches.
+        "B1-denylist-pattern",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("print-(?:access|identity)-token\\\\b",
+         "print-(?:access|identity)-tokensonly\\\\b"),
+        "test_B1_the_shipped_denylist_refuses_credential_disclosure",
+        "tighten the disclosure pattern to a spelling nothing uses while "
+        "refactoring the escapes -- the rule survives every eyeball diff and "
+        "matches nothing",
+    ),
+Mutation(
         "B1-denylist-rule",
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ('{"id":"gcp.access-token-disclosure"', '{"id":"gcp.access-token-disclosure-XX"'),

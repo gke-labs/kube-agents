@@ -170,12 +170,13 @@ e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
 	@echo "==> verify OK"
 
 test-python: ## Run the Python unit tests outside k8s-operator/.

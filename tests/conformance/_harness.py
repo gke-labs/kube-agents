@@ -91,7 +91,7 @@ SOURCES: dict[str, Source] = {
     ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
-        ("/sessions/{session_id}/inject", "trigger_agent_troubleshooter"),
+        ("/sessions/{session_id}/inject", "trigger_agent_troubleshooter", "_gateway_api_token"),
     ),
     "docker_entrypoint": Source(
         "deploy/shared/docker-entrypoint.sh",

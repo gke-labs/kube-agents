@@ -333,6 +333,15 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         for node in ast.walk(ast.parse(source.read_text())):
             if not isinstance(node, ast.Call) or getattr(node.func, "id", "") != "Mutation":
                 continue
+            # A must_survive control asserts the *opposite* of coverage — the
+            # suite staying green is its pass — so counting its kills field as
+            # an attack let an assertion claim mutation coverage no mutation
+            # provides. Only genuine kills qualify.
+            if any(
+                keyword.arg == "must_survive" and getattr(keyword.value, "value", False)
+                for keyword in node.keywords
+            ):
+                continue
             if len(node.args) >= 4 and isinstance(node.args[3], ast.Constant):
                 targets.append(node.args[3].value)
         return targets
