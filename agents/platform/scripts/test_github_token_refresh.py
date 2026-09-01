@@ -4,7 +4,10 @@ import os
 import sys
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
+
+sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import github_token_refresh
 from github_token_refresh import (
@@ -127,6 +130,78 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             "http://127.0.0.1:8765/v1/github/refresh", request.full_url
         )
 
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("gitops_workspace.get_managed_github_repos")
+    def test_scopes_token_to_all_managed_repos_in_org(
+        self, get_managed_github_repos, urlopen, run
+    ):
+        import json
+
+        get_managed_github_repos.return_value = [
+            "owner/repo1",
+            "owner/repo2",
+            "other-org/repo3",
+        ]
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="fake-oidc-token\n")
+            return MagicMock()
+
+        run.side_effect = fake_run
+
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"fake-installation-token"
+        response.__enter__.return_value = response
+        urlopen.return_value = response
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            token = refresh_git_credentials("owner/repo1")
+
+        self.assertEqual("fake-installation-token", token)
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual("owner", body["org_name"])
+        self.assertEqual(["repo1", "repo2"], body["repositories"])
+        self.assertEqual("platform-agent-scope", body["scope"])
+
+    @patch("github_token_refresh.log")
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("gitops_workspace.get_managed_github_repos")
+    def test_managed_repos_expansion_failure_logs_warning(
+        self, get_managed_github_repos, urlopen, run, mock_log
+    ):
+        import json
+
+        get_managed_github_repos.side_effect = RuntimeError("ConfigMap not found")
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="fake-oidc-token\n")
+            return MagicMock()
+
+        run.side_effect = fake_run
+
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"fake-installation-token"
+        response.__enter__.return_value = response
+        urlopen.return_value = response
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            token = refresh_git_credentials("owner/repo1")
+
+        self.assertEqual("fake-installation-token", token)
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(["repo1"], body["repositories"])
+        mock_log.assert_any_call(
+            "WARNING: Could not expand managed repositories for token scoping: ConfigMap not found"
+        )
+
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_fails_immediately_on_sidecar_502(self, urlopen, sleep):
@@ -166,7 +241,9 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 refresh_git_credentials("owner/repository", initial_delay=0.01)
 
-        self.assertIn("Credential sidecar failed to refresh GitHub auth", str(cm.exception))
+        self.assertIn(
+            "Credential sidecar failed to refresh GitHub auth", str(cm.exception)
+        )
         self.assertEqual(1, urlopen.call_count)
         sleep.assert_not_called()
 
@@ -206,10 +283,13 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 refresh_git_credentials("owner/repository", initial_delay=0.01)
 
-        self.assertIn("Credential sidecar failed to refresh GitHub auth", str(cm.exception))
+        self.assertIn(
+            "Credential sidecar failed to refresh GitHub auth", str(cm.exception)
+        )
 
     @patch("github_token_refresh.subprocess.run")
-    def test_direct_minty_gcloud_auth_audiences_fallback(self, run):
+    @patch("gitops_workspace.get_managed_github_repos", return_value=[])
+    def test_direct_minty_gcloud_auth_audiences_fallback(self, mock_get_managed, run):
         # First call with --audiences raises, second call without flags succeeds
         res_fail = Exception("gcloud auth print-identity-token --audiences rejected")
         res_ok = MagicMock()
@@ -244,12 +324,15 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError) as cm:
                 refresh_git_credentials("owner/repository")
-            self.assertIn("Retrieved Google OIDC token via gcloud is empty", str(cm.exception))
+            self.assertIn(
+                "Retrieved Google OIDC token via gcloud is empty", str(cm.exception)
+            )
 
     @patch("github_token_refresh.subprocess.run")
+    @patch("gitops_workspace.get_managed_github_repos", return_value=[])
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
-    def test_direct_minty_retries_on_5xx_and_succeeds(self, urlopen, sleep, run):
+    def test_direct_minty_retries_on_5xx_and_succeeds(self, urlopen, sleep, mock_get_managed, run):
         run_oidc = MagicMock()
         run_oidc.stdout = "mock-oidc-token\n"
         run.side_effect = [run_oidc, MagicMock(), MagicMock()]
@@ -276,10 +359,11 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         sleep.assert_called_once_with(0.01)
 
     @patch("github_token_refresh.subprocess.run")
+    @patch("gitops_workspace.get_managed_github_repos", return_value=[])
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_direct_minty_retries_on_connection_error_and_succeeds(
-        self, urlopen, sleep, run
+        self, urlopen, sleep, mock_get_managed, run
     ):
         run_oidc = MagicMock()
         run_oidc.stdout = "mock-oidc-token\n"
@@ -388,7 +472,10 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     def test_main_cli_execution_failure_exits(self, run):
         with patch.object(sys, "argv", ["github_token_refresh.py", "org/repo"]):
-            with patch("github_token_refresh.refresh_git_credentials", side_effect=Exception("boom")):
+            with patch(
+                "github_token_refresh.refresh_git_credentials",
+                side_effect=Exception("boom"),
+            ):
                 with self.assertRaises(SystemExit) as cm:
                     main()
                 self.assertEqual(1, cm.exception.code)

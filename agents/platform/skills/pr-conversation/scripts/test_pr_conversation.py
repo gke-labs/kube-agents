@@ -160,13 +160,15 @@ class _Harness(unittest.TestCase):
         return path
 
     def run_helper(self, argv, provider, repo=REPO, repo_error=None):
-        target = (
+        if argv and argv[0] in ("reply", "refuse") and "--repo" not in argv:
+            argv = [argv[0], "--repo", repo or REPO] + list(argv[1:])
+        managed_mock = (
             mock.Mock(side_effect=repo_error)
             if repo_error
-            else mock.Mock(return_value=repo)
+            else mock.Mock(return_value=[repo] if repo else [])
         )
         buf = StringIO()
-        with mock.patch.object(forge, "target_repo", target), \
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              redirect_stdout(buf):
             rc = helper.main(argv)
@@ -198,6 +200,40 @@ class PollTest(_Harness):
         self.assertEqual(row["kind"], "slash")
         self.assertEqual(row["head_ref"], "platform-agent/x")
         self.assertTrue(row["can_write"])
+
+    def test_poll_across_multiple_repositories(self):
+        """poll returns requests across all managed repositories."""
+        pr1 = make_pr(1, head_ref="platform-agent/fix-1", head_repo="acme/repo1")
+        pr2 = make_pr(2, head_ref="platform-agent/fix-2", head_repo="acme/repo2")
+
+        class MultiRepoFakeProvider(FakeProvider):
+            def list_open_prs(self, repo):
+                if repo == "acme/repo1":
+                    return [pr1]
+                elif repo == "acme/repo2":
+                    return [pr2]
+                return []
+
+            def list_comments(self, repo, pr):
+                if repo == "acme/repo1" and pr.number == 1:
+                    return [make_comment("IC_1", "/agent fix repo1")]
+                elif repo == "acme/repo2" and pr.number == 2:
+                    return [make_comment("IC_2", "/agent fix repo2")]
+                return []
+
+        provider = MultiRepoFakeProvider()
+        managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch.object(forge, "provider_for", return_value=provider), \
+             redirect_stdout(StringIO()) as buf:
+            helper.main(["poll"])
+            out = buf.getvalue()
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(len(payload["requests"]), 2)
+        repos_in_conversations = [conv["repo"] for conv in payload["conversations"]]
+        self.assertIn("acme/repo1", repos_in_conversations)
+        self.assertIn("acme/repo2", repos_in_conversations)
 
     def test_an_untrusted_request_is_reported_rather_than_hidden(self):
         """The worker is told so it can refuse, not left looking like it missed it."""
@@ -1105,6 +1141,30 @@ class TrustGateTest(_Harness):
             self._post(provider, "reply", "--no-change")
         self.assertEqual(provider.posted, [])
         self.assertIn(forge.IGNORE_LABEL, err.getvalue())
+
+
+class RepoValidationTest(_Harness):
+    def test_invalid_repo_format_rejected(self):
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self.run_helper(["reply", "--repo", "../invalid", "--pr", "12", "--comment-id", "IC_1", "--body-file", self.scratch_file("r.md", "body"), "--no-change"], provider)
+        self.assertIn("Invalid repository format", err.getvalue())
+
+    def test_unmanaged_repo_rejected(self):
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self.run_helper(["reply", "--repo", "unmanaged/repo", "--pr", "12", "--comment-id", "IC_1", "--body-file", self.scratch_file("r.md", "body"), "--no-change"], provider, repo="managed/repo")
+        self.assertIn("not in the managed repositories list", err.getvalue())
+
+    def test_poll_unmanaged_repo_returns_error(self):
+        provider = answerable()
+        _rc, out = self.run_helper(["poll", "--repo", "unmanaged/repo"], provider, repo="managed/repo")
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "INVALID_REPOSITORY")
+        self.assertIn("not in the managed repositories list", payload["value"])
 
 
 if __name__ == "__main__":

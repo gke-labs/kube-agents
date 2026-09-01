@@ -13,8 +13,13 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator
+./skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator [--repo "<owner>/<repo>"]
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/security-patch-orchestrator/org__repo", "findings_path":"/opt/data/scratch/findings_security-patch-orchestrator.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace`. The audit pod does not start inside a git checkout: `start` clones the GitOps repository to `workspace` itself, and that clone is where every `remediation.path` in step 4 is resolved and where every grep for an existing declaration belongs. `start` creates and resets no branch; there is no report branch. `issue` is this stream's open ledger issue, or `null` when it has none — either way you never create it. `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger; write the manifest for each of those in step 4. The helper owns all git/`gh` work and renders the ledger issue body and every remediation PR body — **never hand-write a body, never run `git commit`/`gh issue create`/`gh pr create`/`gh issue comment` yourself.** **Never comment on the ledger yourself:** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit, and an agent that posts it — including when someone asks for a fix in chat — is authorizing its own pull request. `finish` ignores a `/remediate` from a machine account, so posting one achieves nothing but noise on the issue.
 
@@ -252,7 +257,8 @@ Worked example, for a 3.5 finding on node pool `batch-a`:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit security-patch-orchestrator \
-  --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json
+  --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json \
+  [--repo "<owner>/<repo>"]
 ```
 
 One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.

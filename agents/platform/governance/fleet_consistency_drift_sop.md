@@ -11,8 +11,13 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift
+./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"]
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consistency-drift/<owner>__<name>", "findings_path":"/opt/data/scratch/findings_fleet-consistency-drift.json", "pending_remediation_requests":[…]}`. Use the returned `findings_path` verbatim. `workspace` is the GitOps clone `start` made — the pod has no checkout of its own — and any `remediation.path` you emit in §5 is resolved against it. `issue` is this stream's open ledger issue, or `null` when it has none; `finish` opens or rewrites it either way. There is no audit branch and no report branch: do not create branches, commit, push, or call `gh` yourself — the helper owns every git and GitHub operation and renders the ledger issue body. You never hand-write it.
 
@@ -54,6 +59,7 @@ Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consisten
    So `scope.clusters` is **every cluster you read**, compared or not — the harness rejects an empty list. If **zero** clusters enumerate, do not call `finish`: a fleet you could not read is not a clean fleet, so report the enumeration failure as your one-line summary and stop rather than returning `[SILENT]`.
 
    `scope.skipped` holds one case and one only: `describe` failed or was denied — quote the error in the reason. A cluster you read but did not compare stays in `scope.clusters` and says so in its `limitations`:
+
    - `status` is not `RUNNING` (`PROVISIONING`, `RECONCILING`, `STOPPING`, `ERROR`, `DEGRADED`) — a cluster mid-change is not drifting. `"status RECONCILING: excluded from every cohort, no facet compared."`
    - `createTime` is under 24 hours old — a brand-new cluster has not settled. `"created <createTime>: under 24h, excluded from every cohort."`
    - Its cohort is below the §2 floor — see §2.4 for the wording.
@@ -236,7 +242,8 @@ Worked example, for a 4.4 network-policy outlier:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
-  --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json
+  --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json \
+  [--repo "<owner>/<repo>"]
 ```
 
 - One JSON line comes back: `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`.

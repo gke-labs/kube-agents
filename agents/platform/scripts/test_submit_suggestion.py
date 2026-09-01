@@ -80,8 +80,18 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.patch_attr(submit_suggestion, "log", lambda msg: None)
 
         # Everything resolves to the local bare repo instead of github.com.
+        real_resolve = gitops_workspace.resolve_repo
+
+        def local_resolve(workspace=None):
+            if workspace is not None:
+                return real_resolve(workspace=workspace)
+            return "acme/fleet"
+
+        self.patch_attr(gitops_workspace, "resolve_repo", local_resolve)
         self.patch_attr(
-            gitops_workspace, "resolve_repo", lambda settings=None: "acme/fleet"
+            gitops_workspace,
+            "get_managed_github_repos",
+            lambda: ["acme/fleet", "acme/secondary-repo"],
         )
         real_ensure = gitops_workspace.ensure_workspace
 
@@ -133,10 +143,12 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------- #
 
-    def prepare(self, branch="platform-agent/fix-netpol", lease=None):
+    def prepare(self, branch="platform-agent/fix-netpol", lease=None, repo=None):
         args = ["prepare", "--branch", branch]
         if lease:
             args += ["--lease", lease]
+        if repo:
+            args += ["--repo", repo]
         out = io.StringIO()
         with redirect_stdout(out):
             submit_suggestion.dispatch(args)
@@ -221,6 +233,39 @@ class TestCheckBranch(unittest.TestCase):
         )
 
 
+class TestValidateRepo(unittest.TestCase):
+    def test_invalid_format_raises(self):
+        for bad in ("", "foo", "foo/bar/baz", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.validate_repo(bad)
+                self.assertIn("Invalid repository format", str(caught.exception))
+
+    def test_unmanaged_repo_raises_when_managed_repos_configured(self):
+        with patch.object(gitops_workspace, "get_managed_github_repos", return_value=["acme/managed"]):
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.validate_repo("acme/unmanaged")
+            self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_managed_repo_passes(self):
+        with patch.object(gitops_workspace, "get_managed_github_repos", return_value=["acme/managed"]):
+            self.assertEqual(submit_suggestion.validate_repo("acme/managed"), "acme/managed")
+
+    def test_passes_when_no_managed_repos_configured(self):
+        with patch.object(gitops_workspace, "get_managed_github_repos", return_value=[]):
+            self.assertEqual(submit_suggestion.validate_repo("acme/any"), "acme/any")
+
+    def test_raises_when_get_managed_github_repos_fails(self):
+        with patch.object(
+            gitops_workspace,
+            "get_managed_github_repos",
+            side_effect=RuntimeError("kubectl failed: Forbidden"),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                submit_suggestion.validate_repo("acme/any")
+            self.assertIn("kubectl failed: Forbidden", str(caught.exception))
+
+
 # --------------------------------------------------------------------------- #
 # prepare — leasing a private clone
 # --------------------------------------------------------------------------- #
@@ -284,6 +329,15 @@ class TestPrepare(SubmitSuggestionTestCase):
         self.prepare()
         self.assertFalse(stray.exists())
 
+    def test_prepare_refused_when_managed_repos_read_fails(self):
+        with patch.object(
+            gitops_workspace,
+            "get_managed_github_repos",
+            side_effect=RuntimeError("ConfigMap missing"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.prepare()
+
 
 # --------------------------------------------------------------------------- #
 # submit — pushing only what we own
@@ -306,6 +360,28 @@ class TestSubmit(SubmitSuggestionTestCase):
         self.assertEqual(argv[argv.index("--repo") + 1], "acme/fleet")
         self.assertEqual(argv[argv.index("--head") + 1], "platform-agent/fix-netpol")
         self.assertEqual(argv[argv.index("--base") + 1], "main")
+
+    def test_submit_inherits_target_repo_from_prepare_lease(self):
+        """When prepare leases a non-default repo, submit without --repo uses it."""
+        payload = self.prepare(
+            branch="platform-agent/secondary-fix", repo="acme/secondary-repo"
+        )
+        self.commit(payload["workspace"])
+
+        args = [
+            "submit",
+            "--branch", "platform-agent/secondary-fix",
+            "--title", "fix",
+            "--body", "details",
+            "--workspace", payload["workspace"],
+            "--lease", payload["lease"],
+        ]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch(args)
+
+        argv, _ = self.gh_calls[0]
+        self.assertEqual(argv[argv.index("--repo") + 1], "acme/secondary-repo")
 
     def test_another_agents_workspace_is_refused(self):
         # The check the credential proxy cannot make. The audit's tree holds a
@@ -505,6 +581,17 @@ class TestSubmit(SubmitSuggestionTestCase):
         self.assertTrue(seen)
         for cwd in seen:
             self.assertTrue(str(cwd).strip(), "a git call ran with no cwd")
+
+    def test_submit_refused_when_managed_repos_read_fails(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with patch.object(
+            gitops_workspace,
+            "get_managed_github_repos",
+            side_effect=RuntimeError("ConfigMap missing"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.submit(payload["branch"], payload["workspace"])
 
 
 # --------------------------------------------------------------------------- #

@@ -398,19 +398,7 @@ func allowAllUsers(users []string) bool {
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
-	gitRepo := ""
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo = strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-	}
-
-	if err := agentv1alpha1.ValidateGitRepoURL(gitRepo); err != nil {
-		manifestsLog.Info("Invalid gitRepo URL in PlatformAgent spec, defaulting SETTINGS.md to None", "err", err, "gitRepo", gitRepo)
-		gitRepo = "None"
-	} else if gitRepo == "" {
-		gitRepo = "None"
-	}
-
-	settingsContent := fmt.Sprintf("# GKE Scope Configuration\n- **Git Repo:** %s\n", gitRepo)
+	settingsContent := "# GKE Scope Configuration\n"
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -572,6 +560,11 @@ const (
 	// managedVolumeName projects the two keys above into managedScopeDir under the names
 	// Hermes expects (config.yaml and .env).
 	managedVolumeName = "platform-agent-managed-vol"
+
+	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
+	// volume into the agent container so skills can read managed repositories directly from disk.
+	gitopsStateVolumeName = "gitops-state-volume"
+	gitopsStateDir        = "/etc/gitops"
 )
 
 // loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
@@ -1162,6 +1155,43 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// buildGitopsStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
+func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	data := map[string]string{}
+
+	// Extract primary repository from CR Spec if provided
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
+		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
+		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
+		if gitRepo != "" && gitRepo != "None" {
+			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
+				if cleanedURL, err := agentv1alpha1.CleanRepoURLWithOrg(gitRepo, org); err == nil {
+					entries := []agentv1alpha1.ManagedRepoEntry{
+						{Type: "github", URL: cleanedURL},
+					}
+					if jsonBytes, err := json.Marshal(entries); err == nil {
+						data["managed_repos"] = string(jsonBytes)
+					}
+				}
+			} else {
+				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+			}
+		}
+	}
+
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-gitops-state",
+			Namespace: agent.Namespace,
+		},
+		Data: data,
+	}
+}
+
 // renderConfigYAML builds the MANAGED config the pod runs under.
 //
 // Unlike every other profile rendering, this one is not an overlay merged into the PVC.
@@ -1715,6 +1745,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
 		},
+		{
+			Name:  "GITOPS_STATE_CONFIGMAP",
+			Value: agent.Name + "-gitops-state",
+		},
+		{
+			Name:  "GITOPS_STATE_PATH",
+			Value: path.Join(gitopsStateDir, "managed_repos"),
+		},
 	}
 
 	// The two exceptions to "no credentials in the sandbox", both of them
@@ -1853,6 +1891,23 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "SLACK_HOME_CHANNEL_NAME",
 					Value: slack.HomeChannelName,
+				})
+			}
+		}
+		if github := integration.GitHub; github != nil {
+			org := strings.TrimSpace(github.Org)
+			if org == "" && github.GitRepo != "" {
+				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
+					parts := strings.SplitN(cleaned, "/", 2)
+					if len(parts) == 2 {
+						org = parts[0]
+					}
+				}
+			}
+			if org != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "GITHUB_ORG",
+					Value: org,
 				})
 			}
 		}
@@ -2245,6 +2300,15 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 			SubPath:   "session",
 		},
 		{
+			// Directory mount, never subPath: a subPath does not receive kubelet
+			// ConfigMap updates. As a mounted directory, updates to managed repos
+			// in the ConfigMap are automatically synced live by the kubelet without
+			// restarting the agent pod.
+			Name:      gitopsStateVolumeName,
+			MountPath: gitopsStateDir,
+			ReadOnly:  true,
+		},
+		{
 			// The one writable path outside the PVC, and the reason
 			// readOnlyRootFilesystem is survivable here: docker-entrypoint.sh runs
 			// four hermes invocations with HOME=/tmp before the agent starts, and
@@ -2568,6 +2632,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			// the management cluster, which never gets a Cluster Agent profile.
 			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
+			{Name: gitopsStateVolumeName, MountPath: gitopsStateDir, ReadOnly: true},
 		}, scopedPoolMounts...),
 		SecurityContext: securityContext,
 	}
@@ -2610,6 +2675,8 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// reserves the name — appending after that call would leave it
 		// protected only by its presence in SensitiveEnvVars, which is
 		// incidental and would not hold for a name not on that list.
+		{Name: "GITOPS_STATE_CONFIGMAP", Value: agent.Name + "-gitops-state"},
+		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
 	// Set in both directions, deliberately. The broker's own default is off, so
@@ -2891,6 +2958,20 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 			}}},
 		}}},
 		buildEventWatcherTokenVolume(),
+	}
+}
+
+func buildGitopsStateVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: gitopsStateVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: agent.Name + "-gitops-state",
+				},
+				DefaultMode: ptr.To(int32(0644)),
+			},
+		},
 	}
 }
 
@@ -3463,6 +3544,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 				},
 			},
 		},
+		buildGitopsStateVolume(agent),
 		{
 			// Bounded, like every other scratch emptyDir here. Without a
 			// sizeLimit a runaway write fills the node's ephemeral storage and the

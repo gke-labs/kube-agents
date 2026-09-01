@@ -109,11 +109,16 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
-  {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
+  {{- if or (and $integ.github (or $integ.github.org $integ.github.gitRepo)) $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
   integration:
-    {{- with $integ.github.gitRepo }}
+    {{- if and $integ.github (or $integ.github.org $integ.github.gitRepo) }}
     github:
-      gitRepo: {{ . | quote }}
+      {{- if $integ.github.org }}
+      org: {{ $integ.github.org | quote }}
+      {{- end }}
+      {{- if $integ.github.gitRepo }}
+      gitRepo: {{ $integ.github.gitRepo | quote }}
+      {{- end }}
     {{- end }}
     {{- if $integ.googleChat.enabled }}
     googleChat:

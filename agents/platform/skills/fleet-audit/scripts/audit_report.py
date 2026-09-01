@@ -4192,26 +4192,48 @@ def refresh_credentials(repo: str | None = None) -> None:
     refresh_git_credentials(repo)
 
 
-SETTINGS_PATH = os.environ.get("FLEET_AUDIT_SETTINGS") or "/opt/data/SETTINGS.md"
+BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-# Both of these live in `gitops_workspace` now, because `submit-suggestion`
-# needs the same answer and a third copy of the SETTINGS.md parser is how the
-# skills start disagreeing about which repository they are writing to. They stay
-# named here so this module's own callers — and its tests, which patch
-# SETTINGS_PATH — do not have to care where the implementation moved.
-def repo_from_settings(path: str | None = None) -> str | None:
-    """The target repository as `owner/name`, from SETTINGS.md, or None."""
+def resolve_repo(
+    audit_id: str | None = None,
+    repo: str | None = None,
+    workspace: str | Path | None = None,
+) -> str:
+    """Resolve the GitOps repository as `owner/name`, checking explicit repo, workspace, lease record, then ConfigMap."""
     import gitops_workspace
 
-    return gitops_workspace.repo_from_settings(path or SETTINGS_PATH)
+    if repo and str(repo).strip():
+        r = str(repo).strip()
+        if not BARE_REPO_RE.match(r):
+            raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
+        managed = gitops_workspace.get_managed_github_repos()
+        if managed and r not in managed:
+            raise ValueError(
+                f"Repository {r!r} is not in the managed repositories list: {managed}"
+            )
+        return r
 
+    if workspace is not None:
+        try:
+            w_repo = gitops_workspace.resolve_repo(workspace=workspace)
+            if w_repo and BARE_REPO_RE.match(w_repo):
+                return w_repo
+        except Exception:
+            pass
 
-def resolve_repo() -> str:
-    """Resolve the GitOps repository as `owner/name`, without needing a clone."""
-    import gitops_workspace
+    if audit_id:
+        try:
+            holder = gitops_workspace.lease_dir(
+                GITOPS_WORKSPACE or gitops_workspace.default_root(), audit_id
+            )
+            record = gitops_workspace.read_lease(holder)
+            if record and record.get("repo"):
+                return record["repo"]
+        except Exception:
+            pass
 
-    return gitops_workspace.resolve_repo(SETTINGS_PATH)
+    return gitops_workspace.resolve_repo()
 
 
 def repo_root() -> Path:
@@ -4231,7 +4253,7 @@ def repo_root_best_effort() -> Path:
         return Path.cwd()
 
 
-def dry_run_repo_root(audit_id: str) -> Path:
+def dry_run_repo_root(audit_id: str, repo: str | None = None) -> Path:
     """Where a dry run looks for the manifests the real run would stage.
 
     The real run resolves every `remediation.path` inside the GitOps clone that
@@ -4245,15 +4267,15 @@ def dry_run_repo_root(audit_id: str) -> Path:
     The clone's location is a pure function of the repository name and this
     stream's lease, so it can be derived without cloning, fetching, or any other
     side effect — which keeps the dry run's promise intact. If it is not on disk
-    yet (nothing has cloned it, or `SETTINGS.md` is absent because this is a
-    laptop and not the pod), fall back rather than fail: a command that is safe
-    to run anywhere has to run anywhere.
+    yet (nothing has cloned it, or the managed repositories ConfigMap is absent
+    because this is a laptop and not the pod), fall back rather than fail: a
+    command that is safe to run anywhere has to run anywhere.
     """
     try:
         import gitops_workspace
 
         target = gitops_workspace.workspace_path(
-            resolve_repo(), GITOPS_WORKSPACE, lease=audit_id
+            resolve_repo(audit_id=audit_id, repo=repo), GITOPS_WORKSPACE, lease=audit_id
         )
     except Exception:
         return repo_root_best_effort()
@@ -5283,9 +5305,8 @@ def _workspace_runner(
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
-    # Resolve first, then mint: the token is repo-scoped, and the repository
-    # cannot be read off a clone that does not exist yet.
-    repo = resolve_repo()
+    opt_repo = getattr(args, "repo", None)
+    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     # The one place a scrub is correct: the audit has not written anything yet,
     # so whatever is in the tree is debris from a run that did not finish.
@@ -5361,11 +5382,11 @@ def handle_start(args: argparse.Namespace) -> None:
     )
 
 
-def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
+def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str | None = None) -> None:
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
-    root = dry_run_repo_root(audit_id)
+    root = dry_run_repo_root(audit_id, repo=repo)
     log(f"DRY RUN: resolving remediation paths under {root}.")
 
     # The same degradation the real run applies, so a dry run shows the body
@@ -5590,6 +5611,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
+    opt_repo = getattr(args, "repo", None)
 
     by_id = {str(f.get("id", "")): f for f in findings}
     unknown = [fid for fid in args.finding if fid not in by_id]
@@ -5618,7 +5640,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         # command is to show what the pull request would say, and an operator
         # drafting a document before writing its manifests would otherwise get a
         # blank preview and no explanation.
-        dry_root = dry_run_repo_root(audit_id)
+        dry_root = dry_run_repo_root(audit_id, repo=opt_repo)
         log(f"DRY RUN: resolving remediation paths under {dry_root}.")
         for fid in args.finding:
             if remediation_file_problem(by_id[fid], dry_root):
@@ -5647,7 +5669,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             )
         return
 
-    repo = resolve_repo()
+    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -5761,12 +5783,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
+    opt_repo = getattr(args, "repo", None)
 
     if args.dry_run:
-        _handle_finish_dry_run(audit_id, data, now)
+        _handle_finish_dry_run(audit_id, data, now, repo=opt_repo)
         return
 
-    repo = resolve_repo()
+    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -6249,6 +6272,10 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--audit", required=True, help=f"Audit id: one of {', '.join(sorted(AUDITS))}."
     )
+    start_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
+    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -6256,6 +6283,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--audit", required=True, help="Audit id.")
     finish_parser.add_argument(
         "--findings-file", required=True, help="Path to the findings.json to publish."
+    )
+    finish_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository (defaults to leased workspace repo or ConfigMap registered repo).",
     )
     finish_parser.add_argument(
         "--dry-run",
@@ -6277,6 +6308,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="ID",
         help="Finding id to remediate; repeat for more than one.",
+    )
+    remediate_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository (defaults to leased workspace repo or ConfigMap registered repo).",
     )
     remediate_parser.add_argument(
         "--issue",

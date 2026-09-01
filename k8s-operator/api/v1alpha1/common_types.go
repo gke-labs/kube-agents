@@ -18,7 +18,6 @@ package v1alpha1
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 	"unicode"
@@ -837,7 +836,16 @@ type IntegrationSpec struct {
 
 // GitHubSpec contains the configuration for the GitHub integration.
 type GitHubSpec struct {
-	// GitRepo is the target GitOps repository URL for the agent environment.
+	// Org is the target GitHub organization or user account for the agent environment.
+	// If omitted and GitRepo is provided, the organization is inferred from the repository owner.
+	// +kubebuilder:validation:MaxLength=39
+	// +kubebuilder:validation:Pattern=`^$|^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`
+	// +optional
+	Org string `json:"org,omitempty"`
+
+	// GitRepo is the optional target GitOps repository URL or owner/repo shorthand for the agent environment.
+	// When omitted or empty, no repository is initially configured, and repositories can be registered
+	// in the gitops-state ConfigMap by a cluster administrator.
 	// +kubebuilder:validation:MaxLength=2048
 	// +optional
 	GitRepo string `json:"gitRepo,omitempty"`
@@ -1150,61 +1158,151 @@ type AgentStatus struct {
 }
 
 const (
-	// MaxGitRepoURLLength defines the maximum character length for GitRepo URLs,
-	// matching the +kubebuilder:validation:MaxLength marker on GitHubSpec.GitRepo.
+	// MaxGitHubOrgLength defines the maximum character length for GitHub org/user names.
+	MaxGitHubOrgLength = 39
+	// MaxGitRepoURLLength defines the maximum character length for Git repository URLs.
 	MaxGitRepoURLLength = 2048
 )
 
-// scpRegex validates SCP-style SSH Git URLs (e.g., git@github.com:owner/repo.git).
-// Compiled at package level to avoid re-compilation overhead on every validation invocation.
-var scpRegex = regexp.MustCompile(`^git@[a-zA-Z0-9.-]+:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(\.git)?$`)
+// githubOrgRegex validates GitHub organization or username format
+// (alphanumeric and hyphens, not starting or ending with hyphen, max 39 chars).
+var githubOrgRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
 
-// ownerRepoRegex validates bare "owner/repo" shorthand (e.g. "gke-labs/kube-agents").
-var ownerRepoRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+// CleanRepoSlug cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format.
+func CleanRepoSlug(rawURL string) (string, error) {
+	return CleanRepoSlugWithOrg(rawURL, "")
+}
 
-// ValidateGitRepoURL verifies that a GitRepo string is a valid Git repository URL
-// and contains no control characters or newline injections (PI-004).
-func ValidateGitRepoURL(rawURL string) error {
+// CleanRepoSlugWithOrg cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format,
+// using the provided org if a bare repository name (without a slash) is given.
+func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
+	cleaned := strings.TrimSpace(rawURL)
+	cleaned = strings.TrimSuffix(cleaned, ".git")
+
+	// Validate URL scheme if a scheme is present
+	if idx := strings.Index(cleaned, "://"); idx != -1 {
+		scheme := strings.ToLower(cleaned[:idx])
+		if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
+			return "", fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
+		}
+	}
+
+	// Strip known URL schemes
+	for _, scheme := range []string{"ssh://", "git://", "https://", "http://"} {
+		cleaned = strings.TrimPrefix(cleaned, scheme)
+	}
+
+	// Handle user@host prefix (e.g. git@github.com:owner/repo or git@github.com/owner/repo)
+	if idx := strings.Index(cleaned, "@"); idx != -1 {
+		cleaned = cleaned[idx+1:]
+	}
+
+	// Handle SCP-style host:path syntax (e.g. github.com:owner/repo)
+	if strings.Contains(cleaned, ":") {
+		parts := strings.SplitN(cleaned, ":", 2)
+		if len(parts) == 2 {
+			cleaned = parts[1]
+		}
+	}
+
+	// Strip common domain prefixes
+	cleaned = strings.TrimPrefix(cleaned, "github.com/")
+	cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
+	cleaned = strings.Trim(cleaned, "/")
+
+	if cleaned == "" {
+		return "", fmt.Errorf("empty repository")
+	}
+
+	// If no slash is present and an org was supplied, prefix with org
+	if !strings.Contains(cleaned, "/") && strings.TrimSpace(org) != "" {
+		cleaned = strings.TrimSpace(org) + "/" + cleaned
+	}
+
+	// Basic verification of owner/repo structure
+	if strings.Count(cleaned, "/") != 1 {
+		return "", fmt.Errorf("invalid repository format")
+	}
+	return cleaned, nil
+}
+
+// CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
+func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	trimmed := strings.TrimSpace(rawURL)
-	if trimmed == "" {
+	if trimmed == "" || trimmed == "None" {
+		return "", fmt.Errorf("empty repository")
+	}
+	if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
+		u := strings.TrimSuffix(trimmed, ".git")
+		u = strings.TrimSuffix(u, "/")
+		return u, nil
+	}
+	cleanedSlug, err := CleanRepoSlugWithOrg(rawURL, org)
+	if err != nil {
+		return "", err
+	}
+	return "https://github.com/" + cleanedSlug, nil
+}
+
+// ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid
+// and contains no whitespace or non-graphic character injections.
+func ValidateGitRepoURL(gitRepo string) error {
+	return ValidateGitRepoURLWithOrg(gitRepo, "")
+}
+
+// ValidateGitRepoURLWithOrg verifies that a Git repository URL or shorthand (with optional org context)
+// is structurally valid and contains no whitespace or non-graphic character injections.
+func ValidateGitRepoURLWithOrg(gitRepo, org string) error {
+	trimmed := strings.TrimSpace(gitRepo)
+	if trimmed == "" || trimmed == "None" {
 		return nil
 	}
 
 	if utf8.RuneCountInString(trimmed) > MaxGitRepoURLLength {
-		return fmt.Errorf("gitRepo URL exceeds maximum length of %d characters", MaxGitRepoURLLength)
+		return fmt.Errorf("git repo URL exceeds maximum length of %d characters", MaxGitRepoURLLength)
 	}
 
-	// Disallow whitespace (ASCII and Unicode) and any non-graphic characters (control chars, zero-width chars, etc.)
 	for _, r := range trimmed {
 		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
-			return fmt.Errorf("gitRepo URL contains whitespace or non-graphic characters")
+			return fmt.Errorf("git repo URL contains whitespace or non-graphic characters")
 		}
 	}
 
-	// Check SCP-style SSH format: git@host:owner/repo.git
-	if scpRegex.MatchString(trimmed) {
-		return nil
-	}
-
-	// Check bare owner/repo shorthand (e.g., gke-labs/kube-agents)
-	if ownerRepoRegex.MatchString(trimmed) {
-		return nil
-	}
-
-	// Parse standard URIs
-	u, err := url.ParseRequestURI(trimmed)
-	if err != nil {
-		return fmt.Errorf("invalid URL structure: %w", err)
-	}
-
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
-		return fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", u.Scheme)
-	}
-
-	if u.Host == "" {
-		return fmt.Errorf("gitRepo URL missing host")
+	if _, err := CleanRepoSlugWithOrg(trimmed, org); err != nil {
+		return fmt.Errorf("invalid git repository format %q: expected owner/repo or valid git URL", trimmed)
 	}
 
 	return nil
+}
+
+// ValidateGitHubOrg verifies that a GitHub Org string is a valid organization or user name
+// and contains no control characters, slashes, or newline injections (PI-004).
+func ValidateGitHubOrg(org string) error {
+	trimmed := strings.TrimSpace(org)
+	if trimmed == "" {
+		return nil
+	}
+
+	if utf8.RuneCountInString(trimmed) > MaxGitHubOrgLength {
+		return fmt.Errorf("github org exceeds maximum length of %d characters", MaxGitHubOrgLength)
+	}
+
+	// Disallow whitespace and any non-graphic characters
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
+			return fmt.Errorf("github org contains whitespace or non-graphic characters")
+		}
+	}
+
+	if !githubOrgRegex.MatchString(trimmed) {
+		return fmt.Errorf("invalid github org %q: must contain only alphanumeric characters and hyphens, and cannot begin or end with a hyphen", trimmed)
+	}
+
+	return nil
+}
+
+// ManagedRepoEntry represents a single managed repository in the gitops-state ConfigMap.
+type ManagedRepoEntry struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
 }

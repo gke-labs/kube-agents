@@ -15,8 +15,13 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit ai-security-audit
+./skills/fleet-audit/scripts/audit_report.py start --audit ai-security-audit [--repo "<owner>/<repo>"]
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/ai-security-audit/org__repo", "findings_path":"/opt/data/scratch/findings_ai-security-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
 
@@ -309,7 +314,8 @@ Worked example, for a 3.2 finding on `serving/vllm-llama`:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit ai-security-audit \
-  --findings-file /opt/data/scratch/findings_ai-security-audit.json
+  --findings-file /opt/data/scratch/findings_ai-security-audit.json \
+  [--repo "<owner>/<repo>"]
 ```
 
 One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.

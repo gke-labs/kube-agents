@@ -13,7 +13,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 # The shared scripts dir holds github_token_refresh (docker-entrypoint.sh keeps
 # executable scripts shared across profiles rather than copying them into each
@@ -25,11 +24,8 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
 
-SETTINGS_PATH = "/opt/data/SETTINGS.md"
-
-# The only directory a report may be read from. The report is posted publicly
-# and then unlinked, so the path is confined rather than merely existence-checked.
 SCRATCH_DIR = "/opt/data/scratch"
 
 # Shell convention for "command not found", reused so a missing binary stays
@@ -65,31 +61,6 @@ _GH_AUTH_FAILURE = re.compile(
 _refresh_attempted = False
 _refresh_failed = False
 
-# The operator writes this literal when no GitOps repo is configured
-# (buildSettingsConfigMap in platformagent_manifests.go). It means "absent",
-# not "malformed".
-SETTINGS_REPO_UNSET = "none"
-
-# The host must sit at the *start* of the value, after an optional scheme and
-# optional userinfo — not merely after some delimiter. Both spellings reject
-# "https://evilgithub.com/attacker/repo", but only this one rejects github.com
-# appearing as a path segment on another host, which is how
-# "https://evil.com/github.com/attacker/repo" resolved to "attacker/repo".
-#
-# The scheme alternation mirrors the four ValidateGitRepoURL accepts
-# (common_types.go). Excluding "/" from the userinfo class is what stops
-# "https://user@evil.com/github.com/a/b". The trailing "[/:]" accepts both web
-# URLs and SCP-form SSH remotes ("git@github.com:acme/toolkit.git"); the
-# optional "www." preserves the prefix the original parser handled explicitly.
-#
-# urllib.parse is not usable here: SCP-form remotes have no valid scheme (the
-# "@" disqualifies "git@github.com" as one, so the whole string comes back as
-# a path), and the bare "owner/repo" shorthand below has no host at all.
-REPO_URL_RE = re.compile(
-    r"^(?:(?:https?|git|ssh)://)?(?:[^/@]+@)?(?:www\.)?github\.com[/:]"
-    r"([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
-)
-
 # The operator accepts a bare "owner/repo" shorthand as a valid gitRepo and
 # writes it through to SETTINGS.md verbatim, so it reaches us hostless. This
 # mirrors ownerRepoRegex in k8s-operator/api/v1alpha1/common_types.go, which is
@@ -97,104 +68,6 @@ REPO_URL_RE = re.compile(
 # malformed would alert on a supported configuration. It is also the form
 # `gh -R` takes natively.
 BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
-
-class RepoUnparseable(Exception):
-    """SETTINGS.md names a target repository, but it could not be understood.
-
-    Distinct from *absent* on purpose. An operator who configured nothing has
-    nothing for us to do — that is silence. An operator who configured
-    something we cannot read is a fault, and silence there means the resolver
-    stops working and nobody finds out.
-    """
-
-
-def _valid_repo_component(part: str) -> bool:
-    """Reject path components that are unsafe to hand to ``gh -R``.
-
-    The regex character class permits "." and "-", so it happily produces
-    "../..", and a leading dash would be parsed by ``gh`` as a flag rather
-    than as part of the repository slug. Neither is a shape problem the
-    pattern can express, so it is checked here.
-    """
-    return bool(part) and part not in (".", "..") and not part.startswith("-")
-
-
-def get_target_repo(
-    required: bool = True, settings_path: Optional[str] = None
-) -> Optional[str]:
-    """Extract the target repository slug from SETTINGS.md.
-
-    Returns ``owner/repo``. Raises :class:`RepoUnparseable` when a repository
-    is configured but cannot be parsed. When none is configured at all, obeys
-    ``required``: exit for callers that cannot proceed without one, return
-    ``None`` for callers that treat it as "nothing to do".
-    """
-    # Resolved at call time, not bound as a default, so the module constant
-    # stays the single source of truth (and is patchable under test).
-    settings_path = settings_path or SETTINGS_PATH
-    if not os.path.exists(settings_path):
-        if required:
-            print(f"Error: {settings_path} not found.", file=sys.stderr)
-            sys.exit(1)
-        return None
-
-    configured = None
-    with open(settings_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if "Git Repo:" in line:
-                configured = line.split("Git Repo:", 1)[1]
-                # Strip the markdown bold delimiters the operator emits
-                # around the key, leaving just the value.
-                configured = configured.replace("*", "").strip()
-                break
-
-    if (
-        configured is None
-        or not configured
-        or configured.lower() == SETTINGS_REPO_UNSET
-    ):
-        if required:
-            print(
-                f"Error: No target repository configured in {settings_path}.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        return None
-
-    match = REPO_URL_RE.search(configured)
-    if match:
-        repo = match.group(1)
-    elif BARE_REPO_RE.match(configured):
-        repo = configured
-    else:
-        raise RepoUnparseable(configured)
-
-    repo = re.sub(r"\.git$", "", repo)
-    owner, _, name = repo.partition("/")
-    # Checked after the shorthand branch, not instead of it: "../.." satisfies
-    # BARE_REPO_RE, so the component guard is what rejects it.
-    if not _valid_repo_component(owner) or not _valid_repo_component(name):
-        raise RepoUnparseable(configured)
-
-    return repo
-
-
-def resolve_repo_or_exit(required: bool = True) -> Optional[str]:
-    """``get_target_repo`` for callers that cannot route the fault themselves.
-
-    ``claim`` and ``transition`` are invoked with an issue number already in
-    hand, so there is no useful degraded mode: a repository we cannot parse is
-    a hard stop, exactly as it was before the value became optional.
-    """
-    try:
-        return get_target_repo(required=required)
-    except RepoUnparseable as e:
-        print(
-            f"Error: Could not extract target repository from {SETTINGS_PATH}: {e}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
 
 def _run_gh_once(args: list) -> subprocess.CompletedProcess:
@@ -247,7 +120,7 @@ def _looks_like_auth_failure(args: list, result) -> bool:
     return bool(_GH_AUTH_FAILURE.search(result.stderr or ""))
 
 
-def _refresh_credentials_once() -> bool:
+def _refresh_credentials_once(args: list = None) -> bool:
     """Mint a fresh token, at most once per process.
 
     Returns True only when a new token actually landed -- i.e. when retrying
@@ -263,15 +136,20 @@ def _refresh_credentials_once() -> bool:
         return False
     _refresh_attempted = True
 
-    # Broad on purpose. This runs inside run_gh, on a path that previously
-    # never touched the filesystem, so anything the lookup can raise --
-    # RepoUnparseable, or an OSError from a SETTINGS.md that exists but cannot
-    # be read -- would become a brand-new crash in every gh caller. Failing to
-    # identify a repository means "do not mint", never "abort the command".
-    try:
-        repo = get_target_repo(required=False)
-    except Exception:
-        repo = None
+    repo = None
+    if args and "-R" in args:
+        try:
+            repo = args[args.index("-R") + 1]
+        except (ValueError, IndexError):
+            pass
+
+    if not repo:
+        try:
+            managed = get_managed_github_repos()
+            repo = managed[0] if managed else None
+        except Exception:
+            repo = None
+
     if not repo:
         # No repository to scope a token to, so there is nothing to mint. Let
         # the original failure stand; the caller reports it as it always did.
@@ -322,7 +200,7 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
     limit, or a timeout is not a credential problem either.
     """
     result = _run_gh_once(args)
-    if _looks_like_auth_failure(args, result) and _refresh_credentials_once():
+    if _looks_like_auth_failure(args, result) and _refresh_credentials_once(args):
         result = _run_gh_once(args)
 
     if check and result.returncode != 0:
@@ -682,21 +560,25 @@ def _fetch_comments(repo: str, number) -> list:
 
 
 def handle_poll(args):
-    # Nothing configured is not a fault: it is a supported deployment with no
-    # work to do. Its own status, rather than NO_ISSUES, so the two cannot be
-    # confused by a later reader.
     try:
-        repo = get_target_repo(required=False)
-    except RepoUnparseable as e:
+        repos = get_managed_github_repos()
+    except Exception as e:
         print(
             json.dumps(
-                {"status": "ERROR", "reason": "GIT_REPO_UNPARSEABLE", "value": str(e)}
+                {
+                    "status": "ERROR",
+                    "reason": "CONFIGMAP_READ_FAILED",
+                    "error": str(e),
+                }
             )
         )
         return
-    if not repo:
+
+    repos = [r for r in repos if BARE_REPO_RE.match(r)]
+    if not repos:
         print(json.dumps({"status": "NOT_CONFIGURED"}))
         return
+
     # Check auth pre-flight safely. A repo is configured but credentials are
     # broken: that is a real fault, so it must NOT be reported as NO_ISSUES
     # (which the skill silences) or the resolver goes quiet forever.
@@ -727,75 +609,96 @@ def handle_poll(args):
         print(json.dumps({"status": "ERROR", "reason": reason}))
         return
 
-    # Sweep stale issues first
-    sweep_stale_issues(repo)
+    all_issues = []
+    unreachable_repos = []
 
-    # Query next unaddressed issue.
-    # `agent:audit` is excluded because those issues are fleet-audit ledgers:
-    # that skill owns them and rewrites them in place on every run.
-    search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved -label:agent:audit"
-    # check=False: `gh auth status` passes when *any* host is authenticated, so
-    # a token without scope for this repo — or a repo that 404s — only fails
-    # here. With check=True that exits non-zero having printed no JSON at all,
-    # which the skill has no branch for.
-    #
-    # `comments` is deliberately absent from this projection and `--limit` is
-    # 100 rather than 10, and the two go together. Ranking by priority only
-    # reorders the rows the query returned, and which rows those are is not
-    # something this query gets to decide: `--search` goes to the search API,
-    # whose ordering without a `sort:` qualifier is GitHub's relevance ranking
-    # rather than anything this code can predict. At a limit of 10 the ranking
-    # therefore re-sorted an arbitrary handful and a P0 outside it was never a
-    # candidate — the delay the ranking was added to remove. Widening the window
-    # is what makes the ranking mean anything, and 100 covers the whole
-    # unaddressed backlog of a repository this agent is plausibly pointed at.
-    # It is affordable only because `comments` is dropped — that field costs one
-    # GraphQL round trip per issue, so asking for it across 100 issues is what
-    # would blow `github_scan_gate`'s RESOLVER_TIMEOUT_S. The winner's comments
-    # are fetched on their own below, once there is exactly one issue to fetch
-    # them for; that is one list call plus one view call, against the ten
-    # issues' worth of comment round trips the old projection paid every tick.
-    res = run_gh(
-        [
-            "issue",
-            "list",
-            "-R",
-            repo,
-            "--search",
-            search_query,
-            "--json",
-            "number,title,body,labels,createdAt",
-            "--limit",
-            "100",
-        ],
-        check=False,
-    )
-    if res.returncode != 0:
+    for repo in repos:
+        # Sweep stale issues first
+        sweep_stale_issues(repo)
+
+        # Query next unaddressed issue.
+        # `agent:audit` is excluded because those issues are fleet-audit ledgers:
+        # that skill owns them and rewrites them in place on every run.
+        search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved -label:agent:audit"
+        # check=False: `gh auth status` passes when *any* host is authenticated, so
+        # a token without scope for this repo — or a repo that 404s — only fails
+        # here. With check=True that exits non-zero having printed no JSON at all,
+        # which the skill has no branch for.
+        #
+        # `comments` is deliberately absent from this projection and `--limit` is
+        # 100 rather than 10, and the two go together. Ranking by priority only
+        # reorders the rows the query returned, and which rows those are is not
+        # something this query gets to decide: `--search` goes to the search API,
+        # whose ordering without a `sort:` qualifier is GitHub's relevance ranking
+        # rather than anything this code can predict. At a limit of 10 the ranking
+        # therefore re-sorted an arbitrary handful and a P0 outside it was never a
+        # candidate — the delay the ranking was added to remove. Widening the window
+        # is what makes the ranking mean anything, and 100 covers the whole
+        # unaddressed backlog of a repository this agent is plausibly pointed at.
+        # It is affordable only because `comments` is dropped — that field costs one
+        # GraphQL round trip per issue, so asking for it across 100 issues is what
+        # would blow `github_scan_gate`'s RESOLVER_TIMEOUT_S. The winner's comments
+        # are fetched on their own below, once there is exactly one issue to fetch
+        # them for; that is one list call plus one view call, against the ten
+        # issues' worth of comment round trips the old projection paid every tick.
+        res = run_gh(
+            [
+                "issue",
+                "list",
+                "-R",
+                repo,
+                "--search",
+                search_query,
+                "--json",
+                "number,title,body,labels,createdAt",
+                "--limit",
+                "100",
+            ],
+            check=False,
+        )
+        if res.returncode != 0:
+            unreachable_repos.append(repo)
+            continue
+
+        try:
+            issues = json.loads(res.stdout)
+            if not isinstance(issues, list):
+                unreachable_repos.append(repo)
+                continue
+        except Exception:
+            unreachable_repos.append(repo)
+            continue
+
+        for issue in issues:
+            issue["_repo"] = repo
+            all_issues.append(issue)
+
+    if not all_issues:
+        if unreachable_repos and len(unreachable_repos) == len(repos):
+            print(
+                json.dumps(
+                    {
+                        "status": "ERROR",
+                        "reason": "REPO_UNREACHABLE",
+                        "unreachable_repos": unreachable_repos,
+                    }
+                )
+            )
+            return
         print(
             json.dumps(
                 {
-                    "status": "ERROR",
-                    "reason": "REPO_UNREACHABLE",
-                    "repository": repo,
+                    "status": "NO_ISSUES",
+                    "managed_repos": repos,
+                    "unreachable_repos": unreachable_repos,
                 }
             )
         )
         return
 
-    try:
-        issues = json.loads(res.stdout)
-        if not isinstance(issues, list):
-            issues = []
-    except Exception:
-        issues = []
-
-    if not issues:
-        print(json.dumps({"status": "NO_ISSUES", "repository": repo}))
-        return
-
     # Select issue by highest priority score, then earliest creation date and lowest issue number (FIFO tie-breaker)
     scored_issues = []
-    for x in issues:
+    for x in all_issues:
         score, label = calculate_issue_priority(x)
         created_at = x.get("createdAt") or ""
         scored_issues.append((score, created_at, int(x["number"]), label, x))
@@ -803,12 +706,12 @@ def handle_poll(args):
     scored_issues.sort(key=lambda item: (-item[0], item[1], item[2]))
 
     _, _, _, priority_label, target = scored_issues[0]
+    repo = target["_repo"]
 
     raw_title = target.get("title") or ""
     sanitized_title = sanitize_untrusted_text(raw_title)
     raw_body = target.get("body") or ""
     sanitized_body = sanitize_untrusted_text(raw_body)
-
     comments = []
     for c in _fetch_comments(repo, target["number"]):
         author = c.get("author") if isinstance(c.get("author"), dict) else {}
@@ -835,14 +738,54 @@ def handle_poll(args):
                 "title_plain": sanitized_title,
                 "body": f"<untrusted_body>{sanitized_body}</untrusted_body>",
                 "comments": comments,
+                "unreachable_repos": unreachable_repos,
             },
             indent=2,
         )
     )
 
 
+def _validate_repo_or_exit(repo: str) -> None:
+    if not repo or not is_valid_repo_slug(repo):
+        print(
+            json.dumps(
+                {
+                    "status": "ERROR",
+                    "reason": "INVALID_REPOSITORY",
+                    "error": f"Invalid repository format: {repo!r}",
+                }
+            )
+        )
+        sys.exit(1)
+    try:
+        managed = get_managed_github_repos()
+    except Exception as e:
+        print(
+            json.dumps(
+                {
+                    "status": "ERROR",
+                    "reason": "CONFIGMAP_READ_FAILED",
+                    "error": str(e),
+                }
+            )
+        )
+        sys.exit(1)
+    if repo not in managed:
+        print(
+            json.dumps(
+                {
+                    "status": "ERROR",
+                    "reason": "UNMANAGED_REPOSITORY",
+                    "error": f"Repository {repo!r} is not in the managed repositories list: {managed}",
+                }
+            )
+        )
+        sys.exit(1)
+
+
 def handle_claim(args):
-    repo = resolve_repo_or_exit(required=True)
+    repo = args.repo
+    _validate_repo_or_exit(repo)
     issue_num = str(args.issue)
     ensure_labels_exist(repo)
 
@@ -886,7 +829,7 @@ def handle_claim(args):
 
 
 def handle_transition(args):
-    repo = resolve_repo_or_exit(required=True)
+    repo = args.repo
     issue_num = str(args.issue)
     state = args.state
     report_file = args.report_file
@@ -908,6 +851,8 @@ def handle_transition(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+    _validate_repo_or_exit(repo)
 
     # Post report comment directly via file parameter (-F)
     run_gh(["issue", "comment", issue_num, "-R", repo, "-F", real_report_path])
@@ -976,6 +921,9 @@ def main():
     claim_parser.add_argument(
         "--issue", required=True, type=int, help="Issue number to claim."
     )
+    claim_parser.add_argument(
+        "--repo", required=True, help="Target repository to act upon."
+    )
 
     # transition
     trans_parser = subparsers.add_parser(
@@ -983,6 +931,9 @@ def main():
     )
     trans_parser.add_argument(
         "--issue", required=True, type=int, help="Issue number to transition."
+    )
+    trans_parser.add_argument(
+        "--repo", required=True, help="Target repository to act upon."
     )
     trans_parser.add_argument(
         "--state",

@@ -18,7 +18,7 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
 
-The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of `/opt/data/SETTINGS.md` (per `SOUL.md §1`). The flow:
+The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of the `$GITOPS_STATE_CONFIGMAP` ConfigMap (per `SOUL.md §1`). The flow:
 
 1. Runs `"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON. The path is spelled from `$HERMES_HOME` because the skill is reached from a kanban card as well as from a cron turn, and only a cron turn starts in the profile directory.
 2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
@@ -123,10 +123,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 If a git operation fails with an auth error (e.g. `fatal: Authentication failed`, `could not read Username`), `SOUL.md §3` requires the agent to run the packaged token refresher:
 
 ```bash
-# outside a git repo
 ./scripts/github_token_refresh.py <owner>/<repo>
-# inside a git repo (repo inferred from remote.origin.url)
-./scripts/github_token_refresh.py
 ```
 
 which triggers a fresh mint from Minty and caches it, then retries the command. The recovery ladder (`§4`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.

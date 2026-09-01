@@ -449,7 +449,7 @@ It adds exactly two workloads to `kubeagents-system`.
 
 **1. `hindsight-api` — a `Deployment`, one replica** (`api.yaml`).
 
-- Image `ghcr.io/vectorize-io/hindsight-api:0.9.1`, pinned by digest. The pin
+- Image `ghcr.io/vectorize-io/hindsight-api:0.9.2`, pinned by digest. The pin
   lives in `images.json` at the repository root and the manifest takes it as a
   variable, so a mirrored install can point it at an approved registry.
 - Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;

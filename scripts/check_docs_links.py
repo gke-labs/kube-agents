@@ -74,7 +74,7 @@ def tracked_paths() -> set[Path]:
         text=True,
         check=True,
     ).stdout.split("\0")
-    return {(REPO / p).resolve() for p in out if p}
+    return {(REPO / p).resolve() for p in out if p and (REPO / p).is_file()}
 
 
 def tracked_markdown() -> list[Path]:
@@ -85,7 +85,7 @@ def tracked_markdown() -> list[Path]:
         text=True,
         check=True,
     ).stdout.split("\0")
-    return [REPO / p for p in out if p and "node_modules" not in p]
+    return [REPO / p for p in out if p and "node_modules" not in p and (REPO / p).is_file()]
 
 
 def strip_code_fences(text: str) -> list[tuple[int, str]]:

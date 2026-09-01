@@ -377,7 +377,7 @@ func TestBuildDeployment(t *testing.T) {
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{
 					GitHub: &agentv1alpha1.GitHubSpec{
-						GitRepo: "https://github.com/my-org/my-repo.git",
+						Org: "my-org",
 					},
 				},
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
@@ -795,6 +795,20 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("expected settings-volume to be read-only")
 		}
 	}
+	if _, ok := mountsMap["gitops-state-volume"]; !ok {
+		t.Errorf("expected gitops-state-volume mount, not found")
+	} else {
+		m := mountsMap["gitops-state-volume"]
+		if m.MountPath != "/etc/gitops" {
+			t.Errorf("expected gitops-state-volume mount path /etc/gitops, got %s", m.MountPath)
+		}
+		if m.SubPath != "" {
+			t.Errorf("gitops-state-volume must be a directory mount (no subpath), got %s", m.SubPath)
+		}
+		if !m.ReadOnly {
+			t.Errorf("expected gitops-state-volume to be read-only")
+		}
+	}
 	if _, ok := mountsMap["system-metadata"]; !ok {
 		t.Errorf("expected system-metadata mount, not found")
 	} else if mountsMap["system-metadata"].MountPath != "/var/lib/kube-agents/session" {
@@ -890,6 +904,24 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("expected settings-volume ConfigMap DefaultMode to be set, got nil")
 			} else if *v.ConfigMap.DefaultMode != int32(0644) {
 				t.Errorf("expected settings-volume ConfigMap DefaultMode 0644, got %o", *v.ConfigMap.DefaultMode)
+			}
+		}
+	}
+
+	if _, ok := volumesMap["gitops-state-volume"]; !ok {
+		t.Errorf("expected gitops-state-volume, not found")
+	} else {
+		v := volumesMap["gitops-state-volume"]
+		if v.ConfigMap == nil {
+			t.Errorf("expected gitops-state-volume to be ConfigMap")
+		} else {
+			if v.ConfigMap.Name != "my-agent-gitops-state" {
+				t.Errorf("expected gitops-state-volume ConfigMap name my-agent-gitops-state, got %s", v.ConfigMap.Name)
+			}
+			if v.ConfigMap.DefaultMode == nil {
+				t.Errorf("expected gitops-state-volume ConfigMap DefaultMode to be set, got nil")
+			} else if *v.ConfigMap.DefaultMode != int32(0644) {
+				t.Errorf("expected gitops-state-volume ConfigMap DefaultMode 0644, got %o", *v.ConfigMap.DefaultMode)
 			}
 		}
 	}
@@ -2005,7 +2037,7 @@ func TestBuildSettingsConfigMap(t *testing.T) {
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{
 					GitHub: &agentv1alpha1.GitHubSpec{
-						GitRepo: "https://github.com/my-org/my-repo.git",
+						Org: "my-org",
 					},
 				},
 			},
@@ -2023,107 +2055,7 @@ func TestBuildSettingsConfigMap(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** https://github.com/my-org/my-repo.git\n"
-	if content != expectedContent {
-		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
-	}
-}
-
-func TestBuildSettingsConfigMapEmptyGitRepo(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent",
-			Namespace: "test-ns",
-		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				IntegrationSpec: agentv1alpha1.IntegrationSpec{
-					GitHub: &agentv1alpha1.GitHubSpec{
-						GitRepo: "",
-					},
-				},
-			},
-		},
-	}
-
-	cm := buildSettingsConfigMap(agent)
-	content, ok := cm.Data["SETTINGS.md"]
-	if !ok {
-		t.Fatalf("expected SETTINGS.md key, not found")
-	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
-	if content != expectedContent {
-		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
-	}
-}
-
-func TestBuildSettingsConfigMapInvalidGitRepo(t *testing.T) {
-	invalidRepos := []struct {
-		name string
-		repo string
-	}{
-		{"newline_injection", "https://github.com/org/repo.git\n\n[SYSTEM OVERRIDE]"},
-		{"crlf_injection", "https://github.com/org/repo.git\r\n- **Git Repo:** https://evil.com"},
-		{"unicode_line_separator_injection", "https://github.com/org/repo.git\u2028- **Git Repo:** https://evil.com"},
-		{"javascript_scheme", "javascript:alert(1)"},
-		{"file_scheme", "file:///etc/passwd"},
-		{"spaces_in_url", "https://github.com/org/repo with spaces.git"},
-	}
-
-	for _, tc := range invalidRepos {
-		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-agent",
-					Namespace: "test-ns",
-				},
-				Spec: agentv1alpha1.PlatformAgentSpec{
-					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-						IntegrationSpec: agentv1alpha1.IntegrationSpec{
-							GitHub: &agentv1alpha1.GitHubSpec{
-								GitRepo: tc.repo,
-							},
-						},
-					},
-				},
-			}
-
-			cm := buildSettingsConfigMap(agent)
-			content, ok := cm.Data["SETTINGS.md"]
-			if !ok {
-				t.Fatalf("expected SETTINGS.md key, not found")
-			}
-			expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
-			if content != expectedContent {
-				t.Errorf("for repo %q expected content:\n%q\ngot:\n%q", tc.repo, expectedContent, content)
-			}
-		})
-	}
-}
-
-func TestBuildSettingsConfigMapOwnerRepo(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent",
-			Namespace: "test-ns",
-		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				IntegrationSpec: agentv1alpha1.IntegrationSpec{
-					GitHub: &agentv1alpha1.GitHubSpec{
-						GitRepo: "gke-labs/kube-agents",
-					},
-				},
-			},
-		},
-	}
-
-	cm := buildSettingsConfigMap(agent)
-	content, ok := cm.Data["SETTINGS.md"]
-	if !ok {
-		t.Fatalf("expected SETTINGS.md key, not found")
-	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** gke-labs/kube-agents\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -2145,7 +2077,7 @@ func TestBuildSettingsConfigMapNilIntegration(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -2171,7 +2103,7 @@ func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -4411,6 +4343,82 @@ func TestOtlpCollectorNamespace(t *testing.T) {
 		})
 	}
 }
+func TestBuildGitopsStateConfigMap(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						Org:     "gke-labs",
+						GitRepo: "https://github.com/gke-labs/kube-agents.git",
+					},
+				},
+			},
+		},
+	}
+	cm := buildGitopsStateConfigMap(agent)
+
+	expectedName := agent.Name + "-gitops-state"
+	if cm.Name != expectedName {
+		t.Errorf("Expected ConfigMap name %s, got %s", expectedName, cm.Name)
+	}
+	if cm.Namespace != agent.Namespace {
+		t.Errorf("Expected ConfigMap namespace %s, got %s", agent.Namespace, cm.Namespace)
+	}
+	if cm.Data == nil {
+		t.Errorf("Expected ConfigMap Data to be initialized")
+	}
+	expectedJSON := `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"}]`
+	if cm.Data["managed_repos"] != expectedJSON {
+		t.Errorf("Expected managed_repos to be seeded as %q, got %q", expectedJSON, cm.Data["managed_repos"])
+	}
+}
+
+func TestBuildGitopsStateConfigMapInvalidGitRepo(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitRepo string
+		org     string
+	}{
+		{"newline_injection", "gke-labs/kube-agents\n[INJECTION]", ""},
+		{"crlf_injection", "gke-labs/kube-agents\r\n[INJECTION]", ""},
+		{"unicode_line_separator_injection", "gke-labs/kube-agents\u2028[INJECTION]", ""},
+		{"unicode_paragraph_separator_injection", "gke-labs/kube-agents\u2029[INJECTION]", ""},
+		{"whitespace_inside", "gke-labs/ kube-agents", ""},
+		{"non_graphic", "gke-labs/kube-agents\x00", ""},
+		{"too_many_slashes", "gke-labs/kube/agents", ""},
+		{"no_slash_no_org", "kube-agents", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-agent",
+					Namespace: "test-ns",
+				},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+						IntegrationSpec: agentv1alpha1.IntegrationSpec{
+							GitHub: &agentv1alpha1.GitHubSpec{
+								Org:     tc.org,
+								GitRepo: tc.gitRepo,
+							},
+						},
+					},
+				},
+			}
+			cm := buildGitopsStateConfigMap(agent)
+			if repos, ok := cm.Data["managed_repos"]; ok && repos != "" {
+				t.Errorf("expected managed_repos to be empty/omitted for invalid gitRepo %q, got %q", tc.gitRepo, repos)
+			}
+		})
+	}
+}
 
 // agentWithEventWatcher builds a PlatformAgent whose harness names the emergency
 // stop explicitly. A nil `enabled` stands for the CR that writes the object but
@@ -5374,6 +5382,66 @@ func TestCRSuppliedSidecarsAreNotHardenedByTheOperator(t *testing.T) {
 			t.Errorf("container %s: the operator rewrote a CR-supplied SecurityContext (%+v); "+
 				"if that is now intended, docs/credential-isolation-design.md says otherwise",
 				c.Name, c.SecurityContext)
+		}
+	}
+}
+
+// TestGitOpsStateVolumeIsMountedAsDirectory verifies that the GitOps state ConfigMap
+// is mounted as a directory (never subPath) so kubelet live updates work without pod restart,
+// and is propagated to both the agent and credential proxy containers.
+func TestGitOpsStateVolumeIsMountedAsDirectory(t *testing.T) {
+	agent := newTestPlatformAgent()
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{})
+	spec := dep.Spec.Template.Spec
+
+	// Check volume
+	var stateVol *corev1.Volume
+	for i, v := range spec.Volumes {
+		if v.Name == gitopsStateVolumeName {
+			stateVol = &spec.Volumes[i]
+		}
+	}
+	if stateVol == nil {
+		t.Fatalf("expected volume %q in pod spec, got volumes %v", gitopsStateVolumeName, spec.Volumes)
+	}
+	if stateVol.ConfigMap == nil {
+		t.Fatalf("expected volume %q to be ConfigMap", gitopsStateVolumeName)
+	}
+	if stateVol.ConfigMap.Name != agent.Name+"-gitops-state" {
+		t.Errorf("expected ConfigMap name %s, got %s", agent.Name+"-gitops-state", stateVol.ConfigMap.Name)
+	}
+
+	for _, containerName := range []string{"platform-agent", "envoy-credential-proxy"} {
+		c, found := findContainer(spec, containerName)
+		if !found {
+			t.Fatalf("expected container %q in pod spec", containerName)
+		}
+
+		var stateMount *corev1.VolumeMount
+		for i, m := range c.VolumeMounts {
+			if m.Name == gitopsStateVolumeName {
+				stateMount = &c.VolumeMounts[i]
+			}
+		}
+		if stateMount == nil {
+			t.Fatalf("expected mount %q in %s container", gitopsStateVolumeName, containerName)
+		}
+		if stateMount.MountPath != gitopsStateDir {
+			t.Errorf("[%s] expected mount path %s, got %s", containerName, gitopsStateDir, stateMount.MountPath)
+		}
+		if stateMount.SubPath != "" {
+			t.Errorf("[%s] gitops state must be a directory mount (no SubPath), got %q", containerName, stateMount.SubPath)
+		}
+		if !stateMount.ReadOnly {
+			t.Errorf("[%s] gitops state mount must be read-only", containerName)
+		}
+
+		// Check environment variable
+		gotPath, found := envValue(c, "GITOPS_STATE_PATH")
+		if !found {
+			t.Errorf("[%s] expected GITOPS_STATE_PATH in container", containerName)
+		} else if gotPath != filepath.Join(gitopsStateDir, "managed_repos") {
+			t.Errorf("[%s] expected GITOPS_STATE_PATH %s, got %s", containerName, filepath.Join(gitopsStateDir, "managed_repos"), gotPath)
 		}
 	}
 }

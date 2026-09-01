@@ -58,7 +58,7 @@ metadata:
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
 data:
-  {{ $org }}-{{ $repo }}.yaml: |
+  default.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
       if: "assertion.iss == 'https://accounts.google.com'"
@@ -158,8 +158,7 @@ spec:
             {{- toYaml $m.resources | nindent 12 }}
           volumeMounts:
             - name: config-volume
-              mountPath: /etc/minty/{{ $org }}/{{ $repo }}.yaml
-              subPath: {{ $org }}-{{ $repo }}.yaml
+              mountPath: /etc/minty/{{ $org }}
       volumes:
         - name: config-volume
           configMap:

@@ -355,31 +355,6 @@ def _parse_repo(configured: str) -> str:
     return repo
 
 
-def target_repo(settings_path: Optional[str] = None) -> Optional[str]:
-    """The configured repository as `owner/name`, or None when there is none.
-
-    None means "nothing configured", which is a supported install. A configured
-    value that cannot be read raises instead, because those two must never
-    reach an operator as the same silence.
-    """
-    path = settings_path or SETTINGS_PATH
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except OSError:
-        return None
-
-    configured = None
-    for line in lines:
-        if "Git Repo:" in line:
-            configured = line.split("Git Repo:", 1)[1].replace("*", "").strip()
-            break
-
-    if not configured or configured.lower() == SETTINGS_REPO_UNSET:
-        return None
-    return _parse_repo(configured)
-
-
 def run_gh(argv: Sequence[str]) -> subprocess.CompletedProcess:
     """One `gh` invocation, never raising for a non-zero exit.
 
@@ -740,20 +715,14 @@ class GitHubProvider:
 PROVIDERS: dict[str, type] = {"github.com": GitHubProvider}
 
 
-def provider_for(settings_path: Optional[str] = None, **kwargs) -> ForgeProvider:
-    """Pick a provider from the host in SETTINGS.md's `Git Repo:` line.
+def provider_for(repo: Optional[str] = None, **kwargs) -> ForgeProvider:
+    """Pick a provider from the host in repo or default to GitHub.
 
     A bare `owner/repo` — which the operator accepts and writes through
     verbatim — names no host, so it means GitHub: that shorthand is `gh -R`'s
     own form and no other forge shares it.
     """
-    path = settings_path or SETTINGS_PATH
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:
-        text = ""
-    lowered = text.lower()
+    lowered = (repo or "").lower()
     for host, cls in PROVIDERS.items():
         if host in lowered:
             return cls(**kwargs)

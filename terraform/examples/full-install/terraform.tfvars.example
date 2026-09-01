@@ -66,9 +66,6 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_google_chat        = true
 # google_chat_allowed_users = ["you@example.com"]
 
-# GitOps target repository for the agent's GitHub integration.
-# github_repo = "my-org/my-gitops-repo"
-
 # Model routing for the bundled LiteLLM gateway (defaults: gemini and the
 # provider's default model; set the matching *_api_key above).
 # model_provider     = "gemini"
@@ -85,8 +82,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # vertex_location    = ""
 
 
-# Optional GitHub token minter backend (GSA + KMS signing key).
+# Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
+# github_repo          = "my-github-org/my-repo"
 
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack

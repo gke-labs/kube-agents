@@ -18,9 +18,12 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,6 +80,7 @@ const (
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
+	AnnotationManagedMinterKeys       = "kubeagents.x-k8s.io/managed-minter-keys"
 
 	// The condition reporting that cluster event ingestion has been switched off
 	// on the spec. It is written only in that state — see updateStatusReady.
@@ -247,6 +251,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 8. Reconcile Settings ConfigMap
 	settingsHash, err := r.reconcileSettingsConfigMap(ctx, instance)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Reconcile Gitops State ConfigMap (create-only to avoid overwriting agent updates)
+	if err := r.reconcileGitopsStateConfigMap(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -588,6 +597,300 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 		return "", err
 	}
 	return hash, nil
+}
+
+func parseManagedRepoEntries(raw string) ([]agentv1alpha1.ManagedRepoEntry, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(raw, "[") {
+		return nil, fmt.Errorf("managed_repos JSON must be an array starting with '['")
+	}
+	var entries []agentv1alpha1.ManagedRepoEntry
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal managed_repos JSON: %w", err)
+	}
+	var res []agentv1alpha1.ManagedRepoEntry
+	for _, e := range entries {
+		u := strings.TrimSpace(e.URL)
+		t := strings.TrimSpace(e.Type)
+		if u != "" && t != "" {
+			res = append(res, agentv1alpha1.ManagedRepoEntry{Type: t, URL: u})
+		}
+	}
+	return res, nil
+}
+
+func parseManagedRepos(raw string) ([]string, error) {
+	entries, err := parseManagedRepoEntries(raw)
+	if err != nil {
+		return nil, err
+	}
+	var res []string
+	for _, e := range entries {
+		res = append(res, e.URL)
+	}
+	return res, nil
+}
+
+// reconcileGitopsStateConfigMap ensures the <agent-name>-gitops-state ConfigMap exists to track
+// managed repositories. If spec.integration.github.gitRepo is defined on the CR, it is seeded
+// into managed_repos and kept present on subsequent reconciles without removing any additional
+// repositories added to the ConfigMap.
+//
+// Repository lifecycle and removal:
+// The reconciler appends any repository declared in spec.integration.github.gitRepo to managed_repos
+// if it is not already present in the ConfigMap, preserving all existing entries.
+// Repository removal/unregistration is administrator-driven via the ConfigMap: to unregister a
+// repository, remove its entry directly from managed_repos in the <agent-name>-gitops-state ConfigMap.
+// If the repository to be removed was declared in spec.integration.github.gitRepo on the CR, clear or
+// update gitRepo on the CR as well so the reconciler does not re-append it on subsequent passes.
+func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildGitopsStateConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+
+	found := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			withCommonLabels(cm, agent)
+			if err := r.Create(ctx, cm); err != nil {
+				return err
+			}
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data["managed_repos"])
+		}
+		return err
+	}
+
+	// If the CR spec provides a repository and the existing ConfigMap does not include it,
+	// ensure the repository is recorded without overwriting other dynamically added repositories.
+	if cmRepo, ok := cm.Data["managed_repos"]; ok && cmRepo != "" {
+		if found.Data == nil {
+			found.Data = map[string]string{}
+		}
+		existing := strings.TrimSpace(found.Data["managed_repos"])
+		if existing == "" {
+			found.Data["managed_repos"] = cmRepo
+			if err := r.Update(ctx, found); err != nil {
+				return err
+			}
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo)
+		}
+		specEntries, err := parseManagedRepoEntries(cmRepo)
+		if err != nil {
+			return fmt.Errorf("failed to parse spec repository JSON: %w", err)
+		}
+		existingEntries, err := parseManagedRepoEntries(existing)
+		if err != nil {
+			return fmt.Errorf("failed to parse existing managed_repos in ConfigMap %s: %w", found.Name, err)
+		}
+		updated := false
+		for _, se := range specEntries {
+			present := false
+			for _, ee := range existingEntries {
+				if ee.URL == se.URL {
+					present = true
+					break
+				}
+			}
+			if !present {
+				existingEntries = append(existingEntries, se)
+				updated = true
+			}
+		}
+		if updated {
+			if jsonBytes, err := json.Marshal(existingEntries); err == nil {
+				found.Data["managed_repos"] = string(jsonBytes)
+			}
+			if err := r.Update(ctx, found); err != nil {
+				return err
+			}
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+		}
+	}
+
+	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+}
+
+func parseManagedKeysAnnotation(ann string) map[string]struct{} {
+	keys := make(map[string]struct{})
+	if strings.TrimSpace(ann) == "" {
+		return keys
+	}
+	for _, k := range strings.Split(ann, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys[k] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func serializeManagedKeysAnnotation(keys map[string]struct{}) string {
+	var list []string
+	for k := range keys {
+		list = append(list, k)
+	}
+	sort.Strings(list)
+	return strings.Join(list, ",")
+}
+
+var minterRepoRegex = regexp.MustCompile(`(?m)^(\s*repositories:\s*\n)(?:\s*-\s*.*?\n)+`)
+
+func renderRepoPolicy(baseTemplate string, repos []string) string {
+	return minterRepoRegex.ReplaceAllStringFunc(baseTemplate, func(match string) string {
+		lines := strings.Split(match, "\n")
+		prefix := lines[0]
+		indent := ""
+		for _, ch := range prefix {
+			if ch == ' ' || ch == '\t' {
+				indent += string(ch)
+			} else {
+				break
+			}
+		}
+		itemIndent := indent + "  "
+		var sb strings.Builder
+		sb.WriteString(prefix)
+		for _, r := range repos {
+			sb.WriteString("\n")
+			sb.WriteString(itemIndent)
+			sb.WriteString("- '")
+			sb.WriteString(r)
+			sb.WriteString("'")
+		}
+		sb.WriteString("\n")
+		return sb.String()
+	})
+}
+
+// syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
+// to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
+// entry exists in github-token-minter-config ConfigMap.
+// Repositories belonging to a different organization are skipped because the minter instance is
+// bound to the primary organization directory (/etc/minty/<primary-org>/).
+// Operator-managed <repo>.yaml entries for repositories that are no longer managed are pruned.
+func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
+	logger := logf.FromContext(ctx)
+	minterCM := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: agent.Namespace}, minterCM)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if minterCM.Data == nil {
+		return nil
+	}
+
+	baseTemplate, ok := minterCM.Data["default.yaml"]
+	if !ok || strings.TrimSpace(baseTemplate) == "" {
+		return nil
+	}
+
+	managedReposStr = strings.TrimSpace(managedReposStr)
+
+	// Read operator-managed keys from annotation
+	existingAnn := ""
+	if minterCM.Annotations != nil {
+		existingAnn = minterCM.Annotations[AnnotationManagedMinterKeys]
+	}
+	operatorManagedKeys := parseManagedKeysAnnotation(existingAnn)
+
+	// An empty managed_repos with no previously operator-managed keys is a no-op to avoid wiping unmanaged keys.
+	if managedReposStr == "" && len(operatorManagedKeys) == 0 {
+		return nil
+	}
+
+	primaryOrg := ""
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
+		github := agent.Spec.Integration.GitHub
+		primaryOrg = strings.TrimSpace(github.Org)
+		if primaryOrg == "" && github.GitRepo != "" {
+			if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
+				parts := strings.SplitN(cleaned, "/", 2)
+				if len(parts) == 2 {
+					primaryOrg = parts[0]
+				}
+			}
+		}
+	}
+
+	repos, err := parseManagedRepos(managedReposStr)
+	if err != nil {
+		return fmt.Errorf("failed to parse managed_repos for minter policy sync: %w", err)
+	}
+	var allBareRepos []string
+	activeKeys := make(map[string]string, len(repos))
+	for _, fullRepo := range repos {
+		fullRepo = strings.TrimSpace(fullRepo)
+		if fullRepo == "" {
+			continue
+		}
+		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
+		if err != nil {
+			logger.V(1).Info("skipping invalid repo in managed_repos for minter policy sync", "repo", fullRepo, "error", err)
+			continue
+		}
+		parts := strings.SplitN(slug, "/", 2)
+		if len(parts) == 2 {
+			repoOrg := parts[0]
+			bareRepo := parts[1]
+			if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
+				logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
+					"repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
+				continue
+			}
+			if _, exists := activeKeys[bareRepo+".yaml"]; !exists {
+				activeKeys[bareRepo+".yaml"] = bareRepo
+				allBareRepos = append(allBareRepos, bareRepo)
+			}
+		}
+	}
+	sort.Strings(allBareRepos)
+
+	updated := false
+
+	// Ensure all active managed repositories have policy entries containing all same-org managed repositories
+	expectedContent := renderRepoPolicy(baseTemplate, allBareRepos)
+	for key := range activeKeys {
+		currentVal, exists := minterCM.Data[key]
+		_, managed := operatorManagedKeys[key]
+		if !exists {
+			minterCM.Data[key] = expectedContent
+			operatorManagedKeys[key] = struct{}{}
+			updated = true
+		} else if managed && currentVal != expectedContent {
+			minterCM.Data[key] = expectedContent
+			updated = true
+		}
+	}
+
+	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active
+	for key := range operatorManagedKeys {
+		if key == "default.yaml" {
+			continue
+		}
+		if _, active := activeKeys[key]; !active {
+			delete(minterCM.Data, key)
+			delete(operatorManagedKeys, key)
+			updated = true
+		}
+	}
+
+	if updated {
+		if minterCM.Annotations == nil {
+			minterCM.Annotations = make(map[string]string)
+		}
+		minterCM.Annotations[AnnotationManagedMinterKeys] = serializeManagedKeysAnnotation(operatorManagedKeys)
+		return r.Update(ctx, minterCM)
+	}
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
@@ -1341,6 +1644,7 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range existingRoleBindings.Items {
 		rb := &existingRoleBindings.Items[i]
+		// Preserve local and leader bindings during reconciliation
 		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
 			continue
 		}
@@ -1519,7 +1823,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	gitRepoErr := error(nil)
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepoErr = agentv1alpha1.ValidateGitRepoURL(agent.Spec.Integration.GitHub.GitRepo)
+		if err := agentv1alpha1.ValidateGitHubOrg(agent.Spec.Integration.GitHub.Org); err != nil {
+			gitRepoErr = err
+		} else if err := agentv1alpha1.ValidateGitRepoURLWithOrg(agent.Spec.Integration.GitHub.GitRepo, agent.Spec.Integration.GitHub.Org); err != nil {
+			gitRepoErr = err
+		}
 	}
 
 	degradedStatus := metav1.ConditionFalse
@@ -1527,7 +1835,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
 		condReason = "InvalidGitRepoURL"
-		condMsg = fmt.Sprintf("Invalid gitRepo URL (%s); GitOps disabled in SETTINGS.md", gitRepoErr.Error())
+		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config", gitRepoErr.Error())
 		degradedStatus = metav1.ConditionTrue
 	}
 

@@ -13,8 +13,13 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit
+./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit [--repo "<owner>/<repo>"]
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
 
@@ -181,7 +186,9 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json
+./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
+  --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
+  [--repo "<owner>/<repo>"]
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}

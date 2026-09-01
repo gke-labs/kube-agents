@@ -17,7 +17,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlsplit
+
+# Add scripts directory so gitops_workspace is importable
+sys.path.append("/opt/defaults/scripts")
+sys.path.append("/opt/data/scripts")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from credential_proxy_client import authorization_headers
 
@@ -106,10 +112,12 @@ def _valid_repository_segment(segment: str) -> bool:
     )
 
 
-def get_current_git_repo() -> str | None:
+def get_current_git_repo(cwd: str | None = None) -> str | None:
+    """Extract repository name (owner/repo) from local git config."""
     try:
         res = subprocess.run(
             ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
             check=True,
@@ -127,9 +135,10 @@ def refresh_git_credentials(
     initial_delay: float = 0.5,
     backoff_factor: float = 2.0,
 ) -> str:
+    """Query local Minty, retrieve token, and cache inside git credentials."""
     repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
 
-    if not repository or "/" not in repository:
+    if not repository or repository.count("/") != 1:
         raise RuntimeError(
             f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
         )
@@ -204,16 +213,34 @@ def refresh_git_credentials(
 
     # 2. Query Minty Token Broker with bounded retries
     org_name, repo_name = repository.split("/", 1)
+
+    # In a multi-repo deployment, scope the installation token to all managed
+    # repositories within this organization to avoid pod-wide token slot churn.
+    repositories_to_scope = [repo_name]
+    try:
+        from gitops_workspace import get_managed_github_repos
+
+        for m in get_managed_github_repos():
+            if "/" in m:
+                m_org, m_repo = m.split("/", 1)
+                if (
+                    m_org.lower() == org_name.lower()
+                    and m_repo not in repositories_to_scope
+                ):
+                    repositories_to_scope.append(m_repo)
+    except Exception as e:
+        log(f"WARNING: Could not expand managed repositories for token scoping: {e}")
+
     headers = {"Content-Type": "application/json", "X-OIDC-Token": oidc_token}
     body = {
         "org_name": org_name,
-        "repositories": [repo_name],
+        "repositories": repositories_to_scope,
         "scope": "platform-agent-scope",
     }
     req_data = json.dumps(body).encode("utf-8")
 
     log(
-        f"Requesting scoped installation token from Minty for repository: {org_name}/{repo_name}..."
+        f"Requesting scoped installation token from Minty for organization {org_name} (repositories: {repositories_to_scope})..."
     )
 
     token = None

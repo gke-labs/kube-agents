@@ -392,15 +392,14 @@ upgrading does not publish an endpoint on a cluster that has none — see the
 [module README](../../modules/gke-cluster/README.md) for why that endpoint is
 not covered by master-authorized-networks.
 
-### Google Chat and GitHub integrations
+### Google Chat, Slack, and GitHub integrations
 
 With `enable_google_chat = true` the composition provisions the GCP backend
 (topic, subscription, IAM) **and** enables the CR's `googleChat` integration
 with the created topic/subscription — restrict access with
 `google_chat_allowed_users` (empty = everyone).
 
-Set `github_repo` to wire the agent's GitOps target repository
-(`spec.integration.github.gitRepo`).
+With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
