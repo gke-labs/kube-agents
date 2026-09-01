@@ -21,8 +21,9 @@ with no chat adapters and nothing in the symptom pointed at a Slack file.
 
 So this checks the shim against the thing it actually wraps:
 
-1. the signatures of every upstream callable the two patches replace are still
-   the signatures they were written against;
+1. the signatures and parameter defaults of every upstream callable the two
+   patches replace or reimplement are still the signatures and defaults they
+   were written against;
 2. a plugin-sourced entry registers through the shim exactly as
    ``hermes_cli/plugins.py`` registers one, scope and all, and comes back
    relay-backed and findable;
@@ -34,9 +35,11 @@ So this checks the shim against the thing it actually wraps:
    in the environment, scripts on ``PYTHONPATH`` -- so ``sitecustomize``'s
    import hook is what installs the patch, not this file.
 
-Check 1 is a pin. When it fails, read the upstream method, decide whether the
-shim needs to change, and then update the expectation deliberately -- do not
-refresh it to whatever the new image says.
+Check 1 is a pin covering both callable signatures (`UPSTREAM_SIGNATURES`) and
+critical parameter defaults (`PINNED_DEFAULTS`) on reimplemented methods. When
+either fails, read the upstream method, decide whether the shim needs to change,
+and then update the expectation deliberately -- do not refresh it to whatever
+the new image says.
 
 Checks 1-4 run in a process where ``SLACK_RELAY_URL`` is *unset at startup*,
 because ``sitecustomize.install_hook()`` reads the environment as it is
