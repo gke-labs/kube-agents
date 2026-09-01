@@ -645,10 +645,13 @@ class _TransportError(RuntimeError):
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
 # gone or saturated -- the pod restarted, the tunnel died -- and which clear
-# once it is back. Every other status is an answer about the request itself and
+# once it is back. 429 is the endpoint's own admission control ("Too many
+# concurrent runs"): the request never reached an agent, and the condition
+# clears when a slot frees, which is the same run class as a saturated
+# gateway. Every other status is an answer about the request itself and
 # repeating the request cannot change it, 500 included: a handler that raised
 # will raise again.
-_RETRYABLE_STATUSES = frozenset({502, 503, 504})
+_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
 def _connection_dropped(exc: BaseException) -> bool:
