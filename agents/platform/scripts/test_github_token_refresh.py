@@ -30,6 +30,68 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual("gke-labs/kube-agents", get_current_git_repo())
 
     @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_ssh_over_443(self, run):
+        res = MagicMock()
+        res.stdout = "ssh://git@ssh.github.com:443/gke-labs/kube-agents.git\n"
+        run.return_value = res
+        self.assertEqual("gke-labs/kube-agents", get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_rejects_lookalike_hosts(self, run):
+        res = MagicMock()
+        run.return_value = res
+        for url in (
+            "https://evil.example/github.com/gke-labs/kube-agents.git",
+            "https://github.com.evil.example/gke-labs/kube-agents.git",
+            "https://notgithub.com/gke-labs/kube-agents.git",
+            "git@evil.example:github.com/gke-labs/kube-agents.git",
+            "https://github.com@evil.example/gke-labs/kube-agents.git",
+            "https://evil.example/x.git?github.com",
+            "https://evil.example/x.git#github.com",
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                self.assertIsNone(get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_www_alias(self, run):
+        res = MagicMock()
+        res.stdout = "https://www.github.com/gke-labs/kube-agents.git\n"
+        run.return_value = res
+        self.assertEqual("gke-labs/kube-agents", get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_rejects_non_slug_paths(self, run):
+        res = MagicMock()
+        run.return_value = res
+        for url in (
+            # A deep link, not a clone URL: nothing downstream on the direct
+            # Minty path would reject "kube-agents/tree/main" as a repository.
+            "https://github.com/gke-labs/kube-agents/tree/main",
+            "https://github.com/../../etc/passwd",
+            "https://github.com/%2e%2e/x.git",
+            "https://github.com/gke-labs",
+            "https://github.com/",
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                self.assertIsNone(get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_non_github_remote_returns_none(self, run):
+        res = MagicMock()
+        res.stdout = "https://gitlab.com/gke-labs/kube-agents.git\n"
+        run.return_value = res
+        self.assertIsNone(get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_get_current_git_repo_local_path_returns_none(self, run):
+        res = MagicMock()
+        res.stdout = "/srv/git/kube-agents.git\n"
+        run.return_value = res
+        self.assertIsNone(get_current_git_repo())
+
+    @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_failure_returns_none(self, run):
         run.side_effect = Exception("git not found")
         self.assertIsNone(get_current_git_repo())

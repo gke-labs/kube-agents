@@ -149,6 +149,9 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
+// apps/daemonsets is also read by resolveNetpolProfile to discover the gke-metadata-server
+// DaemonSet port (issue #747 B4) — a second consumer of a grant that already existed for
+// buildMinimalPlatformRole's escalation-prevention requirement.
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
@@ -1581,6 +1584,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agent.Status.NetworkPolicy.DNSClusterIPs = append([]string(nil), netpolProfile.DNSClusterIPs...)
 	agent.Status.NetworkPolicy.DNSClusterIPsSource = netpolProfile.DNSSource
 	agent.Status.NetworkPolicy.MetadataDaemonIP = netpolProfile.MetadataDaemonIP
+	agent.Status.NetworkPolicy.MetadataDaemonPort = netpolProfile.MetadataDaemonPort
 	agent.Status.NetworkPolicy.MetadataDaemonIPSource = netpolProfile.MetadataDaemonSource
 
 	now := metav1.Now()
@@ -1631,6 +1635,9 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 		return false
 	}
 	if status.MetadataDaemonIP != profile.MetadataDaemonIP {
+		return false
+	}
+	if status.MetadataDaemonPort != profile.MetadataDaemonPort {
 		return false
 	}
 	if status.MetadataDaemonIPSource != profile.MetadataDaemonSource {

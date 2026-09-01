@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>kube-agents · evaluation dashboard</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-0:#f7f8f9; --surface-1:#ffffff; --surface-2:#f1f2f0; --line:#e9ebe6; --line-2:#d7d9d2;
+    --text-primary:#151a24; --text-secondary:#3f464d; --text-muted:#8b9296;
+    --accent:#0053e2; --accent-soft:#e8effc; --hl:#ffc220; --hl-soft:#fff4d6;
+    --good:#0ca30c; --good-text:#04720a; --good-bg:#e6f5e6;
+    --crit:#d03b3b; --crit-text:#a01f1f; --crit-bg:#fbe9e9;
+    --warn:#fab219; --warn-text:#7a5200; --warn-bg:#fdf3d7;
+    --ser:#ec835a; --ser-text:#9c3f14; --ser-bg:#fdeee6;
+    --skip-bg:#eef0ee;
+    --shadow:0 1px 2px rgba(21,26,36,.05), 0 8px 24px -12px rgba(21,26,36,.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-0:#0a0a0c; --surface-1:#161618; --surface-2:#212126; --line:#27272a; --line-2:#3a3a42;
+      --text-primary:#fbfaf7; --text-secondary:#c9ced6; --text-muted:#a9afba;
+      --accent:#8b5cf6; --accent-deep:#6e00ff; --accent-soft:#241740; --accent-link:#c4b5fd; --hl:#f59e0b; --hl-soft:#331f05;
+      --good-text:#5fd35f; --good-bg:#14320f; --crit-text:#ef8080; --crit-bg:#3a1515;
+      --warn-text:#fcd34d; --warn-bg:#331f05; --ser-text:#f2a380; --ser-bg:#38200f;
+      --skip-bg:#212126;
+      --shadow:0 1px 2px rgba(0,0,0,.6), 0 10px 30px -12px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-0:#0a0a0c; --surface-1:#161618; --surface-2:#212126; --line:#27272a; --line-2:#3a3a42;
+    --text-primary:#fbfaf7; --text-secondary:#c9ced6; --text-muted:#a9afba;
+    --accent:#8b5cf6; --accent-deep:#6e00ff; --accent-soft:#241740; --accent-link:#c4b5fd; --hl:#f59e0b; --hl-soft:#331f05;
+    --good-text:#5fd35f; --good-bg:#14320f; --crit-text:#ef8080; --crit-bg:#3a1515;
+    --warn-text:#fcd34d; --warn-bg:#331f05; --ser-text:#f2a380; --ser-bg:#38200f;
+    --skip-bg:#212126;
+    --shadow:0 1px 2px rgba(0,0,0,.6), 0 10px 30px -12px rgba(0,0,0,.7);
+  }
+  * { box-sizing:border-box; margin:0; }
+  body.viz-root { background:var(--surface-0); color:var(--text-primary);
+    font:14.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1060px; margin:0 auto; padding:0 28px 80px; }
+  a { color:var(--accent-link,var(--accent)); text-decoration:none; font-weight:600; }
+  b, strong { font-weight:650; }
+  code, .num, .tile .v, .score .val, .cap { font-family:'DM Mono',ui-monospace,SFMono-Regular,Menlo,monospace; }
+  code { font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--text-secondary); }
+
+  .top { position:sticky; top:0; z-index:5; background:var(--surface-1); border-bottom:1px solid var(--line); }
+  .top-in { max-width:1060px; margin:0 auto; padding:13px 28px; display:flex; align-items:center; gap:16px; }
+  .brand { font-size:15px; font-weight:750; letter-spacing:-.01em; display:flex; align-items:center; gap:9px; }
+  .brand .logo { width:22px; height:22px; border-radius:6px; background:var(--accent-deep,var(--accent)); display:inline-flex;
+    align-items:center; justify-content:center; color:#fff; font-size:12px; font-weight:800; }
+  .nav { display:flex; gap:20px; margin-left:16px; }
+  .nav a { color:var(--text-muted); font-size:13px; font-weight:650; padding:4px 0; border-bottom:2px solid transparent; }
+  .nav a.on { color:var(--text-primary); border-bottom-color:var(--accent); }
+  .top .meta { margin-left:auto; font-size:12px; color:var(--text-muted); font-weight:500; }
+  .fresh { font-weight:650; white-space:nowrap; }
+  /* Staleness is announced with a text label (STALE / UNREACHABLE), never
+     with color alone; the amber chrome is reinforcement. */
+  .fresh.stale { background:var(--hl-soft); border:1px solid var(--hl);
+    border-radius:6px; padding:2px 8px; color:var(--text-primary); font-weight:750; }
+
+  .eyebrow { font-size:11.5px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-link,var(--accent)); }
+  h1 { font-size:25px; font-weight:750; letter-spacing:-.02em; margin-top:6px; }
+  .lede { color:var(--text-secondary); font-size:14px; margin-top:6px; max-width:76ch; }
+  h2 { font-size:15px; font-weight:750; letter-spacing:-.01em; margin:40px 0 4px; }
+  .sub { font-size:12.5px; color:var(--text-muted); margin-bottom:12px; }
+
+  /* metric tiles */
+  .tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:24px; }
+  .tile { background:var(--surface-1); border:1px solid var(--line); border-radius:12px;
+    padding:16px 18px 14px; box-shadow:var(--shadow); }
+  .tile .k { font-size:11.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--text-muted); }
+  .tile .v { font-size:28px; font-weight:800; letter-spacing:-.02em; margin-top:6px; font-variant-numeric:tabular-nums;
+    display:flex; align-items:baseline; gap:10px; }
+  .tile .v small { font-size:13px; color:var(--text-muted); font-weight:600; }
+  .delta { font-size:12px; font-weight:750; border-radius:999px; padding:2px 9px; }
+  .delta.up { background:var(--good-bg); color:var(--good-text); }
+  .delta.flat { background:var(--skip-bg); color:var(--text-secondary); }
+  .tile .d2 { font-size:12px; color:var(--text-muted); margin-top:6px; font-weight:550; }
+
+  .card { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); }
+  .pad { padding:18px 20px; }
+
+  /* pills */
+  .pill { display:inline-flex; align-items:center; gap:6px; border-radius:6px; padding:3px 9px;
+    font-size:11px; font-weight:750; letter-spacing:.03em; }
+  .p-pass { background:var(--good-bg); color:var(--good-text); }
+  .p-fail { background:var(--crit-bg); color:var(--crit-text); }
+  .p-infra { background:var(--ser-bg); color:var(--ser-text); }
+  .p-pend { background:var(--skip-bg); color:var(--text-secondary); }
+  .p-fix { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
+
+  /* case table */
+  table { border-collapse:collapse; width:100%; }
+  th { text-align:left; font-size:11px; color:var(--text-muted); text-transform:uppercase;
+    letter-spacing:.06em; font-weight:750; padding:10px 16px; border-bottom:1px solid var(--line); }
+  td { padding:11px 16px; border-bottom:1px solid var(--line); font-size:13.5px; vertical-align:middle; }
+  tbody tr:hover td { background:var(--surface-2); }
+  tr:last-child td { border-bottom:none; }
+  td.num { font-variant-numeric:tabular-nums; font-weight:600; color:var(--text-secondary); text-align:right; }
+  .tname { font-weight:700; }
+  .tnote { font-size:12px; color:var(--text-muted); margin-top:1px; }
+  .tdom { font-size:11px; font-weight:700; color:var(--text-secondary); background:var(--surface-2);
+    border:1px solid var(--line); border-radius:999px; padding:2px 9px; white-space:nowrap; }
+  .hist { display:inline-flex; gap:3px; vertical-align:middle; }
+  .hist i { width:9px; height:9px; border-radius:50%; }
+  .h-pass{background:var(--good);} .h-fail{background:var(--crit);}
+  .h-infra{background:var(--ser);} .h-na{background:var(--skip-bg); border:1.5px solid var(--line-2);}
+
+  /* score bar */
+  .score { display:flex; align-items:center; gap:9px; min-width:150px; }
+  .score .bar { position:relative; flex:1; height:6px; border-radius:6px; background:var(--surface-2); overflow:visible; }
+  .score .fill { position:absolute; inset:0; right:auto; border-radius:6px; background:var(--accent); }
+  .score .thr { position:absolute; top:-3px; width:2px; height:12px; background:var(--line-2); border-radius:2px; }
+  .score .val { font-size:12.5px; font-weight:750; font-variant-numeric:tabular-nums; width:30px; text-align:right; }
+
+  .legend { font-size:12px; font-weight:550; color:var(--text-secondary); margin-top:10px; display:flex; gap:18px; }
+  .legend span { display:inline-flex; gap:6px; align-items:center; }
+  .legend i { width:9px; height:9px; border-radius:50%; }
+
+  .split { display:grid; grid-template-columns:1.1fr .9fr; gap:14px; }
+  .chartcard .t { font-size:14px; font-weight:750; }
+  .chartcard .s { font-size:12px; color:var(--text-muted); margin-top:1px; }
+  .chartcard svg { display:block; width:100%; height:170px; margin-top:10px; }
+  .prog { position:relative; width:100px; height:6px; border-radius:6px; background:var(--surface-2); overflow:hidden; }
+  .prog i { position:absolute; inset:0; right:auto; border-radius:6px; background:var(--accent); }
+  .cap { font-size:11.5px; color:var(--text-muted); font-weight:550; }
+
+  .empty { border:1.5px dashed var(--line-2); border-radius:12px; padding:24px 26px; background:var(--surface-1); }
+  .empty b { font-size:14px; }
+  .empty p { font-size:13px; color:var(--text-secondary); margin-top:6px; max-width:66ch; }
+  .banner { display:inline-flex; gap:8px; align-items:center; background:var(--hl-soft); border:1px solid var(--hl);
+    border-radius:8px; padding:5px 12px; font-size:12px; font-weight:700; color:var(--text-primary); }
+
+  #tip { position:fixed; top:0; left:0; pointer-events:none; background:var(--text-primary);
+    color:var(--surface-1); font-size:12px; font-weight:600; padding:4px 9px; border-radius:7px;
+    opacity:0; transition:opacity .08s; z-index:9; white-space:nowrap; }
+  .foot { margin-top:44px; font-size:12.5px; color:var(--text-muted); max-width:84ch; }
+</style>
+</head>
+<body class="viz-root" data-palette="#8b5cf6">
+<div id="tip"></div>
+
+<div class="top"><div class="top-in">
+  <span class="brand"><span class="logo">ka</span>evals</span>
+  <nav class="nav">
+    <a class="on" href="#suite">Test suite</a><a href="#trends">Trends</a>
+    <a href="#nightly">Evidence</a><a href="#release">Releases</a>
+  </nav>
+  <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
+</div></div>
+
+<div class="wrap"><div id="app">__APP__</div></div>
+
+<script>
+const tip=document.getElementById("tip");
+document.addEventListener("mousemove",e=>{
+  const t=e.target.closest("circle[data-l]");
+  if(t){tip.textContent=t.dataset.l;tip.style.opacity=1;tip.style.transform=`translate(${e.clientX+12}px,${e.clientY-10}px)`;}
+  else tip.style.opacity=0;
+});
+</script>
+
+<script>
+/* Live read side.
+ *
+ * render.py bakes the same data below that it rendered server-side; this
+ * script re-renders #app from it on load, then refetches data.json every
+ * 60 seconds and re-renders in place -- no full page reload, no build step.
+ * It is a deliberate JS mirror of render.py's fragment builders (same
+ * function names, same order); render.py owns the golden tests, this owns
+ * the screen a viewer actually watches. Change them together.
+ *
+ * States:
+ *  - fresh:       "updated HH:MM UTC · Nm ago"
+ *  - stale:       generated_at older than data.json's stale_after_s
+ *                 (default 7200s) -> amber badge labelled STALE
+ *  - unreachable: a poll failed -> amber badge labelled UNREACHABLE, and
+ *                 the last successfully rendered data stays on screen
+ */
+"use strict";
+
+const DASH = {
+  bootstrap: __DATA_JSON__,
+  notes: __NOTES_JSON__,
+  refreshMs: 60000,
+  freshnessTickMs: 30000,
+  staleDefaultS: 7200,
+  judgeThreshold: 0.8,
+  screeningWindow: 20,
+  maxTrendPoints: 10,
+  issueUrl: "https://github.com/gke-labs/kube-agents/issues",
+};
+
+let current = DASH.bootstrap;
+let unreachable = false;
+
+const esc = (value) => String(value)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
+
+const RESULT_PILLS = {
+  pass: '<span class="pill p-pass">PASSED</span>',
+  fail: '<span class="pill p-fail">FAILED</span>',
+  infra: '<span class="pill p-infra">INFRA</span>',
+  pend: '<span class="pill p-pend">IN BUILD</span>',
+};
+const HIST_CLASSES = { pass: "h-pass", fail: "h-fail", infra: "h-infra", na: "h-na" };
+
+/* ---- data.json access (tolerant, mirrors render.py) ---- */
+
+function sortedRuns(data) {
+  const runs = (data.runs || []).filter((r) => r && typeof r === "object");
+  if (runs.length && runs.every((r) => typeof r.started === "string")) {
+    runs.sort((a, b) => (a.started < b.started ? -1 : a.started > b.started ? 1 : 0));
+  }
+  return runs;
+}
+const runTasks = (run) => (run ? (run.tasks || []).filter((t) => t && typeof t === "object") : []);
+// Runs that measured anything: at least one task row. An aborted build
+// parses to zero tasks; anchoring the tiles or the suite table to one
+// would render vacuous 0/0 states. Trends and the header sha stay on
+// sortedRuns. Mirrors render.py's measured_runs.
+const measuredRuns = (data) => sortedRuns(data).filter((r) => runTasks(r).length);
+
+function countedResults(run) {
+  let passed = 0, failed = 0, infra = 0;
+  for (const task of runTasks(run)) {
+    const result = String(task.result || "").toLowerCase();
+    if (result === "pass") passed += 1;
+    else if (result === "fail") failed += 1;
+    else if (result === "infra") infra += 1;
+  }
+  return [passed, failed, infra];
+}
+function passFraction(run) {
+  const [passed, failed] = countedResults(run);
+  return passed + failed ? passed / (passed + failed) : null;
+}
+function medianTaskMinutes(run) {
+  const durations = runTasks(run).map((t) => t.duration_s)
+    .filter((d) => typeof d === "number").sort((a, b) => a - b);
+  if (!durations.length) return null;
+  const mid = Math.floor(durations.length / 2);
+  const median = durations.length % 2 ? durations[mid] : (durations[mid - 1] + durations[mid]) / 2;
+  return median / 60;
+}
+const latestTaskFor = (name, run) => runTasks(run).find((t) => t.name === name) || null;
+
+function parseIso(value) {
+  if (typeof value !== "string") return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
+const utcStamp = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+
+function runLabel(run, index) {
+  if (run.pr !== undefined && run.pr !== null) return `#${run.pr}`;
+  const buildId = String(run.build_id || "");
+  return buildId ? buildId.slice(0, 6) : `run ${index + 1}`;
+}
+
+/* ---- HTML fragments (mirrors render.py) ---- */
+
+function noteHtml(entry) {
+  if (!entry) return "";
+  const parts = [];
+  if (entry.note) parts.push(esc(entry.note));
+  for (const issue of entry.issues || []) {
+    const match = /^#(\d+)$/.exec(String(issue).trim());
+    parts.push(match
+      ? `<a href="${DASH.issueUrl}/${match[1]}">${esc(issue)}</a>`
+      : esc(issue));
+  }
+  return parts.length ? `<div class="tnote">${parts.join(" · ")}</div>` : "";
+}
+
+const deltaChip = (cls, text) => `<span class="delta ${cls}">${esc(text)}</span>`;
+const tile = (key, valueHtml, chipHtml, detail) =>
+  `<div class="tile"><div class="k">${esc(key)}</div>` +
+  `<div class="v">${valueHtml}${chipHtml}</div><div class="d2">${esc(detail)}</div></div>`;
+
+function ratioChip(currentValue, previousValue, unit, havePreviousRun) {
+  // "first run" only when there is genuinely no prior run -- a prior run
+  // that just failed to report this metric gets no chip at all.
+  if (currentValue == null || previousValue == null || !previousValue || !currentValue) {
+    return previousValue == null && !havePreviousRun ? deltaChip("flat", "first run") : "";
+  }
+  if (previousValue / currentValue >= 1.5) {
+    return deltaChip("up", `▲ ${(previousValue / currentValue).toFixed(1)}× cheaper`);
+  }
+  if (currentValue / previousValue >= 1.5) {
+    return deltaChip("flat", `▼ ${(currentValue / previousValue).toFixed(1)}× slower`);
+  }
+  return deltaChip("flat", `≈ prev ${previousValue.toFixed(0)}${unit}`);
+}
+
+function tilesHtml(data) {
+  const runs = measuredRuns(data);
+  const latest = runs[runs.length - 1] || null;
+  const previous = runs.length > 1 ? runs[runs.length - 2] : null;
+  const tiles = [];
+
+  if (latest) {
+    const [passed, failed, infra] = countedResults(latest);
+    // "all passed" must never be claimed by a run that measured nothing.
+    const chip = failed ? deltaChip("flat", `${failed} failed`)
+      : infra ? deltaChip("flat", `${infra} infra`)
+      : passed ? deltaChip("up", "all passed") : "";
+    const buildId = String(latest.build_id || "?");
+    tiles.push(tile("Latest run", `${passed}<small>/ ${passed + failed} passed</small>`, chip,
+      `build ${buildId.slice(0, 8)}… · ${latest.project || "?"}`));
+  } else {
+    tiles.push(tile("Latest run", "—", "",
+      sortedRuns(data).length ? "no measured runs yet" : "no runs on record"));
+  }
+
+  const coverage = data.coverage || {};
+  // Whole numbers only, mirroring render.py's is_count: value_html is raw
+  // (it carries <small>), so anything else must not be interpolated.
+  if (Number.isInteger(coverage.domains_covered) && Number.isInteger(coverage.domains_total)) {
+    const uncovered = (coverage.uncovered || []).map(String);
+    const chip = coverage.domains_covered >= coverage.domains_total
+      ? deltaChip("up", "all covered")
+      : deltaChip("flat", `${coverage.domains_total - coverage.domains_covered} open`);
+    tiles.push(tile("Domain coverage",
+      `${coverage.domains_covered}<small>/ ${coverage.domains_total}</small>`, chip,
+      uncovered.length ? `uncovered: ${uncovered.join(", ")}` : "all domains covered"));
+  } else {
+    tiles.push(tile("Domain coverage", "—", "", "not reported"));
+  }
+
+  const med = medianTaskMinutes(latest);
+  if (med != null) {
+    tiles.push(tile("Median case cost", `${med.toFixed(1)}<small>min</small>`,
+      ratioChip(med, medianTaskMinutes(previous), "min", previous != null),
+      `median across ${runTasks(latest).length} cases · latest run`));
+  } else {
+    tiles.push(tile("Median case cost", "—", "", "no task durations yet"));
+  }
+
+  const duration = latest ? latest.duration_s : null;
+  if (typeof duration === "number") {
+    const prevDuration = previous && typeof previous.duration_s === "number"
+      ? previous.duration_s / 60 : null;
+    const finished = latest ? parseIso(latest.finished) : null;
+    tiles.push(tile("Wall clock", `${(duration / 60).toFixed(0)}<small>min</small>`,
+      ratioChip(duration / 60, prevDuration, "min", previous != null),
+      finished != null ? `finished ${utcStamp(finished)} UTC` : "whole-run wall clock"));
+  } else {
+    tiles.push(tile("Wall clock", "—", "", "not reported"));
+  }
+
+  return tiles.join("");
+}
+
+function scoreHtml(judge) {
+  if (typeof judge !== "number") return '<span class="cap">—</span>';
+  const value = Math.min(Math.max(judge, 0), 1);
+  return `<div class="score"><div class="bar">` +
+    `<div class="fill" style="width:${(value * 100).toFixed(0)}%"></div>` +
+    `<div class="thr" style="left:${(DASH.judgeThreshold * 100).toFixed(0)}%"></div></div>` +
+    `<span class="val">${value.toFixed(1)}</span></div>`;
+}
+
+function caseRow(kase, latestRun) {
+  const name = String(kase.name || "?");
+  const task = latestTaskFor(name, latestRun);
+
+  let status;
+  if (task) {
+    status = String(task.result || "").toLowerCase();
+    if (!["pass", "fail", "infra"].includes(status)) status = "pend";
+  } else {
+    const measured = (kase.last3 || [])
+      .map((h) => String(h).toLowerCase())
+      .filter((h) => ["pass", "fail", "infra"].includes(h));
+    status = measured.length ? measured[measured.length - 1] : "pend";
+  }
+
+  let last3 = (kase.last3 || []).map((h) => String(h).toLowerCase()).slice(-3);
+  last3 = Array(3 - last3.length).fill("na")
+    .concat(last3.map((h) => (h in HIST_CLASSES ? h : "na")));
+  const hist = last3.map((h) => `<i class="${HIST_CLASSES[h]}" title="${h}"></i>`).join("");
+
+  let judge = task ? task.outcome_validity : null;
+  if (judge == null) {
+    const history = (kase.ov_history || []).filter((h) => typeof h.value === "number");
+    judge = history.length ? history[history.length - 1].value : null;
+  }
+
+  let duration = task ? task.duration_s : null;
+  if (typeof duration !== "number") duration = (kase.durations || {}).med;
+  const durationText = typeof duration === "number" ? `${duration.toFixed(0)}s` : "—";
+
+  const domainHtml = kase.domain ? `<span class="tdom">${esc(kase.domain)}</span>` : "";
+
+  return `<tr><td>${RESULT_PILLS[status]}</td>` +
+    `<td><div class="tname">${esc(name)}</div>${noteHtml(DASH.notes[name])}</td>` +
+    `<td>${domainHtml}</td><td><span class="hist">${hist}</span></td>` +
+    `<td>${scoreHtml(judge)}</td><td class="num">${durationText}</td></tr>`;
+}
+
+function suiteHtml(data) {
+  const runs = measuredRuns(data);
+  const latest = runs[runs.length - 1] || null;
+  const rows = (data.cases || []).map((c) => caseRow(c, latest)).join("")
+    || '<tr><td colspan="6"><span class="cap">no cases on record yet</span></td></tr>';
+  return `
+  <h2 id="suite">Test suite</h2>
+  <div class="sub">Latest measured result per case · <b>Result</b> is the gating exact-check verdict · <b>Judge</b> is advisory (threshold tick at ${DASH.judgeThreshold}) · history dots = last 3 runs</div>
+  <div class="card"><table id="cases">
+    <thead><tr><th>Result</th><th>Test case</th><th>Domain</th><th>History</th><th>Judge (advisory)</th><th style="text-align:right">Duration</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>
+  <div class="legend">
+    <span><i class="h-pass"></i>pass</span><span><i class="h-fail"></i>fail</span>
+    <span><i class="h-infra"></i>INFRA — excluded from verdict</span><span><i class="h-na"></i>not in run</span>
+  </div>`;
+}
+
+function chartSvg(points, threshold) {
+  if (points.length < 2) return "";
+  const width = 480, height = 170, px = 14, py = 16, ymax = 1;
+  const xs = (i) => px + (i * (width - 2 * px)) / (points.length - 1);
+  const ys = (v) => height - py - (v / ymax) * (height - 2 * py);
+  const poly = points.map(([, v], i) => `${xs(i).toFixed(1)},${ys(v).toFixed(1)}`).join(" ");
+  const dots = points.map(([label, v], i) =>
+    `<circle cx="${xs(i).toFixed(1)}" cy="${ys(v).toFixed(1)}" r="5" fill="var(--accent)" ` +
+    `stroke="var(--surface-1)" stroke-width="2" data-l="${esc(label)} · ${v.toFixed(2)}"/>`).join("");
+  const xlab = points.map(([label], i) =>
+    `<text x="${xs(i).toFixed(1)}" y="${height - 2}" text-anchor="middle" font-size="10.5" ` +
+    `font-weight="600" fill="var(--text-muted)">${esc(label)}</text>`).join("");
+  const thrLine = threshold != null
+    ? `<line x1="${px}" y1="${ys(threshold).toFixed(1)}" x2="${width - px}" y2="${ys(threshold).toFixed(1)}" ` +
+      `stroke="var(--line-2)" stroke-dasharray="3 4"/>`
+    : "";
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">` +
+    `${thrLine}<line x1="${px}" y1="${ys(0).toFixed(1)}" x2="${width - px}" y2="${ys(0).toFixed(1)}" stroke="var(--line)"/>` +
+    `<polyline points="${poly}" fill="none" stroke="var(--accent)" stroke-width="2.5" ` +
+    `stroke-linejoin="round" stroke-linecap="round"/>${dots}${xlab}</svg>`;
+}
+
+function ratePoints(data) {
+  const points = [];
+  sortedRuns(data).forEach((run, index) => {
+    const fraction = passFraction(run);
+    if (fraction != null) points.push([runLabel(run, index), fraction]);
+  });
+  return points.slice(-DASH.maxTrendPoints);
+}
+
+function judgeTrendCase(data) {
+  const candidates = (data.cases || []).filter((c) => (c.ov_history || []).length >= 2);
+  if (!candidates.length) return null;
+  return candidates.reduce((best, c) =>
+    (c.ov_history.length > best.ov_history.length ? c : best));
+}
+
+function trendsHtml(data) {
+  // No threshold line here: 0.8 is the judge threshold, and drawing it on
+  // the pass-fraction chart would present it as a pass-rate target.
+  const rate = chartSvg(ratePoints(data))
+    || '<div class="cap" style="margin-top:14px">not enough runs yet</div>';
+
+  const labels = {};
+  sortedRuns(data).forEach((run, index) => { labels[String(run.build_id)] = runLabel(run, index); });
+  const judgeCase = judgeTrendCase(data);
+  let judgeTitle = "judge score", judge = "";
+  if (judgeCase) {
+    const points = judgeCase.ov_history
+      .filter((h) => typeof h.value === "number")
+      .map((h) => [labels[String(h.build_id)] || String(h.build_id || "?").slice(0, 6), h.value])
+      .slice(-DASH.maxTrendPoints);
+    judgeTitle = `${judgeCase.name || "?"} · judge score`;
+    judge = chartSvg(points, DASH.judgeThreshold);
+  }
+  judge = judge || '<div class="cap" style="margin-top:14px">no judge history yet</div>';
+
+  return `
+  <h2 id="trends">Trends</h2>
+  <div class="split">
+    <div class="card pad chartcard">
+      <div class="t">Suite pass fraction, per run</div>
+      <div class="s">pass / (pass + fail) — INFRA excluded</div>
+      <div id="ratechart">${rate}</div>
+    </div>
+    <div class="card pad chartcard">
+      <div class="t">${esc(judgeTitle)}</div>
+      <div class="s">advisory · threshold tick at ${DASH.judgeThreshold}</div>
+      <div id="judgechart">${judge}</div>
+    </div>
+  </div>`;
+}
+
+function evidenceRow(kase) {
+  const name = String(kase.name || "?");
+  const have = typeof kase.runs_on_record === "number" ? Math.trunc(kase.runs_on_record) : 0;
+  const width = Math.min(100, (100 * have) / DASH.screeningWindow);
+  const rateText = typeof kase.pass_rate === "number" ? `${Math.round(kase.pass_rate * 100)}%` : "—";
+  const presubmit = kase.active
+    ? '<span class="pill p-pass">IN PRESUBMIT</span>'
+    : '<span class="pill p-fix">NOT IN PRESUBMIT</span>';
+  return `<tr><td style="font-weight:650">${esc(name)}</td>` +
+    `<td><div style="display:flex;align-items:center;gap:10px">` +
+    `<div class="prog"><i style="width:${width.toFixed(0)}%"></i></div>` +
+    `<span class="cap">${have} of ${DASH.screeningWindow}</span></div></td>` +
+    `<td class="num" style="text-align:left">${rateText}</td><td>${presubmit}</td></tr>`;
+}
+
+function evidenceHtml(data) {
+  const cases = [...(data.cases || [])].sort((a, b) =>
+    ((b.runs_on_record || 0) - (a.runs_on_record || 0))
+    || String(a.name || "").localeCompare(String(b.name || "")));
+  const rows = cases.map(evidenceRow).join("")
+    || '<tr><td colspan="4"><span class="cap">no cases on record yet</span></td></tr>';
+  return `
+  <h2 id="nightly">Evidence on record</h2>
+  <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the ${DASH.screeningWindow}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md)</div>
+  <div class="card"><table id="evidence">
+    <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>In presubmit</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+const RELEASES_HTML = `
+  <h2 id="release">Releases</h2>
+  <div class="empty">
+    <span class="banner">⏳ No RC in the gate window</span>
+    <p style="margin-top:12px">When the next RC cuts, the four-gate checklist renders here automatically: E2E matrix · audit-machinery canary on the RC image · eval non-inferiority · operator sign-off.</p>
+  </div>`;
+
+const HERO_LEDE = "Every pull request runs the agent against a real seeded fleet. " +
+  "Exact checks gate; judged scores are recorded, never blocking; infrastructure " +
+  "failures never count against a PR.";
+
+const heroHtml = (data) => `
+  <section style="margin-top:30px">
+    <span class="eyebrow">Agent evaluation · presubmit</span>
+    <h1>Is the agent getting better or worse?</h1>
+    <div class="lede">${HERO_LEDE}</div>
+    <div class="tiles" id="tiles">${tilesHtml(data)}</div>
+  </section>`;
+
+function footHtml(data) {
+  const generated = parseIso(data.generated_at);
+  const runs = (data.runs || []).length;
+  return `<div class="foot" id="foot">Every number on this page is computed from ` +
+    `<code>data.json</code> (source: ${esc(data.source || "?")}, ` +
+    `generated ${generated != null ? utcStamp(generated) + " UTC" : "unknown time"}, ` +
+    `${runs} run${runs !== 1 ? "s" : ""} on record). ` +
+    `Row annotations come from <code>case-notes.yaml</code> and are advisory only.</div>`;
+}
+
+const EMPTY_STATE_HTML = `
+  <section style="margin-top:30px" id="empty-state">
+    <span class="eyebrow">Agent evaluation · presubmit</span>
+    <h1>Is the agent getting better or worse?</h1>
+    <div class="empty" style="margin-top:24px">
+      <span class="banner">⏳ No evaluation data yet</span>
+      <p style="margin-top:12px">No runs are on record in <code>data.json</code>. Once the collector publishes its first run, the header tiles, the per-case suite table, the trend charts and the nightly evidence all render from that file automatically — nothing else feeds this page.</p>
+    </div>
+  </section>`;
+
+function appHtml(data) {
+  if (!((data.runs || []).length || (data.cases || []).length)) return EMPTY_STATE_HTML;
+  return heroHtml(data) + suiteHtml(data) + trendsHtml(data)
+    + evidenceHtml(data) + RELEASES_HTML + footHtml(data);
+}
+
+function metaHtml(data) {
+  const runs = sortedRuns(data);
+  if (!runs.length) return "no runs on record";
+  const sha = String(runs[runs.length - 1].head_sha || "").slice(0, 7);
+  return sha ? `head ${esc(sha)}` : "head unknown";
+}
+
+/* ---- freshness badge and the 60s poll ---- */
+
+function renderFreshness() {
+  const el = document.getElementById("freshness");
+  if (!el) return;
+  const generated = parseIso(current && current.generated_at);
+  const staleAfterMs = 1000 * (current && typeof current.stale_after_s === "number"
+    ? current.stale_after_s : DASH.staleDefaultS);
+  const hhmm = generated != null ? new Date(generated).toISOString().slice(11, 16) : "—";
+  const ageMin = generated != null ? Math.max(0, Math.round((Date.now() - generated) / 60000)) : null;
+  let text = `updated ${hhmm} UTC` + (ageMin != null ? ` · ${ageMin}m ago` : "");
+  let stale = false;
+  if (unreachable) { text = `UNREACHABLE · ${text}`; stale = true; }
+  else if (generated != null && Date.now() - generated > staleAfterMs) {
+    text = `STALE · ${text}`; stale = true;
+  }
+  el.textContent = text;
+  el.className = stale ? "fresh stale" : "fresh";
+}
+
+function renderAll() {
+  document.getElementById("app").innerHTML = appHtml(current || {});
+  document.getElementById("headmeta").innerHTML = metaHtml(current || {});
+  renderFreshness();
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("data.json", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    current = await response.json();
+    unreachable = false;
+    renderAll();
+  } catch (err) {
+    // Keep the last rendered data on screen; only the badge changes.
+    unreachable = true;
+    renderFreshness();
+  }
+}
+
+renderAll();
+if (location.protocol !== "file:") {
+  // A file:// preview of a rendered out-dir cannot fetch; it stays a static
+  // render of the baked data instead of pretending the feed is down.
+  refresh();
+  setInterval(refresh, DASH.refreshMs);
+}
+setInterval(renderFreshness, DASH.freshnessTickMs);
+</script>
+</body>
+</html>

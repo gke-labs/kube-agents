@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -344,8 +345,259 @@ func TestResolveNetpolProfile(t *testing.T) {
 		if profile.MetadataDaemonIP != "" {
 			t.Errorf("got MetadataDaemonIP %q, want empty (suppressed)", profile.MetadataDaemonIP)
 		}
+		if profile.MetadataDaemonPort != 0 {
+			t.Errorf("got MetadataDaemonPort %d, want 0 (suppressed)", profile.MetadataDaemonPort)
+		}
 		if profile.MetadataDaemonSource != netpolSourceSuppressed {
 			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceSuppressed)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		ds := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "gke-metadata-server"},
+			Spec: appsv1.DaemonSetSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "gke-metadata-server",
+								Ports: []corev1.ContainerPort{
+									{Name: "metadata-server", ContainerPort: 988},
+									{Name: "alts", ContainerPort: 987},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ds).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonIP != metadataDaemonIP {
+			t.Errorf("got MetadataDaemonIP %q, want %q", profile.MetadataDaemonIP, metadataDaemonIP)
+		}
+		if profile.MetadataDaemonPort != 988 {
+			t.Errorf("got MetadataDaemonPort %d, want 988", profile.MetadataDaemonPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDiscovered {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDiscovered)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_CustomPort", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		ds := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "gke-metadata-server"},
+			Spec: appsv1.DaemonSetSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "gke-metadata-server",
+								Ports: []corev1.ContainerPort{
+									{Name: "metadata-server", ContainerPort: 1988},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ds).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonPort != 1988 {
+			t.Errorf("got MetadataDaemonPort %d, want 1988", profile.MetadataDaemonPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDiscovered {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDiscovered)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_NoMatchingPortFallsBackToDefault", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		ds := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "gke-metadata-server"},
+			Spec: appsv1.DaemonSetSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "gke-metadata-server",
+								Ports: []corev1.ContainerPort{
+									{Name: "other-port", ContainerPort: 8080},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ds).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonPort != metadataDaemonDefaultPort {
+			t.Errorf("got MetadataDaemonPort %d, want default %d", profile.MetadataDaemonPort, metadataDaemonDefaultPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDefault {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDefault)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_TransientErrorPreservesDiscoveredStatus", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		client := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(metadataDaemonGetFails()).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Status: agentv1alpha1.AgentStatus{
+				NetworkPolicy: agentv1alpha1.NetworkPolicyStatus{
+					MetadataDaemonIP:       metadataDaemonIP,
+					MetadataDaemonPort:     1988,
+					MetadataDaemonIPSource: netpolSourceDiscovered,
+				},
+			},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonPort != 1988 {
+			t.Errorf("got MetadataDaemonPort %d, want the previously discovered 1988", profile.MetadataDaemonPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDiscovered {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDiscovered)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_TransientErrorNoPriorStatusFallsBackToDefault", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		client := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(metadataDaemonGetFails()).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonPort != metadataDaemonDefaultPort {
+			t.Errorf("got MetadataDaemonPort %d, want default %d", profile.MetadataDaemonPort, metadataDaemonDefaultPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDefault {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDefault)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_TransientErrorIgnoresNonDiscoveredStatus", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		client := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(metadataDaemonGetFails()).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Status: agentv1alpha1.AgentStatus{
+				NetworkPolicy: agentv1alpha1.NetworkPolicyStatus{
+					MetadataDaemonIP:       "169.254.169.245",
+					MetadataDaemonPort:     1988,
+					MetadataDaemonIPSource: netpolSourceSpec,
+				},
+			},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonPort != metadataDaemonDefaultPort {
+			t.Errorf("got MetadataDaemonPort %d, want default %d", profile.MetadataDaemonPort, metadataDaemonDefaultPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDefault {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDefault)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_NotFoundFallsBackToDefault", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		client := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonIP != metadataDaemonIP {
+			t.Errorf("got MetadataDaemonIP %q, want default %q", profile.MetadataDaemonIP, metadataDaemonIP)
+		}
+		if profile.MetadataDaemonPort != metadataDaemonDefaultPort {
+			t.Errorf("got MetadataDaemonPort %d, want default %d", profile.MetadataDaemonPort, metadataDaemonDefaultPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceDefault {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceDefault)
+		}
+	})
+
+	t.Run("DiscoveryMetadataDaemon_SpecOverridesDiscovery", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		ds := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "gke-metadata-server"},
+			Spec: appsv1.DaemonSetSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "gke-metadata-server",
+								Ports: []corev1.ContainerPort{
+									{Name: "metadata-server", ContainerPort: 1988},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ds).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+						MetadataDaemon: &agentv1alpha1.MetadataDaemonSpec{
+							Endpoint: "10.0.0.99",
+						},
+					},
+				},
+			},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if profile.MetadataDaemonIP != "10.0.0.99" {
+			t.Errorf("got MetadataDaemonIP %q, want 10.0.0.99", profile.MetadataDaemonIP)
+		}
+		if profile.MetadataDaemonPort != metadataDaemonDefaultPort {
+			t.Errorf("got MetadataDaemonPort %d, want default %d", profile.MetadataDaemonPort, metadataDaemonDefaultPort)
+		}
+		if profile.MetadataDaemonSource != netpolSourceSpec {
+			t.Errorf("got MetadataDaemonSource %q, want %q", profile.MetadataDaemonSource, netpolSourceSpec)
 		}
 	})
 
@@ -633,6 +885,20 @@ func kubeDNSGetFails() interceptor.Funcs {
 	return interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if key.Namespace == "kube-system" && key.Name == "kube-dns" {
+				return apierrors.NewServiceUnavailable("apiserver is shutting down")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+// metadataDaemonGetFails makes the kube-system/gke-metadata-server read return ServiceUnavailable --
+// a transient API error rather than a NotFound, which is the distinction the anti-flap logic
+// branches on.
+func metadataDaemonGetFails() interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Namespace == "kube-system" && key.Name == "gke-metadata-server" {
 				return apierrors.NewServiceUnavailable("apiserver is shutting down")
 			}
 			return c.Get(ctx, key, obj, opts...)

@@ -433,6 +433,27 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
+# 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.
+#
+# Why: Hermes caches tool definitions from `mcp_servers` in `<profile>/cache/mcp_schema_cache.json`
+# so lazy startup can register tools without spawning subprocesses on every turn.
+# However, Hermes keys the cache entry only on `config_fingerprint` (command/args/url),
+# which does not change when an image update modifies the contents of a local script
+# (e.g. platform_mcp_server.py or router_server.py).
+# When an upgraded container image starts over an existing PVC, the stale cached tool list
+# shadows newly added or modified tools indefinitely (Issue #854).
+# Dropping local server entries forces Hermes to re-discover tools on first connect.
+# Remote servers (e.g. developer_knowledge, gke) are preserved to avoid unnecessary
+# network round-trips.
+INVALIDATE_MCP_SCRIPT="/opt/defaults/scripts/invalidate_mcp_cache.py"
+[ -f "$INVALIDATE_MCP_SCRIPT" ] || INVALIDATE_MCP_SCRIPT="$TARGET_DIR/scripts/invalidate_mcp_cache.py"
+if [ -f "$INVALIDATE_MCP_SCRIPT" ]; then
+    PYTHON="python3"
+    [ -x "$INSTALL_DIR/.venv/bin/python3" ] && PYTHON="$INSTALL_DIR/.venv/bin/python3"
+    "$PYTHON" "$INVALIDATE_MCP_SCRIPT" "$TARGET_DIR" \
+        || echo "WARN: could not invalidate local MCP schema caches; upgraded tools may not be discovered" >&2
+fi
+
 # Where the operator mounts its per-profile overlay ConfigMap (the operator's
 # profileOverlayDir), and the script that consumes what it holds. Resolved here rather
 # than at step 2.7, its only consumer, so the two paths sit next to the step 2d comment

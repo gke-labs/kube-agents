@@ -62,7 +62,8 @@ docs/designs/live-test-lease.md.
 Re-testing after new commits folds into this section rather than stacking a round
 beneath it: keep what still holds, and re-run or flag what the new commits invalidated.
 
-Full contract: AGENTS.md, "Pull Request Hygiene".
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
 -->
 
 -
@@ -95,7 +96,8 @@ Re-running the pass folds into this section rather than stacking a round beneath
 it: keep what still holds, re-state what the new commits changed, and drop the
 superseded round rather than a finding's disposition.
 
-Full contract: AGENTS.md, "Pull Request Hygiene".
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
 -->
 
 -

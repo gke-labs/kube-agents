@@ -1,0 +1,123 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platformagent
+  namespace: kubeagents-system
+spec:
+  # Harness configures the core execution environment and framework-level settings.
+  # +optional
+  harness:
+    # ClusterName is the logical name of the cluster where the agent is running.
+    # +required
+    clusterName: "cluster-a"
+    # Location is the geographical location or cloud region.
+    # +required
+    location: "us-central1-a"
+    # ProjectID is the GCP Project ID of the cluster. Required: the credential
+    # proxy only bootstraps a kubectl context when clusterName, location, and
+    # projectId are all present. Omit it and kubectl resolves to localhost:8080.
+    # +required
+    projectId: "example-project"
+    # Hermes configures the internal event-routing or agent framework.
+    # +optional
+    hermes:
+      # DashboardEnabled toggles the PLATFORM_AGENT_DASHBOARD environment variable.
+      # Default: true
+      # +optional
+      dashboardEnabled: true
+      # PluginsDebug toggles the PLATFORM_AGENT_PLUGINS_DEBUG environment variable.
+      # Default: false
+      # +optional
+      pluginsDebug: false
+      # ApiServerSecretRef references a Secret holding API_SERVER_EXTERNAL_KEY, the
+      # credential outside callers present to the credential-proxy sidecar. It does
+      # NOT set API_SERVER_KEY: the value the Hermes API server itself validates is
+      # the non-secret loopback sentinel the operator pins, and pointing this at a
+      # Secret does not replace it.
+      # +optional
+      apiServerSecretRef:
+        name: "platformagent-secrets"
+        key: "api-key"
+  # Deployment abstracts the Kubernetes Pod/Deployment configuration,
+  # decoupling the compute payload from the agent's application logic.
+  # +optional
+  deployment:
+    # Golden fixture: platformagent-tagged.yaml plus a scoped service account
+    # pool, and nothing else. Diff the two expected outputs and the whole of
+    # what spec.security.scopedServiceAccounts renders is visible at once --
+    # which is the property this fixture exists to hold, since the mapping
+    # being readable off a manifest rather than inferred from the broker's
+    # behaviour is the point of putting it in the CR at all.
+    image: "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9"
+    tag: "latest"
+
+    imagePullPolicy: "IfNotPresent"
+  security:
+    serviceAccountName: "kubeagents-platform-agent"
+    # WorkloadIdentity maps external IAM to the KSA securely.
+    # +optional
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com"
+    # One account per cluster. Deliberately out of sorted order, and
+    # deliberately spanning two projects: the rendered ConfigMap must come back
+    # sorted by scope key, and the second project is what shows that
+    # cross-project membership is a list entry rather than a second deployment.
+    scopedServiceAccounts:
+      - projectId: "example-project"
+        location: "us-central1-a"
+        clusterName: "cluster-b"
+        serviceAccountEmail: "ka-cluster-b-7d2f91a0@example-project.iam.gserviceaccount.com"
+      - projectId: "other-project"
+        location: "europe-west1"
+        clusterName: "cluster-a"
+        serviceAccountEmail: "ka-cluster-a-3e8b04c5@other-project.iam.gserviceaccount.com"
+      - projectId: "example-project"
+        location: "us-central1-a"
+        clusterName: "cluster-a"
+        serviceAccountEmail: "ka-cluster-a-1a2b3c4d@example-project.iam.gserviceaccount.com"
+
+  # Integration configures platform-specific external connections.
+  # +optional
+  integration:
+    # GoogleChat configures the Google Chat integration.
+    # +optional
+    googleChat:
+      # Enabled toggles the Google Chat integration.
+      # Default: false
+      # +optional
+      enabled: true
+      # Mode controls output verbosity in Google Chat ("default" or "debug").
+      # Default: "default"
+      # +optional
+      mode: "default"
+      # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
+      # +optional
+      projectId: "kube-agents-gkedemos"
+      # TopicName is the GCP Chat Topic Name. Required if enabled.
+      # +optional
+      topicName: "kubeagents-google-chat-events"
+      # SubscriptionName is the GCP Chat Subscription Name. Required if enabled.
+      # +optional
+      subscriptionName: "kubeagents-google-chat-events-sub"
+    # Slack configures the Slack integration.
+    # +optional
+    slack:
+      # Enabled toggles the Slack integration.
+      # Default: false
+      # +optional
+      enabled: false
+      # BotToken is the Slack bot token (xoxb-...).
+      # +optional
+      botToken: ""
+      # AppToken is the Slack app token for Socket Mode (xapp-...).
+      # +optional
+      appToken: ""
+      # AllowedUsers is a list of allowed member IDs.
+      # +optional
+      allowedUsers: []
+      # HomeChannel is the default channel ID for scheduled messages.
+      # +optional
+      homeChannel: ""
+      # HomeChannelName is the human-readable channel name.
+      # +optional
+      homeChannelName: ""

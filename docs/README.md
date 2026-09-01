@@ -15,8 +15,11 @@ editing any doc.
 ## 1. Directory overview
 
 Dot-directories at the repository root (`.agents/`, `.github/`, `.claude/`)
-hold tooling — review skills, PR templates, agent config — not documentation;
-they are out of the map's scope and `docs-check-map` exempts them.
+hold tooling — review skills, agent rules, PR templates, agent config — not
+documentation; they are out of the map's scope and `docs-check-map` exempts
+them. `.agents/rules/` is the one the canonical-home table in `AGENTS.md`
+points at, so a rule's home is found through that table rather than through
+this map.
 
 This file states **no document counts**, anywhere — not a repository total, not
 a per-directory total, not a per-family total. A count is a number every
@@ -131,6 +134,7 @@ identifier appears, add its source here.
 | Identifier | Source of truth |
 | --- | --- |
 | Service-account names, namespace, permission-set defaults | `k8s-operator/scripts/common.sh` |
+| The installer's `--gvisor` default | `install.sh` |
 | Go toolchain version | `k8s-operator/go.mod` |
 | Minimum supported tool versions (`gcloud`) | `k8s-operator/scripts/min_versions.sh` |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
@@ -149,6 +153,7 @@ identifier appears, add its source here.
 | OTLP endpoint default, discovery candidates, and `otlpEndpointSource` values | `k8s-operator/internal/controller/telemetry.go` |
 | DNS/metadata-daemon defaults, the `dnsClusterIPsSource` / `metadataDaemonIPSource` values, and the `additionalEgress` prefix floors (`/12`, `/48`) | `k8s-operator/internal/controller/netpolprofile.go` and `platformagent_controller.go` |
 | Agent egress-allowlist policy: metadata addresses, the `-sandbox-metadata-deny` name, the `controlPlaneCIDRs` floors (`/16`, `/32`), and the `EgressPolicyRequiresSplitBroker` / `EgressAllowlistRefused` reasons | `k8s-operator/internal/controller/platformagent_egress_policy.go` and `platformagent_controller.go` |
+| Scoped service-account pool: `CREDENTIAL_PROXY_SCOPED_SA_POOL{,_FILE}`, the pool file path, the scope-key spelling, and the `ka-<name>-<hash8>` account ids | `agents/platform/scripts/scoped_sa_pool.py`, `k8s-operator/internal/controller/platformagent_manifests.go`, `terraform/modules/kube-agents-iam/scoped_pool.tf` |
 | Image inventory: every image an install pulls, and its upstream pin | `images.json` |
 | Registry prefix defaults (`REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`) | `k8s-operator/scripts/common.sh` |
 | Provisioning image-tag attachment (`qualify_image_ref`) | `k8s-operator/scripts/common.sh` |
@@ -165,6 +170,8 @@ identifier appears, add its source here.
 | Live-test lease: ConfigMap name, TTL, `vars.sh` keys read, which commands count as mutations | `scripts/live_test_lease.py` |
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
+| Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, and `OWNERS_ALIASES` |
+| Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
 | Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |
@@ -228,7 +235,7 @@ pull request:
 | --- | --- | --- | --- | --- |
 | `README.md` | Project overview | Front door for "The Kubernetes Agentic Harness": Planning Agent + Platform Agent managing GKE via GitOps PRs and ChatOps, with quick-start pointers and an architecture diagram. | Value proposition, components, governance/isolation summary, links to the docs site | Evaluators and adopters; also usable by an agent to start setup |
 | `INSTALL.md` | Install guide | Self-contained, executable installation guide: automated GCP/GKE provisioning, manual Kubernetes deployment, local dev, declarative Terraform+Helm install (pointer to its canonical guide), teardown, troubleshooting. Commands only; explanation lives on the site. | Prerequisites, provisioning stages, integrations, teardown | Written to be runnable end-to-end by a human or an AI agent |
-| `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. States the rules; the commands that carry them out live in `docs/pull-request-workflow.md`. | Doc ownership table, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES; loaded into every session, so `make docs-check-context-budget` caps its size |
+| `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the engineering rules, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. States the rules; the commands that carry them out live in `docs/pull-request-workflow.md` and the mechanics that are prose in `.agents/rules/`. | Doc ownership table, engineering rules, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES; loaded into every session, so `make docs-check-context-budget` caps its size |
 | `CLAUDE.md` | Contributor rules | Imports `AGENTS.md` and points to it for commit authorship and PR attribution guidance. | Points to `AGENTS.md` rules | Claude Code sessions |
 | `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, LLM gateway setup, chat, observability, integrations, validation | Console users and contributors |
 | `admin_console/CONNECTION_SECURITY.md` | Security reference | Security contract for the local console's persisted connection lease. | Stored metadata, filesystem controls, identity binding, revalidation, trust boundary | Console users and security reviewers |
@@ -306,7 +313,7 @@ pull request:
 | `docs/designs/spec-subagent-profiles.md` | Feature design | Subagents as declarative profiles: the `AgentProfile` resource, submission as a bus message rather than an API call, dispatcher-rendered Jobs, four reserved artifact names, the janitor for orphaned tasks, and the kanban retirement inventory with its two named gaps. | `AgentProfile`, dispatcher, artifact names, lifecycle, kanban gap table | Draft for review; not yet implemented |
 | `docs/contributing.md` | Contributor guide | Short entry point: Google CLA and community guidelines, deferring everything else to the site's contributing page and `AGENTS.md`. | CLA, pointers | Human contributors |
 | `docs/credential-isolation-design.md` | Feature design | Design keeping API keys, tokens, and SA credentials out of the agent sandbox container; credentialed operations proxied through an Envoy credential-proxy sidecar. | Pod anatomy, CLI forwarding, guarantee and stated limitation | Canonical design; site `reference/credential-isolation.md` defers here |
-| `docs/pull-request-workflow.md` | Contributor guide | The commands behind `AGENTS.md`'s pull-request rules: the duplicate-work scan, the branch-drift check against `upstream/main`, the local validation checks and the constraint each one exists for, and the `kube-agents-bot` review — how long it takes, how to poll for it, how to reply and resolve. | `gh` and GraphQL recipes, drift `comm` check, prettier/Docker/layer-budget detail, bot timing and failure modes | AI coding agents and human contributors; mechanics only, `AGENTS.md` owns the rules |
+| `docs/pull-request-workflow.md` | Contributor guide | The commands behind `AGENTS.md`'s pull-request rules: the duplicate-work scan, the branch-drift check against `upstream/main`, the local validation checks and the constraint each one exists for, and the `kube-agents-bot` review — how long it takes, how to poll for it, how to reply and resolve. Ends at the merge: the two labels Tide requires, the `OWNERS` approvers behind them, `/hold`, why branch protection reads as though there is no review gate, and which party owes an open pull request its next move. | `gh` and GraphQL recipes, drift `comm` check, prettier/Docker/layer-budget detail, bot timing and failure modes, Tide `lgtm`+`approved`, `OWNERS`, PR ownership rule | AI coding agents and human contributors; mechanics only, `AGENTS.md` owns the rules |
 | `docs/testing-map.md` | Contributor guide | The mechanics behind `AGENTS.md`'s rule for where a test goes: the nine test homes, what runs each, and how far "runs on a pull request" is from "gates a merge" — two paths-filtered workflows that report green having run nothing, a release gate on a three-hourly schedule rather than manual dispatch, and a directory no `PYTHON_TEST_DIRS` glob reaches. | Test-tier routing, `make test-python`/`test-bench`/`verify`, `dorny/paths-filter` green-on-nothing, RC pipeline schedule, test discovery globs | AI coding agents and human contributors; mechanics only, `AGENTS.md` owns the rule |
 | `docs/security-requirements.md` | Requirements | Provider-neutral security configuration model across three dimensions (permission, interaction, authorization), explicitly distinguishing current behavior from planned capabilities. | Permission sets, credential-isolation requirements, attribution requirements | Referenced by the site's security pages; current-vs-planned marked inline |
 | `docs/chatops/microsoft-teams.md` | Integration guide | Deployment, Azure Entra ID / Bot Framework app registration, single-tenant policy lockdown, and Microsoft Teams ChatOps configuration walkthrough. | Microsoft Teams, Bot Framework, Entra ID OAuth, App manifest, Adaptive Cards | Administrators enabling Microsoft Teams ChatOps |
@@ -322,7 +329,7 @@ only what the title does not say.
 | --- | --- | --- | --- | --- |
 | `index.mdx` | Site page | Landing page (hero + cards): the project pitch and entry points. | Chat + Platform agents, components, skills | Everyone |
 | `404.md` | Site page | Custom not-found page linking to key entry points. | Navigation | Site infrastructure |
-| `contributing.md` | Site page | Full contributing guide: CLA, PR hygiene, live validation, the local checks CI enforces, and the automated `kube-agents-bot` review. | CLA, Conventional Commits, `make` checks, automated review | Contributors; `docs/contributing.md` points here |
+| `contributing.md` | Site page | Full contributing guide: CLA, PR hygiene, live validation, the local checks CI enforces, the automated `kube-agents-bot` review, and how Prow merges a change. | CLA, Conventional Commits, `make` checks, automated review, Prow merge | Contributors; `docs/contributing.md` points here |
 | `overview/what-is-kube-agents.md` | Site page | Inventory of the first-party components: what installs where and what runs after the provisioner reconciles. | Operator, agent Deployment, gateway, Minty | New users |
 | `overview/architecture.mdx` | Site page | Component map and the three request flows (chat, cron tick, remediation PR) through one Hermes gateway hosting the two profiles. | Flows, kanban coordination, topology, failure modes | The shipping-architecture page |
 | `overview/proactive-autonomy.md` | Site page | The hands-free loop: cron jobs fire the Platform Agent at governance SOPs; audits, PRs, alerts. | Watchdog loop, safety rails | New users |
@@ -343,7 +350,7 @@ only what the title does not say.
 | `install/uninstall.md` | Site page | Removing the agent, operator, and provisioned GCP resources; agent-only vs full teardown. | Teardown | — |
 | `deploy/index.md` | Site page | Hub for the deploy section: Docker, Kustomize, Minty, release versioning, telemetry, GitOps. | Navigation | — |
 | `deploy/kustomize.md` | Site page | What ships in `deploy/kustomize/` and what the operator lays down on top of it. | Base vs operator-created objects | — |
-| `deploy/release-versioning.md` | Site page | How Release Candidate builds are promoted to immutable SemVer releases across container images, Helm charts, and TF modules. | SemVer promotion, chart appVersion, TF git tag ref pinning | SREs and contributors |
+| `deploy/release-versioning.md` | Site page | Release lifecycle, automated SemVer 2.0 governance, clean promotion, GA release execution, and emergency hotfix runbook. | SemVer calculation, RC validation gate, clean promotion, CLI dispatch, emergency runbook | SREs and maintainers |
 | `deploy/docker-images.md` | Site page | The images shipped from this repo and how tags are managed. | Image list, base pin, registry overrides, CI | — |
 | `deploy/token-minter.md` | Site page | Minty: the in-cluster broker minting short-lived GitHub App installation tokens; no long-lived secret on disk. | Token flow, KMS-held key, setup | Operator-side README: `k8s-operator/config/integrations/github/README.md` |
 | `deploy/telemetry.md` | Site page | Where OTel, Prometheus, and Cloud Logging fit in the shipping deploy, and how to point it at a collector other than the GKE-managed one. | What runs where, OTLP endpoint precedence and discovery, non-GKE clusters | — |

@@ -114,6 +114,40 @@ variable "project_roles" {
   default     = null
 }
 
+variable "scoped_clusters" {
+  description = <<-EOT
+    GKE clusters to provision a scoped reader service account for -- one account
+    per cluster. Empty, the default, provisions no pool and leaves the agent's
+    single identity in place.
+
+    A non-empty list does two things. It provisions the accounts, and it arms
+    the credential broker: the mapping reaches the PlatformAgent CR, and a
+    request naming a cluster that is not in this list is then refused rather
+    than served by a wider credential.
+
+    The default is empty because a pool member holds no IAM grant. The IAM
+    Condition that scoped it grants nothing for Kubernetes object operations
+    (measured 2026-08-12), and un-conditioned the same binding is project-wide
+    container.viewer, so both are gone -- see the kube-agents-iam module's
+    scoped_pool.tf. An armed pool therefore selects a powerless identity for
+    every request and turns every cluster read into a Forbidden. Set this to
+    exercise the selection, refusal and minting path; the authority arrives with
+    per-cluster RBAC.
+
+    Name each cluster by value rather than from module.gke_cluster's outputs,
+    including this composition's own: the accounts would otherwise depend on the
+    cluster existing and Terraform would refuse to plan the IAM until after it
+    was created.
+  EOT
+  type = list(object({
+    project_id   = string
+    location     = string
+    cluster_name = string
+  }))
+  nullable = false
+  default  = []
+}
+
 variable "image_tag" {
   description = "Image tag for both the operator and the platform agent. Required because a checkout's Chart.yaml carries an appVersion placeholder that never matches a published image tag, so the chart's tag defaulting cannot work from a checkout. `latest` is fine for evaluation; set an `X.Y.Z` release tag for production."
   type        = string

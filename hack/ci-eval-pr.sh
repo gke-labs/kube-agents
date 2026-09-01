@@ -188,6 +188,134 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
 
+# ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
+# Re-renders and republishes the eval dashboard at the very end of every
+# MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
+# CONTRACT: the dashboard must never break the job it observes, so every
+# failure mode -- the sibling dashboard PRs not merged yet (no
+# scripts/eval_dashboard/), the IAM grant not applied, a gsutil error, a
+# python crash, a hung upload -- logs exactly ONE
+# "eval-dashboard publish skipped: <reason>" line and never changes the job's
+# exit code.
+#
+# MAIN-BRANCH RUNS ONLY, the baseline store's trust boundary: a presubmit
+# runs branch-authored code, so publishing from one would let any pull
+# request rewrite the dashboard everyone reads -- both through the bucket
+# credential and through collect.py, which reads TASKS and the domain
+# metadata out of THIS checkout. The gate is the baseline recorder's
+# (JOB_TYPE postsubmit/periodic, no PULL_NUMBER), re-derived here because the
+# trap can fire from a set -e death long before that code runs. The gate
+# alone is conventional -- a branch can edit this file -- which is why
+# prerequisite 2 below puts the credential itself out of the presubmit's
+# reach; that split is what makes the boundary structural, exactly as
+# docs/designs/eval-scorer.md#the-two-service-accounts argues for the
+# baseline store.
+#
+# Nothing publishes until BOTH prerequisites exist:
+#   1. the nightly periodic (NEVER the presubmit) exports
+#      EVAL_DASHBOARD_TARGET (gs://kube-agents-dashboards/evals/, a dedicated
+#      bucket in the team's own project) -- an oss-test-infra change;
+#   2. a DEDICATED publisher identity bound to that periodic alone --
+#      eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com via
+#      Workload Identity, the eval-baseline-recorder pattern from
+#      docs/designs/eval-scorer.md#provisioning-it, NEVER the shared
+#      prowjob-default-sa every presubmit also runs as -- holding
+#      roles/storage.objectUser on the kube-agents-dashboards bucket (a grant
+#      in the team's project, not the OSS Prow infra project). Republishing
+#      overwrites the same object paths, so any workable role carries
+#      storage.objects.delete; the boundary is the identity, not the role:
+#      no account a presubmit can run as ever holds a write on this bucket.
+#      The same identity also needs READ on the sweep's source --
+#      roles/storage.objectViewer on gs://kube-agents-prow -- unless that
+#      bucket's existing public read already covers it; without it the first
+#      armed run 403s, which the zero-runs floor below turns into a skip,
+#      never into publishing an empty dashboard over a good one.
+# Until both land this costs one log line per run.
+# scripts/test_eval_dashboard_publish.py runs this function out of this file
+# and asserts the fail-safe AND the main-branch gate hold.
+publish_eval_dashboard() {
+  case "${JOB_TYPE:-}" in
+    postsubmit | periodic) ;;
+    *)
+      echo "eval-dashboard publish skipped: not a main-branch run (JOB_TYPE=${JOB_TYPE:-unset}): a pull request never writes the dashboard"
+      return 0
+      ;;
+  esac
+  if [ -n "${PULL_NUMBER:-}" ]; then
+    echo "eval-dashboard publish skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request never writes the dashboard"
+    return 0
+  fi
+  if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
+    echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
+    return 0
+  fi
+  local dash_src="${SCRIPT_DIR}/../scripts/eval_dashboard"
+  # All three stages, not just the first: the siblings land one file each
+  # (collect.py merged in #1044; render.py and publish.py are still open), and
+  # gating on collect.py alone would run its full GCS sweep only to die at
+  # render.py -- the guard must keep the hook CHEAP while any stage is absent.
+  local dash_stage
+  for dash_stage in collect.py render.py publish.py; do
+    if [ ! -f "${dash_src}/${dash_stage}" ]; then
+      echo "eval-dashboard publish skipped: ${dash_src}/${dash_stage} does not exist (sibling dashboard PRs not merged yet)"
+      return 0
+    fi
+  done
+  local dash_tmp dash_rc=0
+  dash_tmp="$(mktemp -d)" || { echo "eval-dashboard publish skipped: mktemp -d failed"; return 0; }
+  # One timeout over the whole collect -> render -> publish pipeline so a hung
+  # gsutil cannot eat the job's tail. errexit lives inside the child only; out
+  # here any failure becomes the one skip line. The array idiom is the
+  # PROFILE_ROWS one above: no `timeout` binary (a laptop) must degrade to
+  # running unbounded, not to breaking the trap.
+  #
+  # The budget must be LARGER than the 300s collect.py grants each individual
+  # gsutil call, or the one hung call the collector is willing to wait out
+  # kills the whole pipeline instead -- and the sweep is serial over every
+  # archived build (1 + 3N gsutil processes), so it needs real headroom on
+  # top. 900s covers both and only ever taxes the nightly's tail (the gate
+  # above keeps presubmits out entirely); EVAL_DASHBOARD_TIMEOUT overrides it
+  # from the job config without a code change. Bounding the sweep itself
+  # (--since/--limit) is collect.py's follow-up, not this hook's.
+  local dash_budget="${EVAL_DASHBOARD_TIMEOUT:-900}"
+  local dash_timeout=(timeout "${dash_budget}")
+  command -v timeout >/dev/null 2>&1 || dash_timeout=()
+  # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
+  # The zero-runs floor between collect and render is the evidence_store
+  # lesson (StoreUnreachable vs "empty store"): collect.py WARNS and
+  # continues when a gsutil listing fails, so a total source outage -- a 403
+  # before the read grant lands, no gsutil on PATH -- still yields a
+  # well-formed document with runs: [] and exit 0. Publishing that would
+  # overwrite a good dashboard with an empty one and log success; the floor
+  # turns it into the skip line instead.
+  # shellcheck disable=SC2016
+  ${dash_timeout[@]+"${dash_timeout[@]}"} bash -c '
+    set -euo pipefail
+    python3 "$1/collect.py" --pr-glob "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --out "$2/data.json"
+    python3 -c "
+import json, sys
+if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
+    sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
+" "$2/data.json"
+    python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
+    python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
+  ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?
+  if [ "${dash_rc}" -eq 0 ]; then
+    echo "eval-dashboard: published to ${EVAL_DASHBOARD_TARGET}"
+  else
+    echo "eval-dashboard publish skipped: pipeline exited ${dash_rc} (124 means the ${dash_budget}s timeout): $(tail -n 3 "${dash_tmp}/publish.log" 2>/dev/null | tr '\n' ' ')"
+  fi
+  # The full pipeline log rides to Prow on success AND failure: collect.py's
+  # per-build fetch errors are warnings, not failures, and those warnings are
+  # the only after-the-fact evidence that a published dashboard came from a
+  # partial sweep.
+  if [ -n "${ARTIFACTS:-}" ] && [ -d "${ARTIFACTS}" ]; then
+    cp "${dash_tmp}/publish.log" "${ARTIFACTS}/eval-dashboard-publish.log" 2>/dev/null || true
+  fi
+  rm -rf "${dash_tmp}" || true
+  return 0
+}
+
 # Print the profile on every exit — success, gate failure, or a set -e death —
 # then hand the original exit code to the artifact dumper ci-env.sh provides.
 #
@@ -215,6 +343,10 @@ profile_and_dump_on_exit() {
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
+  # Dashboard last, after the artifacts the run itself needs; the exit code
+  # was captured above and publish_eval_dashboard never returns non-zero, so
+  # this cannot change what Prow reports (errexit is already cleared above).
+  publish_eval_dashboard
 }
 trap profile_and_dump_on_exit EXIT
 # A Prow deadline delivers SIGTERM, which does not run the EXIT trap on its
@@ -327,9 +459,12 @@ export TF_VAR_infra_provider="gcp"
 # Every other stack under bench/tf builds its own cluster or reuses the seeded
 # slot-c one; prebuilt/autoops-incident can use neither, because the incident
 # it plants has to be seen by k8s-event-watcher, which runs as a peer process
-# inside the Platform Agent pod and reads events --in-cluster. An incident on
-# any other cluster is never detected, and the case waits out its timeout for
-# a card nobody filed. A stack that does not declare these ignores them.
+# inside the Platform Agent pod. The watcher does fan in over the Cluster Agent
+# profile clusters as well as its own, but a per-run cluster reaches that watch
+# set too late to be watched inside the run -- see the header of
+# bench/tf/prebuilt/autoops-incident/main.tf. An incident there goes
+# undetected and the case waits out its timeout for a card nobody filed. A
+# stack that does not declare these ignores them.
 export TF_VAR_host_cluster_name="${HOST_CLUSTER_NAME}"
 export TF_VAR_host_cluster_location="${REGION}"
 export TF_VAR_agent_namespace="${TARGET_NAMESPACE}"
@@ -517,9 +652,11 @@ TASKS=(
   # machinery canary: compliance-rbac-overgrant, the measured-clean one,
   # which exercises SOP dispatch, delegation, the token minter and the
   # ledger write end to end under the fleet-audits domain. Budget: canary
-  # 606s + six probes and one reliability variation at ~150-350s each +
-  # crashloop 142s + the two incumbents, against the deadline the
-  # 2026-08-26 run blew with full audits.
+  # 606s + the probes and prompt variations at ~150-350s each + crashloop
+  # 142s + the incumbents, against the deadline the 2026-08-26 run blew with
+  # full audits. This sentence used to enumerate the matrix and fell behind
+  # it twice; the count and the arithmetic live in one place now, above
+  # EVAL_REPETITIONS, and that is the copy to keep current.
   #
   # This list is the gate's REPORTING order. Execution order is the
   # fan-out's cost-hinted queue below (longest units first), so a Prow
@@ -531,6 +668,20 @@ TASKS=(
   "./tasks/upgrades-lagging-master-probe/task.yaml"
   "./tasks/consistency-authorized-networks-probe/task.yaml"
   "./tasks/cost-idle-pool-probe/task.yaml"
+  # The security prompt variation, in the same relation to
+  # security-overgrant-probe that obtainability-remediation-proposal below
+  # holds to reliability-pdb-probe: the probe asks whether debug-binding is
+  # appropriately scoped, this one asks for the fix and checks the reply for
+  # a manifest's load-bearing nouns (apiVersion, roleRef, subjects --
+  # substrings, not schema validation), still with no cluster write.
+  # Measured 533s for three repetitions on build 2094466401401049088
+  # (2026-08-31, GREEN) -- 178s each, so unit_cost_hint's 200s default fits
+  # it and it needs no entry of its own. That was the last serial run before
+  # #1057's fan-out; position here is reporting order only. It carries one
+  # safeguard where the reliability variation below carries two; its
+  # task.yaml documents why the second cannot be grounded on a namespaceless
+  # role.
+  "./tasks/security-overgrant-remediation-proposal/task.yaml"
   # The reliability prompt variation that grades what the probe does not
   # ask for: reliability-pdb-probe asks whether checkout-gateway survives a
   # drain; this one asks for a remediation manifest and checks the reply
@@ -738,9 +889,9 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # that is issue #902's lane. The serial measurements kept below predate the
 # fan-out and are its baseline.
 #
-# FOURTEEN tasks at three repetitions is FORTY-TWO devops-bench invocations,
-# where the presubmit's budget was sized for two. This number is no longer an
-# extrapolation from other builds: THIS matrix has now run end to end, at
+# SEVENTEEN tasks at three repetitions is FIFTY-ONE devops-bench invocations,
+# where the presubmit's budget was sized for two. The per-invocation cost is no
+# longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
 # (2026-08-27, GREEN).
 #
@@ -750,26 +901,43 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #       teardown)                                                16.4min
 #
 # So an invocation averages 3.6min, not the 4.7min extrapolated from #956's and
-# #982's builds -- those over-read it. Fourteen tasks x three is 42 invocations
-# and ~168min, or 1.43x against 240m.
+# #982's builds -- those over-read it. Seventeen tasks x three is 51 invocations
+# and ~184min, ~200min once the fixed term is added back, or 1.80x against the
+# 360m deadline.
 #
 # One term in that is still a substitution rather than a measurement:
 # rca-remediation-pr, activated by #998 so that its own smoke run would BE the
 # first measurement, is priced at the fleet average. It is one of the two active
 # tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
-# measured 681s per repetition -- at that cost the total is ~191min and 1.26x.
-# Treat 1.26x as the honest figure and 1.43x as the optimistic one until the
-# first fourteen-task run lands.
+# measured 681s per repetition -- at that cost the total is ~207min of
+# invocations, ~223min with the fixed term, and 1.61x. 1.61x was the honest
+# figure and 1.80x the optimistic one.
 #
-# The budget has been raised twice to get here, both merged: oss-test-infra
-# #2667 took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off
-# a ten-task measurement. 150m would still have been a guaranteed timeout, which
-# is what made #2669 a prerequisite rather than a follow-up.
+# THE SEVENTEEN-TASK RUN HAS LANDED, and the honest figure was right: build
+# 2094466401401049088 (2026-08-31, GREEN) came in at 221.7min whole-job against
+# the 223.2min predicted, 1.5min apart, with the optimistic 200min nowhere near.
+# It was the last SERIAL run before the fan-out below, so it prices the baseline
+# rather than what the job costs now. What it settles is that the 3.6min average
+# and the 16.4min fixed term extrapolate honestly, which is what the four
+# estimates before them did not.
 #
-# It is deliberately NOT being raised a third time here: work to cut the eval's
-# runtime is in flight separately, and if it lands the headroom returns without
-# another pull request against another repository. At 1.26x-1.43x measured there
-# is real room, so 300m stays a follow-up rather than a blocker.
+# Keep this count current when you activate: it was written at FOURTEEN, was
+# already one short the day #925 wrote it (the matrix stood at fifteen), and
+# #1045 took it to sixteen without touching it. Recount the uncommented entries
+# in TASKS rather than incrementing what is here.
+#
+# The budget has been raised three times to get here, all merged: oss-test-infra
+# #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
+# ten-task measurement, and #2676 took it 240m -> 360m on 2026-08-31. 150m would
+# still have been a guaranteed timeout, which is what made #2669 a prerequisite
+# rather than a follow-up.
+#
+# #2676 is why this activation needs no companion raise, and it changes the
+# picture rather than trimming it: at 240m the seventeenth case would have run
+# at 1.07x honest -- not a guaranteed timeout the way 0.89x was, but under half
+# the 2x this job was historically sized at. At 360m it is 1.61x. Note that
+# #2676 moved the number without touching the comment block above it, so the
+# Prow file's own prose still argues from 240m.
 #
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
@@ -780,9 +948,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # canary-cost case ~34min -- divided by however much of EVAL_TASK_PARALLELISM
 # the fan-out below actually realises against the pool's model quota, which the
 # first parallel Prow run will measure. Until it has, budget serially: a case
-# that fits at parallelism 1 cannot be the thing that blows the deadline.
-# Activating a case and raising the budget are one change in two repositories,
-# not a change and a follow-up.
+# that fits at parallelism 1 cannot be the thing that blows the deadline. At
+# 360m and seventeen tasks that leaves ~137-160min of serial headroom, which is
+# real room again -- exactly when this stops being watched, so recount before
+# you trust it. Activating a case and raising the budget are one change in two
+# repositories, not a change and a follow-up.
 #
 # The variance that was flagged as the thing to watch has resolved in the good
 # direction: consistency-authorized-networks-probe took 1039s on the one earlier

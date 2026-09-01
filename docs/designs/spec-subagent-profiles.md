@@ -292,6 +292,16 @@ draws today (`platformagent_manifests.go:1348-1371`).
 Artifact names are data, so the set can grow without touching the envelope or the payload
 spec. These four are reserved so that renderers and the audit tooling can rely on them.
 
+Deviation, recorded 8/31: the worker adapter as first built (ahead of its stage 3
+slot, for the gateway's session workers) produces `progress` from the model's own
+narration, not from an explicit tool. It maps the harness's assistant text blocks to
+`progress` chunks (thinking deltas to `thinking`, tool calls to `activity`), so the
+milestones are whatever the model chose to say out loud, at the model's cadence. The
+rendering path is unaffected - the gateway's rolling line consumes them the same way -
+but "agent-authored milestones" overstates what rides the artifact today. What closes
+it: the adapter exposing the progress tool (the demo used an in-process MCP server for
+this) and mapping only its calls to `progress` - the rest of the stage 3 adapter work.
+
 **Input flows the other way on the same subjects.** A worker that needs a human lands on
 `input-required` with a message saying what it needs - the `needs_input` escalation, now a
 first-class task state. The requester (or the gateway, relaying a human) publishes a

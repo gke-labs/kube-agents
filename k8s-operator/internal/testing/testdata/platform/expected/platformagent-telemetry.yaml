@@ -769,6 +769,8 @@ spec:
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
+              value: "0"
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY

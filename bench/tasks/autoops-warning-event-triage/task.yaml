@@ -5,12 +5,16 @@
 #
 # The scenario brings its own incident. bench/tf/prebuilt/autoops-incident
 # plants one OOM-killed Deployment in one namespace on the cluster the Platform
-# Agent pod runs in -- the only cluster k8s-event-watcher sees -- and does not
-# return until the watcher has logged that it opened an incident for it. By the
-# time the prompt below runs, the card exists and is being worked. The stack
-# reads no seeded fleet and shares no planted defect with any other case:
-# cluster-agent-crashloop-debug owns the fleet's payments-api crashloop, and two
-# cases pointed at one pod share its dedup entry and its failures.
+# Agent pod runs in, and does not return until the watcher has logged that it
+# opened an incident for it. That cluster, and not a per-run one, because it is
+# the only cluster k8s-event-watcher is guaranteed to be watching while the
+# case runs -- the watcher does fan in over the Cluster Agent profile clusters
+# as well, but a per-run cluster is in neither set, for the timing reasons that
+# stack's header gives. By the time the prompt below runs, the card exists and
+# is being worked. The stack reads no seeded fleet and shares no planted defect
+# with any other case: cluster-agent-crashloop-debug owns the fleet's
+# payments-api crashloop, and two cases pointed at one pod share its dedup
+# entry and its failures.
 #
 # This is the one presubmit case that mutates, which is why it is
 # namespace-scoped rather than read-only: the namespace is created by the

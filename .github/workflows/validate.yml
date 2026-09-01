@@ -134,8 +134,14 @@ jobs:
           # what lets callers write `{{- with (include ...) }}`. hermes is not in
           # this list: it carries a mandatory apiServerSecretRef and so always
           # renders — only the optional fields inside it are compacted.
+          # availability needs runtimeClassName emptied to qualify: it defaults
+          # to "gvisor", so the block is not all-unset by default. Setting it
+          # back to "" is also the documented way to run on the standard
+          # container runtime, so this doubles as the check that opting out
+          # removes the field rather than rendering an empty one.
           if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --show-only templates/platform-agent-cr.yaml \
+            --set platformAgent.deployment.availability.runtimeClassName="" \
             | grep -qE "^\s+(memory|availability):"; then
             echo "an all-unset parent block still rendered" >&2
             exit 1

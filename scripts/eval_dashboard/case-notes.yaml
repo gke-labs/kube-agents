@@ -1,0 +1,24 @@
+# Optional one-line annotations for the eval dashboard, keyed by case name.
+#
+# Everything measurable on the dashboard comes from data.json; this file is
+# the one place for the sentence a number cannot carry -- why a case was
+# redesigned, which issue tracks a known failure. render.py tolerates an
+# absent file and a case with no entry (both simply mean "no note"), so
+# deleting a stale line can never break a render.
+#
+# Entry shape (all keys optional):
+#
+#   notes:
+#     <case-name>:
+#       note: one-line human context, shown under the case name
+#       issues: ["#123", "#456"]   # rendered as links to this repo's issues
+
+notes:
+  agent-kanban-smoke:
+    note: redesigned 08-27
+  capacity-pinned-pool-probe:
+    issues: ["#1010"]
+  compliance-rbac-overgrant:
+    issues: ["#998", "#985"]
+  gpu-stress-test-diagnosis:
+    note: reuse regression under investigation

@@ -124,7 +124,8 @@ instead. In order of preference:
   Neither of those trailing instructions is padding — step 5 explains what each one carries.
 
 If none of those is available to you, **you are blocked, and the pull request waits**. Say what you
-are blocked on. `AGENTS.md` is explicit that an approval you could not get blocks this step rather
+are blocked on. [`.agents/rules/pre_pr_review.md`](../../rules/pre_pr_review.md) is explicit that
+an approval you could not get blocks this step rather
 than waiving it, so the authoring context is not the fallback — running the pass there and
 disclosing it is what you do when a human, told the above, tells you to proceed anyway. Then
 **Self-Review** says which context ran the pass, in those words.
@@ -181,7 +182,8 @@ request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not
 finding as CONFIRMED to make one column of it; the pass did not do the verification that word
 claims.
 
-Every survivor gets a disposition either way, to the bar `AGENTS.md` sets: fixed, or deliberately
+Every survivor gets a disposition either way, to the bar
+[`.agents/rules/pre_pr_review.md`](../../rules/pre_pr_review.md) sets: fixed, or deliberately
 not, with a reason that argues about this change.
 
 Report what a pass only suspects rather than acting on it. A finding it could not pin down is an

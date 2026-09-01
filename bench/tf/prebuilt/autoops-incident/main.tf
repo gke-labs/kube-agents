@@ -17,10 +17,26 @@
 # Every other prebuilt stack here builds a cluster and plants something on it.
 # This one builds nothing. The incident has to happen on the cluster the
 # Platform Agent pod is running on, because that is the only cluster
-# k8s-event-watcher sees: it is a peer process inside that pod's
-# envoy-credential-proxy container, started by deploy/shared/start-services.sh
-# with --in-cluster. An incident planted on a per-run task cluster is never
-# detected and the case waits out its timeout for a card nobody filed.
+# k8s-event-watcher is guaranteed to be watching while the case runs.
+#
+# It is not a single-cluster watcher. It runs as a peer process inside that
+# pod's envoy-credential-proxy container, started by
+# deploy/shared/start-services.sh with BOTH --in-cluster and --profiles-dir,
+# and those sources are additive: the host cluster, plus every Cluster Agent
+# profile on the PVC naming a cluster the direct entry does not already cover
+# (#497; see the README of k8s-operator/cmd/k8s-event-watcher, Section 4,
+# "Option C: Multi-Cluster Fan-In").
+#
+# What makes the host cluster the only usable target here is timing, twice
+# over. A per-run task cluster gets a Cluster Agent profile only from the
+# hourly cluster-agent-reconcile tick (agents/chat/defaults/cron/jobs.json),
+# and the watcher reads that directory once, at startup, so a profile written
+# mid-run is picked up only from the watcher process's next start -- a pod
+# restart, or a crash the start-services.sh supervisor loop restarts it from.
+# An incident on a per-run task cluster therefore goes undetected unless both
+# of those land inside the run, which is a race rather than a design, and one
+# the case loses on almost every run while waiting out its timeout for a card
+# nobody filed.
 #
 # So this stack takes the host cluster as an input, applies one Deployment into
 # one namespace on it, waits until the pipeline has demonstrably started, and
@@ -129,10 +145,12 @@ resource "null_resource" "incident" {
       # documents the same mechanism, which is why it pins the agent connection
       # with --context.
       #
-      # An incident planted on the wrong cluster is never seen: k8s-event-watcher
-      # runs in-cluster inside the Platform Agent pod and watches only the cluster
-      # it is in. The old form of this step asserted the context instead of
-      # setting it, which would have failed the apply on every presubmit run.
+      # An incident planted on the wrong cluster is never seen inside the run:
+      # the watcher fans in over the host cluster plus the Cluster Agent
+      # profiles present when it started, and a per-run task cluster is in
+      # neither set -- see the header of this file for why. The old form of
+      # this step asserted the context instead of setting it, which would have
+      # failed the apply on every presubmit run.
       #
       # A plain get-credentials is the right call and needs no DNS-endpoint
       # handling: it is exactly what hack/ci-eval-pr.sh does for this same
@@ -248,6 +266,13 @@ resource "null_resource" "incident" {
       # --since-time, not --since: the namespace name is static, so a wall-clock
       # window would also match the `fire` line from an earlier run against a
       # recycled Boskos lease and return before this run's incident exists.
+      #
+      # The fire line carries no cluster (k8s-event-watcher/main.go), and the
+      # watcher fans in over several, so in principle this matches a pod of
+      # that name on any watched cluster. Nothing reaches it today: only this
+      # stack plants ${local.ns}, the destroy removes it, and the task loop is
+      # sequential. A leftover namespace from a failed teardown on another
+      # watched cluster, or the concurrency of #637, would.
       elapsed=0
       until kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \

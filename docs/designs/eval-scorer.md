@@ -1042,13 +1042,17 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
 ## Open items
 
-- **The presubmit's timeout — at `240m`, held there on purpose, and the thinnest number here.**
+- **The presubmit's timeout — at `360m`, and no longer the thinnest number here.**
   `85m` was sized when the job made two `devops-bench` invocations and averaged ~43min.
   [oss-test-infra#2667](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2667) took it to
-  `150m` off an estimate and
+  `150m` off an estimate,
   [oss-test-infra#2669](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2669) took it to
-  `240m` off a ten-task measurement; both have merged and the Prow `job-config` has rolled, which is
-  what unblocked this pull request.
+  `240m` off a ten-task measurement, and
+  [oss-test-infra#2676](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2676) took it to
+  `360m` on 2026-08-31; all three have merged and the Prow `job-config` has rolled. The first two are
+  what unblocked this pull request. At seventeen tasks the job runs at 1.61× honest, so the headroom
+  that made this the tightest constraint on the page has come back — which is precisely when it stops
+  being watched, and the recount warning below is there for that reason.
 
   **This is no longer an extrapolation.** The matrix has run end to end at thirteen tasks × three
   repetitions, GREEN, on build `2093054834931404800` (2026-08-27):
@@ -1062,13 +1066,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   An invocation therefore averages **3.6min**, not the 4.7min extrapolated from #956's and #982's
   builds — those over-read it, which is why every estimate before this one was pessimistic:
 
-  | reps | invocations | expected   | 150m  | 240m      |
-  | ---- | ----------- | ---------- | ----- | --------- |
-  | 1    | 14          | 67min      | 2.24× | 3.58×     |
-  | 3    | 42          | **168min** | 0.89× | **1.43×** |
+  | reps | invocations | expected   | 150m  | 240m      | 360m      |
+  | ---- | ----------- | ---------- | ----- | --------- | --------- |
+  | 1    | 17          | 61min      | 2.45× | 3.93×     | 5.90×     |
+  | 3    | 51          | **184min** | 0.82× | **1.30×** | **1.96×** |
 
   `150m` would still have been a guaranteed timeout, which is what made #2669 a prerequisite rather
-  than a follow-up.
+  than a follow-up. The rows count the matrix at seventeen active tasks; recount the uncommented
+  entries in `TASKS` rather than trusting the number here, which has fallen behind the matrix three
+  times.
 
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
@@ -1079,12 +1085,21 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   to model 429s, parallelism 2 in 2512s with one. The serial figures in this section are the
   fan-out's baseline; the first parallel Prow run replaces them.
 
-  **One term in that is still a substitution rather than a measurement, and 1.26× is the honest
+  **One term in that is still a substitution rather than a measurement, and 1.61× is the honest
   figure.** #998 activated `rca-remediation-pr` precisely so its own smoke run would be the first
   measurement of it, so the table prices it at the fleet average. It is one of the two active tasks
   that **write**, so `compliance-rbac-overgrant` is the better comparable at a measured 681s per
-  repetition — at that cost the total is ~191min and **1.26×**. Read 1.43× as the optimistic bound
-  and 1.26× as the working number until the first fourteen-task run lands.
+  repetition — at that cost the invocations total ~207min, or ~223min once the 16.4min fixed term is
+  added back, and **1.61×** against `360m`. 1.80× was the optimistic bound and 1.61× the working
+  number. Both are counted on the whole job; the table's ratios leave the fixed term out, which is
+  why they read higher.
+
+  **The seventeen-task run has since landed and the honest figure was the right one to lead with.**
+  Build `2094466401401049088` (2026-08-31, GREEN) took **221.7min** whole-job against the predicted
+  223.2min — 1.5min apart, with the optimistic 200min a long way off. That was the last serial run
+  before the fan-out, so it prices the baseline rather than what the job costs now; what it settles
+  is that the 3.6min average and the 16.4min fixed term extrapolate honestly across a growing
+  matrix, which is what four earlier estimates failed to do.
 
   **The variance that was flagged as the thing to watch has resolved in the good direction.**
   `consistency-authorized-networks-probe` took 1039s on the one earlier run that existed, against
@@ -1093,10 +1108,17 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `compliance-rbac-overgrant` at 2042s for three repetitions, 24% of the whole task budget on its
   own.
 
-  **It is not being raised a third time, and that is a decision rather than an oversight.** The
-  fan-out above is the runtime cut that was awaited: if it realises even half its parallelism in a
-  pool project, the serial 1.26×–1.43× drops below 1× and the headroom returns without another pull
-  request against another repository. `300m` stays a follow-up rather than a blocker.
+  **The third raise landed on 2026-08-31:**
+  [`oss-test-infra#2676`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2676) took the
+  deadline `240m` → `360m`, keeping three repetitions. It is why the seventeenth activation needed no
+  companion change of its own. At `240m` that case would have run at 1.07× honest — thin rather than
+  broken, since 0.89× was a guaranteed timeout and 1.07× is not, but under half the 2× this job was
+  historically sized at. At `360m` it is 1.61×, and twenty tasks would still be 1.41×. One caveat for
+  anyone reading the Prow file: #2676 moved the number without touching the comment block above it,
+  so that prose still argues from `240m`. The raise and the fan-out above are redundant on purpose
+  rather than by accident: the raise is measured against serial arithmetic that still holds if the
+  fan-out realises no parallelism at all against a pool project's model quota. `300m`, which this
+  section previously carried as the next raise to ask for, is moot: the deadline is above it.
 
   The recurring failure is structural rather than arithmetical, and worth naming: **the budget lives
   in another repository**, so activating a case here spends headroom that only a separate pull
@@ -1106,8 +1128,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `hack/ci-eval-pr.sh` says so where someone about to uncomment a line will read it.
 
   **Retry-on-failure — one repetition, two more only if the first fails — is the obvious way to buy
-  that runtime back, and it is deliberately not taken.** On a green run it would cost 14
-  invocations instead of 42 and land the job near 67min, which is real money. It is declined
+  that runtime back, and it is deliberately not taken.** On a green run it would cost 17
+  invocations instead of 51 and land the job near 61min, which is real money. It is declined
   because it is not verdict-identical to three unconditional repetitions, in four ways, and the
   cheap version of a gate that quietly grades differently is worse than an expensive one:
 

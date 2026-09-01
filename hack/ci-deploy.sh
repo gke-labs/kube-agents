@@ -262,6 +262,16 @@ echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 # Webhooks stay at the chart's default (off): a PR evaluation cluster carries
 # no cert-manager, and admission-webhook coverage belongs to the operator's
 # own test suite rather than this smoke pipeline.
+#
+# runtimeClassName is pinned empty rather than left at the chart's default,
+# which is `gvisor`. Step 7 reaches the agent over `kubectl port-forward`, and
+# that does not work against a sandboxed pod -- the forward is set up in the
+# host-side CNI netns while the listener lives in the sandbox's own network
+# stack, so the connection is refused (scripts/exec_tunnel.py is canonical on
+# this). On a pool cluster with no `gvisor` RuntimeClass the pod would not
+# schedule at all. Either way this job wants the standard runtime; what the
+# sandbox does to the agent is the release pipeline's to exercise, not a smoke
+# test's.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ==="
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
@@ -282,6 +292,7 @@ helm upgrade --install kube-agents ./charts/kube-agents \
   --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
   --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
   --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+  --set "platformAgent.deployment.availability.runtimeClassName=" \
   --wait --timeout 15m
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 

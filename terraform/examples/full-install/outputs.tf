@@ -64,3 +64,8 @@ output "github_minter_kms_key" {
   description = "KMS signing key to import the GitHub App PEM into (null when the minter is disabled)"
   value       = try(module.github_minter[0].kms_key, null)
 }
+
+output "scoped_service_accounts" {
+  description = "Map from GKE resource name to the service account for that cluster. The key is what the credential broker matches on, so the two are directly comparable. The accounts hold no IAM grant as of 2026-08-12; see scoped_pool.tf."
+  value       = module.kube_agents_iam.scoped_service_accounts
+}

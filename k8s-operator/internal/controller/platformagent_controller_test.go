@@ -68,6 +68,7 @@ func defaultTestNetpolProfile() netpolProfile {
 		DNSClusterIPs:        []string{defaultDNSClusterIP},
 		DNSSource:            netpolSourceDefault,
 		MetadataDaemonIP:     metadataDaemonIP,
+		MetadataDaemonPort:   metadataDaemonDefaultPort,
 		MetadataDaemonSource: netpolSourceDefault,
 	}
 }
@@ -1339,6 +1340,34 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 	// from whatever the code emits.
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
 	wantPorts := []int32{80, 988}
+	if !reflect.DeepEqual(gotPorts, wantPorts) {
+		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	}
+}
+
+func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	profile := defaultTestNetpolProfile()
+	profile.MetadataDaemonPort = 1988
+
+	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+
+	got1988 := egressCIDRsForPort(netpol, 1988)
+	want1988 := []string{
+		"169.254.169.252/32",
+		"169.254.169.254/32",
+	}
+	if !reflect.DeepEqual(got1988, want1988) {
+		t.Errorf("expected custom metadata daemon peers %v, got %v", want1988, got1988)
+	}
+
+	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
+	wantPorts := []int32{80, 1988}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
@@ -3857,6 +3886,9 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 	}
 	if agent.Status.NetworkPolicy.MetadataDaemonIP != "169.254.169.245" {
 		t.Errorf("got MetadataDaemonIP %q, want 169.254.169.245", agent.Status.NetworkPolicy.MetadataDaemonIP)
+	}
+	if agent.Status.NetworkPolicy.MetadataDaemonPort != metadataDaemonDefaultPort {
+		t.Errorf("got MetadataDaemonPort %d, want %d", agent.Status.NetworkPolicy.MetadataDaemonPort, metadataDaemonDefaultPort)
 	}
 	if agent.Status.NetworkPolicy.MetadataDaemonIPSource != "Spec" {
 		t.Errorf("got MetadataDaemonIPSource %q, want Spec", agent.Status.NetworkPolicy.MetadataDaemonIPSource)

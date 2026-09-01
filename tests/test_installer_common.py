@@ -381,12 +381,75 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_gvisor_node_pool    = true", dest.read_text())
 
-    def test_tfvars_without_gvisor_sets_neither(self):
+    def test_tfvars_leaves_the_agent_unsandboxed_when_gvisor_is_unset(self):
+        # install.sh owns the default-on policy and always writes the result to
+        # vars.sh before calling this, so an unset ENABLE_GVISOR here is not a
+        # fresh install -- it is a caller reading an install that already
+        # exists, and such an install is not sandboxed. Deciding otherwise
+        # would make the generator disagree with the running cluster.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_gvisor_node_pool    = false", content)
+            self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_tfvars_unset_gvisor_skips_the_autopilot_floor(self):
+        # uninstall.sh treats vars.sh as optional -- the documented
+        # `curl ... | bash` teardown runs from a fresh clone that has none --
+        # and calls this bare under `set -e` before lifecycle.sh destroy. If an
+        # unset ENABLE_GVISOR defaulted on, the floor check would abort the
+        # teardown of an old Autopilot cluster and leave the install with no
+        # working way to remove itself.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k"},
+            describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("1.27.4-gke.800", proc.stderr)
+
+    def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
+        # The abort's remedy has to work for whoever hit it. --gvisor=false is
+        # install.sh's; upgrade.sh rejects that flag and reads vars.sh instead,
+        # so naming only the flag sends its callers to a dead end.
+        proc = self._run(
+            # _PRINT_STUBS swallows print_info, and the way out is printed
+            # there rather than beside the error.
+            'print_info() { echo "INFO: $*" >&2; }; '
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "true"},
+            describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("--gvisor=false", proc.stderr)
+        self.assertIn("vars.sh", proc.stderr)
+
+    def test_tfvars_gvisor_off_clears_the_floor_on_a_sub_floor_autopilot(self):
+        # The composition uninstall.sh relies on: an explicit false must skip
+        # the floor check, not merely the tfvars values. The unset case above
+        # only covers a teardown from a fresh clone with no vars.sh; the
+        # ordinary teardown sources one saying "true" and uninstall.sh exports
+        # false over it, which is this row.
+        proc = self._run(
+            'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
+            env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "false"},
+            describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("1.27.4-gke.800", proc.stderr)
+
+    def test_tfvars_with_gvisor_off_sets_neither(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ENABLE_GVISOR": "false"},
                 describe_stub="printf '\\n'; exit 0",
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)

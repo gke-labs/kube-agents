@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +44,14 @@ const (
 	// defaultDNSClusterIP is the standard fallback DNS VIP when kube-dns cannot be discovered.
 	defaultDNSClusterIP = "10.96.0.10"
 
+	// metadataDaemonNamespace and metadataDaemonDaemonSet locate the GKE metadata daemon
+	// DaemonSet whose declared container port is discovery's only reliable signal — see
+	// discoverMetadataDaemonPort's doc comment for why the IP itself isn't read from it.
+	metadataDaemonNamespace   = "kube-system"
+	metadataDaemonDaemonSet   = "gke-metadata-server"
+	metadataDaemonPortName    = "metadata-server"
+	metadataDaemonDefaultPort int32 = 988
+
 	// Source constants reporting how the network policy values were chosen.
 	netpolSourceSpec        = "Spec"
 	netpolSourceAnnotation  = "Annotation"
@@ -58,6 +67,7 @@ type netpolProfile struct {
 	DNSClusterIPs        []string
 	DNSSource            string
 	MetadataDaemonIP     string // "" == suppress rule 3
+	MetadataDaemonPort   int32
 	MetadataDaemonSource string
 	AdditionalEgress     []networkingv1.NetworkPolicyEgressRule
 }
@@ -160,6 +170,7 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 	if ip := trimmedAnnotation(agent, AnnotationMetadataDaemonIP); ip != "" {
 		if net.ParseIP(ip) != nil {
 			p.MetadataDaemonIP = ip
+			p.MetadataDaemonPort = metadataDaemonDefaultPort
 			p.MetadataDaemonSource = netpolSourceAnnotation
 		} else {
 			log.Info("Ignoring invalid annotation IP", "annotation", AnnotationMetadataDaemonIP, "value", ip)
@@ -172,9 +183,11 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 		if ep == "" {
 			// Explicit empty string suppresses rule 3 entirely
 			p.MetadataDaemonIP = ""
+			p.MetadataDaemonPort = 0
 			p.MetadataDaemonSource = netpolSourceSuppressed
 		} else if net.ParseIP(ep) != nil {
 			p.MetadataDaemonIP = ep
+			p.MetadataDaemonPort = metadataDaemonDefaultPort
 			p.MetadataDaemonSource = netpolSourceSpec
 		} else {
 			log.Info("Ignoring invalid IP in spec.networkPolicy.metadataDaemon.endpoint", "value", ep)
@@ -185,15 +198,45 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 	if p.MetadataDaemonSource == "" && r.MetadataDaemonIPOverride != "" {
 		if net.ParseIP(r.MetadataDaemonIPOverride) != nil {
 			p.MetadataDaemonIP = r.MetadataDaemonIPOverride
+			p.MetadataDaemonPort = metadataDaemonDefaultPort
 			p.MetadataDaemonSource = netpolSourceOperatorEnv
 		} else {
 			log.Info("Ignoring invalid operator override IP", "flag", "kubernetes-metadata-daemon-ip", "value", r.MetadataDaemonIPOverride)
 		}
 	}
 
-	// 4. Default fallback
+	// 4. In-cluster discovery from kube-system/gke-metadata-server DaemonSet
+	if p.MetadataDaemonSource == "" {
+		port, err := r.discoverMetadataDaemonPort(ctx)
+		switch {
+		case err == nil && port > 0:
+			if port != metadataDaemonDefaultPort {
+				log.Info("Discovered non-default metadata daemon container port from DaemonSet",
+					"daemonset", metadataDaemonDaemonSet,
+					"namespace", metadataDaemonNamespace,
+					"port", port,
+					"default", metadataDaemonDefaultPort)
+			}
+			p.MetadataDaemonIP = metadataDaemonIP
+			p.MetadataDaemonPort = port
+			p.MetadataDaemonSource = netpolSourceDiscovered
+		case err != nil && !apierrors.IsNotFound(err):
+			log.Info("Failed to discover gke-metadata-server DaemonSet", "error", err)
+			// Anti-flap on transient error (timeout/forbidden): preserve last discovered port from status
+			if agent != nil &&
+				agent.Status.NetworkPolicy.MetadataDaemonIPSource == netpolSourceDiscovered &&
+				agent.Status.NetworkPolicy.MetadataDaemonPort > 0 {
+				p.MetadataDaemonIP = metadataDaemonIP
+				p.MetadataDaemonPort = agent.Status.NetworkPolicy.MetadataDaemonPort
+				p.MetadataDaemonSource = netpolSourceDiscovered
+			}
+		}
+	}
+
+	// 5. Documented fallback default
 	if p.MetadataDaemonSource == "" {
 		p.MetadataDaemonIP = metadataDaemonIP // 169.254.169.252
+		p.MetadataDaemonPort = metadataDaemonDefaultPort
 		p.MetadataDaemonSource = netpolSourceDefault
 	}
 
@@ -382,4 +425,37 @@ func trimmedAnnotation(agent *agentv1alpha1.PlatformAgent, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(agent.Annotations[key])
+}
+
+// discoverMetadataDaemonPort reads the live kube-system/gke-metadata-server DaemonSet and
+// returns the containerPort named "metadata-server", confirming Workload-Identity-on-GKE
+// as a side effect. It deliberately does not parse --addr: flag formats change across node
+// images, a named port is the DaemonSet's API surface, and the IP itself (169.254.169.252)
+// appears in no structured field at all, so this only ever confirms the port.
+// Uses r.APIReader to bypass the Informer cache, ensuring zero cluster-wide cache overhead.
+// A cluster-wide TTL cache (like telemetry) is unnecessary here because PlatformAgent is a
+// cluster singleton, so this single point-lookup generates negligible API server load.
+// Every failure mode (Forbidden, NotFound, no matching port) returns 0 and an error or nil,
+// and is non-fatal by contract with the caller.
+func (r *PlatformAgentReconciler) discoverMetadataDaemonPort(ctx context.Context) (int32, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if reader == nil {
+		return 0, nil
+	}
+	var ds appsv1.DaemonSet
+	key := types.NamespacedName{Namespace: metadataDaemonNamespace, Name: metadataDaemonDaemonSet}
+	if err := reader.Get(ctx, key, &ds); err != nil {
+		return 0, err
+	}
+	for _, c := range ds.Spec.Template.Spec.Containers {
+		for _, p := range c.Ports {
+			if p.Name == metadataDaemonPortName && p.ContainerPort > 0 {
+				return p.ContainerPort, nil
+			}
+		}
+	}
+	return 0, nil
 }

@@ -59,15 +59,13 @@ gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet || true
 
 if [ -n "${COMMIT_SHA}" ]; then
   echo "🔍 Verifying platform-agent-gateway deployment container image matches commit ${COMMIT_SHA}..."
-  start_time=$(date +%s)
-  until kubectl get deploy/platform-agent-gateway -n "${AGENT_NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null | grep -q ":${COMMIT_SHA}"; do
-    if [ $(($(date +%s) - start_time)) -gt 300 ]; then
-      echo "❌ ERROR: Deployment platform-agent-gateway did not update to image tag :${COMMIT_SHA} within timeout!" >&2
-      exit 1
-    fi
-    echo "Waiting for deployment platform-agent-gateway image to be updated to :${COMMIT_SHA}..."
-    sleep 5
-  done
+  # Delegated rather than open-coded. This read-back used to grep
+  # `.containers[*].image` for the SHA, which passed on the first container that
+  # matched and never looked at `.initContainers` at all -- so the agent could
+  # sit at an old tag behind an envoy-credential-proxy that had rolled forward,
+  # and the loop would exit satisfied. confirm_agent_image.sh checks every
+  # first-party release image in the template and reports which ones came apart.
+  "${SCRIPT_DIR}/../confirm_agent_image.sh" "${AGENT_NAMESPACE}" platform-agent-gateway "${COMMIT_SHA}"
   echo "✅ platform-agent-gateway deployment image matches candidate commit ${COMMIT_SHA}."
 fi
 

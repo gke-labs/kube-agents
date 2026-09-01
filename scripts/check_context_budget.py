@@ -20,7 +20,8 @@ So the budget is checked rather than watched. The remedy when this fails is
 almost never to delete a rule -- it is to move the *mechanics* out to a
 document the agent opens when it is carrying the rule out, the way
 ``docs/pull-request-workflow.md`` holds the commands whose rules live in
-``AGENTS.md``. Raising ``BUDGET`` is the other option, and it is a real one, but
+``AGENTS.md`` and ``.agents/rules/`` holds the mechanics that are prose rather
+than commands. Raising ``BUDGET`` is the other option, and it is a real one, but
 it should be a decision someone argues for in a pull request rather than the
 path of least resistance.
 
@@ -143,9 +144,10 @@ def main() -> int:
             "\n"
             "These files are loaded into every session in every checkout, so this is a\n"
             "cost paid by every task in the repository. Prefer moving mechanics out over\n"
-            "deleting a rule: the commands for a procedure belong in a document the agent\n"
-            "opens while carrying it out (docs/pull-request-workflow.md is the worked\n"
-            "example), while the rule, its trigger, and its reason stay in AGENTS.md.\n"
+            "deleting a rule: mechanics belong in a document the agent opens while\n"
+            "carrying the rule out -- docs/pull-request-workflow.md for the ones that are\n"
+            "commands, .agents/rules/ for the ones that are prose -- while the rule, its\n"
+            "trigger, and its reason stay in AGENTS.md.\n"
             "Raising BUDGET in scripts/check_context_budget.py is a legitimate answer too,\n"
             "but argue for it in the pull request."
         )
