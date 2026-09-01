@@ -845,9 +845,10 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. All sixteen active cases are admitted -- the deliberate call
-# was full coverage over a curated subset, accepting that three cases
-# carry a named, tracked risk rather than a clean record:
+# optional. Fifteen of the sixteen active cases are admitted -- the
+# deliberate call was full coverage over a curated subset, accepting that
+# two admitted cases carry a named, tracked risk rather than a clean
+# record:
 #
 #   capacity-pinned-pool-probe            -- #1010: worker completes its
 #     card at fan-out ("Awaiting synthesis" as the final answer). The
@@ -856,10 +857,13 @@ print(m.group(1).strip('\'\"') if m else '')
 #   cluster-agent-healthy-workload-no-finding -- #1100: the agent invents
 #     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
 #     collapse taxes an innocent PR; rung-6 screening retires the risk.
-#   autoops-warning-event-triage          -- #1101: youngest case, no
-#     blocking-grade record yet and one judged-check floor uncalibrated.
 #
-# If any of the three reds a pull request its diff cannot explain, demote
+# autoops-warning-event-triage is the one case NOT admitted -- #1101: it
+# has failed its exact checks on every graded repetition on record (0/5
+# across its two runs), so admitting it reds every pull request today.
+# It enters when #1101's bar is settled and it has a clean record.
+#
+# If an admitted case reds a pull request its diff cannot explain, demote
 # it here and reference its issue. Demotion is a one-line same-day edit to
 # this list -- this file, not the Prow config, is deliberately the fast
 # lever.
@@ -867,7 +871,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,capacity-pinned-pool-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,cluster-agent-healthy-workload-no-finding,gpu-stress-test-diagnosis,agent-kanban-smoke,autoops-warning-event-triage}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,capacity-pinned-pool-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,cluster-agent-healthy-workload-no-finding,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
