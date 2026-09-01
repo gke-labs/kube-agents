@@ -933,7 +933,9 @@ TASKS=(
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
-  # Last, because it is the only entry that pays twice. Its stack plants an
+  # Was last because it was the only entry that pays twice -- its #1023
+  # crashloop sibling below now pays the same two waits, and array order
+  # stopped mattering when unit_cost_hint took over launch order. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
   # watcher's leading-edge debounce clears and the incident opens (~1 minute,
   # bounded at 12), and then the agent turn itself waits on the AutoOps card,
@@ -944,6 +946,28 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   "./tasks/autoops-warning-event-triage/task.yaml"
+  # Two second-domain cases (#1023), both ACTIVE on the strength of their
+  # authoring pull request's own measured /test all run (Prow skips draft
+  # PRs); a red takes the offending entry back out before that PR leaves
+  # draft — the #1049 rule.
+  #
+  # ai-security-planted-model-audit: fleet-audits' second case beside the
+  # compliance canary — a second audit stream end to end
+  # (ai-security-audit, whose checks nothing else touches) over a defect
+  # its own stack plants on the host cluster, plus the SOP's
+  # report-the-name-never-the-value redaction rule made exact. Full-audit
+  # shape; hinted at the audit estimate below until measured.
+  #
+  # autoops-crashloop-config-triage: incident-triage's second case — the
+  # same watcher/dispatch/delivery pipeline as the entry above, on a
+  # different failure class whose evidence lives in the container log and
+  # pod spec rather than in lastState.terminated, keyed on a planted
+  # config path a pattern-matched OOM diagnosis cannot produce. Sibling
+  # stack directory (shared state is why it is not a variable on the
+  # incumbent's stack); pays the same open-incident and card waits, so it
+  # takes the incumbent's 900 hint as its estimate.
+  "./tasks/ai-security-planted-model-audit/task.yaml"
+  "./tasks/autoops-crashloop-config-triage/task.yaml"
   # Eleven registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
@@ -1067,8 +1091,9 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # that is issue #902's lane. The serial measurements kept below predate the
 # fan-out and are its baseline.
 #
-# SEVENTEEN tasks at three repetitions is FIFTY-ONE devops-bench invocations,
-# where the presubmit's budget was sized for two. The per-invocation cost is no
+# NINETEEN tasks at three repetitions is FIFTY-SEVEN devops-bench invocations
+# at this branch's head: the SEVENTEEN main's copy was recounted at, plus the
+# two #1023 entries this branch activates. The per-invocation cost is no
 # longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
 # (2026-08-27, GREEN).
@@ -1127,10 +1152,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # the fan-out below actually realises against the pool's model quota, which the
 # first parallel Prow run will measure. Until it has, budget serially: a case
 # that fits at parallelism 1 cannot be the thing that blows the deadline. At
-# 360m and seventeen tasks that leaves ~137-160min of serial headroom, which is
-# real room again -- exactly when this stops being watched, so recount before
-# you trust it. Activating a case and raising the budget are one change in two
-# repositories, not a change and a follow-up.
+# 360m and nineteen tasks the average-cost arithmetic is no longer the binding
+# term: the #1023 note below prices the serialized stack-bearing chain, and its
+# measured run -- not this average -- is what says the matrix fits. Recount
+# before you trust either. Activating a case and raising the budget are one
+# change in two repositories, not a change and a follow-up.
 #
 # The variance that was flagged as the thing to watch has resolved in the good
 # direction: consistency-authorized-networks-probe took 1039s on the one earlier
@@ -1146,6 +1172,24 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # pull request. It is not a legitimate default: at 1 the collapse rung
 # degenerates to "the single run failed", which is exactly the trigger-happy
 # rule this change exists to replace.
+# #1023's fleet-audits and incident-triage second cases
+# (ai-security-planted-model-audit, autoops-crashloop-config-triage) do NOT
+# amortize across lanes the way noop cases do, and the binding constraint is
+# not parallelism: both are stack-bearing, and the infra mutex below holds
+# lock-infra for a unit's WHOLE invocation, so every tofu unit serializes
+# with every other. These six units join gpu-stress's and the incumbent
+# autoops task's six in one serial chain — at the 900 estimates that chain
+# alone is ~180 minutes, plus the crashloop apply's bounded watcher waits
+# (420s+300s worst case per rep) riding inside it, against the measured
+# 167-minute 16-case baseline (build 2094432646640701440, zero model 429s
+# at P=4). The authoring PR's measured run is what says whether that chain
+# fits; if it crowds the deadline, thinning the chain (not raising P) is
+# the lever. Of the sibling lanes, #1066 has merged (the seventeenth case,
+# 178s/rep measured on the last serial run -- cheap and stack-free, so it
+# rides the fan-out without touching this chain); #1079, #1082, #1083 and
+# #1050 still budget their own additions against the same baseline, and
+# whichever merges LAST owns the combined recompute -- no single lane's
+# arithmetic covers the sum.
 EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
@@ -1251,6 +1295,10 @@ fi
 unit_cost_hint() {
   case "$1" in
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    # ESTIMATES, not measurements — the audit at its shape's sibling prices
+    # (606-962s/rep), the crashloop triage at its sibling's hint (same
+    # waits). Replace with measured costs from the authoring PR's run.
+    ai-security-planted-model-audit | autoops-crashloop-config-triage) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     *) echo 200 ;;

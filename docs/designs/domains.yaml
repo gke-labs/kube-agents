@@ -27,9 +27,10 @@
 # So in presubmit each audit domain is covered by a PROBE -- a targeted
 # question about that domain's planted defect, answered from observed
 # evidence and graded on the reply -- while the audit-SOP machinery itself
-# (dispatch, delegation, token minter, ledger write) is exercised end to end
-# by exactly one audit kept as a canary, under the `fleet-audits` domain.
-# The full audit scenarios remain spec-ready for the nightly tier.
+# (dispatch, delegation, token minter, ledger write) was exercised end to end
+# by exactly one audit kept as a canary, under the `fleet-audits` domain
+# (#1023 has since reactivated further audits under their own domains).
+# The audits #1023 has not reactivated remain spec-ready nightly candidates.
 
 domains:
   - slug: chat-and-routing
@@ -76,8 +77,9 @@ domains:
 # probes cover chat-and-routing; cluster-debugging came off first among the
 # Phase 2 domains, in #939. Reliability, capacity, security, upgrades,
 # consistency and cost are covered by the six domain probes, and fleet-audits
-# by the compliance-audit canary -- see the header above for why probes rather
-# than six full audits. incident-triage came off last, in #1045, once
+# by the compliance-audit canary (joined under #1023 by a second stream,
+# ai-security-planted-model-audit) -- see the header above for why probes
+# rather than six full audits. incident-triage came off last, in #1045, once
 # bench/tf/prebuilt/autoops-incident gave autoops-warning-event-triage an
 # incident to triage; note that gpu-stress-test-diagnosis never covered it,
 # being a chat-prompted post-incident RCA rather than event-fired triage.

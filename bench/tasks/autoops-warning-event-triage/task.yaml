@@ -16,8 +16,10 @@
 # payments-api crashloop, and two cases pointed at one pod share its dedup
 # entry and its failures.
 #
-# This is the one presubmit case that mutates, which is why it is
-# namespace-scoped rather than read-only: the namespace is created by the
+# This was the first presubmit case that mutates, and the rule it
+# established — namespace-scoped rather than read-only — is the one its
+# #1023 siblings (autoops-crashloop-config-triage, and the fleet-audits
+# plant ai-security-planted-model-audit) inherit: the namespace is created by the
 # stack's apply and deleted by its destroy (`teardown: true`), and the
 # safeguards below assert the agent left the planted object exactly as the
 # stack wrote it.
