@@ -92,12 +92,31 @@ MUTATIONS: list[Mutation] = [
         "_KUBECTL_IDENTITY_FLAGS, so this tests whether the second guard holds",
     ),
     Mutation(
+        # The fast-path `-sVALUE` test and the cluster walk are mutually
+        # redundant for the attached spelling — deleting either alone weakens
+        # nothing, measured by execution. The kill is therefore the walk's own
+        # return, which is the only coverage the clustered spelling
+        # (`-As http://host`, boolean then s) has; the corpus carries that
+        # spelling so this deletion goes red.
         "A3-attached-shorthand",
+        "agents/platform/scripts/command_policy.py",
+        ('                if character == "s":\n                    return "-s"\n', ""),
+        "test_A3_rejects_attached_shorthand_server",
+        "drop the cluster walk's server detection while simplifying the loop; "
+        "-As http://host then reaches the server flag unrefused",
+    ),
+    Mutation(
+        # The other half of the redundancy, pinned as deliberate: deleting the
+        # `-sVALUE` fast-path must leave the suite green, because the cluster
+        # walk catches every spelling the corpus carries. If this ever goes
+        # OVERSHOT, the walk lost coverage and the fast-path became the only
+        # thing standing — which is worth knowing loudly.
+        "A3-fastpath-redundant",
         "agents/platform/scripts/command_policy.py",
         ('        if token.startswith("-s") and token != "-s":\n            return "-s"\n', ""),
         "test_A3_rejects_attached_shorthand_server",
-        "remove the attached-shorthand clause, restoring the exact-token "
-        "matching the slice 2a Critical defeated",
+        "remove the redundant fast-path; the cluster walk covers it",
+        must_survive=True,
     ),
     Mutation(
         "A3-kubectl-kuberc-env",
@@ -125,13 +144,17 @@ MUTATIONS: list[Mutation] = [
         "make the refusal more helpful by naming what was refused -- the "
         "obvious improvement that turns a denial into an oracle",
     ),
-    Mutation(
+        Mutation(
+        # The original unpinned bind's resourceNames; #387 removed the bind
+        # rule outright, so the live escalation edit is granting escalate on
+        # the RBAC rule the operator still holds full CRUD through.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
-        ("    resourceNames:\n      - view\n", ""),
-        "test_A4_the_operator_cannot_escalate",
-        "remove the resourceNames bound on `bind`, so the operator can attach "
-        "any existing ClusterRole to an agent",
+        ("      - roles\n    verbs:\n      - create\n",
+         "      - roles\n    verbs:\n      - create\n      - escalate\n"),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "grant the operator escalate so a reconcile can widen a role in place "
+        "-- the ceiling in C5 becomes advisory",
     ),
     Mutation(
         "A1-refusal-emptied",
@@ -172,17 +195,18 @@ MUTATIONS: list[Mutation] = [
         "test stays green while --sort-by, --since and --selector become "
         "refusals, which is how a control gets switched off in production",
     ),
-    Mutation(
-        "A4-chart-bind-unpinned",
+        Mutation(
+        # Originally unpinned the chart's bind-to-view rule; the rule is gone
+        # from both delivery paths (#387), so the live edit is bind returning
+        # to the chart copy alone — the same-ceiling drift A4 exists to catch.
+        "A4-chart-bind-returns",
         "charts/kube-agents/templates/operator-rbac.yaml",
-        ("  - apiGroups:\n      - rbac.authorization.k8s.io\n    resourceNames:\n"
-         "      - view\n    resources:\n      - clusterroles\n    verbs:\n      - bind\n",
+        ("  # END GENERATED RULES",
          "  - apiGroups:\n      - rbac.authorization.k8s.io\n    resources:\n"
-         "      - clusterroles\n    verbs:\n      - bind\n"),
+         "      - clusterroles\n    verbs:\n      - bind\n  # END GENERATED RULES"),
         "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
-        "the chart twin of A4-operator-escalate, hand-edited inside the "
-        "generated block instead of regenerated: the kustomize role still reads "
-        "correct and only Helm installs get an unrestricted bind",
+        "give the chart's operator role an unrestricted bind the kustomize "
+        "role does not carry -- one delivery path quietly grows a ceiling",
     ),
     Mutation(
         "A4-inject-assertion-renamed",
@@ -256,13 +280,20 @@ MUTATIONS: list[Mutation] = [
         "actually gets dropped",
     ),
     Mutation(
+        # Originally inserted a checkout into auto_request_review.yml, which
+        # has since moved off pull_request_target (it is workflow_run-gated on
+        # the AI Review check now), so the insertion landed outside the test's
+        # trigger filter and proved nothing. risk_classify.yml is the live
+        # pull_request_target workflow, and its safety is exactly the pinned
+        # ref — so the mutation is the one-line flip an author debugging the
+        # classifier against their own PR would make.
         "B4-pull-request-target-checkout",
-        ".github/workflows/auto_request_review.yml",
-        ("    steps:", "    steps:\n      - uses: actions/checkout@v4\n        with:\n"
-                        "          ref: ${{ github.event.pull_request.head.sha }}"),
-        "test_B4_no_pull_request_target_workflow_checks_out",
-        "check out the PR head in a pull_request_target workflow -- arbitrary "
-        "code execution with the base repository's token",
+        ".github/workflows/risk_classify.yml",
+        ("          ref: ${{ github.event.repository.default_branch }}",
+         "          ref: ${{ github.event.pull_request.head.sha }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "point the classifier's checkout at the pull request so it classifies "
+        "the new rules too -- arbitrary code execution with a writable token",
     ),
     Mutation(
         "B6-codeowners-bot",
@@ -458,8 +489,10 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "C3-log-sanitiser",
         "agents/platform/scripts/credential_proxy.py",
-        ("filtered = ''.join(c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Zl', 'Zp'))",
-         "filtered = s"),
+        ("    filtered = ''.join(\n"
+         "        c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')\n"
+         "    )\n",
+         "    filtered = s\n"),
         "test_C3_untrusted_output_cannot_forge_a_log_line",
         "stop stripping control characters, so tool output can forge a record",
     ),
@@ -475,7 +508,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "C4-base-image-digest",
         "tags.env",
-        ("@sha256:16788311e2fa3035456bdc1bafb8ec2b1777db64ebf020af9bb7eb73c3712c9e", ""),
+        ("@sha256:68e15ae2a6d894d0ccbd9f8aacbbe13d4d28fa5dc9b6a303970b67bb2499b1a6", ""),
         "test_C4_the_agent_base_image_is_pinned_by_digest",
         "drop the digest and keep the tag, which reads as equivalent",
     ),
@@ -643,7 +676,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "D1-principal-not-logged",
         "agents/platform/scripts/credential_proxy.py",
-        ("            _sanitize_for_logging(principal.describe()),", "            \"-\","),
+        ("            _sanitize_for_logging(principal.describe(), max_length=512),", "            \"-\","),
         "test_D1_the_exec_route_records_a_principal",
         "drop the principal from the exec record while refactoring a handler "
         "that does not yet read it",

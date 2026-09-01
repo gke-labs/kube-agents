@@ -203,6 +203,11 @@ class A3ThePrincipalComesFromAVerifiedChannel(unittest.TestCase):
             ["kubectl", "get", "pods", "-shttp://127.0.0.1:8443"],
             ["kubectl", "get", "pods", "-shttps://evil.example"],
             ["kubectl", "-s127.0.0.1:8443", "get", "pods"],
+            # The clustered spelling: pflag reads -As as the boolean -A then
+            # the value-taking -s. Only the cluster walk catches this one —
+            # the -sVALUE fast-path never sees it — so this case is what makes
+            # deleting that walk a red suite rather than a silent hole.
+            ["kubectl", "get", "pods", "-As", "http://127.0.0.1:8443"],
         ):
             with self.subTest(argv=argv):
                 decision = command_policy.evaluate(argv)
