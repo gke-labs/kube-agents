@@ -82,6 +82,7 @@ import json
 import os
 import re
 import threading
+from datetime import timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -122,8 +123,12 @@ _COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 # from the PlatformAgent CR, mounted read-only, on a volume the agent does not
 # write. Reading it as validation of provenance would be a declaration standing
 # in for the property it describes.
+# \Z and fullmatch, not $ and match — the same trailing-newline trap the
+# _COMPONENT comment records. The file is operator-rendered and CRD-validated,
+# so a newline only arrives via a hand-written pool file, but the invariant
+# this module keeps is that no pattern in it admits one.
 _SERVICE_ACCOUNT = re.compile(
-    r"^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$"
+    r"[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com\Z"
 )
 
 # One hour is the ceiling `generateAccessToken` enforces without
@@ -250,7 +255,7 @@ def parse_pool(document: object) -> dict[str, PoolMember]:
         except ValueError as error:
             raise PoolConfigurationError(f"serviceAccounts[{index}]: {error}") from error
         email = entry.get("serviceAccountEmail")
-        if not isinstance(email, str) or not _SERVICE_ACCOUNT.match(email):
+        if not isinstance(email, str) or not _SERVICE_ACCOUNT.fullmatch(email):
             raise PoolConfigurationError(
                 f"serviceAccounts[{index}] has no well-formed serviceAccountEmail: {email!r}"
             )
@@ -319,7 +324,15 @@ def mint_impersonated_token(service_account: str, lifetime_seconds: int) -> tupl
     credentials.refresh(Request())
     if not credentials.token:
         raise RuntimeError(f"no access token was returned for {service_account}")
-    return credentials.token, credentials.expiry.timestamp()
+    # google-auth parses generateAccessToken's expireTime into a naive UTC
+    # datetime, and .timestamp() on a naive datetime reads it in the host's
+    # local timezone — east of UTC every cached token would look already
+    # expired, west of UTC it would be reused past its real life. The shipped
+    # container runs UTC, so pin the zone rather than the deployment.
+    expiry = credentials.expiry
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return credentials.token, expiry.timestamp()
 
 
 class ScopedServiceAccountPool:

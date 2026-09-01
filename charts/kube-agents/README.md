@@ -357,8 +357,10 @@ Two knobs need context beyond the chart:
 `platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
 may read to the Google service account that reads it. Empty is the default and
 should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
-non-empty list arms the credential broker onto identities that can read nothing
-and every cluster read is refused. The
+non-empty list arms the credential broker onto identities that can read
+nothing, and every cluster read fails — a mapped cluster gets a powerless
+token and a `Forbidden` from GKE, an unmapped one is refused by the broker
+before any GKE call. The
 `terraform/examples/full-install` composition fills it in from its
 `scoped_service_accounts` output when `scoped_clusters` is set. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
@@ -472,7 +474,6 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
-
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

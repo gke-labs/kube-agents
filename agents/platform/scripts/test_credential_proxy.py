@@ -2814,8 +2814,10 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         environment = {
             "API_SERVER_EXTERNAL_KEY": "external",
             "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
-            # Armed by default now, and this case drives `serve` for an
-            # unrelated property with no pool mapping mounted.
+            # The pool is off by default (2026-08-12), so this line is
+            # belt-and-braces: the case drives `serve` for an unrelated
+            # property with no pool mapping mounted, and says so explicitly
+            # rather than leaning on the default.
             "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
         }
         if enforce_value is not None:
@@ -4201,7 +4203,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
 
         Reading the file back out of the subprocess is what makes this a test of
         the join rather than of a helper: it fails if the credential is right in
-        `_scoped_kubeconfig` and never reaches the process.
+        `_kubeconfig_for` and never reaches the process.
         """
         stub_dir = Path(self.temp_dir.name) / "fake-bin"
         stub_dir.mkdir(parents=True, exist_ok=True)
