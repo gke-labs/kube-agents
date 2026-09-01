@@ -646,9 +646,14 @@ class _TransportError(RuntimeError):
 # Gateway statuses a proxy in front of the agent emits when the upstream is
 # gone or saturated -- the pod restarted, the tunnel died -- and which clear
 # once it is back. 429 is the endpoint's own admission control ("Too many
-# concurrent runs"): the request never reached an agent, and the condition
-# clears when a slot frees, which is the same run class as a saturated
-# gateway. Every other status is an answer about the request itself and
+# concurrent runs"): the rejected request itself never reached an agent --
+# true of an opening turn and of a status poll alike, where the delegating
+# turn already ran but this poll was refused at the door -- and the condition
+# clears when a slot frees, the same run class as a saturated gateway. On
+# exhaustion both turn paths deliberately end in _infra_failure rather than
+# grading a partial record: see _DelegationTransportExhausted for why settling
+# the cards into a record that is about to be replaced wholesale is not a
+# rescue. Every other status is an answer about the request itself and
 # repeating the request cannot change it, 500 included: a handler that raised
 # will raise again.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
