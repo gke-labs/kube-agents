@@ -22,11 +22,9 @@ When this skill is loaded for a **design, planning, or capacity-check request**
 workflow) rather than a stockout alert:
 
 - Execute **only Step 4's diagnostic subsections A-D** (quota, reservations,
-  usage, and capacity advice). Step 4's Efficiency Directive and CRITICAL
-  MANDATE belong to the alert-driven remediation flow below and do not
-  apply here: in design-time mode there is no notification to send and no
-  Pull Request to open.
-  quota verification, reservations, and capacity obtainability advice.
+  usage, and capacity advice). Steps 1-3 and 5-7 are the alert-driven
+  remediation flow and are not part of design-time mode; where Step 4's own
+  directives address both modes, they say which clause applies to which.
 - Run the capacity advice for **Spot and Flex-Start** — the two provisioning
   models `gcloud beta compute advice capacity` accepts
   (`--provisioning-model=SPOT` and `FLEX_START`) — and read the per-zone
@@ -260,7 +258,7 @@ _Note: Filter by other metric names (e.g., `N4_CPUS`, `C4_CPUS`, `NVIDIA_T4_GPUS
 
 #### B. Reservations Check
 
-Check if any zonal reservations are available for the target workload's machine type to guarantee compute capacity:
+Check if any zonal reservations are available for the target workload's machine type; a reservation holds capacity for it (the report must not describe this as a guarantee):
 
 ```bash
 gcloud compute reservations list --format="json"
