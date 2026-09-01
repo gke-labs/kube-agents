@@ -1193,11 +1193,13 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Thirteen of the sixteen active cases are admitted: the ones
+# optional. Thirteen of the seventeen active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
-# infra classes the harness already excludes from the verdict. Three are
-# held out, each with a filed issue naming its exit condition -- they
-# still run and report on every pull request, they just cannot red one:
+# infra classes the harness already excludes from the verdict. Four are
+# held out -- they still run and report on every pull request, they just
+# cannot red one. security-overgrant-remediation-proposal (#1066) is
+# simply new: it earns its record like any case, then enters. The other
+# three each have a filed issue naming the exit condition:
 #
 #   capacity-pinned-pool-probe            -- #1010: worker completes its
 #     card at fan-out ("Awaiting synthesis" as the final answer). The
