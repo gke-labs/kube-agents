@@ -832,10 +832,11 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # A 4xx, a 500, or a body that is not JSON says the endpoint
-                # answered; that is the agent's own failure and still belongs
-                # in front of the judge. Only a gateway status or a dropped
-                # connection is worth a second attempt.
+                # A 500, a 4xx other than 429, or a body that is not JSON
+                # says a handler answered; that is the agent's own failure and
+                # still belongs in front of the judge. Only a gateway status,
+                # an admission-control 429, or a dropped connection is worth a
+                # second attempt: see _RETRYABLE_STATUSES.
                 if not exc.retryable:
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
@@ -926,8 +927,10 @@ class KubeAgentsHarness(AgentHarness):
             turn ran or the header was absent.
 
         Raises:
-            _DelegationTransportExhausted: Every retry died without an HTTP
-                answer; the run is infrastructure, not a gradable result.
+            _DelegationTransportExhausted: Every retry died without reaching
+                an agent -- no HTTP answer at all, or a 429 refused at the
+                admission door; the run is infrastructure, not a gradable
+                result.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -989,11 +992,15 @@ class KubeAgentsHarness(AgentHarness):
                 if transport_failures < _MAX_TRANSPORT_FAILURES:
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
-                    # A retryable failure means the endpoint never answered,
-                    # and the tunnel is the prime suspect (build
+                    # A retryable failure usually means the endpoint never
+                    # answered, and the tunnel is the prime suspect (build
                     # 2092638061140643840: three 502s over a live listener
                     # whose upstream pod had been replaced), so it is torn
-                    # down and respawned first, exactly like the opening turn.
+                    # down and respawned first, exactly like the opening
+                    # turn. The exception is 429, the one retryable status
+                    # the endpoint itself sends: the tunnel it arrived
+                    # through is healthy, and the respawn's few seconds are
+                    # merely pacing before the slot is asked for again.
                     if exc.retryable:
                         try:
                             _reset_port_forward(local_port)
@@ -1018,10 +1025,11 @@ class KubeAgentsHarness(AgentHarness):
                         f"status turns failed in transport {transport_failures} times "
                         "running; still waiting on: " + ", ".join(outstanding)
                     ) from exc
-                # The endpoint answered every time (a 4xx, a 500, non-JSON):
-                # that is the agent's own failure, so it stays in front of the
-                # judge as before -- recorded, not just logged, which is what
-                # stops devops-bench promoting the partial record.
+                # A handler answered every time (a non-429 4xx, a 500,
+                # non-JSON): that is the agent's own failure, so it stays in
+                # front of the judge as before -- recorded, not just logged,
+                # which is what stops devops-bench promoting the partial
+                # record.
                 result.errors.append(
                     f"status turns failed in transport {transport_failures} times running; "
                     "still waiting on: " + ", ".join(outstanding)
