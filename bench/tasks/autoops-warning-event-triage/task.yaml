@@ -217,9 +217,11 @@ verification_spec:
       # session_kv_server.py owns two report shapes, and only the lettered one
       # has an "Option A" in it. With exactly one remediation the template
       # forbids the letter outright ("do not letter it and do not use the word
-      # 'Option'") and the report ends on "**Proposed fix (...)**" instead. So
-      # "To authorize:" is the one line both shapes carry, which is why the
-      # notifier keys on it and why this check does too.
+      # 'Option'") and labels that bullet "**Proposed fix (...)**" instead. The
+      # call to action follows it either way -- the single-option shape is those
+      # two bullets and nothing else -- so "To authorize:" is the one line both
+      # shapes carry, which is why the notifier keys on it and why this check
+      # does too.
       #
       # This check used to require "Option A" outright, which asked for a token
       # one of the two legal shapes forbids. It failed #1057 three times on a
@@ -248,10 +250,13 @@ verification_spec:
       #    this check accepts it.
       #
       # That last one is why "What to do" is written here without a leading #:
-      # pinning the heading depth is not on offer, because normalization strips
-      # *, _ and ` but leaves # alone, so a literal "## What to do" would red on
-      # the "###" the template is equally free to emit. The looser phrase is the
-      # deliberate trade. That same stripping is what lets "To authorize:" match
+      # normalization strips *, _ and ` but leaves # alone, so a literal
+      # "## What to do" would pin the depth, and it is the AGENT's reproduction
+      # of the template that may drift there, not the template -- the same
+      # tolerance `_WHAT_TO_DO_RE` is built for ("written to tolerate the
+      # heading depth drifting"). It buys that tolerance by dropping the
+      # heading requirement altogether, which is the trade. That same stripping
+      # is what lets "To authorize:" match
       # every emphasis spelling the notifier needed a lookbehind for --
       # `**To authorize:**`, `**To authorize**:`, `__To authorize__:` all
       # normalize alike.

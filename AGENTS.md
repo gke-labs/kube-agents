@@ -39,7 +39,8 @@ did not expect, or nowhere at all, and the suite reports green around it.
 
 - **No** — it is a test, and it runs on every pull request. Put it beside the module it covers; in
   `tests/` when there is nothing to sit beside, as for a shell script or a rendered manifest; or in
-  `tests/integration/` when it spans two components.
+  `tests/integration/` when it spans two components — but in `bench/tests/` when one of those
+  components is the bench harness, which `tests/integration/` cannot import.
   See [`tests/integration/README.md`](tests/integration/README.md).
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
   `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what

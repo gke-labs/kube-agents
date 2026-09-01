@@ -18,8 +18,10 @@
 report template a Cluster Agent fills in. It permits two shapes, and the
 difference between them is the whole subject of this module: with two or more
 remediations the options are lettered ``Option A``, ``Option B``, ...; with
-exactly one the template forbids the letter outright and the report ends on a
-``Proposed fix`` bullet instead.
+exactly one the template forbids the letter outright and labels that bullet
+``Proposed fix`` instead. The call to action follows either way — the
+single-option shape is those two bullets and nothing else — which is why
+``To authorize:`` is the line both shapes carry.
 
 Two gates read the result, and neither is written in the same language as the
 template:
@@ -82,15 +84,16 @@ import pytest
 import yaml
 
 from kube_agents_bench import transcript
-from kube_agents_bench.verifiers import ReportContainsVerifier
+from kube_agents_bench.verifiers import ReportContainsVerifier, _normalize
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: The case whose delivery objective this module pins. One case, deliberately:
-#: it is currently the only one in `domain: incident-triage` and the only one
-#: carrying a delivery objective at all (#1103's sibling case drops its own,
-#: citing the very defect this module's check fixes), and a glob over the
-#: directory would silently cover nothing on the day this one is renamed.
+#: The case whose delivery objective this module pins. Named, not globbed: it
+#: is the only case in `domain: incident-triage` and the only task.yaml in the
+#: tree containing "What to do" or "To authorize:", so a glob over the
+#: directory would cover exactly this file today and silently cover nothing on
+#: the day it is renamed. A second case adopting the delivery contract should
+#: be added to a list here rather than left to a pattern.
 CASE_PATH = REPO_ROOT / "bench" / "tasks" / "autoops-warning-event-triage" / "task.yaml"
 CHECK_NAME = "triage-delivers-an-actionable-report"
 
@@ -289,7 +292,12 @@ def test_every_phrase_the_case_requires_is_still_in_the_template():
     an exemplar but has left the template that is supposed to be its source —
     the point at which the case is asserting a string nothing writes any more.
     """
-    text = _template_text()
+    # Normalized on both sides, the way the verifier compares them. A raw
+    # substring test would be STRICTER than the check it stands in for -- a
+    # template emitting `**To authorize**:` still satisfies the eval check but
+    # would fail a literal `in` -- and a false red on a case that works is the
+    # one failure mode this module must not introduce.
+    text = _normalize(_template_text())
     check = _delivery_check()
     required = check.get("required_phrases", [])
     assert WHAT_TO_DO_PHRASE in required, (
@@ -299,7 +307,7 @@ def test_every_phrase_the_case_requires_is_still_in_the_template():
         "Without this assertion an empty required_phrases satisfies every check "
         "below vacuously."
     )
-    missing = [p for p in required if p not in text]
+    missing = [p for p in required if _normalize(p) not in text]
     assert not missing, f"{CHECK_NAME} requires phrases the template no longer writes: {missing}"
     alternatives = check.get("any_of_phrases", [])
     assert alternatives, (
@@ -307,6 +315,16 @@ def test_every_phrase_the_case_requires_is_still_in_the_template():
         "so a delivery check written only from required_phrases asserts one of "
         "them and reds the other."
     )
-    assert [p for p in alternatives if p in text], (
-        f"none of {CHECK_NAME}'s alternatives appear in the template: {alternatives}"
+    # EVERY alternative, not just one of them. `any_of_phrases` is a disjunction
+    # when the verifier grades a report -- either token satisfies it -- but each
+    # listed token still has to be one the template actually writes. Accepting
+    # "at least one present" lets a rename of `Option A` pass unnoticed, because
+    # `To authorize:` survives it and carries the list on its own; the lettered
+    # alternative is then dead text asserting a string nothing emits, which is
+    # precisely the drift this test is here to name.
+    dead = [p for p in alternatives if _normalize(p) not in text]
+    assert not dead, (
+        f"{CHECK_NAME} offers alternatives the template no longer writes: {dead}. "
+        "The check still passes on the surviving alternative, so nothing else in "
+        "the suite reds -- which is why this assertion is per-phrase."
     )
