@@ -106,7 +106,7 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 
 | Skill | Description |
 | ----- | ----------- |
-| [`gke-obtainability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-obtainability/SKILL.md) | Diagnose GKE capacity stockouts and check quota and live hardware obtainability. Use when reacting to cluster-autoscaler stockout alerts, and also when a cluster design or capacity plan needs live evidence: regional quota verification (gcloud compute regions describe) and capacity obtainability advice (gcloud beta compute advice capacity / capacity-history) across zones and provisioning models. |
+| [`gke-obtainability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-obtainability/SKILL.md) | Check GKE quota and live hardware obtainability before recommending capacity. Use when a cluster design, capacity plan, or scale-up decision needs live evidence: regional quota verification (gcloud compute regions describe), reservations, and capacity obtainability advice (gcloud beta compute advice capacity / capacity-history) across zones and provisioning models. For handling an inbound cluster-autoscaler stockout alert end to end — triage, GitOps remediation, Pull Request — use the gke-stockout-investigator plugin skill instead. |
 
 ### Cluster Agent (per-cluster runtime)
 
