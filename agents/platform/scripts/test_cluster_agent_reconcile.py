@@ -583,7 +583,15 @@ class NotifyTargetTest(unittest.TestCase):
         # notice the two halves being wired together wrongly. This one drives the
         # real resolver off the environment the operator renders for a Slack-only
         # install, which is the configuration #989 was reported against.
-        with mock.patch.object(chat_platforms, "CONFIG_PATH", "/nonexistent/config.yaml"), \
+        #
+        # Both path constants are pinned away, not just CONFIG_PATH. They are computed
+        # at import time, so `clear=True` does not move them, and the managed scope is
+        # consulted first and wins outright — on a machine that has an /etc/hermes
+        # (the agent pod itself) this assertion would be decided by that host's CR
+        # rather than by the fixture below.
+        with mock.patch.multiple(chat_platforms,
+                                 CONFIG_PATH="/nonexistent/config.yaml",
+                                 MANAGED_CONFIG_PATH="/nonexistent/managed.yaml"), \
              mock.patch.dict(os.environ, {"SLACK_RELAY_URL": "http://127.0.0.1:8780"}, clear=True), \
              mock.patch.object(rec.subprocess, "run") as sub:
             rec._notify("created 1 profile(s): demo")
